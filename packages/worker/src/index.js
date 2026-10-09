@@ -1,4 +1,5 @@
-import { FlowsHub } from "./do.js";
+// The DO class must be exported from the entrypoint for wrangler's DO migrations.
+export { FlowsHub } from "./do.js";
 
 export default {
   async fetch(request, env, ctx) {
