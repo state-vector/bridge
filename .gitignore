@@ -6,3 +6,5 @@ node_modules/
 .wrangler/
 __pycache__/
 *.pyc
+dist/
+packages/desktop/src-tauri/target/

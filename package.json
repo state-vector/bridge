@@ -1,0 +1,19 @@
+{
+  "name": "flows-monorepo",
+  "private": true,
+  "type": "module",
+  "description": "flows: decisions, activity flows, presence — agents + humans, one surface",
+  "workspaces": [
+    "packages/specs",
+    "packages/worker",
+    "packages/desktop"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

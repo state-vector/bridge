@@ -1,0 +1,20 @@
+{
+  "name": "@flows/specs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single source of truth: event contract, JSON Schemas, generated TS types, protocol docs",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./schemas/*": "./schemas/*"
+  },
+  "scripts": {
+    "generate": "python3 scripts/gen_types.py",
+    "validate": "python3 scripts/validate_fixtures.py",
+    "test": "npm run validate"
+  },
+  "dependencies": {
+    "json-schema-to-typescript": "^15.0.4"
+  }
+}
