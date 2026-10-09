@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/ingest-request.schema.json",
+  "title": "flows POST /ingest request body",
+  "oneOf": [
+    { "$ref": "event.schema.json" },
+    {
+      "type": "object",
+      "required": ["events"],
+      "properties": {
+        "events": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "event.schema.json" }
+        }
+      }
+    }
+  ]
+}

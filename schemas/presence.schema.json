@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/presence.schema.json",
+  "title": "flows presence (actor freshness)",
+  "type": "object",
+  "required": ["id", "kind", "label", "last_ts", "status", "active"],
+  "properties": {
+    "id":      { "type": "string", "description": "agent:coder | human:ray | system:cron" },
+    "kind":    { "enum": ["agent", "human", "system"] },
+    "label":   { "type": ["string", "null"] },
+    "last_ts": { "type": "integer", "description": "ms epoch of last signal" },
+    "status":  { "type": ["string", "null"], "description": "working | active | ..." },
+    "active":  { "type": "boolean", "description": "signal within the 10-minute window" }
+  }
+}

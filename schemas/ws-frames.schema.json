@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/ws-frames.schema.json",
+  "title": "flows /ws server→client frames",
+  "oneOf": [
+    {
+      "title": "snapshot",
+      "type": "object",
+      "required": ["type", "state"],
+      "properties": {
+        "type": { "const": "snapshot" },
+        "state": { "$ref": "state.schema.json" }
+      }
+    },
+    {
+      "title": "event",
+      "type": "object",
+      "required": ["type", "event"],
+      "properties": {
+        "type": { "const": "event" },
+        "event": { "$ref": "eventview.schema.json" }
+      }
+    },
+    {
+      "title": "decisions",
+      "type": "object",
+      "required": ["type", "decisions"],
+      "properties": {
+        "type": { "const": "decisions" },
+        "decisions": { "type": "array", "items": { "$ref": "decision.schema.json" } }
+      }
+    },
+    {
+      "title": "presence",
+      "type": "object",
+      "required": ["type", "presence"],
+      "properties": {
+        "type": { "const": "presence" },
+        "presence": { "type": "array", "items": { "$ref": "presence.schema.json" } }
+      }
+    }
+  ]
+}

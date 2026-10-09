@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/state.schema.json",
+  "title": "flows /api/state response and ws snapshot state",
+  "type": "object",
+  "required": ["events", "decisions", "presence", "now"],
+  "properties": {
+    "now": { "type": "integer", "description": "server ms epoch" },
+    "events":   { "type": "array", "items": { "$ref": "eventview.schema.json" } },
+    "decisions":{ "type": "array", "items": { "$ref": "decision.schema.json" } },
+    "presence": { "type": "array", "items": { "$ref": "presence.schema.json" } }
+  }
+}

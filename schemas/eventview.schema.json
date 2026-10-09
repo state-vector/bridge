@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/eventview.schema.json",
+  "title": "flows event as stored/rendered (server-normalized Event)",
+  "type": "object",
+  "required": ["id", "kind", "source", "ts", "decision", "payload"],
+  "properties": {
+    "id":      { "type": "string", "maxLength": 200 },
+    "source":  { "type": "string", "maxLength": 40 },
+    "kind":    { "type": "string", "maxLength": 40 },
+    "ts":      { "type": "integer", "description": "ms epoch (normalized from posted seconds)" },
+    "board":   { "type": ["string", "null"], "maxLength": 60 },
+    "task_id": { "type": ["string", "null"], "maxLength": 100 },
+    "title":   { "type": ["string", "null"], "maxLength": 300 },
+    "actor":   { "type": ["string", "null"], "maxLength": 80 },
+    "actor_kind":  { "enum": ["agent", "human", "system", null] },
+    "actor_label": { "type": ["string", "null"], "maxLength": 80 },
+    "decision":{ "type": "boolean", "description": "true when kind=blocked" },
+    "payload": { "type": "object" }
+  }
+}

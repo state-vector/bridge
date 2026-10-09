@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/decision.schema.json",
+  "title": "flows decision (derived; only status=open is published)",
+  "type": "object",
+  "required": ["id", "status", "title", "kind", "opened_ts", "updated_ts"],
+  "properties": {
+    "id":          { "type": "string", "description": "dec:<board|source>:<task_id>" },
+    "status":      { "enum": ["open", "resolved"] },
+    "title":       { "type": "string", "maxLength": 300 },
+    "reason":      { "type": "string", "description": "from blocked payload.reason" },
+    "kind":        { "enum": ["needs_input", "diagnostic", null] },
+    "task_id":     { "type": ["string", "null"] },
+    "board":       { "type": ["string", "null"] },
+    "opened_ts":   { "type": "integer" },
+    "updated_ts":  { "type": "integer" },
+    "resolved_ts": { "type": ["integer", "null"] }
+  }
+}

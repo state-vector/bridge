@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/event.schema.json",
+  "title": "flows ingest event",
+  "type": "object",
+  "required": ["id", "source", "kind"],
+  "additionalProperties": true,
+  "properties": {
+    "id":      { "type": "string", "maxLength": 200, "description": "globally unique; duplicates are deduped no-ops" },
+    "source":  { "type": "string", "maxLength": 40,  "description": "kanban | github | linear | slack | cron | ..." },
+    "kind":    { "type": "string", "maxLength": 40,  "description": "blocked/unblocked/completed/heartbeat get special semantics; others render as generic activity" },
+    "ts":      { "type": "integer", "description": "unix seconds" },
+    "board":   { "type": ["string", "null"], "maxLength": 60 },
+    "task_id": { "type": ["string", "null"], "maxLength": 100, "description": "stable work ref; drives decision open/close" },
+    "title":   { "type": ["string", "null"], "maxLength": 300 },
+    "actor":   { "type": ["string", "null"], "maxLength": 80, "description": "agent:<profile> | human:<name> | system:<name>" },
+    "actor_kind":  { "enum": ["agent", "human", "system"], "description": "inferred from actor prefix when absent" },
+    "actor_label": { "type": "string", "maxLength": 80 },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "reason": { "type": "string", "description": "shown on decision cards (blocked events)" },
+        "kind":   { "type": "string", "description": "needs_input | diagnostic — decision card severity" }
+      }
+    }
+  }
+}
