@@ -19,10 +19,7 @@
     "payload": {
       "type": "object",
       "additionalProperties": true,
-      "properties": {
-        "reason": { "type": "string", "description": "shown on decision cards (blocked events)" },
-        "kind":   { "type": "string", "description": "needs_input | diagnostic — decision card severity" }
-      }
+      "description": "source-specific. Convention: reason = decision-card text (blocked); kind = needs_input | diagnostic | null (severity). No type constraints here — payloads vary by source."
     }
   }
 }
