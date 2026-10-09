@@ -22,13 +22,17 @@ npx wrangler secret put FLOWS_INGEST_TOKEN   # generate: openssl rand -hex 24
 
 ```
 
-## 2. Cloudflare Access (dashboard, one-time)
+## 2. Human-plane auth (password — Zero Trust/Access NOT enabled, it's paid)
 
-- Zero Trust → Access → Applications → self-hosted →
-  domain: `flows.<subdomain>.workers.dev` (or one-click: Workers → flows →
-  Settings → Domains → Enable Cloudflare Access)
-- Policy: Include → Emails → ray@…, grace@… (Google or GitHub login)
-- Save. Test: incognito window → URL → should bounce to IdP.
+Worker serves its own login page; sessions are HMAC-signed cookies (30d).
+
+```bash
+cd ~/flows/packages/worker
+npx wrangler secret put BRIDGE_UI_PASSWORD   # share with Grace; rotate = re-put
+```
+
+(Optional later: set CF_ACCESS_TEAM + CF_ACCESS_AUD secrets and the same code
+switches to Cloudflare Access JWT validation — both paths ship.)
 
 ## 3. Shipper on the EC2 box
 
