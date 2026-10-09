@@ -132,5 +132,7 @@ Actors upsert from any event with an `actor`; `heartbeat`/`pulse` keep them fres
 | presence "active" window | 10 min |
 | state/feed sizes | 200 events · 100 decisions · 200 actors |
 
-Machine-readable copies: [`schemas/event.schema.json`](../schemas/event.schema.json),
-[`schemas/ws-frames.schema.json`](../schemas/ws-frames.schema.json).
+Machine-readable copies: `schemas/event.schema.json`,
+`schemas/ws-frames.schema.json` (+ `state`, `eventview`, `decision`, `presence`,
+`ingest-request`). All validated against 116 real shipper events; refs resolve
+via `$id` registry (`flows/…`).
