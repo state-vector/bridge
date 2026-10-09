@@ -5,16 +5,11 @@ Access application created for the workers.dev hostname (AUD `02bf2012058821d837
 
 ## 1. Worker
 
-Two paths — CI is the default:
-
-- **Push to `main`** touching `packages/worker/**` or `packages/specs/schemas/**` →
-  GitHub Actions runs the specs gate then `wrangler deploy` (uses the
-  `CF_API_TOKEN` repo secret). Watch: `gh run watch` or the Actions tab.
-- **Manual, from the box:**
+Deploys are **manual from the box** (or Cloudflare's own dashboard/git integration — Ray is connecting the repo there; do NOT wire GitHub Actions deploys). CI, when added, is for tests only.
 
 ```bash
 cd ~/flows/packages/worker
-export CLOUDFLARE_API_TOKEN=<token>   # already in GH secrets for CI
+export CLOUDFLARE_API_TOKEN=<token>
 npx wrangler deploy
 # note the printed URL: https://flows.<subdomain>.workers.dev
 ```

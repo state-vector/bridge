@@ -2,7 +2,7 @@
 
 Real-time surface for **decisions**, **activity flows**, and **presence** — agents and humans, one place. Not a kanban UI; the board stays in Hermes. One ingest door (`POST /ingest`, bearer); humans get a Cloudflare Access–gated UI today, Tauri desktop later.
 
-**GitHub:** https://github.com/state-vector/bridge (private). `CF_API_TOKEN` is in the repo's Actions secrets for deploy.
+**GitHub:** https://github.com/state-vector/bridge (private). Deploys to Cloudflare are done from the box / Cloudflare dashboard — **not** GitHub CI (CI may be used later for tests only).
 
 ## Packages (npm workspaces)
 
