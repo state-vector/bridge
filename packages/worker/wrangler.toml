@@ -1,10 +1,11 @@
-name = "flows"
+name = "bridge"
 main = "src/index.js"
 compatibility_date = "2026-01-15"
 account_id = "013b6a2b6f3dfb6c8d48657769681087"
 
-# POC lives on the free workers.dev URL; Access protects it (see deploy.md).
-workers_dev = true
+# Live URL: https://bridge.ray-013.workers.dev (Workers subdomain: ray-013).
+# workers_dev stays true so both `wrangler deploy` from the box and CF's git
+# integration publish to that URL.
 
 [durable_objects]
 bindings = [{ name = "HUB", class_name = "FlowsHub" }]

@@ -4,7 +4,8 @@
   "type": "module",
   "description": "flows: decisions, activity, presence — Cloudflare Worker + Durable Object POC",
   "scripts": {
-    "deploy": "wrangler deploy",
+    "build": "echo 'bridge worker: no compile step — wrangler bundles src/ at deploy'",
+    "test": "node --check src/index.js && node --check src/do.js && node --check src/ui.js && echo 'worker syntax OK'",
     "dev": "wrangler dev"
   },
   "dependencies": {
