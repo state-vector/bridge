@@ -18,8 +18,8 @@ Secrets (not in wrangler.toml):
 
 ```bash
 npx wrangler secret put FLOWS_INGEST_TOKEN   # generate: openssl rand -hex 24
-npx wrangler secret put CF_ACCESS_TEAM       # https://<team>.cloudflareaccess.com
-npx wrangler secret put CF_ACCESS_AUD        # 02bf2012058821d837180e16d3146cc0
+
+
 ```
 
 ## 2. Cloudflare Access (dashboard, one-time)

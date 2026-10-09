@@ -1,5 +1,6 @@
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
+import { LOGIN_HTML } from "./ui.js";
 
 export default {
   async fetch(request, env, ctx) {
@@ -8,9 +9,28 @@ export default {
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);
     }
-    // Everything below is human-facing → require a valid Access JWT.
-    const auth = await requireAccess(request, env);
-    if (auth !== true) return auth; // it's a 403 Response
+
+    // Human plane. Auth mode: Cloudflare Access JWT when CF_ACCESS_TEAM+AUD are
+    // set, otherwise password login (BRIDGE_UI_PASSWORD) with an HMAC cookie.
+    if (url.pathname === "/login") {
+      if (request.method === "POST") return handleLogin(request, env);
+      return new Response(LOGIN_HTML, {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+
+    const auth = await checkAuth(request, env);
+    if (auth !== true) return auth; // login page / 401 / 403 / 503 Response
+
+    if (url.pathname === "/logout") {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          "Set-Cookie": `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`,
+          "Location": "/",
+        },
+      });
+    }
 
     const id = env.HUB.idFromName("global");
     const hub = env.HUB.get(id);
@@ -37,36 +57,89 @@ async function handleIngest(request, env) {
   return hub.fetch("https://hub/ingest", { ...request, json: { events } });
 }
 
-// --- Cloudflare Access JWT validation (Cf-Access-Jwt-Assertion) ---
-const KEYS_URL = () => `${ENV.CF_ACCESS_TEAM}/cdn-cgi/access/certs`;
-let ENV = {};
-let jwksCache = null, jwksAt = 0;
+// --- auth: optional Access JWT, else password cookie session ---
+const SESSION_COOKIE = "bridge_session";
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
 
-export function setEnvForTests(v) { ENV = v; }
+async function checkAuth(request, env) {
+  if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) return requireAccess(request, env);
+  if (!env.BRIDGE_UI_PASSWORD) {
+    return json({ error: "auth not configured: set BRIDGE_UI_PASSWORD (or CF_ACCESS_TEAM+AUD)" }, 503);
+  }
+  const cookie = request.headers.get("Cookie") || "";
+  const m = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+  if (!m || !(await verifySession(m[1], env.BRIDGE_UI_PASSWORD))) {
+    return loginResponse(request);
+  }
+  return true;
+}
 
+function loginResponse(request) {
+  const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
+  if (wantsHtml) {
+    return new Response(LOGIN_HTML, {
+      status: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+  return json({ error: "unauthorized: POST /login {password}" }, 401);
+}
+
+async function handleLogin(request, env) {
+  if (!env.BRIDGE_UI_PASSWORD) return json({ error: "auth not configured" }, 503);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+  const pw = String(body.password ?? "");
+  const a = new TextEncoder().encode(pw), b = new TextEncoder().encode(env.BRIDGE_UI_PASSWORD);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) diff |= a[i] ^ b[i];
+  if (a.length !== b.length || diff !== 0) return json({ error: "wrong password" }, 403);
+
+  const exp = String(Date.now() + SESSION_TTL_MS);
+  const cookie = `${SESSION_COOKIE}=${exp}.${await sign(exp, env.BRIDGE_UI_PASSWORD)}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+  return json({ ok: true }, 200, { "Set-Cookie": cookie });
+}
+
+function hex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sign(payload, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
+}
+
+async function verifySession(value, secret) {
+  const dot = value.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const exp = value.slice(0, dot), sig = value.slice(dot + 1);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  const expected = await sign(exp, secret);
+  if (expected.length !== sig.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+  return diff === 0;
+}
+
+// --- optional: Cloudflare Access JWT validation (kept for when Zero Trust is on) ---
 async function requireAccess(request, env) {
   const team = env.CF_ACCESS_TEAM, aud = env.CF_ACCESS_AUD;
-  if (!team || !aud) return json({ error: "access not configured" }, 503);
   const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
   if (!jwt) return json({ error: "no access jwt" }, 403);
   try {
-    const [{ jwtVerify }, { createRemoteJWKSet }] = await Promise.all([
-      import("jose"), import("jose"),
-    ]);
-    if (!jwksCache || Date.now() - jwksAt > 3600_000) {
-      jwksCache = createRemoteJWKSet(new URL(KEYS_URL()));
-      jwksAt = Date.now();
-    }
-    await jwtVerify(jwt, jwksCache, { issuer: team, audience: aud });
+    const { jwtVerify, createRemoteJWKSet } = await import("jose");
+    const jwks = createRemoteJWKSet(new URL(`${team}/cdn-cgi/access/certs`));
+    await jwtVerify(jwt, jwks, { issuer: team, audience: aud });
     return true;
   } catch (e) {
     return json({ error: "invalid access jwt", detail: String(e).slice(0, 120) }, 403);
   }
 }
 
-function json(obj, status = 200) {
+function json(obj, status = 200, extra = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...extra },
   });
 }

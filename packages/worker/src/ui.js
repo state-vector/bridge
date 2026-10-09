@@ -43,7 +43,7 @@ footer{color:var(--dim);font-size:11px;margin-top:24px}
 <div><h2>Who is active</h2><div class="pres" id="presence"></div></div>
 <div><h2>Activity</h2><div id="feed"></div></div>
 </div>
-<footer>flows · one door for agent + human work · cloudflare access</footer>
+<footer>bridge · one door for agent + human work</footer>
 <script>
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
 function ago(ts){const s=(Date.now()-ts)/1000;if(s<90)return Math.floor(s)+'s';if(s<7200)return Math.floor(s/60)+'m';
@@ -78,8 +78,37 @@ else if(msg.type==='presence')renderPresence(msg.presence);
 document.querySelector('#live .dot').classList.remove('down');
 document.querySelector('#live').lastChild.textContent='LIVE'};
 ws.onopen=()=>{retry=0};
-ws.onclose=()=>{document.querySelector('#live .dot').classList.add('down');
+ws.onclose=async(e)=>{if(e.code===4001){document.getElementById('live').innerHTML='SESSION EXPIRED — <a href="/login">login</a>';return}
+document.querySelector('#live .dot').classList.add('down');
 document.querySelector('#live').lastChild.textContent='RECONNECTING';
 setTimeout(connect,Math.min(15000,1000*Math.pow(2,retry++)))}}
 connect();
+</script></body></html>`;
+
+export const LOGIN_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><title>bridge — login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0d1117;--fg:#c9d1d9;--dim:#8b949e;--card:#161b22;--line:#30363d;--red:#f85149}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--fg);
+font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
+form{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:28px;width:300px}
+h1{font-size:16px;margin-bottom:16px}
+input{width:100%;background:#0d1117;color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:8px 10px;font-size:14px;margin-bottom:12px}
+button{width:100%;background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 10px;font-size:14px;cursor:pointer}
+.err{color:var(--red);font-size:12px;margin-bottom:10px;min-height:16px}
+</style></head><body>
+<form onsubmit="return go()">
+<h1>bridge</h1>
+<div class="err" id="err"></div>
+<input id="pw" type="password" placeholder="password" autofocus>
+<button>sign in</button>
+</form>
+<script>
+async function go(){
+const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({password:document.getElementById('pw').value})});
+if(r.ok){location.href='/';return false}
+document.getElementById('err').textContent='wrong password';return false}
 </script></body></html>`;
