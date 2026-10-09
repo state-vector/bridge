@@ -1,0 +1,13 @@
+[Unit]
+Description=flows kanban shipper -> CF Worker /ingest
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/flows/adapters/kanban-shipper.py
+Environment=FLOWS_INGEST_URL=https://flows.REPLACE-SUBDOMAIN.workers.dev/ingest
+EnvironmentFile=%h/.hermes/.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

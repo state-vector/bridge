@@ -1,0 +1,8 @@
+# secrets & local state — never commit
+.env
+*.token
+cursor.json
+node_modules/
+.wrangler/
+__pycache__/
+*.pyc

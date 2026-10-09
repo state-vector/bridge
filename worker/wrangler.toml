@@ -1,0 +1,20 @@
+name = "flows"
+main = "src/index.js"
+compatibility_date = "2026-01-15"
+account_id = "013b6a2b6f3dfb6c8d48657769681087"
+
+# POC lives on the free workers.dev URL; Access protects it (see deploy.md).
+workers_dev = true
+
+[durable_objects]
+bindings = [{ name = "HUB", class_name = "FlowsHub" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FlowsHub"]
+
+[vars]
+# Overridden by `wrangler secret put` at deploy:
+#   FLOWS_INGEST_TOKEN  shared bearer for POST /ingest
+#   CF_ACCESS_TEAM      https://<team>.cloudflareaccess.com
+#   CF_ACCESS_AUD       02bf2012058821d837180e16d3146cc0
