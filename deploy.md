@@ -5,9 +5,16 @@ Access application created for the workers.dev hostname (AUD `02bf2012058821d837
 
 ## 1. Worker
 
+Two paths — CI is the default:
+
+- **Push to `main`** touching `packages/worker/**` or `packages/specs/schemas/**` →
+  GitHub Actions runs the specs gate then `wrangler deploy` (uses the
+  `CF_API_TOKEN` repo secret). Watch: `gh run watch` or the Actions tab.
+- **Manual, from the box:**
+
 ```bash
-cd ~/flows/worker
-npx wrangler login          # or: export CLOUDFLARE_API_TOKEN=<token from Ray>
+cd ~/flows/packages/worker
+export CLOUDFLARE_API_TOKEN=<token>   # already in GH secrets for CI
 npx wrangler deploy
 # note the printed URL: https://flows.<subdomain>.workers.dev
 ```
@@ -33,8 +40,8 @@ npx wrangler secret put CF_ACCESS_AUD        # 02bf2012058821d837180e16d3146cc0
 ```bash
 # one-time env (in ~/.hermes/.env so the unit's EnvironmentFile picks it up):
 #   FLOWS_INGEST_TOKEN=<same token as step 1>
-sed -i "s/REPLACE-SUBDOMAIN/<subdomain>/" ~/flows/adapters/flows-shipper.service
-mkdir -p ~/.config/systemd/user && cp ~/flows/adapters/flows-shipper.service ~/.config/systemd/user/
+sed -i "s/REPLACE-SUBDOMAIN/<subdomain>/" ~/flows/packages/adapters/flows-shipper.service
+mkdir -p ~/.config/systemd/user && cp ~/flows/packages/adapters/flows-shipper.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now flows-shipper
 journalctl --user -u flows-shipper -f        # expect "shipped N: {...}"
 ```

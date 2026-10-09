@@ -11,7 +11,7 @@
   },
   "scripts": {
     "generate": "python3 scripts/gen_types.py",
-    "validate": "python3 scripts/validate_fixtures.py",
+    "validate": "python3 scripts/gen_types.py",
     "test": "npm run validate"
   },
   "dependencies": {

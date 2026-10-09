@@ -4,11 +4,11 @@ against an in-memory SQLite shim. No wrangler needed.
 """
 import json, sqlite3, sys, time, threading, http.server, urllib.request
 
-sys.path.insert(0, "/home/hermes/flows/adapters")
+sys.path.insert(0, "/home/hermes/flows/packages/adapters")
 
 # ---- 1. shipper: produce events from the real board DB ----
 import importlib.util
-spec = importlib.util.spec_from_file_location("kanban_shipper", "/home/hermes/flows/adapters/kanban-shipper.py")
+spec = importlib.util.spec_from_file_location("kanban_shipper", "/home/hermes/flows/packages/adapters/kanban-shipper.py")
 ks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ks)
 
@@ -39,14 +39,14 @@ assert len(kept) == 1, f"collapse failed: {len(kept)}"
 print("[t3] heartbeat collapse OK (10 -> 1)")
 
 # ---- 2. worker: normalize + decision logic against a shimmed DO SQLite ----
-do_src = open("/home/hermes/flows/worker/src/do.js").read()
+do_src = open("/home/hermes/flows/packages/worker/src/do.js").read()
 for frag in ["CREATE TABLE IF NOT EXISTS events", "INSERT INTO decisions",
              "status='resolved'", "UPDATE decisions", "DELETE FROM events WHERE kind='heartbeat'"]:
     assert frag in do_src, f"do.js missing logic: {frag}"
 print("[t4] do.js contains schema/decision/heartbeat-collapse logic OK")
 
 # ---- 3. router: auth gates present in source ----
-ix = open("/home/hermes/flows/worker/src/index.js").read()
+ix = open("/home/hermes/flows/packages/worker/src/index.js").read()
 for frag in ["FLOWS_INGEST_TOKEN", "Cf-Access-Jwt-Assertion", "jwtVerify", "requireAccess"]:
     assert frag in ix, f"index.js missing: {frag}"
 print("[t5] ingest bearer + Access JWT gates wired OK")
