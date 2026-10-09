@@ -1,23 +1,28 @@
-# flows
+# bridge
 
-Real-time surface for **decisions**, **activity flows**, and **presence** — agents and humans in one place. Not a kanban UI; the board stays in Hermes. This is the "watch it move / know where you're needed" layer.
+Real-time surface for **decisions**, **activity flows**, and **presence** — agents and humans, one place. Not a kanban UI; the board stays in Hermes. One ingest door (`POST /ingest`, bearer); humans get a Cloudflare Access–gated UI today, Tauri desktop later.
 
-POC status: pre-deploy. Waiting on CF API token + Access secret (via DM) and Access policy config.
+**GitHub:** https://github.com/detached-cody/bridge (private). `CF_API_TOKEN` is in the repo's Actions secrets for deploy.
 
-## Layout
+## Packages (npm workspaces)
 
+| package | what |
+|---|---|
+| **`packages/specs`** | the contract: JSON Schemas (`schemas/`), wire docs (`docs/api.md`), TS types (`src/types.ts` + `src/index.ts` constants), consistency gate (`scripts/gen_types.py`). Every other package codes against this. |
+| **`packages/worker`** | Cloudflare Worker + FlowsHub Durable Object: `/ingest` (bearer), `/ws` fanout (hibernating), `/api/state`, `/` UI. Deploy via `deploy.md`. |
+| **`packages/adapters`** | anything → `/ingest`: `kanban-shipper.py` (tails the Hermes kanban SQLite on EC2; read-only, cursor-resumable) + its systemd unit + smoke tests. GitHub/Linear webhooks land here next. |
+| **`packages/desktop`** | placeholder for the Tauri (TS) app — ws client, actionable notifications, offline cache. Consumes `@flows/specs`. |
+
+## Workflow
+
+```bash
+npm install                      # workspace bootstrap (worker deps incl. wrangler, jose)
+npm run test -w packages/specs   # schema/type consistency gate
+npm run test                     # everything
+cd packages/worker && npx wrangler deploy
 ```
-worker/                  Cloudflare Worker + Durable Object (the hub)
-  src/index.js           routes: /ingest (bearer) · /api/state · /ws · /
-  src/do.js              FlowsHub DO: SQLite state + WS fanout (hibernating)
-  src/ui.js              single-page UI (no build step)
-  wrangler.toml          account + DO binding + migration
-adapters/                anything → flows ingest door
-  kanban-shipper.py      tails Hermes kanban task_events → POST /ingest
-  flows-shipper.service  systemd user unit for the shipper
-  README.md              the event contract (add GitHub/Linear here next)
-deploy.md                exact deploy + Access setup steps
-```
+
+Contract change → edit `packages/specs/schemas/*.json` → `npm run generate -w packages/specs` (validates refs + types mirror) → worker and desktop both consume the same types.
 
 ## Principles
 
@@ -25,8 +30,8 @@ deploy.md                exact deploy + Access setup steps
 - Decisions are first-class durable objects server-side; the feed is derivable.
 - Presence = freshness of last signal (agent heartbeats now; humans when adapters land).
 - Free tier only: one SQLite-backed DO, hibernating WebSockets, Access on the workers.dev URL.
-- Heartbeats are collapsed before shipping (one `pulse` per run/minute) so presence costs ~nothing.
+- Heartbeats collapsed (60 s window per task) so presence costs ~nothing.
 
 ## Deploy
 
-See `deploy.md`. Short version: `npx wrangler deploy` in `worker/`, put secrets, enable Access on the workers.dev URL, allowlist emails, start the shipper unit.
+See `deploy.md`. Short version: `npx wrangler deploy` in `packages/worker/`, put secrets, enable Access on the workers.dev URL, allowlist emails, start the shipper unit.
