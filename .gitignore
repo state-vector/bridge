@@ -7,4 +7,11 @@ node_modules/
 __pycache__/
 *.pyc
 dist/
+# webapp dist IS committed: CF workers builds deploys the repo as-is (no build step configured)
+!packages/webapp/dist
 packages/desktop/src-tauri/target/
+
+# local worker dev secrets
+.dev.vars
+# tauri generated capability schemas
+packages/desktop/src-tauri/gen/
