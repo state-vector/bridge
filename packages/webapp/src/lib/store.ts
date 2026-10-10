@@ -181,6 +181,10 @@ export const useBridge = create<BridgeState>((set, get) => {
 });
 
 // ---------- selectors ----------
+// NEVER pass a selector that builds a fresh array/object per call straight to
+// useBridge() — useSyncExternalStore treats each new snapshot as a change and
+// loops forever (React error #185). Select the stable slice in the component,
+// derive with useMemo. (visibleDecisions removed for exactly this reason.)
 
 export const visibleDecisions = (s: BridgeState) =>
   rankDecisions(s.decisions).filter((d) => s.board === "all" || d.board === s.board);
