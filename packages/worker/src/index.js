@@ -54,7 +54,12 @@ async function handleIngest(request, env) {
 
   const id = env.HUB.idFromName("global");
   const hub = env.HUB.get(id);
-  return hub.fetch("https://hub/ingest", { ...request, json: { events } });
+  // forward a real request body — spreading a Request loses everything (prototype accessors)
+  return hub.fetch("https://hub/ingest", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ events }),
+  });
 }
 
 // --- auth: optional Access JWT, else password cookie session ---

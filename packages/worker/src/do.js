@@ -37,6 +37,15 @@ export class FlowsHub {
         task_id TEXT, board TEXT, resolved_ts INTEGER
       );
     `);
+    // rich asks (contract v2): options/urgency/deadline_ts/asker — additive for existing DBs
+    for (const ddl of [
+      `ALTER TABLE decisions ADD COLUMN options TEXT`,
+      `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
+      `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
+      `ALTER TABLE decisions ADD COLUMN asker TEXT`,
+    ]) {
+      try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    }
   }
 
   async fetch(request) {
@@ -54,7 +63,8 @@ export class FlowsHub {
 
   // ---- ingest ----
   async handleIngest(request) {
-    const { events } = request.json;
+    const body = await request.json();
+    const events = Array.isArray(body.events) ? body.events : [body];
     const inserted = [], wsPairs = [];
     const now = Date.now();
 
@@ -109,12 +119,17 @@ export class FlowsHub {
   openDecision(ev) {
     const id = `dec:${ev.board ?? ev.source}:${ev.task_id ?? ev.id}`;
     const kind = ev.payload?.kind || "diagnostic";
+    const options = normalizeOptions(ev.payload?.options);
+    const urgency = ev.payload?.urgency === "time-sensitive" ? "time-sensitive" : "normal";
+    const deadline = Number.isFinite(ev.payload?.deadline_ts) ? ev.payload.deadline_ts : null;
     this.state.storage.sql.exec(
-      `INSERT INTO decisions (id, opened_ts, updated_ts, status, title, reason, kind, task_id, board)
-       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET updated_ts=excluded.updated_ts, reason=excluded.reason`,
+      `INSERT INTO decisions (id, opened_ts, updated_ts, status, title, reason, kind, task_id, board, options, urgency, deadline_ts, asker)
+       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET updated_ts=excluded.updated_ts, reason=excluded.reason,
+         options=excluded.options, urgency=excluded.urgency, deadline_ts=excluded.deadline_ts`,
       id, ev.ts, ev.ts, ev.title || "Untitled task", ev.payload?.reason || "", kind,
-      ev.task_id, ev.board);
+      ev.task_id, ev.board,
+      options ? JSON.stringify(options) : null, urgency, deadline, ev.actor);
   }
 
   closeDecisions(ev) {
@@ -126,7 +141,11 @@ export class FlowsHub {
 
   listDecisions() {
     return this.state.storage.sql.exec(
-      `SELECT * FROM decisions WHERE status='open' ORDER BY opened_ts DESC LIMIT 100`).toArray();
+      `SELECT * FROM decisions WHERE status='open' ORDER BY opened_ts DESC LIMIT 100`).toArray()
+      .map((d) => ({
+        ...d,
+        options: typeof d.options === "string" ? safeParse(d.options) : (d.options ?? null),
+      }));
   }
 
   listPresence() {
@@ -199,3 +218,15 @@ function classifyActor(actor) {
 }
 
 function safeParse(s) { try { return JSON.parse(s); } catch { return {}; } }
+
+function normalizeOptions(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = raw.slice(0, 6)
+    .filter((o) => o && typeof o === "object" && o.id && o.label)
+    .map((o) => ({
+      id: String(o.id).slice(0, 40),
+      label: String(o.label).slice(0, 80),
+      hint: o.hint ? String(o.hint).slice(0, 120) : null,
+    }));
+  return out.length ? out : null;
+}

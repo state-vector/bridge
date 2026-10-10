@@ -14,6 +14,23 @@
     "board":       { "type": ["string", "null"] },
     "opened_ts":   { "type": "integer" },
     "updated_ts":  { "type": "integer" },
-    "resolved_ts": { "type": ["integer", "null"] }
+    "resolved_ts": { "type": ["integer", "null"] },
+    "options": {
+      "type": ["array", "null"],
+      "maxItems": 6,
+      "description": "answer choices raised with the blocked event (payload.options); answer = unblocked/completed event with payload.choice = options[].id",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+          "id":    { "type": "string", "maxLength": 40 },
+          "label": { "type": "string", "maxLength": 80 },
+          "hint":  { "type": ["string", "null"], "maxLength": 120 }
+        }
+      }
+    },
+    "urgency":     { "enum": ["normal", "time-sensitive", null], "description": "from blocked payload.urgency; time-sensitive may interrupt" },
+    "deadline_ts": { "type": ["integer", "null"], "description": "ms epoch, from blocked payload.deadline_ts" },
+    "asker":       { "type": ["string", "null"], "description": "actor id that raised the blocked event" }
   }
 }

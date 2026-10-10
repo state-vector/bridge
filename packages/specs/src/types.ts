@@ -55,6 +55,21 @@ export interface Decision {
   opened_ts: number;
   updated_ts: number;
   resolved_ts?: number | null;
+  /** Answer choices raised with the blocked event (payload.options). */
+  options?: DecisionOption[] | null;
+  /** "time-sensitive" may interrupt (notification tier). */
+  urgency?: "normal" | "time-sensitive" | null;
+  /** ms epoch, from blocked payload.deadline_ts. */
+  deadline_ts?: number | null;
+  /** Actor id that raised the blocked event. */
+  asker?: string | null;
+}
+
+/** One answer choice on a decision. Answer by ingesting unblocked/completed with payload.choice = id. */
+export interface DecisionOption {
+  id: string;
+  label: string;
+  hint?: string | null;
 }
 
 /** Actor freshness. Humans arrive via adapters (github/linear/slack); agents via kanban/pulse. */
@@ -86,7 +101,7 @@ export type WsFrame =
   | { type: "decisions"; decisions: Decision[] }
   | { type: "presence"; presence: Presence[] };
 
-export interface IngestRequest =
+export type IngestRequest =
   | Event
   | { events: Event[] };
 

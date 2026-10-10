@@ -103,9 +103,26 @@ Unknown fields are **ignored, not rejected** (forward-compatible adapters). Fiel
   "reason": "waiting on scope call",   // from blocked payload.reason
   "kind": "needs_input",               // needs_input (amber) | diagnostic (red)
   "task_id": "t_ab12", "board": "superpositional",
-  "opened_ts": 0, "updated_ts": 0, "resolved_ts": null
+  "opened_ts": 0, "updated_ts": 0, "resolved_ts": null,
+  // --- rich asks (all optional, from the blocked event's payload) ---
+  "options": [ { "id": "flag", "label": "Ship behind flag", "hint": "reversible" } ],
+  "urgency": "time-sensitive",         // normal | time-sensitive (may interrupt)
+  "deadline_ts": 1791526000000,        // ms epoch
+  "asker": "agent:coder"               // actor that raised it
 }
 ```
+
+**Ask conventions (no new endpoints — everything rides `/ingest`):**
+
+- **Ask richly:** `blocked` event payload may carry `options` (≤6 `{id,label,hint?}`),
+  `urgency` (`"time-sensitive"` tiers the notification), `deadline_ts` (ms), and
+  `kind: "needs_input"`. The hub copies them onto the derived decision.
+- **Answer:** ingest `unblocked` (work resumes) or `completed` on the same `task_id`
+  with `payload: { "choice": "<options[].id>", "note": "...", "decision_id": "dec:..." }`.
+  The hub resolves the decision; the answer lands in the feed with your actor id
+  (that's the audit trail).
+- **Askers without a choice list** just omit `options` — answerers use plain
+  unblock/done.
 
 Lifecycle: `blocked` event → upsert open decision (same id updates reason/ts).
 `unblocked` **or** `completed` on the same `task_id` → resolves all open decisions for it.
