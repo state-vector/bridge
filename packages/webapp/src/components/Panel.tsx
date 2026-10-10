@@ -1,23 +1,29 @@
 import { useMemo } from "react";
-import { useBridge, visibleDecisions } from "../lib/store";
-import { myAnswers } from "../lib/views";
+import { useBridge } from "../lib/store";
+import { myAnswers, rankDecisions } from "../lib/views";
 import { DecisionCard } from "./DecisionCard";
 import { SessionList } from "./SessionList";
 
 export function Panel() {
-  const decisions = useBridge(visibleDecisions);
+  // selectors must return stable refs; derive new arrays via useMemo
+  const decisions = useBridge((s) => s.decisions);
+  const board = useBridge((s) => s.board);
+  const visible = useMemo(
+    () => rankDecisions(decisions).filter((d) => board === "all" || d.board === board),
+    [decisions, board],
+  );
   const events = useBridge((s) => s.events);
   const answered = useMemo(() => myAnswers(events, "human:ray"), [events]);
 
   return (
     <div className="panel-scroll">
       <section className="panel-section">
-        <h2>Decisions{decisions.length > 0 ? ` · ${decisions.length}` : ""}</h2>
+        <h2>Decisions{visible.length > 0 ? ` · ${visible.length}` : ""}</h2>
         <div className="ask-list">
-          {decisions.map((d) => (
+          {visible.map((d) => (
             <DecisionCard key={d.id} d={d} />
           ))}
-          {decisions.length === 0 && <p className="empty">Nothing needs you right now.</p>}
+          {visible.length === 0 && <p className="empty">Nothing needs you right now.</p>}
         </div>
         {answered.length > 0 && (
           <div className="answered-strip">
