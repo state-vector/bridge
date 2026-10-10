@@ -1,0 +1,30 @@
+{
+  "name": "@flows/webapp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "bridge webapp — decisions + presence panel; served by the worker (assets) and embedded in @flows/desktop",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "hub": "node mock-hub.mjs",
+    "demo": "concurrently -k -n hub,vite -c blue,green \"npm:hub\" \"npm:dev\""
+  },
+  "dependencies": {
+    "@flows/specs": "*",
+    "@tauri-apps/api": "^2.12.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "ws": "^8.22.0",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^9.2.1",
+    "typescript": "~5.6.0",
+    "vite": "^8.0.16"
+  }
+}

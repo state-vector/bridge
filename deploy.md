@@ -55,6 +55,37 @@ curl -s -X POST $URL/ingest -H "Authorization: Bearer $TOKEN" \
 # UI: open $URL in browser → Access login → decisions/feed/presence live
 ```
 
+## 5. Webapp (served by the worker, same URL)
+
+The React panel (`packages/webapp`) ships as worker assets — one deploy, one origin, no CORS.
+**`packages/webapp/dist` is committed** so the git-integration deploy (plain `wrangler deploy`,
+no build step) always has assets; after changing webapp code run:
+
+```bash
+npm run build -w @flows/webapp          # → packages/webapp/dist (commit the diff)
+```
+
+`wrangler.toml [assets]` serves the SPA at `/` with `run_worker_first` for
+`/ingest`, `/api/state`, `/ws`, `/ui`, `/login`, `/logout`. Human auth is the
+password session (`BRIDGE_UI_PASSWORD` → `POST /login` → HMAC cookie); the panel
+prompts for it in-place, and the ingest token is set in the panel's ⚙ settings.
+
+## 6. Desktop app (Tauri menubar)
+
+```bash
+npm run build -w @flows/desktop         # → src-tauri/target/release/bundle/macos/Bridge.app
+```
+
+- Live mode (default): the panel loads the **deployed** URL same-origin; sign in
+  with the hub password in the banner when prompted (cookie persists in the
+  webview). Remote-URL IPC is allowed via
+  `src-tauri/capabilities/remote-hub.json` (notifications + panel commands).
+- Offline/demo: settings (⚙) → mode `mock` + `npm run hub -w @flows/webapp`.
+- Notification buttons (Unblock / Done) answer decisions by POSTing to `/ingest`
+  with the token stored in the app's settings. First launch of the .app: grant
+  notification permission.
+
+
 ## Rollback / kill switch
 
 - `wrangler delete` removes the worker + DO state.
