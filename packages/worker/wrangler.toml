@@ -7,6 +7,11 @@ account_id = "013b6a2b6f3dfb6c8d48657769681087"
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
 # integration publish to that URL.
 
+# PR pipeline note: CF's git integration runs `npx wrangler preview` on
+# non-main branches; wrangler 4.x refuses without a `previews` block (can be
+# empty — settings stay at top level).
+[previews]
+
 [durable_objects]
 bindings = [{ name = "HUB", class_name = "FlowsHub" }]
 
