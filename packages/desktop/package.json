@@ -1,15 +1,13 @@
 {
   "name": "@flows/desktop",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "bridge desktop — Tauri menubar shell (decisions + presence, actionable notifications) over @flows/webapp",
+  "description": "Tauri (TS) desktop app for bridge — placeholder scaffold; consumes @flows/specs",
   "scripts": {
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "echo 'placeholder: tauri app lands here (tauri.app, TS frontend, ws client + actionable notifications)'"
   },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2"
+  "dependencies": {
+    "@flows/specs": "*"
   }
 }
