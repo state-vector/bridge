@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useKb } from "../store/kb";
 import { getConfig } from "../lib/config";
 import { rel } from "../lib/views";
@@ -18,8 +18,8 @@ function Copyable({ label, body }: { label: string; body: string }) {
   );
 }
 
-/** Agent setup: bootstrap prompt + mcpServers JSON — always visible, token slotted in after mint. */
-function AgentSetup({ label, secret, projectName }: { label: string | null; secret: string | null; projectName: string }) {
+/** Agent setup: bootstrap prompt + mcpServers JSON — shown in a modal so it's out of the flow. */
+function AgentSetupModal({ label, secret, projectName, onClose }: { label: string | null; secret: string | null; projectName: string; onClose: () => void }) {
   const url = `${getConfig().url}/mcp`;
   const [instructions, setInstructions] = useState("");
   const tokenLabel = label ?? "<agent-label>";
@@ -46,14 +46,21 @@ function AgentSetup({ label, secret, projectName }: { label: string | null; secr
   ].join(" ");
 
   return (
-    <div className="card">
-      <h2>Agent setup</h2>
-      <p className="muted-note">
-        Wire your agent's MCP config, prepend the bootstrap prompt. {secret ? "Auth token below is shown once — store it." : "Mint a token above to get a real one slotted in."}
-      </p>
-      <Copyable label="Bootstrap prompt" body={prompt} />
-      <Copyable label="mcpServers JSON" body={mcpJson} />
-
+    <div className="panel-backdrop" onClick={onClose}>
+      <div className="overlay-card connect-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="detail-head">
+          <h2>Connect "{tokenLabel}"</h2>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+        <p className="muted-note">Wire the agent's MCP config, then prepend the bootstrap prompt. {secret ? "The auth token is shown once — store it now." : "Mint a token to slot the real one in."}</p>
+        <Copyable label="Bootstrap prompt" body={prompt} />
+        <Copyable label="mcpServers JSON" body={mcpJson} />
+        {secret && (
+          <div className="secret">
+            Auth token (shown once):<br />{secret}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -68,20 +75,16 @@ export function ConnectView() {
   const [label, setLabel] = useState("");
   const [tags, setTags] = useState("");
   const [transport, setTransport] = useState("mcp");
-  const [secret, setSecret] = useState<{ label: string; secret: string } | null>(null);
+  const [setupFor, setSetupFor] = useState<{ label: string; secret: string | null } | null>(null);
   const [msg, setMsg] = useState("");
 
 
   const projectName = settings.project_name || "Superpositional";
-  const agentSetup = useMemo(
-    () => <AgentSetup label={secret?.label ?? null} secret={secret?.secret ?? null} projectName={projectName} />,
-    [secret, projectName],
-  );
 
   const doMint = async () => {
     try {
       const t = await mint(label.trim(), tags.split(",").map((x) => x.trim()).filter(Boolean), transport);
-      setSecret({ label: t.label, secret: t.secret });
+      setSetupFor({ label: t.label, secret: t.secret });
       setLabel("");
       setTags("");
     } catch (e) {
@@ -96,10 +99,10 @@ export function ConnectView() {
         <span className="muted-note">one auth token per agent client · sessions self-name</span>
       </div>
 
-      {agentSetup}
+      {setupFor && <AgentSetupModal label={setupFor.label} secret={setupFor.secret} projectName={projectName} onClose={() => setSetupFor(null)} />}
 
       <div className="card">
-        <h2>Mint auth token</h2>
+        <h2>Auth tokens</h2>
         <div className="row">
           <div><label>Agent label</label><input value={label} placeholder="opencode-ray" onChange={(e) => setLabel(e.target.value)} /></div>
           <div><label>Capability tags (comma-sep)</label><input value={tags} placeholder="datadog-access, deploy" onChange={(e) => setTags(e.target.value)} /></div>
@@ -124,7 +127,14 @@ export function ConnectView() {
                 <td>{rel(t.created_ts)}</td>
                 <td>{t.last_seen_ts ? rel(t.last_seen_ts) : "never"}</td>
                 <td>{t.revoked_ts ? <span className="login-error">revoked</span> : <span className="ok">active</span>}</td>
-                <td>{!t.revoked_ts && <button className="opt-btn" onClick={() => void revoke(t.id)}>revoke</button>}</td>
+                <td>
+                  {!t.revoked_ts && (
+                    <>
+                      <button className="opt-btn" onClick={() => setSetupFor({ label: t.label, secret: null })}>setup</button>{" "}
+                      <button className="opt-btn danger" onClick={() => void revoke(t.id)}>revoke</button>
+                    </>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>

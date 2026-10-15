@@ -11,6 +11,8 @@ const COLUMNS = [
 
 function TaskCard({ task }: { task: any }) {
   const transition = useKb((s) => s.transition);
+  const p = task.meta?.last_progress;
+  const active = p && Date.now() - p.ts < 120_000;
   const next: Record<string, string[]> = {
     todo: ["in_progress", "blocked"],
     in_progress: ["done", "blocked"],
@@ -19,11 +21,21 @@ function TaskCard({ task }: { task: any }) {
   };
   const label: Record<string, string> = { in_progress: "start", done: "done", blocked: "block" };
   return (
-    <div className={`task-card task-${task.status}`}>
-      <div className="task-title">{task.title}</div>
+    <div className={`task-card task-${task.status} ${active ? "task-active" : ""}`}>
+      <div className="task-title">
+        {active && <span className="pulse" />}
+        {task.title}
+      </div>
+      {p && (
+        <div className="task-progress-line">
+          <span className={`chip ${SENTIMENT_CHIP[p.sentiment] ?? ""}`}>{p.sentiment}</span>
+          <span className="task-progress-note">{p.note}</span>
+        </div>
+      )}
       <div className="task-meta">
         {task.id} · {rel(task.updated_ts)}
         {task.owner ? ` · ${task.owner}` : ""}
+        {(task.tags ?? []).length > 0 && ` · ${(task.tags ?? []).join(", ")}`}
       </div>
       <div className="task-actions">
         {(next[task.status] ?? []).map((to) => (
@@ -35,6 +47,36 @@ function TaskCard({ task }: { task: any }) {
     </div>
   );
 }
+
+function ActivityChart({ events }: { events: any[] }) {
+  const buckets = useMemo(() => {
+    const now = Date.now();
+    const mins = Array.from({ length: 30 }, (_, i) => ({ t: now - (29 - i) * 60_000, n: 0 }));
+    for (const e of events) {
+      const idx = 29 - Math.floor((now - e.ts) / 60_000);
+      if (idx >= 0 && idx < 30) mins[idx].n++;
+    }
+    return mins;
+  }, [events]);
+  const max = Math.max(1, ...buckets.map((b) => b.n));
+  const total = buckets.reduce((a, b) => a + b.n, 0);
+  const last5 = events.filter((e) => Date.now() - e.ts < 300_000).length;
+  return (
+    <div className="chart-box" title="events per minute, last 30m">
+      <svg viewBox={`0 0 ${30 * 6} 24`} className="chart-svg" preserveAspectRatio="none">
+        {buckets.map((b, i) => (
+          <rect key={i} x={i * 6} y={24 - (b.n / max) * 22} width={4.5} height={Math.max(b.n ? 2 : 0.5, (b.n / max) * 22)} className={b.n ? "chart-bar hot" : "chart-bar"} />
+        ))}
+      </svg>
+      <span className="muted-note">{total} events/hr · {last5} last 5m</span>
+    </div>
+  );
+}
+
+const SENTIMENT_CHIP: Record<string, string> = {
+  going_well: "chip-done", neutral: "", struggling: "chip-diag",
+  converging: "chip-kind kind-agent", diverging: "chip-urgent",
+};
 
 export function BoardView() {
   const tasks = useKb((s) => s.tasks);
@@ -62,6 +104,7 @@ export function BoardView() {
         <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
         <span className="muted-note">lanes: agent · {sessions.length} sessions seen</span>
       </div>
+      <ActivityChart events={events} />
       {lanes.length === 0 && (
         <p className="empty">No tasks yet — create via MCP (create_artefact type=task) or here.</p>
       )}

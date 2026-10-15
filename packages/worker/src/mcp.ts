@@ -165,6 +165,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const a = await call("related", { id: args.id, limit: args.limit });
       return text(JSON.stringify(a, null, 1));
     }
+    case "log_progress": {
+      const a = await call("progress.log", args);
+      return text(JSON.stringify(a));
+    }
     case "ask_agent": {
       const a = await call("ask.create", { to: args.to ?? "any", question: args.question });
       return text(JSON.stringify({ ...a, note: "they will see it on their next orient. check yours too." }));
@@ -226,6 +230,7 @@ const TOOLS = [
         body_md: { type: "string" },
         meta: { type: "object" },
         owner: { type: "string" },
+        tags: { type: "array", items: { type: "string" }, description: "categories, e.g. [ingestion, performance]" },
       },
     },
   },
@@ -284,6 +289,19 @@ const TOOLS = [
       type: "object",
       required: ["id"],
       properties: { id: { type: "string" }, limit: { type: "integer", maximum: 50 } },
+    },
+  },
+  {
+    name: "log_progress",
+    description: "Fine-grained progress while working a task: one line + sentiment (going_well | neutral | struggling | converging | diverging). Send often — it feeds the live board.",
+    inputSchema: {
+      type: "object",
+      required: ["id", "note"],
+      properties: {
+        id: { type: "string", description: "task artefact id" },
+        note: { type: "string" },
+        sentiment: { type: "string", enum: ["going_well", "neutral", "struggling", "converging", "diverging"] },
+      },
     },
   },
   {

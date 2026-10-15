@@ -202,6 +202,21 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
   return lines.join("\n");
 }
 
+// ---------- progress sentiment (board aliveness) ----------
+
+export const SENTIMENTS = ["going_well", "neutral", "struggling", "converging", "diverging"] as const;
+export type Sentiment = (typeof SENTIMENTS)[number];
+
+export function isSentiment(v: unknown): v is Sentiment {
+  return typeof v === "string" && (SENTIMENTS as readonly string[]).includes(v);
+}
+
+export function sanitizeTags(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out = [...new Set(raw.map((t: any) => String(t).trim().toLowerCase().replace(/[^a-z0-9:_-]/g, "-")).filter((t) => t.length > 0 && t.length <= 30))].slice(0, 10);
+  return out.length ? out : null;
+}
+
 // ---------- limits ----------
 
 export const LIMITS = {

@@ -331,3 +331,34 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .connect-pre { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 11px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; color: var(--text); }
 .inbox-legacy { height: 100%; display: flex; flex-direction: column; padding: 10px 12px; gap: 8px; overflow: hidden; }
 .inbox-legacy .panel-scroll { flex: 1; overflow-y: auto; }
+
+/* ---------- board aliveness ---------- */
+.chart-box { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 10px; }
+.chart-svg { width: 200px; height: 24px; }
+.chart-bar { fill: #2a3547; }
+.chart-bar.hot { fill: var(--accent); }
+.pulse {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); margin-right: 6px; animation: pulse 1.6s ease-out infinite;
+}
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(62,207,142,.5); } 70% { box-shadow: 0 0 0 6px rgba(62,207,142,0); } 100% { box-shadow: 0 0 0 0 rgba(62,207,142,0); } }
+.task-active { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+.task-progress-line { display: flex; gap: 6px; align-items: center; margin-top: 5px; }
+.task-progress-note { font-size: 11px; color: var(--text-dim); }
+
+/* ---------- connect modal ---------- */
+.connect-modal { width: min(560px, 92vw); max-height: 86vh; overflow-y: auto; }
+
+/* ---------- knowledge / discussions / settings ---------- */
+.know-wrap, .disc-wrap, .settings-wrap { padding: 12px; height: 100%; overflow-y: auto; }
+.know-search { display: flex; gap: 6px; margin-bottom: 10px; }
+.know-search input { flex: 1; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; color: var(--text); padding: 8px 10px; font-size: 13px; }
+.know-search input:focus { outline: none; border-color: var(--accent); }
+.know-results { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.know-hit { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; text-align: left; color: var(--text); cursor: pointer; font-size: 12.5px; font-family: inherit; }
+.know-hit:hover { border-color: var(--accent); }
+.know-detail { margin-bottom: 12px; }
+.know-body { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
+.know-rel { display: block; margin: 4px 0; text-align: left; }
+.disc-list { display: flex; flex-direction: column; gap: 10px; }
+.disc-done { opacity: 0.75; }

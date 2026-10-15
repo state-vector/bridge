@@ -32,7 +32,9 @@ import {
   idSeq,
   isArtefactType,
   isRelation,
+  isSentiment,
   isValidAskTarget,
+  sanitizeTags,
   validateRelation,
   validateTransition,
 } from "./core.ts";
@@ -189,6 +191,7 @@ export class KnowledgeHub {
       `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
       `ALTER TABLE decisions ADD COLUMN asker TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -238,6 +241,7 @@ export class KnowledgeHub {
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "orient": return this.json(await this.orient(body));
+        case "progress.log": return this.json(await this.progressLog(body, actor));
         case "settings.public": return this.json({ settings: this.publicSettings() });
         case "bootstrap": {
           const m = this.settingsMap();
@@ -279,10 +283,12 @@ export class KnowledgeHub {
     const id = formatId(type, seq);
     const ts = Date.now();
     const status = INITIAL_STATUS[type];
+    const tags = sanitizeTags(body.tags);
     this.state.storage.sql.exec(
-      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, type, title, status, bodyMd, JSON.stringify(body.meta ?? {}), String(body.owner ?? actor), ts, ts,
+      tags ? JSON.stringify(tags) : null,
     );
     this.audit(actor, "create", id, { type, title });
     await this.embedArtefact(id, title, bodyMd);
@@ -299,6 +305,7 @@ export class KnowledgeHub {
     const conds: string[] = [], params: any[] = [];
     if (body.type) { conds.push("type = ?"); params.push(String(body.type)); }
     if (body.status) { conds.push("status = ?"); params.push(String(body.status)); }
+    if (body.tag) { conds.push("tags LIKE ?"); params.push(`%"${String(body.tag).replace(/[^a-z0-9:_-]/g, "")}"%`); }
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
     const rows = this.state.storage.sql
       .exec(`SELECT * FROM artefacts ${where} ORDER BY updated_ts DESC LIMIT ?`, ...params, Math.min(Number(body.limit ?? 50), 200))
@@ -397,12 +404,13 @@ export class KnowledgeHub {
     const title = body.title !== undefined ? String(body.title) : row.title;
     const bodyMd = body.body_md !== undefined ? String(body.body_md) : row.body_md;
     const meta = body.meta !== undefined ? JSON.stringify(body.meta) : row.meta;
+    const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);
     // update does not touch status — transitions are the only status path
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, updated_ts = ? WHERE id = ?`,
-      title, bodyMd, meta, Date.now(), id,
+      `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, updated_ts = ? WHERE id = ?`,
+      title, bodyMd, meta, tags ? JSON.stringify(tags) : null, Date.now(), id,
     );
     this.audit(actor, "update", id, {});
     await this.embedArtefact(id, title, bodyMd);
@@ -468,6 +476,23 @@ export class KnowledgeHub {
       `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
     ).toArray();
     return { counts: byType };
+  }
+
+  /** Fine-grained progress from a working agent: note + sentiment, shown live on the board. */
+  private async progressLog(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const note = String(body.note ?? "").trim().slice(0, 500);
+    const sentiment = isSentiment(body.sentiment) ? body.sentiment : "neutral";
+    const row = this.one(`SELECT id, meta FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    meta.last_progress = { note, sentiment, actor, ts: Date.now() };
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+      JSON.stringify(meta), Date.now(), id,
+    );
+    this.audit(actor, "progress", id, { note, sentiment });
+    return { id, note, sentiment };
   }
 
   // ---------- identity, sessions, asks, settings, orient ----------
@@ -693,7 +718,7 @@ export class KnowledgeHub {
   }
 
   private shape(row: any) {
-    return { ...row, meta: JSON.parse(row.meta ?? "{}") };
+    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: row.tags ? JSON.parse(row.tags) : [] };
   }
 
   private json(obj: unknown, status = 200) {
