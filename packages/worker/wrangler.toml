@@ -7,6 +7,9 @@ account_id = "013b6a2b6f3dfb6c8d48657769681087"
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
 # integration publish to that URL.
 
+[ai]
+binding = "AI"
+
 [durable_objects]
 bindings = [
   { name = "HUB", class_name = "FlowsHub" },

@@ -222,3 +222,53 @@ export function checkLimits(title: string, body: string, meta?: unknown): string
   return null;
 }
 
+
+// ---------- semantic search (fuzzy smarts) ----------
+
+/** Cosine similarity between two equal-length vectors. */
+export function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0, na = 0, nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+/**
+ * Merge keyword (FTS) and vector results: max-score per artefact, then top-k.
+ * `via` records which path found it — useful for debugging relevance.
+ */
+export function hybridMerge(
+  fts: Array<{ id: string; score: number }>,
+  vec: Array<{ id: string; score: number }>,
+  k = 20,
+): Array<{ id: string; score: number; via: string[] }> {
+  const byId = new Map<string, { score: number; via: Set<string> }>();
+  for (const r of fts) {
+    const e = byId.get(r.id) ?? { score: 0, via: new Set() };
+    e.score = Math.max(e.score, r.score);
+    e.via.add("keyword");
+    byId.set(r.id, e);
+  }
+  for (const r of vec) {
+    const e = byId.get(r.id) ?? { score: 0, via: new Set() };
+    e.score = Math.max(e.score, r.score);
+    e.via.add("semantic");
+    byId.set(r.id, e);
+  }
+  return [...byId.entries()]
+    .map(([id, e]) => ({ id, score: e.score, via: [...e.via] }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k);
+}
+
+/** Embedding models truncate hard — feed title-weighted head, not the whole doc. */
+export function embedText(title: string, body: string): string {
+  return (title + "\n" + title + "\n" + body).slice(0, 4000);
+}
+
+export const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";

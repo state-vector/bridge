@@ -7,6 +7,7 @@ export interface KbArtefact {
   type: string;
   title: string;
   status: string;
+  board?: string | null;
   owner?: string;
   body_md?: string;
   meta?: Record<string, unknown>;
@@ -62,7 +63,8 @@ export const kbApi = {
     return j<{ artefacts: KbArtefact[] }>(`/api/kb/artefacts${p.size ? `?${p}` : ""}`);
   },
   artefact: (id: string) => j<KbArtefact & { relations: { relation: string; artefact_id: string; dir: string }[] }>(`/api/kb/artefact?id=${id}`),
-  search: (q: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
+  search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
+  related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   transition: (id: string, to: string, note?: string) =>

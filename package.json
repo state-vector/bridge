@@ -2,7 +2,7 @@
   "name": "flows-monorepo",
   "private": true,
   "type": "module",
-  "description": "flows: decisions, activity flows, presence — agents + humans, one surface",
+  "description": "bridge: work orchestration — decisions, activity, presence, knowledge for agents + humans",
   "workspaces": [
     "packages/specs",
     "packages/worker",

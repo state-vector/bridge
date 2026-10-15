@@ -82,3 +82,24 @@ describe("limits", () => {
     expect(checkLimits("t", "b", { a: 1 })).toBeNull();
   });
 });
+
+import { cosine, hybridMerge } from "../src/kb/core.ts";
+
+describe("semantic helpers", () => {
+  it("cosine: identical = 1, orthogonal = 0, opposite = -1", () => {
+    expect(cosine([1, 0], [1, 0])).toBeCloseTo(1);
+    expect(cosine([1, 0], [0, 1])).toBeCloseTo(0);
+    expect(cosine([1, 0], [-1, 0])).toBeCloseTo(-1);
+  });
+
+  it("hybrid merge: max-score, records via, sorts desc, caps k", () => {
+    const merged = hybridMerge(
+      [{ id: "A", score: 5 }, { id: "B", score: 3 }],
+      [{ id: "B", score: 9 }, { id: "C", score: 1 }],
+      2,
+    );
+    expect(merged[0]).toMatchObject({ id: "B", score: 9, via: ["keyword", "semantic"] });
+    expect(merged[1]).toMatchObject({ id: "A", via: ["keyword"] });
+    expect(merged.length).toBe(2);
+  });
+});

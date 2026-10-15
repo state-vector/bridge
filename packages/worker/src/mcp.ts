@@ -161,6 +161,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const a = await call("agents.list", {});
       return text(JSON.stringify(a, null, 1));
     }
+    case "related_artefacts": {
+      const a = await call("related", { id: args.id, limit: args.limit });
+      return text(JSON.stringify(a, null, 1));
+    }
     case "ask_agent": {
       const a = await call("ask.create", { to: args.to ?? "any", question: args.question });
       return text(JSON.stringify({ ...a, note: "they will see it on their next orient. check yours too." }));
@@ -272,6 +276,15 @@ const TOOLS = [
     name: "list_agents",
     description: "List connected agents (label, capability tags, online) — use to address ask_agent.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "related_artefacts",
+    description: "Artefacts semantically related to X — what supports, constrains or invalidates it.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "string" }, limit: { type: "integer", maximum: 50 } },
+    },
   },
   {
     name: "ask_agent",

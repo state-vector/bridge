@@ -39,6 +39,7 @@ export default {
           : sub === "artefact" ? "https://kb/artefact"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
+          : sub === "related" ? "https://kb/related"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return new Response("not found", { status: 404 });
@@ -75,7 +76,6 @@ export default {
         : op === "tokens" ? "https://kb/admin.mint"
         : op === "tokens/revoke" ? "https://kb/admin.revoke"
         : op === "settings" && request.method === "GET" ? "https://kb/admin.settings_get"
-        : op === "debug_auth" ? "https://kb/admin.debug_auth"
         : op === "settings" ? "https://kb/admin.settings_set"
         : null;
       if (!kbUrl) return new Response("not found", { status: 404 });

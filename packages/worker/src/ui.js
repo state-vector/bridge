@@ -1,5 +1,5 @@
 export const UI_HTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>flows</title>
+<html><head><meta charset="utf-8"><title>Bridge</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{--bg:#0d1117;--fg:#c9d1d9;--dim:#8b949e;--card:#161b22;--line:#30363d;
@@ -36,7 +36,7 @@ border-radius:20px;padding:3px 12px;font-size:12px}
 .k.commented,.k.attached,.k.status,.k.archived{color:var(--dim)}
 footer{color:var(--dim);font-size:11px;margin-top:24px}
 </style></head><body>
-<header><span id="live"><span class="dot"></span>LIVE</span><h1>flows</h1>
+<header><span id="live"><span class="dot"></span>LIVE</span><h1>bridge</h1>
 <span style="margin-left:auto" class="muted" id="clock"></span></header>
 <h2>Decisions needed</h2><div id="decisions"></div>
 <div class="grid">

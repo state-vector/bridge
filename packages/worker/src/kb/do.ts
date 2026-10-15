@@ -10,6 +10,10 @@
  * Ops: create | get | list | search | update | transition | link | stats
  */
 import {
+  EMBED_MODEL,
+  cosine,
+  embedText,
+  hybridMerge,
   composeBootstrap,
   TRANSPORTS,
   ARTEFACT_TYPES,
@@ -34,7 +38,7 @@ import {
 } from "./core.ts";
 
 export class KnowledgeHub {
-  constructor(private state: DurableObjectState) {}
+  constructor(private state: DurableObjectState, private env: any) {}
 
   // ---------- realtime (hibernating websockets) ----------
 
@@ -162,6 +166,10 @@ export class KnowledgeHub {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS embeddings (
+        artefact_id TEXT PRIMARY KEY,
+        vec BLOB NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
         from_label TEXT NOT NULL,
@@ -216,6 +224,7 @@ export class KnowledgeHub {
         case "get": return this.json(await this.get(String(body.id)));
         case "list": return this.json(await this.list(body));
         case "search": return this.json(await this.search(body));
+        case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
         case "link": return this.json(await this.link(body, actor));
@@ -248,11 +257,6 @@ export class KnowledgeHub {
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
-          if (op === "admin.debug_auth") {
-            const hash = await hashAuthToken(String(body.secret ?? ""));
-            const rows = this.state.storage.sql.exec(`SELECT id, label, hash, revoked_ts FROM auth_tokens`).toArray();
-            return this.json({ hash_probed: hash.slice(0, 16), rows: rows.map((r) => ({ id: r.id, label: r.label, hash: r.hash.slice(0, 16), revoked: !!r.revoked_ts })) });
-          }
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
@@ -281,6 +285,7 @@ export class KnowledgeHub {
       id, type, title, status, bodyMd, JSON.stringify(body.meta ?? {}), String(body.owner ?? actor), ts, ts,
     );
     this.audit(actor, "create", id, { type, title });
+    await this.embedArtefact(id, title, bodyMd);
     return { id, type, status };
   }
 
@@ -301,19 +306,88 @@ export class KnowledgeHub {
     return { artefacts: rows.map((r) => this.shape(r)) };
   }
 
+  /** Hybrid: FTS5 keyword + embedding cosine, merged. Falls back to FTS-only when AI is unavailable. */
   private async search(body: any) {
-    const q = ftsQuery(String(body.q ?? ""));
+    const rawQ = String(body.q ?? "");
+    const limit = Math.min(Number(body.limit ?? 20), 100);
+    const q = ftsQuery(rawQ);
     if (!q) return { artefacts: [], note: "empty query" };
     const typeFilter = body.type ? `AND a.type = '${String(body.type).replace(/[^a-z_]/g, "")}'` : "";
-    const rows = this.state.storage.sql
+
+    const ftsRows = this.state.storage.sql
       .exec(
-        `SELECT a.* FROM artefacts_fts f JOIN artefacts a ON a.rowid = f.rowid
-         WHERE artefacts_fts MATCH ? ${typeFilter}
-         ORDER BY rank LIMIT ?`,
-        q, Math.min(Number(body.limit ?? 20), 100),
+        `SELECT a.id FROM artefacts_fts f JOIN artefacts a ON a.rowid = f.rowid
+         WHERE artefacts_fts MATCH ? ${typeFilter} ORDER BY rank LIMIT ?`,
+        q, limit,
       )
-      .toArray();
-    return { artefacts: rows.map((r) => this.shape(r)) };
+      .toArray()
+      .map((r: any, i: number) => ({ id: r.id, score: 1 / (1 + i) }));
+
+    let vecRows: Array<{ id: string; score: number }> = [];
+    try {
+      const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(rawQ, "")] });
+      const qv = out?.data?.[0];
+      if (Array.isArray(qv)) {
+        const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings`).toArray();
+        const qvec = new Float32Array(qv);
+        const scored = rows.map((r: any) => {
+          const v = new Float32Array(r.vec.buffer ?? r.vec);
+          return { id: r.artefact_id, score: cosine(qvec, v) };
+        }).filter((r) => r.score > 0.35);
+        scored.sort((a, b) => b.score - a.score);
+        vecRows = scored.slice(0, limit);
+      }
+    } catch { /* AI unavailable (local dev / no auth) — FTS only */ }
+
+    const merged = hybridMerge(ftsRows, vecRows, limit);
+    if (merged.length === 0) return { artefacts: [], note: "no matches (keyword + semantic)" };
+    const ids = merged.map((m) => m.id);
+    const marks = ids.map(() => "?").join(",");
+    const rows = this.state.storage.sql.exec(
+      `SELECT * FROM artefacts WHERE id IN (${marks})`, ...ids,
+    ).toArray().map((r: any) => this.shape(r));
+    const byId = new Map(rows.map((r: any) => [r.id, r]));
+    const scored = merged
+      .map((m) => {
+        const r: any = byId.get(m.id);
+        return r ? { ...r, _score: m.score, _via: m.via } : null;
+      })
+      .filter((r): r is any => !!r);
+    return { artefacts: scored, hybrid: { keyword: ftsRows.length, semantic: vecRows.length } };
+  }
+
+  /** "What relates to X?" — nearest artefacts by embedding. */
+  private async related(id: string, limit: number) {
+    const row = this.one(`SELECT vec FROM embeddings WHERE artefact_id = ?`, id);
+    if (!row) return { artefacts: [], note: "no embedding for artefact" };
+    const qvec = new Float32Array(row.vec.buffer ?? row.vec);
+    const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings WHERE artefact_id != ?`, id).toArray();
+    const scored = rows.map((r: any) => {
+      const v = new Float32Array(r.vec.buffer ?? r.vec);
+      return { id: r.artefact_id, score: cosine(qvec, v) };
+    }).filter((r) => r.score > 0.3);
+    scored.sort((a, b) => b.score - a.score);
+    const ids = scored.slice(0, limit).map((r) => r.id);
+    if (ids.length === 0) return { artefacts: [] };
+    const marks = ids.map(() => "?").join(",");
+    const arts = this.state.storage.sql.exec(`SELECT * FROM artefacts WHERE id IN (${marks})`, ...ids).toArray().map((r: any) => this.shape(r));
+    const byId = new Map(arts.map((a: any) => [a.id, a]));
+    return { artefacts: ids.map((i) => byId.get(i)).filter((a): a is any => !!a) };
+  }
+
+  /** Embed title-weighted text; store as float32 BLOB. Best-effort — never fail the write. */
+  private async embedArtefact(id: string, title: string, body: string) {
+    try {
+      const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(title, body)] });
+      const vec = out?.data?.[0];
+      if (!Array.isArray(vec)) return;
+      const f32 = Float32Array.from(vec);
+      this.state.storage.sql.exec(
+        `INSERT INTO embeddings (artefact_id, vec) VALUES (?, ?)
+         ON CONFLICT(artefact_id) DO UPDATE SET vec = excluded.vec`,
+        id, new Uint8Array(f32.buffer),
+      );
+    } catch { /* AI unavailable — semantic search degrades to FTS for this artefact */ }
   }
 
   private async update(body: any, actor: string) {
@@ -331,6 +405,7 @@ export class KnowledgeHub {
       title, bodyMd, meta, Date.now(), id,
     );
     this.audit(actor, "update", id, {});
+    await this.embedArtefact(id, title, bodyMd);
     return { id };
   }
 
