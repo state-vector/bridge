@@ -125,6 +125,48 @@ async function kb(hub: any, op: string, payload: object) {
   return out;
 }
 
+/**
+ * Proactive discovery for get_artefact: merges typed relations, semantic
+ * neighbours, and keyword hits on title+tags. Open tasks owned by OTHER
+ * agents surface first (with a coordination flag) — "is anyone else working
+ * on this?" answered without a second call.
+ */
+const OPEN_STATUSES = new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
+async function seeAlso(a: any, rel: any, identity: Ctx["identity"], call: Ctx["call"]) {
+  const q = [a.title, ...(a.tags ?? [])].join(" ").slice(0, 300);
+  const [sem, kw] = await Promise.all([
+    call("related", { id: a.id, limit: 6 }).catch(() => ({ artefacts: [] })),
+    q.trim() ? call("search", { q, limit: 6 }).catch(() => ({ artefacts: [] })) : { artefacts: [] },
+  ]);
+  const byId = new Map<string, any>();
+  const put = (x: any, why: string, rank: number) => {
+    if (!x || x.id === a.id) return;
+    const e = byId.get(x.id) ?? { ...shallow(x), owner: x.owner, tags: x.tags, why: new Set<string>(), _rank: 0 };
+    e.why.add(why);
+    e._rank = Math.max(e._rank, rank);
+    byId.set(x.id, e);
+  };
+  for (const r of (rel as any).relations ?? []) {
+    const full = r.artefact_id ? await call("get", { id: r.artefact_id }).catch(() => null) : null;
+    put(full, r.relation, 0);
+  }
+  for (const x of (sem as any).artefacts ?? []) put(x, "similar", 1);
+  for (const x of (kw as any).artefacts ?? []) put(x, "keyword", 1);
+  const rows = [...byId.values()];
+  // priority: others' open work > discussions/research > everything else
+  for (const e of rows) {
+    if (e.type === "task" && OPEN_STATUSES.has(e.status) && e.owner && e.owner !== identity.label) {
+      e.coordination = true;
+      e._rank = -1;
+    } else if (e.type === "discussion" || e.type === "research" || e.type === "steering") {
+      e._rank = Math.min(e._rank, 2);
+    }
+  }
+  rows.sort((x, y) => x._rank - y._rank || y.updated_ts - x.updated_ts);
+  for (const e of rows) { delete e._rank; e.why = [...e.why]; }
+  return rows.slice(0, 8);
+}
+
 async function callTool(name: string, args: any, ctx: Ctx) {
   const { call, identity } = ctx;
   switch (name) {
@@ -147,7 +189,18 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     case "get_artefact": {
       const a = await call("get", { id: args.id });
       const rel = await call("relations", { id: args.id });
-      return text(JSON.stringify({ ...a, relations: (rel as any).relations }, null, 1));
+      // proactive surfacing: related work + docs, so agents discover overlap
+      // and existing knowledge before they build. see seeAlso() below.
+      const also = await seeAlso(a, rel, identity, call);
+      const overlap = also.filter((s: any) => s.coordination);
+      return text(JSON.stringify({
+        ...a,
+        relations: (rel as any).relations,
+        see_also: also,
+        coordination: overlap.length
+          ? `${overlap.length} open task(s) in this area are owned by other agents: ${overlap.map((s: any) => `${s.id} (${s.owner})`).join(", ")} — coordinate before building. ask_agent them, don't fork.`
+          : undefined,
+      }, null, 1));
     }
     case "create_artefact":
       return text(JSON.stringify(await call("create", { ...args, session: args.session, token_id: identity.token_id })));
@@ -215,7 +268,7 @@ const TOOLS = [
   },
   {
     name: "get_artefact",
-    description: "Read one artefact by id, with its relations.",
+    description: "Read one artefact by id, with its relations. Returns see_also: related work, docs and discussions — including open tasks owned by OTHER agents (coordination flag) — so you discover overlap before building.",
     inputSchema: { type: "object", required: ["id"], properties: { id: { type: "string" } } },
   },
   {

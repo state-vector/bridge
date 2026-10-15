@@ -50,6 +50,13 @@ const board = await j("/api/kb/board");
 const bt = board.body.tasks?.find((x) => x.id === c.json.id);
 checks["board: progress + session + status_ts"] = !!bt?.meta?.last_progress && !!bt?.meta?.session && typeof bt?.status_ts === "number";
 checks["board: progress stream"] = (board.body.progress ?? []).some((x) => x.artefact_id === c.json.id);
+// proactive surfacing: B creates an overlapping task; A's get_artefact should see it
+const overlap = await tool(B, "create_artefact", { type: "task", title: `Batching impl follow-up ${uid}`, tags: ["ingestion", "performance"] });
+const got = await tool(A, "get_artefact", { id: c.json.id });
+const sa = got.json?.see_also?.find((x) => x.id === overlap.json.id);
+checks["see_also surfaces other agent's open task"] = !!sa && !!sa.coordination;
+checks["coordination note present"] = /owned by other agents/.test(got.json?.coordination ?? "");
+
 const q = await tool(B, "ask_agent", { to: "tag:datadog-access", question: `p95? (${uid})` });
 checks["ask tag:capability"] = !q.isError;
 const inboxA = await tool(A, "asks", {});
