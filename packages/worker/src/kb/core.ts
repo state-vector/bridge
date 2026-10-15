@@ -191,6 +191,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `You are connected to Bridge — the work orchestration layer for "${projectName || DEFAULT_PROJECT}".`,
     `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
     `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
+    `While working a task, send log_progress often — one line + a sentiment (going_well / struggling / converging / diverging). It feeds the live board.`,
     `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
   ];
   if (board.mode === "external") {
