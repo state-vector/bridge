@@ -35,6 +35,7 @@ export interface KbAuthToken {
   id: string;
   label: string;
   tags: string[];
+  transport?: string;
   created_ts: number;
   last_seen_ts?: number | null;
   revoked_ts?: number | null;
@@ -71,8 +72,8 @@ export const kbApi = {
 
   // admin (connect page)
   tokens: () => j<{ tokens: KbAuthToken[]; sessions: KbSession[] }>("/api/kb/admin/tokens"),
-  mint: (label: string, tags: string[]) =>
-    j<{ id: string; label: string; tags: string[]; secret: string }>("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags }) }),
+  mint: (label: string, tags: string[], transport?: string) =>
+    j<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags, transport }) }),
   revoke: (id: string) => j<{ id: string }>("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id }) }),
   settings: () => j<{ settings: Record<string, any> }>("/api/kb/admin/settings"),
   saveSettings: (settings: Record<string, unknown>) =>

@@ -11,6 +11,7 @@
  */
 import {
   composeBootstrap,
+  TRANSPORTS,
   ARTEFACT_TYPES,
   ArtefactType,
   DEFAULT_BOARD,
@@ -144,6 +145,7 @@ export class KnowledgeHub {
         label TEXT NOT NULL UNIQUE,
         hash TEXT NOT NULL UNIQUE,
         tags TEXT NOT NULL DEFAULT '[]',
+        transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
         last_seen_ts INTEGER,
         revoked_ts INTEGER
@@ -172,6 +174,16 @@ export class KnowledgeHub {
         answered_ts INTEGER
       );
     `);
+    // additive columns for DBs created before these existed
+    for (const ddl of [
+      `ALTER TABLE decisions ADD COLUMN options TEXT`,
+      `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
+      `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
+      `ALTER TABLE decisions ADD COLUMN asker TEXT`,
+      `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
+    ]) {
+      try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -236,6 +248,11 @@ export class KnowledgeHub {
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
+          if (op === "admin.debug_auth") {
+            const hash = await hashAuthToken(String(body.secret ?? ""));
+            const rows = this.state.storage.sql.exec(`SELECT id, label, hash, revoked_ts FROM auth_tokens`).toArray();
+            return this.json({ hash_probed: hash.slice(0, 16), rows: rows.map((r) => ({ id: r.id, label: r.label, hash: r.hash.slice(0, 16), revoked: !!r.revoked_ts })) });
+          }
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
@@ -384,7 +401,12 @@ export class KnowledgeHub {
   private async identify(bearer: string) {
     if (!bearer) throw new Error("missing bearer");
     const hash = await hashAuthToken(bearer);
-    const row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+    let row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+    if (!row) {
+      // absorb dev-mode write-visibility hiccups right after mint
+      await new Promise((r) => setTimeout(r, 250));
+      row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+    }
     if (!row) throw new Error("unknown auth token");
     if (row.revoked_ts) throw new Error("auth token revoked");
     this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
@@ -395,16 +417,17 @@ export class KnowledgeHub {
   private async listAgents() {
     const cutoff = Date.now() - 10 * 60_000;
     const agents = this.state.storage.sql.exec(
-      `SELECT label, tags, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC LIMIT 100`,
+      `SELECT label, tags, transport, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC LIMIT 100`,
     ).toArray()
       .filter((a) => !a.revoked_ts)
       .map((a) => ({
         label: a.label,
         tags: JSON.parse(a.tags ?? "[]"),
+        transport: a.transport ?? "mcp",
         online: a.last_seen_ts >= cutoff,
         last_seen_ts: a.last_seen_ts,
       }));
-    return { agents };
+    return { agents, note: "bridge routes between agents — transport shows how each is reachable today (mcp) or next (a2a, acp-proxy, board)" };
   }
 
   /** Register/refresh a session. Names are unique per auth token. */
@@ -520,21 +543,22 @@ export class KnowledgeHub {
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
+    const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
     const secret = generateAuthToken();
     const hash = await hashAuthToken(secret);
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, created_ts) VALUES (?, ?, ?, ?, ?)`,
-      id, label, hash, JSON.stringify(tags), ts,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, created_ts) VALUES (?, ?, ?, ?, ?, ?)`,
+      id, label, hash, JSON.stringify(tags), transport, ts,
     );
-    this.audit("admin", "mint", id, { label });
-    return { id, label, tags, secret }; // secret shown exactly once
+    this.audit("admin", "mint", id, { label, transport });
+    return { id, label, tags, transport, secret }; // secret shown exactly once
   }
 
   private async tokenList() {
     const rows = this.state.storage.sql.exec(
-      `SELECT id, label, tags, created_ts, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY created_ts DESC`,
+      `SELECT id, label, tags, transport, created_ts, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY created_ts DESC`,
     ).toArray();
     const sessions = this.state.storage.sql.exec(
       `SELECT token_id, name, first_seen_ts, last_seen_ts FROM sessions ORDER BY last_seen_ts DESC`,
@@ -556,9 +580,8 @@ export class KnowledgeHub {
   }
 
   private async settingsSet(body: any) {
-    const allowed = new Set(SETTINGS_KEYS as readonly string[]);
-    const entries = Object.entries(body.settings ?? {}).filter(([k]) => allowed.has(k));
-    if (entries.length === 0) throw new Error(`no valid settings keys (allowed: ${SETTINGS_KEYS.join(", ")})`);
+    const entries = Object.entries(body.settings ?? {}).filter(([k]) => /^[a-z0-9_]{1,40}$/.test(k));
+    if (entries.length === 0) throw new Error("no valid settings keys (lowercase [a-z0-9_])");
     for (const [k, v] of entries) {
       this.state.storage.sql.exec(
         `INSERT INTO settings (key, value) VALUES (?, ?)

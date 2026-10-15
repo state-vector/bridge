@@ -170,7 +170,8 @@ export const ASK_ANSWERED = "answered";
 
 export const SETTINGS_KEYS = ["project_name", "board", "bootstrap_md"] as const;
 export type SettingsKey = (typeof SETTINGS_KEYS)[number];
-
+export const TRANSPORTS = ["mcp", "a2a", "acp-proxy", "board"] as const;
+export type Transport = (typeof TRANSPORTS)[number];
 export interface BoardSettings {
   mode: "none" | "builtin" | "external";
   /** e.g. "github-projects" */

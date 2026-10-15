@@ -16,7 +16,7 @@ interface KbState {
   stop: () => void;
   refresh: () => Promise<void>;
   refreshAdmin: () => Promise<void>;
-  mint: (label: string, tags: string[]) => Promise<{ id: string; label: string; tags: string[]; secret: string }>;
+  mint: (label: string, tags: string[], transport?: string) => Promise<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>;
   revoke: (id: string) => Promise<void>;
   saveSettings: (s: Record<string, unknown>) => Promise<void>;
   transition: (id: string, to: string, note?: string) => Promise<void>;
@@ -81,8 +81,8 @@ export const useKb = create<KbState>((set, get) => ({
     } catch { /* not signed in yet */ }
   },
 
-  mint: async (label, tags) => {
-    const r = await kbApi.mint(label, tags);
+  mint: async (label, tags, transport) => {
+    const r = await kbApi.mint(label, tags, transport);
     await get().refreshAdmin();
     return r;
   },
