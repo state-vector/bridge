@@ -202,6 +202,7 @@ export class KnowledgeHub {
       `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
       `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
       `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
+      `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
