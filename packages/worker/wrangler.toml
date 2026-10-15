@@ -8,11 +8,18 @@ account_id = "013b6a2b6f3dfb6c8d48657769681087"
 # integration publish to that URL.
 
 [durable_objects]
-bindings = [{ name = "HUB", class_name = "FlowsHub" }]
+bindings = [
+  { name = "HUB", class_name = "FlowsHub" },
+  { name = "KB", class_name = "KnowledgeHub" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FlowsHub"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["KnowledgeHub"]
 
 # Webapp deployment: @flows/webapp is built to dist and served as worker assets,
 # same origin as /ws + /api/state (Access cookie just works; no CORS).
@@ -20,7 +27,7 @@ new_sqlite_classes = ["FlowsHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/ingest", "/api/state", "/ws", "/ui", "/login", "/logout"]
+run_worker_first = ["/ingest", "/api/state", "/ws", "/ui", "/login", "/logout", "/mcp"]
 
 [vars]
 # Overridden by `wrangler secret put` at deploy:

@@ -5,13 +5,15 @@
   "description": "flows: decisions, activity, presence — Cloudflare Worker + Durable Object POC",
   "scripts": {
     "build": "echo 'bridge worker: no compile step — wrangler bundles src/ at deploy'",
-    "test": "node --check src/index.js && node --check src/do.js && node --check src/ui.js && echo 'worker syntax OK'",
-    "dev": "wrangler dev"
+    "test": "node --check src/index.js && node --check src/do.js && node --check src/ui.js && vitest run",
+    "dev": "wrangler dev",
+    "test:syntax": "node --check src/index.js && node --check src/do.js && node --check src/ui.js"
   },
   "dependencies": {
     "jose": "^5.9.6"
   },
   "devDependencies": {
+    "vitest": "^3.1.1",
     "wrangler": "^4.0.0"
   }
 }
