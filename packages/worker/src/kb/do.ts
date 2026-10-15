@@ -492,7 +492,11 @@ export class KnowledgeHub {
       JSON.stringify(meta), Date.now(), id,
     );
     this.audit(actor, "progress", id, { note, sentiment });
-    return { id, note, sentiment };
+    const m = this.settingsMap();
+    return {
+      id, note, sentiment,
+      instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : ""),
+    };
   }
 
   // ---------- identity, sessions, asks, settings, orient ----------
@@ -615,7 +619,7 @@ export class KnowledgeHub {
     ).toArray();
     const settings = this.settingsMap();
     return {
-      project: settings.project_name || "Superpositional",
+      instructions: composeBootstrap(settings.project_name || "Superpositional", settings.board ?? DEFAULT_BOARD) + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : ""),
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,
