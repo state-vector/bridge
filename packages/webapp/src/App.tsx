@@ -2,18 +2,24 @@ import { useEffect, useState } from "react";
 import { BoardView } from "./components/BoardView";
 import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
+import { DiscussionsView } from "./components/DiscussionsView";
+import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { Panel } from "./components/Panel";
+import { SettingsView } from "./components/SettingsView";
 import type { WsFrame } from "@flows/specs";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";
 
-type Tab = "board" | "log" | "connect" | "inbox";
+type Tab = "board" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "board", label: "Board" },
   { key: "log", label: "Log" },
+  { key: "knowledge", label: "Knowledge" },
+  { key: "discussions", label: "Discuss" },
   { key: "connect", label: "Connect" },
+  { key: "settings", label: "Settings" },
   { key: "inbox", label: "Decisions" },
 ];
 
@@ -160,7 +166,10 @@ export default function App() {
       <main className="main">
         {tab === "board" && <BoardView />}
         {tab === "log" && <LogView />}
+        {tab === "knowledge" && <KnowledgeView />}
+        {tab === "discussions" && <DiscussionsView />}
         {tab === "connect" && <ConnectView />}
+        {tab === "settings" && <SettingsView />}
         {tab === "inbox" && <Panel />}
       </main>
       {selectedId && <DecisionDetail />}
