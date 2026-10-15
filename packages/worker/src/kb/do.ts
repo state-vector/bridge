@@ -13,7 +13,9 @@ import {
   issueRef,
   scaffoldBody,
   EMBED_MODEL,
+  TRIGRAM_DIM,
   cosine,
+  trigramVec,
   embedText,
   hybridMerge,
   composeBootstrap,
@@ -89,7 +91,7 @@ export class KnowledgeHub {
 
   async board() {
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, owner, tags, meta, body_md, created_ts, updated_ts FROM artefacts
+      `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
     ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: t.tags ? JSON.parse(t.tags) : [] }));
     const sessions = this.state.storage.sql.exec(
@@ -176,7 +178,8 @@ export class KnowledgeHub {
       );
       CREATE TABLE IF NOT EXISTS embeddings (
         artefact_id TEXT PRIMARY KEY,
-        vec BLOB NOT NULL
+        vec BLOB NOT NULL,
+        dim INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -197,6 +200,7 @@ export class KnowledgeHub {
       `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
       `ALTER TABLE decisions ADD COLUMN asker TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
       `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
@@ -287,15 +291,16 @@ export class KnowledgeHub {
     if (limitErr) throw new Error(limitErr);
 
     const seq = (await this.nextSeq(type));
-    const id = formatId(type, seq);
+    const id = formatId(seq);
     const ts = Date.now();
     const status = INITIAL_STATUS[type];
     const tags = sanitizeTags(body.tags);
+    const session = await this.resolveSession(body, String(body.token_id ?? ""));
     this.state.storage.sql.exec(
-      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, type, title, status, bodyMd, JSON.stringify(body.meta ?? {}), String(body.owner ?? actor), ts, ts,
-      tags ? JSON.stringify(tags) : null,
+      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, type, title, status, bodyMd, JSON.stringify({ ...(body.meta ?? {}), session }), String(body.owner ?? actor), ts, ts,
+      tags ? JSON.stringify(tags) : null, ts,
     );
     if (!bodyMd.trim() && (type === "task" || type === "rfc" || type === "goal")) {
       bodyMd = scaffoldBody(title, String(body.owner ?? actor));
@@ -346,20 +351,24 @@ export class KnowledgeHub {
       .map((r: any, i: number) => ({ id: r.id, score: 1 / (1 + i) }));
 
     let vecRows: Array<{ id: string; score: number }> = [];
+    let qvec: Float32Array | null = null;
+    let qdim = 0;
     try {
-      const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(rawQ, "")] });
-      const qv = out?.data?.[0];
-      if (Array.isArray(qv)) {
-        const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings`).toArray();
-        const qvec = new Float32Array(qv);
-        const scored = rows.map((r: any) => {
-          const v = new Float32Array(r.vec.buffer ?? r.vec);
-          return { id: r.artefact_id, score: cosine(qvec, v) };
-        }).filter((r) => r.score > 0.35);
-        scored.sort((a, b) => b.score - a.score);
-        vecRows = scored.slice(0, limit);
+      if (this.env?.AI) {
+        const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(rawQ, "")] });
+        if (Array.isArray(out?.data?.[0])) { qvec = Float32Array.from(out.data[0]); qdim = qvec.length; }
       }
-    } catch { /* AI unavailable (local dev / no auth) — FTS only */ }
+    } catch { /* AI unavailable */ }
+    if (!qvec) { qvec = Float32Array.from(trigramVec(embedText(rawQ, ""), TRIGRAM_DIM)); qdim = TRIGRAM_DIM; }
+    {
+      const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings WHERE dim = ?`, qdim).toArray();
+      const scored = rows.map((r: any) => {
+        const v = new Float32Array(r.vec.buffer ?? r.vec);
+        return { id: r.artefact_id, score: cosine(qvec as Float32Array, v) };
+      }).filter((r) => r.score > 0.3);
+      scored.sort((a, b) => b.score - a.score);
+      vecRows = scored.slice(0, limit);
+    }
 
     const merged = hybridMerge(ftsRows, vecRows, limit);
     if (merged.length === 0) return { artefacts: [], note: "no matches (keyword + semantic)" };
@@ -380,10 +389,10 @@ export class KnowledgeHub {
 
   /** "What relates to X?" — nearest artefacts by embedding. */
   private async related(id: string, limit: number) {
-    const row = this.one(`SELECT vec FROM embeddings WHERE artefact_id = ?`, id);
+    const row = this.one(`SELECT vec, dim FROM embeddings WHERE artefact_id = ?`, id);
     if (!row) return { artefacts: [], note: "no embedding for artefact" };
     const qvec = new Float32Array(row.vec.buffer ?? row.vec);
-    const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings WHERE artefact_id != ?`, id).toArray();
+    const rows = this.state.storage.sql.exec(`SELECT artefact_id, vec FROM embeddings WHERE artefact_id != ? AND dim = ?`, id, row.dim).toArray();
     const scored = rows.map((r: any) => {
       const v = new Float32Array(r.vec.buffer ?? r.vec);
       return { id: r.artefact_id, score: cosine(qvec, v) };
@@ -397,19 +406,30 @@ export class KnowledgeHub {
     return { artefacts: ids.map((i) => byId.get(i)).filter((a): a is any => !!a) };
   }
 
-  /** Embed title-weighted text; store as float32 BLOB. Best-effort — never fail the write. */
+  /**
+   * Embed title-weighted text; store as float32 BLOB with the vector dim.
+   * Two spaces: Workers AI (prod, 768d) when bound; local hashed-trigram (256d) fallback.
+   * Best-effort — never fails the write.
+   */
   private async embedArtefact(id: string, title: string, body: string) {
+    let vec: number[] | null = null;
+    let dim = 0;
     try {
-      const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(title, body)] });
-      const vec = out?.data?.[0];
-      if (!Array.isArray(vec)) return;
-      const f32 = Float32Array.from(vec);
-      this.state.storage.sql.exec(
-        `INSERT INTO embeddings (artefact_id, vec) VALUES (?, ?)
-         ON CONFLICT(artefact_id) DO UPDATE SET vec = excluded.vec`,
-        id, new Uint8Array(f32.buffer),
-      );
-    } catch { /* AI unavailable — semantic search degrades to FTS for this artefact */ }
+      if (this.env?.AI) {
+        const out: any = await this.env.AI.run(EMBED_MODEL, { text: [embedText(title, body)] });
+        if (Array.isArray(out?.data?.[0])) { vec = out.data[0]; dim = vec.length; }
+      }
+    } catch { /* AI unavailable */ }
+    if (!vec) {
+      vec = trigramVec(embedText(title, body), TRIGRAM_DIM);
+      dim = TRIGRAM_DIM;
+    }
+    const f32 = Float32Array.from(vec);
+    this.state.storage.sql.exec(
+      `INSERT INTO embeddings (artefact_id, vec, dim) VALUES (?, ?, ?)
+       ON CONFLICT(artefact_id) DO UPDATE SET vec = excluded.vec, dim = excluded.dim`,
+      id, new Uint8Array(f32.buffer), dim,
+    );
   }
 
   private async update(body: any, actor: string) {
@@ -441,7 +461,7 @@ export class KnowledgeHub {
     if (!verdict.ok) throw new Error(verdict.reason);
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, updated_ts = ? WHERE id = ?`, to, ts, id,
+      `UPDATE artefacts SET status = ?, status_ts = ?, updated_ts = ? WHERE id = ?`, to, ts, ts, id,
     );
     if (to === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
@@ -501,7 +521,8 @@ export class KnowledgeHub {
     const row = this.one(`SELECT id, meta FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
-    meta.last_progress = { note, sentiment, actor, ts: Date.now() };
+    meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session };
+    if (body.session && !meta.session) meta.session = body.session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
@@ -519,6 +540,7 @@ export class KnowledgeHub {
   /** Resolve a bearer secret to an agent identity; touches last_seen. */
   private async identify(bearer: string) {
     if (!bearer) throw new Error("missing bearer");
+    console.log(`[identify] bearer(${bearer.length})=${bearer.slice(0, 24)}`);
     const hash = await hashAuthToken(bearer);
     let row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
     if (!row) {
@@ -547,6 +569,18 @@ export class KnowledgeHub {
         last_seen_ts: a.last_seen_ts,
       }));
     return { agents, note: "bridge routes between agents — transport shows how each is reachable today (mcp) or next (a2a, acp-proxy, board)" };
+  }
+
+  /** The session a write belongs to: explicit, else the token's most recent session. */
+  private async resolveSession(body: any, tokenId: string): Promise<string | undefined> {
+    if (body.session) {
+      await this.sessionTouch({ token_id: tokenId, session: body.session }).catch(() => {});
+      return String(body.session);
+    }
+    const row = this.one(
+      `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`, tokenId,
+    ) as any;
+    return row?.name ?? undefined;
   }
 
   /** Register/refresh a session. Names are unique per auth token. */
@@ -793,13 +827,14 @@ export class KnowledgeHub {
     this.broadcastEvent({ seq: Number(r?.seq ?? 0), ts, actor, op, artefact_id: artefactId, detail });
   }
 
-  private async nextSeq(type: ArtefactType): Promise<number> {
-    const prefix = type.toUpperCase() + "-";
-    const row = this.one(
-      `SELECT MAX(CAST(substr(id, ?) AS INTEGER)) AS m FROM artefacts WHERE id LIKE ?`,
-      prefix.length + 1, `${prefix}%`,
-    ) as any;
-    return (Number(row?.m) || 0) + 1;
+  private async nextSeq(_type: ArtefactType): Promise<number> {
+    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts`).toArray();
+    let max = 0;
+    for (const r of rows as any[]) {
+      const m = /^BR#(\d+)$/.exec(String(r.id));
+      if (m) max = Math.max(max, parseInt(m[1], 10));
+    }
+    return max + 1;
   }
 
   private one(query: string, ...params: any[]) {

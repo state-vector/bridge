@@ -45,11 +45,12 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
 }
 
 interface TaskMeta {
+  session?: string;
   last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number };
 }
 
 export function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }) {
-  const [task, setTask] = useState<(KbArtefact & { meta?: TaskMeta }) | null>(null);
+  const [task, setTask] = useState<(KbArtefact & { meta?: TaskMeta; status_ts?: number }) | null>(null);
   const [related, setRelated] = useState<KbArtefact[]>([]);
   const [note, setNote] = useState("");
   const [sentiment, setSentiment] = useState("neutral");
@@ -195,7 +196,9 @@ export function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () =>
         <dl className="audit" style={{ marginTop: "auto" }}>
           <dt>id</dt><dd>{task?.id ?? taskId}</dd>
           <dt>owner</dt><dd>{task?.owner ?? "—"}</dd>
-          <dt>tags</dt><dd>{(task?.tags ?? []).join(", ") || "—"}</dd>
+          <dt>session</dt><dd>{task?.meta?.session ?? "—"}</dd>
+          <dt>in lane</dt><dd>{task?.status_ts ? rel(task.status_ts) : "—"}</dd>
+          <dt>tags</dt><dd>{((task?.tags ?? []) as string[]).join(", ") || "—"}</dd>
           <dt>updated</dt><dd>{task ? rel(task.updated_ts) : "—"}</dd>
         </dl>
       </aside>

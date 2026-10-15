@@ -63,8 +63,9 @@ describe("relations", () => {
 
 describe("ids + search", () => {
   it("formats and parses ids", () => {
-    expect(formatId("rfc", 7)).toBe("RFC-007");
-    expect(idSeq("RFC-007")).toBe(7);
+    expect(formatId(7)).toBe("BR#7");
+    expect(idSeq("BR#7")).toBe(7);
+    expect(idSeq("TASK-003")).toBe(3); // legacy ids still count
     expect(idSeq("nope")).toBeNaN();
   });
 
@@ -101,5 +102,17 @@ describe("semantic helpers", () => {
     expect(merged[0]).toMatchObject({ id: "B", score: 9, via: ["keyword", "semantic"] });
     expect(merged[1]).toMatchObject({ id: "A", via: ["keyword"] });
     expect(merged.length).toBe(2);
+  });
+});
+
+import { trigramVec } from "../src/kb/core.ts";
+
+describe("trigram fuzzy vectors", () => {
+  it("similar strings → high similarity, typos tolerated", () => {
+    const a = trigramVec("batching ingestion latency");
+    const b = trigramVec("batching ingestion latenct"); // typo
+    const c = trigramVec("stripe billing ledger");
+    expect(cosine(a, b)).toBeGreaterThan(0.8);
+    expect(cosine(a, c)).toBeLessThan(0.3);
   });
 });

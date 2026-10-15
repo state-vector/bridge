@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import { rel } from "../lib/views";
 import { SentimentBar, TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
@@ -89,11 +89,16 @@ function ActivityChart({ events }: { events: any[] }) {
 }
 
 export function BoardView() {
-  const tasks = useKb((s) => s.tasks);
+  const tasks = useKb((s) => s.tasks) as any[];
   const sessions = useKb((s) => s.sessions);
   const events = useKb((s) => s.events);
   const conn = useKb((s) => s.conn);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 15_000);
+    return () => clearInterval(t);
+  }, []);
 
   // swimlane = owning agent label; sessions give us agent → live session names
   const lanes = useMemo(() => {

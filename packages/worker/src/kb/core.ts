@@ -101,15 +101,21 @@ export function validateRelation(
 
 // ---------- ids ----------
 
-/** `RFC-007` style ids, per-type counters. */
-export function formatId(type: ArtefactType, seq: number): string {
-  return `${type.toUpperCase()}-${String(seq).padStart(3, "0")}`;
+/**
+ * Bridge-vended ids: `BR#<opaque>` — clarifies provenance, id itself is opaque
+ * (numeric today, string-tolerant later). Legacy per-type ids (`TASK-001`)
+ * remain readable and count toward the global sequence.
+ */
+export function formatId(seq: number): string {
+  return `BR#${seq}`;
 }
 
-/** Extract the numeric suffix from a well-formed id; NaN otherwise. */
+/** Extract the numeric part from a Bridge-vended or legacy id; NaN otherwise. */
 export function idSeq(id: string): number {
-  const m = /^[A-Z]+-(\d+)$/.exec(id);
-  return m ? parseInt(m[1], 10) : NaN;
+  const br = /^BR#(\d+)$/.exec(id);
+  if (br) return parseInt(br[1], 10);
+  const legacy = /^[A-Z]+-(\d+)$/.exec(id);
+  return legacy ? parseInt(legacy[1], 10) : NaN;
 }
 
 // ---------- search ----------
@@ -192,6 +198,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
     `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
     `While working a task, send log_progress often — one line + a sentiment (going_well / struggling / converging / diverging). It feeds the live board.`,
+    `TASK STATUS IS YOUR RESPONSIBILITY. Claimed work: transition → in_progress the moment you start. Finished: → done (link the PR in the artefact). Stuck: → blocked + ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
     `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
   ];
   if (board.mode === "external") {
@@ -305,4 +312,22 @@ Raised by ${owner || "unknown"} — no detail provided at creation.
 ## Acceptance
 - (to be defined)
 `;
+}
+
+/** Dim for the local hashed-trigram fallback embedder (no external service). */
+export const TRIGRAM_DIM = 256;
+
+/** Self-contained fuzzy vector: hashed character trigrams, L2-normalised. Typo-tolerant. */
+export function trigramVec(text: string, dim = TRIGRAM_DIM): number[] {
+  const clean = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const v = new Array(dim).fill(0);
+  const padded = `  ${clean}  `;
+  for (let i = 0; i < padded.length - 2; i++) {
+    const g = padded.slice(i, i + 3);
+    let h = 0;
+    for (let j = 0; j < g.length; j++) h = (h * 31 + g.charCodeAt(j)) >>> 0;
+    v[h % dim] += 1;
+  }
+  const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0));
+  return norm ? v.map((x) => x / norm) : v;
 }

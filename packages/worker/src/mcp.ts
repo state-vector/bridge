@@ -150,7 +150,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify({ ...a, relations: (rel as any).relations }, null, 1));
     }
     case "create_artefact":
-      return text(JSON.stringify(await call("create", args)));
+      return text(JSON.stringify(await call("create", { ...args, session: args.session, token_id: identity.token_id })));
     case "update_artefact":
       return text(JSON.stringify(await call("update", args)));
     case "transition":
@@ -166,7 +166,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify(a, null, 1));
     }
     case "log_progress": {
-      const a = await call("progress.log", args);
+      const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
       return text(JSON.stringify(a));
     }
     case "ask_agent": {
@@ -231,6 +231,7 @@ const TOOLS = [
         meta: { type: "object" },
         owner: { type: "string" },
         tags: { type: "array", items: { type: "string" }, description: "categories, e.g. [ingestion, performance]" },
+        session: { type: "string", description: "your session name — attributes the card to your session" },
       },
     },
   },
