@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Worker unit tests (kb core) + webapp build + specs gate
+        run: |
+          npm run test -w packages/worker
+          npm run build -w @flows/webapp
+          npm run test -w @flows/specs
+      - name: Worker bundle check (wrangler dry-run)
+        working-directory: packages/worker
+        run: npx wrangler deploy --dry-run

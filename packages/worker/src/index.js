@@ -1,6 +1,9 @@
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
 import { LOGIN_HTML } from "./ui.js";
+import { handleMcp, KnowledgeHub } from "./mcp.ts";
+
+export { KnowledgeHub };
 
 export default {
   async fetch(request, env, ctx) {
@@ -8,6 +11,11 @@ export default {
 
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);
+    }
+
+    // MCP: machine plane (bearer) — agents talk to the knowledge layer here.
+    if (url.pathname === "/mcp") {
+      return handleMcp(request, env);
     }
 
     // Human plane. Auth mode: Cloudflare Access JWT when CF_ACCESS_TEAM+AUD are
