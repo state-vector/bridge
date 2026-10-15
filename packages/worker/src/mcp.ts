@@ -253,14 +253,15 @@ const TOOLS = [
     name: "transition",
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + unblock_condition — no dead-end cards.`,
     inputSchema: {
       type: "object",
       required: ["id", "to"],
       properties: {
         id: { type: "string" },
         to: { type: "string" },
-        note: { type: "string" },
+        note: { type: "string", description: "required when moving to blocked: the reason" },
+        unblock_condition: { type: "string", description: "required when moving to blocked: what unblocks it" },
         replacement_id: { type: "string", description: "for superseded: the replacing artefact" },
       },
     },

@@ -63,6 +63,18 @@ const board2 = await j("/api/kb/board");
 checks["REST board"] = board2.body.tasks?.some((t) => t.id === created.body.id);
 const events = await j("/api/kb/events?since=0");
 checks["REST events"] = events.body.events?.length >= 3;
+// blocked validation: no reason → 400; with reason+unblock → ok; meta.blocked present
+const badBlock = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked" }) });
+checks["blocked without reason+unblock rejected"] = badBlock.status === 400 && /unblock/.test(JSON.stringify(badBlock.body));
+const okBlock = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked", note: "waiting on creds", unblock_condition: "creds arrive" }) });
+checks["blocked with reason+unblock ok"] = okBlock.status === 200;
+const boardAfterBlock = await j("/api/kb/board");
+const blockedTask = boardAfterBlock.body.tasks?.find((t) => t.id === created.body.id);
+checks["blocked meta persisted"] = blockedTask?.meta?.blocked?.reason === "waiting on creds" && !!blockedTask?.meta?.blocked?.unblock_condition;
+await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "in_progress" }) });
+const boardUnblocked = await j("/api/kb/board");
+checks["unblock clears blocked meta"] = !boardUnblocked.body.tasks?.find((t) => t.id === created.body.id)?.meta?.blocked;
+
 await new Promise((resolveWs) => {
   const tryWs = (attempt) => {
   const ws = new WebSocket(base.replace("http", "ws") + "/kb-ws?since=0", { headers: { cookie } });
@@ -71,7 +83,7 @@ await new Promise((resolveWs) => {
   ws.on("message", (raw) => frames.push(JSON.parse(raw)));
   ws.on("open", async () => {
     await new Promise((r) => setTimeout(r, 400));
-    await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked" }) });
+    await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "done" }) });
     const deadline = Date.now() + 5000;
     const poll = setInterval(() => {
       const hit = frames.some((f) => f.type === "kb.event" && f.event?.artefact_id === created.body.id);

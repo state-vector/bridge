@@ -459,9 +459,22 @@ export class KnowledgeHub {
     if (!row) throw new Error(`no such artefact: ${id}`);
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
     if (!verdict.ok) throw new Error(verdict.reason);
+    if (to === "blocked") {
+      const reason = String(body.note ?? body.reason ?? "").trim();
+      const unblock = String(body.unblock_condition ?? "").trim();
+      if (!reason || !unblock)
+        throw new Error("moving to blocked requires BOTH a reason (note) and an unblock condition — a blocked card without an unblock path is a dead end");
+    }
+    const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = Date.now();
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (to === "blocked") {
+      meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+    } else if (meta.blocked) {
+      delete meta.blocked; // unblocking clears the dead-end record
+    }
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, status_ts = ?, updated_ts = ? WHERE id = ?`, to, ts, ts, id,
+      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ? WHERE id = ?`, to, ts, JSON.stringify(meta), ts, id,
     );
     if (to === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
@@ -471,8 +484,8 @@ export class KnowledgeHub {
           String(body.replacement_id), id, ts,
         );
     }
-    this.audit(actor, "transition", id, { from: row.status, to, note: body.note ?? "" });
-    return { id, status: to };
+    this.audit(actor, "transition", id, { from: row.status, to, note: body.note ?? "", sentiment });
+    return { id, status: to, ...(sentiment ? { sentiment } : {}) };
   }
 
   private async link(body: any, actor: string) {

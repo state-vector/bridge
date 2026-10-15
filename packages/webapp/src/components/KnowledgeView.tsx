@@ -1,11 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useKb } from "../store/kb";
 import { rel } from "../lib/views";
 import { kbApi } from "../lib/kb";
 
 const TYPES = ["steering", "goal", "rfc", "decision", "discussion", "research", "task", "progress", "agent"];
 
+const GROUP_ORDER = ["steering", "goal", "rfc", "decision", "research", "discussion", "task", "progress", "agent"] as const;
+
 export function KnowledgeView() {
+  const [all, setAll] = useState<any[] | null>(null);
   const [q, setQ] = useState("");
   const [results, setResults] = useState<any[] | null>(null);
   const [selected, setSelected] = useState<any | null>(null);
@@ -15,8 +18,16 @@ export function KnowledgeView() {
   const [createType, setCreateType] = useState("steering");
   const [msg, setMsg] = useState("");
 
+  const loadAll = async () => {
+    try {
+      const r = await kbApi.artefacts({ limit: 200 });
+      setAll(r.artefacts ?? []);
+    } catch { /* live hub required */ }
+  };
+  useEffect(() => { void loadAll(); }, []);
+
   const doSearch = async () => {
-    if (!q.trim()) return;
+    if (!q.trim()) { setResults(null); void loadAll(); return; }
     try {
       const r = await kbApi.search(q.trim());
       setResults(r.artefacts ?? []);
@@ -61,6 +72,26 @@ export function KnowledgeView() {
         <button className="opt-btn" onClick={() => void doSearch()}>Search</button>
       </div>
 
+      {results === null && all !== null && (
+        <div className="know-groups">
+          {GROUP_ORDER.map((g) => {
+            const items = all.filter((a) => a.type === g);
+            if (items.length === 0) return null;
+            return (
+              <div key={g} className="know-group">
+                <h3 className="lane-head">{g}s <span className="muted-note">· {items.length}</span></h3>
+                {items.map((a) => (
+                  <button key={a.id} className="know-hit" onClick={() => void open(a.id)}>
+                    <span className="chip chip-scope">{a.status}</span> <b>{a.title}</b>
+                    <span className="muted-note"> {a.id}{(a.tags ?? []).length ? ` · ${(a.tags ?? []).join(", ")}` : ""}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+          {all.length === 0 && <p className="empty">No artefacts yet — create one below or via MCP.</p>}
+        </div>
+      )}
       {results !== null && (
         <div className="know-results">
           {results.map((a: any) => (

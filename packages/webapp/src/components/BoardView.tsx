@@ -10,8 +10,7 @@ const COLUMNS = [
   { key: "done", label: "Done" },
 ] as const;
 
-function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void }) {
-  const transition = useKb((s) => s.transition);
+function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string, intent?: "blocked") => void }) {
   const progress = useKb((s) => s.progress);
   const p = task.meta?.last_progress;
   const recent = progress.filter((x) => x.artefact_id === task.id).slice(0, 2);
@@ -22,7 +21,7 @@ function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void })
     blocked: ["in_progress"],
     done: [],
   };
-  const label: Record<string, string> = { in_progress: "start", done: "done", blocked: "block" };
+  const label: Record<string, string> = { in_progress: "start", done: "done" };
   return (
     <div className={`task-card task-${task.status} ${active ? "task-active" : "task-clickable"}`} onClick={() => onOpen(task.id)}>
       <div className="task-title">
@@ -47,6 +46,12 @@ function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void })
           <span className="task-progress-note">{p.note}</span>
         </div>
       )}
+      {task.status === "blocked" && task.meta?.blocked && (
+        <div className="task-blocked-info">
+          <div className="task-progress-note"><b>why:</b> {task.meta.blocked.reason}</div>
+          <div className="task-progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition}</div>
+        </div>
+      )}
       <div className="task-meta">
         {task.id} · {rel(task.updated_ts)}
         {task.owner ? ` · ${task.owner}` : ""}
@@ -54,7 +59,7 @@ function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void })
       </div>
       <div className="task-actions" onClick={(e) => e.stopPropagation()}>
         {(next[task.status] ?? []).map((to) => (
-          <button key={to} className="opt-btn task-btn" onClick={() => void transition(task.id, to)}>
+          <button key={to} className="opt-btn task-btn" onClick={() => onOpen(task.id, to === "blocked" ? "blocked" : undefined)}>
             {label[to] ?? to}
           </button>
         ))}
@@ -94,6 +99,8 @@ export function BoardView() {
   const events = useKb((s) => s.events);
   const conn = useKb((s) => s.conn);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [blockedIntent, setBlockedIntent] = useState(false);
+  const openTask = (id: string, intent?: "blocked") => { setSelectedTaskId(id); setBlockedIntent(intent === "blocked"); };
   const [, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick((x) => x + 1), 15_000);
@@ -115,7 +122,7 @@ export function BoardView() {
 
   return (
     <div className="board-wrap">
-      {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />}
+      {selectedTaskId && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={() => setSelectedTaskId(null)} />}
       <div className="view-head">
         <h2>Board</h2>
         <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
@@ -144,7 +151,7 @@ export function BoardView() {
                     const ev = lastEventFor(t.id);
                     return (
                       <div key={t.id}>
-                        <TaskCard task={t} onOpen={setSelectedTaskId} />
+                        <TaskCard task={t} onOpen={openTask} />
                         {ev && <div className="task-progress">▸ {ev.op}{ev.detail?.to ? ` → ${ev.detail.to}` : ""} · {rel(ev.ts)}</div>}
                       </div>
                     );

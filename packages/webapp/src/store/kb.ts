@@ -20,7 +20,7 @@ interface KbState {
   mint: (label: string, tags: string[], transport?: string) => Promise<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>;
   revoke: (id: string) => Promise<void>;
   saveSettings: (s: Record<string, unknown>) => Promise<void>;
-  transition: (id: string, to: string, note?: string) => Promise<void>;
+  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) => Promise<void>;
 }
 
 let stopWs: (() => void) | null = null;
@@ -96,8 +96,8 @@ export const useKb = create<KbState>((set, get) => ({
     await kbApi.saveSettings(s);
     await get().refreshAdmin();
   },
-  transition: async (id, to, note) => {
-    await kbApi.transition(id, to, note);
+  transition: async (id, to, extra) => {
+    await kbApi.transition(id, to, extra);
     await get().refresh();
   },
 }));

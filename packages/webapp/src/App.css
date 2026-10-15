@@ -381,3 +381,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .task-clickable { cursor: pointer; }
 .task-snippet { font-size: 11.5px; color: var(--text-dim); line-height: 1.35; }
 .task-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.task-blocked-info { display: flex; flex-direction: column; gap: 2px; margin-top: 5px; padding: 6px 8px; background: color-mix(in srgb, var(--red) 8%, transparent); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); border-radius: 6px; }
+.task-blocked-info .progress-note b { color: var(--red); }
+.know-group { margin-bottom: 14px; }
+.know-groups { display: flex; flex-direction: column; }

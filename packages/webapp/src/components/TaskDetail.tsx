@@ -46,10 +46,11 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
 
 interface TaskMeta {
   session?: string;
+  blocked?: { reason?: string; unblock_condition?: string; ts?: number };
   last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number };
 }
 
-export function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; openBlocked?: boolean; onClose: () => void }) {
   const [task, setTask] = useState<(KbArtefact & { meta?: TaskMeta; status_ts?: number }) | null>(null);
   const [related, setRelated] = useState<KbArtefact[]>([]);
   const [note, setNote] = useState("");
@@ -57,6 +58,9 @@ export function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () =>
   const [body, setBody] = useState<string | null>(null);
   const [showBody, setShowBody] = useState(false);
   const [msg, setMsg] = useState("");
+  const [blockedIntent, setBlockedIntent] = useState(!!openBlocked);
+  const [blockedReason, setBlockedReason] = useState("");
+  const [unblockCondition, setUnblockCondition] = useState("");
 
   const progress = useKbStateProgress(taskId);
   const transition = useKb((s) => s.transition);
@@ -154,13 +158,37 @@ export function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () =>
 
         <div className="detail-block">
           <label>Status</label>
-          <div className="ask-actions">
-            {["todo", "in_progress", "blocked", "done"]
-              .filter((s) => s !== task?.status)
-              .map((s) => (
-                <button key={s} className="opt-btn" onClick={() => void transition(taskId, s)}>{s}</button>
-              ))}
-          </div>
+          {task?.meta?.blocked && (
+            <div className="task-blocked-info">
+              <div className="progress-note"><b>why:</b> {task.meta.blocked.reason ?? ""}</div>
+              <div className="progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition ?? ""}</div>
+            </div>
+          )}
+          {blockedIntent ? (
+            <>
+              <textarea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
+              <input placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
+              <button
+                className="opt-btn"
+                disabled={!blockedReason.trim() || !unblockCondition.trim()}
+                onClick={async () => {
+                  await transition(taskId, "blocked", { note: blockedReason.trim(), unblock_condition: unblockCondition.trim() });
+                  setBlockedReason(""); setUnblockCondition(""); onClose();
+                }}
+              >
+                Mark blocked
+              </button>
+              <button className="opt-btn opt-ghost" onClick={onClose}>Cancel</button>
+            </>
+          ) : (
+            <div className="ask-actions">
+              {["todo", "in_progress", "blocked", "done"]
+                .filter((s) => s !== task?.status)
+                .map((s) => (
+                  <button key={s} className="opt-btn" onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</button>
+                ))}
+            </div>
+          )}
         </div>
 
         <div className="detail-block">

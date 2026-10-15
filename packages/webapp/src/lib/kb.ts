@@ -77,8 +77,8 @@ export const kbApi = {
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
-  transition: (id: string, to: string, note?: string) =>
-    j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, note }) }),
+  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
+    j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
   update: (id: string, patch: { title?: string; body_md?: string; meta?: object }) =>
     j<{ id: string }>(`/api/kb/update`, { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 

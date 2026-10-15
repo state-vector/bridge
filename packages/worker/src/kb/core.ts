@@ -198,7 +198,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
     `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
     `While working a task, send log_progress often — one line + a sentiment (going_well / struggling / converging / diverging). It feeds the live board.`,
-    `TASK STATUS IS YOUR RESPONSIBILITY. Claimed work: transition → in_progress the moment you start. Finished: → done (link the PR in the artefact). Stuck: → blocked + ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
+    `TASK STATUS IS YOUR RESPONSIBILITY. Claimed work: transition → in_progress the moment you start. Finished: → done (link the PR in the artefact). Stuck: → blocked with a reason AND an unblock condition (both required — no dead-end cards), then ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
     `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
   ];
   if (board.mode === "external") {
