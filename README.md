@@ -10,8 +10,8 @@ Real-time surface for **decisions**, **activity flows**, and **presence** — ag
 |---|---|
 | **`packages/specs`** | the contract: JSON Schemas (`schemas/`), wire docs (`docs/api.md`), TS types (`src/types.ts` + `src/index.ts` constants), consistency gate (`scripts/gen_types.py`). Every other package codes against this. |
 | **`packages/worker`** | Cloudflare Worker + FlowsHub Durable Object: `/ingest` (bearer), `/ws` fanout (hibernating), `/api/state`, `/` → **the webapp** (worker assets, SPA), `/ui` legacy page. Deploy via `deploy.md`. |
-| **`packages/webapp`** | the React panel (decisions + sessions): scope/board chips, answer decisions by ingesting `unblocked`/`completed`, steer events, WS live. Built once, served two ways — worker assets (web) and Tauri (desktop). `npm run demo -w @flows/webapp` runs a contract-faithful mock hub for offline dev. |
-| **`packages/desktop`** | Tauri menubar shell: tray popover of the webapp panel, blur-hide, Access SSO in-panel (live mode loads the deployed URL same-origin), native notifications with **Unblock / Done** buttons that answer through `/ingest`. |
+| **`packages/webapp`** | the web app: **Board** (tasks by status, per-agent swimlanes, live progress + sentiment, activity chart), **Log** (audit stream), **Knowledge** (hybrid search, artefact browser), **Discussions**, **Connect** (auth tokens + agent setup), **Decisions** (legacy plane). `npm run demo -w @flows/webapp` runs a contract-faithful mock hub for offline dev. |
+| desktop (Tauri menubar) | **parked** — removed from workspaces; the shell lives in git history (`packages/desktop`, pre-removal) for when we return to it. |
 | **`packages/adapters`** | anything → `/ingest`: `kanban-shipper.py` (tails the Hermes kanban SQLite on EC2; read-only, cursor-resumable) + its systemd unit + smoke tests. GitHub/Linear webhooks land here next. |
 
 ## Workflow
@@ -20,8 +20,6 @@ Real-time surface for **decisions**, **activity flows**, and **presence** — ag
 npm install                      # workspace bootstrap (worker deps incl. wrangler, jose)
 npm run test -w packages/specs   # schema/type consistency gate
 npm run build -w @flows/webapp   # build the panel (worker assets + tauri both consume dist)
-npm run dev -w @flows/desktop    # menubar app (tauri dev; builds webapp first)
-npm run build -w @flows/desktop  # .app bundle → actionable notification buttons
 cd packages/worker && npx wrangler deploy   # ships worker + webapp together
 ```
 

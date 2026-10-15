@@ -2,12 +2,11 @@
   "name": "flows-monorepo",
   "private": true,
   "type": "module",
-  "description": "bridge: work orchestration — decisions, activity, presence, knowledge for agents + humans",
+  "description": "bridge: work orchestration for agents + humans — web app first",
   "workspaces": [
     "packages/specs",
     "packages/worker",
-    "packages/webapp",
-    "packages/desktop"
+    "packages/webapp"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
