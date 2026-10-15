@@ -421,3 +421,31 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .set-row .set-key { color: var(--text-faint); font-family: ui-monospace, monospace; font-size: 12px; }
 .set-del { color: var(--red); }
 .set-footnote { margin-top: 8px; line-height: 1.5; }
+
+/* ---------- dashboard ---------- */
+.dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
+.dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
+.chart-svg { width: 100%; height: 28px; }
+.chart-bar.hot { fill: var(--accent); }
+.sentiment-word { text-transform: capitalize; }
+.flow-counts { display: flex; gap: 10px; font-size: 11.5px; flex-wrap: wrap; align-items: center; }
+.fc { padding: 2px 8px; border-radius: 99px; font-weight: 600; }
+.fc-todo { background: var(--bg-hover); color: var(--text-dim); }
+.fc-in_progress { background: color-mix(in srgb, var(--amber) 15%, transparent); color: var(--amber); }
+.fc-blocked { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.fc-done { background: color-mix(in srgb, var(--green) 15%, transparent); color: var(--green); }
+
+/* ---------- board controls ---------- */
+.board-controls { display: flex; gap: 6px; margin-left: 8px; }
+.board-controls select {
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 7px;
+  color: var(--text-dim); padding: 3px 8px; font-size: 11.5px; font-family: inherit;
+}
+.board-controls select:focus { outline: none; border-color: var(--accent); }
+
+/* ---------- progress flash (latest update animates on change) ---------- */
+.progress-flash { animation: flash-in .6s ease-out; }
+@keyframes flash-in {
+  0% { background: color-mix(in srgb, var(--accent) 25%, transparent); border-radius: 6px; transform: translateY(-2px); }
+  100% { background: transparent; transform: translateY(0); }
+}
