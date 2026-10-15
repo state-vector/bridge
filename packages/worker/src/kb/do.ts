@@ -220,8 +220,8 @@ export class KnowledgeHub {
         case "bootstrap": {
           const m = this.settingsMap();
           return this.json({
-            project_name: m.project_name ?? "this project",
-            instructions: composeBootstrap(m.project_name ?? "this project", m.board ?? DEFAULT_BOARD),
+            project_name: m.project_name || "Superpositional",
+            instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD),
           });
         }
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
@@ -475,7 +475,7 @@ export class KnowledgeHub {
     ).toArray();
     const settings = this.settingsMap();
     return {
-      project: settings.project_name ?? "unnamed project",
+      project: settings.project_name || "Superpositional",
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,

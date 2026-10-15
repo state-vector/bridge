@@ -8,7 +8,7 @@ export const ADMIN_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bridge — knowledge admin</title>
+<title>Bridge — work orchestration</title>
 <style>
   :root { color-scheme: dark; }
   body { background: #0e1116; color: #e8edf4; font: 14px -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; }
@@ -29,7 +29,7 @@ export const ADMIN_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>Bridge — knowledge admin</h1>
+<h1>Bridge — work orchestration</h1>
 
 <div class="card">
   <h2>Auth tokens</h2>

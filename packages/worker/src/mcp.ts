@@ -73,7 +73,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
         result = {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "bridge-kb", version: "0.2.0" },
+          serverInfo: { name: "bridge-kb", version: "0.2.0", description: "Bridge — work orchestration for agents" },
           instructions: composeBootstrap(
             settings.project_name ?? "this project",
             settings.board ?? { mode: "none" },

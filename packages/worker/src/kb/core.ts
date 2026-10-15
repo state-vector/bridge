@@ -183,9 +183,11 @@ export interface BoardSettings {
 export const DEFAULT_BOARD: BoardSettings = { mode: "none" };
 
 /** Compose the per-project bootstrap instructions (kept short — discovery only). */
+export const DEFAULT_PROJECT = "Superpositional";
+
 export function composeBootstrap(projectName: string, board: BoardSettings): string {
   const lines = [
-    `You are connected to Bridge — the project knowledge layer for "${projectName}".`,
+    `You are connected to Bridge — the work orchestration layer for "${projectName || DEFAULT_PROJECT}".`,
     `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
     `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
     `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,

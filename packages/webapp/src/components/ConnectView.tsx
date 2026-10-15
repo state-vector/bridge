@@ -3,10 +3,28 @@ import { useKb } from "../store/kb";
 import { getConfig } from "../lib/config";
 import { rel } from "../lib/views";
 
+function Copyable({ label, body }: { label: string; body: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="connect-block">
+      <div className="connect-row">
+        <span>{label}</span>
+        <button className="opt-btn" onClick={async () => { await navigator.clipboard.writeText(body); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
+          {copied ? "copied ✓" : "copy"}
+        </button>
+      </div>
+      <pre className="connect-pre">{body}</pre>
+    </div>
+  );
+}
 
-function BootstrapBlock({ label, secret, projectName }: { label: string; secret: string; projectName: string }) {
+/** Agent setup: bootstrap prompt + mcpServers JSON — always visible, token slotted in after mint. */
+function AgentSetup({ label, secret, projectName }: { label: string | null; secret: string | null; projectName: string }) {
   const url = `${getConfig().url}/mcp`;
-  const [instructions, setInstructions] = useState<string>("");
+  const [instructions, setInstructions] = useState("");
+  const tokenLabel = label ?? "<agent-label>";
+  const token = secret ?? "<auth-token>";
+
   useEffect(() => {
     let on = true;
     void (async () => {
@@ -17,35 +35,25 @@ function BootstrapBlock({ label, secret, projectName }: { label: string; secret:
     })();
     return () => { on = false; };
   }, [projectName]);
+
   const mcpJson = JSON.stringify(
-    { "bridge-kb": { url, headers: { Authorization: `Bearer ${secret}` } } },
+    { "bridge-kb": { url, headers: { Authorization: `Bearer ${token}` } } },
     null, 2,
   );
   const prompt = [
-    instructions || `You are connected to Bridge — the knowledge layer for "${projectName}".`,
-    `Your auth token identifies you as "${label}". Name your session on orient.`,
+    instructions || `You are connected to Bridge — the work orchestration layer for "${projectName}".`,
+    `Your auth token identifies you as "${tokenLabel}". Name your session on orient (session: "<unique-name>").`,
   ].join(" ");
-  const download = (name: string, body: string) => {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
-    a.download = name;
-    a.click();
-  };
+
   return (
-    <div className="connect-block">
-      <div className="connect-row">
-        <span>mcpServers JSON</span>
-        <button className="opt-btn" onClick={() => void navigator.clipboard.writeText(mcpJson)}>copy</button>
-      </div>
-      <pre className="connect-pre">{mcpJson}</pre>
-      <div className="connect-row">
-        <span>Bootstrap prompt</span>
-        <button className="opt-btn" onClick={() => void navigator.clipboard.writeText(prompt)}>copy</button>
-      </div>
-      <pre className="connect-pre">{prompt}</pre>
+    <div className="card">
+      <h2>Agent setup</h2>
       <p className="muted-note">
-        Also useful: <code className="inline" onClick={() => download(`${label}-auth-token.txt`, secret)} style={{ cursor: "pointer" }}>download auth token</code> (keep it secret).
+        Wire your agent's MCP config, prepend the bootstrap prompt. {secret ? "Auth token below is shown once — store it." : "Mint a token above to get a real one slotted in."}
       </p>
+      <Copyable label="Bootstrap prompt" body={prompt} />
+      <Copyable label="mcpServers JSON" body={mcpJson} />
+
     </div>
   );
 }
@@ -72,6 +80,12 @@ export function ConnectView() {
     setBootstrapMd(settings.bootstrap_md ?? "");
   }, [settings]);
 
+  const projectName = name || settings.project_name || "Superpositional";
+  const agentSetup = useMemo(
+    () => <AgentSetup label={secret?.label ?? null} secret={secret?.secret ?? null} projectName={projectName} />,
+    [secret, projectName],
+  );
+
   const doMint = async () => {
     try {
       const t = await mint(label.trim(), tags.split(",").map((s) => s.trim()).filter(Boolean));
@@ -83,18 +97,14 @@ export function ConnectView() {
     }
   };
 
-  const projectName = settings.project_name ?? name ?? "this project";
-  const secretBlock = useMemo(
-    () => (secret ? <BootstrapBlock label={secret.label} secret={secret.secret} projectName={projectName} /> : null),
-    [secret, projectName],
-  );
-
   return (
     <div className="connect-wrap">
       <div className="view-head">
         <h2>Connect agents</h2>
         <span className="muted-note">one auth token per agent client · sessions self-name</span>
       </div>
+
+      {agentSetup}
 
       <div className="card">
         <h2>Mint auth token</h2>
@@ -103,7 +113,6 @@ export function ConnectView() {
           <div><label>Capability tags (comma-sep)</label><input value={tags} placeholder="datadog-access, deploy" onChange={(e) => setTags(e.target.value)} /></div>
         </div>
         <p><button className="opt-btn" disabled={!label.trim()} onClick={() => void doMint()}>Mint</button></p>
-        {secretBlock}
         {msg && <p className="login-error">{msg}</p>}
         <table className="log-table">
           <thead><tr><th>agent</th><th>tags</th><th>created</th><th>last seen</th><th>state</th><th></th></tr></thead>
@@ -134,7 +143,7 @@ export function ConnectView() {
       <div className="card">
         <h2>Project flags</h2>
         <label>Project name</label>
-        <input value={name} onChange={(e) => setName(e.target.value)} />
+        <input value={name} placeholder="Superpositional" onChange={(e) => setName(e.target.value)} />
         <label>Board mode</label>
         <select value={board.mode} onChange={(e) => setBoard({ ...board, mode: e.target.value })}>
           <option value="none">none</option>
@@ -152,7 +161,7 @@ export function ConnectView() {
         <label>Extra bootstrap markdown</label>
         <textarea rows={3} value={bootstrapMd} onChange={(e) => setBootstrapMd(e.target.value)} />
         <p><button className="opt-btn" onClick={async () => { await saveSettings({ project_name: name, board, bootstrap_md: bootstrapMd }); setMsg("saved"); setTimeout(() => setMsg(""), 2000); }}>Save flags</button> {msg && <span className="ok">{msg}</span>}</p>
-        <p className="muted-note">Agents get these via MCP instructions on connect and inside orient. The entry prompt teaches discovery only — docs stay in artefacts.</p>
+        <p className="muted-note">Agents receive these via MCP instructions on connect and inside orient. The entry prompt teaches discovery only — detail stays in artefacts.</p>
       </div>
     </div>
   );
