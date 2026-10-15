@@ -680,11 +680,18 @@ export class KnowledgeHub {
       label, ...askPlaceholders,
     ).toArray();
     const settings = this.settingsMap();
+    const projectName = settings.project_name || "Superpositional";
+    const myTasks = this.state.storage.sql.exec(
+      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','blocked') ORDER BY updated_ts DESC LIMIT 10`,
+      label,
+    ).toArray();
     return {
-      instructions: composeBootstrap(settings.project_name || "Superpositional", settings.board ?? DEFAULT_BOARD) + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : ""),
+      project: projectName,
+      instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD) + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : ""),
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,
+      my_tasks: myTasks,
       pending_asks: pendingAsks,
     };
   }

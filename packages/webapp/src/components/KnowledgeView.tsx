@@ -1,139 +1,141 @@
 import { useEffect, useState } from "react";
-import { useKb } from "../store/kb";
-import { rel } from "../lib/views";
 import { kbApi } from "../lib/kb";
+import { rel } from "../lib/views";
 
-const TYPES = ["steering", "goal", "rfc", "decision", "discussion", "research", "task", "progress", "agent"];
+const GROUPS = ["steering", "goal", "rfc", "decision", "research", "discussion", "task", "progress", "agent"];
+const GROUP_LABEL: Record<string, string> = {
+  steering: "Steering", goal: "Goals", rfc: "RFCs", decision: "Decisions",
+  research: "Research", discussion: "Discussions", task: "Tasks", progress: "Progress", agent: "Agents",
+};
 
-const GROUP_ORDER = ["steering", "goal", "rfc", "decision", "research", "discussion", "task", "progress", "agent"] as const;
+const STATUS_TONE: Record<string, string> = {
+  active: "ok", accepted: "ok", done: "ok", implemented: "ok", published: "ok", achieved: "ok",
+  draft: "muted", proposed: "amber", open: "amber", todo: "muted", in_progress: "amber", logged: "muted",
+  blocked: "err", rejected: "err", dropped: "err", superseded: "err", concluded: "muted",
+};
+
+function StatusChip({ status }: { status: string }) {
+  const tone = STATUS_TONE[status] ?? "muted";
+  return <span className={`st-chip st-${tone}`}>{status.replace(/_/g, " ")}</span>;
+}
 
 export function KnowledgeView() {
   const [all, setAll] = useState<any[] | null>(null);
   const [q, setQ] = useState("");
+  const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<any[] | null>(null);
   const [selected, setSelected] = useState<any | null>(null);
   const [related, setRelated] = useState<any[]>([]);
+  const [createType, setCreateType] = useState("steering");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [createType, setCreateType] = useState("steering");
   const [msg, setMsg] = useState("");
 
   const loadAll = async () => {
-    try {
-      const r = await kbApi.artefacts({ limit: 200 });
-      setAll(r.artefacts ?? []);
-    } catch { /* live hub required */ }
+    try { setAll((await kbApi.artefacts({ limit: 200 })).artefacts ?? []); } catch { setAll([]); }
   };
   useEffect(() => { void loadAll(); }, []);
 
   const doSearch = async () => {
-    if (!q.trim()) { setResults(null); void loadAll(); return; }
-    try {
-      const r = await kbApi.search(q.trim());
-      setResults(r.artefacts ?? []);
-    } catch {
-      setMsg("search needs a live hub");
-    }
+    if (!q.trim()) { setSearching(false); setResults(null); return; }
+    setSearching(true);
+    try { setResults((await kbApi.search(q.trim())).artefacts ?? []); } catch { setMsg("search needs a live hub"); }
   };
+
   const open = async (id: string) => {
     try {
-      const a = await kbApi.artefact(id);
-      setSelected(a as any);
-      const r = await kbApi.related(id);
-      setRelated(r.artefacts ?? []);
-    } catch (e) {
-      setSelected({ id, title: "load failed", body_md: String(e) });
-    }
+      setSelected(await kbApi.artefact(id));
+      setRelated((await kbApi.related(id)).artefacts ?? []);
+    } catch { setSelected(null); }
   };
+
   const create = async () => {
     try {
       await kbApi.create({ type: createType, title: title.trim(), body_md: body });
-      setTitle(""); setBody(""); setMsg("created");
-      setTimeout(() => setMsg(""), 1500);
-      await useKb.getState().refresh();
-    } catch (e) {
-      setMsg(`failed: ${(e as Error).message}`);
-    }
+      setTitle(""); setBody(""); setMsg("created"); setTimeout(() => setMsg(""), 1500);
+      await loadAll();
+    } catch (e) { setMsg((e as Error).message); }
   };
+
+  const rows = searching ? (results ?? []) : (all ?? []);
 
   return (
     <div className="know-wrap">
       <div className="view-head">
         <h2>Knowledge</h2>
-        <span className="muted-note">hybrid: keyword + semantic</span>
-      </div>
-      <div className="know-search">
-        <input
-          value={q}
-          placeholder="Ask in plain words — “who owns ingestion latency?”"
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && void doSearch()}
-        />
-        <button className="opt-btn" onClick={() => void doSearch()}>Search</button>
+        <span className="muted-note">{searching ? `search: "${q}"` : `${(all ?? []).length} artefacts`}</span>
       </div>
 
-      {results === null && all !== null && (
-        <div className="know-groups">
-          {GROUP_ORDER.map((g) => {
-            const items = all.filter((a) => a.type === g);
+      <div className="know-search">
+        <input value={q} placeholder="Search — plain words work" onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void doSearch()} />
+        <button className="opt-btn" onClick={() => void doSearch()}>{searching ? "✕ clear" : "Search"}</button>
+      </div>
+
+      {rows.length > 0 && (
+        <div className="know-list">
+          {(!searching ? GROUPS : ["*"]).map((g) => {
+            const items = g === "*" ? rows : rows.filter((a: any) => a.type === g);
             if (items.length === 0) return null;
             return (
               <div key={g} className="know-group">
-                <h3 className="lane-head">{g}s <span className="muted-note">· {items.length}</span></h3>
-                {items.map((a) => (
-                  <button key={a.id} className="know-hit" onClick={() => void open(a.id)}>
-                    <span className="chip chip-scope">{a.status}</span> <b>{a.title}</b>
-                    <span className="muted-note"> {a.id}{(a.tags ?? []).length ? ` · ${(a.tags ?? []).join(", ")}` : ""}</span>
+                {!searching && <div className="know-group-head">{GROUP_LABEL[g]}<span>{items.length}</span></div>}
+                {items.map((a: any) => (
+                  <button key={a.id} className="know-row" onClick={() => void open(a.id)}>
+                    <StatusChip status={a.status} />
+                    <span className="know-row-title">{a.title}</span>
+                    <span className="know-row-meta">{a.id} · {rel(a.updated_ts)}</span>
                   </button>
                 ))}
               </div>
             );
           })}
-          {all.length === 0 && <p className="empty">No artefacts yet — create one below or via MCP.</p>}
         </div>
       )}
-      {results !== null && (
-        <div className="know-results">
-          {results.map((a: any) => (
-            <button key={a.id} className="know-hit" onClick={() => void open(a.id)}>
-              <span className="chip chip-scope">{a.type}</span> <b>{a.title}</b>
-              <span className="muted-note"> {a.id} · {a.status}{a._via ? ` · ${a._via.join("+")}` : ""}</span>
-            </button>
-          ))}
-          {results.length === 0 && <p className="empty">No matches — try fewer words or different phrasing.</p>}
-        </div>
-      )}
+      {rows.length === 0 && <p className="empty">{searching ? "No matches — rephrase or clear." : "Nothing yet."}</p>}
 
       {selected && (
-        <div className="card know-detail">
+        <div className="know-detail-card">
           <div className="detail-head">
-            <div className="ask-chips"><span className="chip chip-scope">{selected.type}</span><span className="chip">{selected.status}</span><span className="why-line">{selected.id} · {rel(selected.updated_ts)}</span></div>
+            <div className="ask-chips">
+              <span className="chip chip-scope">{selected.type}</span>
+              <StatusChip status={selected.status} />
+              <span className="why-line">{selected.id} · updated {rel(selected.updated_ts)}</span>
+            </div>
             <button className="icon-btn" onClick={() => { setSelected(null); setRelated([]); }}>✕</button>
           </div>
           <h3 className="detail-question">{selected.title}</h3>
-          <pre className="know-body">{selected.body_md}</pre>
+          <pre className="know-body">{selected.body_md || "—"}</pre>
+          {(selected.tags ?? []).length > 0 && (
+            <div className="task-tags">{selected.tags.map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+          )}
           {related.length > 0 && (
-            <div>
+            <div className="know-related">
               <label>Related</label>
               {related.map((r: any) => (
-                <button key={r.id} className="opt-btn know-rel" onClick={() => void open(r.id)}>{r.type}: {r.title}</button>
+                <button key={r.id} className="know-row know-rel-row" onClick={() => void open(r.id)}>
+                  <span className="chip chip-scope">{r.type}</span>
+                  <span className="know-row-title">{r.title}</span>
+                </button>
               ))}
             </div>
           )}
         </div>
       )}
 
-      <div className="card">
-        <h2>Create artefact</h2>
-        <div className="row">
+      <div className="settings-card">
+        <h2>New artefact</h2>
+        <div className="set-row">
           <select value={createType} onChange={(e) => setCreateType(e.target.value)}>
             {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
           <input value={title} placeholder="Title" onChange={(e) => setTitle(e.target.value)} />
         </div>
-        <textarea rows={4} value={body} placeholder="Markdown body — context, criteria, constraints…" onChange={(e) => setBody(e.target.value)} />
-        <p><button className="opt-btn" disabled={!title.trim()} onClick={() => void create()}>Create</button> {msg && <span className="ok">{msg}</span>}</p>
+        <textarea rows={4} value={body} placeholder="Markdown body…" onChange={(e) => setBody(e.target.value)} />
+        <button className="opt-btn" disabled={!title.trim()} onClick={() => void create()}>Create</button>
+        {msg && <span className={msg === "created" ? "ok" : "login-error"}> {msg}</span>}
       </div>
     </div>
   );
 }
+
+const TYPES = ["steering", "goal", "rfc", "decision", "discussion", "research", "task", "progress", "agent"];

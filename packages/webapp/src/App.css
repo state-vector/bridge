@@ -385,3 +385,39 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .task-blocked-info .progress-note b { color: var(--red); }
 .know-group { margin-bottom: 14px; }
 .know-groups { display: flex; flex-direction: column; }
+
+/* ---------- knowledge (tidy) ---------- */
+.know-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
+.know-group-head { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--text-faint); padding: 4px 2px; display: flex; justify-content: space-between; }
+.know-group-head span { color: var(--text-dim); }
+.know-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; border-bottom: 1px solid var(--line);
+  padding: 8px 4px; cursor: pointer; text-align: left; font-family: inherit; color: var(--text);
+}
+.know-row:hover { background: var(--bg-hover); border-radius: 6px; }
+.know-row-title { font-size: 13px; font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.know-row-meta { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+.st-chip { font-size: 9.5px; padding: 2px 7px; border-radius: 99px; font-weight: 600; white-space: nowrap; }
+.st-ok { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); }
+.st-amber { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); }
+.st-err { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.st-muted { background: var(--bg-hover); color: var(--text-faint); }
+.know-detail-card { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.know-related { margin-top: 10px; }
+.know-related label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint); }
+.know-rel-row { padding: 5px 4px; }
+
+/* ---------- settings (tidy) ---------- */
+.set-card { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.set-field { display: flex; flex-direction: column; gap: 6px; }
+.set-field label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint); }
+.set-field input, .set-field select, .set-field textarea {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+  color: var(--text); padding: 8px 10px; font-size: 13px; font-family: inherit; width: 100%; box-sizing: border-box;
+}
+.set-field input:focus, .set-field select:focus, .set-field textarea:focus { outline: none; border-color: var(--accent); }
+.set-row { display: flex; gap: 6px; align-items: center; }
+.set-row .set-key { color: var(--text-faint); font-family: ui-monospace, monospace; font-size: 12px; }
+.set-del { color: var(--red); }
+.set-footnote { margin-top: 8px; line-height: 1.5; }
