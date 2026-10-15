@@ -1,10 +1,21 @@
 import { useEffect, useState } from "react";
+import { BoardView } from "./components/BoardView";
+import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
+import { LogView } from "./components/LogView";
 import { Panel } from "./components/Panel";
 import type { WsFrame } from "@flows/specs";
-import { boardsOf } from "./lib/views";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
+import { useKb } from "./store/kb";
 import "./App.css";
+
+type Tab = "board" | "log" | "connect" | "inbox";
+const TABS: Array<{ key: Tab; label: string }> = [
+  { key: "board", label: "Board" },
+  { key: "log", label: "Log" },
+  { key: "connect", label: "Connect" },
+  { key: "inbox", label: "Decisions" },
+];
 
 const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
   void (async () => {
@@ -15,75 +26,26 @@ const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
       /* plain browser */
     }
   })();
-};
+}
 
-function TopBar() {
+function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   const conn = useBridge((s) => s.conn);
-  const board = useBridge((s) => s.board);
-  const setBoard = useBridge((s) => s.setBoard);
-  const decisions = useBridge((s) => s.decisions);
-  const events = useBridge((s) => s.events);
-  const [settings, setSettings] = useState(false);
-  const [urlDraft, setUrlDraft] = useState("");
-  const [tokenDraft, setTokenDraft] = useState("");
-  const boards = boardsOf(decisions, events);
-  const saveConfig = useBridge((s) => s.saveConfig);
-
-  const openSettings = () => {
-    setUrlDraft(useBridge.getState().url);
-    setTokenDraft(useBridge.getState().token);
-    setSettings(!settings);
-  };
+  const kbConn = useKb((s) => s.conn);
 
   return (
     <header className="topbar">
       <div className="brand">
         Bridge
-        <span className={`conn conn-${conn}`} title={conn}>
-          ●
-        </span>
+        <span className={`conn conn-${conn}`} title={`hub: ${conn}`}>●</span>
+        <span className={`conn conn-${kbConn === "open" ? "open" : "closed"}`} title={`kb realtime: ${kbConn}`}>●</span>
       </div>
-      <div className="scope-chips">
-        {["all", ...boards].slice(0, 5).map((b) => (
-          <button
-            key={b}
-            className={`chip chip-scope ${board === b ? "active" : ""}`}
-            onClick={() => setBoard(b as typeof board)}
-          >
-            {b === "all" ? "ALL" : b.toUpperCase()}
+      <nav className="tabs">
+        {TABS.map((t) => (
+          <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => setTab(t.key)}>
+            {t.label}
           </button>
         ))}
-        <button className="icon-btn" onClick={openSettings} aria-label="Settings">
-          ⚙
-        </button>
-      </div>
-      {settings && (
-        <div className="settings-drawer">
-          <label>
-            Hub URL
-            <input value={urlDraft} onChange={(e) => setUrlDraft(e.target.value)} />
-          </label>
-          <label>
-            Ingest token
-            <input
-              type="password"
-              value={tokenDraft}
-              placeholder="FLOWS_INGEST_TOKEN"
-              onChange={(e) => setTokenDraft(e.target.value)}
-            />
-          </label>
-          <div className="settings-actions">
-            <button
-              className="opt-btn"
-              onClick={() => {
-                saveConfig({ url: urlDraft, token: tokenDraft });
-              }}
-            >
-              Save & reconnect
-            </button>
-          </div>
-        </div>
-      )}
+      </nav>
     </header>
   );
 }
@@ -131,6 +93,7 @@ export default function App() {
   const resolve = useBridge((s) => s.resolve);
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
+  const [tab, setTab] = useState<Tab>("board");
 
   useEffect(() => {
     connectHub({
@@ -139,6 +102,7 @@ export default function App() {
       onStatus: (status) => useBridge.setState({ conn: status }),
       onFrame: (frame: WsFrame) => useBridge.getState().applyFrame(frame),
     });
+    useKb.getState().start();
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") tauriInvoke("hide_panel");
@@ -174,6 +138,7 @@ export default function App() {
       window.removeEventListener("keydown", onKey);
       unsubs.forEach((u) => u());
       disconnectHub();
+      useKb.getState().stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -182,7 +147,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <TopBar />
+      <TopBar tab={tab} setTab={setTab} />
       {conn === "auth" && <AuthBanner />}
       {conn === "closed" && (
         <div className="conn-banner">
@@ -193,7 +158,10 @@ export default function App() {
         </div>
       )}
       <main className="main">
-        <Panel />
+        {tab === "board" && <BoardView />}
+        {tab === "log" && <LogView />}
+        {tab === "connect" && <ConnectView />}
+        {tab === "inbox" && <Panel />}
       </main>
       {selectedId && <DecisionDetail />}
       {overlay && (
@@ -206,24 +174,10 @@ export default function App() {
             <h2>{overlay.title}</h2>
             {overlay.reason && <p className="ask-reason">{overlay.reason}</p>}
             <div className="overlay-actions">
-              <button className="opt-btn" onClick={() => void resolve(overlay, "unblocked")}>
-                Unblock
-              </button>
-              <button className="opt-btn" onClick={() => void resolve(overlay, "completed")}>
-                Done
-              </button>
-              <button
-                className="opt-btn opt-ghost"
-                onClick={() => {
-                  selectDecision(overlay.id);
-                  dismissOverlay();
-                }}
-              >
-                Open
-              </button>
-              <button className="opt-btn opt-ghost" onClick={dismissOverlay}>
-                Later
-              </button>
+              <button className="opt-btn" onClick={() => void resolve(overlay, "unblocked")}>Unblock</button>
+              <button className="opt-btn" onClick={() => void resolve(overlay, "completed")}>Done</button>
+              <button className="opt-btn opt-ghost" onClick={() => { selectDecision(overlay.id); dismissOverlay(); }}>Open</button>
+              <button className="opt-btn opt-ghost" onClick={dismissOverlay}>Later</button>
             </div>
           </div>
         </div>

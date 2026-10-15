@@ -18,6 +18,44 @@ export default {
       return handleMcp(request, env);
     }
 
+    // Knowledge realtime (human plane, cookie): KB event fanout.
+    if (url.pathname === "/kb-ws") {
+      const auth = await checkAuth(request, env);
+      if (auth !== true) return auth;
+      const kbId = env.KB.idFromName("global");
+      return env.KB.get(kbId).fetch("https://kb/ws", request);
+    }
+
+    // Knowledge REST mirror (human plane, cookie).
+    if (url.pathname.startsWith("/api/kb/") && !url.pathname.startsWith("/api/kb/admin/")) {
+      const auth = await checkAuth(request, env);
+      if (auth !== true) return auth;
+      const kbId = env.KB.idFromName("global");
+      const sub = url.pathname.slice("/api/kb/".length);
+      if (request.method === "GET") {
+        const kbUrl = sub === "board" ? "https://kb/board"
+          : sub === "events" ? "https://kb/events"
+          : sub === "artefacts" ? "https://kb/artefacts"
+          : sub === "artefact" ? "https://kb/artefact"
+          : sub === "search" ? "https://kb/search"
+          : sub === "stats" ? "https://kb/stats"
+          : null;
+        if (!kbUrl) return new Response("not found", { status: 404 });
+        return env.KB.get(kbId).fetch(kbUrl + url.search, request);
+      }
+      if (request.method === "POST") {
+        const op = ["create", "update", "transition", "link"].includes(sub) ? sub : null;
+        if (!op) return new Response("not found", { status: 404 });
+        const body = await request.json().catch(() => ({}));
+        body.actor = "web";
+        return env.KB.get(kbId).fetch(`https://kb/${op}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      }
+    }
+
     // Knowledge admin API + page: human plane, forwarded to the KB DO.
     if (url.pathname === "/kb") {
       if (request.headers.get("Accept")?.includes("text/html")) {

@@ -34,6 +34,67 @@ import {
 export class KnowledgeHub {
   constructor(private state: DurableObjectState) {}
 
+  // ---------- realtime (hibernating websockets) ----------
+
+  async handleWs(request: Request) {
+    const pair = new WebSocketPair();
+    this.state.acceptWebSocket(pair[1]);
+    const since = Number(new URL(request.url).searchParams.get("since") ?? 0);
+    const recent = await this.eventsSince(since, 100);
+    pair[1].send(JSON.stringify({ type: "kb.events", events: recent.events }));
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  async webSocketMessage(_ws: WebSocket, message: string) {
+    try {
+      const m = JSON.parse(message);
+      if (m?.type === "ping") _ws.send(JSON.stringify({ type: "pong" }));
+    } catch { /* ignore */ }
+  }
+
+  webSocketClose() {}
+
+  private broadcastEvent(ev: unknown) {
+    const frame = JSON.stringify({ type: "kb.event", event: ev });
+    for (const ws of this.state.getWebSockets()) {
+      try { ws.send(frame); } catch { /* hibernated client gone */ }
+    }
+  }
+
+  async eventsSince(since: number, limit: number) {
+    // since=0 → the most recent window (newest first, returned oldest-first);
+    // since>0 → incremental forward from the cursor.
+    const rows = since > 0
+      ? this.state.storage.sql.exec(
+          `SELECT seq, ts, actor, op, artefact_id, detail FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?`,
+          since, limit,
+        ).toArray()
+      : this.state.storage.sql.exec(
+          `SELECT seq, ts, actor, op, artefact_id, detail FROM events WHERE seq > 0 ORDER BY seq DESC LIMIT ?`,
+          limit,
+        ).toArray().reverse();
+    const events = rows.map((e) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
+    return { events, last_seq: events.length ? events[events.length - 1].seq : since };
+  }
+
+  async board() {
+    const tasks = this.state.storage.sql.exec(
+      `SELECT id, title, status, owner, meta, created_ts, updated_ts FROM artefacts
+       WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
+    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}") }));
+    const sessions = this.state.storage.sql.exec(
+      `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
+       FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
+    ).toArray();
+    return { tasks, sessions };
+  }
+
+  private async getWithRelations(id: string) {
+    const a = await this.get(id);
+    const rel = await this.relations(id);
+    return { ...a, relations: rel.relations };
+  }
+
   async ensureSchema() {
     this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS artefacts (
@@ -115,6 +176,21 @@ export class KnowledgeHub {
   async fetch(request: Request): Promise<Response> {
     await this.ensureSchema();
     const url = new URL(request.url);
+
+    // realtime: hibernating WS fanout of audit events
+    if (url.pathname === "/ws") return this.handleWs(request);
+    // human-plane GET mirror
+    if (request.method === "GET") {
+      switch (url.pathname) {
+        case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
+        case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+        case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
+        case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+        case "/board": return this.json(await this.board());
+        case "/stats": return this.json(await this.stats());
+      }
+    }
+
     const op = url.pathname.slice(1);
     let body: any = {};
     if (request.method === "POST") body = await request.json();
@@ -472,10 +548,12 @@ export class KnowledgeHub {
   // ---------- helpers ----------
 
   private audit(actor: string, op: string, artefactId: string | null, detail: object) {
-    this.state.storage.sql.exec(
-      `INSERT INTO events (ts, actor, op, artefact_id, detail) VALUES (?, ?, ?, ?, ?)`,
-      Date.now(), actor, op, artefactId, JSON.stringify(detail),
-    );
+    const ts = Date.now();
+    const r = this.state.storage.sql.exec(
+      `INSERT INTO events (ts, actor, op, artefact_id, detail) VALUES (?, ?, ?, ?, ?) RETURNING seq`,
+      ts, actor, op, artefactId, JSON.stringify(detail),
+    ).toArray()[0] as any;
+    this.broadcastEvent({ seq: Number(r?.seq ?? 0), ts, actor, op, artefact_id: artefactId, detail });
   }
 
   private async nextSeq(type: ArtefactType): Promise<number> {
