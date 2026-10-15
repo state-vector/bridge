@@ -87,14 +87,18 @@ export class KnowledgeHub {
 
   async board() {
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, owner, meta, created_ts, updated_ts FROM artefacts
+      `SELECT id, title, status, owner, tags, meta, created_ts, updated_ts FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
-    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}") }));
+    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: t.tags ? JSON.parse(t.tags) : [] }));
     const sessions = this.state.storage.sql.exec(
       `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
     ).toArray();
-    return { tasks, sessions };
+    const progress = this.state.storage.sql.exec(
+      `SELECT seq, ts, actor, artefact_id, detail FROM events
+       WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
+    ).toArray().map((e) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
+    return { tasks, sessions, progress };
   }
 
   private async getWithRelations(id: string) {

@@ -1,12 +1,13 @@
 import { create } from "zustand";
 import { connectKbWs, kbApi } from "../lib/kb";
-import type { KbArtefact, KbAuthToken, KbEvent, KbSession } from "../lib/kb";
+import type { KbArtefact, KbAuthToken, KbEvent, KbProgress, KbSession } from "../lib/kb";
 import { getConfig } from "../lib/config";
 
 interface KbState {
   conn: "open" | "closed" | "off";
   tasks: KbArtefact[];
   sessions: KbSession[];
+  progress: KbProgress[];
   events: KbEvent[]; // newest first
   lastSeq: number;
   tokens: KbAuthToken[];
@@ -28,6 +29,7 @@ export const useKb = create<KbState>((set, get) => ({
   conn: "off",
   tasks: [],
   sessions: [],
+  progress: [],
   events: [],
   lastSeq: 0,
   tokens: [],
@@ -61,7 +63,7 @@ export const useKb = create<KbState>((set, get) => ({
   refresh: async () => {
     try {
       const board = await kbApi.board();
-      set({ tasks: board.tasks, sessions: board.sessions });
+      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [] });
       const ev = await kbApi.events(get().lastSeq);
       if (ev.events.length) {
         const s = get();

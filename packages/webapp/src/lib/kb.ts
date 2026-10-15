@@ -7,6 +7,7 @@ export interface KbArtefact {
   type: string;
   title: string;
   status: string;
+  tags?: string[] | null;
   board?: string | null;
   owner?: string;
   body_md?: string;
@@ -42,9 +43,18 @@ export interface KbAuthToken {
   revoked_ts?: number | null;
 }
 
+export interface KbProgress {
+  seq: number;
+  ts: number;
+  actor: string;
+  artefact_id: string;
+  detail: { note?: string; sentiment?: string };
+}
+
 export interface KbBoard {
   tasks: KbArtefact[];
   sessions: KbSession[];
+  progress: KbProgress[];
 }
 
 const base = () => getConfig().url;

@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import { rel } from "../lib/views";
+import { SentimentBar, TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 
 const COLUMNS = [
   { key: "todo", label: "To do" },
@@ -9,9 +10,11 @@ const COLUMNS = [
   { key: "done", label: "Done" },
 ] as const;
 
-function TaskCard({ task }: { task: any }) {
+function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void }) {
   const transition = useKb((s) => s.transition);
+  const progress = useKb((s) => s.progress);
   const p = task.meta?.last_progress;
+  const recent = progress.filter((x) => x.artefact_id === task.id).slice(0, 2);
   const active = p && Date.now() - p.ts < 120_000;
   const next: Record<string, string[]> = {
     todo: ["in_progress", "blocked"],
@@ -21,11 +24,19 @@ function TaskCard({ task }: { task: any }) {
   };
   const label: Record<string, string> = { in_progress: "start", done: "done", blocked: "block" };
   return (
-    <div className={`task-card task-${task.status} ${active ? "task-active" : ""}`}>
+    <div className={`task-card task-${task.status} ${active ? "task-active" : "task-clickable"}`} onClick={() => onOpen(task.id)}>
       <div className="task-title">
         {active && <span className="pulse" />}
         {task.title}
       </div>
+      {recent.map((x) => (
+        <div key={x.seq} className="task-progress-line">
+          <span className={`chip ${SENTIMENT_CHIP[x.detail?.sentiment ?? ""] ?? ""}`}>
+            {x.detail?.sentiment ?? "progress"}
+          </span>
+          <span className="task-progress-note">{x.detail?.note}</span>
+        </div>
+      ))}
       {p && (
         <div className="task-progress-line">
           <span className={`chip ${SENTIMENT_CHIP[p.sentiment] ?? ""}`}>{p.sentiment}</span>
@@ -39,7 +50,7 @@ function TaskCard({ task }: { task: any }) {
       </div>
       <div className="task-actions">
         {(next[task.status] ?? []).map((to) => (
-          <button key={to} className="opt-btn task-btn" onClick={() => void transition(task.id, to)}>
+          <button key={to} className="opt-btn task-btn" onClick={(e) => { e.stopPropagation(); void transition(task.id, to); }}>
             {label[to] ?? to}
           </button>
         ))}
@@ -73,16 +84,12 @@ function ActivityChart({ events }: { events: any[] }) {
   );
 }
 
-const SENTIMENT_CHIP: Record<string, string> = {
-  going_well: "chip-done", neutral: "", struggling: "chip-diag",
-  converging: "chip-kind kind-agent", diverging: "chip-urgent",
-};
-
 export function BoardView() {
   const tasks = useKb((s) => s.tasks);
   const sessions = useKb((s) => s.sessions);
   const events = useKb((s) => s.events);
   const conn = useKb((s) => s.conn);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   // swimlane = owning agent label; sessions give us agent → live session names
   const lanes = useMemo(() => {
@@ -99,12 +106,14 @@ export function BoardView() {
 
   return (
     <div className="board-wrap">
+      {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />}
       <div className="view-head">
         <h2>Board</h2>
         <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
         <span className="muted-note">lanes: agent · {sessions.length} sessions seen</span>
       </div>
       <ActivityChart events={events} />
+      <SentimentBar tasks={tasks} />
       {lanes.length === 0 && (
         <p className="empty">No tasks yet — create via MCP (create_artefact type=task) or here.</p>
       )}
@@ -126,7 +135,7 @@ export function BoardView() {
                     const ev = lastEventFor(t.id);
                     return (
                       <div key={t.id}>
-                        <TaskCard task={t} />
+                        <TaskCard task={t} onOpen={setSelectedTaskId} />
                         {ev && <div className="task-progress">▸ {ev.op}{ev.detail?.to ? ` → ${ev.detail.to}` : ""} · {rel(ev.ts)}</div>}
                       </div>
                     );

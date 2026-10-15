@@ -362,3 +362,19 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .know-rel { display: block; margin: 4px 0; text-align: left; }
 .disc-list { display: flex; flex-direction: column; gap: 10px; }
 .disc-done { opacity: 0.75; }
+
+/* ---------- aggregate sentiment ---------- */
+.sentiment-bar-box { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.sentiment-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; flex: 1; max-width: 300px; background: var(--bg-raised); }
+.sb-seg { height: 100%; }
+.sb-going_well { background: var(--green); }
+.sb-converging { background: var(--accent); }
+.sb-neutral { background: #3a4356; }
+.sb-diverging { background: var(--startup); }
+.sb-struggling { background: var(--red); }
+
+/* ---------- task detail panel ---------- */
+.progress-history { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+.progress-line { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.progress-note { color: var(--text-dim); flex: 1; }
+.task-clickable { cursor: pointer; }
