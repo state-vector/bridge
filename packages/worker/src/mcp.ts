@@ -68,7 +68,8 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   try {
     switch (msg.method) {
       case "initialize": {
-        const settings = (await kb(hub, "settings.public", {})).settings ?? {};
+        const pub = (await kb(hub, "bootstrap", {}));
+        const settings = { project_name: pub.project_name, board: pub.board ?? { mode: "none" }, bootstrap_md: pub.bootstrap_md };
         result = {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },

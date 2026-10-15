@@ -6,15 +6,24 @@ import { rel } from "../lib/views";
 
 function BootstrapBlock({ label, secret, projectName }: { label: string; secret: string; projectName: string }) {
   const url = `${getConfig().url}/mcp`;
+  const [instructions, setInstructions] = useState<string>("");
+  useEffect(() => {
+    let on = true;
+    void (async () => {
+      try {
+        const r = await fetch(`${getConfig().url}/api/kb/bootstrap`, { credentials: "include" });
+        if (r.ok && on) setInstructions((await r.json()).instructions ?? "");
+      } catch { /* offline */ }
+    })();
+    return () => { on = false; };
+  }, [projectName]);
   const mcpJson = JSON.stringify(
     { "bridge-kb": { url, headers: { Authorization: `Bearer ${secret}` } } },
     null, 2,
   );
   const prompt = [
-    `You are connected to Bridge — the knowledge layer for "${projectName}".`,
+    instructions || `You are connected to Bridge — the knowledge layer for "${projectName}".`,
     `Your auth token identifies you as "${label}". Name your session on orient.`,
-    `Start every session with the orient tool: it returns goals, open work, pending asks addressed to you, and project flags.`,
-    `Search and read artefacts before assuming; record outcomes as artefacts; answer asks addressed to you.`,
   ].join(" ");
   const download = (name: string, body: string) => {
     const a = document.createElement("a");

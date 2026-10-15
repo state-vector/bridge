@@ -10,6 +10,7 @@
  * Ops: create | get | list | search | update | transition | link | stats
  */
 import {
+  composeBootstrap,
   ARTEFACT_TYPES,
   ArtefactType,
   DEFAULT_BOARD,
@@ -216,6 +217,13 @@ export class KnowledgeHub {
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "orient": return this.json(await this.orient(body));
         case "settings.public": return this.json({ settings: this.publicSettings() });
+        case "bootstrap": {
+          const m = this.settingsMap();
+          return this.json({
+            project_name: m.project_name ?? "this project",
+            instructions: composeBootstrap(m.project_name ?? "this project", m.board ?? DEFAULT_BOARD),
+          });
+        }
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
         case "admin.mint":
         case "admin.list_tokens":

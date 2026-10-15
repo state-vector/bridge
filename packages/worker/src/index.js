@@ -39,6 +39,7 @@ export default {
           : sub === "artefact" ? "https://kb/artefact"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
+          : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return new Response("not found", { status: 404 });
         return env.KB.get(kbId).fetch(kbUrl + url.search, request);
