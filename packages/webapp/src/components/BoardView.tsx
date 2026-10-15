@@ -29,6 +29,10 @@ function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void })
         {active && <span className="pulse" />}
         {task.title}
       </div>
+      {(() => {
+        const snippet = (task.body_md ?? "").split("\n").find((l: string) => l.trim() && !l.startsWith("#")) ?? "";
+        return snippet ? <div className="task-snippet">{snippet.slice(0, 140)}{snippet.length > 140 ? "…" : ""}</div> : null;
+      })()}
       {recent.map((x) => (
         <div key={x.seq} className="task-progress-line">
           <span className={`chip ${SENTIMENT_CHIP[x.detail?.sentiment ?? ""] ?? ""}`}>
