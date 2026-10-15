@@ -48,9 +48,9 @@ function TaskCard({ task, onOpen }: { task: any; onOpen: (id: string) => void })
         {task.owner ? ` · ${task.owner}` : ""}
         {(task.tags ?? []).length > 0 && ` · ${(task.tags ?? []).join(", ")}`}
       </div>
-      <div className="task-actions">
+      <div className="task-actions" onClick={(e) => e.stopPropagation()}>
         {(next[task.status] ?? []).map((to) => (
-          <button key={to} className="opt-btn task-btn" onClick={(e) => { e.stopPropagation(); void transition(task.id, to); }}>
+          <button key={to} className="opt-btn task-btn" onClick={() => void transition(task.id, to)}>
             {label[to] ?? to}
           </button>
         ))}

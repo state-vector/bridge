@@ -87,7 +87,7 @@ export class KnowledgeHub {
 
   async board() {
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, owner, tags, meta, created_ts, updated_ts FROM artefacts
+      `SELECT id, title, status, owner, tags, meta, body_md, created_ts, updated_ts FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
     ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: t.tags ? JSON.parse(t.tags) : [] }));
     const sessions = this.state.storage.sql.exec(
