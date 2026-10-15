@@ -288,3 +288,21 @@ export function embedText(title: string, body: string): string {
 }
 
 export const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
+
+// ---------- task enrichment ----------
+
+/** "#1886" | "SUP-1036-style #12" — first GitHub issue reference in a title. */
+export function issueRef(title: string): number | null {
+  const m = /#(\d+)/.exec(title);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/** Minimum viable body so no artefact is ever an empty card. */
+export function scaffoldBody(title: string, owner: string): string {
+  return `## Context
+Raised by ${owner || "unknown"} — no detail provided at creation.
+
+## Acceptance
+- (to be defined)
+`;
+}

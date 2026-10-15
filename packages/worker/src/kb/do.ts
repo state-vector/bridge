@@ -10,6 +10,8 @@
  * Ops: create | get | list | search | update | transition | link | stats
  */
 import {
+  issueRef,
+  scaffoldBody,
   EMBED_MODEL,
   cosine,
   embedText,
@@ -232,6 +234,7 @@ export class KnowledgeHub {
         case "list": return this.json(await this.list(body));
         case "search": return this.json(await this.search(body));
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
+        case "enrich": return this.json(await this.enrich(body, actor));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
         case "link": return this.json(await this.link(body, actor));
@@ -279,7 +282,7 @@ export class KnowledgeHub {
     const type = body.type as ArtefactType;
     if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
     const title = String(body.title ?? "");
-    const bodyMd = String(body.body_md ?? "");
+    let bodyMd = String(body.body_md ?? "");
     const limitErr = checkLimits(title, bodyMd, body.meta);
     if (limitErr) throw new Error(limitErr);
 
@@ -294,8 +297,16 @@ export class KnowledgeHub {
       id, type, title, status, bodyMd, JSON.stringify(body.meta ?? {}), String(body.owner ?? actor), ts, ts,
       tags ? JSON.stringify(tags) : null,
     );
+    if (!bodyMd.trim() && (type === "task" || type === "rfc" || type === "goal")) {
+      bodyMd = scaffoldBody(title, String(body.owner ?? actor));
+    }
     this.audit(actor, "create", id, { type, title });
     await this.embedArtefact(id, title, bodyMd);
+    // GitHub auto-enrichment: "#1886" in the title pulls issue body/labels
+    if (this.env.GH_TOKEN) {
+      const ref = issueRef(title);
+      if (ref) { try { await this.enrichFromGitHub(id, ref); } catch { /* GH unavailable — stay bare */ } }
+    }
     return { id, type, status };
   }
 
@@ -699,6 +710,76 @@ export class KnowledgeHub {
       this.audit("admin", "settings", k, {});
     }
     return { settings: this.settingsMap() };
+  }
+
+  // ---------- GitHub enrichment ----------
+
+  private ghCache = new Map<string, { ts: number; data: any }>();
+
+  private async ghIssue(num: number): Promise<any | null> {
+    if (!this.env.GH_TOKEN) return null;
+    const repo = this.settingsMap().github_repo ?? "state-vector/superpositional";
+    const key = `${repo}#${num}`;
+    const hit = this.ghCache.get(key);
+    if (hit && Date.now() - hit.ts < 600_000) return hit.data;
+    try {
+      const r = await fetch(`https://api.github.com/repos/${repo}/issues/${num}`, {
+        headers: {
+          authorization: `Bearer ${this.env.GH_TOKEN}`,
+          accept: "application/vnd.github+json",
+          "user-agent": "bridge-kb",
+        },
+      });
+      if (!r.ok) return null;
+      const data = await r.json();
+      this.ghCache.set(key, { ts: Date.now(), data });
+      return data;
+    } catch { return null; }
+  }
+
+  /** Pull issue body/labels into a bare artefact. Idempotent via the "## From GitHub" marker. */
+  private async enrichFromGitHub(id: string, num: number) {
+    const row = this.one(`SELECT title, body_md, tags, updated_ts FROM artefacts WHERE id = ?`, id);
+    if (!row || (row.body_md ?? "").includes("## From GitHub")) return null;
+    const issue = await this.ghIssue(num);
+    if (!issue) return null;
+    const labels: string[] = (issue.labels ?? []).map((l: any) => String(l.name ?? l));
+    const body = `${row.body_md ?? ""}\n## From GitHub — #${num}\n**${issue.title}** · state: ${issue.state}${labels.length ? ` · labels: ${labels.join(", ")}` : ""}\n\n${String(issue.body ?? "").slice(0, 2000)}\n`;
+    const existing = JSON.parse(row.tags ?? "[]");
+    const merged = [...new Set([...existing, ...labels.map((l) => l.toLowerCase().replace(/[^a-z0-9:_-]/g, "-"))])].slice(0, 10);
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET body_md = ?, tags = ?, updated_ts = ? WHERE id = ?`,
+      body, JSON.stringify(merged), Date.now(), id,
+    );
+    await this.embedArtefact(id, row.title, body);
+    this.audit("system", "enrich", id, { issue: num });
+    return id;
+  }
+
+  /** Enrich one or all bare, issue-referencing tasks. */
+  private async enrich(body: any, actor: string) {
+    if (!this.env.GH_TOKEN) throw new Error("GH_TOKEN not configured — GitHub enrichment unavailable");
+    const targets = body.id
+      ? [String(body.id)]
+      : this.state.storage.sql.exec(
+          `SELECT id, title, body_md FROM artefacts
+           WHERE type = 'task' AND status = 'open' OR (type = 'task' AND status IN ('todo','in_progress','blocked'))
+           ORDER BY updated_ts DESC LIMIT 50`,
+        ).toArray()
+          .filter((r: any) => !(r.body_md ?? "").includes("## From GitHub"))
+          .map((r: any) => r.id);
+    const done: string[] = [];
+    for (const id of targets) {
+      const row = this.one(`SELECT title, body_md FROM artefacts WHERE id = ?`, id);
+      if (!row) continue;
+      const num = issueRef(row.title);
+      if (num && !(row.body_md ?? "").includes("## From GitHub")) {
+        const r = await this.enrichFromGitHub(id, num);
+        if (r) done.push(id);
+      }
+    }
+    this.audit(actor, "enrich", null, { count: done.length });
+    return { enriched: done };
   }
 
   // ---------- helpers ----------
