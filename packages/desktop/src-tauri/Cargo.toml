@@ -1,0 +1,35 @@
+[package]
+name = "bridge-desktop"
+version = "0.1.0"
+description = "Bridge — the decision inbox menubar app"
+authors = ["state-vector"]
+edition = "2021"
+
+[lib]
+name = "bridge_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-notification = "2"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSet", "NSDictionary", "NSError"] }
+objc2-user-notifications = { version = "0.3.2", features = ["block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationCategory", "UNNotificationAction", "UNNotificationResponse", "UNNotificationSound"] }

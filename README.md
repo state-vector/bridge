@@ -11,7 +11,7 @@ Real-time surface for **decisions**, **activity flows**, and **presence** — ag
 | **`packages/specs`** | the contract: JSON Schemas (`schemas/`), wire docs (`docs/api.md`), TS types (`src/types.ts` + `src/index.ts` constants), consistency gate (`scripts/gen_types.py`). Every other package codes against this. |
 | **`packages/worker`** | Cloudflare Worker + FlowsHub Durable Object: `/ingest` (bearer), `/ws` fanout (hibernating), `/api/state`, `/` → **the webapp** (worker assets, SPA), `/ui` legacy page. Deploy via `deploy.md`. |
 | **`packages/webapp`** | the web app: **Board** (tasks by status, per-agent swimlanes, live progress + sentiment, activity chart), **Log** (audit stream), **Knowledge** (hybrid search, artefact browser), **Discussions**, **Connect** (auth tokens + agent setup), **Decisions** (legacy plane). `npm run demo -w @flows/webapp` runs a contract-faithful mock hub for offline dev. |
-| desktop (Tauri menubar) | **parked** — removed from workspaces; the shell lives in git history (`packages/desktop`, pre-removal) for when we return to it. |
+| **`packages/desktop`** | **parked** — sits in the repo, excluded from workspaces/builds; restore the workspace entry to revive the Tauri menubar shell (auth-token + MCP flows already designed). |
 | **`packages/adapters`** | anything → `/ingest`: `kanban-shipper.py` (tails the Hermes kanban SQLite on EC2; read-only, cursor-resumable) + its systemd unit + smoke tests. GitHub/Linear webhooks land here next. |
 
 ## Workflow

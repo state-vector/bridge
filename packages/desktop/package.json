@@ -1,0 +1,15 @@
+{
+  "name": "@flows/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "bridge desktop — Tauri menubar shell (decisions + presence, actionable notifications) over @flows/webapp",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

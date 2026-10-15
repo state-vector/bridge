@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Bridge",
+  "version": "0.1.0",
+  "identifier": "com.statevector.bridge",
+  "build": {
+    "beforeDevCommand": "npm run dev -w @flows/webapp",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build -w @flows/webapp",
+    "frontendDist": "../../webapp/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Bridge",
+        "width": 400,
+        "height": 640,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "resizable": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
