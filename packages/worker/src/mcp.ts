@@ -157,6 +157,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify(await call("transition", args)));
     case "link_artefacts":
       return text(JSON.stringify(await call("link", args)));
+    case "list_agents": {
+      const a = await call("agents.list", {});
+      return text(JSON.stringify(a, null, 1));
+    }
     case "ask_agent": {
       const a = await call("ask.create", { to: args.to ?? "any", question: args.question });
       return text(JSON.stringify({ ...a, note: "they will see it on their next orient. check yours too." }));
@@ -263,6 +267,11 @@ const TOOLS = [
         dst: { type: "string" },
       },
     },
+  },
+  {
+    name: "list_agents",
+    description: "List connected agents (label, capability tags, online) — use to address ask_agent.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "ask_agent",

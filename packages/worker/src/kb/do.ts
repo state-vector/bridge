@@ -211,6 +211,7 @@ export class KnowledgeHub {
         case "stats": return this.json(await this.stats());
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
+        case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
         case "ask.inbox": return this.json(await this.askInbox(body));
@@ -388,6 +389,22 @@ export class KnowledgeHub {
     if (row.revoked_ts) throw new Error("auth token revoked");
     this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
     return { token_id: row.id, label: row.label, tags: JSON.parse(row.tags ?? "[]") };
+  }
+
+  /** Active agents (for ask addressing). Labels + capability tags only. */
+  private async listAgents() {
+    const cutoff = Date.now() - 10 * 60_000;
+    const agents = this.state.storage.sql.exec(
+      `SELECT label, tags, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC LIMIT 100`,
+    ).toArray()
+      .filter((a) => !a.revoked_ts)
+      .map((a) => ({
+        label: a.label,
+        tags: JSON.parse(a.tags ?? "[]"),
+        online: a.last_seen_ts >= cutoff,
+        last_seen_ts: a.last_seen_ts,
+      }));
+    return { agents };
   }
 
   /** Register/refresh a session. Names are unique per auth token. */
