@@ -150,45 +150,6 @@ export function ConnectView() {
         </table>
       </div>
 
-      <div className="card">
-        <h2>Settings</h2>
-        <label>Project name</label>
-        <input value={name} placeholder="Superpositional" onChange={(e) => setName(e.target.value)} />
-        <label>Board</label>
-        <div className="row">
-          <select value={board.mode} onChange={(e) => setBoard({ ...board, mode: e.target.value })}>
-            <option value="none">none</option>
-            <option value="builtin">builtin</option>
-            <option value="external">external</option>
-          </select>
-          {board.mode === "external" && <input value={board.kind ?? ""} placeholder="kind (github-projects)" onChange={(e) => setBoard({ ...board, kind: e.target.value })} />}
-        </div>
-        {board.mode === "external" && (
-          <>
-            <label>Board URL</label><input value={board.url ?? ""} onChange={(e) => setBoard({ ...board, url: e.target.value })} />
-            <label>Board prompt for agents</label>
-            <textarea rows={2} value={board.prompt ?? ""} placeholder="Move the task to In Progress when you start…" onChange={(e) => setBoard({ ...board, prompt: e.target.value })} />
-          </>
-        )}
-        <label>Extra bootstrap markdown</label>
-        <textarea rows={3} value={bootstrapMd} onChange={(e) => setBootstrapMd(e.target.value)} />
-
-        <label>More settings (list — key / value)</label>
-        <table className="log-table">
-          <tbody>
-            {extra.map(([k, v]) => (
-              <tr key={k}>
-                <td style={{ width: "40%" }}><input value={k} onChange={(e) => renameExtra(k, e.target.value)} /></td>
-                <td><input value={String(v)} onChange={(e) => setExtraValue(k, e.target.value)} /></td>
-                <td style={{ width: 40 }}><button className="opt-btn" onClick={() => removeExtra(k)}>×</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <p><button className="opt-btn" onClick={addExtra}>+ add setting</button></p>
-        <p><button className="opt-btn" onClick={async () => { await saveSettings({ project_name: name, board, bootstrap_md: bootstrapMd, ...Object.fromEntries(extra) }); setMsg("saved"); setTimeout(() => setMsg(""), 2000); }}>Save settings</button> {msg && <span className="ok">{msg}</span>}</p>
-        <p className="muted-note">Everything here reaches agents via MCP instructions on connect and inside orient. The entry prompt teaches discovery only — detail stays in artefacts.</p>
-      </div>
     </div>
   );
 }
