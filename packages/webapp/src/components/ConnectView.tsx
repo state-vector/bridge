@@ -64,23 +64,13 @@ export function ConnectView() {
   const settings = useKb((s) => s.settings);
   const mint = useKb((s) => s.mint);
   const revoke = useKb((s) => s.revoke);
-  const saveSettings = useKb((s) => s.saveSettings);
-
+  
   const [label, setLabel] = useState("");
   const [tags, setTags] = useState("");
   const [transport, setTransport] = useState("mcp");
   const [secret, setSecret] = useState<{ label: string; secret: string } | null>(null);
   const [msg, setMsg] = useState("");
-  const [extra, setExtra] = useState<Array<[string, string]>>([]);
 
-  useEffect(() => {
-    const known = new Set(["project_name", "board", "bootstrap_md"]);
-    setExtra(Object.entries(settings).filter(([k]) => !known.has(k)).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)] as [string, string]));
-  }, [settings]);
-  const addExtra = () => setExtra([...extra, [`setting_${extra.length + 1}`, ""]]);
-  const removeExtra = (k: string) => setExtra(extra.filter(([key]) => key !== k));
-  const renameExtra = (k: string, nk: string) => setExtra(extra.map(([key, v]) => [key === k ? nk : key, v] as [string, string]));
-  const setExtraValue = (k: string, v: string) => setExtra(extra.map(([key, val]) => [key === k ? k : key, key === k ? v : val] as [string, string]));
 
   const projectName = settings.project_name || "Superpositional";
   const agentSetup = useMemo(
