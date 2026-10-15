@@ -1,14 +1,31 @@
 import { create } from "zustand";
 import { connectKbWs, kbApi } from "../lib/kb";
-import type { KbArtefact, KbAuthToken, KbEvent, KbProgress, KbSession } from "../lib/kb";
+import type { KbArtefact, KbAuthToken, KbEvent, KbProgress, KbSeriesPoint, KbSession } from "../lib/kb";
 import { getConfig } from "../lib/config";
+
+export interface BoardPrefs {
+  issue: boolean; status: boolean; age: boolean; owner: boolean;
+  tags: boolean; sentiment: boolean; snippet: boolean; sparkline: boolean; pct: boolean;
+}
+
+const PREFS_KEY = "bridge.board.prefs";
+const DEFAULT_PREFS: BoardPrefs = {
+  issue: true, status: true, age: true, owner: true,
+  tags: true, sentiment: true, snippet: true, sparkline: true, pct: true,
+};
+function loadPrefs(): BoardPrefs {
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") }; }
+  catch { return DEFAULT_PREFS; }
+}
 
 interface KbState {
   conn: "open" | "closed" | "off";
   tasks: KbArtefact[];
   sessions: KbSession[];
   progress: KbProgress[];
+  series: KbSeriesPoint[];
   events: KbEvent[]; // newest first
+  prefs: BoardPrefs;
   lastSeq: number;
   tokens: KbAuthToken[];
   settings: Record<string, any>;
@@ -21,6 +38,8 @@ interface KbState {
   revoke: (id: string) => Promise<void>;
   saveSettings: (s: Record<string, unknown>) => Promise<void>;
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) => Promise<void>;
+  setPref: (k: keyof BoardPrefs, v: boolean) => void;
+  setPrefs: (p: BoardPrefs) => void;
 }
 
 let stopWs: (() => void) | null = null;
@@ -30,7 +49,9 @@ export const useKb = create<KbState>((set, get) => ({
   tasks: [],
   sessions: [],
   progress: [],
+  series: [],
   events: [],
+  prefs: loadPrefs(),
   lastSeq: 0,
   tokens: [],
   settings: {},
@@ -63,7 +84,7 @@ export const useKb = create<KbState>((set, get) => ({
   refresh: async () => {
     try {
       const board = await kbApi.board();
-      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [] });
+      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [] });
       const ev = await kbApi.events(get().lastSeq);
       if (ev.events.length) {
         const s = get();
@@ -99,6 +120,15 @@ export const useKb = create<KbState>((set, get) => ({
   transition: async (id, to, extra) => {
     await kbApi.transition(id, to, extra);
     await get().refresh();
+  },
+  setPref: (k, v) => {
+    const prefs = { ...get().prefs, [k]: v };
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+    set({ prefs });
+  },
+  setPrefs: (p) => {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
+    set({ prefs: p });
   },
 }));
 

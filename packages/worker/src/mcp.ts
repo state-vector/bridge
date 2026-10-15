@@ -218,6 +218,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const a = await call("related", { id: args.id, limit: args.limit });
       return text(JSON.stringify(a, null, 1));
     }
+    case "get_history": {
+      const h = await call("get_history", { id: args.id, limit: args.limit });
+      return text(JSON.stringify(h, null, 1));
+    }
     case "log_progress": {
       const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
       return text(JSON.stringify(a));
@@ -348,7 +352,7 @@ const TOOLS = [
   },
   {
     name: "log_progress",
-    description: "Fine-grained progress while working a task: one line + sentiment (going_well | neutral | struggling | converging | diverging). Send often — it feeds the live board.",
+    description: "Fine-grained progress while working a task: one line + sentiment (going_well | neutral | struggling | converging | diverging) + optional self-reported gauges (completion_pct, confidence_pct, risk_pct — 0-100 ints). completion = how far along; confidence = belief the result is right; risk = chance of failure/drift. Send often — feeds the live board and charts.",
     inputSchema: {
       type: "object",
       required: ["id", "note"],
@@ -356,7 +360,19 @@ const TOOLS = [
         id: { type: "string", description: "task artefact id" },
         note: { type: "string" },
         sentiment: { type: "string", enum: ["going_well", "neutral", "struggling", "converging", "diverging"] },
+        completion_pct: { type: "integer", minimum: 0, maximum: 100 },
+        confidence_pct: { type: "integer", minimum: 0, maximum: 100 },
+        risk_pct: { type: "integer", minimum: 0, maximum: 100 },
       },
+    },
+  },
+  {
+    name: "get_history",
+    description: "Full version history of an artefact: every mutation, who did it, when, what changed.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "string" }, limit: { type: "integer", maximum: 200 } },
     },
   },
   {

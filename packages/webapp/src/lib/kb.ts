@@ -51,10 +51,33 @@ export interface KbProgress {
   detail: { note?: string; sentiment?: string };
 }
 
+/** One point of a task's self-reported gauge series (from version history). */
+export interface KbSeriesPoint {
+  artefact_id: string;
+  ts: number;
+  actor: string;
+  note?: string;
+  sentiment?: string;
+  completion_pct?: number;
+  confidence_pct?: number;
+  risk_pct?: number;
+}
+
+/** One entry of an artefact's version history: every mutation, who/when/what. */
+export interface KbVersion {
+  seq: number;
+  ts: number;
+  actor: string;
+  action: string;
+  summary: string;
+  data: Record<string, unknown>;
+}
+
 export interface KbBoard {
   tasks: KbArtefact[];
   sessions: KbSession[];
   progress: KbProgress[];
+  series: KbSeriesPoint[];
 }
 
 const base = () => getConfig().url;
@@ -75,6 +98,7 @@ export const kbApi = {
   artefact: (id: string) => j<KbArtefact & { relations: { relation: string; artefact_id: string; dir: string }[] }>(`/api/kb/artefact?id=${id}`),
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
+  history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
   create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>

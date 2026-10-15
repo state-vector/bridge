@@ -449,3 +449,81 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   0% { background: color-mix(in srgb, var(--accent) 25%, transparent); border-radius: 6px; transform: translateY(-2px); }
   100% { background: transparent; transform: translateY(0); }
 }
+
+/* ---------- board v4: fields menu, staleness, ephemeral, sparkline, animations ---------- */
+.fields-menu {
+  position: absolute; z-index: 30; top: 88px; left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 14px; min-width: 240px; box-shadow: 0 12px 40px rgb(0 0 0 / 0.5);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.fields-menu-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); }
+.fields-check { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--text-dim); cursor: pointer; }
+.fields-check input { accent-color: var(--accent); }
+.fields-done { align-self: flex-end; }
+
+.task-title { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650; line-height: 1.3; }
+.task-title .task-id { color: var(--text-faint); font-weight: 600; font-size: 11px; flex-shrink: 0; font-family: ui-monospace, monospace; }
+.task-title .task-title-text { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+.task-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.task-status-row { margin-top: 4px; }
+.age-chip {
+  font-size: 10px; padding: 2px 7px; border-radius: 99px; font-weight: 600;
+  font-variant-numeric: tabular-nums; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--bg-hover); color: var(--text-dim);
+}
+.age-warn { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); }
+.age-dead { background: color-mix(in srgb, var(--red) 16%, transparent); color: var(--red); }
+.task-owner { font-size: 10.5px; color: var(--text-faint); }
+
+.task-sentiment-row { display: flex; gap: 6px; align-items: center; margin-top: 5px; }
+.sentiment-dots { display: flex; gap: 3px; align-items: center; }
+.s-dot { width: 7px; height: 7px; border-radius: 50%; opacity: .85; }
+
+.task-ephemeral {
+  margin-top: 6px; padding: 4px 8px; border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text-dim); font-size: 11px;
+  animation: eph-in .5s ease-out;
+}
+.task-eph-ts { margin-left: 6px; color: var(--text-faint); font-size: 10px; }
+@keyframes eph-in {
+  0% { opacity: 0; transform: translateY(-4px); background: color-mix(in srgb, var(--accent) 30%, transparent); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+.task-pct-row { display: flex; gap: 5px; align-items: center; margin-top: 5px; flex-wrap: wrap; }
+.pct-chip {
+  font-size: 10px; padding: 2px 7px; border-radius: 99px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: var(--bg-hover); color: var(--text-dim);
+}
+.pct-completion { color: var(--accent); }
+.pct-confidence { color: var(--green); }
+.pct-risk { color: var(--red); }
+.task-attention {
+  margin-left: auto; font-size: 10px; color: var(--text-faint);
+  border: 1px solid var(--line); border-radius: 99px; padding: 1px 7px;
+}
+
+.sparkline { width: 100%; height: 26px; margin-top: 6px; display: block; opacity: .9; }
+
+.lane-live { margin-left: 10px; color: var(--green); font-size: 10px; animation: lane-pulse 2s ease-in-out infinite; }
+@keyframes lane-pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+
+.task-card { transition: border-color .3s, transform .15s; animation: card-in .35s ease-out; }
+.task-card:hover { transform: translateY(-1px); }
+@keyframes card-in {
+  0% { opacity: 0; transform: translateY(6px) scale(.98); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-card, .task-ephemeral, .progress-flash, .pulse, .lane-live { animation: none !important; transition: none !important; }
+}
+.pct-inputs { display: flex; gap: 6px; }
+.pct-inputs input { width: 33%; background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--text); padding: 6px 8px; font-size: 12px; }
+.version-history { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.version-history .progress-line { border-bottom: 1px solid var(--line); }

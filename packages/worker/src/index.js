@@ -40,6 +40,7 @@ export default {
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
           : sub === "related" ? "https://kb/related"
+          : sub === "history" ? "https://kb/history"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return new Response("not found", { status: 404 });

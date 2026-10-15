@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { kbApi } from "../lib/kb";
-import type { KbArtefact, KbProgress } from "../lib/kb";
+import type { KbArtefact, KbProgress, KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
 
 export const SENTIMENT_CHIP: Record<string, string> = {
@@ -61,6 +61,10 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
   const [blockedIntent, setBlockedIntent] = useState(!!openBlocked);
   const [blockedReason, setBlockedReason] = useState("");
   const [unblockCondition, setUnblockCondition] = useState("");
+  const [completion, setCompletion] = useState("");
+  const [confidence, setConfidence] = useState("");
+  const [risk, setRisk] = useState("");
+  const [versions, setVersions] = useState<KbVersion[]>([]);
 
   const progress = useKbStateProgress(taskId);
   const transition = useKb((s) => s.transition);
@@ -79,10 +83,15 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
         const r = await kbApi.related(taskId);
         if (on) setRelated(r.artefacts ?? []);
       } catch { /* offline */ }
+      try {
+        const h = await kbApi.history(taskId);
+        if (on) setVersions(h.versions ?? []);
+      } catch { /* offline */ }
     })();
     return () => { on = false; };
   }, [taskId]);
 
+  const clampPct = (v: string) => (v === "" ? undefined : Math.max(0, Math.min(100, Math.round(Number(v)))));
   const logProgress = async () => {
     if (!note.trim()) return;
     try {
@@ -90,9 +99,14 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
         method: "POST",
         credentials: "include",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: taskId, note: note.trim(), sentiment }),
+        body: JSON.stringify({
+          id: taskId, note: note.trim(), sentiment,
+          completion_pct: clampPct(completion), confidence_pct: clampPct(confidence), risk_pct: clampPct(risk),
+        }),
       });
       setNote("");
+      const h = await kbApi.history(taskId);
+      setVersions(h.versions ?? []);
     } catch { /* offline */ }
   };
 
@@ -153,6 +167,11 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
             </select>
           </div>
           <textarea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
+          <div className="pct-inputs">
+            <input type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
+            <input type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
+            <input type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
+          </div>
           <button className="opt-btn" disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</button>
         </div>
 
@@ -220,6 +239,20 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
             ))}
           </div>
         )}
+
+        <div className="detail-block">
+          <label>History — every mutation</label>
+          <div className="version-history">
+            {versions.length === 0 && <span className="muted-note">no versions yet</span>}
+            {versions.map((v) => (
+              <div key={v.seq} className="progress-line">
+                <span className={`chip chip-kind ${v.action === "create" ? "kind-agent" : v.action === "transition" ? "kind-human" : "kind-system"}`}>{v.action}</span>
+                <span className="progress-note">{v.summary}</span>
+                <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
 
         <dl className="audit" style={{ marginTop: "auto" }}>
           <dt>id</dt><dd>{task?.id ?? taskId}</dd>

@@ -36,7 +36,7 @@ const settingsGet = await j("/api/kb/admin/settings");
 checks["settings list (custom keys)"] = settingsGet.body.settings?.review_policy === "two-reviewers";
 const initA = await rpc("initialize", { protocolVersion: "2025-06-18" }, A);
 checks["bootstrap: status duty + progress nudge + project"] = initA.result?.instructions?.includes("TASK STATUS IS YOUR RESPONSIBILITY") && initA.result?.instructions?.includes("log_progress") && initA.result?.instructions?.includes("Superpositional");
-checks["tools = 13"] = (await rpc("tools/list", {}, A)).result?.tools?.length === 13;
+checks["tools = 14"] = (await rpc("tools/list", {}, A)).result?.tools?.length === 14;
 const c = await tool(A, "create_artefact", { type: "task", title: `Batching impl ${uid}`, body_md: "Reduce ingestion latency with bounded batching. Preserve idempotency.", tags: ["ingestion", "performance"], session: "impl-1" });
 checks["create w/ tags+session (BR# id)"] = !c.isError && /^BR#\d+$/.test(c.json?.id ?? "");
 const p = await tool(A, "log_progress", { id: c.json.id, note: "batch writer drafted", sentiment: "converging" });
@@ -70,6 +70,14 @@ const board2 = await j("/api/kb/board");
 checks["REST board"] = board2.body.tasks?.some((t) => t.id === created.body.id);
 const events = await j("/api/kb/events?since=0");
 checks["REST events"] = events.body.events?.length >= 3;
+// pct gauges + version history
+const pct = await tool(A, "log_progress", { id: c.json.id, note: "gauges check", sentiment: "converging", completion_pct: 40, confidence_pct: 75, risk_pct: 20 });
+checks["log_progress pct echoed"] = pct.json?.completion_pct === 40 && pct.json?.confidence_pct === 75 && pct.json?.risk_pct === 20;
+const hist = await tool(A, "get_history", { id: c.json.id });
+checks["get_history has create+progress versions"] = (hist.json?.versions ?? []).some((v) => v.action === "create") && (hist.json?.versions ?? []).some((v) => v.action === "progress" && v.data?.completion_pct === 40);
+const boardSeries = await j("/api/kb/board");
+checks["board series has pct points"] = (boardSeries.body.series ?? []).some((s) => s.artefact_id === c.json.id && s.completion_pct === 40);
+
 // blocked validation: no reason → 400; with reason+unblock → ok; meta.blocked present
 const badBlock = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked" }) });
 checks["blocked without reason+unblock rejected"] = badBlock.status === 400 && /unblock/.test(JSON.stringify(badBlock.body));

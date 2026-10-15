@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { kbApi } from "../lib/kb";
+import type { KbArtefact, KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
 
 const GROUPS = ["steering", "goal", "rfc", "decision", "research", "discussion", "task", "progress", "agent"];
@@ -24,8 +25,9 @@ export function KnowledgeView() {
   const [q, setQ] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<any[] | null>(null);
-  const [selected, setSelected] = useState<any | null>(null);
+  const [selected, setSelected] = useState<(KbArtefact & { relations?: any[] }) | null>(null);
   const [related, setRelated] = useState<any[]>([]);
+  const [versions, setVersions] = useState<KbVersion[]>([]);
   const [createType, setCreateType] = useState("steering");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -61,6 +63,48 @@ export function KnowledgeView() {
 
   return (
     <div className="know-wrap">
+      {selected && (
+        <>
+          <div className="panel-backdrop" onClick={() => { setSelected(null); setVersions([]); }} />
+          <aside className="detail-panel">
+            <header className="detail-head">
+              <div className="ask-chips">
+                <span className="chip chip-scope">{selected.type}</span>
+                <span className="chip">{selected.status}</span>
+              </div>
+              <button className="icon-btn" onClick={() => { setSelected(null); setVersions([]); }}>✕</button>
+            </header>
+            <h2 className="detail-question">{selected.title}</h2>
+            <pre className="know-body">{selected.body_md || "—"}</pre>
+            {(selected.tags ?? []).length > 0 && (
+              <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+            )}
+            {related.length > 0 && (
+              <div className="detail-block">
+                <label>Related</label>
+                {related.map((r) => (
+                  <div key={r.id} className="progress-line">
+                    <span className="chip chip-scope">{r.type}</span> {r.title}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="detail-block">
+              <label>History</label>
+              <div className="version-history">
+                {versions.length === 0 && <span className="muted-note">no versions yet</span>}
+                {versions.map((v) => (
+                  <div key={v.seq} className="progress-line">
+                    <span className={`chip chip-kind ${v.action === "create" ? "kind-agent" : "kind-system"}`}>{v.action}</span>
+                    <span className="progress-note">{v.summary}</span>
+                    <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
+        </>
+      )}
       <div className="view-head">
         <h2>Knowledge</h2>
         <span className="muted-note">{searching ? `search: "${q}"` : `${(all ?? []).length} artefacts`}</span>
@@ -106,7 +150,7 @@ export function KnowledgeView() {
           <h3 className="detail-question">{selected.title}</h3>
           <pre className="know-body">{selected.body_md || "—"}</pre>
           {(selected.tags ?? []).length > 0 && (
-            <div className="task-tags">{selected.tags.map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+            <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
           )}
           {related.length > 0 && (
             <div className="know-related">

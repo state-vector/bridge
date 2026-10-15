@@ -102,7 +102,14 @@ export class KnowledgeHub {
       `SELECT seq, ts, actor, artefact_id, detail FROM events
        WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
     ).toArray().map((e) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
-    return { tasks, sessions, progress };
+    const series = this.state.storage.sql.exec(
+      `SELECT artefact_id, ts, actor, data FROM artefact_versions
+       WHERE action = 'progress' ORDER BY seq DESC LIMIT 400`,
+    ).toArray().map((v: any) => {
+      const d = JSON.parse(v.data ?? "{}");
+      return { artefact_id: v.artefact_id, ts: v.ts, actor: v.actor, ...d };
+    });
+    return { tasks, sessions, progress, series };
   }
 
   private async getWithRelations(id: string) {
@@ -181,6 +188,15 @@ export class KnowledgeHub {
         vec BLOB NOT NULL,
         dim INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS artefact_versions (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        artefact_id TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        summary TEXT,
+        data TEXT NOT NULL DEFAULT '{}'
+      );
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
         from_label TEXT NOT NULL,
@@ -223,6 +239,7 @@ export class KnowledgeHub {
         case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
         case "/board": return this.json(await this.board());
         case "/stats": return this.json(await this.stats());
+        case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
       }
     }
 
@@ -245,6 +262,7 @@ export class KnowledgeHub {
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats());
+        case "get_history": return this.json(await this.getHistory(String(body.id ?? ""), Number(body.limit ?? 100)));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agents.list": return this.json(await this.listAgents());
@@ -307,6 +325,7 @@ export class KnowledgeHub {
       bodyMd = scaffoldBody(title, String(body.owner ?? actor));
     }
     this.audit(actor, "create", id, { type, title });
+    this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [] });
     await this.embedArtefact(id, title, bodyMd);
     // GitHub auto-enrichment: "#1886" in the title pulls issue body/labels
     if (this.env.GH_TOKEN) {
@@ -449,6 +468,11 @@ export class KnowledgeHub {
       title, bodyMd, meta, tags ? JSON.stringify(tags) : null, Date.now(), id,
     );
     this.audit(actor, "update", id, {});
+    const changed = [
+      body.title !== undefined && "title", body.body_md !== undefined && "body",
+      body.meta !== undefined && "meta", body.tags !== undefined && "tags",
+    ].filter(Boolean);
+    this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}`, { title, body_md: bodyMd });
     await this.embedArtefact(id, title, bodyMd);
     return { id };
   }
@@ -486,6 +510,7 @@ export class KnowledgeHub {
         );
     }
     this.audit(actor, "transition", id, { from: row.status, to, note: body.note ?? "", sentiment });
+    this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
     return { id, status: to, ...(sentiment ? { sentiment } : {}) };
   }
 
@@ -527,26 +552,54 @@ export class KnowledgeHub {
     return { counts: byType };
   }
 
-  /** Fine-grained progress from a working agent: note + sentiment, shown live on the board. */
+  /**
+   * Fine-grained progress from a working agent: note + sentiment, shown live on the board.
+   * Optional self-reported gauge fields: completion_pct, confidence_pct, risk_pct (0–100).
+   * completion = how far along; confidence = belief the result is right; risk = chance of
+   * failure/drift. Correlated, not the same — charted as separate series.
+   */
   private async progressLog(body: any, actor: string) {
     const id = String(body.id ?? "");
     const note = String(body.note ?? "").trim().slice(0, 500);
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : "neutral";
+    const pct = (v: any) => (Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : undefined);
+    const completion_pct = pct(body.completion_pct);
+    const confidence_pct = pct(body.confidence_pct);
+    const risk_pct = pct(body.risk_pct);
     const row = this.one(`SELECT id, meta FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
-    meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session };
+    meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
     if (body.session && !meta.session) meta.session = body.session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
     );
     this.audit(actor, "progress", id, { note, sentiment });
+    this.version(id, actor, "progress", note, { note, sentiment, completion_pct, confidence_pct, risk_pct });
     const m = this.settingsMap();
     return {
-      id, note, sentiment,
+      id, note, sentiment, completion_pct, confidence_pct, risk_pct,
       instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : ""),
     };
+  }
+
+  /** Append-only history: every mutation of every artefact gets a version row. */
+  private version(artefactId: string, actor: string, action: string, summary: string, data: object = {}) {
+    const ts = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO artefact_versions (artefact_id, ts, actor, action, summary, data) VALUES (?, ?, ?, ?, ?, ?)`,
+      artefactId, ts, actor, action, summary.slice(0, 500), JSON.stringify(data),
+    );
+  }
+
+  private async getHistory(artefactId: string, limit = 100) {
+    const rows = this.state.storage.sql.exec(
+      `SELECT seq, ts, actor, action, summary, data FROM artefact_versions
+       WHERE artefact_id = ? ORDER BY seq DESC LIMIT ?`,
+      artefactId, Math.min(limit, 200),
+    ).toArray().map((r: any) => ({ ...r, data: JSON.parse(r.data ?? "{}") }));
+    return { artefact_id: artefactId, versions: rows };
   }
 
   // ---------- identity, sessions, asks, settings, orient ----------
@@ -554,7 +607,6 @@ export class KnowledgeHub {
   /** Resolve a bearer secret to an agent identity; touches last_seen. */
   private async identify(bearer: string) {
     if (!bearer) throw new Error("missing bearer");
-    console.log(`[identify] bearer(${bearer.length})=${bearer.slice(0, 24)}`);
     const hash = await hashAuthToken(bearer);
     let row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
     if (!row) {
