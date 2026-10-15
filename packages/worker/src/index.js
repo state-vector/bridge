@@ -18,6 +18,34 @@ export default {
       return handleMcp(request, env);
     }
 
+    // Knowledge admin API + page: human plane, forwarded to the KB DO.
+    if (url.pathname === "/kb") {
+      if (request.headers.get("Accept")?.includes("text/html")) {
+        return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+      }
+      return new Response("use the /kb page", { status: 404 });
+    }
+    if (url.pathname.startsWith("/api/kb/admin/")) {
+      const auth = await checkAuth(request, env);
+      if (auth !== true) return auth;
+      const op = url.pathname.slice("/api/kb/admin/".length);
+      const kbId = env.KB.idFromName("global");
+      const kbHub = env.KB.get(kbId);
+      const kbUrl =
+        op === "tokens" && request.method === "GET" ? "https://kb/admin.list_tokens"
+        : op === "tokens" ? "https://kb/admin.mint"
+        : op === "tokens/revoke" ? "https://kb/admin.revoke"
+        : op === "settings" && request.method === "GET" ? "https://kb/admin.settings_get"
+        : op === "settings" ? "https://kb/admin.settings_set"
+        : null;
+      if (!kbUrl) return new Response("not found", { status: 404 });
+      return kbHub.fetch(kbUrl, {
+        method: request.method === "GET" ? "POST" : "POST",
+        headers: { "content-type": "application/json", "x-kb-admin": "1" },
+        body: JSON.stringify(await request.json().catch(() => ({}))),
+      });
+    }
+
     // Human plane. Auth mode: Cloudflare Access JWT when CF_ACCESS_TEAM+AUD are
     // set, otherwise password login (BRIDGE_UI_PASSWORD) with an HMAC cookie.
     if (url.pathname === "/login") {

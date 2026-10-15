@@ -12,14 +12,21 @@
 import {
   ARTEFACT_TYPES,
   ArtefactType,
+  DEFAULT_BOARD,
   INITIAL_STATUS,
   LIMITS,
+  SETTINGS_KEYS,
+  ASK_ANSWERED,
+  ASK_OPEN,
   checkLimits,
   ftsQuery,
   formatId,
+  generateAuthToken,
+  hashAuthToken,
   idSeq,
   isArtefactType,
   isRelation,
+  isValidAskTarget,
   validateRelation,
   validateTransition,
 } from "./core.ts";
@@ -70,6 +77,38 @@ export class KnowledgeHub {
           VALUES ('delete', old.rowid, old.title, old.body_md);
         INSERT INTO artefacts_fts(rowid, title, body_md) VALUES (new.rowid, new.title, new.body_md);
       END;
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL UNIQUE,
+        hash TEXT NOT NULL UNIQUE,
+        tags TEXT NOT NULL DEFAULT '[]',
+        created_ts INTEGER NOT NULL,
+        last_seen_ts INTEGER,
+        revoked_ts INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        first_seen_ts INTEGER NOT NULL,
+        last_seen_ts INTEGER NOT NULL,
+        UNIQUE (token_id, name)
+      );
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS asks (
+        id TEXT PRIMARY KEY,
+        from_label TEXT NOT NULL,
+        to_target TEXT NOT NULL,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        answer TEXT,
+        answered_by TEXT,
+        created_ts INTEGER NOT NULL,
+        answered_ts INTEGER
+      );
     `);
   }
 
@@ -79,6 +118,7 @@ export class KnowledgeHub {
     const op = url.pathname.slice(1);
     let body: any = {};
     if (request.method === "POST") body = await request.json();
+    const isAdmin = request.headers.get("x-kb-admin") === "1";
     const actor = String(body.actor ?? "mcp");
 
     try {
@@ -92,6 +132,26 @@ export class KnowledgeHub {
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats());
+        // ---- machine-plane identity + sessions + asks ----
+        case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
+        case "session.touch": return this.json(await this.sessionTouch(body));
+        case "ask.create": return this.json(await this.askCreate(body, actor));
+        case "ask.inbox": return this.json(await this.askInbox(body));
+        case "ask.answer": return this.json(await this.askAnswer(body, actor));
+        case "orient": return this.json(await this.orient(body));
+        case "settings.public": return this.json({ settings: this.publicSettings() });
+        // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
+        case "admin.mint":
+        case "admin.list_tokens":
+        case "admin.revoke":
+        case "admin.settings_get":
+        case "admin.settings_set":
+          if (!isAdmin) return this.json({ error: "admin only" }, 403);
+          if (op === "admin.mint") return this.json(await this.tokenMint(body));
+          if (op === "admin.list_tokens") return this.json(await this.tokenList());
+          if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
+          if (op === "admin.settings_get") return this.json(await this.settingsGet());
+          return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
     } catch (e) {
@@ -231,6 +291,182 @@ export class KnowledgeHub {
       `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
     ).toArray();
     return { counts: byType };
+  }
+
+  // ---------- identity, sessions, asks, settings, orient ----------
+
+  /** Resolve a bearer secret to an agent identity; touches last_seen. */
+  private async identify(bearer: string) {
+    if (!bearer) throw new Error("missing bearer");
+    const hash = await hashAuthToken(bearer);
+    const row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+    if (!row) throw new Error("unknown auth token");
+    if (row.revoked_ts) throw new Error("auth token revoked");
+    this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
+    return { token_id: row.id, label: row.label, tags: JSON.parse(row.tags ?? "[]") };
+  }
+
+  /** Register/refresh a session. Names are unique per auth token. */
+  private async sessionTouch(body: any) {
+    const token_id = String(body.token_id ?? "");
+    const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
+    const ts = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO sessions (token_id, name, first_seen_ts, last_seen_ts) VALUES (?, ?, ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts`,
+      token_id, name, ts, ts,
+    );
+    return { session: name };
+  }
+
+  private async askCreate(body: any, actor: string) {
+    const to = String(body.to ?? "any");
+    const question = String(body.question ?? "").trim();
+    if (!question) throw new Error("question is required");
+    if (question.length > 2000) throw new Error("question exceeds 2000 chars");
+    if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
+    const id = `ASK-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    this.state.storage.sql.exec(
+      `INSERT INTO asks (id, from_label, to_target, question, status, created_ts) VALUES (?, ?, ?, ?, 'open', ?)`,
+      id, actor, to, question, Date.now(),
+    );
+    this.audit(actor, "ask", id, { to: to, question });
+    return { id, to, question };
+  }
+
+  private async askInbox(body: any) {
+    const label = String(body.label ?? "");
+    const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
+    const placeholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
+    const marks = placeholders.map(() => "?").join(",");
+    const open = this.state.storage.sql.exec(
+      `SELECT id, from_label, to_target, question, created_ts FROM asks
+       WHERE status = 'open' AND from_label != ? AND to_target IN (${marks})
+       ORDER BY created_ts DESC LIMIT 50`,
+      label, ...placeholders,
+    ).toArray();
+    const sent = this.state.storage.sql.exec(
+      `SELECT id, to_target, question, status, answer, answered_by, created_ts FROM asks
+       WHERE from_label = ? ORDER BY created_ts DESC LIMIT 50`,
+      label,
+    ).toArray();
+    return { inbox: open, sent };
+  }
+
+  private async askAnswer(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const answer = String(body.answer ?? "").trim();
+    if (!answer) throw new Error("answer is required");
+    const row = this.one(`SELECT status FROM asks WHERE id = ?`, id);
+    if (!row) throw new Error(`no such ask: ${id}`);
+    if (row.status !== ASK_OPEN) throw new Error(`ask ${id} already ${row.status}`);
+    this.state.storage.sql.exec(
+      `UPDATE asks SET status = 'answered', answer = ?, answered_by = ?, answered_ts = ? WHERE id = ?`,
+      answer.slice(0, 4000), actor, Date.now(), id,
+    );
+    this.audit(actor, "answer", id, {});
+    return { id, status: ASK_ANSWERED };
+  }
+
+  private async orient(body: any) {
+    const label = String(body.label ?? "");
+    const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
+    const counts = this.state.storage.sql.exec(
+      `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
+    ).toArray();
+    const openStatuses = ["draft", "proposed", "active", "open", "todo", "in_progress", "blocked"];
+    const marks = openStatuses.map(() => "?").join(",");
+    const open = this.state.storage.sql.exec(
+      `SELECT id, type, title, status, owner, updated_ts FROM artefacts
+       WHERE status IN (${marks}) ORDER BY updated_ts DESC LIMIT 30`,
+      ...openStatuses,
+    ).toArray();
+    const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
+    const askMarks = askPlaceholders.map(() => "?").join(",");
+    const pendingAsks = this.state.storage.sql.exec(
+      `SELECT id, from_label, to_target, question, created_ts FROM asks
+       WHERE status = 'open' AND from_label != ? AND to_target IN (${askMarks})
+       ORDER BY created_ts DESC LIMIT 10`,
+      label, ...askPlaceholders,
+    ).toArray();
+    const settings = this.settingsMap();
+    return {
+      project: settings.project_name ?? "unnamed project",
+      board: settings.board ?? DEFAULT_BOARD,
+      counts,
+      open_artefacts: open,
+      pending_asks: pendingAsks,
+    };
+  }
+
+  /** Project-facing settings only (safe for any authenticated agent). */
+  private publicSettings() {
+    const m = this.settingsMap();
+    return { project_name: m.project_name, board: m.board ?? DEFAULT_BOARD, bootstrap_md: m.bootstrap_md };
+  }
+
+  private settingsMap(): Record<string, any> {
+    const rows = this.state.storage.sql.exec(`SELECT key, value FROM settings`).toArray();
+    const map: Record<string, any> = {};
+    for (const r of rows) map[r.key] = JSON.parse(r.value);
+    return map;
+  }
+
+  // ---------- admin ops (human plane) ----------
+
+  private async tokenMint(body: any) {
+    const label = String(body.label ?? "").trim();
+    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
+    const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
+    const secret = generateAuthToken();
+    const hash = await hashAuthToken(secret);
+    const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+    const ts = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO auth_tokens (id, label, hash, tags, created_ts) VALUES (?, ?, ?, ?, ?)`,
+      id, label, hash, JSON.stringify(tags), ts,
+    );
+    this.audit("admin", "mint", id, { label });
+    return { id, label, tags, secret }; // secret shown exactly once
+  }
+
+  private async tokenList() {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, label, tags, created_ts, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY created_ts DESC`,
+    ).toArray();
+    const sessions = this.state.storage.sql.exec(
+      `SELECT token_id, name, first_seen_ts, last_seen_ts FROM sessions ORDER BY last_seen_ts DESC`,
+    ).toArray();
+    return { tokens: rows.map((r) => ({ ...r, tags: JSON.parse(r.tags ?? "[]") })), sessions };
+  }
+
+  private async tokenRevoke(body: any) {
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT id, label FROM auth_tokens WHERE id = ?`, id);
+    if (!row) throw new Error(`no such auth token: ${id}`);
+    this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, Date.now(), id);
+    this.audit("admin", "revoke", id, { label: row.label });
+    return { id, revoked: true };
+  }
+
+  private async settingsGet() {
+    return { settings: this.settingsMap() };
+  }
+
+  private async settingsSet(body: any) {
+    const allowed = new Set(SETTINGS_KEYS as readonly string[]);
+    const entries = Object.entries(body.settings ?? {}).filter(([k]) => allowed.has(k));
+    if (entries.length === 0) throw new Error(`no valid settings keys (allowed: ${SETTINGS_KEYS.join(", ")})`);
+    for (const [k, v] of entries) {
+      this.state.storage.sql.exec(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        k, JSON.stringify(v),
+      );
+      this.audit("admin", "settings", k, {});
+    }
+    return { settings: this.settingsMap() };
   }
 
   // ---------- helpers ----------

@@ -129,6 +129,76 @@ export function ftsQuery(input: string): string | null {
   return tokens.map((t) => `"${t}"`).join(" OR ");
 }
 
+// ---------- auth tokens (for agents — never call them "tokens" alone) ----------
+
+/**
+ * Auth token = one agent client. Sessions self-name uniquely per token.
+ * Secret shown once at mint; only the SHA-256 hash is stored.
+ */
+export function generateAuthToken(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return "bkw_" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export async function hashAuthToken(secret: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function isValidAuthTokenShape(secret: string): boolean {
+  return /^bkw_[0-9a-f]{48}$/.test(secret);
+}
+
+// ---------- asks (agent-to-agent) ----------
+
+/**
+ * Ask addressing: `any` (open floor), an agent label (auth-token label),
+ * `label@session`, or `tag:<capability>` (e.g. tag:datadog-access).
+ */
+export function isValidAskTarget(to: string): boolean {
+  if (!to || to.length > 120) return false;
+  if (to === "any") return true;
+  if (to.startsWith("tag:")) return /^[a-z0-9:_-]{1,100}$/.test(to.slice(4));
+  return /^[a-zA-Z0-9._@-]{1,100}$/.test(to);
+}
+
+export const ASK_OPEN = "open";
+export const ASK_ANSWERED = "answered";
+
+// ---------- settings ----------
+
+export const SETTINGS_KEYS = ["project_name", "board", "bootstrap_md"] as const;
+export type SettingsKey = (typeof SETTINGS_KEYS)[number];
+
+export interface BoardSettings {
+  mode: "none" | "builtin" | "external";
+  /** e.g. "github-projects" */
+  kind?: string;
+  url?: string;
+  /** user-authored prompt telling agents how to behave on their board */
+  prompt?: string;
+}
+
+export const DEFAULT_BOARD: BoardSettings = { mode: "none" };
+
+/** Compose the per-project bootstrap instructions (kept short — discovery only). */
+export function composeBootstrap(projectName: string, board: BoardSettings): string {
+  const lines = [
+    `You are connected to Bridge — the project knowledge layer for "${projectName}".`,
+    `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
+    `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
+    `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
+  ];
+  if (board.mode === "external") {
+    lines.push(
+      `Work is tracked on the team's external board${board.kind ? ` (${board.kind})` : ""}${board.url ? `: ${board.url}` : "."} Follow it.`,
+    );
+    if (board.prompt) lines.push(board.prompt);
+  }
+  return lines.join("\n");
+}
+
 // ---------- limits ----------
 
 export const LIMITS = {

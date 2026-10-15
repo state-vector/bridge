@@ -1,14 +1,16 @@
 /**
  * MCP streamable-HTTP endpoint for the knowledge layer.
  *
- * Stateless JSON-RPC over POST /mcp. Machine plane: bearer (FLOWS_INGEST_TOKEN).
- * Tool set is deliberately small and terse — schemas sit in every connected
- * agent's context, so each tool is one call, compact output, no chatter.
+ * Stateless JSON-RPC over POST /mcp. Machine plane: per-agent auth tokens
+ * (minted on the admin page) — never call them "tokens" around LLMs, it's an
+ * auth token. One auth token per agent client; sessions self-name uniquely
+ * via `session` on orient.
  */
 import {
   ARTEFACT_TYPES,
   LIFECYCLES,
   RELATIONS,
+  composeBootstrap,
 } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 
@@ -16,10 +18,8 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   if (request.method !== "POST") {
     return json({ error: "MCP endpoint: POST only" }, 405);
   }
-  const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!token || token !== env.FLOWS_INGEST_TOKEN) {
-    return json({ error: "unauthorized" }, 401);
-  }
+  const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!bearer) return json({ error: "unauthorized: missing auth token" }, 401);
 
   let msg: any;
   try {
@@ -30,18 +30,34 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   if (!msg || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     return json({ error: "not a JSON-RPC 2.0 request" }, 400);
   }
-
-  // notifications: no response body per JSON-RPC
   if (msg.method.startsWith("notifications/")) {
     return new Response(null, { status: 202 });
   }
 
   const hub = env.KB.get(env.KB.idFromName("global"));
+
+  // identity: registry auth token (bkw_…) or the legacy shared ingest token
+  let identity: { token_id: string; label: string; tags: string[] };
+  try {
+    if (bearer === env.FLOWS_INGEST_TOKEN) {
+      identity = { token_id: "shared", label: "shared", tags: [] };
+    } else {
+      identity = await kb(hub, "auth.identify", { bearer });
+    }
+  } catch (e) {
+    return json(
+      { jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32001, message: String((e as Error).message) } },
+      401,
+    );
+  }
+
+  const sessionName = String(msg.params?.arguments?.session ?? msg.params?.arguments?.__session ?? "");
+
   const call = async (op: string, payload: object) => {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: "mcp" }),
+      body: JSON.stringify({ ...payload, actor: identity.label }),
     });
     const out = await r.json();
     if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
@@ -51,13 +67,19 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   let result: unknown;
   try {
     switch (msg.method) {
-      case "initialize":
+      case "initialize": {
+        const settings = (await kb(hub, "settings.public", {})).settings ?? {};
         result = {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "bridge-kb", version: "0.1.0" },
+          serverInfo: { name: "bridge-kb", version: "0.2.0" },
+          instructions: composeBootstrap(
+            settings.project_name ?? "this project",
+            settings.board ?? { mode: "none" },
+          ),
         };
         break;
+      }
       case "ping":
         result = {};
         break;
@@ -67,7 +89,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
       case "tools/call": {
         const name = String(msg.params?.name ?? "");
         const args = msg.params?.arguments ?? {};
-        result = await callTool(name, args, call);
+        result = await callTool(name, args, { call, identity, sessionName });
         break;
       }
       default:
@@ -75,7 +97,6 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     }
   } catch (e) {
     const message = String((e as Error).message ?? e);
-    // tool-level failures are results with isError, not protocol errors
     if (msg.method === "tools/call") {
       result = { content: [{ type: "text", text: message }], isError: true };
     } else {
@@ -86,15 +107,39 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   return json({ jsonrpc: "2.0", id: msg.id ?? null, result });
 }
 
-async function callTool(name: string, args: any, call: (op: string, p: object) => Promise<any>) {
+interface Ctx {
+  call: (op: string, payload: object) => Promise<any>;
+  identity: { token_id: string; label: string; tags: string[] };
+  sessionName: string;
+}
+
+async function kb(hub: any, op: string, payload: object) {
+  const r = await hub.fetch(`https://kb/${op}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const out = await r.json();
+  if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
+  return out;
+}
+
+async function callTool(name: string, args: any, ctx: Ctx) {
+  const { call, identity } = ctx;
   switch (name) {
     case "orient": {
-      const stats = await call("stats", {});
-      const recent = await call("list", { limit: 20 });
-      const open = (recent as any).artefacts.filter((a: any) =>
-        !["achieved", "dropped", "done", "concluded", "rejected", "superseded", "implemented", "published"].includes(a.status),
-      );
-      return text(JSON.stringify({ counts: (stats as any).counts, open_artefacts: open.map(shallow) }, null, 1));
+      // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
+      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName });
+      const o = await call("orient", { label: identity.label, tags: identity.tags });
+      const named = args.session ?? ctx.sessionName;
+      return text(JSON.stringify(
+        {
+          ...o,
+          you: { agent: identity.label, session: session.session, tags: identity.tags },
+          note: named ? undefined : "you did not name this session — pass session: \"<unique-name>\" on orient next time",
+        },
+        null, 1,
+      ));
     }
     case "search_knowledge":
       return text(JSON.stringify(await call("search", { q: args.q, type: args.type, limit: args.limit })));
@@ -111,6 +156,18 @@ async function callTool(name: string, args: any, call: (op: string, p: object) =
       return text(JSON.stringify(await call("transition", args)));
     case "link_artefacts":
       return text(JSON.stringify(await call("link", args)));
+    case "ask_agent": {
+      const a = await call("ask.create", { to: args.to ?? "any", question: args.question });
+      return text(JSON.stringify({ ...a, note: "they will see it on their next orient. check yours too." }));
+    }
+    case "asks": {
+      const inbox = await call("ask.inbox", { label: identity.label, tags: identity.tags });
+      return text(JSON.stringify(inbox, null, 1));
+    }
+    case "answer_ask": {
+      const a = await call("ask.answer", { id: args.id, answer: args.answer });
+      return text(JSON.stringify(a));
+    }
     default:
       return err(`unknown tool: ${name}`);
   }
@@ -124,8 +181,11 @@ const err = (t: string) => ({ content: [{ type: "text", text: t }], isError: tru
 const TOOLS = [
   {
     name: "orient",
-    description: "Project overview: artefact counts + open items. Call at session start.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags.",
+    inputSchema: {
+      type: "object",
+      properties: { session: { type: "string", description: "unique session name (per agent)" } },
+    },
   },
   {
     name: "search_knowledge",
@@ -201,6 +261,32 @@ const TOOLS = [
         relation: { type: "string", enum: RELATIONS },
         dst: { type: "string" },
       },
+    },
+  },
+  {
+    name: "ask_agent",
+    description: "Ask another agent for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any.",
+    inputSchema: {
+      type: "object",
+      required: ["question"],
+      properties: {
+        to: { type: "string", description: "default: any" },
+        question: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "asks",
+    description: "Your ask inbox (open asks addressed to you) + asks you sent (with answers).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "answer_ask",
+    description: "Answer an ask from your inbox.",
+    inputSchema: {
+      type: "object",
+      required: ["id", "answer"],
+      properties: { id: { type: "string" }, answer: { type: "string" } },
     },
   },
 ];
