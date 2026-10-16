@@ -56,7 +56,7 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
       </nav>
       {session && (
         <div className="user-widget" title={session.expires_ts ? `session expires ${new Date(session.expires_ts).toLocaleString()}` : session.mode}>
-          <span className="user-mode">{session.mode === "access" ? "SSO" : "shared"}</span>
+          <span className="user-mode">{session.mode === "access" ? "SSO" : "GitHub"}</span>
           <span className="user-name">{session.user ?? "admin"}</span>
           <button className="opt-btn user-out" onClick={() => void signOut()}>Sign out</button>
         </div>
@@ -67,40 +67,17 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
 
 function SignIn() {
   const url = useBridge((s) => s.url);
-  const loginError = useBridge((s) => s.loginError);
-  const loginWithPassword = useBridge((s) => s.loginWithPassword);
-  const [pw, setPw] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const submit = async () => {
-    if (!pw || busy) return;
-    setBusy(true);
-    await loginWithPassword(pw);
-    setBusy(false);
-    setPw("");
-  };
+  const signInWithGithub = useBridge((s) => s.signInWithGithub);
 
   return (
     <div className="auth-gate">
-      <form
-        className="auth-card"
-        onSubmit={(e) => { e.preventDefault(); void submit(); }}
-      >
+      <div className="auth-card">
         <div className="brand auth-brand">Bridge</div>
         <p className="auth-host">Sign in to {new URL(url).host}</p>
-        <input
-          type="password"
-          className="login-input"
-          placeholder="password"
-          value={pw}
-          onChange={(e) => setPw(e.target.value)}
-          autoFocus
-        />
-        <button className="opt-btn auth-submit" type="submit" disabled={!pw || busy}>
-          {busy ? "…" : "Sign in"}
+        <button className="opt-btn auth-submit" onClick={() => signInWithGithub()}>
+          Sign in with GitHub
         </button>
-        {loginError && <span className="login-error">{loginError}</span>}
-      </form>
+      </div>
     </div>
   );
 }

@@ -3,9 +3,13 @@ import {
   composeBootstrap,
   generateAuthToken,
   hashAuthToken,
+  isWsSlug,
   isValidAskTarget,
   isValidAuthTokenShape,
+  tokenWorkspace,
   DEFAULT_BOARD,
+  DEFAULT_WS_SLUG,
+  doWs,
 } from "../src/kb/core.ts";
 
 describe("auth tokens", () => {
@@ -17,6 +21,25 @@ describe("auth tokens", () => {
     expect(h).toMatch(/^[0-9a-f]{64}$/);
     expect(await hashAuthToken(a)).toBe(h);
     expect(isValidAuthTokenShape("bkw_short")).toBe(false);
+  });
+
+  it("embeds workspace slugs in agent tokens; legacy bare tokens = default ws", () => {
+    const scoped = generateAuthToken("state-vector");
+    expect(scoped).toMatch(/^bkw_state-vector_[0-9a-f]{48}$/);
+    expect(isValidAuthTokenShape(scoped)).toBe(true);
+    expect(tokenWorkspace(scoped)).toBe("state-vector");
+    expect(tokenWorkspace(generateAuthToken())).toBeNull();
+    // a ws-scoped secret must not parse as a bare one and vice versa
+    expect(tokenWorkspace("bkw_state-vector_short")).toBeNull();
+    expect(isWsSlug("state-vector")).toBe(true);
+    expect(isWsSlug("State Vector")).toBe(false);
+  });
+
+  it("maps the default workspace to the legacy global DO id", () => {
+    expect(DEFAULT_WS_SLUG).toBe("state-vector");
+    expect(doWs("state-vector")).toBe("global");
+    expect(doWs("rayh")).toBe("ws:rayh");
+    expect(doWs("state-vector-2")).toBe("ws:state-vector-2");
   });
 });
 

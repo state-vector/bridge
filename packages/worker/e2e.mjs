@@ -1,6 +1,6 @@
-/** Full KB e2e against `wrangler dev` on :8799 (.dev.vars: BRIDGE_UI_PASSWORD, FLOWS_INGEST_TOKEN). Run: node e2e.mjs */
+/** Full KB e2e against `wrangler dev` on :8799 (.dev.vars: GITHUB_CLIENT_SECRET, FLOWS_INGEST_TOKEN). Run: node e2e.mjs */
 import WebSocket from "ws";
-const base = "http://127.0.0.1:8799";
+const base = "http://127.0.0.1:8801";
 let cookie = "", id = 0;
 const checks = {};
 const j = async (path, opts = {}) => {
@@ -20,10 +20,23 @@ const tool = async (token, name, args) => {
   return { isError: r.result?.isError === true || !!r.error, text, json };
 };
 const uid = Math.random().toString(36).slice(2, 6);
-const login = await fetch(base + "/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: process.env.BRIDGE_UI_PASSWORD ?? "testpass" }) });
-cookie = (login.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]).join("; ");
-checks["admin login"] = login.ok;
+// GitHub OAuth can't be scripted — mint the same HMAC session cookie the worker
+// would set after the callback (secret must match .dev.vars GITHUB_CLIENT_SECRET).
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const ghSecret = process.env.GITHUB_CLIENT_SECRET ?? "testghsecret";
+// mint the same HMAC session cookie the worker sets after the OAuth callback
+// (value = exp.login.ws.sig; ws must match the signed payload).
+const mintCookie = async (login, ws) => {
+  const exp = String(Date.now() + 3600_000);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(ghSecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${exp}.${login}.${ws}`)));
+  return `bridge_session=${exp}.${login}.${ws}.${sig}`;
+};
+cookie = await mintCookie("rayh", "e2e"); // suite runs in its own workspace
+checks["session cookie minted"] = cookie.startsWith("bridge_session=");
+const wsCreate = await j("/api/workspaces", { method: "POST", body: JSON.stringify({ slug: "e2e" }) }); // idempotent-enough: 'already exists' = provisioned by an earlier run
 const mintA = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `oc-${uid}`, tags: ["datadog-access"], transport: "mcp" }) });
+checks["workspace provisioned (minted tokens embed the ws slug)"] = /^bkw_e2e_[0-9a-f]{48}$/.test(mintA.body?.secret ?? "");
 const A = mintA.body.secret;
 const mintB = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `acp-${uid}`, transport: "acp-proxy" }) });
 const B = mintB.body.secret;
@@ -35,7 +48,7 @@ await j("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ setti
 const settingsGet = await j("/api/kb/admin/settings");
 checks["settings list (custom keys)"] = settingsGet.body.settings?.review_policy === "two-reviewers";
 const initA = await rpc("initialize", { protocolVersion: "2025-06-18" }, A);
-checks["bootstrap: status duty + progress nudge + project"] = initA.result?.instructions?.includes("TASK STATUS IS YOUR RESPONSIBILITY") && initA.result?.instructions?.includes("log_progress") && initA.result?.instructions?.includes("Superpositional");
+checks["bootstrap: status duty + progress nudge + project"] = /Status is your responsibility/.test(initA.result?.instructions ?? "") && /PROTOCOL CARD/.test(initA.result?.instructions ?? "") && /Superpositional/.test(initA.result?.instructions ?? "");
 checks["tools = 14"] = (await rpc("tools/list", {}, A)).result?.tools?.length === 14;
 const c = await tool(A, "create_artefact", { type: "task", title: `Batching impl ${uid}`, body_md: "Reduce ingestion latency with bounded batching. Preserve idempotency.", tags: ["ingestion", "performance"], session: "impl-1", meta: { qualified: true } });
 checks["create w/ tags+session (BR# id)"] = !c.isError && /^BR#\d+$/.test(c.json?.id ?? "");
@@ -158,7 +171,32 @@ await new Promise((resolveWs) => {
   tryWs(0);
 });
 const sess = await j("/api/session");
-checks["session endpoint (mode + expiry)"] = sess.body.mode === "password" && typeof sess.body.expires_ts === "number" && sess.body.expires_ts > Date.now();
+checks["session endpoint (mode + user + workspace + expiry)"] = sess.body.mode === "github" && sess.body.user === "rayh" && sess.body.workspace === "e2e" && typeof sess.body.expires_ts === "number" && sess.body.expires_ts > Date.now();
+{
+  const saved = cookie;
+  // legacy pre-workspaces cookie (2-part payload) → default workspace
+  const exp = String(Date.now() + 3600_000);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(ghSecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${exp}.rayh`)));
+  cookie = `bridge_session=${exp}.rayh.${sig}`;
+  const legacy = await j("/api/session");
+  checks["legacy cookie maps to default workspace"] = legacy.body.mode === "github" && legacy.body.user === "rayh" && legacy.body.workspace === "state-vector";
+  // outsider: own auto-workspace, sees none of the e2e workspace's data
+  cookie = await mintCookie("stranger", "gh-stranger");
+  const strangerWs = await j("/api/workspaces", { method: "POST", body: JSON.stringify({ slug: "gh-stranger" }) });
+  const outsider = await j("/api/kb/board");
+  checks["outsider sees empty workspace (no cross-workspace leak)"] = outsider.status === 200 && (outsider.body.tasks ?? []).length === 0 && (outsider.body.events ?? []).length === 0;
+  // agent tokens are workspace-ROUTED (bearer-only): a stranger's own token reaches
+  // their empty workspace and must not see the e2e workspace's data
+  const strToken = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `str-${uid}` }) });
+  const strInit = await rpc("initialize", { protocolVersion: "2025-06-18" }, strToken.body.secret);
+  checks["stranger's own token initializes in their workspace"] = !strInit.error && !!strInit.result?.instructions;
+  const strSearch = await rpc("tools/call", { name: "search_knowledge", arguments: { q: "Batching impl", limit: 50 } }, strToken.body.secret);
+  checks["agent token is workspace-bound (stranger's token sees no e2e data)"] = (JSON.parse(strSearch.result?.content?.[0]?.text ?? "{}").artefacts ?? []).length === 0;
+  const e2eTokenSearch = await rpc("tools/call", { name: "search_knowledge", arguments: { q: "Batching impl", limit: 50 } }, A);
+  checks["e2e workspace token still sees its own data"] = (JSON.parse(e2eTokenSearch.result?.content?.[0]?.text ?? "{}").artefacts ?? []).length >= 1;
+  cookie = saved;
+}
 const mintC = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `tmp-${uid}` }) });
 const tokensNow = await j("/api/kb/admin/tokens");
 await j("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id: tokensNow.body.tokens.find((t) => t.label === `tmp-${uid}`)?.id }) });
@@ -204,7 +242,7 @@ await tool(A, "transition", { id: gParent.json.id, to: "in_progress" });
 checks["analysis child qualifies pickup (claim sets owner)"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === gParent.json.id)?.owner === mintA.body.label;
 const gUnreviewed = await tool(A, "transition", { id: gParent.json.id, to: "done" });
 checks["work cannot be done unreviewed"] = gUnreviewed.isError && /unreviewed/.test(gUnreviewed.text ?? "");
-const gImpl = await tool(A, "create_artefact", { type: "task", title: `Swimlane impl child ${uid}`, tags: ["role:impl"] });
+const gImpl = await tool(A, "create_artefact", { type: "task", title: `Swimlane impl child ${uid}` });
 await tool(A, "link_artefacts", { src: gImpl.json.id, relation: "child_of", dst: gParent.json.id });
 const gBoard1 = await j("/api/kb/board");
 checks["child task carries part_of; parent carries rollup"] = gBoard1.body.tasks?.find((t) => t.id === gImpl.json.id)?.part_of === gParent.json.id
@@ -238,6 +276,32 @@ const orA = await tool(A, "orient", { session: `e2e-a2-${uid}` });
 checks["role-gated task hidden from non-matching agents"] = !(orA.json?.unclaimed_work ?? []).some((t) => t.id === poolT.json.id);
 await tool(AN, "transition", { id: poolT.json.id, to: "in_progress" });
 checks["role agent claims via transition"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === poolT.json.id)?.owner === mintAn.body.label;
+// visibility: agents must not SEE work they cannot claim
+const uqT = await tool(A, "create_artefact", { type: "task", title: `Unqualified pool probe ${uid}` });
+const orA2 = await tool(A, "orient", { session: `e2e-a3-${uid}` });
+checks["unqualified work invisible to non-qualifier agents"] = !(orA2.json?.unclaimed_work ?? []).some((t) => t.id === uqT.json.id);
+const orAn2 = await tool(AN, "orient", { session: `e2e-an2-${uid}` });
+checks["unqualified work visible to qualifier agents"] = (orAn2.json?.unclaimed_work ?? []).some((t) => t.id === uqT.json.id);
+const gRoleT = await tool(A, "create_artefact", { type: "task", title: `Role-gate probe ${uid}`, tags: ["role:impl"], meta: { qualified: true } });
+const orAn3 = await tool(AN, "orient", { session: `e2e-an3-${uid}` });
+checks["role-mismatched work invisible even when ready"] = !(orAn3.json?.unclaimed_work ?? []).some((t) => t.id === gRoleT.json.id);
+const gRoleClaim = await tool(AN, "transition", { id: gRoleT.json.id, to: "in_progress" });
+checks["role-mismatched claim rejected at the gate"] = gRoleClaim.isError && /gated to/.test(gRoleClaim.text ?? "");
+// stacked qualifications: publisher self-qualifies AND requests review confirmation before ready
+const sqT = await tool(A, "create_artefact", { type: "task", title: `Stacked quals probe ${uid}`, qualified: true, await: ["role:review"] });
+const sqBoard1 = await j("/api/kb/board");
+const sqTask1 = sqBoard1.body.tasks?.find((t) => t.id === sqT.json.id);
+checks["stacked quals: declared + unmet bar projected on board"] = sqTask1?.qualification?.state === "qualified" && sqTask1?.qualification?.ready === false && (sqTask1?.qualification?.unmet_bars ?? []).includes("role:review");
+const sqBlocked = await tool(A, "transition", { id: sqT.json.id, to: "in_progress" });
+checks["qualified-but-awaiting work cannot be picked up"] = sqBlocked.isError && /awaiting|unmet bars/.test(sqBlocked.text ?? "");
+const sqReview = await tool(A, "create_artefact", { type: "task", title: `Stacked quals confirm ${uid}`, tags: ["role:review"] });
+await tool(A, "link_artefacts", { src: sqReview.json.id, relation: "child_of", dst: sqT.json.id });
+await tool(A, "transition", { id: sqReview.json.id, to: "in_progress" });
+await tool(A, "transition", { id: sqReview.json.id, to: "done" });
+const sqBoard2 = await j("/api/kb/board");
+checks["stacked quals: bar met → ready"] = sqBoard2.body.tasks?.find((t) => t.id === sqT.json.id)?.qualification?.ready === true;
+await tool(A, "transition", { id: sqT.json.id, to: "in_progress" });
+checks["stacked quals: ready task claimable"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === sqT.json.id)?.owner === mintA.body.label;
 
 // logout round-trip — last, so the shared cookie survives the rest of the suite
 const out = await fetch(base + "/logout", { headers: { cookie }, redirect: "manual" });

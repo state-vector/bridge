@@ -11,6 +11,9 @@ import {
   LIFECYCLES,
   RELATIONS,
   composeBootstrap,
+  DEFAULT_WS_SLUG,
+  doWs,
+  tokenWorkspace,
 } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 
@@ -34,7 +37,13 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     return new Response(null, { status: 202 });
   }
 
-  const hub = env.KB.get(env.KB.idFromName("global"));
+  // Workspace scoping: the bearer token embeds its workspace slug
+  // (`bkw_<ws>_<hex>`) — route to that workspace's DO. Legacy bare tokens
+  // (`bkw_<hex>`) and the shared ingest token belong to the default workspace.
+  const ws = bearer === env.FLOWS_INGEST_TOKEN
+    ? DEFAULT_WS_SLUG
+    : (tokenWorkspace(bearer) ?? DEFAULT_WS_SLUG);
+  const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
 
   // identity: registry auth token (bkw_…) or the legacy shared ingest token
   let identity: { token_id: string; label: string; tags: string[] };
@@ -99,7 +108,10 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   } catch (e) {
     const message = String((e as Error).message ?? e);
     if (msg.method === "tools/call") {
-      result = { content: [{ type: "text", text: message }], isError: true };
+      result = {
+        content: [{ type: "text", text: `ERROR: ${message}\nFix the cause and retry. Read the error — it states the required fix.` }],
+        isError: true,
+      };
     } else {
       return json({ jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32000, message } });
     }
@@ -155,7 +167,9 @@ async function seeAlso(a: any, rel: any, identity: Ctx["identity"], call: Ctx["c
   const rows = [...byId.values()];
   // priority: others' open work > discussions/research > everything else
   for (const e of rows) {
-    if (e.type === "task" && OPEN_STATUSES.has(e.status) && e.owner && e.owner !== identity.label) {
+    const otherClaimed = e.owner && e.owner !== identity.label;
+    const otherPublished = !e.owner && e.created_by && e.created_by !== identity.label; // pooled todo: author attribution
+    if (e.type === "task" && OPEN_STATUSES.has(e.status) && (otherClaimed || otherPublished)) {
       e.coordination = true;
       e._rank = -1;
     } else if (e.type === "discussion" || e.type === "research" || e.type === "steering") {
@@ -175,11 +189,16 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName });
       const o = await call("orient", { label: identity.label, tags: identity.tags });
       const named = args.session ?? ctx.sessionName;
+      const required: string[] = Array.isArray(o.action_required) ? o.action_required : [];
       return text(JSON.stringify(
         {
           ...o,
           you: { agent: identity.label, session: session.session, tags: identity.tags },
-          note: named ? undefined : "you did not name this session — pass session: \"<unique-name>\" on orient next time",
+          note: required.length
+            ? `ACT NOW — handle each of these before anything else:\n${required.join("\n")}`
+            : named
+              ? undefined
+              : "you did not name this session — pass session: \"<unique-name>\" on orient next time",
         },
         null, 1,
       ));
@@ -207,7 +226,16 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     case "update_artefact":
       return text(JSON.stringify(await call("update", args)));
     case "transition":
-      return text(JSON.stringify(await call("transition", args)));
+      return text(JSON.stringify({
+        ...await call("transition", args),
+        note: args.to === "in_progress"
+          ? "claimed. heartbeat: log_progress every ≤10m while in_progress."
+          : args.to === "in_review"
+            ? "in_review. PR is open — your duty is NOT done. You stay owner until the verdict. Poll get_history {id} (or orient → my_tasks) for the verdict: bounce (in_review → in_progress, findings in the note — action them immediately) or done (approved + merged — only then are you released). Reviews can stack: work other tasks while waiting, but keep polling this one."
+            : args.to === "done"
+              ? "done. you are released from this task. outcome belongs in Knowledge — publish research/discussion artefacts for anything reusable."
+              : undefined,
+      }));
     case "link_artefacts":
       return text(JSON.stringify(await call("link", args)));
     case "list_agents": {
@@ -224,7 +252,13 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     }
     case "log_progress": {
       const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
-      return text(JSON.stringify(a));
+      const hasGauges = args.completion_pct != null || args.confidence_pct != null || args.risk_pct != null;
+      return text(JSON.stringify({
+        ...a,
+        note: hasGauges
+          ? undefined
+          : "logged without gauges. include completion_pct / confidence_pct / risk_pct — they chart on the card, drive prioritisation, and count toward your score.",
+      }));
     }
     case "ask_agent": {
       const a = await call("ask.create", { to: args.to ?? "any", question: args.question, artefact_id: args.artefact_id });
@@ -248,7 +282,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
   }
 }
 
-const shallow = (a: any) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts });
+const shallow = (a: any) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts, created_by: a.created_by });
 
 const text = (t: string) => ({ content: [{ type: "text", text: t }] });
 const err = (t: string) => ({ content: [{ type: "text", text: t }], isError: true });
@@ -293,6 +327,8 @@ const TOOLS = [
         meta: { type: "object" },
         owner: { type: "string", description: "leave empty for tasks — work enters as unclaimed todo; set only to pre-assign" },
         project: { type: "string", description: "project slug, e.g. superpositional or bridge; defaults to the deployment's project" },
+        qualified: { type: "boolean", description: "declare you already analysed this task — it goes ready for pickup (publishers are scored on the quality of their self-qualified tasks)" },
+        await: { type: "array", items: { type: "string" }, description: "stacked qualification: further confirmation required before pickup, e.g. [\"role:review\"] — satisfied by a done child of that role or an accepted decision" },
         tags: { type: "array", items: { type: "string" }, description: "categories + role gating for tasks, e.g. [ingestion, role:impl]" },
         session: { type: "string", description: "your session name — attributes the card to your session" },
       },

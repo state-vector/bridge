@@ -10,6 +10,15 @@ import {
 } from "../src/kb/core.ts";
 
 describe("lifecycles", () => {
+  it("task in_progress → in_review → (done | bounce | blocked); bounce returns to work", () => {
+    expect(validateTransition("task", "in_progress", "in_review").ok).toBe(true);
+    expect(validateTransition("task", "in_review", "done").ok).toBe(true);
+    expect(validateTransition("task", "in_review", "in_progress").ok).toBe(true);
+    expect(validateTransition("task", "in_review", "blocked").ok).toBe(true);
+    expect(validateTransition("task", "todo", "in_review").ok).toBe(false);
+    expect(validateTransition("task", "in_review", "superseded").ok).toBe(false);
+  });
+
   it("rfc draft → proposed → accepted → implemented", () => {
     expect(validateTransition("rfc", "draft", "proposed").ok).toBe(true);
     expect(validateTransition("rfc", "proposed", "accepted").ok).toBe(true);

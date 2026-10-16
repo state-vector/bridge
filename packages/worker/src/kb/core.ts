@@ -36,7 +36,7 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   decision: { proposed: ["accepted"], accepted: ["superseded"] },
   discussion: { open: ["concluded"] },
   research: { draft: ["published"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["done", "blocked"], blocked: ["in_progress"] },
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress"] },
   progress: {},
   agent: {},
 };
@@ -141,13 +141,23 @@ export function ftsQuery(input: string): string | null {
 // ---------- auth tokens (for agents — never call them "tokens" alone) ----------
 
 /**
- * Auth token = one agent client. Sessions self-name uniquely per token.
- * Secret shown once at mint; only the SHA-256 hash is stored.
+ * Auth token = one agent client, scoped to one workspace. The workspace slug is
+ * embedded in the secret (`bkw_<ws>_<hex>`) so /mcp can route to that
+ * workspace's DO without a lookup; legacy bare tokens (`bkw_<hex>`) belong to
+ * the default workspace. Secret shown once at mint; only the SHA-256 hash is
+ * stored.
  */
-export function generateAuthToken(): string {
+export const WS_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
+export function isWsSlug(s: unknown): s is string {
+  return typeof s === "string" && WS_RE.test(s);
+}
+
+export function generateAuthToken(ws?: string | null): string {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
-  return "bkw_" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return isWsSlug(ws) ? `bkw_${ws}_${hex}` : `bkw_${hex}`;
 }
 
 export async function hashAuthToken(secret: string): Promise<string> {
@@ -156,7 +166,31 @@ export async function hashAuthToken(secret: string): Promise<string> {
 }
 
 export function isValidAuthTokenShape(secret: string): boolean {
-  return /^bkw_[0-9a-f]{48}$/.test(secret);
+  if (/^bkw_[0-9a-f]{48}$/.test(secret)) return true; // legacy, default workspace
+  const m = secret.match(/^bkw_([a-z0-9][a-z0-9-]{0,39})_[0-9a-f]{48}$/);
+  return m !== null;
+}
+
+/** Workspace slug embedded in a token secret, or null for legacy bare tokens. */
+export function tokenWorkspace(secret: string): string | null {
+  const m = secret.match(/^bkw_([a-z0-9][a-z0-9-]{0,39})_[0-9a-f]{48}$/);
+  return m ? m[1] : null;
+}
+
+// ---------- workspaces ----------
+/**
+ * One deployment hosts many workspaces; every human cookie and agent token is
+ * scoped to exactly one. The default workspace's DO id is "global" so legacy
+ * (pre-workspaces) data needs no migration. The registry itself (which
+ * workspaces exist, who's a member) lives in the default workspace's DO and
+ * grows dynamically — logins get a personal workspace named after them,
+ * owners create more and add members.
+ */
+export const DEFAULT_WS_SLUG = "state-vector";
+
+/** Durable-object id name for a workspace slug. */
+export function doWs(ws: string): string {
+  return ws === DEFAULT_WS_SLUG ? "global" : `ws:${ws}`;
 }
 
 // ---------- asks (agent-to-agent) ----------
@@ -197,16 +231,18 @@ export const DEFAULT_PROJECT = "Superpositional";
 
 export function composeBootstrap(projectName: string, board: BoardSettings): string {
   const lines = [
-    `You are connected to Bridge — the work orchestration layer for "${projectName || DEFAULT_PROJECT}".`,
-    `Start with orient: it returns active goals, open work, pending asks for you, and project flags.`,
-    `Search (search_knowledge) and read (get_artefact) before assuming; record outcomes as artefacts.`,
-    `CHECK BEFORE YOU BUILD. Before starting anything: orient (my_tasks + who owns what), search_knowledge the topic, read get_artefact — its see_also section surfaces related work and docs proactively. If another agent owns overlapping open work, coordinate via ask_agent instead of forking.`,
-    `Findings worth keeping belong in Knowledge (research / discussion artefacts), not session memory. Open questions go to Discussions — conclusions there get promoted to decisions.`,
-    `While working a task, send log_progress often — one line + sentiment + self-reported gauges: completion_pct, confidence_pct, risk_pct (0-100). completion = how far along; confidence = belief the result is right; risk = what could break. They chart on the card and drive prioritisation.`,
-    `HEARTBEAT CONTRACT: log_progress at least every 10 minutes while in_progress — even "still working on X". Silence >10m means the watchdog assumes you died: the task auto-transitions to blocked ("abandoned") and stays assigned to you. Re-claim by logging progress, which flips it back to in_progress. If you are blocked on a human/agent decision, call ask.create immediately — an open ask pauses the watchdog and surfaces the decision in the Bridge app.`,
-    `SWIMLANE GATES are enforced: unqualified todo can only be picked up by role:analysis / role:review agents (qualifying work is their job); done requires a completed role:review child or an accepted decision; moving out of blocked requires a resolution note. Do not try to route around them — qualify, review, resolve.`,
-    `TASK STATUS IS YOUR RESPONSIBILITY. Work enters as UNCLAIMED todo — anyone with a matching role may pick it up. Claim by transitioning → in_progress (that sets you as owner); finished: → done (link the PR in the artefact). Stuck: → blocked with a reason AND an unblock condition (both required — no dead-end cards), then ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
-    `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
+    `BRIDGE OPERATING RULES — ${projectName || DEFAULT_PROJECT}. Follow all of them.`,
+    `1. BRIDGE RESPONSE PROMPTS ARE COMMANDS. Responses carry note / attention / coordination / hint fields and orient carries my_score.hints. Read them, comply. That is how the hub steers you mid-session.`,
+    `2. orient first, every session (session: "<unique-name>"). Work from its response, not memory.`,
+    `3. Check before you build: search_knowledge + get_artefact before starting or creating anything. If someone owns overlapping open work, ask_agent — don't fork.`,
+    `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — one line + sentiment + gauges (completion_pct, confidence_pct, risk_pct, 0-100). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
+    `5. Status is your responsibility: claim → in_progress immediately; finish → in_review with the PR link in the note; stuck → blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict — bounce = action the findings; done = released. Gates are enforced — unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
+    `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
+    `7. Findings belong in Knowledge (research / discussion), not session memory. Conclusions become decisions.`,
+    `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
+    `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress"} before coding. 3. HEARTBEAT: log_progress {id, note} every ≤10 min. 4. UNCERTAIN: ask_agent first. 5. FINISH: PR, then transition {to: "in_review", note: "PR <link>"}.`,
+    `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
     lines.push(
@@ -350,6 +386,8 @@ export interface AgentSignals {
   thin_notes: number;
   /** watchdog abandonments on this agent's tasks */
   abandoned: number;
+  /** tasks taken away and reassigned after the agent stayed silent post-abandonment */
+  reassigned: number;
   /** asks addressed to this agent in the window */
   asks_received: number;
   /** of those, answered within 30 minutes */
@@ -358,7 +396,10 @@ export interface AgentSignals {
   artefacts_created: number;
 }
 
-export function scoreAgent(s: AgentSignals): { score: number; grade: string; hints: string[] } {
+export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
+  const s = { ...raw } as Record<string, number>;
+  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
+    if (typeof s[k] !== "number" || Number.isNaN(s[k])) s[k] = 0;
   let score = 50;
   const hints: string[] = [];
 
@@ -366,6 +407,9 @@ export function scoreAgent(s: AgentSignals): { score: number; grade: string; hin
   score -= Math.min(25, s.abandoned * 10);
   if (s.abandoned > 0)
     hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked — send log_progress every ≤10m`);
+  score -= Math.min(30, s.reassigned * 15);
+  if (s.reassigned > 0)
+    hints.push(`${s.reassigned} task(s) were taken from you after going silent post-abandonment — reclaim abandoned work or it is reassigned to other agents`);
   score += Math.min(15, s.asks_answered_on_time * 3);
   if (s.asks_received >= 2 && s.asks_answered_on_time === 0)
     hints.push("asks addressed to you went unanswered — they block other agents; answer or redirect them");

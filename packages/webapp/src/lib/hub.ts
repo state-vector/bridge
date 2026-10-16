@@ -4,7 +4,7 @@ import type { ConnStatus } from "./status";
 /**
  * Contract client for the bridge worker (packages/worker):
  *   WS   GET  /ws        server-push only: snapshot | event | decisions | presence
- *   REST GET  /api/state snapshot (human plane, Cloudflare Access via cookie)
+ *   REST GET  /api/state snapshot (human plane, GitHub OAuth session cookie)
  *   REST POST /ingest    one door (machine plane, bearer) — the UI answers by ingesting
  */
 
@@ -42,31 +42,14 @@ export function disconnectHub() {
   ws = null;
 }
 
-/** SSO (Access mode): navigating to the hub root bounces through Access; the SPA is served back. */
+/** GitHub OAuth: navigating to /login bounces through github.com and back with a session cookie. */
 export function signIn(base: string) {
-  window.location.href = base;
-}
-
-/** Password mode (default): POST /login → HMAC session cookie. */
-export async function login(base: string, password: string): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const r = await fetch(`${base}/login`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    if (r.ok) return { ok: true };
-    const body = (await r.json().catch(() => ({}))) as { error?: string };
-    return { ok: false, error: body.error ?? `login failed (${r.status})` };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
+  window.location.href = `${base}/login`;
 }
 
 /** Who is signed in (worker: GET /api/session). null when unauthenticated/unreachable. */
 export interface SessionInfo {
-  mode: "password" | "access";
+  mode: "github" | "access";
   user?: string | null;
   expires_ts?: number | null;
 }

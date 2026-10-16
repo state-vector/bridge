@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { Decision, EventView, Presence, WsFrame } from "@flows/specs";
 import { getConfig, setConfig } from "./config";
 import type { Mode } from "./config";
-import { connectHub, disconnectHub, ingest, reconnect, login, fetchSession, logout } from "./hub";
+import { connectHub, disconnectHub, ingest, reconnect, fetchSession, logout, signIn } from "./hub";
 import type { SessionInfo } from "./hub";
 import type { ConnStatus } from "./status";
 import { rankDecisions } from "./views";
@@ -29,10 +29,9 @@ interface BridgeState {
   dismissOverlay: () => void;
   saveConfig: (patch: { mode?: Mode; url?: string; token?: string }) => void;
   retryConnection: () => void;
-  loginWithPassword: (password: string) => Promise<boolean>;
+  signInWithGithub: () => void;
   loadSession: () => Promise<void>;
   signOut: () => Promise<void>;
-  loginError: string | null;
   resolve: (d: Decision, action: "unblocked" | "completed", note?: string, choice?: string) => Promise<void>;
   steer: (actorId: string, text: string) => Promise<void>;
 }
@@ -71,7 +70,6 @@ export const useBridge = create<BridgeState>((set, get) => {
     url: cfg.url,
     token: cfg.token,
     session: null,
-    loginError: null,
 
     decisions: [],
     presence: [],
@@ -128,24 +126,12 @@ export const useBridge = create<BridgeState>((set, get) => {
     },
 
     retryConnection: () => {
-      set({ conn: "connecting", loginError: null });
+      set({ conn: "connecting" });
       reconnect();
     },
 
-    loginWithPassword: async (password) => {
-      const { url } = get();
-      const res = await login(url, password);
-      if (res.ok) {
-        set({ loginError: null, conn: "connecting" });
-        reconnect();
-        void (async () => {
-          const { useKb } = await import("../store/kb");
-          useKb.getState().start();
-        })();
-        return true;
-      }
-      set({ loginError: res.error ?? "login failed" });
-      return false;
+    signInWithGithub: () => {
+      signIn(get().url);
     },
 
     loadSession: async () => {
@@ -157,7 +143,7 @@ export const useBridge = create<BridgeState>((set, get) => {
       disconnectHub();
       const { useKb } = await import("../store/kb");
       useKb.getState().reset();
-      set({ session: null, loginError: null, conn: "auth" });
+      set({ session: null, conn: "auth" });
     },
 
     resolve: async (d, action, note, choice) => {

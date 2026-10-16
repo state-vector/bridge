@@ -25,6 +25,8 @@ import {
   ARTEFACT_TYPES,
   ArtefactType,
   DEFAULT_BOARD,
+  DEFAULT_WS_SLUG,
+  doWs,
   INITIAL_STATUS,
   LIMITS,
   SETTINGS_KEYS,
@@ -147,6 +149,20 @@ export class KnowledgeHub {
       if (child.status === "done" || child.status === "superseded") parent.children_done++;
       else parent.children_open++;
     }
+    // readiness projection (bulk): declared state + evidence maps + stacked bars
+    const { analysisEv, reviewEv } = this.qualificationEvidence();
+    for (const t of tasks) {
+      const q = t.meta.qualification ?? {};
+      const declared = q.state ?? (t.meta.qualified === true ? "qualified" : undefined);
+      const bars: string[] = q.bars ?? [];
+      const parent = t.part_of ? byId.get(t.part_of) : null;
+      const pq = parent ? (parent.meta.qualification ?? {}) : {};
+      const analysisOk = declared === "qualified"
+        || analysisEv.has(t.id)
+        || (parent && (pq.state === "qualified" || parent.meta.qualified === true || analysisEv.has(parent.id))) === true;
+      const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
+      t.qualification = { state: declared ?? (analysisOk ? "qualified" : "open"), how: q.how, by: q.by, bars, unmet_bars: unmet, ready: analysisOk && unmet.length === 0 };
+    }
     const sessions = this.state.storage.sql.exec(
       `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
@@ -175,7 +191,7 @@ export class KnowledgeHub {
     const sig = (label: string): AgentSignals => {
       let s = signals.get(label);
       if (!s) {
-        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 };
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 };
         signals.set(label, s);
       }
       return s;
@@ -196,6 +212,12 @@ export class KnowledgeHub {
        WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
       windowTs,
     ).toArray() as any[]) sig(r.owner || "unknown").abandoned += r.n;
+    for (const r of this.state.storage.sql.exec(
+      `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`, windowTs,
+    ).toArray() as any[]) {
+      const d = JSON.parse(r.detail ?? "{}");
+      sig(d.prev_owner || "unknown").reassigned++;
+    }
     for (const r of this.state.storage.sql.exec(
       `SELECT owner, COUNT(*) AS n FROM artefacts
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
@@ -292,6 +314,17 @@ export class KnowledgeHub {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS workspaces (
+        slug TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        personal INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        ws TEXT NOT NULL,
+        login TEXT NOT NULL,
+        UNIQUE (ws, login)
+      );
       CREATE TABLE IF NOT EXISTS embeddings (
         artefact_id TEXT PRIMARY KEY,
         vec BLOB NOT NULL,
@@ -330,6 +363,7 @@ export class KnowledgeHub {
       `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
       `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
       `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -400,6 +434,12 @@ export class KnowledgeHub {
             instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD),
           });
         }
+        // ---- workspace registry (global DO; human plane, owner-checked) ----
+        case "ws.seed": return this.json(await this.wsSeed(body.logins ?? []));
+        case "ws.list": return this.json(await this.wsList(String(body.login)));
+        case "ws.create": return this.json(await this.wsCreate(body, String(body.login)));
+        case "ws.join": return this.json(await this.wsJoin(body, String(body.login)));
+        case "ws.members": return this.json(await this.wsMembers(body, String(body.login)));
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
         case "admin.mint":
         case "admin.list_tokens":
@@ -438,11 +478,22 @@ export class KnowledgeHub {
     // project: explicit override or the deployment's project; tasks enter UNCLAIMED (owner = pool)
     const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
     const owner = type === "task" ? String(body.owner ?? "").trim() : String(body.owner ?? actor);
+    // qualifications stack: a publisher may declare self-analyzed readiness AND request
+    // further confirmation bars (await: ["role:review"]) before the task goes ready
+    const createMeta: any = { ...(body.meta ?? {}) };
+    if (type === "task" && (body.qualified === true || (Array.isArray(body.await) && body.await.length))) {
+      createMeta.qualification = {
+        state: body.qualified === true ? "qualified" : "open",
+        how: body.qualified === true ? "self-analyzed" : "open",
+        by: actor, ts,
+        bars: Array.isArray(body.await) ? body.await.map(String) : [],
+      };
+    }
     this.state.storage.sql.exec(
-      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, type, title, status, bodyMd, JSON.stringify({ ...(body.meta ?? {}), session }), owner, ts, ts,
-      tags ? JSON.stringify(tags) : null, ts, project,
+      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, type, title, status, bodyMd, JSON.stringify({ ...createMeta, session }), owner, ts, ts,
+      tags ? JSON.stringify(tags) : null, ts, project, actor,
     );
     if (!bodyMd.trim() && (type === "task" || type === "rfc" || type === "goal")) {
       bodyMd = scaffoldBody(title, owner || actor);
@@ -644,12 +695,9 @@ export class KnowledgeHub {
     return { id };
   }
 
-  /** Swimlane qualification evidence: a done analysis/review child, an accepted decision linked
-   *  either direction, an explicit meta.qualified preset, or inheritance from the parent's
-   *  decomposition (the analysis pass that qualified the parent covered its children). */
-  private qualifyCheck(row: any, kind: "analysis" | "review"): { ok: boolean; via?: string } {
-    const meta = JSON.parse(row.meta ?? "{}");
-    if (meta.qualified) return { ok: true, via: "preset" };
+  /** Pure evidence for a qualification kind: a done analysis/review child, or an accepted
+   *  decision linked either way. Declarations (meta.qualified / meta.qualification) don't count. */
+  private hasEvidence(row: any, kind: "analysis" | "review"): { ok: boolean; via?: string } {
     const roleFilter = kind === "analysis"
       ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')`
       : `c.tags LIKE '%"role:review"%'`;
@@ -665,21 +713,71 @@ export class KnowledgeHub {
       row.id,
     );
     if (dec) return { ok: true, via: dec.id };
+    return { ok: false };
+  }
+
+  /** Swimlane qualification: declared (self-analyzed at intake / preset), pure evidence,
+   *  or inherited from the parent's decomposition (the pass that qualified the parent
+   *  covered its children). */
+  private qualifyCheck(row: any, kind: "analysis" | "review"): { ok: boolean; via?: string } {
+    const meta = JSON.parse(row.meta ?? "{}");
+    const q = meta.qualification ?? {};
+    if (kind === "analysis" && (meta.qualified === true || q.state === "qualified")) return { ok: true, via: "declared" };
+    const ev = this.hasEvidence(row, kind);
+    if (ev.ok) return ev;
     const parent = this.one(
       `SELECT p.id AS id, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
        WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
       row.id,
     );
     if (parent) {
-      if (JSON.parse(parent.meta ?? "{}").qualified) return { ok: true, via: `parent:${parent.id}` };
+      const pm = JSON.parse(parent.meta ?? "{}");
+      if (kind === "analysis" && (pm.qualified === true || (pm.qualification ?? {}).state === "qualified"))
+        return { ok: true, via: `parent:${parent.id}` };
       const sib = this.one(
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${roleFilter} LIMIT 1`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${kind === "analysis"
+           ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')`
+           : `c.tags LIKE '%"role:review"%'`} LIMIT 1`,
         parent.id,
       );
       if (sib) return { ok: true, via: `sibling:${sib.id}` };
     }
     return { ok: false };
+  }
+
+  /** Requested-but-unmet qualification bars (qualifications stack: a publisher may
+   *  self-qualify AND ask for further confirmation before the task goes ready). */
+  private unmetBars(row: any): string[] {
+    const meta = JSON.parse(row.meta ?? "{}");
+    const bars: string[] = (meta.qualification ?? {}).bars ?? [];
+    return bars.filter((b) => !this.hasEvidence(row, /review/.test(b) ? "review" : "analysis").ok);
+  }
+
+  /** Bulk evidence for readiness projections: done role-tagged children per parent +
+   *  accepted decisions per task. Review evidence also satisfies the analysis kind. */
+  private qualificationEvidence(): { analysisEv: Set<string>; reviewEv: Set<string> } {
+    const analysisEv = new Set<string>(), reviewEv = new Set<string>();
+    for (const k of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS pid, c.tags AS tags FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status = 'done'`,
+    ).toArray() as any[]) {
+      const tags: string[] = k.tags ? JSON.parse(k.tags) : [];
+      if (tags.includes("role:review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
+      else if (tags.includes("role:analysis")) analysisEv.add(k.pid);
+    }
+    for (const d of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'`,
+    ).toArray() as any[]) { analysisEv.add(d.tid); reviewEv.add(d.tid); }
+    return { analysisEv, reviewEv };
+  }
+
+  /** Agent roles for an actor label (empty for humans "web" and system actors). */
+  private actorTagsFor(label: string): string[] {
+    if (!label || /^(web|system:)/.test(label)) return [];
+    const row = this.one(`SELECT tags FROM auth_tokens WHERE label = ?`, label);
+    try { return JSON.parse(row?.tags ?? "[]"); } catch { return []; }
   }
 
   private async transition(body: any, actor: string) {
@@ -693,9 +791,19 @@ export class KnowledgeHub {
     const tTags: string[] = row.tags ? JSON.parse(row.tags) : [];
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
     if (row.type === "task" && row.status === "todo" && to === "in_progress" && !isQualifier) {
-      const q = this.qualifyCheck(row, "analysis");
-      if (!q.ok)
-        throw new Error(`task ${id} is not qualified — work cannot be picked up until analysed/reviewed. Qualify it by completing a role:analysis child task, linking an accepted decision, or setting meta.qualified. (role:analysis / role:review agents may pick up unqualified work — that is their job.)`);
+      const aTags = this.actorTagsFor(actor);
+      const actorIsQualifier = aTags.includes("role:analysis") || aTags.includes("role:review");
+      const needRoles = tTags.filter((x) => x.startsWith("role:"));
+      if (needRoles.length && actor !== "web" && !needRoles.some((r) => aTags.includes(r)))
+        throw new Error(`task ${id} is gated to ${needRoles.join(", ")} — your agent roles (${aTags.map((r) => r.replace("role:", "")).join(", ") || "none"}) don't match; agents only see and claim work matching their roles`);
+      if (!actorIsQualifier) {
+        const q = this.qualifyCheck(row, "analysis");
+        if (!q.ok)
+          throw new Error(`task ${id} is not qualified — work cannot be picked up until analysed/reviewed. Qualify it by completing a role:analysis child task, linking an accepted decision, or declaring it at create (qualified: true). (role:analysis / role:review agents may pick up unqualified work — that is their job.)`);
+        const bars = this.unmetBars(row);
+        if (bars.length)
+          throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
+      }
     }
     if (row.type === "task" && to === "done" && !isQualifier) {
       const r = this.qualifyCheck(row, "review");
@@ -706,6 +814,18 @@ export class KnowledgeHub {
       const resolution = String(body.note ?? body.resolution ?? "").trim();
       if (!resolution)
         throw new Error(`moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`);
+    }
+    // handoff gate: "ready for review" must carry the PR — reviewers need something to review
+    if (row.type === "task" && to === "in_review") {
+      const note = String(body.note ?? "").trim();
+      if (!/https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(note))
+        throw new Error(`moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call)`);
+    }
+    // bounce back from review: the reviewer's findings ARE the resolution
+    if (row.status === "in_review" && to === "in_progress") {
+      const findings = String(body.note ?? body.resolution ?? "").trim();
+      if (!findings)
+        throw new Error(`bouncing back from review requires the reviewer's findings (note) — "no" without reasons is not an answer`);
     }
     if (to === "blocked") {
       const reason = String(body.note ?? body.reason ?? "").trim();
@@ -723,7 +843,9 @@ export class KnowledgeHub {
     }
     // claim semantics: in_progress on a task claims it for the actor (system actors don't steal claims)
     let owner = row.owner;
-    if (row.type === "task" && to === "in_progress" && !/^system:/.test(actor) && owner !== actor) {
+    // claim only on fresh pickup or abandoned re-claim — a review bounce returns to the AUTHOR
+    const bounceFromReview = row.status === "in_review";
+    if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = actor;
     }
     // a parent isn't completable while children are open
@@ -803,15 +925,34 @@ export class KnowledgeHub {
     const completion_pct = pct(body.completion_pct);
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
-    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, id);
+    const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
+    const m = this.settingsMap();
+    const myScore = this.agentScores().find((a) => a.label === actor);
+    const scoreLine = myScore
+      ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
+      : "";
+    const instructions = composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine;
     // Re-claim: logging progress on a watchdog-abandoned task flips it back to
     // in_progress (the unblock condition the watchdog promised). Legitimately
     // blocked tasks (human reasons) keep their status until explicitly resumed.
     if (row.status === "blocked" && (meta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id, to: "in_progress", note: "re-claimed — agent resumed (heartbeat)" }, actor);
       delete meta.blocked; // transition cleared it in DB — don't resurrect it here
+    } else if (row.status === "todo") {
+      // progress on an unclaimed task = intent to work it. Claim if allowed;
+      // otherwise say WHY instead of silently logging into a card that never moves.
+      const tTags: string[] = JSON.parse(row.tags ?? "[]");
+      const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
+      const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
+      if (!q.ok) {
+        return {
+          id, note, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+          note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`,
+        };
+      }
+      await this.transition({ id, to: "in_progress", note: "started — progress logged" }, actor);
     }
     meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
     if (body.session && !meta.session) meta.session = body.session;
@@ -821,14 +962,8 @@ export class KnowledgeHub {
     );
     this.audit(actor, "progress", id, { note, sentiment });
     this.version(id, actor, "progress", note, { note, sentiment, completion_pct, confidence_pct, risk_pct });
-    const m = this.settingsMap();
-    const myScore = this.agentScores().find((a) => a.label === actor);
-    const scoreLine = myScore
-      ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
-      : "";
     return {
-      id, note, sentiment, completion_pct, confidence_pct, risk_pct,
-      instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine,
+      id, note, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
     };
   }
 
@@ -1027,15 +1162,37 @@ export class KnowledgeHub {
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','blocked') ORDER BY updated_ts DESC LIMIT 10`,
       label,
     ).toArray();
-    // dispatch surface: unclaimed todo tasks this agent's roles may pick up
+    // dispatch surface: unclaimed todo tasks this agent's roles may pick up.
+    // Work that can't be claimed by this agent is INVISIBLE — no temptation, no noise.
     const myRoles = new Set(tags.filter((t) => t.startsWith("role:")));
+    const isQualifierAgent = tags.includes("role:analysis") || tags.includes("role:review");
     const pool = this.state.storage.sql.exec(
-      `SELECT id, title, tags, project, updated_ts FROM artefacts
+      `SELECT id, title, tags, meta, project, updated_ts FROM artefacts
        WHERE type = 'task' AND status = 'todo' AND owner = '' ORDER BY updated_ts DESC LIMIT 30`,
     ).toArray().map((t: any) => ({ ...t, tags: t.tags ? JSON.parse(t.tags) : [] }));
+    const { analysisEv, reviewEv } = this.qualificationEvidence();
+    const qualIds = new Set(
+      (this.state.storage.sql.exec(
+        `SELECT id FROM artefacts WHERE type = 'task'
+         AND (json_extract(meta, '$.qualification.state') = 'qualified' OR json_extract(meta, '$.qualified') = 1)`,
+      ).toArray() as any[]).map((r) => r.id),
+    );
+    const parentQualified = new Set<string>();
+    for (const l of this.state.storage.sql.exec(
+      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
+    ).toArray() as any[]) {
+      if (qualIds.has(l.dst_id) || analysisEv.has(l.dst_id)) parentQualified.add(l.src_id);
+    }
     const unclaimedWork = pool.filter((t: any) => {
-      const needRoles = (t.tags ?? []).filter((x: string) => x.startsWith("role:"));
-      return needRoles.length === 0 || needRoles.some((r: string) => myRoles.has(r));
+      const need = t.tags.filter((x: string) => x.startsWith("role:"));
+      if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
+      const m = JSON.parse(t.meta ?? "{}");
+      const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
+      if (declared !== "qualified" && !analysisEv.has(t.id) && !parentQualified.has(t.id)) return isQualifierAgent;
+      const bars: string[] = m.qualification?.bars ?? [];
+      const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
+      if (unmet.length) return isQualifierAgent;
+      return true;
     }).slice(0, 10);
     // role playbooks (settings.roles.{analysis,impl,...}) composed for this agent's tags
     const rolesSettings = typeof settings.roles === "object" && settings.roles ? settings.roles : {};
@@ -1043,8 +1200,12 @@ export class KnowledgeHub {
       .filter((t) => t.startsWith("role:"))
       .map((t) => ({ role: t.slice(5), playbook: rolesSettings[t.slice(5)] }))
       .filter((p) => typeof p.playbook === "string" && p.playbook.trim());
+    // reaper: sort out my abandoned work at check-in (see reapAbandoned)
+    const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    const staleMin = staleMinS ? Math.max(1, Math.min(120, parseInt(staleMinS.value, 10) || 10)) : 10;
+    const actionRequired = this.reapAbandoned(label, staleMin);
     const my_score = this.agentScores().find((a) => a.label === label)
-      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
     return {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
@@ -1057,8 +1218,56 @@ export class KnowledgeHub {
       unclaimed_work: unclaimedWork,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
+      action_required: actionRequired.length ? actionRequired : undefined,
       my_score,
     };
+  }
+
+  /**
+   * Reaper: runs at orient (check-in). Blocked-abandoned tasks owned by the
+   * checking-in agent:
+   *  - activity by the agent within the stale window → prompt it to check in
+   *    (log_progress re-claims).
+   *  - no activity → penalty (score counts the reaper event) and the task is
+   *    reassigned: back to unclaimed todo, tagged "attempted", meta.attempt
+   *    records who/when/how many times — the next agent must expect partial work.
+   */
+  private reapAbandoned(label: string, staleMin: number): string[] {
+    const out: string[] = [];
+    const now = Date.now();
+    const staleMs = staleMin * 60_000;
+    for (const t of this.state.storage.sql.exec(
+      `SELECT id, title, meta, tags, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status = 'blocked' AND owner = ?`, label,
+    ).toArray() as any[]) {
+      const meta = JSON.parse(t.meta ?? "{}");
+      if (!(meta.blocked?.reason ?? "").startsWith("abandoned")) continue;
+      const lastOwn = this.one(
+        `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, label,
+      )?.ts ?? 0;
+      const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
+      if (idleFor < staleMs) {
+        out.push(
+          `${t.id} "${t.title}" is marked abandoned but you were active on it recently. log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
+        );
+        continue;
+      }
+      const tags: string[] = JSON.parse(t.tags ?? "[]");
+      if (!tags.includes("attempted")) tags.push("attempted");
+      const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
+      meta.attempt = { by: label, at: now, attempts };
+      delete meta.blocked;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET status = 'todo', owner = '', tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
+      );
+      this.audit("system:reaper", "reassign", t.id, { prev_owner: label, attempts, idle_ms: idleFor });
+      this.version(t.id, "system:reaper", "transition", `reassigned — ${label} silent >${staleMin}m after abandonment (attempt ${attempts})`, { prev_owner: label });
+      out.push(
+        `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it. Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`,
+      );
+    }
+    return out;
   }
 
   /** Project-facing settings only (safe for any authenticated agent). */
@@ -1076,13 +1285,114 @@ export class KnowledgeHub {
 
   // ---------- admin ops (human plane) ----------
 
+  /** stable DO slug for this instance's workspace (set by the registry at creation) */
+  private wsSlug(): string {
+    const m = this.settingsMap() as Record<string, any>;
+    return typeof m.ws_slug === "string" ? m.ws_slug : "";
+  }
+
+  // ---- workspace registry (lives in the "global" KB DO; owner-checked, no admin flag) ----
+
+  /** one-time import of the legacy hard-coded membership list */
+  private async wsSeed(logins: string[]) {
+    const now = Date.now();
+    const slug = DEFAULT_WS_SLUG;
+    // this DO *is* the default workspace — stamp it so tokens minted here embed the slug
+    this.state.storage.sql.exec(
+      `INSERT INTO settings (key, value) VALUES ('ws_slug', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      JSON.stringify(slug),
+    );
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO workspaces (slug, owner, personal, created_ts) VALUES (?, ?, 1, ?)`,
+      slug, logins[0] ?? "legacy", now,
+    );
+    for (const login of logins) {
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO workspace_members (ws, login) VALUES (?, ?)`, slug, login,
+      );
+    }
+    return { ok: true, seeded: logins };
+  }
+
+  private async wsList(login: string) {
+    const rows = this.state.storage.sql.exec(
+      `SELECT w.slug, w.owner, w.personal, w.created_ts,
+              EXISTS(SELECT 1 FROM workspace_members m WHERE m.ws = w.slug AND m.login = ?) AS member
+         FROM workspaces w ORDER BY w.created_ts ASC`,
+      login,
+    ).toArray();
+    return {
+      workspaces: rows.map((r) => ({
+        slug: r.slug, owner: r.owner, personal: !!r.personal,
+        created_ts: r.created_ts, member: !!r.member,
+      })),
+    };
+  }
+
+  /** create: owner = caller; they become the first member; personal workspaces are <login> */
+  private async wsCreate(body: any, login: string) {
+    const slug = String(body.slug ?? "").trim();
+    if (slug === "global" || slug === "legacy") throw new Error("reserved workspace name");
+    if (slug !== login && !/^[a-z0-9][a-z0-9-]{1,39}$/.test(slug)) {
+      throw new Error("slug must be 2-40 chars [a-z0-9-] (or your username for a personal ws)");
+    }
+    if (this.one(`SELECT slug FROM workspaces WHERE slug = ?`, slug)) {
+      throw new Error(`workspace '${slug}' already exists`);
+    }
+    const now = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO workspaces (slug, owner, personal, created_ts) VALUES (?, ?, ?, ?)`,
+      slug, login, slug === login ? 1 : 0, now,
+    );
+    this.state.storage.sql.exec(
+      `INSERT INTO workspace_members (ws, login) VALUES (?, ?)`, slug, login,
+    );
+    // provision the KB DO for this workspace immediately: schema init + ws_slug
+    // stamp so tokens minted there embed this workspace's slug
+    const stub = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(slug)));
+    await stub.fetch("https://kb/bootstrap", { method: "POST", body: "{}" }).catch(() => {});
+    await stub.fetch("https://kb/admin.settings_set", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-kb-admin": "1" },
+      body: JSON.stringify({ settings: { ws_slug: slug } }),
+    }).catch(() => {});
+    return { ok: true, slug };
+  }
+
+  /** join: only the owner of an existing workspace can add members */
+  private async wsJoin(body: any, login: string) {
+    const slug = String(body.ws ?? "").trim();
+    const w = this.one(`SELECT slug, owner FROM workspaces WHERE slug = ?`, slug);
+    if (!w) throw new Error(`no such workspace: ${slug}`);
+    if (w.owner !== login) throw new Error("only the workspace owner can add members");
+    const who = String(body.login ?? "").trim().toLowerCase();
+    if (!/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}$/.test(who)) throw new Error("bad github login");
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO workspace_members (ws, login) VALUES (?, ?)`, slug, who,
+    );
+    return { ok: true, ws: slug, login: who };
+  }
+
+  private async wsMembers(body: any, login: string) {
+    const slug = String(body.ws ?? "").trim();
+    const w = this.one(`SELECT slug, owner FROM workspaces WHERE slug = ?`, slug);
+    if (!w) throw new Error(`no such workspace: ${slug}`);
+    const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, slug, login);
+    if (w.owner !== login && !member) throw new Error("not a member of this workspace");
+    const rows = this.state.storage.sql.exec(
+      `SELECT login FROM workspace_members WHERE ws = ? ORDER BY login`, slug,
+    ).toArray();
+    return { ws: slug, owner: w.owner, members: rows.map((r) => r.login) };
+  }
+
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
-    const secret = generateAuthToken();
+    const secret = generateAuthToken(this.wsSlug());
     const hash = await hashAuthToken(secret);
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();

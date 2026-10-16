@@ -1,7 +1,7 @@
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
-import { LOGIN_HTML } from "./ui.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
+import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
 
 export { KnowledgeHub };
 
@@ -21,16 +21,15 @@ export default {
     // Knowledge realtime (human plane, cookie): KB event fanout.
     if (url.pathname === "/kb-ws") {
       const auth = await checkAuth(request, env);
-      if (auth !== true) return auth;
-      const kbId = env.KB.idFromName("global");
-      return env.KB.get(kbId).fetch("https://kb/ws", request);
+      if (auth instanceof Response) return auth;
+      return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
 
     // Knowledge REST mirror (human plane, cookie).
     if (url.pathname.startsWith("/api/kb/") && !url.pathname.startsWith("/api/kb/admin/")) {
       const auth = await checkAuth(request, env);
-      if (auth !== true) return auth;
-      const kbId = env.KB.idFromName("global");
+      if (auth instanceof Response) return auth;
+      const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
         const kbUrl = sub === "board" ? "https://kb/board"
@@ -68,9 +67,9 @@ export default {
     }
     if (url.pathname.startsWith("/api/kb/admin/")) {
       const auth = await checkAuth(request, env);
-      if (auth !== true) return auth;
+      if (auth instanceof Response) return auth;
       const op = url.pathname.slice("/api/kb/admin/".length);
-      const kbId = env.KB.idFromName("global");
+      const kbId = env.KB.idFromName(doWs(auth.ws));
       const kbHub = env.KB.get(kbId);
       const kbUrl =
         op === "tokens" && request.method === "GET" ? "https://kb/admin.list_tokens"
@@ -80,24 +79,22 @@ export default {
         : op === "settings" ? "https://kb/admin.settings_set"
         : null;
       if (!kbUrl) return new Response("not found", { status: 404 });
+      const body = await request.json().catch(() => ({}));
+      if (op === "tokens") body.ws = auth.ws; // minted tokens scoped to the caller's workspace
       return kbHub.fetch(kbUrl, {
         method: request.method === "GET" ? "POST" : "POST",
         headers: { "content-type": "application/json", "x-kb-admin": "1" },
-        body: JSON.stringify(await request.json().catch(() => ({}))),
+        body: JSON.stringify(body),
       });
     }
 
-    // Human plane. Auth mode: Cloudflare Access JWT when CF_ACCESS_TEAM+AUD are
-    // set, otherwise password login (BRIDGE_UI_PASSWORD) with an HMAC cookie.
-    if (url.pathname === "/login") {
-      if (request.method === "POST") return handleLogin(request, env);
-      return new Response(LOGIN_HTML, {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
-      });
-    }
+    // Human plane. Auth mode: GitHub OAuth (HMAC session cookie), or Cloudflare
+    // Access JWT at the edge when CF_ACCESS_TEAM+AUD are set.
+    if (url.pathname === "/login") return handleGithubLogin(request, env);
+    if (url.pathname === "/login/callback") return handleGithubCallback(request, env);
 
     const auth = await checkAuth(request, env);
-    if (auth !== true) return auth; // login page / 401 / 403 / 503 Response
+    if (auth instanceof Response) return auth; // login page / 401 / 403 / 503 Response
 
     if (url.pathname === "/logout") {
       // Access mode: send the browser to the IdP logout too, or Access re-mints on next nav.
@@ -116,8 +113,40 @@ export default {
     // Human plane session probe: who is signed in (widget + tests).
     if (url.pathname === "/api/session") return handleSession(request, env);
 
-    const id = env.HUB.idFromName("global");
-    const hub = env.HUB.get(id);
+    // Workspaces (human plane): list / create / switch. The registry lives in
+    // the default KB DO; create/switch are membership-checked server-side.
+    if (url.pathname === "/api/workspaces" || url.pathname === "/api/workspaces/switch") {
+      const l = auth.login.toLowerCase();
+      if (request.method === "GET") {
+        const home = await wsHome(env, l);
+        const { workspaces } = await wsCall(env, "ws.list", { login: l });
+        return json({ workspaces, current: auth.ws, home });
+      }
+      if (request.method !== "POST") return json({ error: "GET or POST only" }, 405);
+      const body = await request.json().catch(() => ({}));
+      if (url.pathname === "/api/workspaces") {
+        // create: caller becomes owner + first member (DO-side checks)
+        const out = await wsCall(env, "ws.create", { slug: String(body.slug ?? "").trim().toLowerCase(), login: l });
+        return json(out);
+      }
+      // switch: verify membership, then re-mint the signed cookie for the target ws
+      const ws = String(body.ws ?? "").trim().toLowerCase();
+      const { workspaces } = await wsCall(env, "ws.list", { login: l });
+      if (!workspaces.some((w) => w.slug === ws && w.member)) {
+        return json({ error: `not a member of workspace '${ws}'` }, 403);
+      }
+      const exp = String(Date.now() + SESSION_TTL_MS);
+      const sig = await sign(`${exp}.${auth.login}.${ws}`, env.GITHUB_CLIENT_SECRET);
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Set-Cookie": `${SESSION_COOKIE}=${exp}.${auth.login}.${ws}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+
+    const hub = env.HUB.get(env.HUB.idFromName(doWs(auth.ws)));
     if (url.pathname === "/ws") return hub.fetch("https://hub/ws", request);
     if (url.pathname === "/api/state") return hub.fetch("https://hub/state", request);
     if (url.pathname === "/") return hub.fetch("https://hub/ui", request);
@@ -136,7 +165,8 @@ async function handleIngest(request, env) {
   const events = Array.isArray(body.events) ? body.events : [body];
   if (events.length > 1000) return json({ error: "batch too large" }, 413);
 
-  const id = env.HUB.idFromName("global");
+  // shared ingest token is a machine-plane identity in the default workspace
+  const id = env.HUB.idFromName(doWs(DEFAULT_WS_SLUG));
   const hub = env.HUB.get(id);
   // forward a real request body — spreading a Request loses everything (prototype accessors)
   return hub.fetch("https://hub/ingest", {
@@ -146,21 +176,91 @@ async function handleIngest(request, env) {
   });
 }
 
-// --- auth: optional Access JWT, else password cookie session ---
+// --- auth: GitHub OAuth session cookie, optional Access JWT at the edge ---
+// Workspace scoping: every human + agent token lives in exactly one workspace.
+// Legacy data (pre-workspaces) sits in the "global" DO, which is the default
+// workspace's storage — no migration needed.
+// --- workspaces: dynamic, registry-backed (registry lives in the default KB DO) ---
+// No static member map. On login the registry seeds the legacy membership and
+// ensures a personal workspace named after the username exists; users create
+// more workspaces at runtime and owners add members. Legacy bare agent tokens
+// and legacy cookies map to the default workspace, where all pre-workspaces
+// data lives, so no migration is needed.
+const LEGACY_WS_MEMBERS = ["rayh"]; // one-time import: pre-workspaces state-vector members
+
+function wsRegistry(env) {
+  return env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+}
+
+async function wsCall(env, op, body) {
+  const r = await wsRegistry(env).fetch(`https://kb/${op}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.error ?? `ws ${op} failed`);
+  return out;
+}
+
+/**
+ * Ensure the registry is seeded and this login's personal workspace (named
+ * after their username) exists. Returns the workspace to land in: the default
+ * workspace if they're a member of it, else their personal one.
+ */
+async function wsHome(env, login) {
+  const l = login.toLowerCase();
+  await wsCall(env, "ws.seed", { logins: LEGACY_WS_MEMBERS }).catch(() => {});
+  const { workspaces } = await wsCall(env, "ws.list", { login: l });
+  const mine = workspaces.filter((w) => w.member);
+  const hasDefault = mine.some((w) => w.slug === DEFAULT_WS_SLUG);
+  if (!mine.some((w) => w.slug === l)) {
+    await wsCall(env, "ws.create", { slug: l, login: l }).catch(() => {}); // personal ws (idempotent)
+  }
+  return hasDefault ? DEFAULT_WS_SLUG : l;
+}
+
 const SESSION_COOKIE = "bridge_session";
+const OAUTH_COOKIE = "bridge_oauth";
 const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
 
+function githubConfigured(env) {
+  return !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
+}
+
 async function checkAuth(request, env) {
-  if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) return requireAccess(request, env);
-  if (!env.BRIDGE_UI_PASSWORD) {
-    return json({ error: "auth not configured: set BRIDGE_UI_PASSWORD (or CF_ACCESS_TEAM+AUD)" }, 503);
+  if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) {
+    const a = await requireAccess(request, env);
+    if (a !== true) return a;
+    // TODO: map the Access email to a workspace once Access mode is in use.
+    return { login: null, ws: DEFAULT_WS_SLUG };
+  }
+  // deploy-safety fallback: until the GitHub secrets are set, the legacy shared
+  // password cookie (2-part payload) still works so the human plane never 503s
+  if (!githubConfigured(env)) {
+    if (!env.BRIDGE_UI_PASSWORD) {
+      return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET (or legacy BRIDGE_UI_PASSWORD)" }, 503);
+    }
+    const legacy = parseLegacyPasswordCookie(request, env);
+    return legacy ? { login: null, ws: DEFAULT_WS_SLUG, legacy: true } : loginResponse(request);
   }
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
-  if (!m || !(await verifySession(m[1], env.BRIDGE_UI_PASSWORD))) {
-    return loginResponse(request);
-  }
-  return true;
+  const session = m && (await verifySession(m[1], env.GITHUB_CLIENT_SECRET));
+  if (!session) return loginResponse(request);
+  return session; // { login, ws }
+}
+
+/** legacy password-mode session cookie: `bridge_session=<exp>.<hmac>` signed with BRIDGE_UI_PASSWORD */
+function parseLegacyPasswordCookie(request, env) {
+  const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+  if (!m) return false;
+  const dot = m[1].indexOf(".");
+  if (dot <= 0 || m[1].includes(".", dot + 1)) return false;
+  const exp = m[1].slice(0, dot);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  // verifySession's HMAC helper; the legacy secret is the password itself
+  return sign(exp, env.BRIDGE_UI_PASSWORD).then((expected) => expected === m[1].slice(dot + 1));
 }
 
 async function handleSession(request, env) {
@@ -178,36 +278,106 @@ async function handleSession(request, env) {
       return json({ mode: "access", user: null });
     }
   }
+  if (!githubConfigured(env)) {
+    const legacy = await parseLegacyPasswordCookie(request, env);
+    if (!legacy) return json({ mode: "password", user: null, workspace: DEFAULT_WS_SLUG });
+    const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+    return json({ mode: "password", user: null, workspace: DEFAULT_WS_SLUG, expires_ts: Number(m[1].slice(0, m[1].indexOf("."))) });
+  }
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
-  const dot = m ? m[1].indexOf(".") : -1;
-  const expires_ts = dot > 0 && /^\d+$/.test(m[1].slice(0, dot)) ? Number(m[1].slice(0, dot)) : null;
-  return json({ mode: "password", user: null, expires_ts });
+  const session = m && (await verifySession(m[1], env.GITHUB_CLIENT_SECRET));
+  if (!session) return json({ mode: "github", user: null });
+  const dot = m[1].indexOf(".");
+  return json({ mode: "github", user: session.login, workspace: session.ws, expires_ts: Number(m[1].slice(0, dot)) });
 }
 
-function loginResponse(request) {  const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
+function loginResponse(request) {
+  const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
   if (wantsHtml) {
-    return new Response(LOGIN_HTML, {
-      status: 200,
-      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/login", "Cache-Control": "no-store" },
     });
   }
-  return json({ error: "unauthorized: POST /login {password}" }, 401);
+  return json({ error: "unauthorized: sign in via GET /login (github oauth)" }, 401);
 }
 
-async function handleLogin(request, env) {
-  if (!env.BRIDGE_UI_PASSWORD) return json({ error: "auth not configured" }, 503);
-  let body;
-  try { body = await request.json(); } catch { return json({ error: "bad json" }, 400); }
-  const pw = String(body.password ?? "");
-  const a = new TextEncoder().encode(pw), b = new TextEncoder().encode(env.BRIDGE_UI_PASSWORD);
-  let diff = a.length ^ b.length;
-  for (let i = 0; i < Math.min(a.length, b.length); i++) diff |= a[i] ^ b[i];
-  if (a.length !== b.length || diff !== 0) return json({ error: "wrong password" }, 403);
+function startGithubLogin(env, state) {
+  const redirect = new URL("https://github.com/login/oauth/authorize");
+  redirect.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+  redirect.searchParams.set("state", state);
+  redirect.searchParams.set("scope", "read:user");
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: String(redirect),
+      "Set-Cookie": `${OAUTH_COOKIE}=${state}; Max-Age=600; Path=/; HttpOnly; Secure; SameSite=Lax`,
+      "Cache-Control": "no-store",
+    },
+  });
+}
 
+function handleGithubLogin(request, env) {
+  if (!githubConfigured(env)) {
+    return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET" }, 503);
+  }
+  const state = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+  return startGithubLogin(env, state);
+}
+
+function oauthFailure(origin) {
+  const headers = new Headers({ Location: `${origin}/?login=failed`, "Cache-Control": "no-store" });
+  headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleGithubCallback(request, env) {
+  if (!githubConfigured(env)) return json({ error: "auth not configured" }, 503);
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const m = (request.headers.get("Cookie") || "").match(new RegExp(`${OAUTH_COOKIE}=([^;\\s]+)`));
+  if (!code || !state || !m || m[1] !== state) return oauthFailure(url.origin);
+
+  const tokRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code }),
+  });
+  const tok = await tokRes.json().catch(() => ({}));
+  if (!tok.access_token) return oauthFailure(url.origin);
+
+  const uRes = await fetch("https://api.github.com/user", {
+    headers: {
+      authorization: `Bearer ${tok.access_token}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "bridge",
+    },
+  });
+  const u = await uRes.json().catch(() => ({}));
+  if (!u.login) return oauthFailure(url.origin);
+
+  // workspace resolution is dynamic: seed the registry, ensure the login's
+  // personal workspace exists, land in the default ws if they're a member
+  let ws;
+  try {
+    ws = await wsHome(env, u.login);
+  } catch {
+    return oauthFailure(url.origin);
+  }
   const exp = String(Date.now() + SESSION_TTL_MS);
-  const cookie = `${SESSION_COOKIE}=${exp}.${await sign(exp, env.BRIDGE_UI_PASSWORD)}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`;
-  return json({ ok: true }, 200, { "Set-Cookie": cookie });
+  const sig = await sign(`${exp}.${u.login}.${ws}`, env.GITHUB_CLIENT_SECRET);
+  const headers = new Headers({
+    Location: "/",
+    "Cache-Control": "no-store",
+  });
+  headers.append(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=${exp}.${u.login}.${ws}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+  );
+  headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  return new Response(null, { status: 302, headers });
 }
 
 function hex(buf) {
@@ -220,16 +390,25 @@ async function sign(payload, secret) {
   return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
 }
 
+// cookie value = "<expiry_ms>.<github_login>.<workspace>.<hmac>"; legacy cookies
+// (no workspace segment) map to the default workspace. Returns { login, ws } or null.
+// GitHub logins are [A-Za-z0-9-] and slugs [a-z0-9-], so neither contains a dot.
 async function verifySession(value, secret) {
-  const dot = value.lastIndexOf(".");
-  if (dot <= 0) return false;
-  const exp = value.slice(0, dot), sig = value.slice(dot + 1);
-  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
-  const expected = await sign(exp, secret);
-  if (expected.length !== sig.length) return false;
+  const i1 = value.indexOf("."), i2 = value.lastIndexOf(".");
+  if (i1 <= 0 || i2 <= i1) return null;
+  const exp = value.slice(0, i1), mid = value.slice(i1 + 1, i2), sig = value.slice(i2 + 1);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return null;
+  const md = mid.lastIndexOf(".");
+  let login, ws, signed;
+  if (md > 0) { login = mid.slice(0, md); ws = mid.slice(md + 1); signed = `${exp}.${login}.${ws}`; }
+  else { login = mid; ws = DEFAULT_WS_SLUG; signed = `${exp}.${login}`; }
+  if (!/^[A-Za-z0-9-]{1,39}$/.test(login)) return null;
+  if (!isWsSlug(ws)) return null;
+  const expected = await sign(signed, secret);
+  if (expected.length !== sig.length) return null;
   let diff = 0;
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
-  return diff === 0;
+  return diff === 0 ? { login, ws } : null;
 }
 
 // --- optional: Cloudflare Access JWT validation (kept for when Zero Trust is on) ---

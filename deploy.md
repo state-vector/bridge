@@ -22,17 +22,36 @@ npx wrangler secret put FLOWS_INGEST_TOKEN   # generate: openssl rand -hex 24
 
 ```
 
-## 2. Human-plane auth (password — Zero Trust/Access NOT enabled, it's paid)
+## 2. Human-plane auth (GitHub OAuth)
 
-Worker serves its own login page; sessions are HMAC-signed cookies (30d).
+Sign-in is GitHub OAuth: `GET /login` → github.com → `GET /login/callback` →
+HMAC session cookie (30d), signed with `GITHUB_CLIENT_SECRET`. Anyone with a
+GitHub account can sign in (public app).
+
+1. github.com → Settings → Developer settings → OAuth Apps → **New OAuth App**:
+   - Homepage: `https://bridge.ray-013.workers.dev`
+   - Callback: `https://bridge.ray-013.workers.dev/login/callback`
+2. Store the secrets:
 
 ```bash
 cd ~/flows/packages/worker
-npx wrangler secret put BRIDGE_UI_PASSWORD   # share with Grace; rotate = re-put
+npx wrangler secret put GITHUB_CLIENT_ID
+npx wrangler secret put GITHUB_CLIENT_SECRET
+# rotate = re-put (also invalidates all session cookies — they're HMAC-signed with the secret)
+npx wrangler secret delete BRIDGE_UI_PASSWORD   # if the old shared password was set
 ```
 
+**Workspace scoping.** Every human session is scoped to one workspace slug —
+its own DOs (`ws:<slug>`), so users only see content from their workspace:
+
+- `WORKSPACE_MEMBERS` (optional secret): JSON map slug → GitHub logins, e.g.
+  `{"state-vector":["rayh"],"client-x":["grace"]}`. A login in no list gets an
+  isolated auto-workspace `gh-<login>` (empty, private).
+- Legacy pre-workspaces session cookies map to the default workspace
+  `state-vector` (re-login refreshes the cookie with the workspace segment).
+
 (Optional later: set CF_ACCESS_TEAM + CF_ACCESS_AUD secrets and the same code
-switches to Cloudflare Access JWT validation — both paths ship.)
+switches to Cloudflare Access JWT validation at the edge — both paths ship.)
 
 ## 3. Shipper on the EC2 box
 
@@ -52,7 +71,7 @@ curl -s $URL/api/state | python3 -m json.tool | head      # events present
 curl -s -X POST $URL/ingest -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"events":[{"id":"probe:1","source":"probe","kind":"created","ts":'$(date +%s)',"title":"ingest probe"}]}'
-# UI: open $URL in browser → Access login → decisions/feed/presence live
+# UI: open $URL in browser → GitHub login → decisions/feed/presence live
 ```
 
 ## 5. Webapp (served by the worker, same URL)
@@ -67,8 +86,9 @@ npm run build -w @flows/webapp          # → packages/webapp/dist (commit the d
 
 `wrangler.toml [assets]` serves the SPA at `/` with `run_worker_first` for
 `/ingest`, `/api/state`, `/ws`, `/ui`, `/login`, `/logout`. Human auth is the
-password session (`BRIDGE_UI_PASSWORD` → `POST /login` → HMAC cookie); the panel
-prompts for it in-place, and the ingest token is set in the panel's ⚙ settings.
+GitHub OAuth session (`GET /login` → github.com → HMAC cookie); the panel shows
+a sign-in banner when unauthenticated, and the ingest token is set in the
+panel's ⚙ settings.
 
 ## 6. Desktop app (Tauri menubar)
 
@@ -77,8 +97,7 @@ npm run build -w @flows/desktop         # → src-tauri/target/release/bundle/ma
 ```
 
 - Live mode (default): the panel loads the **deployed** URL same-origin; sign in
-  with the hub password in the banner when prompted (cookie persists in the
-  webview). Remote-URL IPC is allowed via
+  with GitHub in the banner when prompted (cookie persists in the webview). Remote-URL IPC is allowed via
   `src-tauri/capabilities/remote-hub.json` (notifications + panel commands).
 - Offline/demo: settings (⚙) → mode `mock` + `npm run hub -w @flows/webapp`.
 - Notification buttons (Unblock / Done) answer decisions by POSTing to `/ingest`

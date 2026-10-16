@@ -29,10 +29,12 @@ new_sqlite_classes = ["KnowledgeHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/ingest", "/api/state", "/api/session", "/ws", "/ui", "/login", "/logout", "/mcp", "/api/kb/*", "/kb-ws"]
+run_worker_first = ["/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/kb-ws"]
 
 [vars]
 # Overridden by `wrangler secret put` at deploy:
-#   FLOWS_INGEST_TOKEN  shared bearer for POST /ingest
-#   CF_ACCESS_TEAM      https://<team>.cloudflareaccess.com
-#   CF_ACCESS_AUD       02bf2012058821d837180e16d3146cc0
+#   GITHUB_CLIENT_ID      GitHub OAuth app client id (human sign-in)
+#   GITHUB_CLIENT_SECRET  GitHub OAuth app client secret (also HMAC-signs session cookies)
+#   FLOWS_INGEST_TOKEN    shared bearer for POST /ingest
+#   CF_ACCESS_TEAM        optional: https://<team>.cloudflareaccess.com (edge JWT mode)
+#   CF_ACCESS_AUD         optional: Access application AUD tag
