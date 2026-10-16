@@ -37,6 +37,8 @@ const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
 function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   const conn = useBridge((s) => s.conn);
   const kbConn = useKb((s) => s.conn);
+  const session = useBridge((s) => s.session);
+  const signOut = useBridge((s) => s.signOut);
 
   return (
     <header className="topbar">
@@ -52,6 +54,13 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
           </button>
         ))}
       </nav>
+      {session && (
+        <div className="user-widget" title={session.expires_ts ? `session expires ${new Date(session.expires_ts).toLocaleString()}` : session.mode}>
+          <span className="user-mode">{session.mode === "access" ? "SSO" : "shared"}</span>
+          <span className="user-name">{session.user ?? "admin"}</span>
+          <button className="opt-btn user-out" onClick={() => void signOut()}>Sign out</button>
+        </div>
+      )}
     </header>
   );
 }
@@ -110,7 +119,10 @@ export default function App() {
     connectHub({
       base: useBridge.getState().url,
       token: useBridge.getState().token,
-      onStatus: (status) => useBridge.setState({ conn: status }),
+      onStatus: (status) => {
+        useBridge.setState({ conn: status });
+        if (status === "open") void useBridge.getState().loadSession();
+      },
       onFrame: (frame: WsFrame) => useBridge.getState().applyFrame(frame),
     });
     useKb.getState().start();

@@ -41,6 +41,16 @@ body { background: transparent; color: var(--text); }
 }
 .brand { font-weight: 700; font-size: 14px; letter-spacing: 0.02em; }
 .conn { font-size: 9px; margin-left: 6px; vertical-align: 2px; }
+.user-widget {
+  margin-left: auto; display: flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--text-dim);
+}
+.user-mode {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-faint); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
+}
+.user-name { color: var(--text); font-weight: 600; }
+.user-out { padding: 3px 9px; font-size: 11px; }
 .conn-open { color: var(--green); }
 .conn-connecting { color: var(--amber); }
 .conn-closed { color: var(--red); }

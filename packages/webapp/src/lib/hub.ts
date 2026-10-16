@@ -64,6 +64,32 @@ export async function login(base: string, password: string): Promise<{ ok: boole
   }
 }
 
+/** Who is signed in (worker: GET /api/session). null when unauthenticated/unreachable. */
+export interface SessionInfo {
+  mode: "password" | "access";
+  user?: string | null;
+  expires_ts?: number | null;
+}
+
+export async function fetchSession(base: string): Promise<SessionInfo | null> {
+  try {
+    const r = await fetch(`${base}/api/session`, { credentials: "include" });
+    if (!r.ok) return null;
+    return (await r.json()) as SessionInfo;
+  } catch {
+    return null;
+  }
+}
+
+/** POST /logout → clears the cookie (Access mode additionally redirects through the IdP). */
+export async function logout(base: string): Promise<void> {
+  try {
+    await fetch(`${base}/logout`, { credentials: "include", redirect: "follow" });
+  } catch {
+    /* clearing locally anyway */
+  }
+}
+
 function dial() {
   if (stopped || !cfg) return;
   const { base, onStatus } = cfg;

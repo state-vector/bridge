@@ -426,7 +426,36 @@ export class KnowledgeHub {
       const ref = issueRef(title);
       if (ref) { try { await this.enrichFromGitHub(id, ref); } catch { /* GH unavailable — stay bare */ } }
     }
+    if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
     return { id, type, status };
+  }
+
+  /** A progress artefact (meta.task → task id) doubles as a heartbeat on that task:
+   *  auto-starts todo tasks, re-claims watchdog-abandoned ones, and bumps last_progress.
+   *  Agents post updates as progress logs instead of calling log_progress on the task —
+   *  without this, the task card never moves. */
+  private async progressHeartbeat(metaObj: any, title: string, actor: string) {
+    const raw = String(metaObj?.task ?? "").trim();
+    if (!raw) return;
+    const candidates = [raw, raw.replace(/^#/, "BR#"), `BR#${raw.replace(/^#/, "")}`];
+    const t = candidates
+      .map((c) => this.one(`SELECT id, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, c))
+      .find(Boolean);
+    if (!t) return;
+    const tmeta = JSON.parse(t.meta ?? "{}");
+    if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
+      await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
+      delete tmeta.blocked;
+    } else if (t.status === "todo") {
+      await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
+    }
+    tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+      JSON.stringify(tmeta), Date.now(), t.id,
+    );
+    this.version(t.id, actor, "progress", title.slice(0, 500), { note: title.slice(0, 200) });
+    this.audit(actor, "progress", t.id, { note: title.slice(0, 200), via: "progress_artefact" });
   }
 
   private async get(id: string) {
@@ -563,6 +592,7 @@ export class KnowledgeHub {
     const metaObj = body.meta !== undefined ? JSON.parse(JSON.stringify(body.meta)) : JSON.parse(row.meta ?? "{}");
     if (reclaimed) delete metaObj.blocked;
     const meta = JSON.stringify(metaObj);
+    if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
     const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);

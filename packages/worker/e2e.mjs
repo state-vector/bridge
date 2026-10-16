@@ -155,10 +155,37 @@ await new Promise((resolveWs) => {
   };
   tryWs(0);
 });
+const sess = await j("/api/session");
+checks["session endpoint (mode + expiry)"] = sess.body.mode === "password" && typeof sess.body.expires_ts === "number" && sess.body.expires_ts > Date.now();
 const mintC = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `tmp-${uid}` }) });
 const tokensNow = await j("/api/kb/admin/tokens");
 await j("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id: tokensNow.body.tokens.find((t) => t.label === `tmp-${uid}`)?.id }) });
 checks["revoked token -32001"] = (await rpc("tools/list", {}, mintC.body.secret)).error?.code === -32001;
+// progress-artefact heartbeat: agents post progress logs instead of log_progress;
+// creating a progress artefact with meta.task must auto-start the todo task
+const hbT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat probe ${uid}` });
+checks["heartbeat probe starts todo"] = hbT.json?.status === "todo";
+const hbP = await tool(A, "create_artefact", { type: "progress", title: `Heartbeat probe log ${uid} — making real progress on the heartbeat path`, meta: { task: hbT.json.id } });
+checks["progress artefact created"] = !hbP.isError;
+const hbBoard = await j("/api/kb/board");
+const hbTask = hbBoard.body.tasks?.find((t) => t.id === hbT.json.id);
+checks["progress artefact auto-starts todo → in_progress"] = hbTask?.status === "in_progress";
+checks["progress artefact bumps task last_progress"] = !!hbTask?.meta?.last_progress && /Heartbeat probe log/.test(hbTask.meta.last_progress.note ?? "");
+checks["progress artefact feeds task series"] = (hbBoard.body.series ?? []).some((s) => s.artefact_id === hbT.json.id);
+// blocked-on-decision tasks must NOT be force-started by a progress artefact
+const bdT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat decision probe ${uid}` });
+await tool(A, "transition", { id: bdT.json.id, to: "in_progress" });
+await tool(A, "ask_agent", { artefact_id: bdT.json.id, to: "any", question: `hold for decision ${uid}?` });
+checks["decision probe is blocked-on-decision"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === bdT.json.id)?.status === "blocked";
+await tool(A, "create_artefact", { type: "progress", title: `should not start a blocked-on-decision task ${uid}`, meta: { task: bdT.json.id } });
+const bdBoard = await j("/api/kb/board");
+checks["progress artefact respects blocked-on-decision"] = bdBoard.body.tasks?.find((t) => t.id === bdT.json.id)?.status === "blocked";
+
+// logout round-trip — last, so the shared cookie survives the rest of the suite
+const out = await fetch(base + "/logout", { headers: { cookie }, redirect: "manual" });
+checks["logout clears cookie"] = out.status === 302 && /Max-Age=0/.test(out.headers.get("set-cookie") ?? "");
+// note: the HMAC session cookie stays valid if manually replayed (stateless) —
+// logout works by making the BROWSER drop it; no server-side session store.
 console.log("---");
 let all = true;
 for (const [k, v] of Object.entries(checks)) { console.log(v ? "PASS" : "FAIL", k); all &&= v; }

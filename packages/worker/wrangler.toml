@@ -29,7 +29,7 @@ new_sqlite_classes = ["KnowledgeHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/ingest", "/api/state", "/ws", "/ui", "/login", "/logout", "/mcp", "/api/kb/*", "/kb-ws"]
+run_worker_first = ["/ingest", "/api/state", "/api/session", "/ws", "/ui", "/login", "/logout", "/mcp", "/api/kb/*", "/kb-ws"]
 
 [vars]
 # Overridden by `wrangler secret put` at deploy:

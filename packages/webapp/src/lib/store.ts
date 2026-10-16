@@ -2,7 +2,8 @@ import { create } from "zustand";
 import type { Decision, EventView, Presence, WsFrame } from "@flows/specs";
 import { getConfig, setConfig } from "./config";
 import type { Mode } from "./config";
-import { connectHub, disconnectHub, ingest, reconnect, login } from "./hub";
+import { connectHub, disconnectHub, ingest, reconnect, login, fetchSession, logout } from "./hub";
+import type { SessionInfo } from "./hub";
 import type { ConnStatus } from "./status";
 import { rankDecisions } from "./views";
 
@@ -13,6 +14,7 @@ interface BridgeState {
   mode: Mode;
   url: string;
   token: string;
+  session: SessionInfo | null;
 
   decisions: Decision[];
   presence: Presence[];
@@ -28,6 +30,8 @@ interface BridgeState {
   saveConfig: (patch: { mode?: Mode; url?: string; token?: string }) => void;
   retryConnection: () => void;
   loginWithPassword: (password: string) => Promise<boolean>;
+  loadSession: () => Promise<void>;
+  signOut: () => Promise<void>;
   loginError: string | null;
   resolve: (d: Decision, action: "unblocked" | "completed", note?: string, choice?: string) => Promise<void>;
   steer: (actorId: string, text: string) => Promise<void>;
@@ -66,6 +70,7 @@ export const useBridge = create<BridgeState>((set, get) => {
     mode: cfg.mode,
     url: cfg.url,
     token: cfg.token,
+    session: null,
     loginError: null,
 
     decisions: [],
@@ -133,10 +138,26 @@ export const useBridge = create<BridgeState>((set, get) => {
       if (res.ok) {
         set({ loginError: null, conn: "connecting" });
         reconnect();
+        void (async () => {
+          const { useKb } = await import("../store/kb");
+          useKb.getState().start();
+        })();
         return true;
       }
       set({ loginError: res.error ?? "login failed" });
       return false;
+    },
+
+    loadSession: async () => {
+      set({ session: await fetchSession(get().url) });
+    },
+
+    signOut: async () => {
+      await logout(get().url);
+      disconnectHub();
+      const { useKb } = await import("../store/kb");
+      useKb.getState().reset();
+      set({ session: null, loginError: null, conn: "auth" });
     },
 
     resolve: async (d, action, note, choice) => {

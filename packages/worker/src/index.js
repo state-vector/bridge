@@ -100,14 +100,21 @@ export default {
     if (auth !== true) return auth; // login page / 401 / 403 / 503 Response
 
     if (url.pathname === "/logout") {
+      // Access mode: send the browser to the IdP logout too, or Access re-mints on next nav.
+      const loc = env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD
+        ? `${env.CF_ACCESS_TEAM}/cdn-cgi/access/logout`
+        : "/";
       return new Response(null, {
         status: 302,
         headers: {
           "Set-Cookie": `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`,
-          "Location": "/",
+          "Location": loc,
         },
       });
     }
+
+    // Human plane session probe: who is signed in (widget + tests).
+    if (url.pathname === "/api/session") return handleSession(request, env);
 
     const id = env.HUB.idFromName("global");
     const hub = env.HUB.get(id);
@@ -156,8 +163,29 @@ async function checkAuth(request, env) {
   return true;
 }
 
-function loginResponse(request) {
-  const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
+async function handleSession(request, env) {
+  if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) {
+    const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
+    try {
+      const { jwtVerify, createRemoteJWKSet } = await import("jose");
+      const { payload } = await jwtVerify(
+        jwt ?? "",
+        createRemoteJWKSet(new URL(`${env.CF_ACCESS_TEAM}/cdn-cgi/access/certs`)),
+        { issuer: env.CF_ACCESS_TEAM, audience: env.CF_ACCESS_AUD },
+      );
+      return json({ mode: "access", user: payload.email ?? null });
+    } catch {
+      return json({ mode: "access", user: null });
+    }
+  }
+  const cookie = request.headers.get("Cookie") || "";
+  const m = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+  const dot = m ? m[1].indexOf(".") : -1;
+  const expires_ts = dot > 0 && /^\d+$/.test(m[1].slice(0, dot)) ? Number(m[1].slice(0, dot)) : null;
+  return json({ mode: "password", user: null, expires_ts });
+}
+
+function loginResponse(request) {  const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
   if (wantsHtml) {
     return new Response(LOGIN_HTML, {
       status: 200,

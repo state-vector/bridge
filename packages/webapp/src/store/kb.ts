@@ -38,6 +38,7 @@ interface KbState {
 
   start: () => void;
   stop: () => void;
+  reset: () => void;
   refresh: () => Promise<void>;
   refreshAdmin: () => Promise<void>;
   mint: (label: string, tags: string[], transport?: string) => Promise<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>;
@@ -85,6 +86,12 @@ export const useKb = create<KbState>((set, get) => ({
   stop: () => {
     stopWs?.();
     stopWs = null;
+  },
+
+  reset: () => {
+    stopWs?.();
+    stopWs = null;
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], events: [], lastSeq: 0, tokens: [], settings: {} });
   },
 
   refresh: async () => {
