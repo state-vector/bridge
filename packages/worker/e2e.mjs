@@ -108,6 +108,17 @@ const reclaim = await tool(A, "log_progress", { id: staleT.json.id, note: "back 
 checks["log_progress re-claims abandoned task"] = !reclaim.isError;
 const boardAfterReclaim = await j("/api/kb/board");
 checks["re-claimed → in_progress"] = boardAfterReclaim.body.tasks?.find((t) => t.id === staleT.json.id)?.status === "in_progress";
+checks["re-claimed task stayed abandoned (server keeps latest status)"] = wdTask?.meta?.blocked?.reason != null && /abandoned/.test(wdTask?.meta?.blocked?.reason ?? "");
+
+// silence cycle 2: re-abandon without an open ask this time → proves resume isn't what masked it
+const again = await pollBoard((t) => t.id === staleT.json.id && t?.status === "blocked" && /abandoned/.test(t?.meta?.blocked?.reason ?? ""), 130_000);
+checks["silence cycle 2 → abandoned again (no ask masking)"] = !!again;
+// cycle 2 re-claim via update_artefact — any mutation is a heartbeat; stale meta.blocked must be stripped
+const upd = await tool(A, "update_artefact", { id: staleT.json.id, body_md: "agent touched this via update_artefact" });
+checks["update_artefact re-claims abandoned task"] = !upd.isError;
+const boardAfterUpd = await j("/api/kb/board");
+const updTask = boardAfterUpd.body.tasks?.find((t) => t.id === staleT.json.id);
+checks["update re-claim → in_progress, blocked meta stripped"] = updTask?.status === "in_progress" && updTask?.meta?.blocked == null;
 
 // blocked validation: no reason → 400; with reason+unblock → ok; meta.blocked present
 const badBlock = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked" }) });

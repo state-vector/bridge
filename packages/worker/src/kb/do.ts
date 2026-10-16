@@ -88,7 +88,9 @@ export class KnowledgeHub {
     for (const r of rows as any[]) {
       const meta = JSON.parse(r.meta ?? "{}");
       if (meta.awaiting_ask) continue;
-      const lastTs = meta.last_progress?.ts ?? r.status_ts ?? r.updated_ts ?? 0;
+      const lastTs = Math.max(
+        meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
+      );
       if (now - lastTs <= staleMs) continue;
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
@@ -490,9 +492,19 @@ export class KnowledgeHub {
     const id = String(body.id ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
+    // any mutation is a heartbeat: abandoned tasks re-claim on first contact
+    const preMeta = JSON.parse(row.meta ?? "{}");
+    const reclaimed =
+      row.status === "blocked" && (preMeta.blocked?.reason ?? "").startsWith("abandoned");
+    if (reclaimed) {
+      await this.transition({ id, to: "in_progress", note: "re-claimed — agent resumed (heartbeat)" }, actor);
+    }
     const title = body.title !== undefined ? String(body.title) : row.title;
     const bodyMd = body.body_md !== undefined ? String(body.body_md) : row.body_md;
-    const meta = body.meta !== undefined ? JSON.stringify(body.meta) : row.meta;
+    // row.meta predates the re-claim transition — strip the stale blocked record so we don't resurrect it
+    const metaObj = body.meta !== undefined ? JSON.parse(JSON.stringify(body.meta)) : JSON.parse(row.meta ?? "{}");
+    if (reclaimed) delete metaObj.blocked;
+    const meta = JSON.stringify(metaObj);
     const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);
@@ -608,6 +620,7 @@ export class KnowledgeHub {
     // blocked tasks (human reasons) keep their status until explicitly resumed.
     if (row.status === "blocked" && (meta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id, to: "in_progress", note: "re-claimed — agent resumed (heartbeat)" }, actor);
+      delete meta.blocked; // transition cleared it in DB — don't resurrect it here
     }
     meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
     if (body.session && !meta.session) meta.session = body.session;
