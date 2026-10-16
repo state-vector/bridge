@@ -94,13 +94,19 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
     return (risk * 0.5 + lowConf * 0.5) + (stale === "dead" ? 40 : stale === "warn" ? 15 : 0);
   }, [p, stale]);
 
+  // humans requeue, agents claim: no "start" button — blocked cards get "retry",
+  // which pushes the card back to todo (unclaimed pool) for any agent to pick up
   const next: Record<string, string[]> = {
-    todo: ["in_progress", "blocked"],
+    todo: ["blocked"],
     in_progress: ["done", "blocked"],
-    blocked: ["in_progress"],
+    blocked: ["todo"],
     done: [],
   };
-  const label: Record<string, string> = { in_progress: "start", done: "done" };
+  const label: Record<string, string> = { done: "done" };
+  const transition = useKb((s) => s.transition);
+  const retry = async () => {
+    try { await transition(task.id, "todo"); } catch { /* card stays blocked — e.g. open ask still pending */ }
+  };
 
   return (
     <div
@@ -113,8 +119,17 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
         {task.title}
       </div>
       <div className="task-row task-status-row">
-        {prefs.status && <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>}
-        {prefs.age && task.status !== "done" && (
+        {prefs.status && task.status === "blocked" && task.meta?.blocked?.class === "subprocess" && !task.meta?.blocked?.reason?.startsWith("abandoned") ? (
+          <span className="st-chip st-amber" title="declared subprocess block — watchdog paused until the declared budget lapses">subprocess{task.meta.blocked.deadline_ts ? ` · until ${new Date(task.meta.blocked.deadline_ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</span>
+        ) : prefs.status && (
+          <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>
+        )}
+        {prefs.age && task.status === "in_progress" && task.meta?.grace_until && task.meta.grace_until > now && (
+          <span className="age-chip age-fresh" title="declared grace window — the agent stated it will be silent until then">
+            silent until {new Date(task.meta.grace_until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          </span>
+        )}
+        {prefs.age && task.status !== "done" && !(task.status === "in_progress" && task.meta?.grace_until > now) && (
           <span className={`age-chip age-${stale}`} title="time since any agent touched this card — live, orange >30m, red >1h">
             {ageClock(lastSignal, now)} since update{STALE_LABEL[stale]}
           </span>
@@ -136,6 +151,12 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
         const snippet = (task.body_md ?? "").split("\n").find((l: string) => l.trim() && !l.startsWith("#")) ?? "";
         return snippet ? <div className="task-snippet">{snippet.slice(0, 140)}{snippet.length > 140 ? "…" : ""}</div> : null;
       })()}
+
+      {p?.will && (
+        <div className="task-snippet task-will" title="the agent's declared next action — what it was about to do when it last checked in">
+          ▸ {p.will.slice(0, 140)}{p.will.length > 140 ? "…" : ""}
+        </div>
+      )}
 
       {prefs.tags && (task.tags ?? []).length > 0 && (
         <div className="task-tags">
@@ -184,9 +205,20 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
 
       <div className="task-actions" onClick={(e) => e.stopPropagation()}>
         {(next[task.status] ?? []).map((to) => (
-          <button key={to} className="opt-btn task-btn" onClick={() => onOpen(task.id, to === "blocked" ? "blocked" : undefined)}>
-            {label[to] ?? to}
-          </button>
+          to === "todo" ? (
+            <button
+              key={to}
+              className="opt-btn task-btn"
+              title="push back to todo — releases the claim, re-enters the unclaimed pool"
+              onClick={() => void retry()}
+            >
+              retry
+            </button>
+          ) : (
+            <button key={to} className="opt-btn task-btn" onClick={() => onOpen(task.id, to === "blocked" ? "blocked" : undefined)}>
+              {label[to] ?? to}
+            </button>
+          )
         ))}
       </div>
     </div>

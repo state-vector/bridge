@@ -36,7 +36,7 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   decision: { proposed: ["accepted"], accepted: ["superseded"] },
   discussion: { open: ["concluded"] },
   research: { draft: ["published"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress"] },
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
   progress: {},
   agent: {},
 };
@@ -235,13 +235,15 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `1. BRIDGE RESPONSE PROMPTS ARE COMMANDS. Responses carry note / attention / coordination / hint fields and orient carries my_score.hints. Read them, comply. That is how the hub steers you mid-session.`,
     `2. orient first, every session (session: "<unique-name>"). Work from its response, not memory.`,
     `3. Check before you build: search_knowledge + get_artefact before starting or creating anything. If someone owns overlapping open work, ask_agent — don't fork.`,
-    `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — one line + sentiment + gauges (completion_pct, confidence_pct, risk_pct, 0-100). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
+    `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — did (what just happened) + will (what you do next) + sentiment + gauges (completion_pct, confidence_pct, risk_pct, 0-100). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
+    `4b. DECLARE SILENCE before any quiet stretch >10m: short op still yours (build, CI wait) → log_progress {will, grace_minutes ≤ 60}. Long or handed-off op (re-index, deploy, background batch) → transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes ≤ 1440}. Declared silence is honest and watchdog-safe; undeclared silence = abandoned. Overrun your declared window and it trips as abandoned anyway.`,
     `5. Status is your responsibility: claim → in_progress immediately; finish → in_review with the PR link in the note; stuck → blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict — bounce = action the findings; done = released. Gates are enforced — unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
     `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `7. Findings belong in Knowledge (research / discussion), not session memory. Conclusions become decisions.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
+    `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress"} before coding. 3. HEARTBEAT: log_progress {id, note} every ≤10 min. 4. UNCERTAIN: ask_agent first. 5. FINISH: PR, then transition {to: "in_review", note: "PR <link>"}.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress"} before coding. 3. HEARTBEAT: log_progress {id, did, will} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"}.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
@@ -252,6 +254,32 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
   }
   return lines.join("\n");
 }
+
+// ---------- server-side playbooks (composed into orient; agents carry nothing) ----------
+/**
+ * Boot prompts live HERE, versioned with the server. An agent's entire
+ * copy-paste prompt is "connect to bridge-kb and call orient first" —
+ * everything else is composed server-side from these defaults plus admin
+ * overrides (settings.playbooks.{cron,interactive} and settings.roles.<role>).
+ * Cadence is selected by the token's `cadence:cron` tag; roles by `role:*` tags.
+ */
+export const DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule — each run is one pass, not a conversation.
+1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
+2. If you own in_progress tasks: log_progress on each (one line + sentiment — the heartbeat), then resume the oldest one.
+3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end.
+4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
+
+export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
+  analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
+- Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
+- Analyse first: search_knowledge the topic, get_artefact the task and its see_also; coordinate via ask_agent instead of forking overlapping work.
+- Decompose into child tasks (child_of the parent): one per coherent unit, each tagged with its role (role:impl / role:review), each carrying concrete checkable acceptance criteria in body_md ("done when X" plus what is OUT of scope). A vague child task is a defect you created; rewrite it before you finish.
+- Qualify the parent by completing a role:analysis child that summarises the plan and open questions, then transition it to done. A done role:analysis child is what lifts the parent's pickup gate. If the publisher requested stacked bars (await), create the matching role:review child so the bar can be met.
+- Never implement the children; never transition the parent to done. Unanalysable? Move it to blocked with a reason + unblock condition and ask the specific question.`,
+  impl: `BUILD: claim qualified work matching your roles, work it to a natural stopping point, and hand over for review — in_review with the PR link in the note. You cannot self-approve done; you stay owner until the verdict.`,
+  review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.`,
+};
 
 // ---------- progress sentiment (board aliveness) ----------
 

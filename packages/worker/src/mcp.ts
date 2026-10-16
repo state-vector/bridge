@@ -232,7 +232,11 @@ async function callTool(name: string, args: any, ctx: Ctx) {
           ? "claimed. heartbeat: log_progress every ≤10m while in_progress."
           : args.to === "in_review"
             ? "in_review. PR is open — your duty is NOT done. You stay owner until the verdict. Poll get_history {id} (or orient → my_tasks) for the verdict: bounce (in_review → in_progress, findings in the note — action them immediately) or done (approved + merged — only then are you released). Reviews can stack: work other tasks while waiting, but keep polling this one."
-            : args.to === "done"
+            : args.to === "blocked"
+              ? args.class === "subprocess"
+                ? `blocked (subprocess). watchdog paused until ${args.budget_minutes}m from now — after that it converts to abandoned. re-claim: log_progress on the task when the subprocess resolves.`
+                : "blocked. an open ask bound to this task pauses the watchdog; otherwise keep the heartbeat or declare grace."
+              : args.to === "done"
               ? "done. you are released from this task. outcome belongs in Knowledge — publish research/discussion artefacts for anything reusable."
               : undefined,
       }));
@@ -253,11 +257,14 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     case "log_progress": {
       const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
       const hasGauges = args.completion_pct != null || args.confidence_pct != null || args.risk_pct != null;
+      const graceUntil = typeof a.grace_until === "number" ? a.grace_until : undefined;
       return text(JSON.stringify({
         ...a,
-        note: hasGauges
-          ? undefined
-          : "logged without gauges. include completion_pct / confidence_pct / risk_pct — they chart on the card, drive prioritisation, and count toward your score.",
+        note: graceUntil
+          ? `grace declared — watchdog paused until ${new Date(graceUntil).toISOString()} (${args.grace_minutes}m). Overrun it and the task is abandoned. Re-claim with log_progress when back.`
+          : hasGauges
+            ? undefined
+            : "logged without gauges. include completion_pct / confidence_pct / risk_pct — they chart on the card, drive prioritisation, and count toward your score.",
       }));
     }
     case "ask_agent": {
@@ -352,7 +359,7 @@ const TOOLS = [
     name: "transition",
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}. Moving to blocked REQUIRES note (reason) + unblock_condition — no dead-end cards.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + unblock_condition — no dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned.`,
     inputSchema: {
       type: "object",
       required: ["id", "to"],
@@ -361,6 +368,8 @@ const TOOLS = [
         to: { type: "string" },
         note: { type: "string", description: "required when moving to blocked: the reason" },
         unblock_condition: { type: "string", description: "required when moving to blocked: what unblocks it" },
+        class: { type: "string", enum: ["subprocess"], description: "blocked class: subprocess = declared block on a long op; requires budget_minutes" },
+        budget_minutes: { type: "integer", maximum: 1440, description: "declared budget for class: subprocess (1-1440); watchdog paused until it lapses" },
         replacement_id: { type: "string", description: "for superseded: the replacing artefact" },
       },
     },
@@ -394,12 +403,14 @@ const TOOLS = [
   },
   {
     name: "log_progress",
-    description: "Fine-grained progress while working a task: one line + sentiment (going_well | neutral | struggling | converging | diverging) + optional self-reported gauges (completion_pct, confidence_pct, risk_pct — 0-100 ints). completion = how far along; confidence = belief the result is right; risk = chance of failure/drift. Send often — feeds the live board and charts.",
+    description: "Fine-grained progress while working a task: did (what just happened; alias: note) + will (what you do next) + sentiment (going_well | neutral | struggling | converging | diverging) + optional gauges (completion_pct, confidence_pct, risk_pct — 0-100 ints). Send often — feeds the live board and charts. Declaring a quiet stretch? pass grace_minutes (1-60) + will naming the op — the watchdog pauses until it lapses.",
     inputSchema: {
       type: "object",
       required: ["id", "note"],
       properties: {
         id: { type: "string", description: "task artefact id" },
+        will: { type: "string", description: "what you will do next — the intent line the board shows while you work" },
+        grace_minutes: { type: "integer", maximum: 60, description: "declared silence window for a long op (requires will) — watchdog paused until it lapses; overrun = abandoned" },
         note: { type: "string" },
         sentiment: { type: "string", enum: ["going_well", "neutral", "struggling", "converging", "diverging"] },
         completion_pct: { type: "integer", minimum: 0, maximum: 100 },

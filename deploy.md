@@ -5,7 +5,7 @@ Access application created for the workers.dev hostname (AUD `02bf2012058821d837
 
 ## 1. Worker
 
-Deploys are **manual from the box** (or Cloudflare's own dashboard/git integration — Ray is connecting the repo there; do NOT wire GitHub Actions deploys). CI, when added, is for tests only.
+Deploys are **push-to-main** — Cloudflare's git integration builds and ships the worker on every push to `main`. Local `npx wrangler deploy` from the box still works for out-of-band fixes. Do NOT wire GitHub Actions deploys. CI, when added, is for tests only.
 
 ```bash
 cd ~/flows/packages/worker

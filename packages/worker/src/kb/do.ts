@@ -25,6 +25,8 @@ import {
   ARTEFACT_TYPES,
   ArtefactType,
   DEFAULT_BOARD,
+  DEFAULT_CRON_PLAYBOOK,
+  DEFAULT_ROLE_PLAYBOOKS,
   DEFAULT_WS_SLUG,
   doWs,
   INITIAL_STATUS,
@@ -77,7 +79,8 @@ export class KnowledgeHub {
     }
   }
 
-  // Watchdog: silence on in_progress means the agent is gone. Block it as
+  // Watchdog: silence on in_progress means the agent is gone — unless the
+  // silence was DECLARED (grace window, subprocess block). Block it as
   // abandoned; the same agent re-claims it by logging progress again.
   async alarm() {
     await this.ensureSchema();
@@ -92,6 +95,8 @@ export class KnowledgeHub {
     for (const r of rows as any[]) {
       const meta = JSON.parse(r.meta ?? "{}");
       if (meta.awaiting_ask) continue;
+      // (A) declared grace: the agent stated a silence window — honor it until it lapses
+      if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
       );
@@ -100,11 +105,35 @@ export class KnowledgeHub {
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
       );
       if (openAsk) continue;
+      const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       await this.transition({
         id: r.id, to: "blocked",
-        note: `abandoned — no update for >${staleMin}m; auto-blocked by watchdog`,
+        note: `abandoned — no update for >${staleMin}m; auto-blocked by watchdog${will}`,
         unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`,
       }, "system:watchdog");
+    }
+    // (B) subprocess blocks: watchdog paused while the declared budget runs;
+    // past the budget the declaration is a lie — convert to abandoned.
+    const subRows = this.state.storage.sql.exec(
+      `SELECT id, owner, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    ).toArray();
+    for (const r of subRows as any[]) {
+      const meta = JSON.parse(r.meta ?? "{}");
+      const b = meta.blocked;
+      if (b?.class !== "subprocess" || typeof b.deadline_ts !== "number") continue;
+      if (b.deadline_ts > now) continue;
+      const wasDoing = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
+      b.class = undefined;
+      b.reason = `abandoned — declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed${wasDoing}`;
+      b.unblock_condition = `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`;
+      b.ts = now;
+      delete b.deadline_ts;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, updated_ts = ?, status_ts = ? WHERE id = ?`,
+        JSON.stringify(meta), now, now, r.id,
+      );
+      this.audit("system:watchdog", "transition", r.id, { from: "blocked", to: "blocked", note: b.reason });
+      this.version(r.id, "system:watchdog", "transition", b.reason, { from: "blocked", to: "blocked", note: b.reason });
     }
     await this.state.storage.setAlarm(now + 60_000);
   }
@@ -534,6 +563,7 @@ export class KnowledgeHub {
       if (q.ok) await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
     tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+    delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(tmeta), Date.now(), t.id,
@@ -833,11 +863,22 @@ export class KnowledgeHub {
       if (!reason || !unblock)
         throw new Error("moving to blocked requires BOTH a reason (note) and an unblock condition — a blocked card without an unblock path is a dead end");
     }
+    // (B) subprocess class: a declared block on a long/handed-off op, with a
+    // budget. The watchdog pauses until the budget lapses; past it the
+    // declaration is a lie and the sweep converts the block to abandoned.
+    const isSubprocess = body.class === "subprocess";
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
     if (to === "blocked") {
       meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+      if (isSubprocess) {
+        const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
+        if (!bm) throw new Error("class: subprocess requires budget_minutes (1-1440) — a declared block without a deadline never trips, which is worse than abandonment");
+        meta.blocked.class = "subprocess";
+        meta.blocked.budget_minutes = bm;
+        meta.blocked.deadline_ts = ts + bm * 60_000;
+      }
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
     }
@@ -847,6 +888,11 @@ export class KnowledgeHub {
     const bounceFromReview = row.status === "in_review";
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = actor;
+    }
+    // retry: pushing a card back to todo releases the claim — it re-enters the
+    // unclaimed pool for any matching agent (or the cron sweep) to pick up fresh
+    if (row.type === "task" && to === "todo") {
+      owner = "";
     }
     // a parent isn't completable while children are open
     if (row.type === "task" && to === "done") {
@@ -868,7 +914,10 @@ export class KnowledgeHub {
           String(body.replacement_id), id, ts,
         );
     }
-    this.audit(actor, "transition", id, { from: row.status, to, note: body.note ?? "", sentiment });
+    this.audit(actor, "transition", id, {
+      from: row.status, to, note: body.note ?? "", sentiment,
+      ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
+    });
     this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
     return { id, status: to, ...(sentiment ? { sentiment } : {}) };
   }
@@ -919,7 +968,8 @@ export class KnowledgeHub {
    */
   private async progressLog(body: any, actor: string) {
     const id = String(body.id ?? "");
-    const note = String(body.note ?? "").trim().slice(0, 500);
+    const note = String(body.note ?? body.did ?? "").trim().slice(0, 500);
+    const will = String(body.will ?? "").trim().slice(0, 500);
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : "neutral";
     const pct = (v: any) => (Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : undefined);
     const completion_pct = pct(body.completion_pct);
@@ -935,10 +985,12 @@ export class KnowledgeHub {
       : "";
     const instructions = composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine;
     // Re-claim: logging progress on a watchdog-abandoned task flips it back to
-    // in_progress (the unblock condition the watchdog promised). Legitimately
-    // blocked tasks (human reasons) keep their status until explicitly resumed.
-    if (row.status === "blocked" && (meta.blocked?.reason ?? "").startsWith("abandoned")) {
-      await this.transition({ id, to: "in_progress", note: "re-claimed — agent resumed (heartbeat)" }, actor);
+    // in_progress (the unblock condition the watchdog promised). Subprocess
+    // blocks re-claim the same way — the agent is back, the subprocess resolved.
+    // Legitimately blocked tasks (human reasons) keep their status until explicitly resumed.
+    const isSubprocessBlock = meta.blocked?.class === "subprocess";
+    if (row.status === "blocked" && ((meta.blocked?.reason ?? "").startsWith("abandoned") || isSubprocessBlock)) {
+      await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed — subprocess resolved" : "re-claimed — agent resumed (heartbeat)" }, actor);
       delete meta.blocked; // transition cleared it in DB — don't resurrect it here
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
@@ -948,22 +1000,35 @@ export class KnowledgeHub {
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
         return {
-          id, note, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
           note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`,
         };
       }
       await this.transition({ id, to: "in_progress", note: "started — progress logged" }, actor);
     }
-    meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
+    // (A) declared grace: a silence window for a long op, made while still
+    // running. Requires a will (what the silence is FOR). Cleared by the next
+    // ordinary log (the agent is back). Watchdog honors it until it lapses.
+    const gm = Math.max(0, Math.min(60, Number(body.grace_minutes) || 0));
+    let graceUntil: number | undefined;
+    if (gm > 0) {
+      if (!will) throw new Error("grace_minutes requires a will — declare what you will be doing during the silence (e.g. 're-index runs, silence ~25m')");
+      graceUntil = Date.now() + gm * 60_000;
+      meta.grace_until = graceUntil;
+    } else {
+      delete meta.grace_until; // ordinary log = agent is back
+    }
+    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
     if (body.session && !meta.session) meta.session = body.session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
     );
-    this.audit(actor, "progress", id, { note, sentiment });
-    this.version(id, actor, "progress", note, { note, sentiment, completion_pct, confidence_pct, risk_pct });
+    this.audit(actor, "progress", id, { note, sentiment, will: will || undefined });
+    this.version(id, actor, "progress", note, { note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct });
     return {
-      id, note, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+      id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct,
+      grace_until: graceUntil, instructions,
     };
   }
 
@@ -1193,12 +1258,27 @@ export class KnowledgeHub {
       const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
       if (unmet.length) return isQualifierAgent;
       return true;
-    }).slice(0, 10);
+    }).slice(0, 10).map((t: any) => {
+      const m = JSON.parse(t.meta ?? "{}");
+      if (m.attempt) {
+        t.previously_attempted = {
+          by: m.attempt.by, attempts: m.attempt.attempts,
+          last_will: m.last_progress?.will ? String(m.last_progress.will).slice(0, 200) : undefined,
+          note: `task was attempted ${m.attempt.attempts}x before (last by ${m.attempt.by}) — partial work may exist; search_knowledge + get_artefact before restarting`,
+        };
+      }
+      return t;
+    });
     // role playbooks (settings.roles.{analysis,impl,...}) composed for this agent's tags
     const rolesSettings = typeof settings.roles === "object" && settings.roles ? settings.roles : {};
+    const kindSettings = typeof settings.playbooks === "object" && settings.playbooks ? settings.playbooks : {};
+    const isCron = tags.includes("cadence:cron");
+    const kindPlaybook =
+      (isCron ? kindSettings.cron : kindSettings.interactive)
+      ?? (isCron ? DEFAULT_CRON_PLAYBOOK : "");
     const playbooks = tags
       .filter((t) => t.startsWith("role:"))
-      .map((t) => ({ role: t.slice(5), playbook: rolesSettings[t.slice(5)] }))
+      .map((t) => ({ role: t.slice(5), playbook: rolesSettings[t.slice(5)] ?? DEFAULT_ROLE_PLAYBOOKS[t.slice(5)] }))
       .filter((p) => typeof p.playbook === "string" && p.playbook.trim());
     // reaper: sort out my abandoned work at check-in (see reapAbandoned)
     const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
@@ -1210,6 +1290,7 @@ export class KnowledgeHub {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
         + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : "")
+        + (kindPlaybook ? `\n\nYOUR KIND: ${isCron ? "cron" : "interactive"}\n${kindPlaybook}` : "")
         + playbooks.map((p) => `\n\nYOUR ROLE: ${p.role}\n${p.playbook}`).join(""),
       board: settings.board ?? DEFAULT_BOARD,
       counts,
@@ -1242,13 +1323,14 @@ export class KnowledgeHub {
     ).toArray() as any[]) {
       const meta = JSON.parse(t.meta ?? "{}");
       if (!(meta.blocked?.reason ?? "").startsWith("abandoned")) continue;
+      const wasDoing = meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
       const lastOwn = this.one(
         `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, label,
       )?.ts ?? 0;
       const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
       if (idleFor < staleMs) {
         out.push(
-          `${t.id} "${t.title}" is marked abandoned but you were active on it recently. log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
+          `${t.id} "${t.title}" is marked abandoned but you were active on it recently.${wasDoing} log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
         );
         continue;
       }
@@ -1264,7 +1346,7 @@ export class KnowledgeHub {
       this.audit("system:reaper", "reassign", t.id, { prev_owner: label, attempts, idle_ms: idleFor });
       this.version(t.id, "system:reaper", "transition", `reassigned — ${label} silent >${staleMin}m after abandonment (attempt ${attempts})`, { prev_owner: label });
       out.push(
-        `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it. Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`,
+        `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`,
       );
     }
     return out;
