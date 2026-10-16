@@ -209,7 +209,7 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
             <button
               key={to}
               className="opt-btn task-btn"
-              title="push back to todo — releases the claim, re-enters the unclaimed pool"
+              title="push back to todo — releases the claim, re-enters the unclaimed pool, tags the task 'attempted' so the next agent verifies state first"
               onClick={() => void retry()}
             >
               retry

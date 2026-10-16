@@ -823,9 +823,16 @@ export class KnowledgeHub {
     if (row.type === "task" && row.status === "todo" && to === "in_progress" && !isQualifier) {
       const aTags = this.actorTagsFor(actor);
       const actorIsQualifier = aTags.includes("role:analysis") || aTags.includes("role:review");
-      const needRoles = tTags.filter((x) => x.startsWith("role:"));
-      if (needRoles.length && actor !== "web" && !needRoles.some((r) => aTags.includes(r)))
-        throw new Error(`task ${id} is gated to ${needRoles.join(", ")} — your agent roles (${aTags.map((r) => r.replace("role:", "")).join(", ") || "none"}) don't match; agents only see and claim work matching their roles`);
+      const needRoles = tTags.filter((x: string) => x.startsWith("role:"));
+      // unqualified work is qualifier intake: role:analysis / role:review agents
+      // may claim it regardless of its target role tags (qualifying it is their
+      // job — otherwise impl-tagged unqualified work is unclaimable by anyone).
+      // Qualified work keeps its normal role gate.
+      const intake = !this.qualifyCheck(row, "analysis").ok || this.unmetBars(row).length > 0;
+      if (!actorIsQualifier || !intake) {
+        if (needRoles.length && actor !== "web" && !needRoles.some((r) => aTags.includes(r)))
+          throw new Error(`task ${id} is gated to ${needRoles.join(", ")} — your agent roles (${aTags.map((r) => r.replace("role:", "")).join(", ") || "none"}) don't match; agents only see and claim work matching their roles`);
+      }
       if (!actorIsQualifier) {
         const q = this.qualifyCheck(row, "analysis");
         if (!q.ok)
@@ -890,9 +897,20 @@ export class KnowledgeHub {
       owner = actor;
     }
     // retry: pushing a card back to todo releases the claim — it re-enters the
-    // unclaimed pool for any matching agent (or the cron sweep) to pick up fresh
+    // unclaimed pool for any matching agent (or the cron sweep) to pick up fresh.
+    // Annotate it: this task was ATTEMPTED and came back. The next agent must
+    // verify current state first — and close it out if the work is already done.
     if (row.type === "task" && to === "todo") {
       owner = "";
+      const tags: string[] = row.tags ? JSON.parse(row.tags) : [];
+      if (!tags.includes("attempted")) tags.push("attempted");
+      this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
+      meta.attempt = {
+        by: actor, at: ts,
+        attempts: ((meta.attempt?.attempts as number) ?? 0) + 1,
+        last_reason: meta.blocked?.reason,
+        last_will: meta.last_progress?.will,
+      };
     }
     // a parent isn't completable while children are open
     if (row.type === "task" && to === "done") {
@@ -1250,21 +1268,30 @@ export class KnowledgeHub {
     }
     const unclaimedWork = pool.filter((t: any) => {
       const need = t.tags.filter((x: string) => x.startsWith("role:"));
-      if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       const m = JSON.parse(t.meta ?? "{}");
       const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
-      if (declared !== "qualified" && !analysisEv.has(t.id) && !parentQualified.has(t.id)) return isQualifierAgent;
+      const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
       const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
-      if (unmet.length) return isQualifierAgent;
+      // unqualified (or bar-unmet) work is qualifier intake: role:analysis / role:review
+      // agents see it regardless of the task's target role tags — qualifying it is
+      // their job (otherwise impl-tagged unqualified work is invisible to everyone
+      // and the pool deadlocks). Everyone else only sees work that is ready for them.
+      if (!qualified || unmet.length) {
+        if (!isQualifierAgent) return false;
+        t.needs_qualification = true;
+        return true;
+      }
+      if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       return true;
     }).slice(0, 10).map((t: any) => {
       const m = JSON.parse(t.meta ?? "{}");
       if (m.attempt) {
         t.previously_attempted = {
           by: m.attempt.by, attempts: m.attempt.attempts,
+          last_reason: m.attempt.last_reason ?? undefined,
           last_will: m.last_progress?.will ? String(m.last_progress.will).slice(0, 200) : undefined,
-          note: `task was attempted ${m.attempt.attempts}x before (last by ${m.attempt.by}) — partial work may exist; search_knowledge + get_artefact before restarting`,
+          note: `task was attempted ${m.attempt.attempts}x before (last by ${m.attempt.by}${m.attempt.last_reason ? ` — came back: ${String(m.attempt.last_reason).slice(0, 120)}` : ""}). VERIFY before working: search_knowledge + get_artefact — the work may already be done (then transition → done) or partially done (continue from the last will: ${m.last_progress?.will ? `"${String(m.last_progress.will).slice(0, 120)}"` : "none recorded"}).`,
         };
       }
       return t;
