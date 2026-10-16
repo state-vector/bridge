@@ -85,6 +85,8 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
   const active = p && now - p.ts < 120_000;
   const lastEvent = task._lastEvent;
   const mine = (series ?? []).filter((x) => x.artefact_id === task.id).slice(-12);
+  // done cards freeze their total lifetime; open cards show staleness live
+  const doneLifetime = task.status === "done" && task.created_ts ? ageClock(task.created_ts, now) : null;
 
   const attention = useMemo(() => {
     const risk = p?.risk_pct ?? 0;
@@ -112,9 +114,19 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       </div>
       <div className="task-row task-status-row">
         {prefs.status && <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>}
-        {prefs.age && (
-          <span className={`age-chip age-${stale}`} title="time in this column">
-            ⏱ {ageClock(task.status_ts, now)}{STALE_LABEL[stale]}
+        {prefs.age && task.status !== "done" && (
+          <span className={`age-chip age-${stale}`} title="time since any agent touched this card — live, orange >30m, red >1h">
+            {ageClock(lastSignal, now)} since update{STALE_LABEL[stale]}
+          </span>
+        )}
+        {prefs.age && task.status !== "done" && task.status_ts && (
+          <span className="age-chip" title="time in this column">
+            {ageClock(task.status_ts, now)} in column
+          </span>
+        )}
+        {prefs.age && task.status === "done" && doneLifetime && (
+          <span className="age-chip age-done" title="total lifetime, arrival → done">
+            ⏱ {doneLifetime} to done
           </span>
         )}
         {prefs.owner && task.owner && <span className="task-owner">{task.owner}</span>}

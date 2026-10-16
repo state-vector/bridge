@@ -527,3 +527,5 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .pct-inputs input { width: 33%; background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--text); padding: 6px 8px; font-size: 12px; }
 .version-history { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
 .version-history .progress-line { border-bottom: 1px solid var(--line); }
+.age-done { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+.age-done { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
