@@ -37,7 +37,7 @@ checks["settings list (custom keys)"] = settingsGet.body.settings?.review_policy
 const initA = await rpc("initialize", { protocolVersion: "2025-06-18" }, A);
 checks["bootstrap: status duty + progress nudge + project"] = initA.result?.instructions?.includes("TASK STATUS IS YOUR RESPONSIBILITY") && initA.result?.instructions?.includes("log_progress") && initA.result?.instructions?.includes("Superpositional");
 checks["tools = 14"] = (await rpc("tools/list", {}, A)).result?.tools?.length === 14;
-const c = await tool(A, "create_artefact", { type: "task", title: `Batching impl ${uid}`, body_md: "Reduce ingestion latency with bounded batching. Preserve idempotency.", tags: ["ingestion", "performance"], session: "impl-1" });
+const c = await tool(A, "create_artefact", { type: "task", title: `Batching impl ${uid}`, body_md: "Reduce ingestion latency with bounded batching. Preserve idempotency.", tags: ["ingestion", "performance"], session: "impl-1", meta: { qualified: true } });
 checks["create w/ tags+session (BR# id)"] = !c.isError && /^BR#\d+$/.test(c.json?.id ?? "");
 const p = await tool(A, "log_progress", { id: c.json.id, note: "batch writer drafted", sentiment: "converging" });
 checks["log_progress w/ sentiment + instructions"] = !p.isError && !!p.json?.instructions;
@@ -84,7 +84,7 @@ checks["board series has pct points"] = (boardSeries.body.series ?? []).some((s)
 
 // watchdog: stale in_progress → blocked "abandoned" → log_progress re-claims; open ask pauses it
 await j("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings: { stale_minutes: 1 } }) });
-const staleT = await tool(A, "create_artefact", { type: "task", title: `Watchdog probe ${uid}` });
+const staleT = await tool(A, "create_artefact", { type: "task", title: `Watchdog probe ${uid}`, meta: { qualified: true } });
 await tool(A, "transition", { id: staleT.json.id, to: "in_progress" });
 const wdAsk = await tool(A, "ask_agent", { artefact_id: staleT.json.id, to: "any", question: `decision needed for ${uid}?` });
 checks["ask linked → task blocked-on-decision"] = !wdAsk.isError && wdAsk.json?.task_status === "blocked" && /blocked-on-decision/.test(wdAsk.json.note ?? "");
@@ -132,7 +132,9 @@ checks["blocked with reason+unblock ok"] = okBlock.status === 200;
 const boardAfterBlock = await j("/api/kb/board");
 const blockedTask = boardAfterBlock.body.tasks?.find((t) => t.id === created.body.id);
 checks["blocked meta persisted"] = blockedTask?.meta?.blocked?.reason === "waiting on creds" && !!blockedTask?.meta?.blocked?.unblock_condition;
-await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "in_progress" }) });
+const noRes = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "in_progress" }) });
+checks["unblocking requires a resolution"] = noRes.status === 400 && /resolution/.test(JSON.stringify(noRes.body));
+await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "in_progress", note: "resolution: creds arrived" }) });
 const boardUnblocked = await j("/api/kb/board");
 checks["unblock clears blocked meta"] = !boardUnblocked.body.tasks?.find((t) => t.id === created.body.id)?.meta?.blocked;
 
@@ -144,7 +146,7 @@ await new Promise((resolveWs) => {
   ws.on("message", (raw) => frames.push(JSON.parse(raw)));
   ws.on("open", async () => {
     await new Promise((r) => setTimeout(r, 400));
-    await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "done" }) });
+    await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked", note: "ws probe block", unblock_condition: "ws probe" }) });
     const deadline = Date.now() + 5000;
     const poll = setInterval(() => {
       const hit = frames.some((f) => f.type === "kb.event" && f.event?.artefact_id === created.body.id);
@@ -163,7 +165,7 @@ await j("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ 
 checks["revoked token -32001"] = (await rpc("tools/list", {}, mintC.body.secret)).error?.code === -32001;
 // progress-artefact heartbeat: agents post progress logs instead of log_progress;
 // creating a progress artefact with meta.task must auto-start the todo task
-const hbT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat probe ${uid}` });
+const hbT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat probe ${uid}`, meta: { qualified: true } });
 checks["heartbeat probe starts todo"] = hbT.json?.status === "todo";
 const hbP = await tool(A, "create_artefact", { type: "progress", title: `Heartbeat probe log ${uid} — making real progress on the heartbeat path`, meta: { task: hbT.json.id } });
 checks["progress artefact created"] = !hbP.isError;
@@ -173,7 +175,7 @@ checks["progress artefact auto-starts todo → in_progress"] = hbTask?.status ==
 checks["progress artefact bumps task last_progress"] = !!hbTask?.meta?.last_progress && /Heartbeat probe log/.test(hbTask.meta.last_progress.note ?? "");
 checks["progress artefact feeds task series"] = (hbBoard.body.series ?? []).some((s) => s.artefact_id === hbT.json.id);
 // blocked-on-decision tasks must NOT be force-started by a progress artefact
-const bdT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat decision probe ${uid}` });
+const bdT = await tool(A, "create_artefact", { type: "task", title: `Heartbeat decision probe ${uid}`, meta: { qualified: true } });
 await tool(A, "transition", { id: bdT.json.id, to: "in_progress" });
 await tool(A, "ask_agent", { artefact_id: bdT.json.id, to: "any", question: `hold for decision ${uid}?` });
 checks["decision probe is blocked-on-decision"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === bdT.json.id)?.status === "blocked";
@@ -182,7 +184,7 @@ const bdBoard = await j("/api/kb/board");
 checks["progress artefact respects blocked-on-decision"] = bdBoard.body.tasks?.find((t) => t.id === bdT.json.id)?.status === "blocked";
 
 // ---- pooled work: project field, claims, flat decomposition, roles ----
-const prjT = await tool(A, "create_artefact", { type: "task", title: `Bridge project probe ${uid}`, project: "bridge" });
+const prjT = await tool(A, "create_artefact", { type: "task", title: `Bridge project probe ${uid}`, project: "bridge", meta: { qualified: true } });
 const prjBoard = await j("/api/kb/board");
 const prjTask = prjBoard.body.tasks?.find((t) => t.id === prjT.json.id);
 checks["project field on create + default for omitted"] = prjTask?.project === "bridge" && hbTask?.project === "Superpositional";
@@ -190,21 +192,40 @@ checks["tasks enter UNCLAIMED (owner = pool)"] = prjTask?.owner === "";
 await tool(A, "transition", { id: prjT.json.id, to: "in_progress" });
 const claimedBoard = await j("/api/kb/board");
 checks["claim: in_progress sets owner to actor"] = claimedBoard.body.tasks?.find((t) => t.id === prjT.json.id)?.owner === mintA.body.label;
-// flat decomposition: parent → child_of; parent not completable while children open
-const parent = await tool(A, "create_artefact", { type: "task", title: `Decompose probe ${uid}` });
-const child = await tool(A, "create_artefact", { type: "task", title: `Decompose child ${uid}` });
-await tool(A, "link_artefacts", { src: child.json.id, relation: "child_of", dst: parent.json.id });
-const decBoard = await j("/api/kb/board");
-checks["child task carries part_of; parent carries rollup"] = decBoard.body.tasks?.find((t) => t.id === child.json.id)?.part_of === parent.json.id
-  && decBoard.body.tasks?.find((t) => t.id === parent.json.id)?.children_open === 1;
-await tool(A, "transition", { id: parent.json.id, to: "in_progress" });
-const badDone = await tool(A, "transition", { id: parent.json.id, to: "done" });
-checks["parent not completable with open children"] = badDone.isError && /open child/.test(badDone.text ?? "");
-await tool(A, "transition", { id: child.json.id, to: "in_progress" });
-await tool(A, "transition", { id: child.json.id, to: "done" });
-await tool(A, "transition", { id: parent.json.id, to: "done" });
-const finalParent = (await tool(A, "get_artefact", { id: parent.json.id })).json;
-checks["parent completes once children closed"] = finalParent?.status === "done";
+// flat decomposition + swimlane gates: qualify → claim → impl → review → done
+const gParent = await tool(A, "create_artefact", { type: "task", title: `Swimlane probe ${uid}` });
+const gPickup = await tool(A, "transition", { id: gParent.json.id, to: "in_progress" });
+checks["unqualified work cannot be picked up"] = gPickup.isError && /not qualified/.test(gPickup.text ?? "");
+const gAnalysis = await tool(A, "create_artefact", { type: "task", title: `Swimlane analysis ${uid}`, tags: ["role:analysis"] });
+await tool(A, "link_artefacts", { src: gAnalysis.json.id, relation: "child_of", dst: gParent.json.id });
+await tool(A, "transition", { id: gAnalysis.json.id, to: "in_progress" });
+await tool(A, "transition", { id: gAnalysis.json.id, to: "done" });
+await tool(A, "transition", { id: gParent.json.id, to: "in_progress" });
+checks["analysis child qualifies pickup (claim sets owner)"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === gParent.json.id)?.owner === mintA.body.label;
+const gUnreviewed = await tool(A, "transition", { id: gParent.json.id, to: "done" });
+checks["work cannot be done unreviewed"] = gUnreviewed.isError && /unreviewed/.test(gUnreviewed.text ?? "");
+const gImpl = await tool(A, "create_artefact", { type: "task", title: `Swimlane impl child ${uid}`, tags: ["role:impl"] });
+await tool(A, "link_artefacts", { src: gImpl.json.id, relation: "child_of", dst: gParent.json.id });
+const gBoard1 = await j("/api/kb/board");
+checks["child task carries part_of; parent carries rollup"] = gBoard1.body.tasks?.find((t) => t.id === gImpl.json.id)?.part_of === gParent.json.id
+  && gBoard1.body.tasks?.find((t) => t.id === gParent.json.id)?.children_open === 1
+  && gBoard1.body.tasks?.find((t) => t.id === gParent.json.id)?.children_done === 1;
+await tool(A, "transition", { id: gImpl.json.id, to: "in_progress" });
+const gImplDone = await tool(A, "transition", { id: gImpl.json.id, to: "done" });
+checks["impl child also gated on review"] = gImplDone.isError && /unreviewed/.test(gImplDone.text ?? "");
+const gReview = await tool(A, "create_artefact", { type: "task", title: `Swimlane review ${uid}`, tags: ["role:review"] });
+await tool(A, "link_artefacts", { src: gReview.json.id, relation: "child_of", dst: gParent.json.id });
+await tool(A, "transition", { id: gReview.json.id, to: "in_progress" });
+await tool(A, "transition", { id: gReview.json.id, to: "done" });
+const gOpenKid = await tool(A, "transition", { id: gParent.json.id, to: "done" });
+checks["parent not completable with open children"] = gOpenKid.isError && /open child/.test(gOpenKid.text ?? "");
+const gVerdict = await tool(A, "create_artefact", { type: "decision", title: `Verdict: pass ${uid}` });
+await tool(A, "link_artefacts", { src: gVerdict.json.id, relation: "supports", dst: gImpl.json.id });
+await tool(A, "transition", { id: gVerdict.json.id, to: "accepted" });
+await tool(A, "transition", { id: gImpl.json.id, to: "done" });
+checks["accepted decision qualifies done"] = (await tool(A, "get_artefact", { id: gImpl.json.id })).json?.status === "done";
+await tool(A, "transition", { id: gParent.json.id, to: "done" });
+checks["parent completes after review child closes"] = (await tool(A, "get_artefact", { id: gParent.json.id })).json?.status === "done";
 // roles + playbooks + unclaimed pool
 const mintAn = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `an-${uid}`, tags: ["role:analysis"] }) });
 const AN = mintAn.body.secret;

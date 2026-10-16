@@ -468,15 +468,19 @@ export class KnowledgeHub {
     if (!raw) return;
     const candidates = [raw, raw.replace(/^#/, "BR#"), `BR#${raw.replace(/^#/, "")}`];
     const t = candidates
-      .map((c) => this.one(`SELECT id, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, c))
+      .map((c) => this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ? AND type = 'task'`, c))
       .find(Boolean);
     if (!t) return;
     const tmeta = JSON.parse(t.meta ?? "{}");
+    const tTags: string[] = t.tags ? JSON.parse(t.tags) : [];
+    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
     if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
       delete tmeta.blocked;
     } else if (t.status === "todo") {
-      await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
+      // pickup gate applies: only qualified work (or qualifier roles) auto-starts
+      const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
+      if (q.ok) await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
     tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
     this.state.storage.sql.exec(
@@ -640,6 +644,44 @@ export class KnowledgeHub {
     return { id };
   }
 
+  /** Swimlane qualification evidence: a done analysis/review child, an accepted decision linked
+   *  either direction, an explicit meta.qualified preset, or inheritance from the parent's
+   *  decomposition (the analysis pass that qualified the parent covered its children). */
+  private qualifyCheck(row: any, kind: "analysis" | "review"): { ok: boolean; via?: string } {
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (meta.qualified) return { ok: true, via: "preset" };
+    const roleFilter = kind === "analysis"
+      ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')`
+      : `c.tags LIKE '%"role:review"%'`;
+    const child = this.one(
+      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${roleFilter} LIMIT 1`,
+      row.id,
+    );
+    if (child) return { ok: true, via: child.id };
+    const dec = this.one(
+      `SELECT d.id AS id FROM relations r JOIN artefacts d ON d.id = r.src_id
+       WHERE r.relation = 'supports' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted' LIMIT 1`,
+      row.id,
+    );
+    if (dec) return { ok: true, via: dec.id };
+    const parent = this.one(
+      `SELECT p.id AS id, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+       WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+      row.id,
+    );
+    if (parent) {
+      if (JSON.parse(parent.meta ?? "{}").qualified) return { ok: true, via: `parent:${parent.id}` };
+      const sib = this.one(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${roleFilter} LIMIT 1`,
+        parent.id,
+      );
+      if (sib) return { ok: true, via: `sibling:${sib.id}` };
+    }
+    return { ok: false };
+  }
+
   private async transition(body: any, actor: string) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
@@ -647,6 +689,24 @@ export class KnowledgeHub {
     if (!row) throw new Error(`no such artefact: ${id}`);
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
     if (!verdict.ok) throw new Error(verdict.reason);
+    // ---- swimlane gates: minimal, enforced state-machine barriers ----
+    const tTags: string[] = row.tags ? JSON.parse(row.tags) : [];
+    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
+    if (row.type === "task" && row.status === "todo" && to === "in_progress" && !isQualifier) {
+      const q = this.qualifyCheck(row, "analysis");
+      if (!q.ok)
+        throw new Error(`task ${id} is not qualified — work cannot be picked up until analysed/reviewed. Qualify it by completing a role:analysis child task, linking an accepted decision, or setting meta.qualified. (role:analysis / role:review agents may pick up unqualified work — that is their job.)`);
+    }
+    if (row.type === "task" && to === "done" && !isQualifier) {
+      const r = this.qualifyCheck(row, "review");
+      if (!r.ok)
+        throw new Error(`task ${id} cannot be completed unreviewed — complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`);
+    }
+    if (row.status === "blocked" && to === "in_progress") {
+      const resolution = String(body.note ?? body.resolution ?? "").trim();
+      if (!resolution)
+        throw new Error(`moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`);
+    }
     if (to === "blocked") {
       const reason = String(body.note ?? body.reason ?? "").trim();
       const unblock = String(body.unblock_condition ?? "").trim();
