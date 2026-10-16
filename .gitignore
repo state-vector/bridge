@@ -15,3 +15,5 @@ packages/desktop/src-tauri/target/
 .dev.vars
 # tauri generated capability schemas
 packages/desktop/src-tauri/gen/
+.DS_Store
+packages/site/
