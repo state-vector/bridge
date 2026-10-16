@@ -125,9 +125,28 @@ export class KnowledgeHub {
 
   async board() {
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts FROM artefacts
+      `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
     ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: t.tags ? JSON.parse(t.tags) : [] }));
+    // flat structure, relations only: child tasks carry part_of, parents get a rollup
+    const links = this.state.storage.sql.exec(
+      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
+    ).toArray();
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+    const parentOf = new Map(links.map((l: any) => [l.src_id, l.dst_id]));
+    for (const t of tasks) {
+      const parent = parentOf.get(t.id);
+      if (parent) t.part_of = parent;
+      t.children_open = 0;
+      t.children_done = 0;
+    }
+    for (const l of links as any[]) {
+      const parent = byId.get(l.dst_id);
+      const child = byId.get(l.src_id);
+      if (!parent || !child) continue;
+      if (child.status === "done" || child.status === "superseded") parent.children_done++;
+      else parent.children_open++;
+    }
     const sessions = this.state.storage.sql.exec(
       `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
@@ -310,9 +329,16 @@ export class KnowledgeHub {
       `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
       `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
       `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
+    // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
+    const projectName = this.settingsMap().project_name || "superpositional";
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET project = ? WHERE project = '' AND type = 'task'`, projectName,
+    );
+    this.state.storage.sql.exec(`UPDATE artefacts SET owner = '' WHERE type = 'task' AND status = 'todo' AND owner != ''`);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -409,14 +435,17 @@ export class KnowledgeHub {
     const status = INITIAL_STATUS[type];
     const tags = sanitizeTags(body.tags);
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
+    // project: explicit override or the deployment's project; tasks enter UNCLAIMED (owner = pool)
+    const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
+    const owner = type === "task" ? String(body.owner ?? "").trim() : String(body.owner ?? actor);
     this.state.storage.sql.exec(
-      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, type, title, status, bodyMd, JSON.stringify({ ...(body.meta ?? {}), session }), String(body.owner ?? actor), ts, ts,
-      tags ? JSON.stringify(tags) : null, ts,
+      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, type, title, status, bodyMd, JSON.stringify({ ...(body.meta ?? {}), session }), owner, ts, ts,
+      tags ? JSON.stringify(tags) : null, ts, project,
     );
     if (!bodyMd.trim() && (type === "task" || type === "rfc" || type === "goal")) {
-      bodyMd = scaffoldBody(title, String(body.owner ?? actor));
+      bodyMd = scaffoldBody(title, owner || actor);
     }
     this.audit(actor, "create", id, { type, title });
     this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [] });
@@ -632,8 +661,22 @@ export class KnowledgeHub {
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
     }
+    // claim semantics: in_progress on a task claims it for the actor (system actors don't steal claims)
+    let owner = row.owner;
+    if (row.type === "task" && to === "in_progress" && !/^system:/.test(actor) && owner !== actor) {
+      owner = actor;
+    }
+    // a parent isn't completable while children are open
+    if (row.type === "task" && to === "done") {
+      const open = this.one(
+        `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
+        id,
+      )?.n ?? 0;
+      if (open > 0) throw new Error(`parent ${id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children)`);
+    }
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ? WHERE id = ?`, to, ts, JSON.stringify(meta), ts, id,
+      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ? WHERE id = ?`, to, ts, JSON.stringify(meta), ts, owner, id,
     );
     if (to === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
@@ -924,15 +967,35 @@ export class KnowledgeHub {
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','blocked') ORDER BY updated_ts DESC LIMIT 10`,
       label,
     ).toArray();
+    // dispatch surface: unclaimed todo tasks this agent's roles may pick up
+    const myRoles = new Set(tags.filter((t) => t.startsWith("role:")));
+    const pool = this.state.storage.sql.exec(
+      `SELECT id, title, tags, project, updated_ts FROM artefacts
+       WHERE type = 'task' AND status = 'todo' AND owner = '' ORDER BY updated_ts DESC LIMIT 30`,
+    ).toArray().map((t: any) => ({ ...t, tags: t.tags ? JSON.parse(t.tags) : [] }));
+    const unclaimedWork = pool.filter((t: any) => {
+      const needRoles = (t.tags ?? []).filter((x: string) => x.startsWith("role:"));
+      return needRoles.length === 0 || needRoles.some((r: string) => myRoles.has(r));
+    }).slice(0, 10);
+    // role playbooks (settings.roles.{analysis,impl,...}) composed for this agent's tags
+    const rolesSettings = typeof settings.roles === "object" && settings.roles ? settings.roles : {};
+    const playbooks = tags
+      .filter((t) => t.startsWith("role:"))
+      .map((t) => ({ role: t.slice(5), playbook: rolesSettings[t.slice(5)] }))
+      .filter((p) => typeof p.playbook === "string" && p.playbook.trim());
     const my_score = this.agentScores().find((a) => a.label === label)
       ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
     return {
       project: projectName,
-      instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD) + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : ""),
+      instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
+        + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : "")
+        + playbooks.map((p) => `\n\nYOUR ROLE: ${p.role}\n${p.playbook}`).join(""),
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,
       my_tasks: myTasks,
+      unclaimed_work: unclaimedWork,
+      my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
       my_score,
     };

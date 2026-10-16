@@ -181,6 +181,43 @@ await tool(A, "create_artefact", { type: "progress", title: `should not start a 
 const bdBoard = await j("/api/kb/board");
 checks["progress artefact respects blocked-on-decision"] = bdBoard.body.tasks?.find((t) => t.id === bdT.json.id)?.status === "blocked";
 
+// ---- pooled work: project field, claims, flat decomposition, roles ----
+const prjT = await tool(A, "create_artefact", { type: "task", title: `Bridge project probe ${uid}`, project: "bridge" });
+const prjBoard = await j("/api/kb/board");
+const prjTask = prjBoard.body.tasks?.find((t) => t.id === prjT.json.id);
+checks["project field on create + default for omitted"] = prjTask?.project === "bridge" && hbTask?.project === "Superpositional";
+checks["tasks enter UNCLAIMED (owner = pool)"] = prjTask?.owner === "";
+await tool(A, "transition", { id: prjT.json.id, to: "in_progress" });
+const claimedBoard = await j("/api/kb/board");
+checks["claim: in_progress sets owner to actor"] = claimedBoard.body.tasks?.find((t) => t.id === prjT.json.id)?.owner === mintA.body.label;
+// flat decomposition: parent → child_of; parent not completable while children open
+const parent = await tool(A, "create_artefact", { type: "task", title: `Decompose probe ${uid}` });
+const child = await tool(A, "create_artefact", { type: "task", title: `Decompose child ${uid}` });
+await tool(A, "link_artefacts", { src: child.json.id, relation: "child_of", dst: parent.json.id });
+const decBoard = await j("/api/kb/board");
+checks["child task carries part_of; parent carries rollup"] = decBoard.body.tasks?.find((t) => t.id === child.json.id)?.part_of === parent.json.id
+  && decBoard.body.tasks?.find((t) => t.id === parent.json.id)?.children_open === 1;
+await tool(A, "transition", { id: parent.json.id, to: "in_progress" });
+const badDone = await tool(A, "transition", { id: parent.json.id, to: "done" });
+checks["parent not completable with open children"] = badDone.isError && /open child/.test(badDone.text ?? "");
+await tool(A, "transition", { id: child.json.id, to: "in_progress" });
+await tool(A, "transition", { id: child.json.id, to: "done" });
+await tool(A, "transition", { id: parent.json.id, to: "done" });
+const finalParent = (await tool(A, "get_artefact", { id: parent.json.id })).json;
+checks["parent completes once children closed"] = finalParent?.status === "done";
+// roles + playbooks + unclaimed pool
+const mintAn = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `an-${uid}`, tags: ["role:analysis"] }) });
+const AN = mintAn.body.secret;
+await j("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings: { roles: { analysis: "DECOMPOSE, DON'T BUILD: claim the high-level task, write child tasks with acceptance criteria and child_of relations, tag children with their role, then return to todo/in_progress — do not implement the children yourself." } } }) });
+const poolT = await tool(A, "create_artefact", { type: "task", title: `Analysis pool probe ${uid}`, tags: ["role:analysis"] });
+const orAn = await tool(AN, "orient", { session: `e2e-an-${uid}` });
+checks["role playbook composed into orient instructions"] = /YOUR ROLE: analysis/.test(orAn.json?.instructions ?? "") && /DECOMPOSE, DON'T BUILD/.test(orAn.json?.instructions ?? "");
+checks["unclaimed_work surfaces pool by role"] = (orAn.json?.unclaimed_work ?? []).some((t) => t.id === poolT.json.id);
+const orA = await tool(A, "orient", { session: `e2e-a2-${uid}` });
+checks["role-gated task hidden from non-matching agents"] = !(orA.json?.unclaimed_work ?? []).some((t) => t.id === poolT.json.id);
+await tool(AN, "transition", { id: poolT.json.id, to: "in_progress" });
+checks["role agent claims via transition"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === poolT.json.id)?.owner === mintAn.body.label;
+
 // logout round-trip — last, so the shared cookie survives the rest of the suite
 const out = await fetch(base + "/logout", { headers: { cookie }, redirect: "manual" });
 checks["logout clears cookie"] = out.status === 302 && /Max-Age=0/.test(out.headers.get("set-cookie") ?? "");

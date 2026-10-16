@@ -77,6 +77,7 @@ export const RELATIONS = [
   "depends_on",
   "discusses",
   "derived_from",
+  "child_of",
   "relates",
 ] as const;
 export type Relation = (typeof RELATIONS)[number];
@@ -96,6 +97,8 @@ export function validateRelation(
     return { ok: false, reason: "implements: source must be a task, target an rfc or goal" };
   if (relation === "constrains" && srcType !== "steering")
     return { ok: false, reason: "constrains: source must be steering" };
+  if (relation === "child_of" && !(srcType === "task" && dstType === "task"))
+    return { ok: false, reason: "child_of: both source and target must be tasks (flat structure — the board never nests, relations do)" };
   return { ok: true };
 }
 
@@ -201,7 +204,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `Findings worth keeping belong in Knowledge (research / discussion artefacts), not session memory. Open questions go to Discussions — conclusions there get promoted to decisions.`,
     `While working a task, send log_progress often — one line + sentiment + self-reported gauges: completion_pct, confidence_pct, risk_pct (0-100). completion = how far along; confidence = belief the result is right; risk = what could break. They chart on the card and drive prioritisation.`,
     `HEARTBEAT CONTRACT: log_progress at least every 10 minutes while in_progress — even "still working on X". Silence >10m means the watchdog assumes you died: the task auto-transitions to blocked ("abandoned") and stays assigned to you. Re-claim by logging progress, which flips it back to in_progress. If you are blocked on a human/agent decision, call ask.create immediately — an open ask pauses the watchdog and surfaces the decision in the Bridge app.`,
-    `TASK STATUS IS YOUR RESPONSIBILITY. Claimed work: transition → in_progress the moment you start. Finished: → done (link the PR in the artefact). Stuck: → blocked with a reason AND an unblock condition (both required — no dead-end cards), then ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
+    `TASK STATUS IS YOUR RESPONSIBILITY. Work enters as UNCLAIMED todo — anyone with a matching role may pick it up. Claim by transitioning → in_progress (that sets you as owner); finished: → done (link the PR in the artefact). Stuck: → blocked with a reason AND an unblock condition (both required — no dead-end cards), then ask. The board is the source of truth — if the card is wrong, the team is misinformed.`,
     `Steering constrains you; accepted decisions are settled — supersede, don't contradict.`,
   ];
   if (board.mode === "external") {
