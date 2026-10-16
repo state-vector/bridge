@@ -78,6 +78,37 @@ checks["get_history has create+progress versions"] = (hist.json?.versions ?? [])
 const boardSeries = await j("/api/kb/board");
 checks["board series has pct points"] = (boardSeries.body.series ?? []).some((s) => s.artefact_id === c.json.id && s.completion_pct === 40);
 
+// watchdog: stale in_progress → blocked "abandoned" → log_progress re-claims; open ask pauses it
+await j("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings: { stale_minutes: 1 } }) });
+const staleT = await tool(A, "create_artefact", { type: "task", title: `Watchdog probe ${uid}` });
+await tool(A, "transition", { id: staleT.json.id, to: "in_progress" });
+const wdAsk = await tool(A, "ask_agent", { artefact_id: staleT.json.id, to: "any", question: `decision needed for ${uid}?` });
+checks["ask linked → task blocked-on-decision"] = !wdAsk.isError && wdAsk.json?.task_status === "blocked" && /blocked-on-decision/.test(wdAsk.json.note ?? "");
+const pollBoard = async (pred, deadlineMs) => {
+  const end = Date.now() + deadlineMs;
+  let last = null;
+  while (Date.now() < end) {
+    const b = await j("/api/kb/board");
+    last = b.body.tasks?.find((t) => t.id === staleT.json.id);
+    if (pred(last)) return last;
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  return last;
+};
+console.log("  polling ≤120s: watchdog must NOT abandon while ask is open…");
+let wdTask = await pollBoard((t) => Date.now() - (t?.meta?.last_progress?.ts ?? t?.status_ts ?? 0) > 75_000, 120_000);
+checks["open ask pauses watchdog (still blocked, not abandoned)"] = wdTask?.status === "blocked" && !/abandoned/.test(wdTask?.meta?.blocked?.reason ?? "");
+await tool(A, "answer_ask", { id: wdAsk.json.id, answer: "ship it" });
+wdTask = await pollBoard((t) => t?.status === "in_progress", 15_000);
+checks["answered ask resumes task to in_progress"] = wdTask?.status === "in_progress";
+console.log("  polling ≤130s: silence → watchdog blocks as abandoned…");
+wdTask = await pollBoard((t) => t?.status === "blocked" && /abandoned/.test(t?.meta?.blocked?.reason ?? ""), 130_000);
+checks["silence >stale_minutes → blocked abandoned"] = wdTask?.status === "blocked" && /abandoned/.test(wdTask?.meta?.blocked?.reason ?? "");
+const reclaim = await tool(A, "log_progress", { id: staleT.json.id, note: "back online — re-claiming" });
+checks["log_progress re-claims abandoned task"] = !reclaim.isError;
+const boardAfterReclaim = await j("/api/kb/board");
+checks["re-claimed → in_progress"] = boardAfterReclaim.body.tasks?.find((t) => t.id === staleT.json.id)?.status === "in_progress";
+
 // blocked validation: no reason → 400; with reason+unblock → ok; meta.blocked present
 const badBlock = await j("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.body.id, to: "blocked" }) });
 checks["blocked without reason+unblock rejected"] = badBlock.status === 400 && /unblock/.test(JSON.stringify(badBlock.body));

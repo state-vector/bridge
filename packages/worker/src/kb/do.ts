@@ -73,6 +73,36 @@ export class KnowledgeHub {
     }
   }
 
+  // Watchdog: silence on in_progress means the agent is gone. Block it as
+  // abandoned; the same agent re-claims it by logging progress again.
+  async alarm() {
+    await this.ensureSchema();
+    const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+    const staleMs = staleMin * 60_000;
+    const now = Date.now();
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status = 'in_progress'`,
+    ).toArray();
+    for (const r of rows as any[]) {
+      const meta = JSON.parse(r.meta ?? "{}");
+      if (meta.awaiting_ask) continue;
+      const lastTs = meta.last_progress?.ts ?? r.status_ts ?? r.updated_ts ?? 0;
+      if (now - lastTs <= staleMs) continue;
+      const openAsk = this.one(
+        `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
+      );
+      if (openAsk) continue;
+      await this.transition({
+        id: r.id, to: "blocked",
+        note: `abandoned — no update for >${staleMin}m; auto-blocked by watchdog`,
+        unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner})`,
+      }, "system:watchdog");
+    }
+    await this.state.storage.setAlarm(now + 60_000);
+  }
+
   async eventsSince(since: number, limit: number) {
     // since=0 → the most recent window (newest first, returned oldest-first);
     // since>0 → incremental forward from the cursor.
@@ -219,6 +249,7 @@ export class KnowledgeHub {
       `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
       `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
       `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
+      `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -226,6 +257,9 @@ export class KnowledgeHub {
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureSchema();
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + 15_000);
+    }
     const url = new URL(request.url);
 
     // realtime: hibernating WS fanout of audit events
@@ -566,9 +600,15 @@ export class KnowledgeHub {
     const completion_pct = pct(body.completion_pct);
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
-    const row = this.one(`SELECT id, meta FROM artefacts WHERE id = ?`, id);
+    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
+    // Re-claim: logging progress on a watchdog-abandoned task flips it back to
+    // in_progress (the unblock condition the watchdog promised). Legitimately
+    // blocked tasks (human reasons) keep their status until explicitly resumed.
+    if (row.status === "blocked" && (meta.blocked?.reason ?? "").startsWith("abandoned")) {
+      await this.transition({ id, to: "in_progress", note: "re-claimed — agent resumed (heartbeat)" }, actor);
+    }
     meta.last_progress = { note, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
     if (body.session && !meta.session) meta.session = body.session;
     this.state.storage.sql.exec(
@@ -668,13 +708,36 @@ export class KnowledgeHub {
     if (!question) throw new Error("question is required");
     if (question.length > 2000) throw new Error("question exceeds 2000 chars");
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
+    const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
+    const options = Array.isArray(body.options) ? body.options.map((o: any) => String(o).slice(0, 200)).filter(Boolean).slice(0, 8) : [];
+    const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
     const id = `ASK-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    let taskStatus: string | undefined;
+    if (artefactId) {
+      const row = this.one(`SELECT type, status, meta FROM artefacts WHERE id = ?`, artefactId);
+      if (!row) throw new Error(`no such artefact: ${artefactId}`);
+      if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
+        const meta = JSON.parse(row.meta ?? "{}");
+        meta.awaiting_ask = { ask_id: id, ts: Date.now() };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), artefactId);
+        if (row.status === "in_progress") {
+          await this.transition({
+            id: artefactId, to: "blocked",
+            note: `blocked on decision — ${id}: ${question.slice(0, 120)}`,
+            unblock_condition: `answer to ask ${id}`,
+          }, actor);
+          taskStatus = "blocked";
+        } else {
+          taskStatus = "blocked";
+        }
+      }
+    }
     this.state.storage.sql.exec(
-      `INSERT INTO asks (id, from_label, to_target, question, status, created_ts) VALUES (?, ?, ?, ?, 'open', ?)`,
-      id, actor, to, question, Date.now(),
+      `INSERT INTO asks (id, from_label, to_target, question, status, created_ts, artefact_id) VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+      id, actor, to, question, Date.now(), artefactId || null,
     );
-    this.audit(actor, "ask", id, { to: to, question });
-    return { id, to, question };
+    this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
+    return { id, to, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
   }
 
   private async askInbox(body: any) {
@@ -700,15 +763,33 @@ export class KnowledgeHub {
     const id = String(body.id ?? "");
     const answer = String(body.answer ?? "").trim();
     if (!answer) throw new Error("answer is required");
-    const row = this.one(`SELECT status FROM asks WHERE id = ?`, id);
+    const row = this.one(`SELECT status, artefact_id FROM asks WHERE id = ?`, id);
     if (!row) throw new Error(`no such ask: ${id}`);
     if (row.status !== ASK_OPEN) throw new Error(`ask ${id} already ${row.status}`);
     this.state.storage.sql.exec(
       `UPDATE asks SET status = 'answered', answer = ?, answered_by = ?, answered_ts = ? WHERE id = ?`,
       answer.slice(0, 4000), actor, Date.now(), id,
     );
-    this.audit(actor, "answer", id, {});
-    return { id, status: ASK_ANSWERED };
+    let taskStatus: string | undefined;
+    if (row.artefact_id) {
+      const t = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, String(row.artefact_id));
+      if (t) {
+        const meta = JSON.parse(t.meta ?? "{}");
+        if (meta.awaiting_ask?.ask_id === id) {
+          delete meta.awaiting_ask;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), String(row.artefact_id));
+        }
+        if (t.status === "blocked") {
+          await this.transition({
+            id: String(row.artefact_id), to: "in_progress",
+            note: `decision ${id} answered — resumed: ${answer.slice(0, 100)}`,
+          }, `system:decision(${actor})`);
+          taskStatus = "in_progress";
+        }
+      }
+    }
+    this.audit(actor, "answer", row.artefact_id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
+    return { id, status: ASK_ANSWERED, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
   }
 
   private async orient(body: any) {

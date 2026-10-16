@@ -227,8 +227,13 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify(a));
     }
     case "ask_agent": {
-      const a = await call("ask.create", { to: args.to ?? "any", question: args.question });
-      return text(JSON.stringify({ ...a, note: "they will see it on their next orient. check yours too." }));
+      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, artefact_id: args.artefact_id });
+      return text(JSON.stringify({
+        ...a,
+        note: a.task_status === "blocked"
+          ? "your task is now blocked-on-decision (watchdog paused for it) and the ask is published in the Bridge app. check asks for the answer."
+          : "they will see it on their next orient. check yours too.",
+      }));
     }
     case "asks": {
       const inbox = await call("ask.inbox", { label: identity.label, tags: identity.tags });
@@ -377,13 +382,14 @@ const TOOLS = [
   },
   {
     name: "ask_agent",
-    description: "Ask another agent for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any.",
+    description: "Ask another agent for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered.",
     inputSchema: {
       type: "object",
       required: ["question"],
       properties: {
         to: { type: "string", description: "default: any" },
         question: { type: "string" },
+        artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },
       },
     },
   },

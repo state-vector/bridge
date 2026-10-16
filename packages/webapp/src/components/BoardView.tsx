@@ -174,6 +174,9 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
 
       {task.status === "blocked" && task.meta?.blocked && (
         <div className="task-blocked-info">
+          {(task.meta.blocked.reason ?? "").startsWith("abandoned") && (
+            <span className="chip chip-urgent">abandoned</span>
+          )}
           <div className="task-progress-note"><b>why:</b> {task.meta.blocked.reason}</div>
           <div className="task-progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition}</div>
         </div>
