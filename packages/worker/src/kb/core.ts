@@ -334,3 +334,45 @@ export function trigramVec(text: string, dim = TRIGRAM_DIM): number[] {
   const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0));
   return norm ? v.map((x) => x / norm) : v;
 }
+
+// ---------- agent behaviour score (self-reinforcing: gaming it = behaving well) ----------
+
+export interface AgentSignals {
+  /** log_progress events in the window */
+  progress_count: number;
+  /** progress events that included at least one gauge */
+  gauge_count: number;
+  /** progress notes < 10 chars — padding */
+  thin_notes: number;
+  /** watchdog abandonments on this agent's tasks */
+  abandoned: number;
+  /** asks addressed to this agent in the window */
+  asks_received: number;
+  /** of those, answered within 30 minutes */
+  asks_answered_on_time: number;
+  /** artefacts created with a real body (≥ 200 chars) */
+  artefacts_created: number;
+}
+
+export function scoreAgent(s: AgentSignals): { score: number; grade: string; hints: string[] } {
+  let score = 50;
+  const hints: string[] = [];
+
+  score += Math.min(20, s.gauge_count * 2);
+  score -= Math.min(25, s.abandoned * 10);
+  if (s.abandoned > 0)
+    hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked — send log_progress every ≤10m`);
+  score += Math.min(15, s.asks_answered_on_time * 3);
+  if (s.asks_received >= 2 && s.asks_answered_on_time === 0)
+    hints.push("asks addressed to you went unanswered — they block other agents; answer or redirect them");
+  score += Math.min(10, s.artefacts_created * 2);
+  if (s.artefacts_created === 0)
+    hints.push("no artefacts created in the last 7 days — outcomes belong in Knowledge, not session memory");
+  score -= Math.min(10, s.thin_notes * 2);
+  if (s.thin_notes > 2)
+    hints.push(`${s.thin_notes} progress notes looked like padding — write what actually happened`);
+
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
+  return { score, grade, hints };
+}

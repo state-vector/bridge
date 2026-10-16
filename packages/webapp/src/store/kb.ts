@@ -1,7 +1,13 @@
 import { create } from "zustand";
-import { connectKbWs, kbApi } from "../lib/kb";
+import { connectKbWs, kbApi, KbAuthError } from "../lib/kb";
 import type { KbArtefact, KbAuthToken, KbEvent, KbProgress, KbSeriesPoint, KbSession } from "../lib/kb";
 import { getConfig } from "../lib/config";
+import { useBridge } from "../lib/store";
+
+/** 401 anywhere on the knowledge plane → raise the app-wide sign-in gate. */
+function escalateAuth(e: unknown) {
+  if (e instanceof KbAuthError) useBridge.setState({ conn: "auth" });
+}
 
 export interface BoardPrefs {
   issue: boolean; status: boolean; age: boolean; owner: boolean;
@@ -91,8 +97,8 @@ export const useKb = create<KbState>((set, get) => ({
         const merged = [...ev.events.slice().reverse(), ...s.events.filter((e) => !ev.events.some((n) => n.seq === e.seq))];
         set({ events: merged.slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.last_seq) });
       }
-    } catch {
-      /* hub unreachable or mock mode — views show empty states */
+    } catch (e) {
+      escalateAuth(e); /* hub unreachable or mock mode — views show empty states */
     }
   },
 
@@ -101,7 +107,9 @@ export const useKb = create<KbState>((set, get) => ({
       const t = await kbApi.tokens();
       const s = await kbApi.settings();
       set({ tokens: t.tokens, sessions: t.sessions, settings: s.settings ?? {} });
-    } catch { /* not signed in yet */ }
+    } catch (e) {
+      escalateAuth(e); /* not signed in yet */
+    }
   },
 
   mint: async (label, tags, transport) => {

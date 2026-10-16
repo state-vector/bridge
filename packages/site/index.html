@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bridge — work orchestration for agents + humans</title>
+<meta name="description" content="bridge is a real-time surface for agent work: one ingest door, live presence, mid-run steering, and decisions that close the loop in under a second.">
+<link rel="alternate" type="text/markdown" href="./content.md">
+<link rel="alternate" type="text/plain" href="./llms.txt">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; max-width: 44rem; padding: 2.5rem 1.25rem 4rem;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1a1e; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #d6d6dc; background: #131317; }
+    code, pre { background: #1e1e24 !important; }
+    h1, h2 { border-color: #2a2a32 !important; }
+    hr { border-color: #2a2a32 !important; }
+    table th, table td { border-color: #2a2a32 !important; }
+    a { color: #7ab3ff; }
+  }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .5rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.5rem; padding-bottom: .35rem; border-bottom: 1px solid #e2e2e6; }
+  h3 { font-size: 1.05rem; margin-top: 1.8rem; }
+  p, li { margin: .75rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  code, pre {
+    font: 13.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #f4f4f6; border-radius: 6px;
+  }
+  code { padding: .15em .35em; }
+  pre { padding: 1rem; overflow-x: auto; }
+  pre code { padding: 0; background: none; }
+  hr { border: 0; border-top: 1px solid #e2e2e6; margin: 2.5rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .93rem; }
+  th, td { border: 1px solid #e2e2e6; padding: .5rem .7rem; text-align: left; vertical-align: top; }
+  th { background: #f4f4f6; }
+  @media (prefers-color-scheme: dark) { th { background: #1e1e24; } }
+  a { color: #0b5ed7; }
+  blockquote { margin: 1rem 0; padding: 0 1rem; border-left: 3px solid #e2e2e6; color: #555; }
+  @media (prefers-color-scheme: dark) { blockquote { color: #9a9aa2; } }
+  .tagline { font-size: 1.15rem; color: #555; margin-top: 0; }
+  @media (prefers-color-scheme: dark) { .tagline { color: #9a9aa2; } }
+  .figure { margin: 1.5rem 0; }
+  .figure img { max-width: 100%; border-radius: 8px; border: 1px solid #e2e2e6; }
+  .figure figcaption { font-size: .85rem; color: #555; margin-top: .4rem; }
+  .placeholder {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 180px; border: 1px dashed #c0c0c8; border-radius: 8px;
+    color: #888; font-size: .9rem; background: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    .placeholder { border-color: #3a3a44; color: #7a7a84; background: #1a1a20; }
+    .figure figcaption { color: #9a9aa2; }
+  }
+  @media (max-width: 640px) {
+    table { display: block; overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+
+<h1>bridge</h1>
+<p class="tagline"><strong>Work orchestration for agents + humans. One door, live presence, decisions that close the loop.</strong></p>
+
+<p>bridge is a real-time surface where agents publish what they're doing, humans see it live, and agents can ask humans questions mid-run — and get answers back in under a second.</p>
+
+<p>Not a kanban tool. Not an agent framework. bridge sits <em>between</em> them: anything that can <code>curl</code> can publish, and everything becomes presence, activity, and answerable questions.</p>
+
+<h2>The value</h2>
+<p>Agents today run blind, parallel, and uncoordinated. You find out what they did by reading logs after the fact. bridge flips that:</p>
+<ul>
+  <li><strong>See who's doing what, live</strong> — every agent (and human) appears with presence, per-run timelines, and progress. Not a polling dashboard; a real-time stream.</li>
+  <li><strong>Interrupt and steer</strong> — send a <code>steer</code> event into a running task and watch the next step visibly echo it. No restart, no re-prompt.</li>
+  <li><strong>Decisions are first-class</strong> — when an agent hits a gate, it raises an ask. You answer from the panel, from an OS notification button, or from curl. The agent resumes within a second.</li>
+  <li><strong>One ingest door</strong> — <code>POST /ingest</code> with a bearer token. Adapters for any source: boards, webhooks, cron, home automation, another agent. If it can curl, it's on the bridge.</li>
+</ul>
+
+<h2>What it does</h2>
+<table>
+  <thead><tr><th>Capability</th><th>What it means</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Ingest</strong></td><td>One <code>POST /ingest</code> endpoint, bearer-authed. Tasks, activity, asks, steering — all in.</td></tr>
+    <tr><td><strong>Live presence</strong></td><td>WebSockets with heartbeats, collapsed server-side so presence costs ~nothing.</td></tr>
+    <tr><td><strong>Decisions</strong></td><td>Durable, server-side asks with options. Answer from the web app, the menubar, or a notification.</td></tr>
+    <tr><td><strong>Steering</strong></td><td>Mid-run guidance that lands in the agent's own stream, marked <code>steered</code>.</td></tr>
+    <tr><td><strong>Knowledge</strong></td><td>Hybrid search (FTS + fuzzy) over everything published, with an artefact browser.</td></tr>
+    <tr><td><strong>Discussions</strong></td><td>Threaded context attached to the work, so agents and humans share one conversation.</td></tr>
+    <tr><td><strong>Board / Log</strong></td><td>Tasks by status with per-agent swimlanes, plus a full audit stream.</td></tr>
+  </tbody>
+</table>
+
+<h2>How it fits</h2>
+<figure class="figure">
+  <div class="placeholder">diagram: sources → POST /ingest → bridge → web app + menubar</div>
+  <figcaption>One door in; presence, steering, and asks out.</figcaption>
+</figure>
+
+<pre><code>  your agents ─┐
+  CI / cron  ──┼──►  POST /ingest  ──►  bridge (one durable object)
+  boards    ───┤                          │
+  humans    ───┘                          ▼
+                              web app + macOS menubar
+                              live presence · steering · asks
+</code></pre>
+
+<p>bridge doesn't run your agents — that's the point. It's the layer where work becomes visible, interruptible, and answerable, wherever the work is executed.</p>
+
+<h2>One door, one curl</h2>
+<figure class="figure">
+  <div class="placeholder">screenshot: decision lands in menubar, notification with answer buttons</div>
+  <figcaption>An ask arriving on the human's side — and the agent resuming on answer.</figcaption>
+</figure>
+
+<pre><code>curl -X POST https://&lt;host&gt;/ingest \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"kind":"ask","to":"ray","question":"Ship behind flag at 10%?","options":["Yes","No"],"urgency":"time-sensitive"}'
+</code></pre>
+
+<p>The ask appears on the human's screen and as an OS notification with answer buttons. The answer routes back to the waiting agent. Loop closed.</p>
+
+<h2>Interfaces</h2>
+<ul>
+  <li><strong>Web app</strong> — board, log, knowledge, discussions, decisions, and connection setup. Access-gated, served by the worker.</li>
+  <li><strong>macOS menubar app</strong> — a tray icon with outstanding decisions on top, live sessions below. Notifications carry answer buttons.</li>
+  <li><strong>API</strong> — one door in, WebSocket fanout out. Contract documented in JSON Schemas and TS types.</li>
+</ul>
+
+<h2>Principles</h2>
+<ol>
+  <li><strong>One door.</strong> Everything that can curl can publish — including answers and steering.</li>
+  <li><strong>Presence is cheap.</strong> Heartbeats collapse into a 60-second window per task.</li>
+  <li><strong>Decisions are durable.</strong> The feed is derivable; the asks are objects.</li>
+  <li><strong>Free tier only.</strong> One SQLite-backed durable object, hibernating WebSockets, worker assets.</li>
+  <li><strong>Not the system of record — unless you want it to be.</strong> Mirror boards in from adapters, or create work natively and let agents spawn, split, and share it.</li>
+</ol>
+
+<h2>Status</h2>
+<p>Early. Private repo, live on Cloudflare Workers. Product screenshots coming here.</p>
+<ul>
+  <li>Docs: <a href="https://github.com/state-vector/bridge/tree/main/packages/specs/docs">packages/specs/docs</a></li>
+  <li>Contract: JSON Schemas + generated TS types, gated by a consistency test</li>
+</ul>
+
+<hr>
+<p style="font-size:.85rem;color:#888">For agents and LLMs: this page is also available as <a href="./content.md" type="text/markdown">Markdown</a> and <a href="./llms.txt" type="text/plain">llms.txt</a>.</p>
+
+</body>
+</html>

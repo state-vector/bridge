@@ -81,6 +81,20 @@ body { background: transparent; color: var(--text); }
 .login-input:focus { outline: none; border-color: var(--amber); }
 .login-error { color: var(--red); font-size: 11.5px; }
 
+.auth-gate {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+}
+.auth-card {
+  display: flex; flex-direction: column; gap: 10px; align-items: center;
+  padding: 28px 30px; min-width: 280px;
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 12px;
+}
+.auth-brand { font-size: 20px; letter-spacing: 0.02em; }
+.auth-host { margin: 0; font-size: 12px; color: var(--text-dim); }
+.auth-card .login-input { width: 220px; }
+.auth-submit { width: 220px; justify-content: center; }
+
 .settings-drawer {
   width: 100%; display: flex; flex-direction: column; gap: 8px;
   padding: 10px 12px; margin-top: 8px;

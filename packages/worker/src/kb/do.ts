@@ -19,6 +19,8 @@ import {
   embedText,
   hybridMerge,
   composeBootstrap,
+  scoreAgent,
+  AgentSignals,
   TRANSPORTS,
   ARTEFACT_TYPES,
   ArtefactType,
@@ -82,7 +84,7 @@ export class KnowledgeHub {
     const staleMs = staleMin * 60_000;
     const now = Date.now();
     const rows = this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts, updated_ts FROM artefacts
+      `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND status = 'in_progress'`,
     ).toArray();
     for (const r of rows as any[]) {
@@ -99,7 +101,7 @@ export class KnowledgeHub {
       await this.transition({
         id: r.id, to: "blocked",
         note: `abandoned — no update for >${staleMin}m; auto-blocked by watchdog`,
-        unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner})`,
+        unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`,
       }, "system:watchdog");
     }
     await this.state.storage.setAlarm(now + 60_000);
@@ -141,7 +143,63 @@ export class KnowledgeHub {
       const d = JSON.parse(v.data ?? "{}");
       return { artefact_id: v.artefact_id, ts: v.ts, actor: v.actor, ...d };
     });
-    return { tasks, sessions, progress, series };
+    return { tasks, sessions, progress, series, agents: this.agentScores() };
+  }
+
+  /** Behaviour signals per agent over the trailing 7-day window, scored via scoreAgent(). */
+  private agentScores(): Array<{ label: string } & AgentSignals & ReturnType<typeof scoreAgent>> {
+    const windowTs = Date.now() - 7 * 24 * 60 * 60_000;
+    const tokens = this.state.storage.sql.exec(
+      `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`,
+    ).toArray() as any[];
+    const signals = new Map<string, AgentSignals>();
+    const sig = (label: string): AgentSignals => {
+      let s = signals.get(label);
+      if (!s) {
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 };
+        signals.set(label, s);
+      }
+      return s;
+    };
+    for (const t of tokens) sig(t.label); // agents with no activity still get a row
+    for (const p of this.state.storage.sql.exec(
+      `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
+      windowTs,
+    ).toArray() as any[]) {
+      const s = sig(p.actor);
+      const d = JSON.parse(p.data ?? "{}");
+      s.progress_count++;
+      if (d.completion_pct != null || d.confidence_pct != null || d.risk_pct != null) s.gauge_count++;
+      if (String(d.note ?? "").trim().length < 10) s.thin_notes++;
+    }
+    for (const r of this.state.storage.sql.exec(
+      `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
+       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
+      windowTs,
+    ).toArray() as any[]) sig(r.owner || "unknown").abandoned += r.n;
+    for (const r of this.state.storage.sql.exec(
+      `SELECT owner, COUNT(*) AS n FROM artefacts
+       WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
+      windowTs,
+    ).toArray() as any[]) sig(r.owner).artefacts_created += r.n;
+    for (const t of tokens) {
+      const s = sig(t.label);
+      const tags: string[] = JSON.parse(t.tags ?? "[]");
+      const targets = ["any", t.label, ...tags.map((x: string) => `tag:${x}`)];
+      const marks = targets.map(() => "?").join(",");
+      s.asks_received = this.one(
+        `SELECT COUNT(*) AS n FROM asks WHERE status IN ('open','answered') AND from_label != ?
+         AND created_ts >= ? AND to_target IN (${marks})`, t.label, windowTs, ...targets,
+      )?.n ?? 0;
+      s.asks_answered_on_time = this.one(
+        `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
+         AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, windowTs,
+      )?.n ?? 0;
+    }
+    return [...signals.entries()]
+      .filter(([label]) => !/^(system:|web$)/.test(label))
+      .map(([label, s]) => ({ label, ...s, ...scoreAgent(s) }))
+      .sort((a, b) => b.score - a.score);
   }
 
   private async getWithRelations(id: string) {
@@ -631,9 +689,13 @@ export class KnowledgeHub {
     this.audit(actor, "progress", id, { note, sentiment });
     this.version(id, actor, "progress", note, { note, sentiment, completion_pct, confidence_pct, risk_pct });
     const m = this.settingsMap();
+    const myScore = this.agentScores().find((a) => a.label === actor);
+    const scoreLine = myScore
+      ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
+      : "";
     return {
       id, note, sentiment, completion_pct, confidence_pct, risk_pct,
-      instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : ""),
+      instructions: composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine,
     };
   }
 
@@ -832,6 +894,8 @@ export class KnowledgeHub {
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','blocked') ORDER BY updated_ts DESC LIMIT 10`,
       label,
     ).toArray();
+    const my_score = this.agentScores().find((a) => a.label === label)
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
     return {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD) + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : ""),
@@ -840,6 +904,7 @@ export class KnowledgeHub {
       open_artefacts: open,
       my_tasks: myTasks,
       pending_asks: pendingAsks,
+      my_score,
     };
   }
 

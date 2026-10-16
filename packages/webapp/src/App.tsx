@@ -56,7 +56,7 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   );
 }
 
-function AuthBanner() {
+function SignIn() {
   const url = useBridge((s) => s.url);
   const loginError = useBridge((s) => s.loginError);
   const loginWithPassword = useBridge((s) => s.loginWithPassword);
@@ -72,21 +72,26 @@ function AuthBanner() {
   };
 
   return (
-    <div className="conn-banner">
-      <span>Signed out of {new URL(url).host}.</span>
-      <input
-        type="password"
-        className="login-input"
-        placeholder="hub password"
-        value={pw}
-        onChange={(e) => setPw(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && void submit()}
-        autoFocus
-      />
-      <button className="opt-btn" onClick={() => void submit()} disabled={!pw || busy}>
-        {busy ? "…" : "Sign in"}
-      </button>
-      {loginError && <span className="login-error">{loginError}</span>}
+    <div className="auth-gate">
+      <form
+        className="auth-card"
+        onSubmit={(e) => { e.preventDefault(); void submit(); }}
+      >
+        <div className="brand auth-brand">Bridge</div>
+        <p className="auth-host">Sign in to {new URL(url).host}</p>
+        <input
+          type="password"
+          className="login-input"
+          placeholder="password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          autoFocus
+        />
+        <button className="opt-btn auth-submit" type="submit" disabled={!pw || busy}>
+          {busy ? "…" : "Sign in"}
+        </button>
+        {loginError && <span className="login-error">{loginError}</span>}
+      </form>
     </div>
   );
 }
@@ -151,10 +156,11 @@ export default function App() {
 
   const overlay = overlayId && overlayDecision ? overlayDecision : null;
 
+  if (conn === "auth") return <SignIn />;
+
   return (
     <div className="app">
       <TopBar tab={tab} setTab={setTab} />
-      {conn === "auth" && <AuthBanner />}
       {conn === "closed" && (
         <div className="conn-banner">
           Hub unreachable — is it deployed / mock hub running (npm run hub)?

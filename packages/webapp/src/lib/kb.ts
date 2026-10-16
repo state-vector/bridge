@@ -82,8 +82,12 @@ export interface KbBoard {
 
 const base = () => getConfig().url;
 
+/** Thrown when the cookie session is missing/expired — the app funnels these into the sign-in gate. */
+export class KbAuthError extends Error {}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${base()}${path}`, { credentials: "include", ...init });
+  if (r.status === 401) throw new KbAuthError("signed out");
   if (!r.ok) throw new Error(`${r.status} ${await r.text().then((t) => t.slice(0, 200))}`);
   return (await r.json()) as T;
 }

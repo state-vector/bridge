@@ -116,3 +116,37 @@ describe("trigram fuzzy vectors", () => {
     expect(cosine(a, c)).toBeLessThan(0.3);
   });
 });
+
+import { scoreAgent, AgentSignals } from "../src/kb/core.ts";
+
+const zero: AgentSignals = {
+  progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0,
+  asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0,
+};
+
+describe("agent behaviour score", () => {
+  it("idle agent sits at 50/fair with a nudge to create", () => {
+    const r = scoreAgent({ ...zero });
+    expect(r.score).toBe(50);
+    expect(r.grade).toBe("fair");
+    expect(r.hints.join(" ")).toMatch(/no artefacts created/);
+  });
+
+  it("gauges and on-time asks raise it; abandonments tank it", () => {
+    const good = scoreAgent({ ...zero, gauge_count: 5, artefacts_created: 3, asks_received: 4, asks_answered_on_time: 4 });
+    expect(good.score).toBeGreaterThan(60);
+    expect(good.grade).toBe("good");
+    const excellent = scoreAgent({ ...zero, gauge_count: 10, artefacts_created: 5, asks_received: 6, asks_answered_on_time: 6 });
+    expect(excellent.score).toBeGreaterThanOrEqual(80);
+    expect(excellent.grade).toBe("excellent");
+    const bad = scoreAgent({ ...zero, abandoned: 3, thin_notes: 4 });
+    expect(bad.score).toBeLessThan(40);
+    expect(bad.grade).toBe("poor");
+    expect(bad.hints.join(" ")).toMatch(/watchdog-blocked/);
+  });
+
+  it("effective range is 15..95 (base 50, penalties capped at 35, bonuses at 45)", () => {
+    expect(scoreAgent({ ...zero, abandoned: 99, thin_notes: 99 }).score).toBe(15);
+    expect(scoreAgent({ ...zero, gauge_count: 99, asks_answered_on_time: 99, artefacts_created: 99 }).score).toBe(95);
+  });
+});

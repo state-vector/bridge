@@ -41,6 +41,7 @@ const c = await tool(A, "create_artefact", { type: "task", title: `Batching impl
 checks["create w/ tags+session (BR# id)"] = !c.isError && /^BR#\d+$/.test(c.json?.id ?? "");
 const p = await tool(A, "log_progress", { id: c.json.id, note: "batch writer drafted", sentiment: "converging" });
 checks["log_progress w/ sentiment + instructions"] = !p.isError && !!p.json?.instructions;
+checks["progress instructions include behaviour score"] = /behaviour score/.test(p.json?.instructions ?? "");
 await tool(A, "transition", { id: c.json.id, to: "in_progress" });
 const s1 = await tool(A, "search_knowledge", { q: "slow ingestion" });
 checks["fuzzy search (semantic+fts)"] = (s1.json?.artefacts?.length ?? 0) >= 1;
@@ -50,6 +51,9 @@ const board = await j("/api/kb/board");
 const bt = board.body.tasks?.find((x) => x.id === c.json.id);
 checks["board: progress + session + status_ts"] = !!bt?.meta?.last_progress && !!bt?.meta?.session && typeof bt?.status_ts === "number";
 checks["board: progress stream"] = (board.body.progress ?? []).some((x) => x.artefact_id === c.json.id);
+checks["board lists agent behaviour scores"] = (board.body.agents ?? []).some((a) => a.label === mintA.body.label && a.progress_count >= 1 && typeof a.score === "number");
+const or = await tool(A, "orient", { session: `e2e-${uid}` });
+checks["orient returns my_score"] = typeof or.json?.my_score?.score === "number" && typeof or.json?.my_score?.grade === "string";
 // proactive surfacing: B creates an overlapping task; A's get_artefact should see it
 const overlap = await tool(B, "create_artefact", { type: "task", title: `Batching impl follow-up ${uid}`, tags: ["ingestion", "performance"] });
 const got = await tool(A, "get_artefact", { id: c.json.id });
