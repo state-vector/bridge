@@ -30,6 +30,7 @@ interface KbState {
   sessions: KbSession[];
   progress: KbProgress[];
   series: KbSeriesPoint[];
+  agents: Array<{ label: string; score: number; grade: string; hints: string[] } & Record<string, number | string>>;
   events: KbEvent[]; // newest first
   prefs: BoardPrefs;
   lastSeq: number;
@@ -54,6 +55,7 @@ let stopWs: (() => void) | null = null;
 export const useKb = create<KbState>((set, get) => ({
   conn: "off",
   tasks: [],
+  agents: [],
   sessions: [],
   progress: [],
   series: [],
@@ -91,13 +93,13 @@ export const useKb = create<KbState>((set, get) => ({
   reset: () => {
     stopWs?.();
     stopWs = null;
-    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], events: [], lastSeq: 0, tokens: [], settings: {} });
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], settings: {} });
   },
 
   refresh: async () => {
     try {
       const board = await kbApi.board();
-      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [] });
+      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [] });
       const ev = await kbApi.events(get().lastSeq);
       if (ev.events.length) {
         const s = get();

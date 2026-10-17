@@ -6,15 +6,17 @@ import { DiscussionsView } from "./components/DiscussionsView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { Panel } from "./components/Panel";
+import { TopView } from "./components/TopView";
 import { SettingsView } from "./components/SettingsView";
 import type { WsFrame } from "@flows/specs";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";
 
-type Tab = "board" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox";
+type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "board", label: "Board" },
+  { key: "top", label: "Top" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discuss" },
@@ -160,6 +162,7 @@ export default function App() {
       )}
       <main className="main">
         {tab === "board" && <BoardView />}
+        {tab === "top" && <TopView />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}

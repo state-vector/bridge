@@ -14,6 +14,7 @@ export interface KbArtefact {
   meta?: Record<string, unknown>;
   created_ts: number;
   updated_ts: number;
+  status_ts?: number;
 }
 
 export interface KbEvent {
@@ -78,6 +79,7 @@ export interface KbBoard {
   sessions: KbSession[];
   progress: KbProgress[];
   series: KbSeriesPoint[];
+  agents?: Array<{ label: string; score: number; grade: string; hints: string[] } & Record<string, number | string>>;
 }
 
 const base = () => getConfig().url;
