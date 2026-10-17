@@ -197,6 +197,20 @@ checks["session endpoint (mode + user + workspace + expiry)"] = sess.body.mode =
   checks["e2e workspace token still sees its own data"] = (JSON.parse(e2eTokenSearch.result?.content?.[0]?.text ?? "{}").artefacts ?? []).length >= 1;
   cookie = saved;
 }
+// device pairing: start → membership-checked approve → one-time poll (opaque token)
+{
+  const pc = (await j("/api/pair/start", { method: "POST", body: JSON.stringify({ device: `e2e-box-${uid}` }) })).body;
+  const got = await j("/api/pair/get", { method: "POST", body: JSON.stringify({ code: pc.code }) });
+  checks["pair: start + get"] = !!pc.code && got.body.status === "pending" && got.body.device === `e2e-box-${uid}`;
+  const denied = await j("/api/pair/approve", { method: "POST", body: JSON.stringify({ code: pc.code, ws: "gh-stranger", label: `p-${uid}`, tags: ["role:impl"] }) });
+  checks["pair: approve requires membership"] = !!denied.body.error;
+  const ok = await j("/api/pair/approve", { method: "POST", body: JSON.stringify({ code: pc.code, ws: "e2e", label: `p-${uid}`, tags: ["role:impl"] }) });
+  checks["pair: approve mints in member ws"] = ok.status === 200 && ok.body.ok === true;
+  const poll1 = await j("/api/pair/poll", { method: "POST", body: JSON.stringify({ code: pc.code }) });
+  checks["pair: poll returns opaque token once"] = poll1.body.status === "authorized" && /^bkw_[0-9a-f]{48}$/.test(poll1.body.token ?? "");
+  const poll2 = await j("/api/pair/poll", { method: "POST", body: JSON.stringify({ code: pc.code }) });
+  checks["pair: second poll expired (one-time read)"] = poll2.body.status === "expired";
+}
 const mintC = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `tmp-${uid}` }) });
 const tokensNow = await j("/api/kb/admin/tokens");
 // tags update in place (roles/capabilities) — secret stays valid, no re-mint
@@ -240,9 +254,10 @@ const gPickup = await tool(A, "transition", { id: gParent.json.id, to: "in_progr
 checks["unqualified work cannot be picked up"] = gPickup.isError && /not qualified/.test(gPickup.text ?? "");
 const gAnalysis = await tool(A, "create_artefact", { type: "task", title: `Swimlane analysis ${uid}`, tags: ["role:analysis"] });
 await tool(A, "link_artefacts", { src: gAnalysis.json.id, relation: "child_of", dst: gParent.json.id });
-await tool(A, "transition", { id: gAnalysis.json.id, to: "in_progress" });
-await tool(A, "transition", { id: gAnalysis.json.id, to: "done" });
-await tool(A, "transition", { id: gParent.json.id, to: "in_progress" });
+await tool(A, "transition", { id: gAnalysis.json.id, to: "in_progress", session: `e2e-analysis-${uid}` });
+await tool(A, "transition", { id: gAnalysis.json.id, to: "done", session: `e2e-analysis-${uid}` });
+// separation of duties: the analysis session cannot claim the parent for impl — fresh session
+await tool(A, "transition", { id: gParent.json.id, to: "in_progress", session: `e2e-impl-${uid}` });
 checks["analysis child qualifies pickup (claim sets owner)"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === gParent.json.id)?.owner === mintA.body.label;
 const gUnreviewed = await tool(A, "transition", { id: gParent.json.id, to: "done" });
 checks["work cannot be done unreviewed"] = gUnreviewed.isError && /unreviewed/.test(gUnreviewed.text ?? "");
@@ -252,13 +267,15 @@ const gBoard1 = await j("/api/kb/board");
 checks["child task carries part_of; parent carries rollup"] = gBoard1.body.tasks?.find((t) => t.id === gImpl.json.id)?.part_of === gParent.json.id
   && gBoard1.body.tasks?.find((t) => t.id === gParent.json.id)?.children_open === 1
   && gBoard1.body.tasks?.find((t) => t.id === gParent.json.id)?.children_done === 1;
-await tool(A, "transition", { id: gImpl.json.id, to: "in_progress" });
+await tool(A, "transition", { id: gImpl.json.id, to: "in_progress", session: `e2e-impl-${uid}` });
 const gImplDone = await tool(A, "transition", { id: gImpl.json.id, to: "done" });
 checks["impl child also gated on review"] = gImplDone.isError && /unreviewed/.test(gImplDone.text ?? "");
-const gReview = await tool(A, "create_artefact", { type: "task", title: `Swimlane review ${uid}`, tags: ["role:review"] });
+const gReview = await tool(A, "create_artefact", { type: "task", title: `Swimlane review ${uid}`, tags: ["role:review"], session: `e2e-review-${uid}` });
 await tool(A, "link_artefacts", { src: gReview.json.id, relation: "child_of", dst: gParent.json.id });
-await tool(A, "transition", { id: gReview.json.id, to: "in_progress" });
-await tool(A, "transition", { id: gReview.json.id, to: "done" });
+// review receipts + separation of duties: the review completes from a different
+// session than the implementation, citing what was verified
+await tool(A, "transition", { id: gReview.json.id, to: "in_progress", session: `e2e-review-${uid}` });
+await tool(A, "transition", { id: gReview.json.id, to: "done", session: `e2e-review-${uid}`, note: "verified: PR https://github.com/state-vector/bridge/pull/1 merged, checks green" });
 const gOpenKid = await tool(A, "transition", { id: gParent.json.id, to: "done" });
 checks["parent not completable with open children"] = gOpenKid.isError && /open child/.test(gOpenKid.text ?? "");
 const gVerdict = await tool(A, "create_artefact", { type: "decision", title: `Verdict: pass ${uid}` });
@@ -309,10 +326,10 @@ const sqTask1 = sqBoard1.body.tasks?.find((t) => t.id === sqT.json.id);
 checks["stacked quals: declared + unmet bar projected on board"] = sqTask1?.qualification?.state === "qualified" && sqTask1?.qualification?.ready === false && (sqTask1?.qualification?.unmet_bars ?? []).includes("role:review");
 const sqBlocked = await tool(A, "transition", { id: sqT.json.id, to: "in_progress" });
 checks["qualified-but-awaiting work cannot be picked up"] = sqBlocked.isError && /awaiting|unmet bars/.test(sqBlocked.text ?? "");
-const sqReview = await tool(A, "create_artefact", { type: "task", title: `Stacked quals confirm ${uid}`, tags: ["role:review"] });
+const sqReview = await tool(A, "create_artefact", { type: "task", title: `Stacked quals confirm ${uid}`, tags: ["role:review"], session: `e2e-review-${uid}` });
 await tool(A, "link_artefacts", { src: sqReview.json.id, relation: "child_of", dst: sqT.json.id });
-await tool(A, "transition", { id: sqReview.json.id, to: "in_progress" });
-await tool(A, "transition", { id: sqReview.json.id, to: "done" });
+await tool(A, "transition", { id: sqReview.json.id, to: "in_progress", session: `e2e-review-${uid}` });
+await tool(A, "transition", { id: sqReview.json.id, to: "done", session: `e2e-review-${uid}`, note: "verified: PR https://github.com/state-vector/bridge/pull/2 merged, checks green" });
 const sqBoard2 = await j("/api/kb/board");
 checks["stacked quals: bar met → ready"] = sqBoard2.body.tasks?.find((t) => t.id === sqT.json.id)?.qualification?.ready === true;
 await tool(A, "transition", { id: sqT.json.id, to: "in_progress" });

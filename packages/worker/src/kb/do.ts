@@ -1450,14 +1450,16 @@ export class KnowledgeHub {
       if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       return true;
     }).slice(0, 10).map((t: any) => {
-      // claimability trait: computed per row, extended as new blockers appear —
-      // orient clients speak domain language (is_claimable), not flag soup.
+      // pool traits — the pattern: computed per row, never stored flags. Clients
+      // speak domain language (is_question, is_claimable, previously_attempted),
+      // and every claimability blocker here is enforced at the claim gate —
+      // a trait that lies is worse than no trait. Extend both together.
       const m = JSON.parse(t.meta ?? "{}");
-      const isQuestion = t.tags?.includes("question");
+      t.is_question = t.tags?.includes("question") ?? false;
       const gated = m.operator_gated;
-      t.is_claimable = !isQuestion && !gated;
+      t.is_claimable = !t.is_question && !gated;
       if (!t.is_claimable) {
-        t.claim_reason = isQuestion
+        t.claim_reason = t.is_question
           ? "question — answered, not claimed (contribute via log_progress {id, did})"
           : `operator gated: ${gated} — a human clears the gate`;
       }

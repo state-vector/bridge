@@ -244,8 +244,30 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       // and existing knowledge before they build. see seeAlso() below.
       const also = await seeAlso(a, rel, identity, call);
       const overlap = also.filter((s: any) => s.coordination);
+      // traits: same computed pattern as the orient pool — domain language over
+      // stored flags; claimability blockers here mirror the claim gate.
+      const isTask = a.type === "task";
+      const aTags: string[] = Array.isArray(a.tags) ? a.tags : [];
+      const m: any = a.meta ?? {};
+      const isQuestion = aTags.includes("question");
+      const gated = m.operator_gated;
+      const traits = isTask
+        ? {
+            is_question: isQuestion,
+            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated,
+            claim_reason: isQuestion
+              ? "question — answered, not claimed (contribute via log_progress {id, did})"
+              : gated
+                ? `operator gated: ${gated} — a human clears the gate`
+                : ["todo", "blocked"].includes(a.status ?? "")
+                  ? undefined
+                  : `status '${a.status}' is not claimable (claim = todo → in_progress)`,
+            previously_attempted: (m.attempt?.attempts ?? 0) > 0 ? m.attempt : undefined,
+          }
+        : undefined;
       return text(JSON.stringify({
         ...a,
+        ...(traits ? { traits } : {}),
         relations: (rel as any).relations,
         see_also: also,
         coordination: overlap.length

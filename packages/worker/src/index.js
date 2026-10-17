@@ -94,6 +94,41 @@ export default {
     if (url.pathname === "/login") return handleGithubLogin(request, env);
     if (url.pathname === "/login/callback") return handleGithubCallback(request, env);
 
+    // Device pairing (github-like device flow, bridge-native): start + poll are
+    // unauthenticated machine-plane; approve is human-plane (session cookie).
+    // The minted token flows to the DEVICE via poll, never to the approver.
+    if (url.pathname.startsWith("/api/pair/")) {
+      const body = await request.json().catch(() => ({}));
+      try {
+        if (url.pathname === "/api/pair/start" && request.method === "POST") {
+          return json(await wsCall(env, "ws.pair.start", { device: String(body.device ?? "device") }));
+        }
+        if (url.pathname === "/api/pair/poll" && request.method === "POST") {
+          return json(await wsCall(env, "ws.pair.poll", { code: String(body.code ?? "") }));
+        }
+        if (url.pathname === "/api/pair/get" && request.method === "POST") {
+          const auth = await checkAuth(request, env);
+          if (auth instanceof Response) return auth;
+          return json(await wsCall(env, "ws.pair.get", { code: String(body.code ?? "") }));
+        }
+        if (url.pathname === "/api/pair/approve" && request.method === "POST") {
+          const auth = await checkAuth(request, env);
+          if (auth instanceof Response) return auth;
+          const out = await wsCall(env, "ws.pair.approve", {
+            code: String(body.code ?? ""),
+            ws: String(body.ws ?? ""),
+            label: String(body.label ?? ""),
+            tags: Array.isArray(body.tags) ? body.tags.slice(0, 10).map(String) : [],
+            login: auth.login ? auth.login.toLowerCase() : "",
+          });
+          return json(out);
+        }
+        return new Response("not found", { status: 404 });
+      } catch (e) {
+        return json({ error: String((e).message ?? e) }, 400);
+      }
+    }
+
     const auth = await checkAuth(request, env);
     if (auth instanceof Response) return auth; // login page / 401 / 403 / 503 Response
 
