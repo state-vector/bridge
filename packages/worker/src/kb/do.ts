@@ -603,9 +603,10 @@ export class KnowledgeHub {
       await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
       delete tmeta.blocked;
     } else if (t.status === "todo") {
-      // pickup gate applies: only qualified work (or qualifier roles) auto-starts
+      // pickup gate applies: only qualified work (or qualifier roles) auto-starts.
+      // Question tasks are never auto-started — contributions don't claim.
       const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
-      if (q.ok) await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
+      if (q.ok && !tTags.includes("question")) await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
     tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
     delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
@@ -903,6 +904,12 @@ export class KnowledgeHub {
       if (!r.ok)
         throw new Error(`task ${id} cannot be completed unreviewed — complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`);
     }
+    // questions are answered, not claimed: a 'question'-tagged task collects
+    // contributions (progress artefacts) from any number of agents and is closed
+    // by its author with an ADR (decision artefact). Claiming would gate others out.
+    if (row.type === "task" && to === "in_progress" && tTags.includes("question")) {
+      throw new Error(`task ${id} is a question (tagged 'question') — questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`);
+    }
     if (row.status === "blocked" && to === "in_progress") {
       const resolution = String(body.note ?? body.resolution ?? "").trim();
       if (!resolution)
@@ -1156,7 +1163,14 @@ export class KnowledgeHub {
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
       // otherwise say WHY instead of silently logging into a card that never moves.
-      const tTags: string[] = parseTags(row.tags);
+      const tTags: string[] = JSON.parse(row.tags ?? "[]");
+      // question tasks: contributions never claim — the author closes with an ADR
+      if (tTags.includes("question")) {
+        return {
+          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+          note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task).",
+        };
+      }
       const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
@@ -1429,6 +1443,7 @@ export class KnowledgeHub {
       if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       return true;
     }).slice(0, 10).map((t: any) => {
+      if (t.tags?.includes("question")) t.is_question = true; // orient clients: surface "questions to answer"
       const m = JSON.parse(t.meta ?? "{}");
       if (m.attempt) {
         t.previously_attempted = {
@@ -1934,6 +1949,9 @@ export class KnowledgeHub {
       ts, actor, op, artefactId, JSON.stringify(detail),
     ).toArray()[0] as any;
     this.broadcastEvent({ seq: Number(r?.seq ?? 0), ts, actor, op, artefact_id: artefactId, detail });
+    // every mutation can move behaviour signals — drop the 30s score cache so
+    // board reads after writes are fresh (the cache exists for DO row-read quota)
+    this.scoreCache = null;
   }
 
   private async nextSeq(_type: ArtefactType): Promise<number> {
