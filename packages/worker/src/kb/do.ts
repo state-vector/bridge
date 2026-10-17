@@ -910,6 +910,13 @@ export class KnowledgeHub {
     if (row.type === "task" && to === "in_progress" && tTags.includes("question")) {
       throw new Error(`task ${id} is a question (tagged 'question') — questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`);
     }
+    // operator-gated work needs a human go-before (meta.operator_gated). The gate
+    // clears when a human updates the task without that meta key.
+    if (row.type === "task" && to === "in_progress") {
+      const pre = JSON.parse(row.meta ?? "{}");
+      if (pre.operator_gated)
+        throw new Error(`task ${id} is operator-gated (${pre.operator_gated}) — a human clears this by updating the task (remove operator_gated from meta) before it can be claimed.`);
+    }
     if (row.status === "blocked" && to === "in_progress") {
       const resolution = String(body.note ?? body.resolution ?? "").trim();
       if (!resolution)
@@ -1443,8 +1450,17 @@ export class KnowledgeHub {
       if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       return true;
     }).slice(0, 10).map((t: any) => {
-      if (t.tags?.includes("question")) t.is_question = true; // orient clients: surface "questions to answer"
+      // claimability trait: computed per row, extended as new blockers appear —
+      // orient clients speak domain language (is_claimable), not flag soup.
       const m = JSON.parse(t.meta ?? "{}");
+      const isQuestion = t.tags?.includes("question");
+      const gated = m.operator_gated;
+      t.is_claimable = !isQuestion && !gated;
+      if (!t.is_claimable) {
+        t.claim_reason = isQuestion
+          ? "question — answered, not claimed (contribute via log_progress {id, did})"
+          : `operator gated: ${gated} — a human clears the gate`;
+      }
       if (m.attempt) {
         t.previously_attempted = {
           by: m.attempt.by, attempts: m.attempt.attempts,
