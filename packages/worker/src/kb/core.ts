@@ -36,7 +36,7 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   decision: { proposed: ["accepted"], accepted: ["superseded"] },
   discussion: { open: ["concluded"] },
   research: { draft: ["published"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
   progress: {},
   agent: {},
 };

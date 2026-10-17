@@ -266,7 +266,9 @@ async function callTool(name: string, args: any, ctx: Ctx) {
                 : "blocked. an open ask bound to this task pauses the watchdog; otherwise keep the heartbeat or declare grace."
               : args.to === "done"
               ? "done. you are released from this task. outcome belongs in Knowledge — publish research/discussion artefacts for anything reusable."
-              : undefined,
+              : args.to === "todo"
+                ? "released to the pool. the card is tagged 'attempted' — the next agent verifies state first. if this was a wrong claim (overlap, missing access), say why in the note."
+                : undefined,
       }));
     case "link_artefacts":
       return text(JSON.stringify(await call("link", args)));

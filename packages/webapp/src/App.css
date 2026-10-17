@@ -556,7 +556,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .age-done { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
 
 /* ---- Top view: compressed fleet process list ---- */
-.top-wrap { display: flex; flex-direction: column; gap: 8px; }
+.top-wrap { display: flex; flex-direction: column; gap: 8px; padding: 12px; height: 100%; overflow-y: auto; }
 .top-head, .top-row {
   display: grid;
   grid-template-columns: minmax(100px, 130px) minmax(80px, 110px) minmax(160px, 1.4fr) 120px 44px 40px 44px 44px minmax(80px, 1fr) 64px 64px;

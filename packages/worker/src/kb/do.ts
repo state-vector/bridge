@@ -906,11 +906,14 @@ export class KnowledgeHub {
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = actor;
     }
-    // retry: pushing a card back to todo releases the claim — it re-enters the
-    // unclaimed pool for any matching agent (or the cron sweep) to pick up fresh.
-    // Annotate it: this task was ATTEMPTED and came back. The next agent must
-    // verify current state first — and close it out if the work is already done.
+    // retry / release: pushing a card back to todo releases the claim — it
+    // re-enters the unclaimed pool for any matching agent (or the cron sweep)
+    // to pick up fresh. Only the current owner or a human may release a claim —
+    // agents can't dump each other's work.
     if (row.type === "task" && to === "todo") {
+      const isHuman = actor === "web" || actor.startsWith("human:");
+      if (row.owner && row.owner !== actor && !isHuman)
+        throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       owner = "";
       const tags: string[] = row.tags ? JSON.parse(row.tags) : [];
       if (!tags.includes("attempted")) tags.push("attempted");
@@ -918,7 +921,7 @@ export class KnowledgeHub {
       meta.attempt = {
         by: actor, at: ts,
         attempts: ((meta.attempt?.attempts as number) ?? 0) + 1,
-        last_reason: meta.blocked?.reason,
+        last_reason: meta.blocked?.reason ?? String(body.note ?? "").trim() || undefined,
         last_will: meta.last_progress?.will,
       };
     }
