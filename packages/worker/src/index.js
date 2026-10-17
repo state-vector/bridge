@@ -75,6 +75,7 @@ export default {
         op === "tokens" && request.method === "GET" ? "https://kb/admin.list_tokens"
         : op === "tokens" ? "https://kb/admin.mint"
         : op === "tokens/revoke" ? "https://kb/admin.revoke"
+        : op === "tokens/tags" ? "https://kb/admin.token_tags"
         : op === "settings" && request.method === "GET" ? "https://kb/admin.settings_get"
         : op === "settings" ? "https://kb/admin.settings_set"
         : null;

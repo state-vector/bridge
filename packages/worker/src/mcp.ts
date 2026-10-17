@@ -13,9 +13,38 @@ import {
   composeBootstrap,
   DEFAULT_WS_SLUG,
   doWs,
+  hashAuthToken,
   tokenWorkspace,
 } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
+
+// per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
+const wsRouteCache = new Map<string, string>();
+
+/**
+ * Workspace routing WITHOUT leaking the workspace in the token: agent tokens
+ * are opaque (`bkw_<hex>`). Order: legacy pre-registry tokens with an embedded
+ * slug (`bkw_<ws>_<hex>`) route by that slug; everything else resolves via the
+ * central registry (hash → ws, written at mint); unknown → default workspace
+ * (whose auth check 401s unknown tokens).
+ */
+async function resolveTokenWs(env: any, bearer: string): Promise<string> {
+  const embedded = tokenWorkspace(bearer);
+  if (embedded) return embedded;
+  const hash = await hashAuthToken(bearer);
+  const hit = wsRouteCache.get(hash);
+  if (hit) return hit;
+  const reg = env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+  const r = await reg.fetch("https://kb/ws.token_lookup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash }),
+  });
+  const out = (await r.json().catch(() => ({}))) as { ws?: string | null };
+  const ws = out.ws ?? DEFAULT_WS_SLUG;
+  if (wsRouteCache.size < 1000) wsRouteCache.set(hash, ws);
+  return ws;
+}
 
 export async function handleMcp(request: Request, env: any): Promise<Response> {
   if (request.method !== "POST") {
@@ -37,12 +66,11 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     return new Response(null, { status: 202 });
   }
 
-  // Workspace scoping: the bearer token embeds its workspace slug
-  // (`bkw_<ws>_<hex>`) — route to that workspace's DO. Legacy bare tokens
-  // (`bkw_<hex>`) and the shared ingest token belong to the default workspace.
+  // tokens are opaque — the workspace comes from the routing order above,
+  // never from the secret itself. The shared ingest token is default-workspace.
   const ws = bearer === env.FLOWS_INGEST_TOKEN
     ? DEFAULT_WS_SLUG
-    : (tokenWorkspace(bearer) ?? DEFAULT_WS_SLUG);
+    : await resolveTokenWs(env, bearer);
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
 
   // identity: registry auth token (bkw_…) or the legacy shared ingest token

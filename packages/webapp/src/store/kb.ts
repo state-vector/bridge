@@ -44,6 +44,7 @@ interface KbState {
   refreshAdmin: () => Promise<void>;
   mint: (label: string, tags: string[], transport?: string) => Promise<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>;
   revoke: (id: string) => Promise<void>;
+  setTokenTags: (id: string, tags: string[]) => Promise<void>;
   saveSettings: (s: Record<string, unknown>) => Promise<void>;
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) => Promise<void>;
   setPref: (k: keyof BoardPrefs, v: boolean) => void;
@@ -128,6 +129,10 @@ export const useKb = create<KbState>((set, get) => ({
   },
   revoke: async (id) => {
     await kbApi.revoke(id);
+    await get().refreshAdmin();
+  },
+  setTokenTags: async (id, tags) => {
+    await kbApi.updateTokenTags(id, tags);
     await get().refreshAdmin();
   },
   saveSettings: async (s) => {

@@ -23,13 +23,15 @@ describe("auth tokens", () => {
     expect(isValidAuthTokenShape("bkw_short")).toBe(false);
   });
 
-  it("embeds workspace slugs in agent tokens; legacy bare tokens = default ws", () => {
-    const scoped = generateAuthToken("state-vector");
-    expect(scoped).toMatch(/^bkw_state-vector_[0-9a-f]{48}$/);
-    expect(isValidAuthTokenShape(scoped)).toBe(true);
-    expect(tokenWorkspace(scoped)).toBe("state-vector");
-    expect(tokenWorkspace(generateAuthToken())).toBeNull();
-    // a ws-scoped secret must not parse as a bare one and vice versa
+  it("tokens are opaque (no workspace leak); legacy embedded-slug tokens still parse", () => {
+    const t = generateAuthToken();
+    expect(t).toMatch(/^bkw_[0-9a-f]{48}$/);
+    expect(isValidAuthTokenShape(t)).toBe(true);
+    expect(tokenWorkspace(t)).toBeNull();
+    // legacy compat: pre-registry tokens with an embedded slug still route
+    const legacy = generateAuthToken("state-vector");
+    expect(legacy).toMatch(/^bkw_state-vector_[0-9a-f]{48}$/);
+    expect(tokenWorkspace(legacy)).toBe("state-vector");
     expect(tokenWorkspace("bkw_state-vector_short")).toBeNull();
     expect(isWsSlug("state-vector")).toBe(true);
     expect(isWsSlug("State Vector")).toBe(false);

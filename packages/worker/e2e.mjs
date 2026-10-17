@@ -36,7 +36,7 @@ cookie = await mintCookie("rayh", "e2e"); // suite runs in its own workspace
 checks["session cookie minted"] = cookie.startsWith("bridge_session=");
 const wsCreate = await j("/api/workspaces", { method: "POST", body: JSON.stringify({ slug: "e2e" }) }); // idempotent-enough: 'already exists' = provisioned by an earlier run
 const mintA = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `oc-${uid}`, tags: ["datadog-access"], transport: "mcp" }) });
-checks["workspace provisioned (minted tokens embed the ws slug)"] = /^bkw_e2e_[0-9a-f]{48}$/.test(mintA.body?.secret ?? "");
+checks["tokens are opaque (no workspace leak in the secret)"] = /^bkw_[0-9a-f]{48}$/.test(mintA.body?.secret ?? "");
 const A = mintA.body.secret;
 const mintB = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `acp-${uid}`, transport: "acp-proxy" }) });
 const B = mintB.body.secret;
@@ -199,6 +199,10 @@ checks["session endpoint (mode + user + workspace + expiry)"] = sess.body.mode =
 }
 const mintC = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `tmp-${uid}` }) });
 const tokensNow = await j("/api/kb/admin/tokens");
+// tags update in place (roles/capabilities) — secret stays valid, no re-mint
+const mintTag = await j("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `tag-${uid}` }) });
+const tagUp = await j("/api/kb/admin/tokens/tags", { method: "POST", body: JSON.stringify({ id: mintTag.body.id, tags: ["role:analysis", "role:impl"] }) });
+checks["token tags update in place"] = tagUp.status === 200 && JSON.stringify(tagUp.body.tags) === JSON.stringify(["role:analysis", "role:impl"]);
 await j("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id: tokensNow.body.tokens.find((t) => t.label === `tmp-${uid}`)?.id }) });
 checks["revoked token -32001"] = (await rpc("tools/list", {}, mintC.body.secret)).error?.code === -32001;
 // progress-artefact heartbeat: agents post progress logs instead of log_progress;
@@ -276,6 +280,17 @@ const orA = await tool(A, "orient", { session: `e2e-a2-${uid}` });
 checks["role-gated task hidden from non-matching agents"] = !(orA.json?.unclaimed_work ?? []).some((t) => t.id === poolT.json.id);
 await tool(AN, "transition", { id: poolT.json.id, to: "in_progress" });
 checks["role agent claims via transition"] = (await j("/api/kb/board")).body.tasks?.find((t) => t.id === poolT.json.id)?.owner === mintAn.body.label;
+// qualifier intake: unqualified work tagged for OTHER roles must be visible AND
+// claimable by analysis agents (their job is to qualify it) — otherwise impl-tagged
+// unqualified tasks deadlock the pool: invisible to impl agents (unqualified) and
+// to analysis agents (role-gated)
+const implT = await tool(A, "create_artefact", { type: "task", title: `Impl-tagged unqualified ${uid}`, tags: ["role:impl"] });
+const orAnQ = await tool(AN, "orient", { session: `e2e-an2-${uid}` });
+const surfaced = orAnQ.json?.unclaimed_work?.find((t) => t.id === implT.json.id);
+checks["qualifier sees unqualified impl-tagged work (needs_qualification)"] = !!surfaced && surfaced.needs_qualification === true;
+checks["qualifier claims impl-tagged unqualified work"] = !(await tool(AN, "transition", { id: implT.json.id, to: "in_progress" })).isError;
+const orAq = await tool(A, "orient", { session: `e2e-a2b-${uid}` });
+checks["unqualified impl work still hidden from impl agents"] = !(orAq.json?.unclaimed_work ?? []).some((t) => t.id === implT.json.id);
 // visibility: agents must not SEE work they cannot claim
 const uqT = await tool(A, "create_artefact", { type: "task", title: `Unqualified pool probe ${uid}` });
 const orA2 = await tool(A, "orient", { session: `e2e-a3-${uid}` });

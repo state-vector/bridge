@@ -117,6 +117,8 @@ export const kbApi = {
   mint: (label: string, tags: string[], transport?: string) =>
     j<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags, transport }) }),
   revoke: (id: string) => j<{ id: string }>("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id }) }),
+  updateTokenTags: (id: string, tags: string[]) =>
+    j<{ id: string; label: string; tags: string[] }>("/api/kb/admin/tokens/tags", { method: "POST", body: JSON.stringify({ id, tags }) }),
   settings: () => j<{ settings: Record<string, any> }>("/api/kb/admin/settings"),
   saveSettings: (settings: Record<string, unknown>) =>
     j<{ settings: Record<string, any> }>("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings }) }),
