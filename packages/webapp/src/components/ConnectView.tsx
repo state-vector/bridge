@@ -96,7 +96,7 @@ export function ConnectView() {
   const projectName = settings.project_name || "Superpositional";
 
   const ROLES = ["impl", "analysis", "review"];
-  const [roles, setRoles] = useState<string[]>(["impl"]);
+  const [roles, setRoles] = useState<string[]>(["impl", "analysis", "review"]);
   const [extraRoles, setExtraRoles] = useState("");
 
   const doMint = async () => {

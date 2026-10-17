@@ -930,7 +930,8 @@ export class KnowledgeHub {
     // agents can't dump each other's work.
     if (row.type === "task" && to === "todo") {
       const isHuman = actor === "web" || actor.startsWith("human:");
-      if (row.owner && row.owner !== actor && !isHuman)
+      const isSystem = /^system:/.test(actor);
+      if (row.owner && row.owner !== actor && !isHuman && !isSystem)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       owner = "";
       const tags: string[] = parseTags(row.tags);
@@ -943,9 +944,15 @@ export class KnowledgeHub {
         last_will: meta.last_progress?.will,
       };
     }
-    // separation of duties: the session that implemented a task cannot be the
-    // one whose review completes it — review children are done by a different session.
+    // receipts: a review verdict must cite the artifact it verified — for PR
+    // work that's the PR link; verification is a double-check, and the check
+    // leaves a trail.
     if (row.type === "task" && to === "done" && tTags.includes("role:review")) {
+      const note = String(body.note ?? "").trim();
+      if (!/https?:\/\/\S+|(^|\s)(PR|merged|passed)\b/i.test(note))
+        throw new Error(`review ${id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, or the check you ran).`);
+      // separation of duties: the session that implemented a task cannot be the
+      // one whose review completes it — review children are done by a different session.
       const parent = this.one(
         `SELECT p.id AS id, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
@@ -954,6 +961,24 @@ export class KnowledgeHub {
       const reviewSession = JSON.parse(row.meta ?? "{}").session;
       if (implSession && reviewSession && implSession === reviewSession)
         throw new Error(`separation of duties: session "${reviewSession}" implemented ${parent?.id} — it cannot also produce the review. Review from a different session.`);
+    }
+    // separation of duties, mechanical: a session that completed the analysis
+    // child cannot carry the parent into implementation. If the parent is
+    // claimed by the same session, release it — impl requires a fresh claim
+    // (fresh session). The claim gate will then allow it (evidence session ≠ new session).
+    if (row.type === "task" && to === "done" && tTags.includes("role:analysis")) {
+      const parent = this.one(
+        `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+         WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
+      );
+      const implSession = parent ? JSON.parse(parent.meta ?? "{}").session : undefined;
+      const analysisSession = JSON.parse(row.meta ?? "{}").session;
+      if (parent?.status === "in_progress" && implSession && analysisSession && implSession === analysisSession) {
+        await this.transition(
+          { id: parent.id, to: "todo", note: `analysis complete (${id}) — released for fresh-claim implementation` },
+          "system:separation",
+        );
+      }
     }
     // a parent isn't completable while children are open
     if (row.type === "task" && to === "done") {
