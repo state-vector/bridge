@@ -851,6 +851,17 @@ export class KnowledgeHub {
         if (bars.length)
           throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
       }
+      // separation of duties: the session that produced the analysis evidence
+      // may not implement the same task in that session — fresh session, fresh claim.
+      if (q.ok && q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
+        const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
+        if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
+          const evSession = JSON.parse(ev.meta ?? "{}").session;
+          const sess = await this.resolveSession(body, String(body.token_id ?? ""));
+          if (evSession && sess && evSession === sess)
+            throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
+        }
+      }
     }
     if (row.type === "task" && to === "done" && !isQualifier) {
       const r = this.qualifyCheck(row, "review");
@@ -927,9 +938,21 @@ export class KnowledgeHub {
       meta.attempt = {
         by: actor, at: ts,
         attempts: ((meta.attempt?.attempts as number) ?? 0) + 1,
-        last_reason: meta.blocked?.reason ?? String(body.note ?? "").trim() || undefined,
+        last_reason: meta.blocked?.reason ?? (String(body.note ?? "").trim() || undefined),
         last_will: meta.last_progress?.will,
       };
+    }
+    // separation of duties: the session that implemented a task cannot be the
+    // one whose review completes it — review children are done by a different session.
+    if (row.type === "task" && to === "done" && tTags.includes("role:review")) {
+      const parent = this.one(
+        `SELECT p.id AS id, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+         WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
+      );
+      const implSession = parent ? JSON.parse(parent.meta ?? "{}").session : undefined;
+      const reviewSession = JSON.parse(row.meta ?? "{}").session;
+      if (implSession && reviewSession && implSession === reviewSession)
+        throw new Error(`separation of duties: session "${reviewSession}" implemented ${parent?.id} — it cannot also produce the review. Review from a different session.`);
     }
     // a parent isn't completable while children are open
     if (row.type === "task" && to === "done") {
