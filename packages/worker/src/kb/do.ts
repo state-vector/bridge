@@ -851,16 +851,16 @@ export class KnowledgeHub {
         const bars = this.unmetBars(row);
         if (bars.length)
           throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
-      }
-      // separation of duties: the session that produced the analysis evidence
-      // may not implement the same task in that session — fresh session, fresh claim.
-      if (q.ok && q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
-        const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
-        if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
-          const evSession = JSON.parse(ev.meta ?? "{}").session;
-          const sess = await this.resolveSession(body, String(body.token_id ?? ""));
-          if (evSession && sess && evSession === sess)
-            throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
+        // separation of duties: the session that produced the analysis evidence
+        // may not implement the same task in that session — fresh session, fresh claim.
+        if (q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
+          const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
+          if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
+            const evSession = JSON.parse(ev.meta ?? "{}").session;
+            const sess = await this.resolveSession(body, String(body.token_id ?? ""));
+            if (evSession && sess && evSession === sess)
+              throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
+          }
         }
       }
     }
