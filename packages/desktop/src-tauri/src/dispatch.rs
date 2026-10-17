@@ -27,6 +27,10 @@ pub struct DispatchConfig {
     pub timeout_mins: u64,
     #[serde(default = "default_opencode_bin")]
     pub opencode_bin: String,
+    #[serde(default)]
+    pub label: Option<String>, // agent identity from pairing
+    #[serde(default)]
+    pub ws: Option<String>, // workspace slug from pairing
 }
 
 fn default_workdir() -> String {
@@ -64,6 +68,8 @@ impl DispatchConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_timeout_mins),
             opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| default_opencode_bin()),
+            label: None,
+            ws: None,
         })
     }
 
@@ -171,6 +177,10 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     .and_then(|w| w.as_str())
                     .unwrap_or("state-vector")
                     .to_string();
+                let label = resp
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .map(|s| s.to_string());
                 eprintln!("[pair] authorized — token for workspace '{ws}' saved");
                 return Ok(DispatchConfig {
                     url: url.to_string(),
@@ -180,6 +190,8 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     poll_secs: default_poll_secs(),
                     timeout_mins: default_timeout_mins(),
                     opencode_bin: default_opencode_bin(),
+                    label,
+                    ws: Some(ws),
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
@@ -242,12 +254,76 @@ fn mcp_call(
     Ok(parsed)
 }
 
+// ---- local dispatch snapshot (rendered by the app's Local view) ----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchActivity {
+    pub ts: u64,
+    pub kind: String, // info | dispatch | finish | error
+    pub msg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct InFlightView {
+    pub task_id: String,
+    pub task_title: String,
+    pub started_ms: u64,
+    pub last_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DispatchSnapshot {
+    pub running: bool,
+    pub url: Option<String>,
+    pub workspace: Option<String>,
+    pub label: Option<String>, // agent identity from pairing
+    pub agent: Option<String>, // opencode agent name
+    pub workdir: Option<String>,
+    pub in_flight: Option<InFlightView>,
+    pub activity: Vec<DispatchActivity>, // newest first, capped
+}
+
+pub type SharedSnapshot = Arc<Mutex<DispatchSnapshot>>;
+
+fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
+    if let Ok(mut s) = snap.lock() {
+        s.activity.insert(
+            0,
+            DispatchActivity {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                kind: kind.into(),
+                msg: msg.into(),
+            },
+        );
+        s.activity.truncate(30);
+    }
+}
+
+fn snap_in_flight(snap: &SharedSnapshot, in_flight: &Option<InFlight>) {
+    if let Ok(mut s) = snap.lock() {
+        s.in_flight = in_flight.as_ref().map(|inf| InFlightView {
+            task_id: inf.task_id.clone(),
+            task_title: inf.task_title.clone(),
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                - inf.started.elapsed().as_millis() as u64,
+            last_note: inf.last_note.clone(),
+        });
+    }
+}
+
 // ---- dispatch state (shared with Tauri commands) ----
 
 struct InFlight {
     task_id: String,
     task_title: String,
     started: std::time::Instant,
+    last_note: String,
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
 }
 
@@ -255,6 +331,7 @@ pub struct DispatchState {
     pub stop: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
     pub last_error: Arc<Mutex<Option<String>>>,
+    pub snapshot: Arc<Mutex<DispatchSnapshot>>,
     pub handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -264,6 +341,7 @@ impl DispatchState {
             stop: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(DispatchSnapshot::default())),
             handle: Mutex::new(None),
         }
     }
@@ -283,12 +361,14 @@ fn tick(
     cfg: &DispatchConfig,
     id: &mut i64,
     in_flight: &mut Option<InFlight>,
+    snap: &SharedSnapshot,
 ) -> Result<Option<String>, String> {
     // 1. heartbeat any in-flight opencode run; finalize when it exits
     if let Some(inf) = in_flight {
         match inf.rx.try_recv() {
             Ok(outcome) => {
                 let inf = in_flight.take().unwrap();
+                snap_in_flight(snap, &None);
                 let mins = inf.started.elapsed().as_secs() / 60;
                 let note = format!(
                     "opencode {} in ~{}m (exit {:?}) — {}",
@@ -317,29 +397,42 @@ fn tick(
                         "transition",
                         json!({ "id": inf.task_id, "to": "in_review", "note": note }),
                     ) {
-                        Ok(_) => return Ok(Some(format!("{} → in_review", inf.task_title))),
+                        Ok(_) => {
+                            let msg = format!("{} → in_review", inf.task_title);
+                            snap_activity(snap, "finish", &msg);
+                            return Ok(Some(msg));
+                        }
                         Err(_) => {
-                            return Ok(Some(format!(
+                            let msg = format!(
                                 "{} finished (no PR link — left in_progress for review pickup)",
                                 inf.task_title
-                            )))
+                            );
+                            snap_activity(snap, "finish", &msg);
+                            return Ok(Some(msg));
                         }
                     }
                 }
-                return Ok(Some(format!("{} failed/timed out — left in_progress", inf.task_title)));
+                let msg = format!("{} failed/timed out — left in_progress", inf.task_title);
+                snap_activity(snap, "finish", &msg);
+                return Ok(Some(msg));
             }
             Err(TryRecvError::Disconnected) => {
                 in_flight.take();
-                return Ok(Some("opencode runner dropped — will re-check next tick".into()));
+                snap_in_flight(snap, &None);
+                let msg: String = "opencode runner dropped — will re-check next tick".into();
+                snap_activity(snap, "error", &msg);
+                return Ok(Some(msg));
             }
             Err(TryRecvError::Empty) => {
                 let mins = inf.started.elapsed().as_secs() / 60;
+                inf.last_note = format!("opencode still working (~{mins}m in)");
                 mcp_call(
                     cfg,
                     id,
                     "log_progress",
                     json!({ "id": inf.task_id, "note": format!("dispatch runner: opencode still working (~{mins}m in)"), "sentiment": "neutral" }),
                 )?;
+                snap_in_flight(snap, in_flight);
                 return Ok(None); // one job at a time
             }
         }
@@ -427,6 +520,7 @@ fn tick(
         task_id: tid.to_string(),
         task_title: title.to_string(),
         started: std::time::Instant::now(),
+        last_note: "dispatching to opencode".into(),
         rx: {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -441,10 +535,13 @@ fn tick(
             rx
         },
     });
-    Ok(Some(format!("claimed {tid} — dispatched to opencode")))
+    snap_in_flight(snap, in_flight);
+    let msg = format!("claimed {tid} — dispatched to opencode");
+    snap_activity(snap, "dispatch", &msg);
+    Ok(Some(msg))
 }
 
-pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>) {
+pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>, snap: SharedSnapshot) {
     // no config → device pairing (needs BRIDGE_URL; prints the code to console)
     let cfg = match cfg {
         Some(c) => c,
@@ -483,15 +580,24 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         "[dispatch] loop started — {} (poll every {}s, workdir {})",
         cfg.url, cfg.poll_secs, cfg.workdir
     );
+    if let Ok(mut s) = snap.lock() {
+        s.running = true;
+        s.url = Some(cfg.url.clone());
+        s.workspace = cfg.ws.clone();
+        s.label = cfg.label.clone();
+        s.agent = cfg.agent.clone();
+        s.workdir = Some(cfg.workdir.clone());
+    }
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match tick(&cfg, &mut id, &mut in_flight) {
+        match tick(&cfg, &mut id, &mut in_flight, &snap) {
             Ok(Some(msg)) => eprintln!("[dispatch] {msg}"),
             Ok(None) => {}
             Err(e) => {
                 eprintln!("[dispatch] error: {e}");
+                snap_activity(&snap, "error", &e);
                 if let Ok(mut g) = last_error.lock() {
                     *g = Some(e);
                 }
@@ -507,6 +613,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         }
     }
     running.store(false, Ordering::Relaxed);
+    if let Ok(mut s) = snap.lock() {
+        s.running = false;
+        s.in_flight = None;
+    }
     eprintln!("[dispatch] loop stopped");
 }
 
@@ -519,8 +629,9 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
     let stop = state.stop.clone();
     let running = state.running.clone();
     let last_error = state.last_error.clone();
+    let snap = state.snapshot.clone();
     *handle = Some(std::thread::spawn(move || {
-        run_loop(cfg, stop, running, last_error)
+        run_loop(cfg, stop, running, last_error, snap)
     }));
     Ok(())
 }

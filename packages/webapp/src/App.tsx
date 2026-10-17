@@ -4,6 +4,7 @@ import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
 import { KnowledgeView } from "./components/KnowledgeView";
+import { LocalView } from "./components/LocalView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { Panel } from "./components/Panel";
@@ -14,17 +15,20 @@ import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";
 
-type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox";
-const TABS: Array<{ key: Tab; label: string }> = [
+type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox" | "local";
+const TABS_ALL: Array<{ key: Tab; label: string }> = [
   { key: "top", label: "Top" },
   { key: "board", label: "Board" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discuss" },
   { key: "connect", label: "Connect" },
+  { key: "local", label: "Local" },
   { key: "settings", label: "Settings" },
   { key: "inbox", label: "Decisions" },
 ];
+// the Local tab is desktop-shell-only (Tauri IPC); hidden in plain browsers
+const TABS = TABS_ALL.filter((t) => t.key !== "local" || "__TAURI_INTERNALS__" in window);
 
 const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
   void (async () => {
@@ -171,6 +175,7 @@ export default function App() {
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
         {tab === "connect" && <ConnectView />}
+        {tab === "local" && <LocalView />}
         {tab === "settings" && <SettingsView />}
         {tab === "inbox" && <Panel />}
       </main>

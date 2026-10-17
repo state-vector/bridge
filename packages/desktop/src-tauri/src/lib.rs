@@ -55,6 +55,11 @@ fn dispatch_status(state: tauri::State<'_, dispatch::DispatchState>) -> serde_js
 }
 
 #[tauri::command]
+fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_json::Value {
+    state.snapshot.lock().map(|s| serde_json::to_value(&*s).unwrap_or_default()).unwrap_or_default()
+}
+
+#[tauri::command]
 fn dispatch_start(
     state: tauri::State<'_, dispatch::DispatchState>,
     config: Option<dispatch::DispatchConfig>,
@@ -77,6 +82,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             notify_ask,
             dispatch_status,
+            dispatch_snapshot,
             dispatch_start,
             dispatch_stop,
             menubar::show_panel,
