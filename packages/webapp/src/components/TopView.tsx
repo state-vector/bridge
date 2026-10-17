@@ -131,10 +131,9 @@ export function TopView() {
         <span className="topc-goal">goal</span>
         <span className="topc-status">status</span>
         <span className="topc-score" title="behaviour compliance score, 7-day window">score</span>
-        <span className="topc-gauge" title="completion %">comp%</span>
         <span className="topc-gauge" title="confidence % — higher is better">conf</span>
         <span className="topc-gauge" title="risk % — lower is better">risk</span>
-        <span className="topc-bar">completion</span>
+        <span className="topc-bar" title="completion % — shown in the bar">completion</span>
         <span className="topc-age" title="time in current column">col age</span>
         <span className="topc-age" title="time since last signal from this agent">last seen</span>
       </div>
@@ -168,13 +167,11 @@ export function TopView() {
               </span>
             )}
           </span>
-          <span className={`topc-gauge top-num ${r.completion != null ? "num-comp" : ""}`}>{r.completion != null ? `${r.completion}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.confidence, true)}`}>{r.confidence != null ? `${r.confidence}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className="topc-bar">
-            <span className="top-bar">
-              <span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} />
-            </span>
+            <span className="top-bar"><span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} /></span>
+            <span className="top-bar-label top-num num-comp">{r.completion != null ? `${r.completion}%` : "—"}</span>
           </span>
           <span className="topc-age top-num">{r.statusTs ? age(r.statusTs, now) : "—"}</span>
           <span className={`topc-age top-num age-${r.lastSignal ? staleness(r.lastSignal, now) : "dead"}`}>{age(r.lastSignal ?? r.lastSeen, now)}</span>
