@@ -59,9 +59,7 @@ fn dispatch_start(
     state: tauri::State<'_, dispatch::DispatchState>,
     config: Option<dispatch::DispatchConfig>,
 ) -> Result<(), String> {
-    let cfg = config
-        .or_else(dispatch::DispatchConfig::from_env)
-        .ok_or("no dispatch config: set BRIDGE_URL + BRIDGE_TOKEN (or pass config)")?;
+    let cfg = config.or_else(dispatch::DispatchConfig::resolve);
     dispatch::start(&state, cfg)
 }
 
@@ -101,8 +99,10 @@ pub fn run() {
                 menubar::setup(app)?;
             }
 
-            // auto-start dispatch when configured via env (desktop + headless)
-            if let Some(cfg) = dispatch::DispatchConfig::from_env() {
+            // auto-start dispatch: headless pairs (device flow) if unconfigured;
+            // menubar mode only auto-starts when a config already exists
+            let cfg = dispatch::DispatchConfig::resolve();
+            if headless || cfg.is_some() {
                 let state = app.state::<dispatch::DispatchState>();
                 dispatch::start(&state, cfg)?;
             }

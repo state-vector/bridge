@@ -5,9 +5,10 @@ import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
+import { PairView } from "./components/PairView";
 import { Panel } from "./components/Panel";
-import { TopView } from "./components/TopView";
 import { SettingsView } from "./components/SettingsView";
+import { TopView } from "./components/TopView";
 import type { WsFrame } from "@flows/specs";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
@@ -146,6 +147,9 @@ export default function App() {
   }, []);
 
   const overlay = overlayId && overlayDecision ? overlayDecision : null;
+
+  // device pairing approval is a standalone page, not a tab
+  if (window.location.pathname === "/pair") return <PairView />;
 
   if (conn === "auth") return <SignIn />;
 

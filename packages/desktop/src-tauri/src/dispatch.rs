@@ -2,17 +2,18 @@
 //! and reports status back through the same protocol (orient / transition /
 //! log_progress). Runs identically in menu-bar and headless mode.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::opencode;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatchConfig {
     pub url: String,
     pub token: String,
@@ -64,6 +65,126 @@ impl DispatchConfig {
                 .unwrap_or_else(default_timeout_mins),
             opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| default_opencode_bin()),
         })
+    }
+
+    /// Resolution order: env vars > ~/.bridge/config.json > None (→ device pairing).
+    pub fn resolve() -> Option<Self> {
+        Self::from_env().or_else(load_config)
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = config_path();
+        let dir = path
+            .parent()
+            .ok_or("no config dir")?
+            .to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        }
+        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, body).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        eprintln!("[dispatch] config saved to {}", path.display());
+        Ok(())
+    }
+}
+
+fn config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".bridge").join("config.json")
+}
+
+fn load_config() -> Option<DispatchConfig> {
+    let raw = std::fs::read_to_string(config_path()).ok()?;
+    serde_json::from_str(&raw)
+        .map_err(|e| {
+            eprintln!("[dispatch] bad config file: {e}");
+            e
+        })
+        .ok()
+}
+
+/// Device pairing (bridge-native github-like device flow): request a code, the
+/// human approves it at {url}/pair, poll until the token arrives. The token is
+/// shown once on this device — the approver never sees it.
+fn pair(url: &str) -> Result<DispatchConfig, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let device = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "device".into());
+
+    let start: serde_json::Value = client
+        .post(format!("{url}/api/pair/start"))
+        .header("content-type", "application/json")
+        .body(json!({ "device": format!("{} (dispatch runner)", device) }).to_string())
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let code = start
+        .get("code")
+        .and_then(|c| c.as_str())
+        .ok_or("pair start failed")?
+        .to_string();
+    eprintln!("[pair] open {url}/pair and enter code {code}");
+    println!("[pair] open {url}/pair and enter code {code}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("pairing timed out — run again to get a fresh code".into());
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let resp: serde_json::Value = client
+            .post(format!("{url}/api/pair/poll"))
+            .header("content-type", "application/json")
+            .body(json!({ "code": code }).to_string())
+            .send()
+            .map_err(|e| format!("poll failed: {e}"))?
+            .json()
+            .map_err(|e| e.to_string())?;
+        match resp.get("status").and_then(|s| s.as_str()) {
+            Some("pending") => continue,
+            Some("slow_down") => {
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+            Some("authorized") => {
+                let token = resp
+                    .get("token")
+                    .and_then(|t| t.as_str())
+                    .ok_or("authorized but no token")?
+                    .to_string();
+                let ws = resp
+                    .get("ws")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("state-vector")
+                    .to_string();
+                eprintln!("[pair] authorized — token for workspace '{ws}' saved");
+                return Ok(DispatchConfig {
+                    url: url.to_string(),
+                    token,
+                    workdir: default_workdir(),
+                    agent: std::env::var("BRIDGE_AGENT").ok(),
+                    poll_secs: default_poll_secs(),
+                    timeout_mins: default_timeout_mins(),
+                    opencode_bin: default_opencode_bin(),
+                });
+            }
+            Some("expired") => return Err("pairing code expired — run again".into()),
+            other => return Err(format!("pairing failed: {other:?}")),
+        }
     }
 }
 
@@ -323,7 +444,38 @@ fn tick(
     Ok(Some(format!("claimed {tid} — dispatched to opencode")))
 }
 
-pub fn run_loop(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>) {
+pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>) {
+    // no config → device pairing (needs BRIDGE_URL; prints the code to console)
+    let cfg = match cfg {
+        Some(c) => c,
+        None => match std::env::var("BRIDGE_URL") {
+            Ok(url) => match pair(url.trim_end_matches('/')) {
+                Ok(c) => {
+                    if let Err(e) = c.save() {
+                        eprintln!("[dispatch] config save failed: {e}");
+                    }
+                    c
+                }
+                Err(e) => {
+                    if let Ok(mut g) = last_error.lock() {
+                        *g = Some(e.clone());
+                    }
+                    eprintln!("[dispatch] pairing failed: {e}");
+                    running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            },
+            Err(_) => {
+                let msg = "no config and no BRIDGE_URL — set BRIDGE_URL (or ~/.bridge/config.json) to pair".to_string();
+                eprintln!("[dispatch] {msg}");
+                if let Ok(mut g) = last_error.lock() {
+                    *g = Some(msg);
+                }
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+        },
+    };
     running.store(true, Ordering::Relaxed);
     let mut id: i64 = 0;
     let mut in_flight: Option<InFlight> = None;
@@ -358,7 +510,7 @@ pub fn run_loop(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<AtomicB
     eprintln!("[dispatch] loop stopped");
 }
 
-pub fn start(state: &DispatchState, cfg: DispatchConfig) -> Result<(), String> {
+pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), String> {
     let mut handle = state.handle.lock().map_err(|_| "state poisoned")?;
     if state.running.load(Ordering::Relaxed) {
         return Err("dispatch loop already running".into());
