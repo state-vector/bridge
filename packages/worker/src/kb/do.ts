@@ -1005,7 +1005,48 @@ export class KnowledgeHub {
       ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
-    return { id, status: to, ...(sentiment ? { sentiment } : {}) };
+    // verification duty: entering review auto-spawns the Verify task into the
+    // unclaimed pool. A verifier (any agent, fresh session) picks it up, checks
+    // receipts (PR/merge state), completes it, then closes the parent (done) or
+    // bounces it (in_progress with findings). The impl agent keeps the parent
+    // claim and waits — in_review is the blocked-until-verdict state.
+    let verifyTaskId: string | undefined;
+    if (row.type === "task" && to === "in_review") {
+      const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+      const created = await this.create(
+        {
+          type: "task",
+          title: `Verify: ${row.title.slice(0, 200)}`,
+          body_md: `Verification duty for ${id} — "${row.title}".\n\nDouble-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+          tags: ["role:review"],
+        },
+        actor,
+      );
+      verifyTaskId = created.id;
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+        verifyTaskId, id, ts,
+      );
+      this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+    }
+    // stale verification rounds: a bounce or a done closes out any open Verify
+    // children of this task (the next in_review spawns a fresh one)
+    if (row.type === "task" && (to === "done" || (row.status === "in_review" && to === "in_progress"))) {
+      for (const v of this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'todo' AND c.tags LIKE '%"role:review"%'`, id,
+      ).toArray() as any[]) {
+        const vm = JSON.parse(v.meta ?? "{}");
+        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — verification round closed`;
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(vm), ts, ts, v.id,
+        );
+        this.audit("system:separation", "transition", v.id, { from: "todo", to: "superseded", note: vm.superseded_reason });
+        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: "todo", to: "superseded" });
+      }
+    }
+    return { id, status: to, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
   }
 
   private async link(body: any, actor: string) {

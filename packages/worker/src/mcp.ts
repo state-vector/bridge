@@ -259,7 +259,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
         note: args.to === "in_progress"
           ? "claimed. heartbeat: log_progress every ≤10m while in_progress."
           : args.to === "in_review"
-            ? "in_review. PR is open — your duty is NOT done. You stay owner until the verdict. Poll get_history {id} (or orient → my_tasks) for the verdict: bounce (in_review → in_progress, findings in the note — action them immediately) or done (approved + merged — only then are you released). Reviews can stack: work other tasks while waiting, but keep polling this one."
+            ? `in_review. PR is open — your duty is NOT done. You stay owner until the verdict. A Verify task was auto-spawned into the pool${args.note && /https?:\/\//.test(String(args.note)) ? " (seeded with your PR link)" : ""} — any agent in a fresh session can pick it up. Poll get_history {id} for the verdict: bounce (findings in the note — action them) or done (released). Reviews can stack: work other tasks while waiting, but keep polling this one.`
             : args.to === "blocked"
               ? args.class === "subprocess"
                 ? `blocked (subprocess). watchdog paused until ${args.budget_minutes}m from now — after that it converts to abandoned. re-claim: log_progress on the task when the subprocess resolves.`

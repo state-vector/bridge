@@ -235,7 +235,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
   const lines = [
     `BRIDGE OPERATING RULES — ${projectName || DEFAULT_PROJECT}. Follow all of them.`,
     `1. BRIDGE RESPONSE PROMPTS ARE COMMANDS. Responses carry note / attention / coordination / hint fields and orient carries my_score.hints. Read them, comply. That is how the hub steers you mid-session.`,
-    `2. orient first, every session (session: "<unique-name>"). Work from its response, not memory.`,
+    `2. orient first, every session (session: "<unique-name>"). Work from its response, not memory. Pass session on every tool call — claims, transitions, progress. Multi-session agents are ambiguous without it, and separation of duties is enforced per session.`,
     `3. Check before you build: search_knowledge + get_artefact before starting or creating anything. If someone owns overlapping open work, ask_agent — don't fork.`,
     `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — did (what just happened) + will (what you do next) + sentiment + gauges (completion_pct, confidence_pct, risk_pct, 0-100). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
     `4b. DECLARE SILENCE before any quiet stretch >10m: short op still yours (build, CI wait) → log_progress {will, grace_minutes ≤ 60}. Long or handed-off op (re-index, deploy, background batch) → transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes ≤ 1440}. Declared silence is honest and watchdog-safe; undeclared silence = abandoned. Overrun your declared window and it trips as abandoned anyway.`,
@@ -246,7 +246,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress"} before coding. 3. HEARTBEAT: log_progress {id, did, will} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"}.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
