@@ -6,7 +6,7 @@ const SENTIMENTS = ["going_well", "converging", "neutral", "diverging", "struggl
 
 /** Top-of-board dashboard: activity chart + sentiment distribution + flow counters. */
 export function DashboardSummary({ tasks, events }: { tasks: KbArtefact[]; events: any[] }) {
-  const inFlight = tasks.filter((t) => ["in_progress", "blocked", "todo"].includes(t.status));
+  const inFlight = tasks.filter((t) => ["todo", "in_progress", "in_review", "blocked"].includes(t.status));
 
   const counts: Record<string, number> = {};
   for (const t of inFlight) {
@@ -56,7 +56,7 @@ export function DashboardSummary({ tasks, events }: { tasks: KbArtefact[]; event
       </div>
       <div className="dash-cell" title="task flow">
         <div className="flow-counts">
-          {["todo", "in_progress", "blocked", "done"].map((st) => (
+          {["todo", "in_progress", "in_review", "blocked", "done"].map((st) => (
             <span key={st} className={`fc fc-${st}`}>{tasks.filter((t) => t.status === st).length} {st.replace("_", " ")}</span>
           ))}
         </div>

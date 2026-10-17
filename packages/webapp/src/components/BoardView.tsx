@@ -7,6 +7,7 @@ import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 const COLUMNS = [
   { key: "todo", label: "To do" },
   { key: "in_progress", label: "In progress" },
+  { key: "in_review", label: "In review" },
   { key: "blocked", label: "Blocked" },
   { key: "done", label: "Done" },
 ] as const;
