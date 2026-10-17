@@ -6,7 +6,8 @@
   "workspaces": [
     "packages/specs",
     "packages/worker",
-    "packages/webapp"
+    "packages/webapp",
+    "packages/desktop"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
