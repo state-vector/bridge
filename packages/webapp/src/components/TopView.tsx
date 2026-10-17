@@ -44,6 +44,7 @@ const ONLINE_MS = 10 * 60_000;
 interface TopRow {
   key: string;
   agent: string;
+  session?: string;
   online: boolean;
   lastSeen: number | undefined;
   taskId?: string;
@@ -82,6 +83,7 @@ export function TopView() {
       return {
         key: t.id,
         agent,
+        session: meta.session ?? p?.session,
         online: sessions.some((s) => s.label === agent && now - s.last_seen_ts < ONLINE_MS),
         lastSeen: sessions.find((s) => s.label === agent)?.last_seen_ts,
         taskId: t.id,
@@ -117,6 +119,7 @@ export function TopView() {
 
       <div className="top-head">
         <span className="topc-agent">agent</span>
+        <span className="topc-session">session</span>
         <span className="topc-goal">goal</span>
         <span className="topc-status">status</span>
         <span className="topc-score" title="behaviour compliance score, 7-day window">cmp</span>
@@ -138,6 +141,7 @@ export function TopView() {
             <span className={`conn conn-${r.online ? "open" : "closed"}`} title={r.online ? "online" : "offline"}>●</span>
             {r.agent}
           </span>
+          <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
             {r.goal ?? "—"}
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
