@@ -24,7 +24,8 @@ interface Snapshot {
   label: string | null;
   agent: string | null;
   workdir: string | null;
-  in_flight: InFlight | null;
+  max_sessions: number;
+  in_flight: InFlight[];
   activity: Activity[];
 }
 
@@ -93,6 +94,7 @@ export function LocalView() {
           {snap?.label && <span className="chip chip-scope" title="paired agent identity">{snap.label}</span>}
           {snap?.workspace && <span className="chip" title="workspace">@{snap.workspace}</span>}
           {snap?.agent && <span className="chip" title="opencode agent">{snap.agent}</span>}
+          {snap && <span className="chip" title="WIP limit (BRIDGE_MAX_SESSIONS)">{snap.in_flight.length}/{snap.max_sessions} sessions</span>}
         </div>
         {snap?.url && <p className="muted-note">hub: {snap.url}</p>}
         {snap?.workdir && <p className="muted-note">workdir: {snap.workdir}</p>}
@@ -109,24 +111,21 @@ export function LocalView() {
         )}
       </div>
 
-      {snap?.in_flight ? (
-        <div className="card">
-          <h2>In flight</h2>
-          <div className="task-title">{snap.in_flight.task_title}</div>
-          <div className="task-row task-status-row">
-            <span className="task-id">{snap.in_flight.task_id}</span>
-            <span className="age-chip" title="time since dispatch">{rel(snap.in_flight.started_ms)}</span>
+      <div className="card">
+        <h2>In flight</h2>
+        {(snap?.in_flight ?? []).length === 0 && (
+          <span className="muted-note">nothing running — idle</span>
+        )}
+        {(snap?.in_flight ?? []).map((inf) => (
+          <div key={inf.task_id} className="progress-line">
+            <span className="task-id">{inf.task_id}</span>
+            <span className="progress-note">
+              <b>{inf.task_title}</b> — {inf.last_note}
+            </span>
+            <span className="step-ts">{rel(inf.started_ms)}</span>
           </div>
-          <div className="task-progress-note">{snap.in_flight.last_note}</div>
-        </div>
-      ) : (
-        snap && (
-          <div className="card">
-            <h2>In flight</h2>
-            <span className="muted-note">nothing running — idle</span>
-          </div>
-        )
-      )}
+        ))}
+      </div>
 
       <div className="card">
         <h2>Activity</h2>

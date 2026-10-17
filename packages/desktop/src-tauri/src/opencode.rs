@@ -28,13 +28,16 @@ fn tail(s: String, max: usize) -> String {
 
 /// Run opencode headlessly against `workdir`. Blocks until exit or timeout.
 /// stdout/stderr are drained on reader threads so big sessions can't deadlock
-/// on full pipes.
+/// on full pipes. `title` tags the opencode session (`bridge-<task_id>`) so the
+/// runner can rediscover it for resume; `resume` continues a prior session.
 pub fn run_task(
     workdir: &str,
     bin: &str,
     agent: Option<&str>,
     prompt: &str,
     timeout: Duration,
+    title: Option<&str>,
+    resume: Option<&str>,
 ) -> RunOutcome {
     let mut cmd = Command::new(bin);
     cmd.arg("run")
@@ -45,6 +48,12 @@ pub fn run_task(
         .stderr(Stdio::piped());
     if let Some(agent) = agent {
         cmd.arg("--agent").arg(agent);
+    }
+    if let Some(title) = title {
+        cmd.arg("--title").arg(title);
+    }
+    if let Some(session) = resume {
+        cmd.arg("--session").arg(session);
     }
     cmd.arg(prompt);
 

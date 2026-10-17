@@ -2,11 +2,13 @@
 //! and reports status back through the same protocol (orient / transition /
 //! log_progress). Runs identically in menu-bar and headless mode.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,6 +33,17 @@ pub struct DispatchConfig {
     pub label: Option<String>, // agent identity from pairing
     #[serde(default)]
     pub ws: Option<String>, // workspace slug from pairing
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize, // WIP limit for this node
+    #[serde(default = "default_isolate")]
+    pub isolate: bool, // per-task git worktrees + PR branch
+}
+
+fn default_max_sessions() -> usize {
+    1
+}
+fn default_isolate() -> bool {
+    true
 }
 
 fn default_workdir() -> String {
@@ -68,6 +81,15 @@ impl DispatchConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_timeout_mins),
             opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| default_opencode_bin()),
+            max_sessions: std::env::var("BRIDGE_MAX_SESSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or_else(default_max_sessions),
+            isolate: !matches!(
+                std::env::var("BRIDGE_ISOLATE").as_deref(),
+                Ok("0") | Ok("false") | Ok("no")
+            ),
             label: None,
             ws: None,
         })
@@ -192,12 +214,48 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     opencode_bin: default_opencode_bin(),
                     label,
                     ws: Some(ws),
+                    max_sessions: default_max_sessions(),
+                    isolate: default_isolate(),
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
             other => return Err(format!("pairing failed: {other:?}")),
         }
     }
+}
+
+/// Find the opencode session id for a dispatched task. Dispatched runs are
+/// titled `bridge-<task_id>` (set at spawn), so sessions are rediscoverable
+/// across runner/app restarts — no local state to lose.
+fn session_id_for(bin: &str, workdir: &str, task_id: &str) -> Option<String> {
+    let want = format!("bridge-{task_id}");
+    let out = Command::new(bin)
+        .arg("session")
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .current_dir(workdir)
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let items = match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(o) => o.get("sessions")?.as_array()?.clone(),
+        _ => return None,
+    };
+    for item in items {
+        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let id = item
+            .get("id")
+            .or_else(|| item.get("sessionID"))
+            .and_then(|i| i.as_str());
+        if let Some(id) = id {
+            if title == want || title.contains(&want) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ---- bridge MCP client (JSON-RPC over POST /mcp) ----
@@ -279,11 +337,30 @@ pub struct DispatchSnapshot {
     pub label: Option<String>, // agent identity from pairing
     pub agent: Option<String>, // opencode agent name
     pub workdir: Option<String>,
-    pub in_flight: Option<InFlightView>,
+    pub max_sessions: usize,
+    pub in_flight: Vec<InFlightView>,
     pub activity: Vec<DispatchActivity>, // newest first, capped
 }
 
 pub type SharedSnapshot = Arc<Mutex<DispatchSnapshot>>;
+
+fn snap_in_flight_list(snap: &SharedSnapshot, in_flight: &[InFlight]) {
+    if let Ok(mut s) = snap.lock() {
+        s.in_flight = in_flight
+            .iter()
+            .map(|inf| InFlightView {
+                task_id: inf.task_id.clone(),
+                task_title: inf.task_title.clone(),
+                started_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+                    - inf.started.elapsed().as_millis() as u64,
+                last_note: inf.last_note.clone(),
+            })
+            .collect();
+    }
+}
 
 fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
     if let Ok(mut s) = snap.lock() {
@@ -302,21 +379,6 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
     }
 }
 
-fn snap_in_flight(snap: &SharedSnapshot, in_flight: &Option<InFlight>) {
-    if let Ok(mut s) = snap.lock() {
-        s.in_flight = in_flight.as_ref().map(|inf| InFlightView {
-            task_id: inf.task_id.clone(),
-            task_title: inf.task_title.clone(),
-            started_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-                - inf.started.elapsed().as_millis() as u64,
-            last_note: inf.last_note.clone(),
-        });
-    }
-}
-
 // ---- dispatch state (shared with Tauri commands) ----
 
 struct InFlight {
@@ -324,6 +386,8 @@ struct InFlight {
     task_title: String,
     started: std::time::Instant,
     last_note: String,
+    worktree: Option<PathBuf>, // isolated worktree to clean up on finalize
+    pr_url: Option<String>,    // PR opened by the session, monitored after handoff
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
 }
 
@@ -357,89 +421,265 @@ impl DispatchState {
 // ---- the loop ----
 
 /// One dispatch tick. Returns Ok(Some(msg)) on notable actions.
+// ---- per-task worktrees + spawning ----
+
+fn slugify(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+/// Provision (or reuse) an isolated worktree for a task: ~/.bridge/worktrees/<slug>
+/// on branch bridge/<slug>. On resume the branch already exists — attach to it.
+fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf> {
+    let slug = slugify(task_id);
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
+    if path.exists() {
+        return Some(path);
+    }
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let branch = format!("bridge/{slug}");
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workdir);
+    if resume {
+        cmd.args(["worktree", "add"]).arg(&path).arg(&branch);
+    } else {
+        cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(&path);
+    }
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    if ok { Some(path) } else { None }
+}
+
+fn cleanup_worktree(workdir: &str, task_id: &str) {
+    let slug = slugify(task_id);
+    let Some(home) = std::env::var("HOME").ok() else { return };
+    let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
+    let _ = Command::new("git")
+        .current_dir(workdir)
+        .args(["worktree", "remove", "--force"])
+        .arg(&path)
+        .output();
+}
+
+fn extract_pr(stdout: &str) -> Option<String> {
+    for tok in stdout.split_whitespace() {
+        if tok.starts_with("https://") && tok.contains("/pull/") {
+            return Some(
+                tok.trim_end_matches(|c| c == ')' || c == ',' || c == '.').to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// Spawn an opencode session for a task: strict policy pre-prompt + task body +
+/// delivery contract (commit, push branch, open PR). Uses an isolated worktree
+/// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
+fn spawn_opencode(
+    cfg: &DispatchConfig,
+    snap: &SharedSnapshot,
+    tid: &str,
+    title: &str,
+    body_md: &str,
+    policy: &str,
+    resume_session: Option<String>,
+    in_flight: &mut Vec<InFlight>,
+) {
+    let resume = resume_session.is_some();
+    let worktree = if cfg.isolate {
+        ensure_worktree(&cfg.workdir, tid, resume)
+    } else {
+        None
+    };
+    let run_dir = worktree
+        .clone()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| cfg.workdir.clone());
+    let branch = format!("bridge/{}", slugify(tid));
+    let resume_note = resume_session
+        .as_ref()
+        .map(|s| format!("\n\nYou are resuming session {s} — pick up where you left off; do not restart the task from scratch."))
+        .unwrap_or_default();
+    let prompt = format!(
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
+        policy, tid, title, body_md, resume_note, run_dir, branch
+    );
+    let outcome = {
+        let cfg2 = cfg.clone();
+        let tid2 = tid.to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
+        std::thread::spawn(move || {
+            let out = opencode::run_task(
+                &run_dir,
+                &cfg2.opencode_bin,
+                cfg2.agent.as_deref(),
+                &prompt,
+                Duration::from_secs(cfg2.timeout_mins * 60),
+                Some(&format!("bridge-{tid2}")),
+                resume_session.as_deref(),
+            );
+            let _ = tx.send(out);
+        });
+        rx
+    };
+    in_flight.push(InFlight {
+        task_id: tid.to_string(),
+        task_title: title.to_string(),
+        started: std::time::Instant::now(),
+        last_note: String::new(),
+        worktree,
+        pr_url: None,
+        rx: outcome,
+    });
+    snap_in_flight_list(snap, in_flight);
+}
+
 fn tick(
     cfg: &DispatchConfig,
     id: &mut i64,
-    in_flight: &mut Option<InFlight>,
+    in_flight: &mut Vec<InFlight>,
+    attempts: &mut HashMap<String, Instant>,
     snap: &SharedSnapshot,
-) -> Result<Option<String>, String> {
-    // 1. heartbeat any in-flight opencode run; finalize when it exits
-    if let Some(inf) = in_flight {
-        match inf.rx.try_recv() {
-            Ok(outcome) => {
-                let inf = in_flight.take().unwrap();
-                snap_in_flight(snap, &None);
-                let mins = inf.started.elapsed().as_secs() / 60;
-                let note = format!(
-                    "opencode {} in ~{}m (exit {:?}) — {}",
-                    if outcome.timed_out { "TIMED OUT" } else { "finished" },
-                    mins,
-                    outcome.exit_code,
-                    if outcome.stdout_tail.is_empty() {
-                        outcome.stderr_tail.clone()
-                    } else {
-                        outcome.stdout_tail.clone()
-                    }
-                );
-                mcp_call(
-                    cfg,
-                    id,
-                    "log_progress",
-                    json!({ "id": inf.task_id, "note": note, "sentiment": if outcome.ok { "converging" } else { "struggling" } }),
-                )?;
-                if outcome.ok {
-                    // handoff gate wants a PR link in the note; if opencode
-                    // didn't produce one the gate rejects and we stay
-                    // in_progress with the summary logged.
-                    match mcp_call(
-                        cfg,
-                        id,
-                        "transition",
-                        json!({ "id": inf.task_id, "to": "in_review", "note": note }),
-                    ) {
-                        Ok(_) => {
-                            let msg = format!("{} → in_review", inf.task_title);
-                            snap_activity(snap, "finish", &msg);
-                            return Ok(Some(msg));
-                        }
-                        Err(_) => {
-                            let msg = format!(
-                                "{} finished (no PR link — left in_progress for review pickup)",
-                                inf.task_title
-                            );
-                            snap_activity(snap, "finish", &msg);
-                            return Ok(Some(msg));
-                        }
-                    }
-                }
-                let msg = format!("{} failed/timed out — left in_progress", inf.task_title);
-                snap_activity(snap, "finish", &msg);
-                return Ok(Some(msg));
-            }
-            Err(TryRecvError::Disconnected) => {
-                in_flight.take();
-                snap_in_flight(snap, &None);
-                let msg: String = "opencode runner dropped — will re-check next tick".into();
-                snap_activity(snap, "error", &msg);
-                return Ok(Some(msg));
-            }
-            Err(TryRecvError::Empty) => {
-                let mins = inf.started.elapsed().as_secs() / 60;
-                inf.last_note = format!("opencode still working (~{mins}m in)");
-                mcp_call(
-                    cfg,
-                    id,
-                    "log_progress",
-                    json!({ "id": inf.task_id, "note": format!("dispatch runner: opencode still working (~{mins}m in)"), "sentiment": "neutral" }),
-                )?;
-                snap_in_flight(snap, in_flight);
-                return Ok(None); // one job at a time
-            }
+) -> Result<Vec<String>, String> {
+    let mut msgs = Vec::new();
+
+    // 1. drain finished sessions: finalize each (progress + in_review + cleanup)
+    let mut finished: Vec<(InFlight, opencode::RunOutcome)> = Vec::new();
+    in_flight.retain_mut(|inf| match inf.rx.try_recv() {
+        Ok(outcome) => {
+            finished.push((
+                InFlight {
+                    task_id: inf.task_id.clone(),
+                    task_title: inf.task_title.clone(),
+                    started: inf.started,
+                    last_note: inf.last_note.clone(),
+                    pr_url: inf.pr_url.clone(),
+                    worktree: inf.worktree.clone(),
+                    rx: std::sync::mpsc::channel().1,
+                },
+                outcome,
+            ));
+            false
         }
+        Err(TryRecvError::Empty) => true,
+        Err(TryRecvError::Disconnected) => {
+            // sender thread died without sending (panic) — treat as failure
+            finished.push((
+                InFlight {
+                    task_id: inf.task_id.clone(),
+                    task_title: inf.task_title.clone(),
+                    started: inf.started,
+                    last_note: inf.last_note.clone(),
+                    pr_url: inf.pr_url.clone(),
+                    worktree: inf.worktree.clone(),
+                    rx: std::sync::mpsc::channel().1,
+                },
+                opencode::RunOutcome {
+                    ok: false,
+                    exit_code: None,
+                    timed_out: false,
+                    stdout_tail: String::new(),
+                    stderr_tail: "opencode runner thread died (no outcome)".into(),
+                },
+            ));
+            false
+        }
+    });
+    if !finished.is_empty() {
+        snap_in_flight_list(snap, in_flight);
+    }
+    for (mut inf, outcome) in finished {
+        let mins = inf.started.elapsed().as_secs() / 60;
+        let pr_url = extract_pr(&outcome.stdout_tail);
+        inf.pr_url = pr_url.clone();
+        let tail = if outcome.stdout_tail.is_empty() {
+            outcome.stderr_tail.clone()
+        } else {
+            outcome.stdout_tail.clone()
+        };
+        let mut note = format!(
+            "opencode {} in ~{}m (exit {:?}) — {}",
+            if outcome.timed_out { "TIMED OUT" } else { "finished" },
+            mins,
+            outcome.exit_code,
+            tail
+        );
+        if let Some(pr) = &pr_url {
+            note.push_str(&format!("\nPR: {pr}"));
+        }
+        let _ = mcp_call(
+            cfg,
+            id,
+            "log_progress",
+            json!({ "id": inf.task_id, "note": note, "sentiment": if outcome.ok { "converging" } else { "struggling" } }),
+        );
+        if outcome.ok {
+            // handoff gate wants a PR link in the note; if opencode didn't
+            // produce one the gate rejects and we stay in_progress.
+            match mcp_call(
+                cfg,
+                id,
+                "transition",
+                json!({ "id": inf.task_id, "to": "in_review", "note": note }),
+            ) {
+                Ok(_) => msgs.push(format!("{} → in_review", inf.task_title)),
+                Err(_) => msgs.push(format!(
+                    "{} finished (no PR link — left in_progress for review pickup)",
+                    inf.task_title
+                )),
+            }
+        } else {
+            msgs.push(format!("{} failed/timed out — left in_progress", inf.task_title));
+        }
+        // PR monitoring v1: record the handoff so the review flow can be tracked;
+        // automated verdict reaction (CI fail → bounce + fix) lands with the PR watch loop
+        if let Some(pr) = pr_url {
+            let _ = mcp_call(
+                cfg,
+                id,
+                "log_progress",
+                json!({ "id": inf.task_id, "note": format!("watching PR {pr} for review verdict"), "sentiment": "neutral" }),
+            );
+        }
+        if inf.worktree.is_some() {
+            cleanup_worktree(&cfg.workdir, &inf.task_id);
+        }
+        attempts.remove(&inf.task_id);
+        snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
     }
 
-    // 2. orient — what's claimable, what's mine
+    // 2. heartbeat every live session (each gets its own log_progress)
+    for inf in in_flight.iter_mut() {
+        let mins = inf.started.elapsed().as_secs() / 60;
+        inf.last_note = format!("opencode still working (~{mins}m in)");
+        mcp_call(
+            cfg,
+            id,
+            "log_progress",
+            json!({ "id": inf.task_id, "note": format!("dispatch runner: opencode still working (~{mins}m in)"), "sentiment": "neutral" }),
+        )?;
+    }
+    if !in_flight.is_empty() {
+        snap_in_flight_list(snap, in_flight);
+    }
+
+    // 3. capacity? nothing to schedule if all sessions busy
+    if in_flight.len() >= cfg.max_sessions {
+        return Ok(msgs);
+    }
+
+    // 4. orient — once per tick when we have capacity
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
+    let policy = orient
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Follow the bridge protocol card: claim before coding, heartbeat every 10 min, ask when uncertain, finish with a PR.")
+        .to_string();
+
+    // 5. previously-dispatched work still open → RESUME it first (claims persist;
+    // the opencode session is rediscoverable by its deterministic title
+    // bridge-<task_id>, so mid-flight runs survive runner/app restarts).
     let my_tasks = orient
         .get("my_tasks")
         .and_then(|v| v.as_array())
@@ -447,100 +687,91 @@ fn tick(
         .unwrap_or_default();
     let open_mine: Vec<&serde_json::Value> = my_tasks
         .iter()
-        .filter(|t| {
-            t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
-        })
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
         .collect();
-
-    // 3. previously-dispatched work still open → heartbeat it, don't double-dispatch
-    if let Some(t) = open_mine.first() {
-        if let (Some(tid), Some(title)) = (
+    for t in open_mine {
+        if in_flight.len() >= cfg.max_sessions {
+            break;
+        }
+        let (Some(tid), Some(title)) = (
             t.get("id").and_then(|v| v.as_str()),
             t.get("title").and_then(|v| v.as_str()),
-        ) {
+        ) else {
+            continue;
+        };
+        if in_flight.iter().any(|inf| inf.task_id == tid) {
+            continue; // already running
+        }
+        // backoff: a task that just failed to spawn shouldn't retry every tick
+        if attempts
+            .get(tid)
+            .map(|a| a.elapsed() < Duration::from_secs(300))
+            .unwrap_or(false)
+        {
             mcp_call(
                 cfg,
                 id,
                 "log_progress",
-                json!({ "id": tid, "note": format!("dispatch runner heartbeat — '{title}' is open but no local opencode session is running; re-dispatch manually if needed"), "sentiment": "neutral" }),
+                json!({ "id": tid, "note": format!("dispatch runner heartbeat — '{title}' is open; opencode resume backed off after a failed attempt"), "sentiment": "neutral" }),
             )?;
+            continue;
         }
-        return Ok(None);
+        let sess = session_id_for(&cfg.opencode_bin, &cfg.workdir, tid);
+        let msg = match &sess {
+            Some(s) => format!("resumed {tid} — continuing opencode session {s}"),
+            None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
+        };
+        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, in_flight);
+        attempts.insert(tid.to_string(), Instant::now());
+        snap_activity(snap, "dispatch", &msg);
+        msgs.push(msg);
     }
 
-    // 4. claim the first claimable task and dispatch it
-    let candidate = orient
+    // 6. claim new claimable tasks until the WIP limit is reached
+    let candidates = orient
         .get("unclaimed_work")
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first().cloned());
-    let Some(task) = candidate else {
-        return Ok(None); // nothing to do — exit quietly this tick
-    };
-    let (Some(tid), Some(title)) = (
-        task.get("id").and_then(|v| v.as_str()),
-        task.get("title").and_then(|v| v.as_str()),
-    ) else {
-        return Ok(None);
-    };
-    mcp_call(
-        cfg,
-        id,
-        "transition",
-        json!({ "id": tid, "to": "in_progress" }),
-    )?;
-    mcp_call(
-        cfg,
-        id,
-        "log_progress",
-        json!({ "id": tid, "note": format!("dispatch runner: claimed '{title}' — dispatching to opencode"), "sentiment": "going_well" }),
-    )?;
+        .cloned()
+        .unwrap_or_default();
+    for task in candidates {
+        if in_flight.len() >= cfg.max_sessions {
+            break;
+        }
+        let (Some(tid), Some(title)) = (
+            task.get("id").and_then(|v| v.as_str()),
+            task.get("title").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if in_flight.iter().any(|inf| inf.task_id == tid)
+            || attempts
+                .get(tid)
+                .map(|a| a.elapsed() < Duration::from_secs(300))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        mcp_call(cfg, id, "transition", json!({ "id": tid, "to": "in_progress" }))?;
+        // fetch the body so the policy pre-prompt carries the actual task
+        let body_md = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))
+            .ok()
+            .and_then(|v| v.get("body_md").and_then(|b| b.as_str()).map(String::from))
+            .unwrap_or_default();
+        mcp_call(
+            cfg,
+            id,
+            "log_progress",
+            json!({ "id": tid, "note": format!("dispatch runner: claimed '{title}' — dispatching to opencode"), "sentiment": "going_well" }),
+        )?;
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, None, in_flight);
+        attempts.insert(tid.to_string(), Instant::now());
+        let msg = format!("claimed {tid} — dispatched to opencode");
+        snap_activity(snap, "dispatch", &msg);
+        msgs.push(msg);
+    }
 
-    // 5. spawn opencode in the background; the loop heartbeats while it works
-    let body = {
-        let cfg2 = cfg.clone();
-        let tid = tid.to_string();
-        let title = title.to_string();
-        let prompt = format!(
-            "Work on this Bridge task.\n\nTask {}: {}\n\n{}\n\nWhen finished, output a concise summary of what you did. If you opened a PR, include its URL.",
-            tid,
-            title,
-            task.get("body_md").and_then(|b| b.as_str()).unwrap_or("")
-        );
-        std::thread::spawn(move || {
-            opencode::run_task(
-                &cfg2.workdir,
-                &cfg2.opencode_bin,
-                cfg2.agent.as_deref(),
-                &prompt,
-                Duration::from_secs(cfg2.timeout_mins * 60),
-            )
-        })
-    };
-    *in_flight = Some(InFlight {
-        task_id: tid.to_string(),
-        task_title: title.to_string(),
-        started: std::time::Instant::now(),
-        last_note: "dispatching to opencode".into(),
-        rx: {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(body.join().unwrap_or_else(|_| opencode::RunOutcome {
-                    ok: false,
-                    stdout_tail: String::new(),
-                    stderr_tail: "runner thread panicked".into(),
-                    exit_code: None,
-                    timed_out: false,
-                }));
-            });
-            rx
-        },
-    });
-    snap_in_flight(snap, in_flight);
-    let msg = format!("claimed {tid} — dispatched to opencode");
-    snap_activity(snap, "dispatch", &msg);
-    Ok(Some(msg))
+    Ok(msgs)
 }
-
 pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>, snap: SharedSnapshot) {
     // no config → device pairing (needs BRIDGE_URL; prints the code to console)
     let cfg = match cfg {
@@ -575,10 +806,11 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     };
     running.store(true, Ordering::Relaxed);
     let mut id: i64 = 0;
-    let mut in_flight: Option<InFlight> = None;
+    let mut in_flight: Vec<InFlight> = Vec::new();
+    let mut attempts: HashMap<String, Instant> = HashMap::new();
     eprintln!(
-        "[dispatch] loop started — {} (poll every {}s, workdir {})",
-        cfg.url, cfg.poll_secs, cfg.workdir
+        "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
+        cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
     );
     if let Ok(mut s) = snap.lock() {
         s.running = true;
@@ -587,14 +819,18 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.label = cfg.label.clone();
         s.agent = cfg.agent.clone();
         s.workdir = Some(cfg.workdir.clone());
+        s.max_sessions = cfg.max_sessions;
     }
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match tick(&cfg, &mut id, &mut in_flight, &snap) {
-            Ok(Some(msg)) => eprintln!("[dispatch] {msg}"),
-            Ok(None) => {}
+        match tick(&cfg, &mut id, &mut in_flight, &mut attempts, &snap) {
+            Ok(msgs) => {
+                for msg in msgs {
+                    eprintln!("[dispatch] {msg}");
+                }
+            }
             Err(e) => {
                 eprintln!("[dispatch] error: {e}");
                 snap_activity(&snap, "error", &e);
@@ -615,7 +851,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     running.store(false, Ordering::Relaxed);
     if let Ok(mut s) = snap.lock() {
         s.running = false;
-        s.in_flight = None;
+        s.in_flight = Vec::new();
     }
     eprintln!("[dispatch] loop stopped");
 }
