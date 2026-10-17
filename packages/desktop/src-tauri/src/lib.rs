@@ -1,5 +1,7 @@
+mod dispatch;
 mod mac_notify;
 mod menubar;
+mod opencode;
 
 use serde::Deserialize;
 use tauri::Manager;
@@ -45,13 +47,40 @@ fn notify_ask(app: tauri::AppHandle, args: NotifyAskArgs) -> bool {
     native
 }
 
+// ---- dispatch commands (webapp settings can drive these via invoke) ----
+
+#[tauri::command]
+fn dispatch_status(state: tauri::State<'_, dispatch::DispatchState>) -> serde_json::Value {
+    state.status()
+}
+
+#[tauri::command]
+fn dispatch_start(
+    state: tauri::State<'_, dispatch::DispatchState>,
+    config: Option<dispatch::DispatchConfig>,
+) -> Result<(), String> {
+    let cfg = config
+        .or_else(dispatch::DispatchConfig::from_env)
+        .ok_or("no dispatch config: set BRIDGE_URL + BRIDGE_TOKEN (or pass config)")?;
+    dispatch::start(&state, cfg)
+}
+
+#[tauri::command]
+fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
+    dispatch::stop(&state);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(dispatch::DispatchState::new())
         .invoke_handler(tauri::generate_handler![
             notify_ask,
+            dispatch_status,
+            dispatch_start,
+            dispatch_stop,
             menubar::show_panel,
             menubar::hide_panel
         ])
@@ -66,7 +95,17 @@ pub fn run() {
                 mac_notify::install_delegate(handle.clone());
             }
 
-            menubar::setup(app)?;
+            // headless mode: no tray, no panel — just the dispatch loop
+            let headless = std::env::args().any(|a| a == "--headless");
+            if !headless {
+                menubar::setup(app)?;
+            }
+
+            // auto-start dispatch when configured via env (desktop + headless)
+            if let Some(cfg) = dispatch::DispatchConfig::from_env() {
+                let state = app.state::<dispatch::DispatchState>();
+                dispatch::start(&state, cfg)?;
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
