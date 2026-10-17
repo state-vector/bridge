@@ -15,8 +15,8 @@ import "./App.css";
 
 type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox";
 const TABS: Array<{ key: Tab; label: string }> = [
-  { key: "board", label: "Board" },
   { key: "top", label: "Top" },
+  { key: "board", label: "Board" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discuss" },
@@ -92,7 +92,7 @@ export default function App() {
   const resolve = useBridge((s) => s.resolve);
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
-  const [tab, setTab] = useState<Tab>("board");
+  const [tab, setTab] = useState<Tab>("top");
 
   useEffect(() => {
     connectHub({

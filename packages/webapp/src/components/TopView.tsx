@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
+import { DashboardSummary } from "./Dashboard";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -65,13 +66,14 @@ export function TopView() {
   const tasks = useKb((s) => s.tasks);
   const sessions = useKb((s) => s.sessions);
   const agents = useKb((s) => s.agents);
+  const events = useKb((s) => s.events);
   const now = Date.now();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   const rows = useMemo<TopRow[]>(() => {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
-    const inFlight = tasks.filter((t) => ["in_progress", "in_review", "blocked"].includes(t.status));
-    const busy = new Set(inFlight.map((t) => t.owner).filter(Boolean));
+    // top = what is RUNNING right now: in_progress + blocked. todo/done/in_review are noise here.
+    const inFlight = tasks.filter((t) => ["in_progress", "blocked"].includes(t.status));
     const taskRows: TopRow[] = inFlight.map((t) => {
       const meta = (t.meta ?? {}) as any;
       const p = meta.last_progress;
@@ -98,29 +100,16 @@ export function TopView() {
       };
     });
     // idle online sessions — visible so you can see who's alive but unloaded
-    const idleRows: TopRow[] = sessions
-      .filter((s) => now - s.last_seen_ts < ONLINE_MS && s.label && !busy.has(s.label))
-      .map((s) => {
-        const sc: any = scoreBy.get(s.label!);
-        return {
-          key: `idle:${s.token_id}:${s.name}`,
-          agent: s.label!,
-          online: true,
-          lastSeen: s.last_seen_ts,
-          score: sc?.score,
-          grade: sc?.grade,
-          status: "idle",
-        };
-      });
-    const weight: Record<string, number> = { blocked: 0, in_review: 1, in_progress: 2 };
-    return [...taskRows, ...idleRows].sort(
-      (a, b) => (weight[a.status ?? ""] ?? 3) - (weight[b.status ?? ""] ?? 3)
+    const weight: Record<string, number> = { blocked: 0, in_progress: 1 };
+    return taskRows.sort(
+      (a, b) => (weight[a.status ?? ""] ?? 2) - (weight[b.status ?? ""] ?? 2)
         || (b.lastSignal ?? b.lastSeen ?? 0) - (a.lastSignal ?? a.lastSeen ?? 0),
     );
   }, [tasks, sessions, agents, now]);
 
   return (
     <div className="top-wrap">
+      <DashboardSummary tasks={tasks} events={events} />
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. click a row for the task.</span>
@@ -142,7 +131,7 @@ export function TopView() {
       {rows.map((r) => (
         <div
           key={r.key}
-          className={`top-row ${r.taskId ? "top-click" : "top-idle"} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""}`}
+          className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""}`}
           onClick={() => r.taskId && setSelectedTaskId(r.taskId)}
         >
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
@@ -156,9 +145,7 @@ export function TopView() {
           <span className="topc-status">
             {r.status === "blocked" && r.blockedClass === "subprocess"
               ? <span className="st-chip st-amber" title="declared subprocess block">subprocess</span>
-              : r.status === "idle"
-                ? <span className="st-chip st-chip-idle">idle</span>
-                : r.status && <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>}
+              : r.status && <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>}
             {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`${r.sentiment}`} />}
             {r.sentiment && <span className={`chip ${SENTIMENT_CHIP[r.sentiment] ?? ""} top-sent`}>{r.sentiment.replace("_", " ")}</span>}
           </span>

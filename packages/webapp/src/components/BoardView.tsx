@@ -3,7 +3,6 @@ import { useKb } from "../store/kb";
 import type { BoardPrefs } from "../store/kb";
 import { rel } from "../lib/views";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
-import { DashboardSummary } from "./Dashboard";
 
 const COLUMNS = [
   { key: "todo", label: "To do" },
@@ -354,7 +353,6 @@ export function BoardView() {
         <span className="muted-note">{tasks.length} tasks</span>
       </div>
       {fieldsOpen && <FieldsMenu onClose={() => setFieldsOpen(false)} />}
-      <DashboardSummary tasks={tasks} events={events} />
       {lanes.length === 0 && (
         <p className="empty">No tasks yet — create via MCP (create_artefact type=task) or here.</p>
       )}
