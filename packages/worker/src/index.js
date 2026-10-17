@@ -327,8 +327,8 @@ function handleGithubLogin(request, env) {
   return startGithubLogin(env, state);
 }
 
-function oauthFailure(origin) {
-  const headers = new Headers({ Location: `${origin}/?login=failed`, "Cache-Control": "no-store" });
+function oauthFailure(origin, reason = "unknown") {
+  const headers = new Headers({ Location: `${origin}/?login=failed&reason=${reason}`, "Cache-Control": "no-store" });
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
   return new Response(null, { status: 302, headers });
 }
@@ -339,7 +339,7 @@ async function handleGithubCallback(request, env) {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
   const m = (request.headers.get("Cookie") || "").match(new RegExp(`${OAUTH_COOKIE}=([^;\\s]+)`));
-  if (!code || !state || !m || m[1] !== state) return oauthFailure(url.origin);
+  if (!code || !state || !m || m[1] !== state) return oauthFailure(url.origin, "state");
 
   const tokRes = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
@@ -347,7 +347,10 @@ async function handleGithubCallback(request, env) {
     body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code }),
   });
   const tok = await tokRes.json().catch(() => ({}));
-  if (!tok.access_token) return oauthFailure(url.origin);
+  if (!tok.access_token) {
+    console.error("login: token exchange failed:", tokRes.status, JSON.stringify(tok).slice(0, 200));
+    return oauthFailure(url.origin, "exchange");
+  }
 
   const uRes = await fetch("https://api.github.com/user", {
     headers: {
@@ -357,15 +360,16 @@ async function handleGithubCallback(request, env) {
     },
   });
   const u = await uRes.json().catch(() => ({}));
-  if (!u.login) return oauthFailure(url.origin);
+  if (!u.login) return oauthFailure(url.origin, "github_user");
 
   // workspace resolution is dynamic: seed the registry, ensure the login's
   // personal workspace exists, land in the default ws if they're a member
   let ws;
   try {
     ws = await wsHome(env, u.login);
-  } catch {
-    return oauthFailure(url.origin);
+  } catch (e) {
+    console.error("login: workspace resolution failed:", String(e));
+    return oauthFailure(url.origin, "workspace");
   }
   const exp = String(Date.now() + SESSION_TTL_MS);
   const sig = await sign(`${exp}.${u.login}.${ws}`, env.GITHUB_CLIENT_SECRET);
