@@ -255,7 +255,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify(await call("update", args)));
     case "transition":
       return text(JSON.stringify({
-        ...await call("transition", args),
+        ...await call("transition", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id }),
         note: args.to === "in_progress"
           ? "claimed. heartbeat: log_progress every ≤10m while in_progress."
           : args.to === "in_review"

@@ -12,6 +12,14 @@ const GRADE_TONE: Record<string, string> = {
   excellent: "ok", good: "ok", fair: "amber", poor: "err",
 };
 
+/** Consistent pct colouring: higher-is-better gauges green/amber/red at 70/40;
+ *  lower-is-better (risk) red/amber/green at 50/20. */
+function pctTone(v: number | undefined, higherIsBetter: boolean): string {
+  if (v == null) return "";
+  if (higherIsBetter) return v >= 70 ? "pos" : v >= 40 ? "warn" : "bad";
+  return v < 20 ? "pos" : v < 50 ? "warn" : "bad";
+}
+
 /** Ticking clock — re-renders every second so ages stay live. */
 function useClock() {
   const [, setTick] = useState(0);
@@ -122,10 +130,10 @@ export function TopView() {
         <span className="topc-session">session</span>
         <span className="topc-goal">goal</span>
         <span className="topc-status">status</span>
-        <span className="topc-score" title="behaviour compliance score, 7-day window">cmp</span>
-        <span className="topc-gauge" title="completion %">cmp%</span>
-        <span className="topc-gauge" title="confidence %">conf</span>
-        <span className="topc-gauge" title="risk %">risk</span>
+        <span className="topc-score" title="behaviour compliance score, 7-day window">score</span>
+        <span className="topc-gauge" title="completion %">comp%</span>
+        <span className="topc-gauge" title="confidence % — higher is better">conf</span>
+        <span className="topc-gauge" title="risk % — lower is better">risk</span>
         <span className="topc-bar">completion</span>
         <span className="topc-age" title="time in current column">col age</span>
         <span className="topc-age" title="time since last signal from this agent">last seen</span>
@@ -160,9 +168,9 @@ export function TopView() {
               </span>
             )}
           </span>
-          <span className="topc-gauge top-num">{r.completion != null ? `${r.completion}` : "—"}</span>
-          <span className="topc-gauge top-num">{r.confidence != null ? `${r.confidence}` : "—"}</span>
-          <span className="topc-gauge top-num">{r.risk != null ? <span className="top-risk">{r.risk}</span> : "—"}</span>
+          <span className={`topc-gauge top-num ${r.completion != null ? "num-comp" : ""}`}>{r.completion != null ? `${r.completion}%` : "—"}</span>
+          <span className={`topc-gauge top-num ${pctTone(r.confidence, true)}`}>{r.confidence != null ? `${r.confidence}%` : "—"}</span>
+          <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className="topc-bar">
             <span className="top-bar">
               <span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} />

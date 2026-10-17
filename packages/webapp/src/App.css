@@ -593,3 +593,9 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .role-picker { display: flex; gap: 14px; margin: 4px 0 10px; }
 .role-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
 .role-opt input { accent-color: var(--accent); }
+
+/* consistent numeric tone: pos/warn/bad shared by top + future views */
+.top-num.pos { color: var(--green); }
+.top-num.warn { color: var(--amber); }
+.top-num.bad { color: var(--red); }
+.top-num.num-comp { color: var(--accent); }

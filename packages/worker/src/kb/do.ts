@@ -906,6 +906,12 @@ export class KnowledgeHub {
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = actor;
     }
+    // session attribution: stamp which session claimed/acted, first-wins, resolved
+    // explicit → the token's most recent session (agents pass session on orient only)
+    if (row.type === "task" && !meta.session) {
+      const sess = await this.resolveSession(body, String(body.token_id ?? ""));
+      if (sess) meta.session = String(sess).slice(0, 120);
+    }
     // retry / release: pushing a card back to todo releases the claim — it
     // re-enters the unclaimed pool for any matching agent (or the cron sweep)
     // to pick up fresh. Only the current owner or a human may release a claim —
@@ -1049,8 +1055,9 @@ export class KnowledgeHub {
     } else {
       delete meta.grace_until; // ordinary log = agent is back
     }
-    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: body.session ?? meta.session, completion_pct, confidence_pct, risk_pct };
-    if (body.session && !meta.session) meta.session = body.session;
+    const session = await this.resolveSession(body, String(body.token_id ?? ""));
+    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct };
+    if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
