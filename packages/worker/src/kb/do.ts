@@ -43,6 +43,7 @@ import {
   isArtefactType,
   isRelation,
   isSentiment,
+  isWsSlug,
   isValidAskTarget,
   sanitizeTags,
   validateRelation,
@@ -354,6 +355,11 @@ export class KnowledgeHub {
         login TEXT NOT NULL,
         UNIQUE (ws, login)
       );
+      CREATE TABLE IF NOT EXISTS ws_tokens (
+        hash TEXT PRIMARY KEY,
+        ws TEXT NOT NULL,
+        created_ts INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS embeddings (
         artefact_id TEXT PRIMARY KEY,
         vec BLOB NOT NULL,
@@ -469,16 +475,20 @@ export class KnowledgeHub {
         case "ws.create": return this.json(await this.wsCreate(body, String(body.login)));
         case "ws.join": return this.json(await this.wsJoin(body, String(body.login)));
         case "ws.members": return this.json(await this.wsMembers(body, String(body.login)));
+        case "ws.token_register": return this.json(await this.wsTokenRegister(body));
+        case "ws.token_lookup": return this.json(await this.wsTokenLookup(body));
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
         case "admin.mint":
         case "admin.list_tokens":
         case "admin.revoke":
+        case "admin.token_tags":
         case "admin.settings_get":
         case "admin.settings_set":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
+          if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
@@ -1495,13 +1505,31 @@ export class KnowledgeHub {
     return { ws: slug, owner: w.owner, members: rows.map((r) => r.login) };
   }
 
+  /** Central registry of opaque token → workspace, written at mint time so /mcp
+   *  can route without the workspace slug being embedded in the secret. */
+  private async wsTokenRegister(body: any) {
+    const hash = String(body.hash ?? ""), ws = String(body.ws ?? "");
+    if (!/^[0-9a-f]{64}$/.test(hash) || !isWsSlug(ws)) throw new Error("bad token registration");
+    this.state.storage.sql.exec(
+      `INSERT INTO ws_tokens (hash, ws, created_ts) VALUES (?, ?, ?)
+       ON CONFLICT(hash) DO UPDATE SET ws = excluded.ws`,
+      hash, ws, Date.now(),
+    );
+    return { ok: true };
+  }
+
+  private async wsTokenLookup(body: any) {
+    const row = this.one(`SELECT ws FROM ws_tokens WHERE hash = ?`, String(body.hash ?? ""));
+    return { ws: row?.ws ?? null };
+  }
+
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
-    const secret = generateAuthToken(this.wsSlug());
+    const secret = generateAuthToken(); // opaque — the workspace is NOT embedded; routing goes through the central registry
     const hash = await hashAuthToken(secret);
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();
@@ -1509,6 +1537,18 @@ export class KnowledgeHub {
       `INSERT INTO auth_tokens (id, label, hash, tags, transport, created_ts) VALUES (?, ?, ?, ?, ?, ?)`,
       id, label, hash, JSON.stringify(tags), transport, ts,
     );
+    // register hash → workspace in the central registry so /mcp routes this
+    // token here. Registry failure must fail the mint — a silently unregistered
+    // token would misroute to the default workspace.
+    const ws = this.wsSlug();
+    if (ws) {
+      const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+      await reg.fetch("https://kb/ws.token_register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hash, ws }),
+      });
+    }
     this.audit("admin", "mint", id, { label, transport });
     return { id, label, tags, transport, secret }; // secret shown exactly once
   }
@@ -1530,6 +1570,20 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, Date.now(), id);
     this.audit("admin", "revoke", id, { label: row.label });
     return { id, revoked: true };
+  }
+
+  /** Update an agent's tags (roles/capabilities) in place — no re-mint, the secret stays valid. */
+  private async tokenTags(body: any) {
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT id, label, tags FROM auth_tokens WHERE id = ?`, id);
+    if (!row) throw new Error(`no such auth token: ${id}`);
+    const tags = sanitizeTags(body.tags);
+    this.state.storage.sql.exec(
+      `UPDATE auth_tokens SET tags = ? WHERE id = ?`,
+      tags ? JSON.stringify(tags) : "[]", id,
+    );
+    this.audit("admin", "tags", id, { label: row.label, tags: tags ?? [] });
+    return { id, label: row.label, tags: tags ?? [] };
   }
 
   private async settingsGet() {

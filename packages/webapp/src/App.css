@@ -587,3 +587,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   .top-head, .top-row { grid-template-columns: minmax(100px, 130px) minmax(140px, 1.4fr) 110px 44px minmax(70px, 1fr) 60px 60px; }
   .topc-gauge, .top-sent { display: none; }
 }
+
+/* ---- role picker (Connect mint) ---- */
+.role-picker { display: flex; gap: 14px; margin: 4px 0 10px; }
+.role-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
+.role-opt input { accent-color: var(--accent); }

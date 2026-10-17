@@ -141,11 +141,12 @@ export function ftsQuery(input: string): string | null {
 // ---------- auth tokens (for agents — never call them "tokens" alone) ----------
 
 /**
- * Auth token = one agent client, scoped to one workspace. The workspace slug is
- * embedded in the secret (`bkw_<ws>_<hex>`) so /mcp can route to that
- * workspace's DO without a lookup; legacy bare tokens (`bkw_<hex>`) belong to
- * the default workspace. Secret shown once at mint; only the SHA-256 hash is
- * stored.
+ * Auth token = one agent client, scoped to one workspace. Tokens are OPAQUE
+ * (`bkw_<hex>`) — the workspace must not leak into the secret. Routing is
+ * resolved server-side via the central registry (hash → ws, written at mint);
+ * the embedded-slug format (`bkw_<ws>_<hex>`) exists only as a legacy-compat
+ * parse for tokens issued before the registry. Secret shown once at mint; only
+ * the SHA-256 hash is stored.
  */
 export const WS_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
@@ -197,7 +198,8 @@ export function doWs(ws: string): string {
 
 /**
  * Ask addressing: `any` (open floor), an agent label (auth-token label),
- * `label@session`, or `tag:<capability>` (e.g. tag:datadog-access).
+ * `label@session`, or `tag:<token tag>` (e.g. tag:deploy). Tags are roles,
+ * human-assigned at mint — capability self-declaration is not a thing.
  */
 export function isValidAskTarget(to: string): boolean {
   if (!to || to.length > 120) return false;
