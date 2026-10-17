@@ -294,9 +294,28 @@ export function isSentiment(v: unknown): v is Sentiment {
 }
 
 export function sanitizeTags(raw: unknown): string[] | null {
-  if (!Array.isArray(raw)) return null;
-  const out = [...new Set(raw.map((t: any) => String(t).trim().toLowerCase().replace(/[^a-z0-9:_-]/g, "-")).filter((t) => t.length > 0 && t.length <= 30))].slice(0, 10);
+  const arr = typeof raw === "string" ? raw.split(",") : raw; // tolerate "a, b" strings from clients
+  if (!Array.isArray(arr)) return null;
+  const out = [...new Set(arr.map((t: any) => String(t).trim().toLowerCase().replace(/[^a-z0-9:_-]/g, "-")).filter((t) => t.length > 0 && t.length <= 30))].slice(0, 10);
   return out.length ? out : null;
+}
+
+/**
+ * Parse the stored tags column defensively: ALWAYS returns a string[]. Legacy
+ * rows may hold a JSON-encoded single string ("role:impl"), a bare unquoted
+ * string, or junk — never trust the shape (a non-array here crashed orient).
+ */
+export function parseTags(raw: unknown): string[] {
+  if (raw == null || raw === "") return [];
+  let v: unknown = raw;
+  if (typeof v === "string") {
+    const s = (v as string).trim();
+    if (!s) return [];
+    try { v = JSON.parse(s); } catch { return [s]; }
+  }
+  if (typeof v === "string") return [v];
+  if (Array.isArray(v)) return v.map((x) => String(x)).filter(Boolean);
+  return [];
 }
 
 // ---------- limits ----------

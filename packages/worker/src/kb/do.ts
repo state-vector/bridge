@@ -45,6 +45,7 @@ import {
   isSentiment,
   isWsSlug,
   isValidAskTarget,
+  parseTags,
   sanitizeTags,
   validateRelation,
   validateTransition,
@@ -159,7 +160,7 @@ export class KnowledgeHub {
     const tasks = this.state.storage.sql.exec(
       `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
-    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: t.tags ? JSON.parse(t.tags) : [] }));
+    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -255,7 +256,7 @@ export class KnowledgeHub {
     ).toArray() as any[]) sig(r.owner).artefacts_created += r.n;
     for (const t of tokens) {
       const s = sig(t.label);
-      const tags: string[] = JSON.parse(t.tags ?? "[]");
+      const tags: string[] = parseTags(t.tags);
       const targets = ["any", t.label, ...tags.map((x: string) => `tag:${x}`)];
       const marks = targets.map(() => "?").join(",");
       s.asks_received = this.one(
@@ -562,7 +563,7 @@ export class KnowledgeHub {
       .find(Boolean);
     if (!t) return;
     const tmeta = JSON.parse(t.meta ?? "{}");
-    const tTags: string[] = t.tags ? JSON.parse(t.tags) : [];
+    const tTags: string[] = parseTags(t.tags);
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
     if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
@@ -802,7 +803,7 @@ export class KnowledgeHub {
       `SELECT r.dst_id AS pid, c.tags AS tags FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status = 'done'`,
     ).toArray() as any[]) {
-      const tags: string[] = k.tags ? JSON.parse(k.tags) : [];
+      const tags: string[] = parseTags(k.tags);
       if (tags.includes("role:review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
       else if (tags.includes("role:analysis")) analysisEv.add(k.pid);
     }
@@ -817,7 +818,7 @@ export class KnowledgeHub {
   private actorTagsFor(label: string): string[] {
     if (!label || /^(web|system:)/.test(label)) return [];
     const row = this.one(`SELECT tags FROM auth_tokens WHERE label = ?`, label);
-    try { return JSON.parse(row?.tags ?? "[]"); } catch { return []; }
+    try { return parseTags(row?.tags); } catch { return []; }
   }
 
   private async transition(body: any, actor: string) {
@@ -828,7 +829,7 @@ export class KnowledgeHub {
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
     if (!verdict.ok) throw new Error(verdict.reason);
     // ---- swimlane gates: minimal, enforced state-machine barriers ----
-    const tTags: string[] = row.tags ? JSON.parse(row.tags) : [];
+    const tTags: string[] = parseTags(row.tags);
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
     if (row.type === "task" && row.status === "todo" && to === "in_progress" && !isQualifier) {
       const aTags = this.actorTagsFor(actor);
@@ -932,7 +933,7 @@ export class KnowledgeHub {
       if (row.owner && row.owner !== actor && !isHuman)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       owner = "";
-      const tags: string[] = row.tags ? JSON.parse(row.tags) : [];
+      const tags: string[] = parseTags(row.tags);
       if (!tags.includes("attempted")) tags.push("attempted");
       this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
       meta.attempt = {
@@ -1055,7 +1056,7 @@ export class KnowledgeHub {
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
       // otherwise say WHY instead of silently logging into a card that never moves.
-      const tTags: string[] = JSON.parse(row.tags ?? "[]");
+      const tTags: string[] = parseTags(row.tags);
       const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
@@ -1126,7 +1127,7 @@ export class KnowledgeHub {
     if (!row) throw new Error("unknown auth token");
     if (row.revoked_ts) throw new Error("auth token revoked");
     this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
-    return { token_id: row.id, label: row.label, tags: JSON.parse(row.tags ?? "[]") };
+    return { token_id: row.id, label: row.label, tags: parseTags(row.tags) };
   }
 
   /** Active agents (for ask addressing). Labels + capability tags only. */
@@ -1138,7 +1139,7 @@ export class KnowledgeHub {
       .filter((a) => !a.revoked_ts)
       .map((a) => ({
         label: a.label,
-        tags: JSON.parse(a.tags ?? "[]"),
+        tags: parseTags(a.tags),
         transport: a.transport ?? "mcp",
         online: a.last_seen_ts >= cutoff,
         last_seen_ts: a.last_seen_ts,
@@ -1295,7 +1296,7 @@ export class KnowledgeHub {
     const pool = this.state.storage.sql.exec(
       `SELECT id, title, tags, meta, project, updated_ts FROM artefacts
        WHERE type = 'task' AND status = 'todo' AND owner = '' ORDER BY updated_ts DESC LIMIT 30`,
-    ).toArray().map((t: any) => ({ ...t, tags: t.tags ? JSON.parse(t.tags) : [] }));
+    ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(
       (this.state.storage.sql.exec(
@@ -1404,7 +1405,7 @@ export class KnowledgeHub {
         );
         continue;
       }
-      const tags: string[] = JSON.parse(t.tags ?? "[]");
+      const tags: string[] = parseTags(t.tags);
       if (!tags.includes("attempted")) tags.push("attempted");
       const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
       meta.attempt = { by: label, at: now, attempts };
@@ -1593,7 +1594,7 @@ export class KnowledgeHub {
     const sessions = this.state.storage.sql.exec(
       `SELECT token_id, name, first_seen_ts, last_seen_ts FROM sessions ORDER BY last_seen_ts DESC`,
     ).toArray();
-    return { tokens: rows.map((r) => ({ ...r, tags: JSON.parse(r.tags ?? "[]") })), sessions };
+    return { tokens: rows.map((r) => ({ ...r, tags: parseTags(r.tags) })), sessions };
   }
 
   private async tokenRevoke(body: any) {
@@ -1670,7 +1671,7 @@ export class KnowledgeHub {
     if (!issue) return null;
     const labels: string[] = (issue.labels ?? []).map((l: any) => String(l.name ?? l));
     const body = `${row.body_md ?? ""}\n## From GitHub — #${num}\n**${issue.title}** · state: ${issue.state}${labels.length ? ` · labels: ${labels.join(", ")}` : ""}\n\n${String(issue.body ?? "").slice(0, 2000)}\n`;
-    const existing = JSON.parse(row.tags ?? "[]");
+    const existing = parseTags(row.tags);
     const merged = [...new Set([...existing, ...labels.map((l) => l.toLowerCase().replace(/[^a-z0-9:_-]/g, "-"))])].slice(0, 10);
     this.state.storage.sql.exec(
       `UPDATE artefacts SET body_md = ?, tags = ?, updated_ts = ? WHERE id = ?`,
@@ -1733,7 +1734,7 @@ export class KnowledgeHub {
   }
 
   private shape(row: any) {
-    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: row.tags ? JSON.parse(row.tags) : [] };
+    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags) };
   }
 
   private json(obj: unknown, status = 200) {

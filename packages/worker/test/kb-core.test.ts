@@ -5,9 +5,30 @@ import {
   formatId,
   idSeq,
   isRelation,
+  parseTags,
+  sanitizeTags,
   validateRelation,
   validateTransition,
 } from "../src/kb/core.ts";
+
+describe("tag parsing (stored column is untrusted)", () => {
+  it("parseTags always returns a string[]", () => {
+    expect(parseTags('["role:impl","x"]')).toEqual(["role:impl", "x"]);
+    expect(parseTags('"role:impl"')).toEqual(["role:impl"]); // JSON-encoded string (crashed orient)
+    expect(parseTags("role:impl")).toEqual(["role:impl"]); // bare unquoted string
+    expect(parseTags(null)).toEqual([]);
+    expect(parseTags("")).toEqual([]);
+    expect(parseTags(42)).toEqual([]);
+    expect(parseTags("{bad json")).toEqual(["{bad json"]);
+  });
+
+  it("sanitizeTags tolerates comma strings from clients", () => {
+    expect(sanitizeTags("role:impl, x")).toEqual(["role:impl", "x"]);
+    expect(sanitizeTags(["A", "a", ""])).toEqual(["a"]);
+    expect(sanitizeTags(42)).toBeNull();
+    expect(sanitizeTags(",,,")).toBeNull();
+  });
+});
 
 describe("lifecycles", () => {
   it("task in_progress → in_review → (done | bounce | blocked); bounce returns to work", () => {
