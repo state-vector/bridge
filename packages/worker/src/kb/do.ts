@@ -54,6 +54,11 @@ import {
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
 
+  /** ensureSchema runs once per isolate, not per request — its migration
+   *  queries are full-table scans, and the free-tier DO row-read quota
+   *  dies under per-request schema checks (2026-10-18 outage). */
+  private schemaReady = false;
+
   // ---------- realtime (hibernating websockets) ----------
 
   async handleWs(request: Request) {
@@ -212,8 +217,19 @@ export class KnowledgeHub {
     return { tasks, sessions, progress, series, agents: this.agentScores() };
   }
 
-  /** Behaviour signals per agent over the trailing 7-day window, scored via scoreAgent(). */
+  /** Behaviour signals per agent over the trailing 7-day window, scored via scoreAgent().
+   *  Cached per-isolate (30s TTL) — it fans out to several table scans per call and
+   *  runs on every board/orient/log_progress; uncached it eats the DO row-read quota. */
+  private scoreCache: { at: number; rows: Array<{ label: string } & AgentSignals & ReturnType<typeof scoreAgent>> } | null = null;
   private agentScores(): Array<{ label: string } & AgentSignals & ReturnType<typeof scoreAgent>> {
+    const now = Date.now();
+    if (this.scoreCache && now - this.scoreCache.at < 30_000) return this.scoreCache.rows;
+    const rows = this.computeAgentScores();
+    this.scoreCache = { at: now, rows };
+    return rows;
+  }
+
+  private computeAgentScores(): Array<{ label: string } & AgentSignals & ReturnType<typeof scoreAgent>> {
     const windowTs = Date.now() - 7 * 24 * 60 * 60_000;
     const tokens = this.state.storage.sql.exec(
       `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`,
@@ -281,6 +297,8 @@ export class KnowledgeHub {
   }
 
   async ensureSchema() {
+    if (this.schemaReady) return;
+    this.schemaReady = true;
     this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS artefacts (
         id TEXT PRIMARY KEY,
@@ -360,6 +378,18 @@ export class KnowledgeHub {
         hash TEXT PRIMARY KEY,
         ws TEXT NOT NULL,
         created_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS pairings (
+        code TEXT PRIMARY KEY,
+        device TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        ws TEXT,
+        label TEXT,
+        tags TEXT,
+        secret TEXT,
+        created_ts INTEGER NOT NULL,
+        approved_ts INTEGER,
+        last_poll_ts INTEGER
       );
       CREATE TABLE IF NOT EXISTS embeddings (
         artefact_id TEXT PRIMARY KEY,
@@ -478,6 +508,10 @@ export class KnowledgeHub {
         case "ws.members": return this.json(await this.wsMembers(body, String(body.login)));
         case "ws.token_register": return this.json(await this.wsTokenRegister(body));
         case "ws.token_lookup": return this.json(await this.wsTokenLookup(body));
+        case "ws.pair.start": return this.json(await this.wsPairStart(body));
+        case "ws.pair.get": return this.json(await this.wsPairGet(body));
+        case "ws.pair.approve": return this.json(await this.wsPairApprove(body));
+        case "ws.pair.poll": return this.json(await this.wsPairPoll(body));
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
         case "admin.mint":
         case "admin.list_tokens":
@@ -1621,6 +1655,123 @@ export class KnowledgeHub {
   private async wsTokenLookup(body: any) {
     const row = this.one(`SELECT ws FROM ws_tokens WHERE hash = ?`, String(body.hash ?? ""));
     return { ws: row?.ws ?? null };
+  }
+
+  // ---- device pairing (lives in the registry DO) ----
+  // GitHub-like device flow, but bridge-native: the device shows a code, the
+  // human approves it in the web UI (picking workspace + roles), and the device
+  // polls its token once. The approver never holds the credential.
+
+  static PAIR_TTL_MS = 15 * 60_000;
+  static PAIR_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"; // no 0/O/1/I
+
+  private pairCode(): string {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    const chars = [...bytes].map((b) => KnowledgeHub.PAIR_ALPHABET[b % KnowledgeHub.PAIR_ALPHABET.length]);
+    return `${chars.slice(0, 4).join("")}-${chars.slice(4).join("")}`;
+  }
+
+  private pairPurge() {
+    const cutoff = Date.now() - KnowledgeHub.PAIR_TTL_MS;
+    this.state.storage.sql.exec(`DELETE FROM pairings WHERE created_ts < ?`, cutoff);
+    // hard cap on pending rows so /api/pair/start can't be spammed into bloat
+    const n = this.one(`SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending'`)?.n ?? 0;
+    if (n > 100) {
+      this.state.storage.sql.exec(
+        `DELETE FROM pairings WHERE status = 'pending' AND code NOT IN (
+           SELECT code FROM pairings WHERE status = 'pending' ORDER BY created_ts DESC LIMIT 100)`,
+      );
+    }
+  }
+
+  private async wsPairStart(body: any) {
+    this.pairPurge();
+    const code = this.pairCode();
+    const now = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO pairings (code, device, status, created_ts) VALUES (?, ?, 'pending', ?)`,
+      code, String(body.device ?? "device").slice(0, 80), now,
+    );
+    return { code, expires_ts: now + KnowledgeHub.PAIR_TTL_MS };
+  }
+
+  private async wsPairGet(body: any) {
+    const row = this.one(
+      `SELECT device, status, created_ts, ws, label FROM pairings WHERE code = ?`,
+      String(body.code ?? "").trim().toUpperCase(),
+    );
+    if (!row) return { status: "expired" };
+    if (row.status === "pending" && Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
+      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, row.code);
+      return { status: "expired" };
+    }
+    return { status: row.status, device: row.device, created_ts: row.created_ts, ws: row.ws, label: row.label };
+  }
+
+  private async wsPairApprove(body: any) {
+    const code = String(body.code ?? "").trim().toUpperCase();
+    const ws = String(body.ws ?? "").trim();
+    const label = String(body.label ?? "").trim();
+    const login = String(body.login ?? "").toLowerCase();
+    const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
+    if (!isWsSlug(ws)) throw new Error("bad workspace slug");
+    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    const row = this.one(`SELECT code, created_ts, status, device FROM pairings WHERE code = ?`, code);
+    if (!row || row.status !== "pending") throw new Error("pairing code not pending");
+    if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
+      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
+      throw new Error("pairing code expired");
+    }
+    const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
+    if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
+    // mint in the target workspace's DO (registers hash → ws in the central
+    // registry); the token flows to the DEVICE via poll, never to the approver
+    const stub = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(ws)));
+    const mintRes = await stub.fetch("https://kb/admin.mint", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-kb-admin": "1" },
+      body: JSON.stringify({ label, tags }),
+    });
+    const minted = await (mintRes as any).json();
+    if (!(mintRes as any).ok || !minted.secret) {
+      throw new Error(String(minted?.error ?? "token mint failed"));
+    }
+    this.state.storage.sql.exec(
+      `UPDATE pairings SET status = 'authorized', ws = ?, label = ?, tags = ?, secret = ?, approved_ts = ? WHERE code = ?`,
+      ws, label, JSON.stringify(tags), minted.secret, Date.now(), code,
+    );
+    this.audit(login, "pair.approve", code, { device: row.device, ws, label });
+    return { ok: true, ws, label };
+  }
+
+  private async wsPairPoll(body: any) {
+    const code = String(body.code ?? "").trim().toUpperCase();
+    const row = this.one(`SELECT code, status, secret, ws, label, tags, created_ts, last_poll_ts FROM pairings WHERE code = ?`, code);
+    if (!row) return { status: "expired" };
+    if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
+      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
+      return { status: "expired" };
+    }
+    // slow-down: devices poll every ~3s; faster than 1.5s gets backed off
+    if (row.last_poll_ts && Date.now() - row.last_poll_ts < 1500) {
+      return { status: "slow_down" };
+    }
+    this.state.storage.sql.exec(`UPDATE pairings SET last_poll_ts = ? WHERE code = ?`, Date.now(), code);
+    if (row.status === "pending") return { status: "pending" };
+    if (row.status === "denied") {
+      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
+      return { status: "denied" };
+    }
+    // authorized: one-time read — the token leaves the registry exactly once
+    this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
+    return {
+      status: "authorized",
+      token: row.secret,
+      ws: row.ws,
+      label: row.label,
+      tags: row.tags ? JSON.parse(row.tags) : [],
+    };
   }
 
   private async tokenMint(body: any) {
