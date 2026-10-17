@@ -18,6 +18,9 @@ import {
 } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 
+/** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
+export const BUILD = "0.3.0";
+
 // per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
 const wsRouteCache = new Map<string, string>();
 
@@ -110,7 +113,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
         result = {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "bridge-kb", version: "0.2.0", description: "Bridge — work orchestration for agents" },
+          serverInfo: { name: "bridge-kb", version: BUILD, description: "Bridge — work orchestration for agents" },
           instructions: composeBootstrap(
             settings.project_name ?? "this project",
             settings.board ?? { mode: "none" },
@@ -221,6 +224,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       return text(JSON.stringify(
         {
           ...o,
+          build: BUILD,
           you: { agent: identity.label, session: session.session, tags: identity.tags },
           note: required.length
             ? `ACT NOW — handle each of these before anything else:\n${required.join("\n")}`
