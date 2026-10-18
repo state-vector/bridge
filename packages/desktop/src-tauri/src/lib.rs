@@ -73,6 +73,15 @@ fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
     dispatch::stop(&state);
 }
 
+/// CLI flag lookup: `--flag value` → parsed value (u64), None when absent/invalid.
+fn cli_u64(name: &str) -> Option<u64> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -107,7 +116,13 @@ pub fn run() {
 
             // auto-start dispatch: headless pairs (device flow) if unconfigured;
             // menubar mode only auto-starts when a config already exists
-            let cfg = dispatch::DispatchConfig::resolve();
+            let mut cfg = dispatch::DispatchConfig::resolve();
+            if let Some(c) = cfg.as_mut() {
+                // CLI override: `--max-sessions N` wins over env/file config.
+                if let Some(n) = cli_u64("--max-sessions") {
+                    c.max_sessions = n.max(1) as usize;
+                }
+            }
             if headless || cfg.is_some() {
                 let state = app.state::<dispatch::DispatchState>();
                 dispatch::start(&state, cfg)?;

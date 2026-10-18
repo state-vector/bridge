@@ -3,10 +3,10 @@ import { kbApi } from "../lib/kb";
 import type { KbArtefact, KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
 
-const GROUPS = ["steering", "goal", "rfc", "decision", "research", "discussion", "task", "progress", "agent"];
+const GROUPS = ["steering", "goal", "decision", "task", "progress", "agent"];
 const GROUP_LABEL: Record<string, string> = {
-  steering: "Steering", goal: "Goals", rfc: "RFCs", decision: "Decisions",
-  research: "Research", discussion: "Discussions", task: "Tasks", progress: "Progress", agent: "Agents",
+  steering: "Steering", goal: "Goals", decision: "Decisions",
+  task: "Tasks", progress: "Progress", agent: "Agents",
 };
 
 const STATUS_TONE: Record<string, string> = {
@@ -182,4 +182,4 @@ export function KnowledgeView() {
   );
 }
 
-const TYPES = ["steering", "goal", "rfc", "decision", "discussion", "research", "task", "progress", "agent"];
+const TYPES = ["steering", "goal", "decision", "task", "progress", "agent"];

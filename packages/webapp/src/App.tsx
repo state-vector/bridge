@@ -21,7 +21,7 @@ const TABS_ALL: Array<{ key: Tab; label: string }> = [
   { key: "top", label: "Top" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
-  { key: "discussions", label: "Discuss" },
+  { key: "discussions", label: "Discussions" },
   { key: "inbox", label: "Decisions" },
 ];
 const isTauri = "__TAURI_INTERNALS__" in window;

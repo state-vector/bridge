@@ -25,6 +25,18 @@ fn tail(s: String, max: usize) -> String {
     }
 }
 
+fn head_line(s: &str, max: usize) -> String {
+    let mut chars = s.chars();
+    let n = chars.by_ref().take(max).count();
+    let truncated = n == max && s.chars().nth(max).is_some();
+    let out: String = s.chars().take(max).collect();
+    if truncated {
+        format!("{out}…")
+    } else {
+        out
+    }
+}
+
 /// Run opencode headlessly against `workdir`. Blocks until exit or timeout.
 /// stdout/stderr are drained on reader threads so big sessions can't deadlock
 /// on full pipes. `title` tags the opencode session (`bridge-<task_id>`) so the
@@ -44,6 +56,14 @@ pub fn run_task(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Sanitize the inherited environment: desktop-client variables (e.g.
+    // OPENCODE_CLIENT, XDG_STATE_HOME pointing at ai.opencode.desktop) make the
+    // headless CLI resolve against the desktop's state and fail with
+    // "Session not found" before any work is done. Strip them for the child.
+    cmd.env_remove("OPENCODE_CLIENT")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("OPENCODE_SERVER_USERNAME")
+        .env_remove("OPENCODE_SERVER_PASSWORD");
     if let Some(agent) = agent {
         cmd.arg("--agent").arg(agent);
     }
@@ -69,18 +89,56 @@ pub fn run_task(
         }
     };
 
+    // reader threads accumulate raw bytes (chunk boundaries can split UTF-8);
+    // the stdout reader logs pickup confirmation on the agent's first output
+    let label = title
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "opencode".into());
     let stdout = child.stdout.take().map(|mut p| {
         std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = p.read_to_string(&mut buf);
-            buf
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let mut first = true;
+            let mut shown = 0usize; // bytes already printed as complete lines
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if first {
+                            first = false;
+                            eprintln!("[dispatch] {label} picked up — agent responding");
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        // Stream complete lines as they arrive so the local
+                        // console shows live agent activity mid-run, not just
+                        // the truncated tail at exit.
+                        while let Some(nl) = bytes[shown..].iter().position(|&b| b == b'\n') {
+                            let end = shown + nl;
+                            let line = String::from_utf8_lossy(&bytes[shown..end]).trim().to_string();
+                            if !line.is_empty() {
+                                eprintln!("[dispatch] {label} | {}", head_line(&line, 240));
+                            }
+                            shown = end + 1;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
         })
     });
     let stderr = child.stderr.take().map(|mut p| {
         std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = p.read_to_string(&mut buf);
-            buf
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
         })
     });
 

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "flows/artefact.schema.json",
+  "title": "flows knowledge-base artefact — the unit of knowledge and work",
+  "description": "Every row in the KB is an artefact. Types are fixed; statuses and transitions are enforced by the worker, not by callers.",
+  "type": "object",
+  "required": ["id", "type", "title", "body_md", "status", "tags", "created_ts", "updated_ts"],
+  "properties": {
+    "id":         { "type": "string", "description": "type-prefixed id, e.g. T#42, D#7, S#3" },
+    "type":       { "enum": ["steering", "goal", "decision", "task", "progress", "agent"] },
+    "title":      { "type": "string", "maxLength": 300 },
+    "body_md":    { "type": "string", "description": "markdown body; for tasks this is the spec the claimer is accountable to" },
+    "status":     { "type": "string", "description": "per-type; see x-transitions for the legal graph" },
+    "tags":       { "type": "array", "items": { "type": "string" }, "description": "role:* tags gate swimlanes (role:impl, role:analysis, role:review)" },
+    "owner":      { "type": ["string", "null"], "description": "agent/session holding the exclusive claim — tasks only; null = unclaimed" },
+    "created_ts": { "type": "integer" },
+    "updated_ts": { "type": "integer" },
+    "meta":       { "type": "object", "description": "typed extras: kind (impl|analysis|review|research|question) for tasks; ask options for decisions; etc." }
+  },
+  "x-transitions": {
+    "description": "The only legal status transitions, enforced server-side. Anything outside this graph is rejected with a reason.",
+    "steering": { "draft": ["active"], "active": ["superseded"] },
+    "goal":     { "draft": ["active"], "active": ["achieved", "dropped"] },
+    "decision": { "proposed": ["accepted"], "accepted": ["superseded"] },
+    "task":     {
+      "todo":        ["in_progress", "blocked"],
+      "in_progress": ["in_review", "done", "blocked", "todo"],
+      "in_review":   ["done", "in_progress", "blocked"],
+      "blocked":     ["in_progress", "todo"]
+    },
+    "progress": { "x-note": "append-only event log; no status, no transitions" },
+    "agent":    { "x-note": "presence/identity record; no status, no transitions" }
+  },
+  "x-task-kinds": {
+    "description": "meta.kind on task artefacts determines pickup mode, output and completion gate.",
+    "impl":      { "pickup": "exclusive claim + session id", "output": "PR", "completion": "verify task done (separation of duties; cannot self-verify)" },
+    "analysis":  { "pickup": "exclusive claim + session id", "output": "breakdown / notes", "completion": "done releases parent claim" },
+    "review":    { "pickup": "exclusive claim, role:review tag required", "output": "verdict + receipts", "completion": "receipts + SoD gate" },
+    "research":  { "pickup": "exclusive claim", "output": "knowledge artefact", "completion": "done with artefact link" },
+    "question":  { "pickup": "open — nobody claims; many contributors", "output": "decision / knowledge artefact", "completion": "author concludes" }
+  },
+  "x-invariants": {
+    "claim": "claiming a task requires: status=todo, meta.kind != question, and the session id — owner is set atomically",
+    "question": "question tasks never hold claims; contributions are progress artefacts with meta.task pointing at the question",
+    "sod": "the agent that sets a task done cannot be the one that opened the PR it produced — verify tasks close impl tasks"
+  }
+}

@@ -2,7 +2,7 @@
 //! and reports status back through the same protocol (orient / transition /
 //! log_progress). Runs identically in menu-bar and headless mode.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -379,6 +379,62 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
     }
 }
 
+// ---- ephemeral flat-file state (headless observability) ----
+//
+// The bridge hub owns authoritative state (task status, claims, progress, PR
+// handoff). The runner keeps only ephemeral per-task state as flat JSON files
+// under ~/.bridge/dispatch/ so headless runs are observable without the app.
+// Files are removed when the task leaves the runner (handed off, or finished
+// without a PR); failed tasks keep their file until the retry succeeds.
+
+fn dispatch_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(&home).join(".bridge").join("dispatch");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_task_state(task_id: &str, v: &serde_json::Value) {
+    if let Some(dir) = dispatch_dir() {
+        let _ = std::fs::write(
+            dir.join(format!("{}.json", slugify(task_id))),
+            serde_json::to_string_pretty(v).unwrap_or_default(),
+        );
+    }
+}
+
+fn remove_task_state(task_id: &str) {
+    if let Some(dir) = dispatch_dir() {
+        let _ = std::fs::remove_file(dir.join(format!("{}.json", slugify(task_id))));
+    }
+}
+
+fn write_runner_state(snap: &SharedSnapshot) {
+    let Some(dir) = dispatch_dir() else { return };
+    if let Ok(s) = snap.lock() {
+        let v = serde_json::json!({
+            "updated_ts": now_ms(),
+            "running": s.running,
+            "url": s.url,
+            "workspace": s.workspace,
+            "label": s.label,
+            "agent": s.agent,
+            "workdir": s.workdir,
+            "max_sessions": s.max_sessions,
+            "in_flight": s.in_flight,
+            "activity": s.activity.iter().take(10).collect::<Vec<_>>(),
+        });
+        let _ = std::fs::write(dir.join("runner.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
+    }
+}
+
 // ---- dispatch state (shared with Tauri commands) ----
 
 struct InFlight {
@@ -439,16 +495,29 @@ fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf
         return Some(path);
     }
     std::fs::create_dir_all(path.parent()?).ok()?;
-    let branch = format!("bridge/{slug}");
-    let mut cmd = Command::new("git");
-    cmd.current_dir(workdir);
-    if resume {
-        cmd.args(["worktree", "add"]).arg(&path).arg(&branch);
-    } else {
-        cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(&path);
-    }
-    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
-    if ok { Some(path) } else { None }
+        let branch = format!("bridge/{slug}");
+        // A fresh (non-resume) dispatch can still hit an existing branch: the
+        // worktree is cleaned up after every finalize, but `bridge/<slug>` stays
+        // behind. `worktree add -b` then fails and we'd silently fall back to
+        // running in the main workdir. Try creating; if the branch exists, attach.
+        let mut cmd = Command::new("git");
+        cmd.current_dir(workdir);
+        if resume {
+            cmd.args(["worktree", "add"]).arg(&path).arg(&branch);
+        } else {
+            cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(&path);
+        }
+        let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+        if ok {
+            return Some(path);
+        }
+        let mut cmd = Command::new("git");
+        cmd.current_dir(workdir)
+            .args(["worktree", "add"])
+            .arg(&path)
+            .arg(&branch);
+        let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+        if ok { Some(path) } else { None }
 }
 
 fn cleanup_worktree(workdir: &str, task_id: &str) {
@@ -464,11 +533,21 @@ fn cleanup_worktree(workdir: &str, task_id: &str) {
 
 fn extract_pr(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
-        if tok.starts_with("https://") && tok.contains("/pull/") {
-            return Some(
-                tok.trim_end_matches(|c| c == ')' || c == ',' || c == '.').to_string(),
-            );
+        // URLs are often wrapped in markdown ("[View PR](https://…/pull/1)")
+        // or prefixed with quotes/punctuation — match anywhere in the token,
+        // not just at its start, so formatting can't break the handoff.
+        let idx = match tok.find("https://") {
+            Some(i) => i,
+            None => continue,
+        };
+        let url = &tok[idx..];
+        if !url.contains("/pull/") {
+            continue;
         }
+        return Some(
+            url.trim_end_matches(|c| c == ')' || c == ',' || c == '.' || c == '"' || c == ']' || c == ';')
+                .to_string(),
+        );
     }
     None
 }
@@ -505,6 +584,28 @@ fn spawn_opencode(
         "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
         policy, tid, title, body_md, resume_note, run_dir, branch
     );
+    // clone for the ephemeral state file: the closure below moves the original
+    let resume_session_for_state = resume_session.clone();
+    eprintln!(
+        "[dispatch] {tid} dispatched — {} opencode session bridge-{tid}{}",
+        if resume {
+            format!("resuming session {}", resume_session.as_deref().unwrap_or("?"))
+        } else {
+            "new".to_string()
+        },
+        worktree
+            .as_ref()
+            .map(|p| format!(" (worktree {})", p.display()))
+            .unwrap_or_default(),
+    );
+    snap_activity(
+        snap,
+        "dispatch",
+        &format!(
+            "{tid} dispatched — {}",
+            if resume { "resumed session" } else { "new session" }
+        ),
+    );
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
@@ -532,6 +633,18 @@ fn spawn_opencode(
         pr_url: None,
         rx: outcome,
     });
+    // ephemeral state file: headless observability (removed on completion)
+    write_task_state(
+        tid,
+        &serde_json::json!({
+            "task_id": tid,
+            "task_title": title,
+            "status": if resume { "resumed" } else { "running" },
+            "started_ts": now_ms(),
+            "session": resume_session_for_state,
+            "worktree": in_flight.last().and_then(|i| i.worktree.clone()).map(|p| p.to_string_lossy().to_string()),
+        }),
+    );
     snap_in_flight_list(snap, in_flight);
 }
 
@@ -540,6 +653,7 @@ fn tick(
     id: &mut i64,
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
+    finished_no_pr: &mut HashSet<String>,
     snap: &SharedSnapshot,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
@@ -608,11 +722,47 @@ fn tick(
         if let Some(pr) = &pr_url {
             note.push_str(&format!("\nPR: {pr}"));
         }
+        // CLI log: the agent's final reply (first lines, capped) — the full
+        // note goes to the bridge via log_progress below.
+        let reply_excerpt: String = {
+            let lines: Vec<&str> = tail.lines().take(4).collect();
+            let mut s = lines.join(" | ");
+            if s.chars().count() > 300 {
+                s = s.chars().take(300).collect::<String>() + "…";
+            }
+            s
+        };
+        eprintln!(
+            "[dispatch] {} {} in ~{}m — agent reply: {}",
+            inf.task_id,
+            if outcome.timed_out { "TIMED OUT" } else { "finished" },
+            mins,
+            reply_excerpt
+        );
         let _ = mcp_call(
             cfg,
             id,
             "log_progress",
-            json!({ "id": inf.task_id, "note": note, "sentiment": if outcome.ok { "converging" } else { "struggling" } }),
+            json!({
+                "id": inf.task_id,
+                "note": note,
+                "sentiment": if outcome.ok { "converging" } else { "struggling" },
+            }),
+        );
+        // persist final state (incl. PR link and exit code) before handoff
+        write_task_state(
+            &inf.task_id,
+            &serde_json::json!({
+                "task_id": &inf.task_id,
+                "task_title": &inf.task_title,
+                "status": if outcome.ok { "finished" } else { "failed" },
+                "started_ts": now_ms() - inf.started.elapsed().as_millis() as u64,
+                "ended_ts": now_ms(),
+                "exit_code": outcome.exit_code,
+                "pr_url": &pr_url,
+                "last_note": &note,
+                "stdout_tail": &outcome.stdout_tail,
+            }),
         );
         if outcome.ok {
             // handoff gate wants a PR link in the note; if opencode didn't
@@ -623,14 +773,39 @@ fn tick(
                 "transition",
                 json!({ "id": inf.task_id, "to": "in_review", "note": note }),
             ) {
-                Ok(_) => msgs.push(format!("{} → in_review", inf.task_title)),
-                Err(_) => msgs.push(format!(
-                    "{} finished (no PR link — left in_progress for review pickup)",
-                    inf.task_title
-                )),
+                Ok(_) => {
+                    // handed off: work is done — remove the ephemeral state file
+                    remove_task_state(&inf.task_id);
+                    attempts.remove(&inf.task_id);
+                    msgs.push(format!(
+                        "{} → in_review{}",
+                        inf.task_title,
+                        pr_url
+                            .as_ref()
+                            .map(|p| format!(" — PR {p}"))
+                            .unwrap_or_default()
+                    ));
+                }
+                Err(_) => {
+                    // opencode exited cleanly but produced no PR — likely an
+                    // analysis/verification task with nothing to ship. Terminal
+                    // for this runner: review pickup takes over from here.
+                    // Without this mark the resume loop re-dispatched the same
+                    // finished session every tick forever.
+                    finished_no_pr.insert(inf.task_id.clone());
+                    remove_task_state(&inf.task_id);
+                    msgs.push(format!(
+                        "{} finished (no PR link — left in_progress for review pickup)",
+                        inf.task_title
+                    ));
+                }
             }
         } else {
-            msgs.push(format!("{} failed/timed out — left in_progress", inf.task_title));
+            // failed/timed out — keep in_progress and set backoff so we don't
+            // hammer the same failing task every tick (previously removed the
+            // backoff entry here, causing an immediate re-dispatch loop).
+            attempts.insert(inf.task_id.clone(), Instant::now());
+            msgs.push(format!("{} failed/timed out — left in_progress (backoff)", inf.task_title));
         }
         // PR monitoring v1: record the handoff so the review flow can be tracked;
         // automated verdict reaction (CI fail → bounce + fix) lands with the PR watch loop
@@ -645,21 +820,14 @@ fn tick(
         if inf.worktree.is_some() {
             cleanup_worktree(&cfg.workdir, &inf.task_id);
         }
-        attempts.remove(&inf.task_id);
         snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
     }
 
-    // 2. heartbeat every live session (each gets its own log_progress)
-    for inf in in_flight.iter_mut() {
-        let mins = inf.started.elapsed().as_secs() / 60;
-        inf.last_note = format!("opencode still working (~{mins}m in)");
-        mcp_call(
-            cfg,
-            id,
-            "log_progress",
-            json!({ "id": inf.task_id, "note": format!("dispatch runner: opencode still working (~{mins}m in)"), "sentiment": "neutral" }),
-        )?;
-    }
+    // heartbeat is the AGENT's job (protocol card: log_progress every ≤10 min
+    // via its own bridge MCP). The dispatcher must not fabricate "still working"
+    // notes on the agent's behalf — that would mask genuine agent silence from
+    // the watchdog. The dispatcher only logs its OWN actions (claim, handoff,
+    // finish) in the sections below.
     if !in_flight.is_empty() {
         snap_in_flight_list(snap, in_flight);
     }
@@ -701,6 +869,11 @@ fn tick(
         };
         if in_flight.iter().any(|inf| inf.task_id == tid) {
             continue; // already running
+        }
+        // terminal: opencode already finished this task without a PR (analysis
+        // /verification work). Never re-dispatch a completed session.
+        if finished_no_pr.contains(tid) {
+            continue;
         }
         // backoff: a task that just failed to spawn shouldn't retry every tick
         if attempts
@@ -751,18 +924,23 @@ fn tick(
         {
             continue;
         }
-        mcp_call(cfg, id, "transition", json!({ "id": tid, "to": "in_progress" }))?;
+        if let Err(e) = mcp_call(cfg, id, "transition", json!({ "id": tid, "to": "in_progress" })) {
+            // claim raced or failed — don't kill the tick or the whole claim loop
+            attempts.insert(tid.to_string(), Instant::now());
+            snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
+            continue;
+        }
         // fetch the body so the policy pre-prompt carries the actual task
         let body_md = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))
             .ok()
             .and_then(|v| v.get("body_md").and_then(|b| b.as_str()).map(String::from))
             .unwrap_or_default();
-        mcp_call(
+        let _ = mcp_call(
             cfg,
             id,
             "log_progress",
             json!({ "id": tid, "note": format!("dispatch runner: claimed '{title}' — dispatching to opencode"), "sentiment": "going_well" }),
-        )?;
+        );
         spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, None, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         let msg = format!("claimed {tid} — dispatched to opencode");
@@ -808,6 +986,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
+    let mut finished_no_pr: HashSet<String> = HashSet::new();
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -825,7 +1004,14 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match tick(&cfg, &mut id, &mut in_flight, &mut attempts, &snap) {
+        match tick(
+            &cfg,
+            &mut id,
+            &mut in_flight,
+            &mut attempts,
+            &mut finished_no_pr,
+            &snap,
+        ) {
             Ok(msgs) => {
                 for msg in msgs {
                     eprintln!("[dispatch] {msg}");
@@ -839,6 +1025,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 }
             }
         }
+        // ephemeral flat-file state: keep ~/.bridge/dispatch/runner.json in sync
+        write_runner_state(&snap);
         // sleep in small slices so stop is responsive
         let wake = std::time::Instant::now() + Duration::from_secs(cfg.poll_secs);
         while std::time::Instant::now() < wake {
@@ -853,6 +1041,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.running = false;
         s.in_flight = Vec::new();
     }
+    write_runner_state(&snap);
     eprintln!("[dispatch] loop stopped");
 }
 
@@ -874,4 +1063,7 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
 
 pub fn stop(state: &DispatchState) {
     state.stop.store(true, Ordering::Relaxed);
+    // persist the stop signal immediately so the flat file reflects it even
+    // before the loop drains its current sleep slice
+    write_runner_state(&state.snapshot);
 }

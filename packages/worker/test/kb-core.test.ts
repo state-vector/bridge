@@ -4,9 +4,11 @@ import {
   ftsQuery,
   formatId,
   idSeq,
+  isQuestionTask,
   isRelation,
   parseTags,
   sanitizeTags,
+  taskKind,
   validateRelation,
   validateTransition,
 } from "../src/kb/core.ts";
@@ -20,6 +22,19 @@ describe("tag parsing (stored column is untrusted)", () => {
     expect(parseTags("")).toEqual([]);
     expect(parseTags(42)).toEqual([]);
     expect(parseTags("{bad json")).toEqual(["{bad json"]);
+  });
+
+  it("parseTags unwraps nested JSON-encoded elements (recursive verify flood)", () => {
+    // legacy rows stored a JSON-encoded array as an array element: the review
+    // gate missed role:review, spawning verify-of-verify on every completion
+    expect(parseTags(['["role:review"]'])).toEqual(["role:review"]);
+    expect(parseTags(["\"[\\\"role:review\\\"]\""])).toEqual(["role:review"]);
+    expect(parseTags(['"role:impl"', '["role:x","role:y"]'])).toEqual(["role:impl", "role:x", "role:y"]);
+    // comma-separated strings inside arrays also split
+    expect(parseTags(["role:a,role:b"])).toEqual(["role:a", "role:b"]);
+    // depth-3 still resolves; unparseable junk passes through as a literal
+    expect(parseTags(['["[\\\"role:z\\\"]"]'])).toEqual(["role:z"]);
+    expect(parseTags(["[{bad json"])).toEqual(["[{bad json"]);
   });
 
   it("sanitizeTags tolerates comma strings from clients", () => {
@@ -40,15 +55,19 @@ describe("lifecycles", () => {
     expect(validateTransition("task", "in_review", "superseded").ok).toBe(false);
   });
 
-  it("rfc draft → proposed → accepted → implemented", () => {
-    expect(validateTransition("rfc", "draft", "proposed").ok).toBe(true);
-    expect(validateTransition("rfc", "proposed", "accepted").ok).toBe(true);
-    expect(validateTransition("rfc", "accepted", "implemented").ok).toBe(true);
+  it("rfc + discussion are gone — question tasks and decisions replaced them", () => {
+    // taskKind is meta-driven; validateTransition for "rfc" must fail as unknown type
+    expect(validateTransition("rfc" as any, "draft", "proposed").ok).toBe(false);
+    expect(validateTransition("discussion" as any, "open", "concluded").ok).toBe(false);
   });
 
-  it("rfc accepted can be superseded, draft cannot be accepted directly", () => {
-    expect(validateTransition("rfc", "accepted", "superseded").ok).toBe(true);
-    expect(validateTransition("rfc", "draft", "accepted").ok).toBe(false);
+  it("task kinds: question is claimable-gated, impl is the default", () => {
+    expect(taskKind({})).toBe("impl");
+    expect(taskKind({ kind: "question" })).toBe("question");
+    expect(taskKind({ kind: "bogus" })).toBe("impl");
+    expect(isQuestionTask({ kind: "question" })).toBe(true);
+    expect(isQuestionTask({ kind: "impl" })).toBe(false);
+    expect(isQuestionTask({})).toBe(false);
   });
 
   it("decisions: proposed → accepted → superseded only", () => {
@@ -79,10 +98,10 @@ describe("relations", () => {
     expect(validateRelation("supersedes", "decision", "rfc").ok).toBe(false);
   });
 
-  it("implements: task → rfc|goal only", () => {
-    expect(validateRelation("implements", "task", "rfc").ok).toBe(true);
+  it("implements: task → goal only (rfc type is gone)", () => {
     expect(validateRelation("implements", "task", "goal").ok).toBe(true);
-    expect(validateRelation("implements", "rfc", "task").ok).toBe(false);
+    expect(validateRelation("implements", "task", "rfc" as any).ok).toBe(false);
+    expect(validateRelation("implements", "rfc" as any, "task").ok).toBe(false);
   });
 
   it("constrains: only steering constrains", () => {

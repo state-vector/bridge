@@ -1,94 +1,166 @@
 import { useEffect, useState } from "react";
-import { kbApi, type KbArtefact } from "../lib/kb";
+import { useKb } from "../store/kb";
+import { kbApi, type KbArtefact, type KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
 
-const TEMPLATE = (context: string) => `## Context\n${context}\n\n## Questions\n- \n\n## Contributions\n\n## Conclusions\n\n## Unresolved\n`;
+/** Discussion tab = threaded display of question tasks with responses.
+ *  No separate discussion artefacts: a "thread" is a task with meta.kind
+ *  === "question"; its responses are the history stream (progress notes,
+ *  asks, answers, transitions). Never claimed, never swept — anyone may
+ *  contribute. */
 
-export function DiscussionsView() {
-  const [discussions, setDiscussions] = useState<KbArtefact[]>([]);
-  const [open, setOpen] = useState<KbArtefact | null>(null);
-  const [title, setTitle] = useState("");
-  const [context, setContext] = useState("");
-  const [contribution, setContribution] = useState("");
+const SENT_DOT: Record<string, string> = {
+  going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
+  diverging: "var(--startup)", struggling: "var(--red)",
+};
+
+const ACTION_LABEL: Record<string, string> = {
+  create: "asked",
+  progress: "",
+  transition: "→",
+  update: "edited",
+  link: "linked",
+  discuss: "contributed",
+};
+
+function versionText(v: KbVersion): string {
+  const note = (v.data?.note as string | undefined) ?? v.summary;
+  return (note ?? "").trim();
+}
+
+function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
+  const [versions, setVersions] = useState<KbVersion[] | null>(null);
+  const [reply, setReply] = useState("");
   const [msg, setMsg] = useState("");
 
-  const load = async () => {
-    try {
-      const r = await kbApi.artefacts({ type: "discussion" });
-      setDiscussions(r.artefacts ?? []);
-    } catch { /* live hub required */ }
-  };
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    let dead = false;
+    setVersions(null);
+    kbApi.history(task.id)
+      .then((r) => { if (!dead) setVersions(r.versions ?? []); })
+      .catch(() => { if (!dead) setVersions([]); });
+    return () => { dead = true; };
+  }, [task.id]);
 
-  const start = async () => {
+  const send = async () => {
+    if (!reply.trim()) return;
     try {
-      await kbApi.create({ type: "discussion", title: title.trim(), body_md: TEMPLATE(context.trim()) });
-      setTitle(""); setContext(""); setMsg("started"); setTimeout(() => setMsg(""), 1500);
-      await load();
-    } catch (e) { setMsg(`failed: ${(e as Error).message}`); }
-  };
-
-  const contribute = async (d: KbArtefact) => {
-    if (!contribution.trim()) return;
-    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
-    const body = `${d.body_md}\n### Contribution — rayh · ${stamp}\n${contribution.trim()}\n`;
-    try {
-      await kbApi.update(d.id, { body_md: body });
-      setContribution("");
-      await load();
-      setOpen(d);
-    } catch (e) { setMsg(`failed: ${(e as Error).message}`); }
+      await kbApi.progress(task.id, reply.trim());
+      setReply("");
+      setMsg("sent");
+      setTimeout(() => setMsg(""), 1500);
+      const r = await kbApi.history(task.id);
+      setVersions(r.versions ?? []);
+    } catch (e) {
+      setMsg(`failed: ${(e as Error).message}`);
+    }
   };
 
-  const conclude = async (d: KbArtefact) => {
+  // oldest last = a natural thread; skip pure heartbeat noise with empty notes
+  const stream = (versions ?? []).slice().reverse().filter((v) => v.action !== "progress" || versionText(v));
+
+  return (
+    <div className="disc-wrap">
+      <div className="view-head">
+        <button className="opt-btn opt-ghost" onClick={onBack}>← All threads</button>
+        <h2>{task.title}</h2>
+      </div>
+      <div className="card ask-thread">
+        <div className="ask-chips">
+          <span className={`chip ${task.status === "done" ? "chip-done" : "chip-needs"}`}>{task.status.toUpperCase()}</span>
+          {task.board && <span className="chip chip-scope">{task.board.toUpperCase()}</span>}
+          <span className="why-line">{task.owner ?? "—"} · opened {rel(task.created_ts)}</span>
+        </div>
+        <pre className="know-body">{task.body_md}</pre>
+      </div>
+      <div className="disc-list">
+        {(versions === null) && <p className="empty">loading responses…</p>}
+        {stream.map((v) => (
+          <div key={v.seq} className={`card resp ${v.action === "progress" ? "resp-note" : ""}`}>
+            <div className="ask-chips">
+              {v.data?.sentiment ? <span className="sent-dot" style={{ background: SENT_DOT[String(v.data.sentiment)] ?? "#3a4356" }} /> : null}
+              <span className="resp-actor">{v.actor}</span>
+              <span className="why-line">{ACTION_LABEL[v.action] ?? v.action} · {rel(v.ts)}</span>
+            </div>
+            {versionText(v) && <p className="resp-body">{versionText(v)}</p>}
+          </div>
+        ))}
+        <div className="card">
+          <textarea
+            rows={2}
+            value={reply}
+            placeholder="Reply — answer, evidence, concern…"
+            onChange={(e) => setReply(e.target.value)}
+          />
+          <p><button className="opt-btn" disabled={!reply.trim()} onClick={() => void send()}>Reply</button> {msg && <span className="ok">{msg}</span>}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function DiscussionsView() {
+  const tasks = useKb((s) => s.tasks);
+  const conn = useKb((s) => s.conn);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [title, setTitle] = useState("");
+  const [context, setContext] = useState("");
+  const [msg, setMsg] = useState("");
+
+  const threads = tasks.filter((t) => t.meta?.kind === "question");
+  const open = openId ? threads.find((t) => t.id === openId) : null;
+
+  // reopen detection: if the WS refresh drops the task, fall back to the id
+  const [refreshTick, setRefreshTick] = useState(0);
+  useEffect(() => { setRefreshTick((x) => x + 1); }, [tasks.length]);
+
+  const ask = async () => {
+    if (!title.trim()) return;
     try {
-      await kbApi.transition(d.id, "concluded");
-      setOpen(null);
-      await load();
-    } catch (e) { setMsg(`failed: ${(e as Error).message}`); }
+      await kbApi.create({ type: "task", title: title.trim(), body_md: context.trim(), meta: { kind: "question" } });
+      setTitle(""); setContext("");
+      setMsg("asked");
+      setTimeout(() => setMsg(""), 1500);
+    } catch (e) {
+      setMsg(`failed: ${(e as Error).message}`);
+    }
   };
+
+  if (open || openId) {
+    const t = open ?? (openId ? { id: openId, title: "…", status: "…", type: "task", created_ts: 0, updated_ts: 0 } as KbArtefact : null);
+    if (t) {
+      return <Thread task={t} onBack={() => setOpenId(null)} />;
+    }
+  }
 
   return (
     <div className="disc-wrap">
       <div className="view-head">
         <h2>Discussions</h2>
-        <span className="muted-note">agents + humans — exploration becomes artefacts, conclusions become decisions</span>
+        <span className="muted-note">question tasks + responses — agents and humans in one thread</span>
+        <span className={`conn conn-${conn === "open" ? "open" : "closed"}`} title={`kb realtime: ${conn}`}>●</span>
       </div>
 
       <div className="card">
-        <h2>Start a discussion</h2>
-        <input value={title} placeholder="Should ingestion use batching?" onChange={(e) => setTitle(e.target.value)} />
-        <textarea rows={2} value={context} placeholder="Context — the problem, the trade-offs…" onChange={(e) => setContext(e.target.value)} />
-        <p><button className="opt-btn" disabled={!title.trim()} onClick={() => void start()}>Start</button> {msg && <span className="ok">{msg}</span>}</p>
+        <h2>Ask a question</h2>
+        <input value={title} placeholder="What should the dispatch backoff strategy be?" onChange={(e) => setTitle(e.target.value)} />
+        <textarea rows={2} value={context} placeholder="Context — the problem, constraints, what you considered…" onChange={(e) => setContext(e.target.value)} />
+        <p><button className="opt-btn" disabled={!title.trim()} onClick={() => void ask()}>Ask</button> {msg && <span className="ok">{msg}</span>}</p>
       </div>
 
-      <div className="disc-list">
-        {discussions.map((d) => (
-          <div key={d.id} className={`card disc ${d.status === "concluded" ? "disc-done" : ""}`}>
+      <div className="disc-list" key={refreshTick}>
+        {threads.map((t) => (
+          <div key={t.id} className="card disc" onClick={() => setOpenId(t.id)}>
             <div className="ask-chips">
-              <span className={`chip ${d.status === "open" ? "chip-needs" : "chip-done"}`}>{d.status.toUpperCase()}</span>
-              {d.board && <span className="chip chip-scope">{d.board.toUpperCase()}</span>}
-              <span className="why-line">updated {rel(d.updated_ts)} · {d.id}</span>
+              <span className={`chip ${t.status === "done" ? "chip-done" : "chip-needs"}`}>{t.status.toUpperCase()}</span>
+              {t.board && <span className="chip chip-scope">{t.board.toUpperCase()}</span>}
+              <span className="why-line">{t.owner ?? "—"} · opened {rel(t.created_ts)} · updated {rel(t.updated_ts)}</span>
             </div>
-            <h3 className="ask-question">{d.title}</h3>
-            {open?.id !== d.id && <p className="ask-reason">{(d.body_md ?? "").split("## Contributions")[0].replace(/#+/g, "").trim().slice(0, 140)}…</p>}
-            {open?.id === d.id && (
-              <>
-                <pre className="know-body">{d.body_md}</pre>
-                <textarea rows={2} value={contribution} placeholder="Your contribution — position, evidence, concern…" onChange={(e) => setContribution(e.target.value)} />
-                <div className="ask-actions">
-                  <button className="opt-btn" disabled={!contribution.trim()} onClick={() => void contribute(d)}>Contribute</button>
-                  <button className="opt-btn" onClick={() => void conclude(d)}>Conclude</button>
-                  <button className="opt-btn opt-ghost" onClick={() => setOpen(null)}>Close</button>
-                </div>
-              </>
-            )}
-            {open?.id !== d.id && (
-              <button className="opt-btn opt-ghost" onClick={() => setOpen(d)}>Open discussion →</button>
-            )}
+            <h3 className="ask-question">{t.title}</h3>
+            <p className="ask-reason">{(t.body_md ?? "").trim().slice(0, 140) || "—"}{(t.body_md ?? "").length > 140 ? "…" : ""}</p>
           </div>
         ))}
-        {discussions.length === 0 && <p className="empty">No discussions yet — questions worth keeping belong here, not in chat.</p>}
+        {threads.length === 0 && <p className="empty">No open question threads.</p>}
       </div>
     </div>
   );

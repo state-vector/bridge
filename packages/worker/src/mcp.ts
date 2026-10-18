@@ -196,14 +196,14 @@ async function seeAlso(a: any, rel: any, identity: Ctx["identity"], call: Ctx["c
   for (const x of (sem as any).artefacts ?? []) put(x, "similar", 1);
   for (const x of (kw as any).artefacts ?? []) put(x, "keyword", 1);
   const rows = [...byId.values()];
-  // priority: others' open work > discussions/research > everything else
+  // priority: others' open work > questions/goals > everything else
   for (const e of rows) {
     const otherClaimed = e.owner && e.owner !== identity.label;
     const otherPublished = !e.owner && e.created_by && e.created_by !== identity.label; // pooled todo: author attribution
     if (e.type === "task" && OPEN_STATUSES.has(e.status) && (otherClaimed || otherPublished)) {
       e.coordination = true;
       e._rank = -1;
-    } else if (e.type === "discussion" || e.type === "research" || e.type === "steering") {
+    } else if (e.type === "steering" || e.type === "goal") {
       e._rank = Math.min(e._rank, 2);
     }
   }
@@ -291,7 +291,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
                 ? `blocked (subprocess). watchdog paused until ${args.budget_minutes}m from now — after that it converts to abandoned. re-claim: log_progress on the task when the subprocess resolves.`
                 : "blocked. an open ask bound to this task pauses the watchdog; otherwise keep the heartbeat or declare grace."
               : args.to === "done"
-              ? "done. you are released from this task. outcome belongs in Knowledge — publish research/discussion artefacts for anything reusable."
+              ? "done. you are released from this task. outcome belongs in Knowledge — publish decision or knowledge artefacts for anything reusable."
               : args.to === "todo"
                 ? "released to the pool. the card is tagged 'attempted' — the next agent verifies state first. if this was a wrong claim (overlap, missing access), say why in the note."
                 : undefined,
@@ -374,7 +374,7 @@ const TOOLS = [
   },
   {
     name: "get_artefact",
-    description: "Read one artefact by id, with its relations. Returns see_also: related work, docs and discussions — including open tasks owned by OTHER agents (coordination flag) — so you discover overlap before building.",
+    description: "Read one artefact by id, with its relations. Returns see_also: related work, docs, and goals — including open tasks owned by OTHER agents (coordination flag) — so you discover overlap before building.",
     inputSchema: { type: "object", required: ["id"], properties: { id: { type: "string" } } },
   },
   {

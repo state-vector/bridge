@@ -7,7 +7,9 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "tauri build",
+    "dev:headless": "cargo build --manifest-path src-tauri/Cargo.toml && ./src-tauri/target/debug/bridge-desktop --headless",
+    "start:headless": "cargo build --release --manifest-path src-tauri/Cargo.toml && ./src-tauri/target/release/bridge-desktop --headless"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

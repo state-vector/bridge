@@ -120,7 +120,13 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       </div>
       <div className="task-row task-status-row">
         {prefs.status && task.status === "blocked" && task.meta?.blocked?.class === "subprocess" && !task.meta?.blocked?.reason?.startsWith("abandoned") ? (
-          <span className="st-chip st-amber" title="declared subprocess block — watchdog paused until the declared budget lapses">subprocess{task.meta.blocked.deadline_ts ? ` · until ${new Date(task.meta.blocked.deadline_ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</span>
+          <span
+            className="st-chip st-amber"
+            title={`declared subprocess block — watchdog paused until the declared budget lapses\n\n${task.meta.blocked.reason ?? ""}`}
+          >
+            subprocess · {task.meta.blocked.reason}
+            {task.meta.blocked.deadline_ts ? ` · until ${new Date(task.meta.blocked.deadline_ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+          </span>
         ) : prefs.status && (
           <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>
         )}

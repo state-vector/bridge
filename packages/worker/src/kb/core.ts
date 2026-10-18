@@ -10,10 +10,7 @@
 export const ARTEFACT_TYPES = [
   "steering",
   "goal",
-  "rfc",
   "decision",
-  "discussion",
-  "research",
   "task",
   "progress",
   "agent",
@@ -24,18 +21,26 @@ export function isArtefactType(t: unknown): t is ArtefactType {
   return typeof t === "string" && (ARTEFACT_TYPES as readonly string[]).includes(t);
 }
 
+/** Task kinds — one task type, distinguished by meta.kind. */
+export const TASK_KINDS = ["impl", "analysis", "review", "research", "question"] as const;
+export type TaskKind = (typeof TASK_KINDS)[number];
+
+/** A task's kind, defaulting to impl. Questions are the open, non-exclusive kind. */
+export function taskKind(meta: any): TaskKind {
+  const k = typeof meta?.kind === "string" ? meta.kind : undefined;
+  return (TASK_KINDS as readonly string[]).includes(k ?? "") ? (k as TaskKind) : "impl";
+}
+
+/** Open tasks anyone may contribute to; never claimed, never swept by the watchdog. */
+export function isQuestionTask(meta: any): boolean {
+  return taskKind(meta) === "question";
+}
+
 /** Allowed status transitions per type. Absent type/keys = no transitions. */
 export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   steering: { draft: ["active"], active: ["superseded"] },
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
-  rfc: {
-    draft: ["proposed"],
-    proposed: ["accepted", "rejected"],
-    accepted: ["implemented", "superseded"],
-  },
   decision: { proposed: ["accepted"], accepted: ["superseded"] },
-  discussion: { open: ["concluded"] },
-  research: { draft: ["published"] },
   task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
   progress: {},
   agent: {},
@@ -45,10 +50,7 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
 export const INITIAL_STATUS: Record<ArtefactType, string> = {
   steering: "draft",
   goal: "draft",
-  rfc: "draft",
   decision: "proposed",
-  discussion: "open",
-  research: "draft",
   task: "todo",
   progress: "logged",
   agent: "active",
@@ -93,8 +95,8 @@ export function validateRelation(
 ): { ok: true } | { ok: false; reason: string } {
   if (relation === "supersedes" && srcType !== dstType)
     return { ok: false, reason: "supersedes requires both artefacts to have the same type" };
-  if (relation === "implements" && !(srcType === "task" && (dstType === "rfc" || dstType === "goal")))
-    return { ok: false, reason: "implements: source must be a task, target an rfc or goal" };
+  if (relation === "implements" && !(srcType === "task" && dstType === "goal"))
+    return { ok: false, reason: "implements: source must be a task, target a goal" };
   if (relation === "constrains" && srcType !== "steering")
     return { ok: false, reason: "constrains: source must be steering" };
   if (relation === "child_of" && !(srcType === "task" && dstType === "task"))
@@ -243,7 +245,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (GH merge status, PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
-    `7. Findings belong in Knowledge (research / discussion), not session memory. Conclusions become decisions.`,
+    `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
@@ -309,14 +311,22 @@ export function sanitizeTags(raw: unknown): string[] | null {
 export function parseTags(raw: unknown): string[] {
   if (raw == null || raw === "") return [];
   let v: unknown = raw;
-  if (typeof v === "string") {
-    const s = (v as string).trim();
-    if (!s) return [];
-    try { v = JSON.parse(s); } catch { return [s]; }
-  }
-  if (typeof v === "string") return [v];
-  if (Array.isArray(v)) return v.map((x) => String(x)).filter(Boolean);
-  return [];
+  // unwrap nested encodings up to depth 3: clients have stored JSON-encoded
+  // strings of arrays as array elements (["\"[\\\"role:review\\\"]\""])
+  const unwrap = (x: unknown, depth: number): string[] => {
+    if (typeof x === "string") {
+      const s = (x as string).trim();
+      if (!s) return [];
+      if (s.startsWith("[") || s.startsWith('"')) {
+        try { return unwrap(JSON.parse(s), depth + 1); } catch { return [s]; }
+      }
+      if (s.includes(",")) return s.split(",").map((t) => t.trim()).filter(Boolean);
+      return [s];
+    }
+    if (Array.isArray(x)) return x.flatMap((e) => unwrap(e, depth + 1));
+    return [];
+  };
+  return unwrap(v, 0);
 }
 
 // ---------- limits ----------
