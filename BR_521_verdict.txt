@@ -1,0 +1,16 @@
+BR#521 verdict: bounced, not done.
+
+Receipts checked:
+- bridge_get_artefact BR#521
+- bridge_get_history BR#521
+- bridge_related_artefacts BR#521
+- bridge_asks (no relevant answer in inbox)
+- git status --short (clean)
+- gh pr list --state all --head bridge/BR-522 (no existing PR found)
+
+Finding:
+- The live artefact trail for BR#521 / BR#520 still lacks a resolvable implementation PR and merge-state receipt.
+- No product defect surfaced; this is a lifecycle/receipt gap only.
+
+Bridge verdict recorded:
+- BR#521 moved to blocked with the unblock condition: provide a concrete implementation PR plus merge-state evidence, then rerun verification with those receipts cited.
