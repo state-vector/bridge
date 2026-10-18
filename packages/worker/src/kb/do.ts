@@ -142,6 +142,33 @@ export class KnowledgeHub {
       this.audit("system:watchdog", "transition", r.id, { from: "blocked", to: "blocked", note: b.reason });
       this.version(r.id, "system:watchdog", "transition", b.reason, { from: "blocked", to: "blocked", note: b.reason });
     }
+    // (C) verification nudge: an unclaimed verify task parks its parent's owner —
+    // never reaped (you can't be "abandoned" from work you never picked up). Past
+    // the threshold, nudge once per hour: audit line (Log + ws broadcast) for the
+    // role:review agents and the waiting owner. The score signal does the rest.
+    const nudgeRows = this.state.storage.sql.exec(
+      `SELECT r.src_id AS verify_task, r.dst_id AS parent_id, c.updated_ts AS age_ts, p.owner AS parent_owner
+       FROM relations r
+       JOIN artefacts c ON c.id = r.src_id
+       JOIN artefacts p ON p.id = r.dst_id
+       WHERE r.relation = 'child_of'
+         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+         AND c.tags LIKE '%"role:review"%'
+         AND p.type = 'task' AND p.status = 'in_review'`,
+    ).toArray() as any[];
+    for (const v of nudgeRows) {
+      const age = now - (v.age_ts ?? now);
+      if (age <= 60 * 60_000) continue;
+      const lastNudge = this.one(
+        `SELECT ts FROM events WHERE artefact_id = ? AND op = 'nudge' ORDER BY ts DESC LIMIT 1`, v.verify_task,
+      );
+      if (lastNudge && now - Number(lastNudge.ts) <= 60 * 60_000) continue;
+      const mins = Math.round(age / 60_000);
+      this.audit("system:pool", "nudge", v.verify_task, {
+        note: `verify task unclaimed ${mins}m — this blocks ${v.parent_id}'s owner (${v.parent_owner || "unknown"}). Pick it up: check receipts, close or bounce the parent.`,
+        parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
+      });
+    }
     await this.state.storage.setAlarm(now + 60_000);
   }
 
@@ -283,6 +310,15 @@ export class KnowledgeHub {
         `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
          AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, windowTs,
       )?.n ?? 0;
+      // verification duty backlog: role:review agents carry the pool's stalled
+      // verify rounds — each one is an implementer parked in in_review.
+      if (tags.includes("role:review")) {
+        s.verify_duty_backlog = this.one(
+          `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id JOIN artefacts p ON p.id = r.dst_id
+           WHERE r.relation = 'child_of' AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+           AND c.tags LIKE '%"role:review"%' AND p.status = 'in_review'`,
+        )?.n ?? 0;
+      }
     }
     return [...signals.entries()]
       .filter(([label]) => !/^(system:|web$)/.test(label))
@@ -1407,7 +1443,7 @@ export class KnowledgeHub {
     const settings = this.settingsMap();
     const projectName = settings.project_name || "Superpositional";
     const myTasks = this.state.storage.sql.exec(
-      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','blocked') ORDER BY updated_ts DESC LIMIT 10`,
+      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','in_review','blocked') ORDER BY updated_ts DESC LIMIT 10`,
       label,
     ).toArray();
     // dispatch surface: unclaimed todo tasks this agent's roles may pick up.
@@ -1426,10 +1462,14 @@ export class KnowledgeHub {
       ).toArray() as any[]).map((r) => r.id),
     );
     const parentQualified = new Set<string>();
+    const verifyParents = new Map<string, any>();
     for (const l of this.state.storage.sql.exec(
-      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
+      `SELECT r.src_id, r.dst_id, p.status AS pstatus, p.title AS ptitle, p.owner AS powner
+       FROM relations r JOIN artefacts p ON p.id = r.dst_id
+       WHERE r.relation = 'child_of'`,
     ).toArray() as any[]) {
       if (qualIds.has(l.dst_id) || analysisEv.has(l.dst_id)) parentQualified.add(l.src_id);
+      if (l.pstatus === "in_review") verifyParents.set(l.src_id, l);
     }
     const unclaimedWork = pool.filter((t: any) => {
       const need = t.tags.filter((x: string) => x.startsWith("role:"));
@@ -1449,6 +1489,11 @@ export class KnowledgeHub {
       }
       if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
       return true;
+    }).sort((a: any, b: any) => {
+      // verification duty outranks everything: an unclaimed verify task parks an
+      // implementer in in_review. Questions next (additive, cheap). Then the rest.
+      const rank = (t: any) => (verifyParents.has(t.id) ? 0 : t.tags?.includes("question") ? 1 : 2);
+      return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
     }).slice(0, 10).map((t: any) => {
       // pool traits — the pattern: computed per row, never stored flags. Clients
       // speak domain language (is_question, is_claimable, previously_attempted),
@@ -1488,6 +1533,44 @@ export class KnowledgeHub {
     const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
     const staleMin = staleMinS ? Math.max(1, Math.min(120, parseInt(staleMinS.value, 10) || 10)) : 10;
     const actionRequired = this.reapAbandoned(label, staleMin);
+    // verification_stalled: an in_review parent's verify child is unclaimed — the
+    // parent's owner is parked waiting on a verdict that only pickup can produce.
+    // Tell the waiting owner (this is a pickup problem, not a review problem) and
+    // any role:review agent (pickup is their duty). 48h = stalled.
+    const stalledVerify = this.state.storage.sql.exec(
+      `SELECT r.src_id AS verify_task, r.dst_id AS parent_id, p.title AS parent_title, p.owner AS parent_owner, c.updated_ts AS age_ts
+       FROM relations r
+       JOIN artefacts c ON c.id = r.src_id
+       JOIN artefacts p ON p.id = r.dst_id
+       WHERE r.relation = 'child_of'
+         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+         AND c.tags LIKE '%"role:review"%'
+         AND p.type = 'task' AND p.status = 'in_review'
+         AND p.updated_ts < ?`,
+      [Date.now() - 48 * 60 * 60 * 1000],
+    ).toArray() as any[];
+
+    const reviewPending = stalledVerify.filter(v => v.parent_owner === label).map(v => ({
+      task_id: v.verify_task,
+      parent_id: v.parent_id,
+      parent_title: v.parent_title,
+      age_minutes: Math.ceil((Date.now() - v.age_ts) / 60000),
+      message: `Verification for '${v.parent_title}' (Task ${v.parent_id}) is stalled — verify task ${v.verify_task} unclaimed for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m.`,
+      required_action: "CLAIM_VERIFY_TASK",
+    }));
+
+    const reviewDuty = tags.includes('role:review')
+      ? stalledVerify.filter(v => v.parent_owner !== label).map(v => ({
+        task_id: v.verify_task,
+        parent_id: v.parent_id,
+        parent_title: v.parent_title,
+        age_minutes: Math.ceil((Date.now() - v.age_ts) / 60000),
+        message: `Stalled review: '${v.parent_title}' (Task ${v.parent_id}) has unclaimed verify task ${v.verify_task} for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m.`,
+        required_action: "PICKUP_REVIEW",
+      }))
+      : [];
+
+    const verificationNotices = [...reviewPending, ...reviewDuty];
     const my_score = this.agentScores().find((a) => a.label === label)
       ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
     return {
@@ -1503,7 +1586,9 @@ export class KnowledgeHub {
       unclaimed_work: unclaimedWork,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
-      action_required: actionRequired.length ? actionRequired : undefined,
+      action_required: actionRequired.length || verificationNotices.length
+        ? [...actionRequired, ...verificationNotices]
+        : undefined,
       my_score,
     };
   }

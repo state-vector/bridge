@@ -445,6 +445,8 @@ export interface AgentSignals {
   asks_answered_on_time: number;
   /** artefacts created with a real body (≥ 200 chars) */
   artefacts_created: number;
+  /** role:review agents only: unclaimed verify tasks blocking a parent's owner */
+  verify_duty_backlog: number;
 }
 
 export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
@@ -470,6 +472,13 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   score -= Math.min(10, s.thin_notes * 2);
   if (s.thin_notes > 2)
     hints.push(`${s.thin_notes} progress notes looked like padding — write what actually happened`);
+  // verification duty: unclaimed verify tasks park an implementer in in_review.
+  // role:review agents carry the pool's review duty — stalled verify rounds cost
+  // them score, the same shape as unanswered asks.
+  if (s.verify_duty_backlog > 0) {
+    score -= Math.min(20, s.verify_duty_backlog * 10);
+    hints.push(`${s.verify_duty_backlog} stalled verify task(s) are unclaimed and blocking their parent's owner — pick one up: check receipts, close or bounce the parent`);
+  }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
   const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
