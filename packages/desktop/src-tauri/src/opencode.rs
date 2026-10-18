@@ -1,8 +1,7 @@
 //! opencode subprocess runner — spawns headless opencode runs and captures output.
 //!
-//! Headless invocation: `opencode run --auto "<prompt>"` (optionally `--agent <name>`).
-//! `--auto` is essential for unattended runs — without it opencode stalls waiting
-//! for permission approvals.
+//! Headless invocation: `opencode run "<prompt>"` (optionally `--agent <name>`).
+//! `opencode run` is already non-interactive — there is no `--auto` flag.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -41,7 +40,6 @@ pub fn run_task(
 ) -> RunOutcome {
     let mut cmd = Command::new(bin);
     cmd.arg("run")
-        .arg("--auto")
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

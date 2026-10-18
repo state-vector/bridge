@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 /**
- * Local dispatch view (desktop shell only): shows the local runner's state —
+ * Dispatch view (desktop shell only): shows the local runner's state —
  * identity, in-flight opencode run, and dispatch activity — via Tauri IPC.
  * Hidden in plain browsers (invoke fails there).
  */
@@ -44,7 +44,7 @@ const KIND_CHIP: Record<string, string> = {
   info: "chip",
 };
 
-export function LocalView() {
+export function DispatchView() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [isTauri, setIsTauri] = useState(true);
   const [msg, setMsg] = useState("");
@@ -81,7 +81,7 @@ export function LocalView() {
   return (
     <div className="connect-wrap">
       <div className="view-head">
-        <h2>Local dispatch</h2>
+        <h2>Dispatch &amp; Agent Interactions</h2>
         <span className="muted-note">this machine's runner + opencode sessions</span>
       </div>
 

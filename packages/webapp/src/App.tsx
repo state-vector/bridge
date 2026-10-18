@@ -4,7 +4,7 @@ import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
 import { KnowledgeView } from "./components/KnowledgeView";
-import { LocalView } from "./components/LocalView";
+import { DispatchView } from "./components/DispatchView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { Panel } from "./components/Panel";
@@ -15,20 +15,19 @@ import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";
 
-type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox" | "local";
+type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox" | "dispatch";
 const TABS_ALL: Array<{ key: Tab; label: string }> = [
+  { key: "dispatch", label: "Dispatch" },
   { key: "top", label: "Top" },
-  { key: "board", label: "Board" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discuss" },
-  { key: "connect", label: "Connect" },
-  { key: "local", label: "Local" },
-  { key: "settings", label: "Settings" },
   { key: "inbox", label: "Decisions" },
 ];
-// the Local tab is desktop-shell-only (Tauri IPC); hidden in plain browsers
-const TABS = TABS_ALL.filter((t) => t.key !== "local" || "__TAURI_INTERNALS__" in window);
+const isTauri = "__TAURI_INTERNALS__" in window;
+// the dispatch tab is desktop-shell-only (Tauri IPC); hidden in plain browsers
+// desktop/mobile narrow shell: dispatch-focused — hide settings, board, connect (for now)
+const TABS = TABS_ALL.filter((t) => t.key !== "dispatch" || isTauri);
 
 const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
   void (async () => {
@@ -41,32 +40,74 @@ const tauriInvoke = (cmd: string, args?: Record<string, unknown>) => {
   })();
 }
 
+const openExternal = (url: string) => {
+  void (async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("plugin:opener|open_url", { url });
+    } catch {
+      window.open(url, "_blank", "noopener");
+    }
+  })();
+}
+
 function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   const conn = useBridge((s) => s.conn);
   const kbConn = useKb((s) => s.conn);
   const session = useBridge((s) => s.session);
   const signOut = useBridge((s) => s.signOut);
+  const url = useBridge((s) => s.url);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <header className="topbar">
+    <header className={`topbar ${isTauri ? "topbar-narrow" : ""}`}>
+      {isTauri && (
+        <button
+          className={`menu-btn ${menuOpen ? "open" : ""}`}
+          onClick={() => setMenuOpen((o) => !o)}
+          title="Menu"
+        >
+          ☰
+        </button>
+      )}
       <div className="brand">
         Bridge
         <span className={`conn conn-${conn}`} title={`hub: ${conn}`}>●</span>
         <span className={`conn conn-${kbConn === "open" ? "open" : "closed"}`} title={`kb realtime: ${kbConn}`}>●</span>
       </div>
-      <nav className="tabs">
-        {TABS.map((t) => (
-          <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => setTab(t.key)}>
-            {t.label}
-          </button>
-        ))}
-      </nav>
+      {!isTauri && (
+        <nav className="tabs">
+          {TABS.map((t) => (
+            <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => setTab(t.key)}>
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      )}
+      <div className="topbar-spacer" />
+      {isTauri && (
+        <button className="opt-btn hub-link" title={`open ${url} in your browser`} onClick={() => openExternal(url)}>
+          view hub in browser ↗
+        </button>
+      )}
       {session && (
         <div className="user-widget" title={session.expires_ts ? `session expires ${new Date(session.expires_ts).toLocaleString()}` : session.mode}>
           <span className="user-mode">{session.mode === "access" ? "SSO" : "GitHub"}</span>
           <span className="user-name">{session.user ?? "admin"}</span>
           <button className="opt-btn user-out" onClick={() => void signOut()}>Sign out</button>
         </div>
+      )}
+      {isTauri && menuOpen && (
+        <>
+          <div className="menu-backdrop" onClick={() => setMenuOpen(false)} />
+          <nav className="menu-drop">
+            {TABS.map((t) => (
+              <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => { setTab(t.key); setMenuOpen(false); }}>
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        </>
       )}
     </header>
   );
@@ -97,7 +138,7 @@ export default function App() {
   const resolve = useBridge((s) => s.resolve);
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
-  const [tab, setTab] = useState<Tab>("top");
+  const [tab, setTab] = useState<Tab>(isTauri ? "dispatch" : "top");
 
   useEffect(() => {
     connectHub({
@@ -158,7 +199,7 @@ export default function App() {
   if (conn === "auth") return <SignIn />;
 
   return (
-    <div className="app">
+    <div className={`app ${isTauri ? "narrow" : ""}`}>
       <TopBar tab={tab} setTab={setTab} />
       {conn === "closed" && (
         <div className="conn-banner">
@@ -175,7 +216,7 @@ export default function App() {
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
         {tab === "connect" && <ConnectView />}
-        {tab === "local" && <LocalView />}
+        {tab === "dispatch" && <DispatchView />}
         {tab === "settings" && <SettingsView />}
         {tab === "inbox" && <Panel />}
       </main>
