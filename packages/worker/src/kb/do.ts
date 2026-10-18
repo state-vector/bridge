@@ -43,6 +43,7 @@ import {
   isArtefactType,
   isRelation,
   isSentiment,
+  isQuestionTask,
   isWsSlug,
   isValidAskTarget,
   parseTags,
@@ -605,7 +606,7 @@ export class KnowledgeHub {
       id, type, title, status, bodyMd, JSON.stringify({ ...createMeta, session }), owner, ts, ts,
       tags ? JSON.stringify(tags) : null, ts, project, actor,
     );
-    if (!bodyMd.trim() && (type === "task" || type === "rfc" || type === "goal")) {
+    if (!bodyMd.trim() && (type === "task" || type === "goal")) {
       bodyMd = scaffoldBody(title, owner || actor);
     }
     this.audit(actor, "create", id, { type, title });
@@ -892,13 +893,38 @@ export class KnowledgeHub {
     try { return parseTags(row?.tags); } catch { return []; }
   }
 
+  /** Every rejected transition is audited (transition_rejected: actor, from, to,
+   *  reason) — gaming the gates is visible in the Log and costs behaviour score. */
   private async transition(body: any, actor: string) {
+    try {
+      return await this.doTransition(body, actor);
+    } catch (e) {
+      const id = String(body?.id ?? "");
+      const to = String(body?.to ?? "");
+      if (id) {
+        const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, id);
+        this.audit(actor, "transition_rejected", id, {
+          from: cur?.status, to, reason: String((e as Error)?.message ?? e).slice(0, 300),
+        });
+      }
+      throw e;
+    }
+  }
+
+  private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
     if (!verdict.ok) throw new Error(verdict.reason);
+    // decisions are human-authoritative: agents propose, a human accepts
+    // (consensus of human — the final say always lands with a person)
+    if (row.type === "decision" && to === "accepted" && !/^web$|^human:/.test(actor))
+      throw new Error(`decision ${id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`);
+    // human sign-off tasks (role:human) are completed by a human, not an agent
+    if (row.type === "task" && to === "done" && parseTags(row.tags).includes("role:human") && !/^web$|^human:/.test(actor))
+      throw new Error(`task ${id} is a human sign-off task (role:human) — completion is human-authoritative; a human marks it done in the webapp.`);
     // ---- swimlane gates: minimal, enforced state-machine barriers ----
     const tTags: string[] = parseTags(row.tags);
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
@@ -1095,23 +1121,44 @@ export class KnowledgeHub {
     // bounces it (in_progress with findings). The impl agent keeps the parent
     // claim and waits — in_review is the blocked-until-verdict state.
     let verifyTaskId: string | undefined;
-    if (row.type === "task" && to === "in_review") {
-      const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
-      const created = await this.create(
-        {
-          type: "task",
-          title: `Verify: ${row.title.slice(0, 200)}`,
-          body_md: `Verification duty for ${id} — "${row.title}".\n\nDouble-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
-          tags: ["role:review"],
-        },
-        actor,
-      );
-      verifyTaskId = created.id;
-      this.state.storage.sql.exec(
-        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-        verifyTaskId, id, ts,
-      );
-      this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+    if (row.type === "task" && to === "in_review" && !tTags.includes("role:review")) {
+      // recursion guard, enforced: reviews don't spawn verify-of-verify, and
+      // child_of chains are capped at 3. The verify round always names the
+      // ROOT task in its title — the chain lives in child_of, never "Verify: Verify: ...".
+      let guardHit: string | undefined;
+      let cursor = id, depth = 0;
+      while (depth < 10) {
+        const p = this.one(
+          `SELECT p.id AS id, p.tags AS tags FROM relations r JOIN artefacts p ON p.id = r.dst_id
+           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
+        );
+        if (!p) break;
+        depth++;
+        if (String(p.tags ?? "").includes("role:review")) { guardHit = `ancestor ${p.id} is a review task — verify-of-verify is blocked`; break; }
+        if (depth >= 3) { guardHit = `nesting depth ${depth} would exceed the child_of cap of 3`; break; }
+        cursor = p.id;
+      }
+      if (guardHit) {
+        this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: guardHit });
+      } else {
+        const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+        const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
+        const created = await this.create(
+          {
+            type: "task",
+            title: `Verify: ${rootTitle.slice(0, 200)}`,
+            body_md: `Verification duty for ${id} — "${rootTitle}".\n\nDouble-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+            tags: ["role:review"],
+          },
+          actor,
+        );
+        verifyTaskId = created.id;
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          verifyTaskId, id, ts,
+        );
+        this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+      }
     }
     // stale verification rounds: a bounce or a done closes out any open Verify
     // children of this task (the next in_review spawns a fresh one)
@@ -1141,6 +1188,22 @@ export class KnowledgeHub {
     if (!src || !dst) throw new Error("both src and dst must exist");
     const verdict = validateRelation(rel, src.type as ArtefactType, dst.type as ArtefactType);
     if (!verdict.ok) throw new Error(verdict.reason);
+    // nesting depth cap: child_of chains max 3 deep — references give structure,
+    // not unbounded trees (verify recursion taught us this the hard way)
+    if (rel === "child_of") {
+      let cursor = dstId, depth = 0, hit: string | undefined;
+      while (depth < 10) {
+        const p = this.one(
+          `SELECT p.id AS id FROM relations r JOIN artefacts p ON p.id = r.dst_id
+           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
+        );
+        if (!p) break;
+        depth++;
+        if (depth >= 3) { hit = `${dstId} is already 3 levels deep in a child_of chain — nesting is capped at 3 to keep the task graph flat`; break; }
+        cursor = p.id;
+      }
+      if (hit) throw new Error(`link rejected: ${hit}`);
+    }
     const count = this.one(
       `SELECT COUNT(*) AS n FROM relations WHERE src_id = ?`, srcId,
     ) as any;
@@ -1500,7 +1563,9 @@ export class KnowledgeHub {
       // and every claimability blocker here is enforced at the claim gate —
       // a trait that lies is worse than no trait. Extend both together.
       const m = JSON.parse(t.meta ?? "{}");
-      t.is_question = t.tags?.includes("question") ?? false;
+      // questions by kind (meta.kind = "question"), not by legacy tag — tags are
+      // roles, kind is the pickup model. Legacy-tagged rows still register.
+      t.is_question = isQuestionTask(m) || t.tags?.includes("question") || false;
       const gated = m.operator_gated;
       t.is_claimable = !t.is_question && !gated;
       if (!t.is_claimable) {
