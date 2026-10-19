@@ -162,6 +162,42 @@ export class KnowledgeHub {
         this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
       }
     }
+    // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
+    // verdict. If no verifier ever picks the verification round up, the park is
+    // permanent — the watchdog used to sweep only in_progress, so in_review
+    // rows accumulated indefinitely. Past the review-stale threshold with no
+    // verify child actively running, bounce: in_review → in_progress (findings
+    // note) → todo (released to the pool). The bounce supersedes the stale
+    // verify round automatically.
+    const rs = this.one(`SELECT value FROM settings WHERE key = 'review_stale_minutes'`);
+    const reviewStaleMin = rs ? Math.max(30, Math.min(2880, parseInt(rs.value, 10) || 360)) : 360;
+    const reviewRows = this.state.storage.sql.exec(
+      `SELECT id, owner, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status = 'in_review'`,
+    ).toArray();
+    for (const r of reviewRows as any[]) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        if (meta.awaiting_ask) continue;
+        const age = now - Math.max(r.status_ts ?? 0, r.updated_ts ?? 0);
+        if (age <= reviewStaleMin * 60_000) continue;
+        const openAsk = this.one(`SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id);
+        if (openAsk) continue;
+        const activeVerify = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'in_progress'
+             AND c.tags LIKE '%"role:review"%' LIMIT 1`, r.id,
+        );
+        if (activeVerify) continue; // a verifier is on it — give them time
+        const hours = Math.round(age / 3_600_000);
+        const findings = `watchdog: review stalled ${hours}h — no verifier picked up the verification round. No adverse findings; resolve whatever the last gate/review named and hand off again, or let the work re-enter the pool.`;
+        await this.transition({ id: r.id, to: "in_progress", note: findings }, "system:watchdog");
+        await this.transition({ id: r.id, to: "todo", note: "released to the pool after a stalled review round (watchdog)" }, "system:watchdog");
+      } catch (e) {
+        // one bad task must not kill the sweep — log and keep going
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
+    }
     // (B) subprocess blocks (legacy shape: blocked + meta.blocked.class) are gone —
     // subprocess silence now lives on in_progress tasks (A2 above). Nothing to sweep here.
     // (B) subprocess blocks: watchdog paused while the declared budget runs;
@@ -231,11 +267,15 @@ export class KnowledgeHub {
        AND COALESCE(json_extract(meta, '$.last_progress.ts'), 0) < ?`,
       now - staleMs,
     )?.n ?? 0;
+    const staleReviewNow = this.one(
+      `SELECT COUNT(*) AS n FROM artefacts WHERE type = 'task' AND status = 'in_review' AND status_ts < ?`,
+      now - reviewStaleMin * 60_000,
+    )?.n ?? 0;
     const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
     this.state.storage.sql.exec(
       `INSERT INTO settings (key, value) VALUES ('watchdog.sweep', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      JSON.stringify({ ts: now, stale_in_progress: staleNow, open_asks: openAsks }),
+      JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks }),
     );
     await this.state.storage.setAlarm(now + 60_000);
   }
@@ -1016,7 +1056,12 @@ export class KnowledgeHub {
         }
       }
     }
-    if (row.type === "task" && to === "done" && !isQualifier) {
+    // role:unblock tasks are exempt: their contract IS the verification pass
+    // (check the exit condition with receipts, record findings, close done).
+    // Demanding a review child of an unblock task deadlocked the pool — the
+    // unblock children could never close, which kept the parent's open-children
+    // gate shut forever (BR#584: 123 attempts).
+    if (row.type === "task" && to === "done" && !isQualifier && !tTags.includes("role:unblock")) {
       const r = this.qualifyCheck(row, "review");
       if (!r.ok)
         throw new Error(`task ${id} cannot be completed unreviewed — complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`);
@@ -1859,7 +1904,17 @@ export class KnowledgeHub {
        WHERE type = 'task' AND status = 'blocked' AND (owner = ? OR owner != '')`, label,
     ).toArray() as any[]) {
       const meta = JSON.parse(t.meta ?? "{}");
-      if (!(meta.blocked?.reason ?? "").startsWith("abandoned")) continue;
+      const reason = String(meta.blocked?.reason ?? "");
+      const isAbandoned = reason.startsWith("abandoned");
+      // Gate-rejection blocks (runner handoff rejected, churn guard) carry an
+      // unblock condition and an unblock child — they get a much longer fuse
+      // than abandonment. But if NOTHING moved for a full day the block is a
+      // dead end too: release the task back to the pool with the error history
+      // on the card (the BR#584-class 123-attempt rows were this).
+      const isStuckGate = reason.startsWith("runner:") || reason.startsWith("churn guard:");
+      if (!isAbandoned && !isStuckGate) continue;
+      const idleLimit = isAbandoned ? staleMs : 24 * 60 * 60_000;
+      const idleDesc = isAbandoned ? `silent >${staleMin}m after abandonment` : `no movement >24h after a gate-rejection block`;
       const mine = t.owner === label;
       const ownerLabel = t.owner || label;
       const wasDoing = mine && meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
@@ -1867,13 +1922,15 @@ export class KnowledgeHub {
         `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, ownerLabel,
       )?.ts ?? 0;
       const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
-      if (mine && idleFor < staleMs) {
-        out.push(
-          `${t.id} "${t.title}" is marked abandoned but you were active on it recently.${wasDoing} log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
-        );
+      if (mine && idleFor < idleLimit) {
+        if (isAbandoned) {
+          out.push(
+            `${t.id} "${t.title}" is marked abandoned but you were active on it recently.${wasDoing} log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
+          );
+        }
         continue;
       }
-      if (idleFor < staleMs) continue; // someone else's, still fresh-ish — leave it
+      if (idleFor < idleLimit) continue; // someone else's, still fresh-ish — leave it
       const tags: string[] = parseTags(t.tags);
       if (!tags.includes("attempted")) tags.push("attempted");
       const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
@@ -1884,11 +1941,11 @@ export class KnowledgeHub {
         JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
       );
       this.audit("system:reaper", "reassign", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-      this.version(t.id, "system:reaper", "transition", `reassigned — ${ownerLabel} silent >${staleMin}m after abandonment (attempt ${attempts})`, { prev_owner: ownerLabel });
+      this.version(t.id, "system:reaper", "transition", `reassigned — ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { prev_owner: ownerLabel });
       out.push(
         mine
-          ? `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`
-          : `${t.id} "${t.title}" was REASSIGNED: ${ownerLabel} went silent >${staleMin}m after the watchdog blocked it (attempt ${attempts}) — back to unclaimed todo for any agent to pick up.`,
+          ? `${t.id} "${t.title}" was REASSIGNED: you ${idleDesc}.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`
+          : `${t.id} "${t.title}" was REASSIGNED: ${ownerLabel} ${idleDesc} (attempt ${attempts}) — back to unclaimed todo for any agent to pick up.`,
       );
     }
     return out;

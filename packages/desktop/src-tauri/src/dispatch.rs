@@ -919,6 +919,10 @@ fn tick(
             if let Some(st) = &live_status {
                 if st != "in_progress" {
                     attempts.remove(&inf.task_id);
+                    // the task left the runner (agent blocked/bounced/closed it
+                    // mid-run) — drop the ephemeral state file too, not just on
+                    // handoff; a retained file made finished tasks look in-flight
+                    remove_task_state(&inf.task_id);
                     snap_activity(snap, "info", &format!("{} yielded — task now {}, session retained for resume", inf.task_id, st));
                     msgs.push(format!("{} yielded ({}) — released, worktree + session kept", inf.task_title, st));
                     continue;
