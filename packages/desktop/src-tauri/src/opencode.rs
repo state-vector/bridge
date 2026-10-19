@@ -14,6 +14,7 @@ pub struct RunOutcome {
     pub stderr_tail: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub session_id: Option<String>, // kiro: captured from stream-json for resume
 }
 
 fn tail(s: String, max: usize) -> String {
@@ -44,10 +45,34 @@ fn head_line(s: &str, max: usize) -> String {
 /// runner can rediscover it for resume; `resume` continues a prior session.
 /// `live` (when given) receives the agent's most recent output line — the
 /// runner heartbeats it to the bridge so the board shows mid-run activity.
+/// Agent backends the runner can drive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Backend {
+    OpenCode,
+    Kiro,
+}
+
+impl Backend {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|v| v.to_ascii_lowercase()) {
+            Some(ref v) if v == "kiro" => Backend::Kiro,
+            _ => Backend::OpenCode,
+        }
+    }
+}
+
+/// Run the agent headlessly against `workdir`. Blocks until exit or timeout.
+/// stdout/stderr are drained on reader threads so big sessions can't deadlock
+/// on full pipes. `title` tags the opencode session (`bridge-<task_id>`) so the
+/// runner can rediscover it for resume; `resume` continues a prior session.
+/// `live` (when given) receives the agent's most recent output line — the
+/// runner heartbeats it to the bridge so the board shows mid-run activity.
 pub fn run_task(
     workdir: &str,
     bin: &str,
+    backend: Backend,
     agent: Option<&str>,
+    model: Option<&str>,
     prompt: &str,
     timeout: Duration,
     title: Option<&str>,
@@ -68,27 +93,53 @@ pub fn run_task(
         .env_remove("XDG_STATE_HOME")
         .env_remove("OPENCODE_SERVER_USERNAME")
         .env_remove("OPENCODE_SERVER_PASSWORD");
-    if let Some(agent) = agent {
-        cmd.arg("--agent").arg(agent);
+    match backend {
+        Backend::OpenCode => {
+            cmd.arg("run");
+            // model override: unset delegates to opencode's own config (its
+            // `model` key). Explicit override matters for RESUMED sessions —
+            // opencode pins the session's original model, so a small model
+            // 400s the moment history exceeds its window.
+            if let Some(model) = model {
+                cmd.arg("--model").arg(model);
+            }
+            if let Some(agent) = agent {
+                cmd.arg("--agent").arg(agent);
+            }
+            if let Some(title) = title {
+                cmd.arg("--title").arg(title);
+            }
+            if let Some(session) = resume {
+                cmd.arg("--session").arg(session);
+            }
+            cmd.arg(prompt);
+        }
+        Backend::Kiro => {
+            cmd.arg("chat").arg("--no-interactive").arg("--trust-all-tools");
+            if let Some(model) = model {
+                cmd.arg("--model").arg(model);
+            }
+            if let Some(agent) = agent {
+                cmd.arg("--agent").arg(agent);
+            }
+            if let Some(session) = resume {
+                cmd.arg("--resume-id").arg(session);
+            }
+            cmd.arg(prompt);
+        }
     }
-    if let Some(title) = title {
-        cmd.arg("--title").arg(title);
-    }
-    if let Some(session) = resume {
-        cmd.arg("--session").arg(session);
-    }
-    cmd.arg(prompt);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[dispatch] opencode spawn failed: {e}");
+            eprintln!("[dispatch] agent spawn failed: {e}");
             return RunOutcome {
                 ok: false,
                 stdout_tail: String::new(),
                 stderr_tail: format!("spawn failed: {e}"),
                 exit_code: None,
                 timed_out: false,
+                session_id: None,
             };
         }
     };
@@ -175,8 +226,17 @@ pub fn run_task(
     let drain = |h: Option<std::thread::JoinHandle<String>>| {
         h.and_then(|h| h.join().ok()).unwrap_or_default()
     };
-    let stdout_tail = tail(drain(stdout), 4000);
+    let stdout_full = drain(stdout);
+    let stdout_tail = tail(stdout_full.clone(), 4000);
     let stderr_tail = tail(drain(stderr), 2000);
+
+    // kiro: capture the session id for later resume. With --no-interactive the
+    // id surfaces in the stream; scan for both common spellings.
+    let session_id = if backend == Backend::Kiro {
+        find_session_id(&stdout_full)
+    } else {
+        None
+    };
 
     RunOutcome {
         ok: status.map(|s| s.success()).unwrap_or(false) && !timed_out,
@@ -184,5 +244,24 @@ pub fn run_task(
         stderr_tail,
         exit_code: status.and_then(|s| s.code()),
         timed_out,
+        session_id,
     }
+}
+
+fn find_session_id(stdout: &str) -> Option<String> {
+    for key in ["\"session_id\"", "\"sessionId\""] {
+        if let Some(idx) = stdout.find(key) {
+            let rest = &stdout[idx + key.len()..];
+            if let Some(cstart) = rest.find('"') {
+                let after = &rest[cstart + 1..];
+                if let Some(cend) = after.find('"') {
+                    let id = &after[..cend];
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

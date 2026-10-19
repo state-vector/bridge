@@ -97,6 +97,8 @@ fn run(cfg: Option<DispatchConfig>) {
                     opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
                     label: None,
                     ws: None,
+                    model: std::env::var("BRIDGE_MODEL").ok(),
+                    backend: std::env::var("BRIDGE_BACKEND").ok(),
                     max_sessions: v.max(1),
                     isolate: !matches!(std::env::var("BRIDGE_ISOLATE").as_deref(), Ok("0") | Ok("false") | Ok("no")),
                 },

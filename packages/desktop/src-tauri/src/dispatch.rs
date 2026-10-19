@@ -23,6 +23,10 @@ pub struct DispatchConfig {
     pub workdir: String,
     #[serde(default)]
     pub agent: Option<String>, // opencode agent name (role prompt), optional
+    #[serde(default)]
+    pub model: Option<String>, // agent model override; unset = the agent CLI's own config decides
+    #[serde(default)]
+    pub backend: Option<String>, // "opencode" (default) | "kiro" — which agent CLI drives the tasks
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
     #[serde(default = "default_timeout_mins")]
@@ -72,6 +76,8 @@ impl DispatchConfig {
             token,
             workdir: std::env::var("BRIDGE_WORKDIR").unwrap_or_else(|_| default_workdir()),
             agent: std::env::var("BRIDGE_AGENT").ok(),
+            model: std::env::var("BRIDGE_MODEL").ok(),
+            backend: std::env::var("BRIDGE_BACKEND").ok(),
             poll_secs: std::env::var("BRIDGE_POLL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -218,6 +224,8 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     token,
                     workdir: default_workdir(),
                     agent: std::env::var("BRIDGE_AGENT").ok(),
+                    model: std::env::var("BRIDGE_MODEL").ok(),
+                    backend: std::env::var("BRIDGE_BACKEND").ok(),
                     poll_secs: default_poll_secs(),
                     timeout_mins: default_timeout_mins(),
                     opencode_bin: default_opencode_bin(),
@@ -596,6 +604,34 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
 }
 
+// ---- backend session registry (kiro) ----
+//
+// opencode sessions carry bridge-<task_id> titles so they're rediscoverable.
+// Kiro has no titles: the runner records task → session_id in a sidecar file
+// after each run and reads it back on resume.
+
+fn sessions_file() -> Option<PathBuf> {
+    Some(dispatch_dir()?.join("sessions.json"))
+}
+
+fn load_session_registry() -> HashMap<String, String> {
+    let Some(path) = sessions_file() else { return HashMap::new() };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_session_id(task_id: &str, session_id: &str) {
+    let Some(path) = sessions_file() else { return };
+    let mut reg = load_session_registry();
+    reg.insert(task_id.to_string(), session_id.to_string());
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&reg).unwrap_or_default(),
+    );
+}
+
 fn extract_pr(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
         // URLs are often wrapped in markdown ("[View PR](https://…/pull/1)")
@@ -630,6 +666,12 @@ fn spawn_opencode(
     resume_session: Option<String>,
     in_flight: &mut Vec<InFlight>,
 ) {
+    let backend = opencode::Backend::parse(cfg.backend.as_deref());
+    let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
+        load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
+    } else {
+        resume_session
+    };
     let resume = resume_session.is_some();
     let worktree = if cfg.isolate {
         ensure_worktree(&cfg.workdir, tid, resume)
@@ -680,16 +722,24 @@ fn spawn_opencode(
         let tid2 = tid.to_string();
         let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
         std::thread::spawn(move || {
+            let backend = opencode::Backend::parse(cfg2.backend.as_deref());
             let out = opencode::run_task(
                 &run_dir,
                 &cfg2.opencode_bin,
+                backend,
                 cfg2.agent.as_deref(),
+                cfg2.model.as_deref(),
                 &prompt,
                 Duration::from_secs(cfg2.timeout_mins * 60),
                 Some(&format!("bridge-{tid2}")),
                 resume_session.as_deref(),
                 Some(live_for_task),
             );
+            if backend == opencode::Backend::Kiro {
+                if let Some(sid) = &out.session_id {
+                    save_session_id(&tid2, sid);
+                }
+            }
             let _ = tx.send(out);
         });
         rx
@@ -769,7 +819,8 @@ fn tick(
                     exit_code: None,
                     timed_out: false,
                     stdout_tail: String::new(),
-                    stderr_tail: "opencode runner thread died (no outcome)".into(),
+                    stderr_tail: "runner thread died (no outcome)".into(),
+                    session_id: None,
                 },
             ));
             false
@@ -908,26 +959,28 @@ fn tick(
                 }
                 Err(e) => {
                     // gate rejected the handoff (e.g. receipts rejected, no PR).
-                    // The task must NOT park at 100% in_progress — rule 9: real
-                    // progress or let go. Release the claim to todo with the
-                    // findings; the next agent verifies state first and acts on
-                    // them (close properly, fix, or re-scope).
-                    let release_note = format!(
-                        "runner: handoff to {transition_to} rejected — {e}. Run completed (~{mins}m, exit 0); findings above. Released for fresh pickup — session + worktree retained.",
+                    // Do NOT release to todo: a release puts the task straight
+                    // back into the claim pool, and the next dispatch hits the
+                    // same gate — the 104-attempt churn loop. The gate's verdict
+                    // is information: block the task with the rejection as the
+                    // reason and the gate's own demand as the exit condition.
+                    let block_note = format!(
+                        "runner: handoff to {transition_to} rejected — {e}. Run completed (~{mins}m, exit 0); session + worktree retained.",
                     );
+                    let unblock = format!("satisfy the rejected gate, then re-claim: {}", truncate(&e, 220));
                     match mcp_call_task(
                         cfg,
                         id,
                         "transition",
-                        json!({ "id": inf.task_id, "to": "todo", "note": release_note }),
+                        json!({ "id": inf.task_id, "to": "blocked", "note": block_note, "unblock_condition": unblock }),
                         &inf.task_id,
                     ) {
                         Ok(_) => {
-                            snap_activity(snap, "info", &format!("{} released to todo after handoff rejection", inf.task_id));
-                            msgs.push(format!("{} → todo (handoff rejected: {}) — findings in note, pool pickup", inf.task_title, truncate(&e, 100)));
+                            snap_activity(snap, "info", &format!("{} blocked after handoff rejection", inf.task_id));
+                            msgs.push(format!("{} → blocked (handoff rejected: {}) — gate demand on the card", inf.task_title, truncate(&e, 100)));
                         }
                         Err(e2) => {
-                            msgs.push(format!("{} handoff AND release failed: {e2} — manual attention needed", inf.task_title));
+                            msgs.push(format!("{} handoff AND block failed: {e2} — manual attention needed", inf.task_title));
                         }
                     }
                     finished_no_pr.insert(inf.task_id.clone());

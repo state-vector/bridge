@@ -932,7 +932,7 @@ export class KnowledgeHub {
 
   private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
-    const to = String(body.to ?? "");
+    let to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
@@ -1060,16 +1060,35 @@ export class KnowledgeHub {
       const isSystem = /^system:/.test(actor);
       if (row.owner && row.owner !== actor && !isHuman && !isSystem)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
-      owner = "";
-      const tags: string[] = parseTags(row.tags);
-      if (!tags.includes("attempted")) tags.push("attempted");
-      this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
-      meta.attempt = {
-        by: actor, at: ts,
-        attempts: ((meta.attempt?.attempts as number) ?? 0) + 1,
-        last_reason: meta.blocked?.reason ?? (String(body.note ?? "").trim() || undefined),
-        last_will: meta.last_progress?.will,
-      };
+      const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
+      if (nextAttempts >= 5 && row.status !== "blocked") {
+        // churn guard: the pool has re-run this task N times and a gate keeps
+        // rejecting the completion. Re-releasing just loops claim → dispatch →
+        // reject → release forever (104-attempt rows taught us this), and each
+        // hop refreshes the timestamps so the watchdog never fires. Redirect
+        // the release into an honest block: the reason and exit are on the
+        // card, a human or a competent agent resolves it.
+        to = "blocked";
+        meta.blocked = {
+          reason: `churn guard: released to the pool ${nextAttempts} times without completing — the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)})`,
+          unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
+          ts,
+        };
+        meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
+        this.audit("system:churn-guard", "release_redirected", id, { attempts: nextAttempts, from: row.status });
+        this.version(id, "system:churn-guard", "transition", `release redirected to blocked — ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
+      } else {
+        owner = "";
+        const tags: string[] = parseTags(row.tags);
+        if (!tags.includes("attempted")) tags.push("attempted");
+        this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
+        meta.attempt = {
+          by: actor, at: ts,
+          attempts: nextAttempts,
+          last_reason: meta.blocked?.reason ?? (String(body.note ?? "").trim() || undefined),
+          last_will: meta.last_progress?.will,
+        };
+      }
     }
     // receipts: a review verdict must cite the artifact it verified — for PR
     // work that's the PR link; verification is a double-check, and the check
