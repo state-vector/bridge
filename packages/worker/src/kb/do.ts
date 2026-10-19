@@ -1058,6 +1058,17 @@ export class KnowledgeHub {
     if (!row) throw new Error(`no such artefact: ${id}`);
     const verdict = validateTransition(row.type as ArtefactType, row.status, to);
     if (!verdict.ok) throw new Error(verdict.reason);
+    // verify and unblock tasks are TERMINAL-AT-BIRTH: they check a thing and
+    // close. They cannot enter in_review — a verify task demanding its own
+    // verification is the verify-of-verify recursion by another door. The
+    // only exits from in_progress are done (with receipts).
+    if (row.type === "task" && to === "in_review") {
+      const rTags = parseTags(row.tags);
+      if (rTags.includes("role:review"))
+        throw new Error(`${id} is a verify task — verification is its own terminal state. Verify tasks close directly via done with receipts; they are never reviewed again.`);
+      if (rTags.includes("role:unblock"))
+        throw new Error(`${id} is an unblock task — unblock tasks close directly via done with their verdict; they are never reviewed.`);
+    }
     // decisions are human-authoritative: agents propose, a human accepts
     // (consensus of human — the final say always lands with a person)
     if (row.type === "decision" && to === "accepted" && !/^web$|^human:/.test(actor))
@@ -1425,6 +1436,17 @@ export class KnowledgeHub {
     if (!src || !dst) throw new Error("both src and dst must exist");
     const verdict = validateRelation(rel, src.type as ArtefactType, dst.type as ArtefactType);
     if (!verdict.ok) throw new Error(verdict.reason);
+    // verify-of-verify is structurally impossible: a verify task can never be
+    // a child of a verify task (or of an unblock task — same ephemerality).
+    // Enforced here at the relation level, not just the auto-spawn path.
+    if (rel === "child_of") {
+      const childTags = parseTags(src.tags);
+      const parentTags = parseTags(dst.tags);
+      if (childTags.includes("role:review") && (parentTags.includes("role:review") || parentTags.includes("role:unblock")))
+        throw new Error(`link rejected: ${srcId} is a verify task — verify tasks are terminal-at-birth and cannot nest under ${parentTags.includes("role:review") ? "another verify" : "an unblock"} task`);
+      if (childTags.includes("role:unblock") && (parentTags.includes("role:unblock") || parentTags.includes("role:review")))
+        throw new Error(`link rejected: ${srcId} is an unblock task — unblock tasks are terminal-at-birth and cannot nest under another ephemeral task`);
+    }
     // nesting depth cap: child_of chains max 3 deep — references give structure,
     // not unbounded trees (verify recursion taught us this the hard way)
     if (rel === "child_of") {
