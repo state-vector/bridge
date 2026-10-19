@@ -90,13 +90,16 @@ export class KnowledgeHub {
   // Watchdog: silence on in_progress means the agent is gone — unless the
   // silence was DECLARED (grace window, subprocess block). Block it as
   // abandoned; the same agent re-claims it by logging progress again.
-  /** Alarm entry point — fail-soft. A throwing alarm() loses its schedule
-   *  (the runtime consumes it), and while fetch() re-arms a null alarm on the
-   *  next request, each attempt dies at the same line: the sweep never runs
-   *  and watchdog.last_tick stays zero (the Oct-19 dead-watchdog incident:
-   *  12-24h stale in_progress rows, zero sweep events). So: re-arm FIRST,
-   *  then run the body inside a catch-all. A sweep that dies halfway is
-   *  logged and retried next tick; the alarm itself can never go silent. */
+  /** Alarm entry point — fail-soft AND self-healing. Two failure modes here:
+   *  (1) a throwing alarm() loses its schedule (the runtime consumes it);
+   *  (2) a POISONED schedule: next_alarm_ts stuck in the past — the runtime
+   *  keeps "firing" it, but if the handler throws before re-arming (old class
+   *  version, quota error, whatever), the alarm never moves forward and the
+   *  sweep never runs (the Oct-19 dead-watchdog incident: next_alarm_ts stuck
+   *  15h in the past, last_tick zero, 12-24h stale rows). So: re-arm FIRST to
+   *  now+60s unconditionally (this jumps past any poisoned timestamp), then
+   *  run the sweep inside a catch-all that logs. The alarm can never go
+   *  silent, and can never stay stuck in the past. */
   async alarm() {
     await this.state.storage.setAlarm(Date.now() + 60_000);
     try {
@@ -274,11 +277,19 @@ export class KnowledgeHub {
       });
     }
     // observability: the board can answer "is the watchdog alive?" via
-    // /api/kb/stats — last tick, stale in-flight count, open asks.
+    // /api/kb/stats — last tick, next alarm ts (poison detection: a
+    // next_alarm_ts stuck in the past means the schedule is jammed), stale
+    // in-flight count, open asks.
+    const nextAlarm = await this.state.storage.getAlarm();
     this.state.storage.sql.exec(
       `INSERT INTO settings (key, value) VALUES ('watchdog.last_tick', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       String(now),
+    );
+    this.state.storage.sql.exec(
+      `INSERT INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      String(nextAlarm ?? 0),
     );
     const staleNow = this.one(
       `SELECT COUNT(*) AS n FROM artefacts WHERE type = 'task' AND status = 'in_progress'
@@ -604,7 +615,12 @@ export class KnowledgeHub {
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureSchema();
-    if ((await this.state.storage.getAlarm()) === null) {
+    // alarm health: null = not scheduled; a timestamp far in the PAST = a stale
+    // alarm the runtime dropped without invoking (observed live: getAlarm stuck
+    // 42h in the past, so this arm-guard never re-armed and the watchdog went
+    // silent for a day). Either way, arm a fresh tick.
+    const alarmAt = await this.state.storage.getAlarm();
+    if (alarmAt === null || alarmAt < Date.now()) {
       await this.state.storage.setAlarm(Date.now() + 15_000);
     }
     const url = new URL(request.url);
@@ -1457,8 +1473,13 @@ export class KnowledgeHub {
     const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
     let watchdog: Record<string, unknown> | undefined;
     try {
+      const recent = this.state.storage.sql.exec(
+        `SELECT op, ts FROM events WHERE artefact_id = 'watchdog' ORDER BY seq DESC LIMIT 3`,
+      ).toArray() as any[];
       watchdog = {
         last_tick: tick ? Number(tick.value) : 0,
+        next_alarm_ts: await this.state.storage.getAlarm(),
+        recent_events: recent.map((e) => ({ op: e.op, age_min: Math.round((Date.now() - Number(e.ts)) / 60000) })),
         open_asks: openAsks,
         ...(sweep ? JSON.parse(sweep.value) : {}),
       };
