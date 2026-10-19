@@ -1722,6 +1722,23 @@ export class KnowledgeHub {
       : [];
 
     const verificationNotices = [...reviewPending, ...reviewDuty];
+    // gauge debt: owned work in flight whose last log carries no gauges. The
+    // board's gauges drive prioritisation and attention scoring — an agent that
+    // stops reporting them goes blind on the board. Surface the debt at every
+    // orient so the behaviour is corrected while the task is live, not after.
+    const gaugeDebt = (this.state.storage.sql.exec(
+      `SELECT id, title, meta FROM artefacts
+       WHERE type = 'task' AND owner = ? AND status IN ('in_progress','blocked')
+       AND (json_extract(meta, '$.last_progress.completion_pct') IS NULL
+            AND json_extract(meta, '$.last_progress.confidence_pct') IS NULL
+            AND json_extract(meta, '$.last_progress.risk_pct') IS NULL
+            AND json_extract(meta, '$.last_progress.context_pct') IS NULL)
+       ORDER BY updated_ts DESC LIMIT 10`,
+      label,
+    ).toArray() as any[]).map((t) => ({ id: t.id, title: t.title }));
+    const gaugeDebtNote = gaugeDebt.length
+      ? `\n\nGAUGE DEBT — these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) — the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.`
+      : "";
     const my_score = this.agentScores().find((a) => a.label === label)
       ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
     return {
@@ -1729,7 +1746,8 @@ export class KnowledgeHub {
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
         + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : "")
         + (kindPlaybook ? `\n\nYOUR KIND: ${isCron ? "cron" : "interactive"}\n${kindPlaybook}` : "")
-        + playbooks.map((p) => `\n\nYOUR ROLE: ${p.role}\n${p.playbook}`).join(""),
+        + playbooks.map((p) => `\n\nYOUR ROLE: ${p.role}\n${p.playbook}`).join("")
+        + gaugeDebtNote,
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,
@@ -1740,6 +1758,7 @@ export class KnowledgeHub {
       action_required: actionRequired.length || verificationNotices.length
         ? [...actionRequired, ...verificationNotices]
         : undefined,
+      gauge_debt: gaugeDebt.length ? gaugeDebt : undefined,
       my_score,
     };
   }

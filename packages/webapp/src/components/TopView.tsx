@@ -69,6 +69,7 @@ interface TopRow {
   completion?: number;
   confidence?: number;
   risk?: number;
+  context?: number;
   sentiment?: string;
   will?: string;
   unblock?: string;
@@ -125,6 +126,7 @@ export function TopView() {
         completion: p?.completion_pct,
         confidence: p?.confidence_pct,
         risk: p?.risk_pct,
+        context: p?.context_pct,
         sentiment: p?.sentiment,
         will: p?.will,
         unblock: unblock?.slice(0, 140),
@@ -180,14 +182,15 @@ export function TopView() {
       <div className="top-head">
         <span className="topc-agent">agent</span>
         <span className="topc-session">session</span>
-        <span className="topc-goal">goal</span>
+        <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
         <span className="topc-score" title="behaviour compliance score, 7-day window">score</span>
         <span className="topc-gauge" title="confidence % — higher is better">conf</span>
         <span className="topc-gauge" title="risk % — lower is better">risk</span>
+        <span className="topc-gauge" title="context % — how full the agent's window is">ctx</span>
         <span className="topc-bar" title="completion % — shown in the bar">completion</span>
-        <span className="topc-age" title="time in current column">col age</span>
-        <span className="topc-age" title="time since last signal from this agent">last seen</span>
+        <span className="topc-age" title="time in the current status">in col</span>
+        <span className="topc-age" title="time since the agent's last signal on this task">last signal</span>
       </div>
 
       {treeRows.map(({ row: r, depth }) => (
@@ -205,19 +208,19 @@ export function TopView() {
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
             {depth > 0 && <span className="tree-branch" title={`child of ${r.partOf ?? "parent"}`}>└─ </span>}
+            <span className={`chip chip-kind kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.goal ?? "—"}
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
             {r.status === "in_progress" && (
-              <span className="st-chip st-live" title={r.subprocess ? "in progress — declared subprocess silence (watchdog paused)" : "in progress — agent active"}>
-                in progress{r.subprocess ? " · subprocess" : ""}
+              <span className="st-chip st-live" title="in progress — the last log line says what it is running">
+                in progress
               </span>
             )}
             {r.status && r.status !== "in_progress" && (
               <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>
             )}
-            <span className={`chip chip-kind kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`agent mood: ${r.sentiment.replace("_", " ")}`} />}
             {r.sentiment && <span className={`chip ${SENTIMENT_CHIP[r.sentiment] ?? ""} top-sent`}>{r.sentiment.replace("_", " ")}</span>}
           </span>
@@ -230,6 +233,7 @@ export function TopView() {
           </span>
           <span className={`topc-gauge top-num ${pctTone(r.confidence, true)}`}>{r.confidence != null ? `${r.confidence}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
+          <span className={`topc-gauge top-num ${pctTone(r.context, false)}`} title="context % — how full the agent's window is; high values mean it should hand off soon">{r.context != null ? `${r.context}%` : "—"}</span>
           <span className="topc-bar">
             {r.status === "blocked" && (r.unblock || r.askPending) ? (
               <span
