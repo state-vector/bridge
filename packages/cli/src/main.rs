@@ -99,6 +99,9 @@ fn run(cfg: Option<DispatchConfig>) {
                     ws: None,
                     model: std::env::var("BRIDGE_MODEL").ok(),
                     backend: std::env::var("BRIDGE_BACKEND").ok(),
+                    backends: std::env::var("BRIDGE_BACKENDS")
+                        .ok()
+                        .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>()),
                     max_sessions: v.max(1),
                     isolate: !matches!(std::env::var("BRIDGE_ISOLATE").as_deref(), Ok("0") | Ok("false") | Ok("no")),
                 },

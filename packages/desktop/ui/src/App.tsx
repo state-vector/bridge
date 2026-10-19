@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-/** Bridge gateway UI. Two pages:
- *  Main — runner status, live dispatch log, link to the full web UI.
- *  Settings — hub, agents (backend + profile + model), concurrency.
+/** Bridge gateway UI. Three pages:
+ *  Main — mini-Top: the local work in flight right now.
+ *  Log — the full dispatch log stream.
+ *  Settings — hub, agents (multi-select backends + profile + model), concurrency.
  *  Settings apply by restarting the dispatch loop with the merged config. */
 
 interface Activity {
@@ -43,6 +44,7 @@ interface Cfg {
   isolate: boolean;
   model: string | null;
   backend: string | null;
+  backends?: string[] | null;
 }
 
 const KIND_CLASS: Record<string, string> = {
@@ -52,12 +54,23 @@ const KIND_CLASS: Record<string, string> = {
   info: "gw-kind-info",
 };
 
+const BACKENDS = ["opencode", "kiro"];
+
 function ts(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+function age(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 export function App() {
-  const [page, setPage] = useState<"main" | "settings">("main");
+  const [page, setPage] = useState<"main" | "log" | "settings">("main");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -65,7 +78,7 @@ export function App() {
   // settings state
   const [cfg, setCfg] = useState<Cfg | null>(null);
   const [maxSessions, setMaxSessions] = useState(1);
-  const [backend, setBackend] = useState("opencode");
+  const [backends, setBackends] = useState<string[]>(["opencode"]);
   const [agent, setAgent] = useState("");
   const [model, setModel] = useState("");
   const [hubUrl, setHubUrl] = useState("");
@@ -86,7 +99,7 @@ export function App() {
       if (c) {
         setCfg(c);
         setMaxSessions(c.max_sessions);
-        setBackend(c.backend ?? "opencode");
+        setBackends(c.backends?.length ? c.backends : c.backend ? [c.backend] : ["opencode"]);
         setAgent(c.agent ?? "");
         setModel(c.model ?? "");
         setHubUrl(c.url);
@@ -119,16 +132,25 @@ export function App() {
     if (snap?.url) window.open(snap.url, "_blank");
   };
 
+  const toggleBackend = (b: string) => {
+    setBackends((cur) => {
+      if (cur.includes(b)) return cur.length > 1 ? cur.filter((x) => x !== b) : cur;
+      return [...BACKENDS.filter((x) => cur.includes(x) || x === b)];
+    });
+  };
+
   const applySettings = async () => {
     if (!cfg) {
       setApplyMsg("no config yet — start once (pairs via BRIDGE_URL), then edit");
       return;
     }
+    const ordered = BACKENDS.filter((b) => backends.includes(b));
     const next: Cfg = {
       ...cfg,
       url: hubUrl.trim().replace(/\/$/, "") || cfg.url,
       max_sessions: Math.max(1, maxSessions),
-      backend: backend || null,
+      backend: ordered[0] ?? null,
+      backends: ordered,
       agent: agent.trim() || null,
       model: model.trim() || null,
     };
@@ -146,7 +168,9 @@ export function App() {
     }
   };
 
+  const inFlight = snap?.in_flight ?? [];
   const activity = snap?.activity ?? [];
+  const now = Date.now();
 
   return (
     <div className="gw">
@@ -154,6 +178,7 @@ export function App() {
         <span className="gw-brand">bridge<span className="cursor" /></span>
         <nav className="gw-nav">
           <button className={page === "main" ? "active" : ""} onClick={() => setPage("main")}>Main</button>
+          <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
         </nav>
         <span className="gw-user">{snap?.label ?? ""}</span>
@@ -170,28 +195,49 @@ export function App() {
                 ? <button className="gw-btn gw-btn-stop" onClick={() => void toggleRun()}>Stop</button>
                 : <button className="gw-btn gw-btn-run" onClick={() => void toggleRun()}>Start</button>}
               <span className="gw-note">
-                {snap?.max_sessions ?? 1} concurrent{snap?.workdir ? ` · ${snap.workdir}` : ""}
+                {inFlight.length}/{snap?.max_sessions ?? 1} in flight
               </span>
               {msg && <span className="gw-err">{msg}</span>}
               <a className="gw-link" style={{ marginLeft: "auto" }} href="#" onClick={(e) => { e.preventDefault(); openWeb(); }}>
                 open full board ↗
               </a>
             </div>
-            {(snap?.in_flight.length ?? 0) > 0 && (
-              <div className="gw-inflight">
-                {snap!.in_flight.map((f) => (
-                  <div key={f.task_id} className="gw-agent">
-                    <span className="gw-agent-name">{f.task_id}</span>
-                    <span className="gw-fnote">{f.last_note || "working"}</span>
+          </div>
+
+          <div className="gw-card">
+            <h2>Local work</h2>
+            <div className="gw-inflight">
+              {inFlight.map((f) => (
+                <div key={f.task_id} className="gw-agent">
+                  <span className={`conn conn-open`} title="in flight">●</span>
+                  <span className="gw-agent-name gw-mono">{f.task_id}</span>
+                  <span className="gw-fnote" title={f.task_title}>{f.task_title}</span>
+                  <span className="gw-fmeta">{age(now - f.started_ms)}</span>
+                </div>
+              ))}
+              {inFlight.length === 0 && (
+                <span className="gw-log-empty">nothing in flight — idle</span>
+              )}
+            </div>
+            {inFlight.some((f) => f.last_note) && (
+              <div className="gw-notes">
+                {inFlight.filter((f) => f.last_note).map((f) => (
+                  <div key={f.task_id} className="gw-line">
+                    <span className="gw-ts">{f.task_id}</span>
+                    <span className="gw-kind-info">{f.last_note}</span>
                   </div>
                 ))}
               </div>
             )}
           </div>
+        </main>
+      )}
 
+      {page === "log" && (
+        <main className="gw-main">
           <div className="gw-card">
             <h2>Dispatch log</h2>
-            <div className="gw-log" ref={logRef}>
+            <div className="gw-log gw-log-tall" ref={logRef}>
               {activity.length === 0 && <span className="gw-log-empty">no activity yet — start the runner</span>}
               {activity.map((a, i) => (
                 <div key={`${a.ts}-${i}`} className="gw-line">
@@ -199,15 +245,6 @@ export function App() {
                   <span className={KIND_CLASS[a.kind] ?? "gw-kind-info"}>{a.msg}</span>
                 </div>
               ))}
-            </div>
-          </div>
-
-          <div className="gw-card">
-            <div className="gw-row">
-              <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openWeb(); }}>
-                board · knowledge · discussions in the browser ↗
-              </a>
-              {snap?.url && <span className="gw-note">{snap.url}</span>}
             </div>
           </div>
         </main>
@@ -226,19 +263,19 @@ export function App() {
           </div>
 
           <div className="gw-card">
-            <h2>Agents</h2>
+            <h2>Agent types</h2>
             <div className="gw-row">
-              {["opencode", "kiro"].map((b) => (
-                <button key={b} className={`gw-btn ${backend === b ? "gw-btn-on" : ""}`} onClick={() => setBackend(b)}>
-                  {b}
+              {BACKENDS.map((b) => (
+                <button key={b} className={`gw-btn ${backends.includes(b) ? "gw-btn-on" : ""}`} onClick={() => toggleBackend(b)}>
+                  {backends.includes(b) ? "✓ " : ""}{b}
                 </button>
               ))}
-              <span className="gw-note">which agent CLI drives the tasks</span>
             </div>
+            <span className="gw-note">tasks rotate across the enabled agent CLIs</span>
             <div className="gw-row">
               <input className="gw-input" style={{ flex: 1 }} value={agent} placeholder="agent profile name (optional)"
                 onChange={(e) => setAgent(e.target.value)} />
-              <input className="gw-input" style={{ flex: 1 }} value={model} placeholder="model override (optional)"
+              <input className="gw-input" style={{ flex: 1 }} value={model} placeholder="model override — empty = the CLI's own default"
                 onChange={(e) => setModel(e.target.value)} />
             </div>
           </div>

@@ -41,6 +41,8 @@ pub struct DispatchConfig {
     pub max_sessions: usize, // WIP limit for this node
     #[serde(default = "default_isolate")]
     pub isolate: bool, // per-task git worktrees + PR branch
+    #[serde(default)]
+    pub backends: Option<Vec<String>>, // multiple agent types; rotate per dispatch
 }
 
 fn default_max_sessions() -> usize {
@@ -96,6 +98,9 @@ impl DispatchConfig {
                 std::env::var("BRIDGE_ISOLATE").as_deref(),
                 Ok("0") | Ok("false") | Ok("no")
             ),
+            backends: std::env::var("BRIDGE_BACKENDS")
+                .ok()
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
             label: None,
             ws: None,
         })
@@ -233,6 +238,7 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     ws: Some(ws),
                     max_sessions: default_max_sessions(),
                     isolate: default_isolate(),
+                    backends: None,
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
@@ -548,6 +554,21 @@ impl DispatchState {
 /// One dispatch tick. Returns Ok(Some(msg)) on notable actions.
 // ---- per-task worktrees + spawning ----
 
+/// Multiple agent types: rotate across cfg.backends (config order); fall back
+/// to the single `backend` field. Round-robin spreads local work across the
+/// enabled CLIs instead of stacking every task on one.
+fn pick_backend(cfg: &DispatchConfig) -> opencode::Backend {
+    static RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let list: Vec<String> = cfg
+        .backends
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg.backend.clone().map(|b| vec![b]))
+        .unwrap_or_else(|| vec!["opencode".into()]);
+    let i = RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % list.len();
+    opencode::Backend::parse(Some(list[i].as_str()))
+}
+
 fn slugify(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
@@ -666,7 +687,7 @@ fn spawn_opencode(
     resume_session: Option<String>,
     in_flight: &mut Vec<InFlight>,
 ) {
-    let backend = opencode::Backend::parse(cfg.backend.as_deref());
+    let backend = pick_backend(cfg);
     let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
