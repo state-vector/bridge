@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { kbApi } from "../lib/kb";
-import type { KbArtefact, KbProgress, KbVersion } from "../lib/kb";
-import { rel } from "../lib/views";
+import type { KbArtefact, KbVersion } from "../lib/kb";
+import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 
 export const SENTIMENT_CHIP: Record<string, string> = {
   going_well: "chip-done",
@@ -9,6 +9,22 @@ export const SENTIMENT_CHIP: Record<string, string> = {
   struggling: "chip-diag",
   converging: "chip-kind kind-agent",
   diverging: "chip-urgent",
+};
+
+/** Unified history: one log holds progress notes AND state changes, typed. */
+export const HISTORY_CHIP: Record<string, string> = {
+  progress: "chip-kind kind-agent",
+  transition: "chip-kind kind-human",
+  create: "chip-done",
+  update: "chip-kind kind-system",
+  reassign: "chip-urgent",
+};
+export const HISTORY_LABEL: Record<string, string> = {
+  progress: "log",
+  transition: "state",
+  create: "created",
+  update: "edited",
+  reassign: "reaped",
 };
 
 export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
@@ -50,8 +66,11 @@ interface TaskMeta {
   last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number };
 }
 
-export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; openBlocked?: boolean; onClose: () => void }) {
+export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
+  taskId: string; openBlocked?: boolean; onClose: () => void; onOpen?: (id: string) => void;
+}) {
   const [task, setTask] = useState<(KbArtefact & { meta?: TaskMeta; status_ts?: number }) | null>(null);
+  const [relations, setRelations] = useState<Array<{ relation: string; artefact_id: string; dir: string }>>([]);
   const [related, setRelated] = useState<KbArtefact[]>([]);
   const [note, setNote] = useState("");
   const [sentiment, setSentiment] = useState("neutral");
@@ -66,7 +85,6 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
   const [risk, setRisk] = useState("");
   const [versions, setVersions] = useState<KbVersion[]>([]);
 
-  const progress = useKbStateProgress(taskId);
   const transition = useKb((s) => s.transition);
 
   useEffect(() => {
@@ -77,6 +95,7 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
         if (on) {
           setTask(a as KbArtefact & { meta?: TaskMeta });
           setBody(a.body_md ?? "");
+          setRelations(((a as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
         }
       } catch { /* stale */ }
       try {
@@ -92,6 +111,11 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
   }, [taskId]);
 
   const clampPct = (v: string) => (v === "" ? undefined : Math.max(0, Math.min(100, Math.round(Number(v)))));
+  // navigate to another task inside the same panel (task refs / dep graph)
+  const nav = (id: string) => {
+    if (!onOpen) return;
+    onOpen(id);
+  };
   const logProgress = async () => {
     if (!note.trim()) return;
     try {
@@ -117,12 +141,13 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
         <header className="detail-head">
           <div className="ask-chips">
             <span className="chip chip-scope">{task?.type ?? "task"}</span>
+            <span className={`chip chip-kind kind-pill kp-${kindOf((task ?? {}) as any)}`}>{kindOf((task ?? {}) as any)}</span>
             <span className="chip">{task?.status ?? "…"}</span>
           </div>
           <button className="icon-btn" onClick={onClose}>✕</button>
         </header>
 
-        <h2 className="detail-question">{task?.title ?? taskId}</h2>
+        <h2 className="detail-question"><RefText text={task?.title ?? taskId} onOpen={nav} /></h2>
         {task?.meta?.last_progress && (
           <p className="task-progress-line">
             <span className={`chip ${SENTIMENT_CHIP[task.meta.last_progress.sentiment ?? ""] ?? ""}`}>
@@ -211,48 +236,44 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
         </div>
 
         <div className="detail-block">
-          <label>Progress history</label>
-          <div className="progress-history">
-            {progress.length === 0 && <span className="muted-note">no progress logged yet</span>}
-            {progress.map((p) => {
-              const d = (p.detail ?? {}) as { note?: string; sentiment?: string };
-              return (
-                <div key={p.seq} className="progress-line">
-                  <span className={`chip ${SENTIMENT_CHIP[d.sentiment ?? ""] ?? ""}`}>
-                    {d.sentiment ?? "progress"}
-                  </span>
-                  <span className="progress-note">{d.note}</span>
-                  <span className="step-ts">{p.actor} · {rel(p.ts)}</span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {related.length > 0 && (
-          <div className="detail-block">
-            <label>Related</label>
-            {related.map((r) => (
-              <div key={r.id} className="progress-line">
-                <span className="chip chip-scope">{r.type}</span> {r.title}
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="detail-block">
-          <label>History — every mutation</label>
+          <label>History — one log: every progress note and state change, typed</label>
           <div className="version-history">
-            {versions.length === 0 && <span className="muted-note">no versions yet</span>}
+            {versions.length === 0 && <span className="muted-note">no history yet</span>}
             {versions.map((v) => (
               <div key={v.seq} className="progress-line">
-                <span className={`chip chip-kind ${v.action === "create" ? "kind-agent" : v.action === "transition" ? "kind-human" : "kind-system"}`}>{v.action}</span>
-                <span className="progress-note">{v.summary}</span>
+                <span className={`chip chip-kind ${HISTORY_CHIP[v.action] ?? "kind-system"}`} title={HISTORY_LABEL[v.action] ?? v.action}>
+                  {HISTORY_LABEL[v.action] ?? v.action}
+                </span>
+                <span className="progress-note"><RefText text={v.summary} onOpen={nav} /></span>
                 <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
               </div>
             ))}
           </div>
         </div>
+
+        {relations.length > 0 && (
+          <div className="detail-block">
+            <label>Dependency graph</label>
+            <DepGraph selfId={taskId} selfTitle={task?.title ?? ""} relations={relations} related={related} onOpen={nav} />
+          </div>
+        )}
+
+        {relations.filter((r) => r.dir === "in").length > 0 && (
+          <div className="detail-block">
+            <label>Child tasks — verify / unblock / decomposition rounds (running or not)</label>
+            {relations.filter((r) => r.dir === "in").map((r) => {
+              const child = related.find((a) => a.id === r.artefact_id);
+              if (!child) return null;
+              return (
+                <div key={r.artefact_id} className="progress-line" onClick={() => nav(r.artefact_id)} style={{ cursor: "pointer" }}>
+                  <span className="chip chip-scope">{r.relation}</span>
+                  <span className={`chip ${child.status === "done" ? "st-ok" : child.status === "blocked" ? "st-err" : "st-amber"}`}>{child.status.replace("_", " ")}</span>
+                  <span className="progress-note"><RefText text={child.title} onOpen={nav} /></span>
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <dl className="audit" style={{ marginTop: "auto" }}>
           <dt>id</dt><dd>{task?.id ?? taskId}</dd>
@@ -267,14 +288,81 @@ export function TaskDetail({ taskId, openBlocked, onClose }: { taskId: string; o
   );
 }
 
+/** Render text with task references (BR#12, TASK-007) as clickable links. */
+export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
+  const parts = text.split(TASK_REF_RE);
+  return (
+    <>
+      {parts.map((p, i) =>
+        /^(BR#\d+|TASK-\d+)$/.test(p) ? (
+          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen(p); }}>{p}</span>
+        ) : (
+          <span key={i}>{p}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/** Dependency graph: upstream (this task depends on / belongs to) on the left,
+ *  downstream (children / dependents) on the right. Click a node to open it. */
+function DepGraph({ selfId, selfTitle, relations, related, onOpen }: {
+  selfId: string; selfTitle: string;
+  relations: Array<{ relation: string; artefact_id: string; dir: string }>;
+  related: KbArtefact[]; onOpen: (id: string) => void;
+}) {
+  const titleOf = (id: string): { id: string; title: string } => {
+    const r = related.find((a) => a.id === id);
+    return { id, title: r?.title ?? id };
+  };
+  const up = relations.filter((r) => r.dir === "out");
+  const down = relations.filter((r) => r.dir === "in");
+  const upNodes = up.map((r) => ({ ...titleOf(r.artefact_id), relation: r.relation }));
+  const downNodes = down.map((r) => ({ ...titleOf(r.artefact_id), relation: r.relation }));
+  const rows = Math.max(1, upNodes.length, downNodes.length);
+  const NODE_H = 30, GAP = 8, MID_W = 130, SIDE = 180;
+  const width = SIDE + MID_W + SIDE + 40;
+  const height = rows * (NODE_H + GAP) + 34;
+  const midY = height / 2 - NODE_H / 2;
+  const trunc = (s: string, n = 26) => (s.length > n ? s.slice(0, n) + "…" : s);
+  return (
+    <div className="dep-graph">
+      <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height}>
+        <text x={width / 2 - MID_W / 2} y={midY + NODE_H + 14} textAnchor="middle" className="dep-label">this task</text>
+        {upNodes.map((n, i) => {
+          const y = (i * (NODE_H + GAP)) + 6;
+          return (
+            <g key={`u${i}`} className="dep-node dep-parent" onClick={() => onOpen(n.id)}>
+              <rect x={0} y={y} width={SIDE} height={NODE_H} rx={5} />
+              <text x={8} y={y + 13} className="dep-title">{trunc(`${n.id} ${trunc(n.title, 18)}`)}</text>
+              <text x={8} y={y + 24} className="dep-label">{n.relation}</text>
+              <path className="dep-edge" d={`M ${SIDE} ${y + NODE_H / 2} C ${SIDE + 40} ${y + NODE_H / 2}, ${width / 2 - MID_W / 2 - 40} ${midY + NODE_H / 2}, ${width / 2 - MID_W / 2} ${midY + NODE_H / 2}`} />
+            </g>
+          );
+        })}
+        {downNodes.map((n, i) => {
+          const y = (i * (NODE_H + GAP)) + 6;
+          return (
+            <g key={`d${i}`} className="dep-node dep-child" onClick={() => onOpen(n.id)}>
+              <rect x={width - SIDE} y={y} width={SIDE} height={NODE_H} rx={5} />
+              <text x={width - SIDE + 8} y={y + 13} className="dep-title">{trunc(`${n.id} ${trunc(n.title, 18)}`)}</text>
+              <text x={width - SIDE + 8} y={y + 24} className="dep-label">{n.relation}</text>
+              <path className="dep-edge" d={`M ${width - SIDE} ${y + NODE_H / 2} C ${width - SIDE - 40} ${y + NODE_H / 2}, ${width / 2 + MID_W / 2 + 40} ${midY + NODE_H / 2}, ${width / 2 + MID_W / 2} ${midY + NODE_H / 2}`} />
+            </g>
+          );
+        })}
+        <g className="dep-node" onClick={() => onOpen(selfId)}>
+          <rect x={width / 2 - MID_W / 2} y={midY} width={MID_W} height={NODE_H} rx={5} style={{ fill: "color-mix(in srgb, var(--accent) 10%, var(--bg-raised))", stroke: "var(--accent)" }} />
+          <text x={width / 2} y={midY + 19} textAnchor="middle" className="dep-title" style={{ fontWeight: 700 }}>{trunc(selfId + " " + trunc(selfTitle, 14), 20)}</text>
+        </g>
+      </svg>
+    </div>
+  );
+}
+
 // — small local hooks/imports kept at bottom to keep the panel readable —
 import { useKb } from "../store/kb";
 import { getConfig } from "../lib/config";
-
-function useKbStateProgress(taskId: string): KbProgress[] {
-  const progress = useKb((s) => s.progress);
-  return useMemo(() => progress.filter((p) => p.artefact_id === taskId), [progress, taskId]);
-}
 
 function getConfigUrl(): string {
   return getConfig().url;

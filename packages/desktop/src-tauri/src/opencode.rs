@@ -5,6 +5,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct RunOutcome {
@@ -41,6 +42,8 @@ fn head_line(s: &str, max: usize) -> String {
 /// stdout/stderr are drained on reader threads so big sessions can't deadlock
 /// on full pipes. `title` tags the opencode session (`bridge-<task_id>`) so the
 /// runner can rediscover it for resume; `resume` continues a prior session.
+/// `live` (when given) receives the agent's most recent output line — the
+/// runner heartbeats it to the bridge so the board shows mid-run activity.
 pub fn run_task(
     workdir: &str,
     bin: &str,
@@ -49,6 +52,7 @@ pub fn run_task(
     timeout: Duration,
     title: Option<&str>,
     resume: Option<&str>,
+    live: Option<Arc<Mutex<String>>>,
 ) -> RunOutcome {
     let mut cmd = Command::new(bin);
     cmd.arg("run")
@@ -117,6 +121,11 @@ pub fn run_task(
                             let line = String::from_utf8_lossy(&bytes[shown..end]).trim().to_string();
                             if !line.is_empty() {
                                 eprintln!("[dispatch] {label} | {}", head_line(&line, 240));
+                                if let Some(cell) = &live {
+                                    if let Ok(mut slot) = cell.lock() {
+                                        *slot = head_line(&line, 200);
+                                    }
+                                }
                             }
                             shown = end + 1;
                         }

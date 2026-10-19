@@ -95,6 +95,15 @@ impl DispatchConfig {
         })
     }
 
+    /// Stable session name for this runner — every MCP call carries it so the
+    /// hub's session registry (and the board's online dots) stay fresh.
+    pub fn session_name(&self) -> String {
+        let slug = |s: &str| -> String {
+            s.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect()
+        };
+        format!("dispatch-{}", slug(self.label.as_deref().unwrap_or("runner")))
+    }
+
     /// Resolution order: env vars > ~/.bridge/config.json > None (→ device pairing).
     pub fn resolve() -> Option<Self> {
         Self::from_env().or_else(load_config)
@@ -224,38 +233,54 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
     }
 }
 
-/// Find the opencode session id for a dispatched task. Dispatched runs are
-/// titled `bridge-<task_id>` (set at spawn), so sessions are rediscoverable
-/// across runner/app restarts — no local state to lose.
-fn session_id_for(bin: &str, workdir: &str, task_id: &str) -> Option<String> {
-    let want = format!("bridge-{task_id}");
-    let out = Command::new(bin)
+/// Snapshot of resumable opencode sessions: title → session id. Dispatched runs
+/// are titled `bridge-<task_id>`, so sessions are rediscoverable across
+/// runner/app restarts — one `session list` per tick serves every lookup.
+fn session_map(bin: &str, workdir: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(out) = Command::new(bin)
         .arg("session")
         .arg("list")
         .arg("--format")
         .arg("json")
         .current_dir(workdir)
         .output()
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        .ok()
+    else {
+        return map;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return map;
+    };
     let items = match v {
         serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(o) => o.get("sessions")?.as_array()?.clone(),
-        _ => return None,
+        serde_json::Value::Object(o) => match o.get("sessions").and_then(|s| s.as_array()) {
+            Some(a) => a.clone(),
+            None => return map,
+        },
+        _ => return map,
     };
     for item in items {
-        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
-        let id = item
+        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        if let Some(id) = item
             .get("id")
             .or_else(|| item.get("sessionID"))
-            .and_then(|i| i.as_str());
-        if let Some(id) = id {
-            if title == want || title.contains(&want) {
-                return Some(id.to_string());
-            }
+            .and_then(|i| i.as_str())
+        {
+            map.insert(title, id.to_string());
         }
     }
-    None
+    map
+}
+
+/// Find the opencode session id for a dispatched task, from a fresh session map.
+/// (One `session list` per lookup — use `session_map` when scanning candidates.)
+#[allow(dead_code)]
+fn session_id_for(bin: &str, workdir: &str, task_id: &str) -> Option<String> {
+    let want = format!("bridge-{task_id}");
+    session_map(bin, workdir).into_iter().find(|(title, _)| {
+        title == &want || title.contains(&want)
+    }).map(|(_, id)| id)
 }
 
 // ---- bridge MCP client (JSON-RPC over POST /mcp) ----
@@ -266,7 +291,25 @@ fn mcp_call(
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    mcp_call_session(cfg, id, tool, args, None)
+}
+
+/// MCP call with an explicit session name. Task-scoped calls use
+/// `dispatch-<task_id>`: every opencode dispatch IS a fresh agent session, and
+/// per-task attribution is what lets separation-of-duties pass honestly — the
+/// session that implemented a task is never the session that verifies it.
+fn mcp_call_session(
+    cfg: &DispatchConfig,
+    id: &mut i64,
+    tool: &str,
+    mut args: serde_json::Value,
+    session: Option<&str>,
+) -> Result<serde_json::Value, String> {
     *id += 1;
+    if let Some(obj) = args.as_object_mut() {
+        let name = session.map(String::from).unwrap_or_else(|| cfg.session_name());
+        obj.entry("session").or_insert_with(|| json!(name));
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -310,6 +353,17 @@ fn mcp_call(
         return Err(text.to_string());
     }
     Ok(parsed)
+}
+
+/// Task-scoped call: session attributed to the task's own dispatch session.
+fn mcp_call_task(
+    cfg: &DispatchConfig,
+    id: &mut i64,
+    tool: &str,
+    args: serde_json::Value,
+    task_id: &str,
+) -> Result<serde_json::Value, String> {
+    mcp_call_session(cfg, id, tool, args, Some(&format!("dispatch-{}", slugify(task_id))))
 }
 
 // ---- local dispatch snapshot (rendered by the app's Local view) ----
@@ -445,6 +499,13 @@ struct InFlight {
     worktree: Option<PathBuf>, // isolated worktree to clean up on finalize
     pr_url: Option<String>,    // PR opened by the session, monitored after handoff
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
+    live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
+}
+
+impl InFlight {
+    fn live_line(&self) -> String {
+        self.live.lock().ok().map(|g| g.clone()).unwrap_or_default()
+    }
 }
 
 pub struct DispatchState {
@@ -531,6 +592,10 @@ fn cleanup_worktree(workdir: &str, task_id: &str) {
         .output();
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
+}
+
 fn extract_pr(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
         // URLs are often wrapped in markdown ("[View PR](https://…/pull/1)")
@@ -581,7 +646,7 @@ fn spawn_opencode(
         .map(|s| format!("\n\nYou are resuming session {s} — pick up where you left off; do not restart the task from scratch."))
         .unwrap_or_default();
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n- HEARTBEAT: call log_progress via the bridge MCP every ~5 minutes — one line: what you just did + what you do next. The board is your only visible output; silence reads as abandonment and gets the task reassigned.\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
         policy, tid, title, body_md, resume_note, run_dir, branch
     );
     // clone for the ephemeral state file: the closure below moves the original
@@ -606,6 +671,10 @@ fn spawn_opencode(
             if resume { "resumed session" } else { "new session" }
         ),
     );
+    // live progress cell: the opencode stdout reader writes the agent's latest
+    // output line here; the heartbeat reads it so the board shows mid-run activity
+    let live = Arc::new(std::sync::Mutex::new(String::new()));
+    let live_for_task = live.clone();
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
@@ -619,6 +688,7 @@ fn spawn_opencode(
                 Duration::from_secs(cfg2.timeout_mins * 60),
                 Some(&format!("bridge-{tid2}")),
                 resume_session.as_deref(),
+                Some(live_for_task),
             );
             let _ = tx.send(out);
         });
@@ -632,6 +702,7 @@ fn spawn_opencode(
         worktree,
         pr_url: None,
         rx: outcome,
+        live,
     });
     // ephemeral state file: headless observability (removed on completion)
     write_task_state(
@@ -671,6 +742,7 @@ fn tick(
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
                     rx: std::sync::mpsc::channel().1,
+                    live: inf.live.clone(),
                 },
                 outcome,
             ));
@@ -688,6 +760,7 @@ fn tick(
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
                     rx: std::sync::mpsc::channel().1,
+                    live: inf.live.clone(),
                 },
                 opencode::RunOutcome {
                     ok: false,
@@ -712,12 +785,15 @@ fn tick(
         } else {
             outcome.stdout_tail.clone()
         };
+        let exit_txt = match outcome.exit_code {
+            Some(0) => "exit 0".to_string(),
+            Some(c) => format!("exit {c}"),
+            None if outcome.timed_out => "killed on timeout".to_string(),
+            None => "no exit (crashed?)".to_string(),
+        };
         let mut note = format!(
-            "opencode {} in ~{}m (exit {:?}) — {}",
-            if outcome.timed_out { "TIMED OUT" } else { "finished" },
-            mins,
-            outcome.exit_code,
-            tail
+            "runner: run finished — {}, ~{mins}m — {}",
+            exit_txt, tail
         );
         if let Some(pr) = &pr_url {
             note.push_str(&format!("\nPR: {pr}"));
@@ -739,16 +815,9 @@ fn tick(
             mins,
             reply_excerpt
         );
-        let _ = mcp_call(
-            cfg,
-            id,
-            "log_progress",
-            json!({
-                "id": inf.task_id,
-                "note": note,
-                "sentiment": if outcome.ok { "converging" } else { "struggling" },
-            }),
-        );
+        // final progress (with 100% on success) is logged AFTER the handoff —
+        // a task must never sit in_progress showing 100% because a gate
+        // rejected the close. See the handoff match below.
         // persist final state (incl. PR link and exit code) before handoff
         write_task_state(
             &inf.task_id,
@@ -765,39 +834,102 @@ fn tick(
             }),
         );
         if outcome.ok {
-            // handoff gate wants a PR link in the note; if opencode didn't
-            // produce one the gate rejects and we stay in_progress.
-            match mcp_call(
+            // YIELD check first: the agent may have blocked/bounced/closed the
+            // task mid-run (ask filed, yielded per the contract). Query the live
+            // status — if the task is no longer in_progress, the agent's state
+            // change is authoritative: release the slot, KEEP the worktree and
+            // session (they're the resume assets), touch nothing server-side.
+            let live_status = mcp_call(cfg, id, "get_artefact", json!({ "id": inf.task_id }))
+                .ok()
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from));
+            if let Some(st) = &live_status {
+                if st != "in_progress" {
+                    attempts.remove(&inf.task_id);
+                    snap_activity(snap, "info", &format!("{} yielded — task now {}, session retained for resume", inf.task_id, st));
+                    msgs.push(format!("{} yielded ({}) — released, worktree + session kept", inf.task_title, st));
+                    continue;
+                }
+            }
+            // VERIFY/ANALYSIS tasks ARE the review: their completion closes them
+            // (done with receipts in the note) — pushing them to in_review would
+            // demand a review of a review and loop forever. IMPL tasks hand off
+            // to in_review (a Verify child then checks the PR).
+            let title_lower = inf.task_title.to_lowercase();
+            let is_review_work = title_lower.starts_with("verify:") || title_lower.contains("verify ")
+                || title_lower.contains("analysis child") || title_lower.contains("review child")
+                || title_lower.starts_with("receipt");
+            let receipt_note = if pr_url.is_some() {
+                note.clone()
+            } else {
+                format!("{note}\nverified against: task artefact + history receipts (exit 0, session dispatch-{})", slugify(&inf.task_id))
+            };
+            let (transition_to, handoff_note) = if is_review_work {
+                ("done", receipt_note)
+            } else {
+                ("in_review", note)
+            };
+            match mcp_call_task(
                 cfg,
                 id,
                 "transition",
-                json!({ "id": inf.task_id, "to": "in_review", "note": note }),
+                json!({ "id": inf.task_id, "to": transition_to, "note": handoff_note }),
+                &inf.task_id,
             ) {
                 Ok(_) => {
-                    // handed off: work is done — remove the ephemeral state file
+                    // handoff succeeded — NOW the task may show 100%: the run's
+                    // duty is complete (done, or impl complete awaiting verify)
+                    let _ = mcp_call_task(
+                        cfg,
+                        id,
+                        "log_progress",
+                        json!({
+                            "id": inf.task_id,
+                            "note": format!("runner: handed off to {} — complete", transition_to),
+                            "sentiment": "converging",
+                            "completion_pct": 100,
+                        }),
+                        &inf.task_id,
+                    );
                     remove_task_state(&inf.task_id);
                     attempts.remove(&inf.task_id);
+                    finished_no_pr.insert(inf.task_id.clone());
+                    if transition_to == "done" && inf.worktree.is_some() {
+                        // terminal: worktree + branch served their purpose
+                        cleanup_worktree(&cfg.workdir, &inf.task_id);
+                    }
                     msgs.push(format!(
-                        "{} → in_review{}",
+                        "{} → {}{}",
                         inf.task_title,
-                        pr_url
-                            .as_ref()
-                            .map(|p| format!(" — PR {p}"))
-                            .unwrap_or_default()
+                        transition_to,
+                        pr_url.as_ref().map(|p| format!(" — PR {p}")).unwrap_or_default()
                     ));
                 }
-                Err(_) => {
-                    // opencode exited cleanly but produced no PR — likely an
-                    // analysis/verification task with nothing to ship. Terminal
-                    // for this runner: review pickup takes over from here.
-                    // Without this mark the resume loop re-dispatched the same
-                    // finished session every tick forever.
+                Err(e) => {
+                    // gate rejected the handoff (e.g. receipts rejected, no PR).
+                    // The task must NOT park at 100% in_progress — rule 9: real
+                    // progress or let go. Release the claim to todo with the
+                    // findings; the next agent verifies state first and acts on
+                    // them (close properly, fix, or re-scope).
+                    let release_note = format!(
+                        "runner: handoff to {transition_to} rejected — {e}. Run completed (~{mins}m, exit 0); findings above. Released for fresh pickup — session + worktree retained.",
+                    );
+                    match mcp_call_task(
+                        cfg,
+                        id,
+                        "transition",
+                        json!({ "id": inf.task_id, "to": "todo", "note": release_note }),
+                        &inf.task_id,
+                    ) {
+                        Ok(_) => {
+                            snap_activity(snap, "info", &format!("{} released to todo after handoff rejection", inf.task_id));
+                            msgs.push(format!("{} → todo (handoff rejected: {}) — findings in note, pool pickup", inf.task_title, truncate(&e, 100)));
+                        }
+                        Err(e2) => {
+                            msgs.push(format!("{} handoff AND release failed: {e2} — manual attention needed", inf.task_title));
+                        }
+                    }
                     finished_no_pr.insert(inf.task_id.clone());
                     remove_task_state(&inf.task_id);
-                    msgs.push(format!(
-                        "{} finished (no PR link — left in_progress for review pickup)",
-                        inf.task_title
-                    ));
                 }
             }
         } else {
@@ -814,20 +946,41 @@ fn tick(
                 cfg,
                 id,
                 "log_progress",
-                json!({ "id": inf.task_id, "note": format!("watching PR {pr} for review verdict"), "sentiment": "neutral" }),
+                json!({ "id": inf.task_id, "note": format!("runner: watching PR {pr} — awaiting verify verdict"), "sentiment": "neutral" }),
             );
         }
-        if inf.worktree.is_some() {
-            cleanup_worktree(&cfg.workdir, &inf.task_id);
-        }
+        // worktree + branch persist through in_review / bounce / failure — they
+        // are the handoff assets (session resume or branch checkout). Only a
+        // terminal `done` (handled above) tears them down.
         snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
     }
 
-    // heartbeat is the AGENT's job (protocol card: log_progress every ≤10 min
-    // via its own bridge MCP). The dispatcher must not fabricate "still working"
-    // notes on the agent's behalf — that would mask genuine agent silence from
-    // the watchdog. The dispatcher only logs its OWN actions (claim, handoff,
-    // finish) in the sections below.
+    // relay, not heartbeat: the AGENT owns progress callbacks (its prompt
+    // instructs log_progress every ~5m via the bridge MCP). The runner only
+    // RELAYS the agent's actual stdout line — real agent output, attributed as
+    // a relay — so the board never shows fabricated progress. No output yet?
+    // The relay says exactly that: liveness, nothing more.
+    for inf in in_flight.iter() {
+        let mins = inf.started.elapsed().as_secs() / 60;
+        let live = inf.live_line();
+        let note = if live.is_empty() {
+            format!("runner: alive ~{mins}m, no agent output yet")
+        } else {
+            format!("runner: agent output — {live}")
+        };
+        if let Err(e) = mcp_call(
+            cfg,
+            id,
+            "log_progress",
+            json!({
+                "id": inf.task_id,
+                "note": note,
+                "sentiment": "neutral",
+            }),
+        ) {
+            eprintln!("[dispatch] relay failed for {}: {e}", inf.task_id);
+        }
+    }
     if !in_flight.is_empty() {
         snap_in_flight_list(snap, in_flight);
     }
@@ -853,6 +1006,7 @@ fn tick(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let sessions = session_map(&cfg.opencode_bin, &cfg.workdir);
     let open_mine: Vec<&serde_json::Value> = my_tasks
         .iter()
         .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
@@ -885,11 +1039,14 @@ fn tick(
                 cfg,
                 id,
                 "log_progress",
-                json!({ "id": tid, "note": format!("dispatch runner heartbeat — '{title}' is open; opencode resume backed off after a failed attempt"), "sentiment": "neutral" }),
+                json!({ "id": tid, "note": format!("runner: '{title}' open — dispatch backed off after a failed attempt, retrying"), "sentiment": "neutral" }),
             )?;
             continue;
         }
-        let sess = session_id_for(&cfg.opencode_bin, &cfg.workdir, tid);
+        let want_title = format!("bridge-{tid}");
+        let sess = sessions.get(&want_title).cloned().or_else(|| {
+            sessions.iter().find(|(title, _)| title.contains(&want_title)).map(|(_, id)| id.clone())
+        });
         let msg = match &sess {
             Some(s) => format!("resumed {tid} — continuing opencode session {s}"),
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
@@ -900,13 +1057,33 @@ fn tick(
         msgs.push(msg);
     }
 
-    // 6. claim new claimable tasks until the WIP limit is reached
+    // 6. claim new claimable tasks until the WIP limit is reached.
+    // BLOCKED tasks with an exit condition rank first: unblocking is priority.
+    // A blocked task is resumed by transitioning back to in_progress with the
+    // resolution — then dispatched like any other work.
+    // RESUME preference: a candidate we hold an opencode session AND worktree
+    // for sorts first — resuming that session restores full context cheaply,
+    // which is how a task that yielded earlier routes back to "the same agent".
     let candidates = orient
         .get("unclaimed_work")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    for task in candidates {
+    let mut candidates: Vec<(serde_json::Value, Option<String>)> = candidates
+        .into_iter()
+        .map(|t| {
+            let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let want_title = format!("bridge-{tid}");
+            let sess = sessions.get(&want_title).cloned();
+            (t, sess)
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        let ra = if a.1.is_some() { 0 } else { 1 };
+        let rb = if b.1.is_some() { 0 } else { 1 };
+        ra.cmp(&rb)
+    });
+    for (task, resume_sess) in candidates {
         if in_flight.len() >= cfg.max_sessions {
             break;
         }
@@ -924,7 +1101,43 @@ fn tick(
         {
             continue;
         }
-        if let Err(e) = mcp_call(cfg, id, "transition", json!({ "id": tid, "to": "in_progress" })) {
+        let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");
+        if is_blocked {
+            // resume the blocked task. Preferred context: the unblock condition
+            // (the exit condition on record). No exit condition? The blocked
+            // REASON is still actionable context — an agent reading the card can
+            // decide: clear it, re-scope the task, or escalate to a human. A
+            // blocked task is never skipped for missing metadata.
+            let unblock = task.get("unblock_condition").and_then(|u| u.as_str()).unwrap_or("");
+            let reason = task.get("blocked_reason").and_then(|u| u.as_str()).unwrap_or("");
+            let context = if !unblock.is_empty() {
+                format!("exit condition: {unblock}")
+            } else if !reason.is_empty() {
+                format!("blocked with no recorded exit condition — reason: {reason}. Read the card and history, then: clear the block, re-scope the task, or file an ask to escalate")
+            } else {
+                "blocked with no reason recorded — read the card and history, then: unblock, re-scope, or escalate".to_string()
+            };
+            if let Err(e) = mcp_call_task(
+                cfg,
+                id,
+                "transition",
+                json!({ "id": tid, "to": "in_progress", "note": format!("runner resume — {context}"), "session": format!("dispatch-{}", slugify(tid)) }),
+                &tid,
+            ) {
+                attempts.insert(tid.to_string(), Instant::now());
+                snap_activity(snap, "error", &format!("unblock {tid} failed: {e}"));
+                continue;
+            }
+            let msg = format!("unblocked {tid} — {context}");
+            snap_activity(snap, "dispatch", &msg);
+            msgs.push(msg);
+        } else if let Err(e) = mcp_call_task(
+            cfg,
+            id,
+            "transition",
+            json!({ "id": tid, "to": "in_progress" }),
+            &tid,
+        ) {
             // claim raced or failed — don't kill the tick or the whole claim loop
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
@@ -935,15 +1148,19 @@ fn tick(
             .ok()
             .and_then(|v| v.get("body_md").and_then(|b| b.as_str()).map(String::from))
             .unwrap_or_default();
-        let _ = mcp_call(
+        let _ = mcp_call_task(
             cfg,
             id,
             "log_progress",
-            json!({ "id": tid, "note": format!("dispatch runner: claimed '{title}' — dispatching to opencode"), "sentiment": "going_well" }),
+            json!({ "id": tid, "note": format!("runner: claimed — dispatching to opencode"), "sentiment": "going_well" }),
+            &tid,
         );
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, None, in_flight);
+        let msg = match &resume_sess {
+            Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
+            None => format!("claimed {tid} — dispatched to opencode"),
+        };
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
-        let msg = format!("claimed {tid} — dispatched to opencode");
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
     }

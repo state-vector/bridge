@@ -396,6 +396,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .resp-body { margin: 0; font-size: 12.5px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
 .sent-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 
+/* ---------- For Me (human inbox) ---------- */
+.forme-item { cursor: default; }
+.forme-link { cursor: pointer; }
+.forme-link:hover { border-color: var(--accent); }
+
 /* ---------- aggregate sentiment ---------- */
 .sentiment-bar-box { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .sentiment-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; flex: 1; max-width: 300px; background: var(--bg-raised); }
@@ -608,3 +613,46 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-num.warn { color: var(--amber); }
 .top-num.bad { color: var(--red); }
 .top-num.num-comp { color: var(--accent); }
+
+/* ---------- board v5: kind pills, live pulse, subprocess, dep graph ---------- */
+
+/* task kind pill: what the task IS (question / impl / verify / analysis / research) */
+.kind-pill { border: none; font-size: 9px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; letter-spacing: .05em; }
+.kind-pill.kp-impl { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.kind-pill.kp-verify { color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); }
+.kind-pill.kp-analysis { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); }
+.kind-pill.kp-question { color: var(--startup); background: color-mix(in srgb, var(--startup) 14%, transparent); }
+.kind-pill.kp-research { color: var(--text-dim); background: color-mix(in srgb, var(--text) 10%, transparent); }
+
+/* in_progress is HEALTH: green and pulsing to show movement */
+.st-chip.st-live { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); animation: chip-pulse 2.2s ease-in-out infinite; }
+@keyframes chip-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 35%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 0%, transparent); }
+}
+
+/* subprocess: still in_progress, quiet while a subprocess runs */
+.st-chip.st-sub { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); }
+
+/* hyperlinked task refs inside titles / snippets */
+.task-ref { color: var(--accent); cursor: pointer; font-weight: 600; }
+.task-ref:hover { text-decoration: underline; }
+
+/* dependency graph (TaskDetail) */
+.dep-graph { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px; overflow-x: auto; }
+.dep-node { cursor: pointer; }
+.dep-node rect { fill: var(--bg-raised); stroke: var(--line); }
+.dep-node:hover rect { stroke: var(--accent); }
+.dep-node.dep-parent rect { stroke: var(--amber); }
+.dep-node.dep-child rect { stroke: var(--accent); }
+.dep-edge { stroke: var(--text-faint); stroke-width: 1; fill: none; }
+.dep-label { font-size: 9px; fill: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+.dep-title { font-size: 10px; fill: var(--text); }
+
+/* ---------- top v2: task ids + unblock exit conditions ---------- */
+.top-task-id { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px; margin-right: 5px; opacity: .9; }
+.top-unblock { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+
+/* tree structure: children indented under parent with a connector rule */
+.top-row-child { border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--line)); margin-left: 14px; border-radius: 0 6px 6px 0; }
+.tree-branch { color: var(--text-faint); font-family: ui-monospace, "SF Mono", Menlo, monospace; }

@@ -101,10 +101,17 @@ export class KnowledgeHub {
        WHERE type = 'task' AND status = 'in_progress'`,
     ).toArray();
     for (const r of rows as any[]) {
+      try {
       const meta = JSON.parse(r.meta ?? "{}");
       if (meta.awaiting_ask) continue;
       // (A) declared grace: the agent stated a silence window — honor it until it lapses
       if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
+      // (A2) declared subprocess window: the task is still in_progress, just
+      // quiet while a subprocess runs — watchdog paused until the budget lapses
+      if (meta.subprocess && typeof meta.subprocess.deadline_ts === "number") {
+        if (meta.subprocess.deadline_ts > now) continue;
+        // lapsed: the declaration is a lie — fall through to abandoned below
+      }
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
       );
@@ -114,18 +121,27 @@ export class KnowledgeHub {
       );
       if (openAsk) continue;
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
+      const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
       await this.transition({
         id: r.id, to: "blocked",
-        note: `abandoned — no update for >${staleMin}m; auto-blocked by watchdog${will}`,
+        note: `abandoned — no update for >${staleMin}m${lapsedSub}; auto-blocked by watchdog${will}`,
         unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`,
       }, "system:watchdog");
+      } catch (e) {
+        // one bad task must not kill the sweep — log and keep going
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
     }
+    // (B) subprocess blocks (legacy shape: blocked + meta.blocked.class) are gone —
+    // subprocess silence now lives on in_progress tasks (A2 above). Nothing to sweep here.
     // (B) subprocess blocks: watchdog paused while the declared budget runs;
     // past the budget the declaration is a lie — convert to abandoned.
+    // (Legacy shape only — new subprocess silence lives on in_progress tasks.)
     const subRows = this.state.storage.sql.exec(
       `SELECT id, owner, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
     ).toArray();
     for (const r of subRows as any[]) {
+      try {
       const meta = JSON.parse(r.meta ?? "{}");
       const b = meta.blocked;
       if (b?.class !== "subprocess" || typeof b.deadline_ts !== "number") continue;
@@ -142,6 +158,9 @@ export class KnowledgeHub {
       );
       this.audit("system:watchdog", "transition", r.id, { from: "blocked", to: "blocked", note: b.reason });
       this.version(r.id, "system:watchdog", "transition", b.reason, { from: "blocked", to: "blocked", note: b.reason });
+      } catch (e) {
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
     }
     // (C) verification nudge: an unclaimed verify task parks its parent's owner —
     // never reaped (you can't be "abandoned" from work you never picked up). Past
@@ -928,36 +947,24 @@ export class KnowledgeHub {
     // ---- swimlane gates: minimal, enforced state-machine barriers ----
     const tTags: string[] = parseTags(row.tags);
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
-    if (row.type === "task" && row.status === "todo" && to === "in_progress" && !isQualifier) {
-      const aTags = this.actorTagsFor(actor);
-      const actorIsQualifier = aTags.includes("role:analysis") || aTags.includes("role:review");
-      const needRoles = tTags.filter((x: string) => x.startsWith("role:"));
-      // unqualified work is qualifier intake: role:analysis / role:review agents
-      // may claim it regardless of its target role tags (qualifying it is their
-      // job — otherwise impl-tagged unqualified work is unclaimable by anyone).
-      // Qualified work keeps its normal role gate.
-      const intake = !this.qualifyCheck(row, "analysis").ok || this.unmetBars(row).length > 0;
-      if (!actorIsQualifier || !intake) {
-        if (needRoles.length && actor !== "web" && !needRoles.some((r) => aTags.includes(r)))
-          throw new Error(`task ${id} is gated to ${needRoles.join(", ")} — your agent roles (${aTags.map((r) => r.replace("role:", "")).join(", ") || "none"}) don't match; agents only see and claim work matching their roles`);
-      }
-      if (!actorIsQualifier) {
-        const q = this.qualifyCheck(row, "analysis");
-        if (!q.ok)
-          throw new Error(`task ${id} is not qualified — work cannot be picked up until analysed/reviewed. Qualify it by completing a role:analysis child task, linking an accepted decision, or declaring it at create (qualified: true). (role:analysis / role:review agents may pick up unqualified work — that is their job.)`);
-        const bars = this.unmetBars(row);
-        if (bars.length)
-          throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
-        // separation of duties: the session that produced the analysis evidence
-        // may not implement the same task in that session — fresh session, fresh claim.
-        if (q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
-          const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
-          if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
-            const evSession = JSON.parse(ev.meta ?? "{}").session;
-            const sess = await this.resolveSession(body, String(body.token_id ?? ""));
-            if (evSession && sess && evSession === sess)
-              throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
-          }
+    if (row.type === "task" && row.status === "todo" && to === "in_progress") {
+      const q = this.qualifyCheck(row, "analysis");
+      // roles are playbooks, not gates: any agent may claim any task — the pool
+      // surfaces everything claimable, ranked verify-first, and an agent that
+      // can't do the work stands down (log it back / bounce). Role tags steer
+      // what shows first; the server's integrity gates do the enforcement.
+      const bars = this.unmetBars(row);
+      if (bars.length)
+        throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
+      // separation of duties: the session that produced the analysis evidence
+      // may not implement the same task in that session — fresh session, fresh claim.
+      if (q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
+        const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
+        if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
+          const evSession = JSON.parse(ev.meta ?? "{}").session;
+          const sess = await this.resolveSession(body, String(body.token_id ?? ""));
+          if (evSession && sess && evSession === sess)
+            throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
         }
       }
     }
@@ -1004,20 +1011,30 @@ export class KnowledgeHub {
     }
     // (B) subprocess class: a declared block on a long/handed-off op, with a
     // budget. The watchdog pauses until the budget lapses; past it the
-    // declaration is a lie and the sweep converts the block to abandoned.
+    // subprocess = declared silence while STILL WORKING: the task stays
+    // in_progress (it isn't blocked — nothing else must finish first). The
+    // watchdog pauses until the declared budget lapses; past it the sweep
+    // converts the silence to abandoned. Blocked is reserved for tasks
+    // awaiting OTHER tasks/decisions.
     const isSubprocess = body.class === "subprocess";
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
+    if (isSubprocess && row.type === "task" && row.status === "in_progress") {
+      const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
+      if (!bm) throw new Error("class: subprocess requires budget_minutes (1-1440) — a declared window without a deadline never trips, which is worse than abandonment");
+      meta.subprocess = { reason: String(body.note ?? body.reason ?? "").trim(), budget_minutes: bm, deadline_ts: ts + bm * 60_000, ts };
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, updated_ts = ?, status_ts = ? WHERE id = ?`,
+        JSON.stringify(meta), ts, ts, id,
+      );
+      this.audit(actor, "transition", id, { from: row.status, to: "in_progress (subprocess)", note: String(body.note ?? ""), class: "subprocess", budget_minutes: bm });
+      this.version(id, actor, "transition", `subprocess declared — watchdog paused until +${bm}m — ${String(body.note ?? "").slice(0, 120)}`, { from: row.status, to: "in_progress", class: "subprocess" });
+      return { id, status: "in_progress", subprocess: true };
+    }
     if (to === "blocked") {
       meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
-      if (isSubprocess) {
-        const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
-        if (!bm) throw new Error("class: subprocess requires budget_minutes (1-1440) — a declared block without a deadline never trips, which is worse than abandonment");
-        meta.blocked.class = "subprocess";
-        meta.blocked.budget_minutes = bm;
-        meta.blocked.deadline_ts = ts + bm * 60_000;
-      }
+      delete meta.subprocess; // a real block supersedes a declared subprocess window
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
     }
@@ -1056,11 +1073,12 @@ export class KnowledgeHub {
     }
     // receipts: a review verdict must cite the artifact it verified — for PR
     // work that's the PR link; verification is a double-check, and the check
-    // leaves a trail.
-    if (row.type === "task" && to === "done" && tTags.includes("role:review")) {
+    // leaves a trail. Unblock tasks carry the same receipt duty: what they
+    // found, and what unblocked (or didn't unblock) the parent.
+    if (row.type === "task" && to === "done" && (tTags.includes("role:review") || tTags.includes("role:unblock"))) {
       const note = String(body.note ?? "").trim();
-      if (!/https?:\/\/\S+|(^|\s)(PR|merged|passed)\b/i.test(note))
-        throw new Error(`review ${id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, or the check you ran).`);
+      if (!/https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(note))
+        throw new Error(`${tTags.includes("role:unblock") ? "unblock" : "review"} ${id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`);
       // separation of duties: the session that implemented a task cannot be the
       // one whose review completes it — review children are done by a different session.
       const parent = this.one(
@@ -1160,12 +1178,13 @@ export class KnowledgeHub {
         this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
       }
     }
-    // stale verification rounds: a bounce or a done closes out any open Verify
-    // children of this task (the next in_review spawns a fresh one)
+    // stale verification rounds: a bounce or a done closes out ANY open Verify
+    // children of this task — regardless of their status (todo, in_progress,
+    // blocked). The next in_review spawns exactly one fresh round.
     if (row.type === "task" && (to === "done" || (row.status === "in_review" && to === "in_progress"))) {
       for (const v of this.state.storage.sql.exec(
-        `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'todo' AND c.tags LIKE '%"role:review"%'`, id,
+        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:review"%'`, id,
       ).toArray() as any[]) {
         const vm = JSON.parse(v.meta ?? "{}");
         vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — verification round closed`;
@@ -1173,9 +1192,48 @@ export class KnowledgeHub {
           `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
           JSON.stringify(vm), ts, ts, v.id,
         );
-        this.audit("system:separation", "transition", v.id, { from: "todo", to: "superseded", note: vm.superseded_reason });
-        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: "todo", to: "superseded" });
+        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
+        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
       }
+      // same for open unblock children: one per block episode, superseded when
+      // the parent moves on (done or bounce) — never accumulating orphans
+      for (const v of this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`, id,
+      ).toArray() as any[]) {
+        const vm = JSON.parse(v.meta ?? "{}");
+        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — unblock round closed`;
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(vm), ts, ts, v.id,
+        );
+        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
+        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
+      }
+    }
+    // every blocked task gets an unblock child: a priority-ranked task whose
+    // contract is "verify whether the exit condition holds; if yes, resume the
+    // parent (in_progress with resolution); if no, record findings and close
+    // yourself". Ask-gated blocks are excluded — the ask answer auto-resumes
+    // them, and a spawned unblock task would race the answer.
+    if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tTags.includes("role:unblock")) {
+      const exitCond = String(meta.blocked?.unblock_condition ?? "").trim();
+      const blockWhy = String(meta.blocked?.reason ?? "").trim();
+      const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
+      const created = await this.create(
+        {
+          type: "task",
+          title: `Unblock: ${rootTitle.slice(0, 200)}`,
+          body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${blockWhy || "see parent"}.\nExit condition: ${exitCond || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
+          tags: ["role:unblock"],
+        },
+        actor,
+      );
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+        created.id, id, ts,
+      );
+      this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
     }
     return { id, status: to, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
   }
@@ -1298,6 +1356,9 @@ export class KnowledgeHub {
       meta.grace_until = graceUntil;
     } else {
       delete meta.grace_until; // ordinary log = agent is back
+      // an ordinary log on a task with a declared subprocess window = the
+      // subprocess resolved (or the agent is back mid-window) — clear it
+      delete meta.subprocess;
     }
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
     meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct };
@@ -1491,10 +1552,20 @@ export class KnowledgeHub {
     const openStatuses = ["draft", "proposed", "active", "open", "todo", "in_progress", "blocked"];
     const marks = openStatuses.map(() => "?").join(",");
     const open = this.state.storage.sql.exec(
-      `SELECT id, type, title, status, owner, updated_ts FROM artefacts
+      `SELECT id, type, title, status, owner, meta, updated_ts FROM artefacts
        WHERE status IN (${marks}) ORDER BY updated_ts DESC LIMIT 30`,
       ...openStatuses,
-    ).toArray();
+    ).toArray().map((t: any) => {
+      // agents orienting need the blocked context inline — the exit condition
+      // is the actionable part of a blocked card
+      if (t.type === "task") {
+        const m = JSON.parse(t.meta ?? "{}");
+        if (m.blocked) { t.blocked_reason = (m.blocked.reason ?? "").slice(0, 200); t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 200); }
+        if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
+        delete t.meta;
+      }
+      return t;
+    });
     const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
     const askMarks = askPlaceholders.map(() => "?").join(",");
     const pendingAsks = this.state.storage.sql.exec(
@@ -1509,13 +1580,13 @@ export class KnowledgeHub {
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','in_review','blocked') ORDER BY updated_ts DESC LIMIT 10`,
       label,
     ).toArray();
-    // dispatch surface: unclaimed todo tasks this agent's roles may pick up.
-    // Work that can't be claimed by this agent is INVISIBLE — no temptation, no noise.
-    const myRoles = new Set(tags.filter((t) => t.startsWith("role:")));
-    const isQualifierAgent = tags.includes("role:analysis") || tags.includes("role:review");
+    // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
+    // (a blocked card with an unblock condition is actionable — unblocking is
+    // priority work). Ranked: blocked-with-condition first, then todo.
     const pool = this.state.storage.sql.exec(
-      `SELECT id, title, tags, meta, project, updated_ts FROM artefacts
-       WHERE type = 'task' AND status = 'todo' AND owner = '' ORDER BY updated_ts DESC LIMIT 30`,
+      `SELECT id, title, tags, meta, project, updated_ts, status FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
+       ORDER BY updated_ts DESC LIMIT 40`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(
@@ -1541,21 +1612,24 @@ export class KnowledgeHub {
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
       const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
-      // unqualified (or bar-unmet) work is qualifier intake: role:analysis / role:review
-      // agents see it regardless of the task's target role tags — qualifying it is
-      // their job (otherwise impl-tagged unqualified work is invisible to everyone
-      // and the pool deadlocks). Everyone else only sees work that is ready for them.
-      if (!qualified || unmet.length) {
-        if (!isQualifierAgent) return false;
-        t.needs_qualification = true;
-        return true;
-      }
-      if (need.length && !need.some((r: string) => myRoles.has(r))) return false;
+      // roles are playbooks, not gates: every agent sees everything claimable.
+      // Flag instead of filter — agents stand down on work they can't do, and
+      // the server's separation-of-duties check is the actual integrity gate.
+      t.needs_qualification = !qualified || unmet.length > 0;
+      if (need.length) t.target_roles = need;
       return true;
     }).sort((a: any, b: any) => {
-      // verification duty outranks everything: an unclaimed verify task parks an
-      // implementer in in_review. Questions next (additive, cheap). Then the rest.
-      const rank = (t: any) => (verifyParents.has(t.id) ? 0 : t.tags?.includes("question") ? 1 : 2);
+      // ranking: unblock children first (cheapest unblocking lever — a check
+      // that releases parked work), then blocked-with-condition, then verify
+      // duty, questions, plain todo.
+      const rank = (t: any) => {
+        const m = JSON.parse(t.meta ?? "{}");
+        if (t.tags?.includes("role:unblock")) return 0;
+        if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
+        if (verifyParents.has(t.id)) return 2;
+        if (t.tags?.includes("question")) return 3;
+        return 4;
+      };
       return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
     }).slice(0, 10).map((t: any) => {
       // pool traits — the pattern: computed per row, never stored flags. Clients
@@ -1563,15 +1637,26 @@ export class KnowledgeHub {
       // and every claimability blocker here is enforced at the claim gate —
       // a trait that lies is worse than no trait. Extend both together.
       const m = JSON.parse(t.meta ?? "{}");
+      // blocked rows: surface the exit condition — the whole point is that an
+      // agent can read WHY and decide whether it can clear it.
+      if (t.status === "blocked") {
+        t.blocked_reason = (m.blocked?.reason ?? "").slice(0, 300);
+        t.unblock_condition = (m.blocked?.unblock_condition ?? "").slice(0, 300);
+        t.awaiting_ask = m.awaiting_ask?.ask_id;
+        t.is_claimable = !!t.unblock_condition; // resume via transition in_progress with resolution
+        if (!t.unblock_condition) t.claim_reason = "blocked without an unblock condition — open the card, resolve or re-scope it";
+      }
       // questions by kind (meta.kind = "question"), not by legacy tag — tags are
       // roles, kind is the pickup model. Legacy-tagged rows still register.
       t.is_question = isQuestionTask(m) || t.tags?.includes("question") || false;
       const gated = m.operator_gated;
-      t.is_claimable = !t.is_question && !gated;
-      if (!t.is_claimable) {
-        t.claim_reason = t.is_question
-          ? "question — answered, not claimed (contribute via log_progress {id, did})"
-          : `operator gated: ${gated} — a human clears the gate`;
+      if (t.status !== "blocked") {
+        t.is_claimable = !t.is_question && !gated;
+        if (!t.is_claimable) {
+          t.claim_reason = t.is_question
+            ? "question — answered, not claimed (contribute via log_progress {id, did})"
+            : `operator gated: ${gated} — a human clears the gate`;
+        }
       }
       if (m.attempt) {
         t.previously_attempted = {
@@ -1659,48 +1744,53 @@ export class KnowledgeHub {
   }
 
   /**
-   * Reaper: runs at orient (check-in). Blocked-abandoned tasks owned by the
-   * checking-in agent:
-   *  - activity by the agent within the stale window → prompt it to check in
-   *    (log_progress re-claims).
-   *  - no activity → penalty (score counts the reaper event) and the task is
-   *    reassigned: back to unclaimed todo, tagged "attempted", meta.attempt
-   *    records who/when/how many times — the next agent must expect partial work.
+   * Reaper: runs at orient (check-in). Blocked-abandoned tasks:
+   *  - OWN tasks: activity within the stale window → prompt to check in
+   *    (log_progress re-claims); no activity → penalty (score counts the
+   *    reaper event) and reassignment.
+   *  - ANYONE'S stale-abandoned tasks: reassigned after the stale window —
+   *    a vanished agent's claim must not park work forever. Runs at ANY
+   *    orient, so the next check-in by any agent sweeps the whole board.
    */
   private reapAbandoned(label: string, staleMin: number): string[] {
     const out: string[] = [];
     const now = Date.now();
     const staleMs = staleMin * 60_000;
     for (const t of this.state.storage.sql.exec(
-      `SELECT id, title, meta, tags, status_ts, updated_ts FROM artefacts
-       WHERE type = 'task' AND status = 'blocked' AND owner = ?`, label,
+      `SELECT id, title, meta, tags, status_ts, updated_ts, owner FROM artefacts
+       WHERE type = 'task' AND status = 'blocked' AND (owner = ? OR owner != '')`, label,
     ).toArray() as any[]) {
       const meta = JSON.parse(t.meta ?? "{}");
       if (!(meta.blocked?.reason ?? "").startsWith("abandoned")) continue;
-      const wasDoing = meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
+      const mine = t.owner === label;
+      const ownerLabel = t.owner || label;
+      const wasDoing = mine && meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
       const lastOwn = this.one(
-        `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, label,
+        `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, ownerLabel,
       )?.ts ?? 0;
       const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
-      if (idleFor < staleMs) {
+      if (mine && idleFor < staleMs) {
         out.push(
           `${t.id} "${t.title}" is marked abandoned but you were active on it recently.${wasDoing} log_progress on it NOW to re-claim, then keep the ≤${staleMin}m heartbeat.`,
         );
         continue;
       }
+      if (idleFor < staleMs) continue; // someone else's, still fresh-ish — leave it
       const tags: string[] = parseTags(t.tags);
       if (!tags.includes("attempted")) tags.push("attempted");
       const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
-      meta.attempt = { by: label, at: now, attempts };
+      meta.attempt = { by: ownerLabel, at: now, attempts };
       delete meta.blocked;
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = 'todo', owner = '', tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
         JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
       );
-      this.audit("system:reaper", "reassign", t.id, { prev_owner: label, attempts, idle_ms: idleFor });
-      this.version(t.id, "system:reaper", "transition", `reassigned — ${label} silent >${staleMin}m after abandonment (attempt ${attempts})`, { prev_owner: label });
+      this.audit("system:reaper", "reassign", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
+      this.version(t.id, "system:reaper", "transition", `reassigned — ${ownerLabel} silent >${staleMin}m after abandonment (attempt ${attempts})`, { prev_owner: ownerLabel });
       out.push(
-        `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`,
+        mine
+          ? `${t.id} "${t.title}" was REASSIGNED: you went silent >${staleMin}m after the watchdog blocked it.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`
+          : `${t.id} "${t.title}" was REASSIGNED: ${ownerLabel} went silent >${staleMin}m after the watchdog blocked it (attempt ${attempts}) — back to unclaimed todo for any agent to pick up.`,
       );
     }
     return out;

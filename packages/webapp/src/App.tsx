@@ -1,28 +1,27 @@
 import { useEffect, useState } from "react";
 import { BoardView } from "./components/BoardView";
-import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
+import { ForMeView } from "./components/ForMeView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { DispatchView } from "./components/DispatchView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
-import { Panel } from "./components/Panel";
-import { SettingsView } from "./components/SettingsView";
 import { TopView } from "./components/TopView";
 import type { WsFrame } from "@flows/specs";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";
 
-type Tab = "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "inbox" | "dispatch";
+type Tab = "forme" | "board" | "top" | "log" | "knowledge" | "discussions" | "connect" | "settings" | "dispatch";
 const TABS_ALL: Array<{ key: Tab; label: string }> = [
+  { key: "forme", label: "For Me" },
   { key: "dispatch", label: "Dispatch" },
+  { key: "board", label: "Board" },
   { key: "top", label: "Top" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discussions" },
-  { key: "inbox", label: "Decisions" },
 ];
 const isTauri = "__TAURI_INTERNALS__" in window;
 // the dispatch tab is desktop-shell-only (Tauri IPC); hidden in plain browsers
@@ -138,7 +137,7 @@ export default function App() {
   const resolve = useBridge((s) => s.resolve);
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
-  const [tab, setTab] = useState<Tab>(isTauri ? "dispatch" : "top");
+  const [tab, setTab] = useState<Tab>(isTauri ? "dispatch" : "forme");
 
   useEffect(() => {
     connectHub({
@@ -210,15 +209,20 @@ export default function App() {
         </div>
       )}
       <main className="main">
+        {tab === "forme" && (
+          <ForMeView
+            openThread={(taskId) => {
+              useKb.setState({ initialThread: taskId } as any);
+              setTab("discussions");
+            }}
+          />
+        )}
         {tab === "board" && <BoardView />}
         {tab === "top" && <TopView />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
-        {tab === "connect" && <ConnectView />}
         {tab === "dispatch" && <DispatchView />}
-        {tab === "settings" && <SettingsView />}
-        {tab === "inbox" && <Panel />}
       </main>
       {selectedId && <DecisionDetail />}
       {overlay && (

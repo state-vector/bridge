@@ -102,12 +102,13 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
 export function DiscussionsView() {
   const tasks = useKb((s) => s.tasks);
   const conn = useKb((s) => s.conn);
-  const [openId, setOpenId] = useState<string | null>(null);
+  const initialThread = useKb((s) => s.initialThread);
+  const [openId, setOpenId] = useState<string | null>(initialThread);
   const [title, setTitle] = useState("");
   const [context, setContext] = useState("");
   const [msg, setMsg] = useState("");
 
-  const threads = tasks.filter((t) => t.meta?.kind === "question");
+  const threads = tasks.filter((t) => t.meta?.kind === "question" || (t.tags ?? []).includes("question"));
   const open = openId ? threads.find((t) => t.id === openId) : null;
 
   // reopen detection: if the WS refresh drops the task, fall back to the id

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
+import { kindOf } from "../lib/views";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -59,6 +60,10 @@ interface TopRow {
   goal?: string;
   status?: string;
   blockedClass?: string;
+  subprocess?: boolean;
+  pinned?: boolean;
+  kind?: string;
+  partOf?: string;
   score?: number;
   grade?: string;
   completion?: number;
@@ -66,6 +71,8 @@ interface TopRow {
   risk?: number;
   sentiment?: string;
   will?: string;
+  unblock?: string;
+  askPending?: string;
   statusTs?: number;
   lastSignal?: number;
 }
@@ -82,22 +89,37 @@ export function TopView() {
   const rows = useMemo<TopRow[]>(() => {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
     // top = what is RUNNING right now: in_progress + blocked. todo/done/in_review are noise here.
+    // Pinned tasks (meta.pinned) ride first — the human's watchlist.
     const inFlight = tasks.filter((t) => ["in_progress", "blocked"].includes(t.status));
     const taskRows: TopRow[] = inFlight.map((t) => {
       const meta = (t.meta ?? {}) as any;
       const p = meta.last_progress;
       const agent = t.owner || "unclaimed";
       const sc: any = scoreBy.get(agent);
+      const sessionSeen = sessions.find((s) => s.label === agent)?.last_seen_ts;
+      // online = either the session pinged recently OR the task itself has a
+      // fresh signal (the runner heartbeats last_progress mid-run — session
+      // touches alone go stale during long headless opencode runs)
+      const lastFresh = Math.max(sessionSeen ?? 0, p?.ts ?? 0);
+      const online = now - lastFresh < ONLINE_MS;
+      // blocked cards: the completion column shows the EXIT CONDITION — the
+      // actionable part of being blocked. That is the "completion" of a block.
+      const unblock: string | undefined = meta.blocked?.unblock_condition;
+      const askPending: string | undefined = meta.awaiting_ask?.ask_id;
       return {
         key: t.id,
         agent,
         session: meta.session ?? p?.session,
-        online: sessions.some((s) => s.label === agent && now - s.last_seen_ts < ONLINE_MS),
-        lastSeen: sessions.find((s) => s.label === agent)?.last_seen_ts,
+        online,
+        lastSeen: sessionSeen,
         taskId: t.id,
         goal: t.title,
         status: t.status,
         blockedClass: meta.blocked?.class,
+        subprocess: !!meta.subprocess,
+        pinned: !!meta.pinned,
+        kind: kindOf(t as any),
+        partOf: (t as any).part_of,
         score: sc?.score,
         grade: sc?.grade,
         completion: p?.completion_pct,
@@ -105,24 +127,54 @@ export function TopView() {
         risk: p?.risk_pct,
         sentiment: p?.sentiment,
         will: p?.will,
+        unblock: unblock?.slice(0, 140),
+        askPending,
         statusTs: (t as any).status_ts,
-        lastSignal: p?.ts ?? t.updated_ts,
+        lastSignal: lastFresh || t.updated_ts,
       };
     });
-    // idle online sessions — visible so you can see who's alive but unloaded
+    // pinned first (meta.pinned), then subprocess/blocked, then in_progress;
+    // within a bucket, most recent signal first
     const weight: Record<string, number> = { blocked: 0, in_progress: 1 };
     return taskRows.sort(
-      (a, b) => (weight[a.status ?? ""] ?? 2) - (weight[b.status ?? ""] ?? 2)
+      (a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
+        || (weight[a.status ?? ""] ?? 2) - (weight[b.status ?? ""] ?? 2)
         || (b.lastSignal ?? b.lastSeen ?? 0) - (a.lastSignal ?? a.lastSeen ?? 0),
     );
   }, [tasks, sessions, agents, now]);
+
+  // tree view: children (verify / unblock / analysis / impl children) nested
+  // under their parent task — you can see at a glance whether the confirm
+  // round is running, parked, or missing. Orphan children (parent not in the
+  // in-flight set) render flat at the bottom.
+  const treeRows = useMemo<Array<{ row: TopRow; depth: number }>>(() => {
+    const byId = new Map(rows.map((r) => [r.taskId ?? r.key, r]));
+    const childrenOf = new Map<string, TopRow[]>();
+    const roots: TopRow[] = [];
+    for (const r of rows) {
+      if (r.partOf && byId.has(r.partOf)) {
+        const list = childrenOf.get(r.partOf) ?? [];
+        list.push(r);
+        childrenOf.set(r.partOf, list);
+      } else {
+        roots.push(r);
+      }
+    }
+    const out: Array<{ row: TopRow; depth: number }> = [];
+    const walk = (r: TopRow, depth: number) => {
+      out.push({ row: r, depth });
+      for (const c of childrenOf.get(r.taskId ?? r.key) ?? []) walk(c, depth + 1);
+    };
+    for (const r of roots) walk(r, 0);
+    return out;
+  }, [rows]);
 
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
       <div className="view-head">
         <h2>Top</h2>
-        <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. click a row for the task.</span>
+        <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
       </div>
 
       <div className="top-head">
@@ -138,26 +190,35 @@ export function TopView() {
         <span className="topc-age" title="time since last signal from this agent">last seen</span>
       </div>
 
-      {rows.map((r) => (
+      {treeRows.map(({ row: r, depth }) => (
         <div
           key={r.key}
-          className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""}`}
+          className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "top-row-child" : ""}`}
+          style={depth > 0 ? { marginLeft: `${(depth - 1) * 22}px` } : undefined}
           onClick={() => r.taskId && setSelectedTaskId(r.taskId)}
         >
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
             <span className={`conn conn-${r.online ? "open" : "closed"}`} title={r.online ? "online" : "offline"}>●</span>
+            {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
             {r.agent}
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
+            {depth > 0 && <span className="tree-branch" title={`child of ${r.partOf ?? "parent"}`}>└─ </span>}
             {r.goal ?? "—"}
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
-            {r.status === "blocked" && r.blockedClass === "subprocess"
-              ? <span className="st-chip st-amber" title="declared subprocess block">subprocess</span>
-              : r.status && <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>}
-            {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`${r.sentiment}`} />}
+            {r.status === "in_progress" && (
+              <span className="st-chip st-live" title={r.subprocess ? "in progress — declared subprocess silence (watchdog paused)" : "in progress — agent active"}>
+                in progress{r.subprocess ? " · subprocess" : ""}
+              </span>
+            )}
+            {r.status && r.status !== "in_progress" && (
+              <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>
+            )}
+            <span className={`chip chip-kind kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
+            {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`agent mood: ${r.sentiment.replace("_", " ")}`} />}
             {r.sentiment && <span className={`chip ${SENTIMENT_CHIP[r.sentiment] ?? ""} top-sent`}>{r.sentiment.replace("_", " ")}</span>}
           </span>
           <span className="topc-score">
@@ -170,19 +231,32 @@ export function TopView() {
           <span className={`topc-gauge top-num ${pctTone(r.confidence, true)}`}>{r.confidence != null ? `${r.confidence}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className="topc-bar">
-            <span className="top-bar"><span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} /></span>
-            <span className="top-bar-label top-num num-comp">{r.completion != null ? `${r.completion}%` : "—"}</span>
+            {r.status === "blocked" && (r.unblock || r.askPending) ? (
+              <span
+                className="top-unblock"
+                title={r.askPending ? `blocked on decision — awaiting answer to ask ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
+              >
+                {r.askPending
+                  ? <><span className="chip chip-urgent">ask</span> awaiting answer to {r.askPending}</>
+                  : <><span className="chip chip-scope">exit</span> {r.unblock}</>}
+              </span>
+            ) : (
+              <>
+                <span className="top-bar"><span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} /></span>
+                <span className="top-bar-label top-num num-comp">{r.completion != null ? `${r.completion}%` : "—"}</span>
+              </>
+            )}
           </span>
           <span className="topc-age top-num">{r.statusTs ? age(r.statusTs, now) : "—"}</span>
           <span className={`topc-age top-num age-${r.lastSignal ? staleness(r.lastSignal, now) : "dead"}`}>{age(r.lastSignal ?? r.lastSeen, now)}</span>
         </div>
       ))}
 
-      {rows.length === 0 && (
+      {treeRows.length === 0 && (
         <p className="empty">No fleet activity — agents appear here when they claim work.</p>
       )}
 
-      {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />}
+      {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
     </div>
   );
 }

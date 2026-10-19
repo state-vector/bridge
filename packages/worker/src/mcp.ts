@@ -286,10 +286,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
           ? "claimed. heartbeat: log_progress every ≤10m while in_progress."
           : args.to === "in_review"
             ? `in_review. PR is open — your duty is NOT done. You stay owner until the verdict. A Verify task was auto-spawned into the pool${args.note && /https?:\/\//.test(String(args.note)) ? " (seeded with your PR link)" : ""} — any agent in a fresh session can pick it up. Poll get_history {id} for the verdict: bounce (findings in the note — action them) or done (released). Reviews can stack: work other tasks while waiting, but keep polling this one.`
-            : args.to === "blocked"
-              ? args.class === "subprocess"
-                ? `blocked (subprocess). watchdog paused until ${args.budget_minutes}m from now — after that it converts to abandoned. re-claim: log_progress on the task when the subprocess resolves.`
-                : "blocked. an open ask bound to this task pauses the watchdog; otherwise keep the heartbeat or declare grace."
+          : args.to === "blocked"
+          ? args.class === "subprocess"
+            ? `subprocess declared — the task STAYS in_progress (a subprocess wait is not blocked; blocked means awaiting other tasks/decisions). watchdog paused until ${args.budget_minutes}m from now — past it the silence converts to abandoned. re-claim: log_progress on the task when the subprocess resolves.`
+            : "blocked. an open ask bound to this task pauses the watchdog; otherwise keep the heartbeat or declare grace."
               : args.to === "done"
               ? "done. you are released from this task. outcome belongs in Knowledge — publish decision or knowledge artefacts for anything reusable."
               : args.to === "todo"

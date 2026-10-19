@@ -36,6 +36,8 @@ interface KbState {
   lastSeq: number;
   tokens: KbAuthToken[];
   settings: Record<string, any>;
+  /** cross-tab handoff: thread id For Me wants Discussions to open */
+  initialThread: string | null;
 
   start: () => void;
   stop: () => void;
@@ -65,6 +67,7 @@ export const useKb = create<KbState>((set, get) => ({
   lastSeq: 0,
   tokens: [],
   settings: {},
+  initialThread: null,
 
   start: () => {
     stopWs?.();
@@ -94,7 +97,7 @@ export const useKb = create<KbState>((set, get) => ({
   reset: () => {
     stopWs?.();
     stopWs = null;
-    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], settings: {} });
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], settings: {}, initialThread: null });
   },
 
   refresh: async () => {

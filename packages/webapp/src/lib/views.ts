@@ -54,3 +54,17 @@ export function myAnswers(events: EventView[], me: string): EventView[] {
 export function presenceLabel(p: Presence): string {
   return p.label && p.label !== p.id ? p.label : (p.id.split(":")[1] ?? p.id);
 }
+
+/** What the task IS: question / verify / analysis / research / impl. */
+export function kindOf(task: { tags?: string[] | null; meta?: any }): string {
+  const tags = (task.tags ?? []) as string[];
+  const m = task.meta ?? {};
+  if (m.kind === "question" || tags.includes("question")) return "question";
+  if (tags.includes("role:review") || m.kind === "review") return "verify";
+  if (tags.includes("role:analysis") || m.kind === "analysis") return "analysis";
+  if (m.kind === "research") return "research";
+  return "impl";
+}
+
+/** Task references (BR#12, TASK-007) inside arbitrary text — for hyperlinking. */
+export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+)\b/g;

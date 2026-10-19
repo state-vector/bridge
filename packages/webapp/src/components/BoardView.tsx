@@ -1,8 +1,31 @@
 import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import type { BoardPrefs } from "../store/kb";
-import { rel } from "../lib/views";
+import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
+
+/** Render text with task references (BR#12, TASK-007) as clickable links. */
+function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
+  const parts = text.split(TASK_REF_RE);
+  return (
+    <>
+      {parts.map((p, i) =>
+        /^(BR#\d+|TASK-\d+)$/.test(p) ? (
+          <span
+            key={i}
+            className="task-ref"
+            title={`open ${p}`}
+            onClick={(e) => { e.stopPropagation(); onOpen(p); }}
+          >
+            {p}
+          </span>
+        ) : (
+          <span key={i}>{p}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 const COLUMNS = [
   { key: "todo", label: "To do" },
@@ -116,18 +139,16 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       <div className="task-title" title={task.title}>
         {active && <span className="pulse" title="updated recently" />}
         {prefs.issue && <span className="task-id">{task.id}</span>}
-        {task.title}
+        <RefText text={task.title} onOpen={(id) => onOpen(id)} />
       </div>
       <div className="task-row task-status-row">
-        {prefs.status && task.status === "blocked" && task.meta?.blocked?.class === "subprocess" && !task.meta?.blocked?.reason?.startsWith("abandoned") ? (
-          <span
-            className="st-chip st-amber"
-            title={`declared subprocess block — watchdog paused until the declared budget lapses\n\n${task.meta.blocked.reason ?? ""}`}
-          >
-            subprocess · {task.meta.blocked.reason}
-            {task.meta.blocked.deadline_ts ? ` · until ${new Date(task.meta.blocked.deadline_ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+        <span className={`chip chip-kind kind-pill kp-${kindOf(task)}`} title="task kind">{kindOf(task)}</span>
+        {prefs.status && task.status === "in_progress" && (
+          <span className="st-chip st-live" title={task.meta?.subprocess ? `in progress — declared subprocess silence (watchdog paused until the budget lapses)\n\n${task.meta.subprocess.reason ?? ""}` : "in progress — agent active"}>
+            in progress{task.meta?.subprocess ? " · subprocess" : ""}
           </span>
-        ) : prefs.status && (
+        )}
+        {prefs.status && task.status !== "in_progress" && (
           <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>
         )}
         {prefs.age && task.status === "in_progress" && task.meta?.grace_until && task.meta.grace_until > now && (
@@ -155,12 +176,12 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
 
       {prefs.snippet && (() => {
         const snippet = (task.body_md ?? "").split("\n").find((l: string) => l.trim() && !l.startsWith("#")) ?? "";
-        return snippet ? <div className="task-snippet">{snippet.slice(0, 140)}{snippet.length > 140 ? "…" : ""}</div> : null;
+        return snippet ? <div className="task-snippet"><RefText text={snippet.slice(0, 140) + (snippet.length > 140 ? "…" : "")} onOpen={(id) => onOpen(id)} /></div> : null;
       })()}
 
       {p?.will && (
         <div className="task-snippet task-will" title="the agent's declared next action — what it was about to do when it last checked in">
-          ▸ {p.will.slice(0, 140)}{p.will.length > 140 ? "…" : ""}
+          ▸ <RefText text={p.will.slice(0, 140) + (p.will.length > 140 ? "…" : "")} onOpen={(id) => onOpen(id)} />
         </div>
       )}
 
@@ -339,7 +360,7 @@ export function BoardView() {
 
   return (
     <div className="board-wrap">
-      {selectedTaskId && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={() => setSelectedTaskId(null)} />}
+      {selectedTaskId && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={() => setSelectedTaskId(null)} onOpen={(id) => { setSelectedTaskId(id); setBlockedIntent(false); }} />}
       <div className="view-head">
         <h2>Board</h2>
         <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
