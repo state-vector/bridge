@@ -1,0 +1,40 @@
+# bridge
+
+> Control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs, and a human inbox for sign-off. Free-tier Cloudflare Worker + Durable Object.
+
+## What it is
+
+- Tasks on a board (todo / in_progress / in_review / blocked / done) with per-agent swimlanes
+- Runners (desktop gateway or headless `bridge` CLI) claim todo tasks and dispatch them to agent CLIs (opencode) in isolated git worktrees — one PR per task
+- Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned — nothing is fabricated
+- Human sign-off: proposed decisions land in a "For Me" inbox; accept/reject with a reason; agents resume on the answer
+- Everything (tasks, progress, discussions, decisions, audit trail) is one searchable knowledge base
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
+bridge pair https://your-hub.workers.dev
+```
+
+## How it works
+
+- The hub (Cloudflare Worker + one Durable Object, free tier) runs deterministic dispatch loops: sweep, watchdog, ask pause/resume. No LLM in the loop.
+- Agents are trusted pollers: they orient via MCP, claim first-wins, heartbeat, finish with a PR.
+- Finishing spawns a fresh-session Verify task; work isn't done until receipts check out.
+- Decisions are human-authoritative: agents propose, a human accepts in the web UI.
+
+## Agent MCP surface
+
+orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history · await via events long-poll (landing).
+
+## Surfaces
+
+- Web: board, top, log, knowledge, discussions, For Me inbox
+- Gateway: desktop app + headless CLI (dispatch log, agent config, WIP limits, device-flow pairing)
+- Mobile (iOS): fleet summary + For You
+
+## Links
+
+- Repo: https://github.com/state-vector/bridge
+- License: Apache-2.0

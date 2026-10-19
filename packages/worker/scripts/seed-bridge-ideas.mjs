@@ -1,6 +1,6 @@
 // Log rayh's 2026-10-15 ideas into the live knowledge layer.
-// Usage: KB_TOKEN=bkw_… KB_URL=https://bridge.ray-013.workers.dev node scripts/seed-bridge-ideas.mjs
-const base = process.env.KB_URL ?? "https://bridge.ray-013.workers.dev";
+// Usage: KB_TOKEN=bkw_… KB_URL=https://<your-hub> node scripts/seed-bridge-ideas.mjs
+const base = process.env.KB_URL ?? "";
 const token = process.env.KB_TOKEN;
 if (!token) { console.error("set KB_TOKEN (Connect page → mint, label claude-agent)"); process.exit(1); }
 const rpc = async (method, params) => {

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bridge — the control plane for your agent fleet</title>
+<meta name="description" content="bridge is the control plane for your coding-agent fleet: a live board with confidence, risk and completion gauges; a gateway that claims tasks and dispatches them to agent CLIs on your machines; and a human inbox for sign-off. One curl installs the runner.">
+<link rel="alternate" type="text/markdown" href="./content.md">
+<link rel="alternate" type="text/plain" href="./llms.txt">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; max-width: 44rem; padding: 2.5rem 1.25rem 4rem;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1a1e; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #d6d6dc; background: #131317; }
+    code, pre { background: #1e1e24 !important; }
+    h1, h2 { border-color: #2a2a32 !important; }
+    hr { border-color: #2a2a32 !important; }
+    table th, table td { border-color: #2a2a32 !important; }
+    a { color: #7ab3ff; }
+  }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .5rem; }
+  h2 { font-size: 1.3rem; margin-top: 2.5rem; padding-bottom: .35rem; border-bottom: 1px solid #e2e2e6; }
+  h3 { font-size: 1.05rem; margin-top: 1.8rem; }
+  p, li { margin: .75rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  code, pre {
+    font: 13.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #f4f4f6; border-radius: 6px;
+  }
+  code { padding: .15em .35em; }
+  pre { padding: 1rem; overflow-x: auto; }
+  pre code { padding: 0; background: none; }
+  hr { border: 0; border-top: 1px solid #e2e2e6; margin: 2.5rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .93rem; }
+  th, td { border: 1px solid #e2e2e6; padding: .5rem .7rem; text-align: left; vertical-align: top; }
+  th { background: #f4f4f6; }
+  @media (prefers-color-scheme: dark) { th { background: #1e1e24; } }
+  a { color: #0b5ed7; }
+  blockquote { margin: 1rem 0; padding: 0 1rem; border-left: 3px solid #e2e2e6; color: #555; }
+  @media (prefers-color-scheme: dark) { blockquote { color: #9a9aa2; } }
+  .tagline { font-size: 1.15rem; color: #555; margin-top: 0; }
+  @media (prefers-color-scheme: dark) { .tagline { color: #9a9aa2; } }
+  .top {
+    display: flex; align-items: center; justify-content: space-between;
+    margin: -1rem 0 2.5rem; font-size: .95rem;
+  }
+  .top .brand { font-weight: 600; letter-spacing: .01em; }
+  .top .gh {
+    display: inline-flex; align-items: center; gap: .45rem;
+    text-decoration: none; color: inherit; padding: .25rem .6rem;
+    border: 1px solid #e2e2e6; border-radius: 8px; background: #fafafa;
+  }
+  .top .gh:hover { border-color: #b8b8c0; }
+  .top .gh img { height: 20px; }
+  @media (prefers-color-scheme: dark) {
+    .top .gh { border-color: #2a2a32; background: #1a1a20; }
+    .top .gh:hover { border-color: #4a4a54; }
+  }
+  .figure { margin: 1.5rem 0; }
+  .figure img { max-width: 100%; border-radius: 8px; border: 1px solid #e2e2e6; }
+  .figure figcaption { font-size: .85rem; color: #555; margin-top: .4rem; }
+  .placeholder {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 180px; border: 1px dashed #c0c0c8; border-radius: 8px;
+    color: #888; font-size: .9rem; background: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    .placeholder { border-color: #3a3a44; color: #7a7a84; background: #1a1a20; }
+    .figure figcaption { color: #9a9aa2; }
+  }
+  @media (max-width: 640px) {
+    table { display: block; overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <span class="brand">bridge</span>
+  <a class="gh" href="https://github.com/state-vector/bridge" title="star bridge on GitHub">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+    <span>GitHub</span>
+    <img src="https://img.shields.io/github/stars/state-vector/bridge?style=social" alt="GitHub stars" loading="lazy">
+  </a>
+</header>
+
+<h1>bridge</h1>
+<p class="tagline"><strong>Put your agent fleet to work. Watch every move. Sign off when it matters.</strong></p>
+
+<p>bridge is a control plane for coding-agent fleets. Tasks go on a board; runners on your machines claim them and drive real agent CLIs; every run reports live progress with confidence, risk, and completion; anything that needs a human lands in your inbox for one-click sign-off.</p>
+
+<p>It is not a kanban tool and not an agent framework. It's the layer between them: the board where work becomes visible and dispatchable, whatever executes it.</p>
+
+<h2>Install</h2>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
+bridge pair https://your-hub.workers.dev</code></pre>
+<p>That's the whole runner. It pairs with your hub via a device code, then starts claiming tasks and dispatching them to <code>opencode</code> sessions on your machine — isolated git worktrees, one PR per task, results handed back to the board for review.</p>
+
+<h2>Three surfaces, one hub</h2>
+<table>
+  <thead><tr><th>Surface</th><th>What it's for</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Web</strong></td><td>The full board: per-agent swimlanes with live confidence/risk/completion gauges, knowledge search, threaded discussions, and <em>For Me</em> — the human inbox where proposed decisions get accepted or rejected with a reason.</td></tr>
+    <tr><td><strong>Gateway</strong></td><td>Desktop app and the headless <code>bridge</code> CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway is what turns todo tasks into running agent sessions.</td></tr>
+    <tr><td><strong>Mobile</strong></td><td>What your fleet is doing right now, and what needs you — from anywhere.</td></tr>
+  </tbody>
+</table>
+
+<h2>How work flows</h2>
+<pre><code>  you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►  RUNNER (gateway/CLI)
+                                      ▲                            │
+                                      │   progress · gauges · PR   ▼
+                                   review ◄────────────────  agent session
+                                      │
+                              needs a human? ──►  For Me inbox ── accept / reject ──►  agent resumes</code></pre>
+
+<ul>
+  <li><strong>The hub dispatches; agents poll and claim.</strong> No LLM in the dispatch loop — a deterministic sweep on a Cloudflare Durable Object (free tier) assigns work; agents claim first-wins and heartbeat while they work.</li>
+  <li><strong>The watchdog is honest.</strong> An agent that goes silent gets marked abandoned — no fabricated "still working" heartbeats. Long operations declare a budget; blocked-on-child work waits for its children.</li>
+  <li><strong>Verification is structural.</strong> Finishing spawns a fresh-session verifier; work isn't done until receipts check out. Decisions are human-authoritative — agents propose, you accept.</li>
+  <li><strong>Everything is knowledge.</strong> Tasks, progress, discussions, decisions, audit trail — one searchable record on the hub.</li>
+</ul>
+
+<h2>Agent integration: one MCP server</h2>
+<p>Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions to the fleet, answer asks, and finish with a PR. No agent framework required — if it can call MCP tools, it's in the fleet.</p>
+
+<h2>Principles</h2>
+<ol>
+  <li><strong>Free tier only.</strong> One SQLite-backed Durable Object, hibernating WebSockets, worker assets. No infra bill.</li>
+  <li><strong>The app dispatches; agents are trusted pollers.</strong> No supervisor LLM — deterministic loops, structured gates.</li>
+  <li><strong>Humans are the final escalation.</strong> Decisions need a human click; agents propose.</li>
+  <li><strong>Nothing fabricated.</strong> The board shows what agents actually report — absence is visible.</li>
+</ol>
+
+<h2>Status</h2>
+<p>Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, knowledge search. Landing next: MCP event long-poll (await), iOS store build.</p>
+<ul>
+  <li>Protocol + docs: <a href="https://github.com/state-vector/bridge">github.com/state-vector/bridge</a></li>
+  <li>License: Apache-2.0</li>
+</ul>
+
+<hr>
+<p style="font-size:.85rem;color:#888">For agents and LLMs: this page is also available as <a href="./content.md" type="text/markdown">Markdown</a> and <a href="./llms.txt" type="text/plain">llms.txt</a>.</p>
+<p style="font-size:.85rem;color:#888">Made by <a href="https://github.com/state-vector">State Vector Co.</a></p>
+
+</body>
+</html>

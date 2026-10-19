@@ -1,17 +1,17 @@
 # Deploy runbook — flows POC
 
-Prereqs: Cloudflare account `013b6a2b6f3dfb6c8d48657769681087`, Zero Trust enabled,
-Access application created for the workers.dev hostname (AUD `02bf2012058821d837180e16d3146cc0`).
+Prereqs: your Cloudflare account, Zero Trust enabled,
+Access application created for the workers.dev hostname (AUD from the Access app).
 
 ## 1. Worker
 
 Deploys are **push-to-main** — Cloudflare's git integration builds and ships the worker on every push to `main`. Local `npx wrangler deploy` from the box still works for out-of-band fixes. Do NOT wire GitHub Actions deploys. CI, when added, is for tests only.
 
 ```bash
-cd ~/flows/packages/worker
+cd ~/bridge/packages/worker
 export CLOUDFLARE_API_TOKEN=<token>
 npx wrangler deploy
-# note the printed URL: https://flows.<subdomain>.workers.dev
+# note the printed URL: https://<your-subdomain>.workers.dev
 ```
 
 Secrets (not in wrangler.toml):
@@ -29,12 +29,12 @@ HMAC session cookie (30d), signed with `GITHUB_CLIENT_SECRET`. Anyone with a
 GitHub account can sign in (public app).
 
 1. github.com → Settings → Developer settings → OAuth Apps → **New OAuth App**:
-   - Homepage: `https://bridge.ray-013.workers.dev`
-   - Callback: `https://bridge.ray-013.workers.dev/login/callback`
+   - Homepage: `https://<your-subdomain>.workers.dev`
+   - Callback: `https://<your-subdomain>.workers.dev/login/callback`
 2. Store the secrets:
 
 ```bash
-cd ~/flows/packages/worker
+cd ~/bridge/packages/worker
 npx wrangler secret put GITHUB_CLIENT_ID
 npx wrangler secret put GITHUB_CLIENT_SECRET
 # rotate = re-put (also invalidates all session cookies — they're HMAC-signed with the secret)
@@ -58,8 +58,8 @@ switches to Cloudflare Access JWT validation at the edge — both paths ship.)
 ```bash
 # one-time env (in ~/.hermes/.env so the unit's EnvironmentFile picks it up):
 #   FLOWS_INGEST_TOKEN=<same token as step 1>
-sed -i "s/REPLACE-SUBDOMAIN/<subdomain>/" ~/flows/packages/adapters/flows-shipper.service
-mkdir -p ~/.config/systemd/user && cp ~/flows/packages/adapters/flows-shipper.service ~/.config/systemd/user/
+sed -i "s/REPLACE-SUBDOMAIN/<subdomain>/" ~/bridge/packages/adapters/flows-shipper.service
+mkdir -p ~/.config/systemd/user && cp ~/bridge/packages/adapters/flows-shipper.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now flows-shipper
 journalctl --user -u flows-shipper -f        # expect "shipped N: {...}"
 ```

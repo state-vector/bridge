@@ -11,8 +11,9 @@ export function isTauri(): boolean {
 }
 
 const env = import.meta.env;
-const DEFAULT_LIVE_URL =
-  (env.VITE_HUB_URL as string | undefined) ?? "https://bridge.ray-013.workers.dev";
+// Hub URL comes from the environment (VITE_HUB_URL at build time) or the
+// browser origin — no personal deployment is baked into the source.
+const DEFAULT_LIVE_URL = (env.VITE_HUB_URL as string | undefined) ?? "";
 
 export function getConfig() {
   const mode =

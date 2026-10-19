@@ -1,0 +1,19 @@
+[package]
+name = "bridge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "bridge headless runner — claim bridge tasks and dispatch them to agent CLIs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+[profile.release]
+strip = true
+lto = true
