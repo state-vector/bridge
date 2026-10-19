@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "bridge desktop — Tauri menubar shell (decisions + presence, actionable notifications) over @flows/webapp",
+  "description": "bridge desktop — gateway/dispatch shell (minimal gateway UI + Rust dispatch core)",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",

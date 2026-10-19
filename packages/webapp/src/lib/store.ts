@@ -39,25 +39,9 @@ interface BridgeState {
 let seenDecisions = new Set<string>();
 
 function notifyDecision(d: Decision) {
-  void (async () => {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("notify_ask", {
-        askId: d.id,
-        asker: d.asker?.split(":")[1] ?? d.board ?? d.kind ?? "hub",
-        question: d.reason ? `${d.title} — ${d.reason}` : d.title,
-        options: d.options?.length
-          ? d.options.slice(0, 4).map((o) => ({ id: o.id, label: o.label }))
-          : [
-              { id: "unblock", label: "Unblock" },
-              { id: "done", label: "Done" },
-            ],
-        urgent: d.urgency === "time-sensitive",
-      });
-    } catch {
-      /* plain browser */
-    }
-  })();
+  // desktop notifications are the gateway shell's job (packages/desktop);
+  // the web UI stays browser-pure — no Tauri invokes here.
+  void d;
 }
 
 export const useBridge = create<BridgeState>((set, get) => {

@@ -7,7 +7,9 @@
     "packages/specs",
     "packages/worker",
     "packages/webapp",
-    "packages/desktop"
+    "packages/desktop",
+    "packages/desktop/ui",
+    "packages/mobile/ui"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
