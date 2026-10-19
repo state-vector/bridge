@@ -1,8 +1,8 @@
 # bridge
 
-**A control plane for coding-agent fleets: dispatch, live progress, and human sign-off.**
+**The outer loop for agentic development.**
 
-bridge is a control plane for coding-agent fleets. Tasks go on a board. Runners on your machines claim tasks and drive agent CLIs. Every run reports live progress with completion, confidence, and risk. Work that needs a human lands in an inbox for one-click sign-off.
+Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.
 
 It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.
 

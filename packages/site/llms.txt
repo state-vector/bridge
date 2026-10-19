@@ -1,6 +1,6 @@
 # bridge
 
-> Control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs, and a human inbox for sign-off. Free-tier Cloudflare Worker + Durable Object.
+> The outer loop for agentic development. Agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. Free-tier Cloudflare Worker + Durable Object.
 
 ## What it is
 

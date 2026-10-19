@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bridge: the control plane for your agent fleet</title>
-<meta name="description" content="bridge is the control plane for your coding-agent fleet: a live board with confidence, risk and completion gauges; a gateway that claims tasks and dispatches them to agent CLIs on your machines; and a human inbox for sign-off. One curl installs the runner.">
+<title>bridge: the outer loop for agentic development</title>
+<meta name="description" content="bridge is the outer loop for agentic development: agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. One curl installs the runner.">
 <link rel="alternate" type="text/markdown" href="./content.md">
 <link rel="alternate" type="text/plain" href="./llms.txt">
 <style>
@@ -108,11 +108,11 @@
 </header>
 
 <h1>bridge<span class="cursor" aria-hidden="true"></span></h1>
-<p class="tagline"><strong>A control plane for coding-agent fleets: dispatch, live progress, and human sign-off.</strong></p>
+<p class="tagline"><strong>The outer loop for agentic development.</strong></p>
 
-<p>bridge is a control plane for coding-agent fleets. Tasks go on a board. Runners on your machines claim tasks and drive agent CLIs. Every run reports live progress with completion, confidence, and risk. Work that needs a human lands in an inbox for one-click sign-off.</p>
+<p>Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.</p>
 
-<p>It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.</p>
+<p>It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible, dispatchable, and accountable, whatever executes it.</p>
 
 <h2>Install</h2>
 <pre><code><span style="color: var(--green);">$</span> curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
