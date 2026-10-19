@@ -62,6 +62,7 @@ export interface KbSeriesPoint {
   completion_pct?: number;
   confidence_pct?: number;
   risk_pct?: number;
+  context_pct?: number;
 }
 
 /** One entry of an artefact's version history: every mutation, who/when/what. */

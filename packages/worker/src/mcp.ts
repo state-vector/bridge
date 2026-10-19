@@ -312,7 +312,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     }
     case "log_progress": {
       const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
-      const hasGauges = args.completion_pct != null || args.confidence_pct != null || args.risk_pct != null;
+      const hasGauges = args.completion_pct != null || args.confidence_pct != null || args.risk_pct != null || args.context_pct != null;
       const graceUntil = typeof a.grace_until === "number" ? a.grace_until : undefined;
       return text(JSON.stringify({
         ...a,
@@ -320,7 +320,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
           ? `grace declared — watchdog paused until ${new Date(graceUntil).toISOString()} (${args.grace_minutes}m). Overrun it and the task is abandoned. Re-claim with log_progress when back.`
           : hasGauges
             ? undefined
-            : "logged without gauges. include completion_pct / confidence_pct / risk_pct — they chart on the card, drive prioritisation, and count toward your score.",
+            : "logged without gauges. include completion_pct / confidence_pct / risk_pct / context_pct — they chart on the card, drive prioritisation, and count toward your score.",
       }));
     }
     case "ask_agent": {
@@ -472,6 +472,7 @@ const TOOLS = [
         completion_pct: { type: "integer", minimum: 0, maximum: 100 },
         confidence_pct: { type: "integer", minimum: 0, maximum: 100 },
         risk_pct: { type: "integer", minimum: 0, maximum: 100 },
+        context_pct: { type: "integer", minimum: 0, maximum: 100, description: "how full your context window is (0-100) — lets the board track context pressure and spot sessions that should hand off before degrading" },
       },
     },
   },

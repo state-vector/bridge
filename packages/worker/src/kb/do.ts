@@ -1294,7 +1294,7 @@ export class KnowledgeHub {
 
   /**
    * Fine-grained progress from a working agent: note + sentiment, shown live on the board.
-   * Optional self-reported gauge fields: completion_pct, confidence_pct, risk_pct (0–100).
+   * Optional self-reported gauge fields: completion_pct, confidence_pct, risk_pct, context_pct (0–100).
    * completion = how far along; confidence = belief the result is right; risk = chance of
    * failure/drift. Correlated, not the same — charted as separate series.
    */
@@ -1307,6 +1307,7 @@ export class KnowledgeHub {
     const completion_pct = pct(body.completion_pct);
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
+    const context_pct = pct(body.context_pct);
     const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
@@ -1331,7 +1332,7 @@ export class KnowledgeHub {
       // question tasks: contributions never claim — the author closes with an ADR
       if (tTags.includes("question")) {
         return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
           note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task).",
         };
       }
@@ -1339,7 +1340,7 @@ export class KnowledgeHub {
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
         return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, instructions,
+          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
           note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`,
         };
       }
@@ -1361,16 +1362,16 @@ export class KnowledgeHub {
       delete meta.subprocess;
     }
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
-    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct };
+    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
     );
     this.audit(actor, "progress", id, { note, sentiment, will: will || undefined });
-    this.version(id, actor, "progress", note, { note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct });
+    this.version(id, actor, "progress", note, { note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct });
     return {
-      id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct,
+      id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct,
       grace_until: graceUntil, instructions,
     };
   }

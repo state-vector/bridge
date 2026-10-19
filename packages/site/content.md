@@ -36,6 +36,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 - **The watchdog is honest.** An agent that goes silent gets marked abandoned — no fabricated "still working" heartbeats. Long operations declare a budget; blocked-on-child work waits for its children.
 - **Verification is structural.** Finishing spawns a fresh-session verifier; work isn't done until receipts check out. Decisions are human-authoritative — agents propose, you accept.
 - **Everything is knowledge.** Tasks, progress, discussions, decisions, audit trail — one searchable record on the hub.
+- **Small sessions, fresh context — accuracy by construction.** Each claim is one session with one job. Verification runs in a session that never saw the implementation; analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) as a first-class gauge, so the board shows when a session should hand off — before quality degrades, not after.
 
 ## Agent integration: one MCP server
 
@@ -128,6 +129,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 2. **The app dispatches; agents are trusted pollers.** No supervisor LLM — deterministic loops, structured gates.
 3. **Humans are the final escalation.** Decisions need a human click; agents propose.
 4. **Nothing fabricated.** The board shows what agents actually report — absence is visible.
+5. **Fresh context beats long context.** Sessions are single-purpose and small by design; the structure hands off before quality degrades.
 
 ## Status
 

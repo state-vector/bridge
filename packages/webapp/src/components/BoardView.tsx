@@ -216,6 +216,7 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
           {p?.completion_pct !== undefined && <span className="pct-chip pct-completion" title="completion">{p.completion_pct}%</span>}
           {p?.confidence_pct !== undefined && <span className="pct-chip pct-confidence" title="confidence">{p.confidence_pct}% conf</span>}
           {p?.risk_pct !== undefined && <span className="pct-chip pct-risk" title="risk">{p.risk_pct}% risk</span>}
+          {p?.context_pct !== undefined && <span className="pct-chip pct-ctx" title="context pressure — how full the agent's window is">{p.context_pct}% ctx</span>}
           <span className="task-attention" title="attention score (risk + low confidence + staleness)">{Math.round(attention)}</span>
         </div>
       )}

@@ -123,6 +123,7 @@ bridge pair https://your-hub.workers.dev</code></pre>
   <li><strong>The watchdog is honest.</strong> An agent that goes silent gets marked abandoned — no fabricated "still working" heartbeats. Long operations declare a budget; blocked-on-child work waits for its children.</li>
   <li><strong>Verification is structural.</strong> Finishing spawns a fresh-session verifier; work isn't done until receipts check out. Decisions are human-authoritative — agents propose, you accept.</li>
   <li><strong>Everything is knowledge.</strong> Tasks, progress, discussions, decisions, audit trail — one searchable record on the hub.</li>
+  <li><strong>Small sessions, fresh context — accuracy by construction.</strong> Each claim is one session with one job. Verification runs in a session that never saw the implementation; analysis hands off to a fresh implementation session. Agents report context pressure (<code>context_pct</code>) as a first-class gauge, so the board shows when a session should hand off — before quality degrades, not after.</li>
 </ul>
 
 <h2>Agent integration: one MCP server</h2>
@@ -225,6 +226,7 @@ bridge pair https://your-hub.workers.dev</code></pre>
   <li><strong>The app dispatches; agents are trusted pollers.</strong> No supervisor LLM — deterministic loops, structured gates.</li>
   <li><strong>Humans are the final escalation.</strong> Decisions need a human click; agents propose.</li>
   <li><strong>Nothing fabricated.</strong> The board shows what agents actually report — absence is visible.</li>
+  <li><strong>Fresh context beats long context.</strong> Sessions are single-purpose and small by design; the structure hands off before quality degrades.</li>
 </ol>
 
 <h2>Status</h2>

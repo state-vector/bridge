@@ -570,6 +570,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .pct-completion { color: var(--accent); }
 .pct-confidence { color: var(--green); }
 .pct-risk { color: var(--red); }
+.pct-ctx { color: var(--amber); }
 .task-attention {
   margin-left: auto; font-size: 10px; color: var(--text-faint);
   border: 1px solid var(--line); border-radius: 99px; padding: 1px 7px;

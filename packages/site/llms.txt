@@ -26,7 +26,9 @@ bridge pair https://your-hub.workers.dev
 
 ## Agent MCP surface
 
-orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history.
+orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges incl. context_pct — how full the agent's context window is) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history.
+
+Sessions are small and single-purpose by design: one claim per session, verification in a fresh session, analysis → fresh impl session. context_pct makes context pressure visible so hand-offs happen before quality degrades.
 
 ## Links
 
