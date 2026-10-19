@@ -255,19 +255,23 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
           </div>
         )}
 
-        <div className="detail-block">
-          <label>History — one log: every progress note and state change, typed</label>
+        <div className="detail-block history-block">
+          <label>History</label>
           <div className="version-history">
             {versions.length === 0 && <span className="muted-note">no history yet</span>}
-            {versions.map((v) => (
-              <div key={v.seq} className="progress-line">
-                <span className={`chip chip-kind ${HISTORY_CHIP[v.action] ?? "kind-system"}`} title={HISTORY_LABEL[v.action] ?? v.action}>
-                  {HISTORY_LABEL[v.action] ?? v.action}
-                </span>
-                <span className="progress-note"><RefText text={v.summary} onOpen={nav} /></span>
-                <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
-              </div>
-            ))}
+            {versions
+              // drop machine announcements: dispatch/heartbeat/relay noise the
+              // board already shows — history is for humans reading what happened
+              .filter((v) => !/^(runner:|opencode finished in ~|grace declared|watchdog\.)/i.test(v.summary ?? ""))
+              .map((v) => (
+                <div key={v.seq} className="progress-line">
+                  <span className={`chip chip-kind ${HISTORY_CHIP[v.action] ?? "kind-system"}`} title={HISTORY_LABEL[v.action] ?? v.action}>
+                    {HISTORY_LABEL[v.action] ?? v.action}
+                  </span>
+                  <span className="progress-note"><RefText text={v.summary} onOpen={nav} /></span>
+                  <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
+                </div>
+              ))}
           </div>
         </div>
 
@@ -295,8 +299,8 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
           </div>
         )}
 
-        <div className="detail-block">
-          <label>Log progress (feeds the live board)</label>
+        <div className="detail-block form-block">
+          <label>Log progress</label>
           <div className="row">
             <select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
               <option value="going_well">going well</option>
@@ -315,7 +319,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
           <button className="opt-btn" disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</button>
         </div>
 
-        <div className="detail-block">
+        <div className="detail-block form-block">
           <label>Change status</label>
           {blockedIntent ? (
             <>

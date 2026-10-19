@@ -230,9 +230,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .detail-panel {
   position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100vw);
   background: var(--bg-raised); border-left: 1px solid var(--line);
-  padding: 18px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 11px;
+  padding: 18px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
   animation: slide-in 0.18s ease-out;
 }
+/* the panel is full height: description + history breathe instead of stacking
+   squished above tall forms; forms pin to the visual bottom via margin-top:auto */
+.detail-panel .detail-block.history-block { flex: 1 1 auto; min-height: 160px; }
+.detail-panel .detail-block.form-block { margin-top: auto; }
 @keyframes slide-in { from { transform: translateX(30px); opacity: 0; } }
 
 .detail-head { display: flex; justify-content: space-between; align-items: center; }
@@ -615,7 +619,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .pct-inputs { display: flex; gap: 6px; }
 .pct-inputs input { width: 33%; background: var(--bg); border: 1px solid var(--line); border-radius: 7px; color: var(--text); padding: 6px 8px; font-size: 12px; }
-.version-history { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.version-history { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; flex: 1 1 auto; }
 .version-history .progress-line { border-bottom: 1px solid var(--line); }
 .age-done { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
 .age-done { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
