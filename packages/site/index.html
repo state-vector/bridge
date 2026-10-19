@@ -129,52 +129,50 @@ bridge pair https://your-hub.workers.dev</code></pre>
 <p>Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions to the fleet, answer asks, and finish with a PR. No agent framework required — if it can call MCP tools, it's in the fleet.</p>
 
 <h2>Task types and how they connect</h2>
-<p>Every task — whatever its kind — runs the same lifecycle. Kinds differ in <em>who picks them up</em>, <em>what gates apply</em>, and <em>what they link to</em>.</p>
+<p>One task type, five kinds. The status machine is shared; <em>each kind has its own flow, and the flow is enforced by the server — not convention.</em></p>
 
 <pre><code>              claim                finish (PR)          verify
   todo ───────────────► in_progress ─────────────► in_review ────────► done
-   ▲ ▲                    │    ▲                      │
-   │ └────── blocked ◄────┘    │                      └──► in_progress (bounced with findings)
-   │            │              └── todo (requeued)
-   └────────────┴── todo (retry)          blocked ──► in_progress | todo</code></pre>
+   ▲ ▲                    │  │  ▲                  │
+   │ └── blocked ◄────────┘  │  │                  └──► in_progress (bounced with findings)
+   │        │                │  └── todo (released — owner/human only, stamps "attempted")
+   │        └── in_progress | todo (unblocked / retry)
+   └── expired (watchdog) ──► todo (attempt count++)</code></pre>
 
-<p>States are honest: <code>blocked</code> carries a reason and an unblock condition; a declared subprocess block pauses the watchdog for its declared budget only; silence past the heartbeat window marks the task abandoned and returns it to the pool.</p>
+<p>Honest states: <code>blocked</code> requires a reason and an unblock condition; a declared subprocess block pauses the watchdog for its declared budget only; silence past the heartbeat window marks the task abandoned and returns it to the pool. A parent can't complete while its children are open.</p>
 
 <table>
-  <thead><tr><th>Kind</th><th>Pickup</th><th>Gates</th><th>Links to</th></tr></thead>
+  <thead><tr><th>Kind</th><th>Mode</th><th>Enforced flow</th></tr></thead>
   <tbody>
     <tr>
       <td><strong>impl</strong> — the work itself</td>
-      <td>role:impl agents; must be <em>qualified</em> first</td>
-      <td>finish requires a PR link; <code>done</code> requires an accepted review verdict</td>
-      <td><code>child_of</code> from analysis/review children; qualified <em>by</em> a done analysis child or an accepted decision (<code>supports</code>); implements a goal</td>
+      <td>exclusive: one claim, one session</td>
+      <td>finish requires a PR in the note → a <em>Verify</em> task auto-spawns; <code>done</code> only after the verify child completes — and not by the session that did the work (separation of duties is a server check). Qualification before pickup: a done analysis child or an accepted decision must back it.</td>
     </tr>
     <tr>
       <td><strong>analysis</strong> — evidence before code</td>
-      <td>role:analysis agents (may claim unqualified work)</td>
-      <td>output is an evidence map / plan — no PR expected</td>
-      <td><code>child_of</code> an impl task; its completion <em>qualifies</em> the parent</td>
+      <td>exclusive claim</td>
+      <td>output is a breakdown/evidence map, not a PR. Its <code>done</code> releases the parent impl's claim — implementation continues in a fresh session with the analysis in hand.</td>
     </tr>
     <tr>
       <td><strong>review</strong> — verification</td>
-      <td>role:review agents; auto-spawned as a <em>Verify</em> task whenever anything enters <code>in_review</code>, always a fresh session</td>
-      <td>verdict recorded as a decision; reviews never spawn reviews (depth-capped)</td>
-      <td><code>child_of</code> the task under review; the accepted verdict decision <code>supports</code> the parent — that link is what releases <code>done</code></td>
+      <td>exclusive claim; verify tasks outrank everything in the pool</td>
+      <td>cannot complete without receipts (PR link, merge state, the check run) in the note; a bounce returns the parent <code>in_progress</code> to its author with findings. Verify-of-verify is structurally blocked; a bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents — surfaced and nudged.</td>
     </tr>
     <tr>
-      <td><strong>research</strong> — open-ended investigation</td>
-      <td>any qualified agent</td>
-      <td>same lifecycle as impl; finishing without a PR is legal (findings land as progress)</td>
-      <td><code>child_of</code> parents, <code>derived_from</code> sources; findings feed later impl/analysis tasks</td>
+      <td><strong>research</strong> — investigation</td>
+      <td>exclusive claim</td>
+      <td>completes with a knowledge artefact link; findings feed later impl/analysis tasks.</td>
     </tr>
     <tr>
       <td><strong>question</strong> — fleet-wide discussion</td>
-      <td><em>nobody claims it</em> — any agent or human contributes via progress notes</td>
-      <td>never swept by the watchdog; closed by the author</td>
-      <td>closure produces an ADR: a decision <code>derived_from</code> the question; accepted decisions unblock gates elsewhere</td>
+      <td><strong>open</strong> — nobody claims it, many contribute</td>
+      <td>contributions are progress entries with provenance; never swept by the watchdog; the author judges sufficiency and closes it by writing a decision. Accepted decisions unblock gates elsewhere.</td>
     </tr>
   </tbody>
 </table>
+
+<p><strong>Priority is enforced, not aspirational.</strong> The pool ranks: unblock tasks first (the cheapest lever — a check that releases parked work), then blocked-with-condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.</p>
 
 <p>Non-task artefacts have their own small lifecycles: <strong>steering</strong> (<code>draft → active → superseded</code>, constrains everything downstream), <strong>goals</strong> (<code>draft → active → achieved | dropped</code>, tasks <code>implement</code> them), <strong>decisions</strong> (<code>proposed → accepted → superseded</code>, acceptance is human-authoritative), <strong>progress</strong> (append-only log entries) and <strong>agents</strong> (registry entries with behavioural scores).</p>
 

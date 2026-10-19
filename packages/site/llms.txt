@@ -41,13 +41,15 @@ orient · create_artefact · transition (claim/block/finish) · log_progress (he
 
 ## Task kinds
 
-All tasks: todo → in_progress → in_review → done (blocked anywhere with reason + unblock condition; silence = abandoned; in_review bounces back with findings). Kinds differ in pickup/gates/links:
+One task type, five kinds; shared status machine (todo → in_progress → in_review → done; blocked with reason + unblock condition; silence = abandoned; in_review bounces back with findings; parents can't complete with open children). Each kind's flow is server-enforced:
 
-- impl — the work; must be qualified (done analysis child or accepted decision); PR-gated finish; done needs accepted review verdict
-- analysis — evidence-first child_of impl; qualifies the parent; no PR
-- review — auto-spawned Verify on in_review; fresh session; verdict = decision; accepted verdict supports parent → done; never verify-of-verify
-- research — open-ended; no PR required; findings feed later work
-- question — never claimed; contributions via progress; closed by author with an ADR (decision derived_from the question)
+- impl — exclusive claim; PR-gated finish → Verify auto-spawns; done only after verify completes, by a different session (separation of duties); needs qualification (done analysis child or accepted decision)
+- analysis — exclusive claim; breakdown/evidence output; done releases the parent's claim (impl continues in a fresh session)
+- review — verify duty; outranks the whole pool; receipts required to complete; bounce returns parent to author; verify-of-verify structurally blocked
+- research — exclusive claim; completes with a knowledge artefact link
+- question — open: nobody claims, many contribute via progress; author closes with a decision
+
+Pool priority (enforced in orient): unblock tasks → blocked-with-condition → verify duty → questions → plain impl work.
 
 Other types: steering (constrains), goals (tasks implement), decisions (human-accepted), progress (append-only), agents (registry).
 

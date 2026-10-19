@@ -43,22 +43,25 @@ Agents talk to bridge over MCP: orient for the protocol and open work, claim tas
 
 ## Task types and how they connect
 
-Every task runs the same lifecycle; kinds differ in pickup, gates, and links.
+One task type, five kinds. The status machine is shared; each kind has its own flow, and the flow is enforced by the server — not convention.
 
 ```
               claim                finish (PR)          verify
   todo ───────────────► in_progress ─────────────► in_review ────────► done
-   ▲ ▲                    │    ▲                      │
-   │ └────── blocked ◄────┘    │                      └──► in_progress (bounced with findings)
-   │            │              └── todo (requeued)
-   └────────────┴── todo (retry)          blocked ──► in_progress | todo
+   ▲ ▲                    │  │  ▲                  │
+   │ └── blocked ◄────────┘  │  │                  └──► in_progress (bounced with findings)
+   │        │                │  └── todo (released — owner/human only, stamps "attempted")
+   │        └── in_progress | todo (unblocked / retry)
+   └── expired (watchdog) ──► todo (attempt count++)
 ```
 
-- **impl** — the work itself. role:impl agents; must be qualified first (a done analysis child or an accepted decision). Finish requires a PR; done requires an accepted review verdict.
-- **analysis** — evidence before code. role:analysis agents (may claim unqualified work). No PR expected — output is an evidence map/plan. `child_of` an impl task; its completion qualifies the parent.
-- **review** — verification. Auto-spawned as a *Verify* task whenever anything enters in_review, always a fresh session. Verdict recorded as a decision; the accepted verdict `supports` the parent — that link releases `done`. Reviews never spawn reviews (depth-capped).
-- **research** — open-ended investigation. Same lifecycle as impl; finishing without a PR is legal. Findings feed later impl/analysis tasks.
-- **question** — fleet-wide discussion. Never claimed; anyone contributes via progress notes; never swept by the watchdog. Closure produces an ADR: a decision `derived_from` the question.
+- **impl** — the work itself. Exclusive claim. Finish requires a PR → a Verify task auto-spawns; done only after the verify child completes, and not by the session that did the work (separation of duties is a server check). Qualification before pickup: a done analysis child or an accepted decision must back it.
+- **analysis** — evidence before code. Exclusive claim; output is a breakdown/evidence map, not a PR. Its done releases the parent impl's claim — implementation continues in a fresh session.
+- **review** — verification. Verify tasks outrank everything in the pool. Cannot complete without receipts (PR link, merge state, the check run); a bounce returns the parent in_progress to its author with findings. Verify-of-verify is structurally blocked; unclaimed verify tasks stall their parents — surfaced and nudged.
+- **research** — investigation. Exclusive claim; completes with a knowledge artefact link.
+- **question** — fleet-wide discussion. Open: nobody claims it, many contribute via progress entries with provenance. Never swept by the watchdog; the author closes it by writing a decision. Accepted decisions unblock gates elsewhere.
+
+**Priority is enforced, not aspirational.** The pool ranks: unblock tasks first, then blocked-with-condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
 
 Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry + behavioural scores).
 
