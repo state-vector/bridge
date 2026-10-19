@@ -36,3 +36,4 @@ Contract change → edit `packages/specs/schemas/*.json` → `npm run generate -
 ## Deploy
 
 See `deploy.md`. Short version: `npm run build -w @flows/webapp && npx wrangler deploy` in `packages/worker/`, put secrets, enable Access on the workers.dev URL, allowlist emails, start the shipper unit.
+BR#585 verification note: GH#875 own-repo review self-declared degraded was not closable from available receipts in this session. No BR#31/GH#875-specific PR link, merge-state receipt, or findings trail was surfaced in the workspace search; result bounced with an explicit receipt gap.
