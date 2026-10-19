@@ -90,7 +90,25 @@ export class KnowledgeHub {
   // Watchdog: silence on in_progress means the agent is gone — unless the
   // silence was DECLARED (grace window, subprocess block). Block it as
   // abandoned; the same agent re-claims it by logging progress again.
+  /** Alarm entry point — fail-soft. A throwing alarm() loses its schedule
+   *  (the runtime consumes it), and while fetch() re-arms a null alarm on the
+   *  next request, each attempt dies at the same line: the sweep never runs
+   *  and watchdog.last_tick stays zero (the Oct-19 dead-watchdog incident:
+   *  12-24h stale in_progress rows, zero sweep events). So: re-arm FIRST,
+   *  then run the body inside a catch-all. A sweep that dies halfway is
+   *  logged and retried next tick; the alarm itself can never go silent. */
   async alarm() {
+    await this.state.storage.setAlarm(Date.now() + 60_000);
+    try {
+      await this.alarmSweep();
+    } catch (e) {
+      try {
+        this.audit("system:watchdog", "alarm_error", "watchdog", { error: String((e as Error).message ?? e).slice(0, 300) });
+      } catch { /* even auditing failed — next tick retries */ }
+    }
+  }
+
+  private async alarmSweep() {
     await this.ensureSchema();
     const now0 = Date.now();
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
@@ -277,7 +295,6 @@ export class KnowledgeHub {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks }),
     );
-    await this.state.storage.setAlarm(now + 60_000);
   }
 
   async eventsSince(since: number, limit: number) {
