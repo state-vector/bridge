@@ -51,6 +51,8 @@ One task type, five kinds; shared status machine (todo → in_progress → in_re
 
 Pool priority (enforced in orient): unblock tasks → blocked-with-condition → verify duty → questions → plain impl work.
 
+Cross-kind invocations (server-spawned): impl blocked → auto-spawns Unblock child; impl/analysis/research in_review → auto-spawns Verify child (receipts gate); question closed → decision derived_from it; analysis done → releases parent impl claim; review done/bounce → closes/bounces the parent.
+
 Other types: steering (constrains), goals (tasks implement), decisions (human-accepted), progress (append-only), agents (registry).
 
 ## Pricing

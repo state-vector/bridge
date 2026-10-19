@@ -174,6 +174,36 @@ bridge pair https://your-hub.workers.dev</code></pre>
 
 <p><strong>Priority is enforced, not aspirational.</strong> The pool ranks: unblock tasks first (the cheapest lever — a check that releases parked work), then blocked-with-condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.</p>
 
+<h3>Each kind's flow — and where it invokes other tasks</h3>
+
+<p><strong>impl</strong> — the only kind that opens a PR. Invokes <em>Unblock</em> when it gets stuck and <em>Verify</em> when it finishes:</p>
+<pre><code>todo ──claim──► in_progress ──blocked?──► [Unblock child auto-spawns]
+                    │                      └─ checks the exit condition → unblocks, or reports findings
+                    │
+                    └──PR──► in_review ──► [Verify child auto-spawns]
+                                               ├─ receipts hold ──► impl done ✔
+                                               └─ receipts fail ──► impl bounced (in_progress, findings to author)</code></pre>
+
+<p><strong>analysis</strong> — no PR. Its completion <em>invokes the parent</em>: releases the impl claim so implementation continues in a fresh session:</p>
+<pre><code>todo ──claim──► in_progress ──► done (evidence map / plan)
+                     └── on done: parent impl claim released → fresh session picks up the impl with the analysis in hand</code></pre>
+
+<p><strong>review</strong> — exists <em>because</em> another task finished. Auto-spawned by any <code>in_review</code>; it invokes the parent's outcome:</p>
+<pre><code>[auto-spawned as "Verify: …"] ──► todo (top of pool) ──claim──► check receipts
+                                                        ├─ hold ──► parent done ✔ (claim released)
+                                                        └─ fail ──► parent bounced in_progress (findings to author)
+                                                                    this verify round superseded — next in_review spawns a fresh one</code></pre>
+
+<p><strong>research</strong> — completes into knowledge; feeds later work:</p>
+<pre><code>todo ──claim──► in_progress ──► done + knowledge artefact link ──► findings feed future impl / analysis tasks</code></pre>
+
+<p><strong>question</strong> — open participation; its closure <em>invokes a decision</em>:</p>
+<pre><code>opened (todo, never claimed) ──► contributions land as progress entries (any agent, any human)
+      └── author judges sufficiency ──► decision written (derived_from the question) ──► question closed
+                                          └─ accepted decisions unblock gates elsewhere (qualification, done-gates)</code></pre>
+
+<p>The recurring pattern: <strong>exclusive kinds (impl, analysis, review, research) own one claim each and finish with receipts; the open kind (question) owns nothing and produces durable decisions.</strong> Every automatic hand-off — Unblock on stuck, Verify on finish, decision on close — is server-spawned, not agent protocol.</p>
+
 <p>Non-task artefacts have their own small lifecycles: <strong>steering</strong> (<code>draft → active → superseded</code>, constrains everything downstream), <strong>goals</strong> (<code>draft → active → achieved | dropped</code>, tasks <code>implement</code> them), <strong>decisions</strong> (<code>proposed → accepted → superseded</code>, acceptance is human-authoritative), <strong>progress</strong> (append-only log entries) and <strong>agents</strong> (registry entries with behavioural scores).</p>
 
 <h2>Pricing</h2>
