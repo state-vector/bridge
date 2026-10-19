@@ -54,6 +54,17 @@ fn dispatch_status(state: tauri::State<'_, dispatch::DispatchState>) -> serde_js
     state.status()
 }
 
+/// The resolved dispatch config (env > ~/.bridge/config.json), so the settings
+/// page can edit fields (concurrency, backend, model) and re-start the loop
+/// with the full shape. Null when unconfigured (pairing still needed).
+#[tauri::command]
+fn dispatch_config() -> serde_json::Value {
+    match dispatch::DispatchConfig::resolve() {
+        Some(c) => serde_json::to_value(&c).unwrap_or_default(),
+        None => serde_json::Value::Null,
+    }
+}
+
 #[tauri::command]
 fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_json::Value {
     state.snapshot.lock().map(|s| serde_json::to_value(&*s).unwrap_or_default()).unwrap_or_default()
@@ -91,6 +102,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             notify_ask,
             dispatch_status,
+            dispatch_config,
             dispatch_snapshot,
             dispatch_start,
             dispatch_stop,
