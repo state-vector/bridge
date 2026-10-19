@@ -39,7 +39,9 @@ pub struct DispatchConfig {
     pub ws: Option<String>, // workspace slug from pairing
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize, // WIP limit for this node
-    #[serde(default = "default_isolate")]
+    #[serde(default)]
+    pub report_minutes: Option<u64>, // Some(n): periodic heartbeat cadence for agents; None: report like a human (meaningful steps only)
+    #[serde(default)]
     pub isolate: bool, // per-task git worktrees + PR branch
     #[serde(default)]
     pub backends: Option<Vec<String>>, // multiple agent types; rotate per dispatch
@@ -94,6 +96,10 @@ impl DispatchConfig {
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or_else(default_max_sessions),
+            report_minutes: std::env::var("BRIDGE_REPORT_MINUTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| (1..=60).contains(&n)),
             isolate: !matches!(
                 std::env::var("BRIDGE_ISOLATE").as_deref(),
                 Ok("0") | Ok("false") | Ok("no")
@@ -235,9 +241,10 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     timeout_mins: default_timeout_mins(),
                     opencode_bin: default_opencode_bin(),
                     label,
-                    ws: Some(ws),
-                    max_sessions: default_max_sessions(),
-                    isolate: default_isolate(),
+                ws: Some(ws),
+                max_sessions: default_max_sessions(),
+                report_minutes: None,
+                isolate: default_isolate(),
                     backends: None,
                 });
             }
@@ -708,9 +715,20 @@ fn spawn_opencode(
         .as_ref()
         .map(|s| format!("\n\nYou are resuming session {s} — pick up where you left off; do not restart the task from scratch."))
         .unwrap_or_default();
+    // Reporting cadence: None (default) = report like a human collaborator —
+    // meaningful steps and findings only, no fixed interval. The runner relays
+    // your stdout lines to the board every poll, so your normal narration keeps
+    // the task visibly alive; you do NOT need scheduled heartbeats. Explicit
+    // report_minutes restores a fixed cadence for agents that narrate nothing.
+    let heartbeat_line = match cfg.report_minutes {
+        Some(mins) => format!(
+            "- HEARTBEAT: call log_progress via the bridge MCP every ~{mins} minutes — one line: what you just did + what you do next. The board is your only visible output; silence reads as abandonment and gets the task reassigned."
+        ),
+        None => "- REPORTING: report progress the way you would to a human user — when you complete a meaningful step, hit a finding, or change direction; not on a timer. The runner relays your output to the board automatically, so narrating your work in your normal output (brief, one line at natural milestones) is enough to keep the task visibly alive.".to_string(),
+    };
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n- HEARTBEAT: call log_progress via the bridge MCP every ~5 minutes — one line: what you just did + what you do next. The board is your only visible output; silence reads as abandonment and gets the task reassigned.\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
-        policy, tid, title, body_md, resume_note, run_dir, branch
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
+        policy, tid, title, body_md, resume_note, run_dir, branch, heartbeat_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -1059,19 +1077,38 @@ fn tick(
         snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
     }
 
-    // relay, not heartbeat: the AGENT owns progress callbacks (its prompt
-    // instructs log_progress every ~5m via the bridge MCP). The runner only
+    // relay, not heartbeat: the AGENT owns progress callbacks. The runner only
     // RELAYS the agent's actual stdout line — real agent output, attributed as
-    // a relay — so the board never shows fabricated progress. No output yet?
-    // The relay says exactly that: liveness, nothing more.
-    for inf in in_flight.iter() {
-        let mins = inf.started.elapsed().as_secs() / 60;
+    // a relay — so the board never shows fabricated progress. With human-style
+    // reporting (the default), agents narrate milestones in their stdout, so
+    // the relay is the liveness signal; when the agent is silent (no output
+    // yet, or unchanged since the last poll) the relay stays quiet — a bare
+    // "alive Nm" line every poll doubles context re-reads for no information.
+    // A liveness fallback only exists in explicit report_minutes mode.
+    for inf in in_flight.iter_mut() {
         let live = inf.live_line();
-        let note = if live.is_empty() {
-            format!("runner: alive ~{mins}m, no agent output yet")
-        } else {
-            format!("runner: agent output — {live}")
-        };
+        if live.is_empty() {
+            if cfg.report_minutes.is_some() {
+                let mins = inf.started.elapsed().as_secs() / 60;
+                if let Err(e) = mcp_call(
+                    cfg,
+                    id,
+                    "log_progress",
+                    json!({
+                        "id": inf.task_id,
+                        "note": format!("runner: alive ~{mins}m, no agent output yet"),
+                        "sentiment": "neutral",
+                    }),
+                ) {
+                    eprintln!("[dispatch] relay failed for {}: {e}", inf.task_id);
+                }
+            }
+            continue;
+        }
+        if inf.last_note == live {
+            continue; // unchanged since last poll — nothing new to relay
+        }
+        let note = format!("runner: agent output — {live}");
         if let Err(e) = mcp_call(
             cfg,
             id,
@@ -1083,6 +1120,10 @@ fn tick(
             }),
         ) {
             eprintln!("[dispatch] relay failed for {}: {e}", inf.task_id);
+        } else if let Ok(mut s) = snap.lock() {
+            if let Some(f) = s.in_flight.iter_mut().find(|f| f.task_id == inf.task_id) {
+                f.last_note = live.clone();
+            }
         }
     }
     if !in_flight.is_empty() {

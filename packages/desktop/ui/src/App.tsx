@@ -260,6 +260,7 @@ export function App() {
               <button className="gw-btn" onClick={() => setMaxSessions((n) => Math.min(8, n + 1))}>+</button>
               <span className="gw-note">concurrent agent sessions (WIP limit)</span>
             </div>
+            <span className="gw-note">all knobs live in ~/.bridge/config.json — editing it by hand is fine; Apply writes this form there too</span>
           </div>
 
           <div className="gw-card">
