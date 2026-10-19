@@ -540,6 +540,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   color: var(--text); padding: 6px 10px; font-size: 13px; resize: vertical;
 }
 .new-task-card input:focus, .new-task-card textarea:focus { outline: 1px solid var(--accent); }
+
+/* ---------- task/knowledge state card (detail panel display half) ---------- */
+.task-state-card { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
+.task-state-card .gauge-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.task-state-card .task-facts { display: grid; grid-template-columns: max-content 1fr; column-gap: 12px; row-gap: 2px; margin: 0; font-size: 12.5px; }
+.task-state-card .fact-row { display: contents; }
+.task-state-card .task-facts dt { color: var(--text-faint); }
+.task-state-card .task-facts dd { margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.task-state-card .task-tags { margin-top: 2px; }
 .fields-check input { accent-color: var(--accent); }
 .fields-done { align-self: flex-end; }
 

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { kbApi } from "../lib/kb";
 import type { KbArtefact, KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
+import { TaskStateCard } from "./TaskDetail";
 
 const GROUPS = ["steering", "goal", "decision", "task", "progress", "agent"];
 const GROUP_LABEL: Record<string, string> = {
@@ -75,6 +76,7 @@ export function KnowledgeView() {
               <button className="icon-btn" onClick={() => { setSelected(null); setVersions([]); }}>✕</button>
             </header>
             <h2 className="detail-question">{selected.title}</h2>
+            <TaskStateCard task={selected as any} />
             <pre className="know-body">{selected.body_md || "—"}</pre>
             {(selected.tags ?? []).length > 0 && (
               <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
@@ -148,6 +150,7 @@ export function KnowledgeView() {
             <button className="icon-btn" onClick={() => { setSelected(null); setRelated([]); }}>✕</button>
           </div>
           <h3 className="detail-question">{selected.title}</h3>
+          <TaskStateCard task={selected as any} />
           <pre className="know-body">{selected.body_md || "—"}</pre>
           {(selected.tags ?? []).length > 0 && (
             <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>

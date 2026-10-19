@@ -63,7 +63,79 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
 interface TaskMeta {
   session?: string;
   blocked?: { reason?: string; unblock_condition?: string; ts?: number };
-  last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number };
+  last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number; completion_pct?: number; confidence_pct?: number; risk_pct?: number; context_pct?: number };
+  attempt?: { by?: string; attempts?: number; last_reason?: string };
+  qualification?: { state?: string; how?: string; by?: string; bars?: string[] };
+  subprocess?: { reason?: string; budget_minutes?: number; deadline_ts?: number };
+  awaiting_ask?: { ask_id?: string };
+  kind?: string;
+  github?: string;
+  [k: string]: unknown;
+}
+
+/** Full state of the item: identity, gauges, structured meta, facts. Read-only —
+ *  the forms (progress / status) live further down; this is the display half.
+ *  Shared with KnowledgeView (any artefact type gets the same treatment). */
+export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string } }) {
+  const m = (task.meta ?? {}) as TaskMeta;
+  const lp = m.last_progress;
+  const gauges: Array<[string, number | undefined]> = [
+    ["done", lp?.completion_pct],
+    ["conf", lp?.confidence_pct],
+    ["risk", lp?.risk_pct],
+    ["ctx", lp?.context_pct],
+  ];
+  const hasGauges = gauges.some(([, v]) => v !== undefined);
+  const facts: Array<[string, string | undefined]> = [
+    ["id", task.id],
+    ["type", task.type !== "task" ? task.type : undefined],
+    ["status", task.status],
+    ["owner", task.owner || undefined],
+    ["session", m.session],
+    ["kind", m.kind],
+    ["project", (task as any).project || undefined],
+    ["created by", (task as any).created_by || undefined],
+    ["created", rel(task.created_ts)],
+    ["in lane", task.status_ts ? rel(task.status_ts) : undefined],
+    ["updated", rel(task.updated_ts)],
+  ];
+  return (
+    <div className="task-state-card">
+      {hasGauges && (
+        <div className="gauge-row">
+          {gauges.filter(([, v]) => v !== undefined).map(([k, v]) => (
+            <span key={k} className="chip chip-scope" title={`${k} gauge (last progress)`}>{k} {v}%</span>
+          ))}
+        </div>
+      )}
+      {m.blocked && (
+        <div className="task-blocked-info">
+          <div className="progress-note"><b>why blocked:</b> {m.blocked.reason ?? ""}</div>
+          <div className="progress-note"><b>unblocks when:</b> {m.blocked.unblock_condition ?? ""}</div>
+        </div>
+      )}
+      {m.subprocess && typeof m.subprocess.deadline_ts === "number" && (
+        <div className="progress-note"><b>subprocess wait</b> until {rel(m.subprocess.deadline_ts)} ({m.subprocess.budget_minutes ?? "?"}m budget){m.subprocess.reason ? ` — ${m.subprocess.reason}` : ""}</div>
+      )}
+      {m.awaiting_ask?.ask_id && (
+        <div className="progress-note"><b>awaiting answer:</b> {m.awaiting_ask.ask_id}</div>
+      )}
+      {m.attempt && (m.attempt.attempts ?? 0) > 0 && (
+        <div className="progress-note"><b>attempted {m.attempt.attempts}x</b>{m.attempt.by ? ` (last: ${m.attempt.by})` : ""}{m.attempt.last_reason ? ` — ${m.attempt.last_reason}` : ""}</div>
+      )}
+      {m.qualification?.state && (
+        <div className="progress-note"><b>qualification:</b> {m.qualification.state}{m.qualification.how ? ` (${m.qualification.how})` : ""}{(m.qualification.bars ?? []).length ? ` · bars: ${(m.qualification.bars ?? []).join(", ")}` : ""}</div>
+      )}
+      <dl className="audit task-facts">
+        {facts.filter(([, v]) => v !== undefined).map(([k, v]) => (
+          <span key={k} className="fact-row"><dt>{k}</dt><dd>{v}</dd></span>
+        ))}
+      </dl>
+      {(task.tags ?? []).length > 0 && (
+        <div className="task-tags">{(task.tags as string[]).map((t) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+      )}
+    </div>
+  );
 }
 
 export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
@@ -148,12 +220,15 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
         </header>
 
         <h2 className="detail-question"><RefText text={task?.title ?? taskId} onOpen={nav} /></h2>
-        {task?.meta?.last_progress && (
+
+        {task && <TaskStateCard task={task as any} />}
+
+        {task?.meta?.last_progress?.note && (
           <p className="task-progress-line">
             <span className={`chip ${SENTIMENT_CHIP[task.meta.last_progress.sentiment ?? ""] ?? ""}`}>
               {task.meta.last_progress.sentiment ?? "progress"}
             </span>
-            <span>{task.meta.last_progress.note ?? ""}</span>
+            <span>{task.meta.last_progress.note}</span>
           </p>
         )}
 
@@ -179,61 +254,6 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
             )}
           </div>
         )}
-
-        <div className="detail-block">
-          <label>Progress (feeds the live board)</label>
-          <div className="row">
-            <select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
-              <option value="going_well">going well</option>
-              <option value="converging">converging</option>
-              <option value="neutral">neutral</option>
-              <option value="diverging">diverging</option>
-              <option value="struggling">struggling</option>
-            </select>
-          </div>
-          <textarea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
-          <div className="pct-inputs">
-            <input type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
-            <input type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
-            <input type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
-          </div>
-          <button className="opt-btn" disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</button>
-        </div>
-
-        <div className="detail-block">
-          <label>Status</label>
-          {task?.meta?.blocked && (
-            <div className="task-blocked-info">
-              <div className="progress-note"><b>why:</b> {task.meta.blocked.reason ?? ""}</div>
-              <div className="progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition ?? ""}</div>
-            </div>
-          )}
-          {blockedIntent ? (
-            <>
-              <textarea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
-              <input placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
-              <button
-                className="opt-btn"
-                disabled={!blockedReason.trim() || !unblockCondition.trim()}
-                onClick={async () => {
-                  await transition(taskId, "blocked", { note: blockedReason.trim(), unblock_condition: unblockCondition.trim() });
-                  setBlockedReason(""); setUnblockCondition(""); onClose();
-                }}
-              >
-                Mark blocked
-              </button>
-              <button className="opt-btn opt-ghost" onClick={onClose}>Cancel</button>
-            </>
-          ) : (
-            <div className="ask-actions">
-              {["todo", "in_progress", "blocked", "done"]
-                .filter((s) => s !== task?.status)
-                .map((s) => (
-                  <button key={s} className="opt-btn" onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</button>
-                ))}
-            </div>
-          )}
-        </div>
 
         <div className="detail-block">
           <label>History — one log: every progress note and state change, typed</label>
@@ -275,14 +295,54 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
           </div>
         )}
 
-        <dl className="audit" style={{ marginTop: "auto" }}>
-          <dt>id</dt><dd>{task?.id ?? taskId}</dd>
-          <dt>owner</dt><dd>{task?.owner ?? "—"}</dd>
-          <dt>session</dt><dd>{task?.meta?.session ?? "—"}</dd>
-          <dt>in lane</dt><dd>{task?.status_ts ? rel(task.status_ts) : "—"}</dd>
-          <dt>tags</dt><dd>{((task?.tags ?? []) as string[]).join(", ") || "—"}</dd>
-          <dt>updated</dt><dd>{task ? rel(task.updated_ts) : "—"}</dd>
-        </dl>
+        <div className="detail-block">
+          <label>Log progress (feeds the live board)</label>
+          <div className="row">
+            <select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
+              <option value="going_well">going well</option>
+              <option value="converging">converging</option>
+              <option value="neutral">neutral</option>
+              <option value="diverging">diverging</option>
+              <option value="struggling">struggling</option>
+            </select>
+          </div>
+          <textarea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
+          <div className="pct-inputs">
+            <input type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
+            <input type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
+            <input type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
+          </div>
+          <button className="opt-btn" disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</button>
+        </div>
+
+        <div className="detail-block">
+          <label>Change status</label>
+          {blockedIntent ? (
+            <>
+              <textarea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
+              <input placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
+              <button
+                className="opt-btn"
+                disabled={!blockedReason.trim() || !unblockCondition.trim()}
+                onClick={async () => {
+                  await transition(taskId, "blocked", { note: blockedReason.trim(), unblock_condition: unblockCondition.trim() });
+                  setBlockedReason(""); setUnblockCondition(""); onClose();
+                }}
+              >
+                Mark blocked
+              </button>
+              <button className="opt-btn opt-ghost" onClick={onClose}>Cancel</button>
+            </>
+          ) : (
+            <div className="ask-actions">
+              {["todo", "in_progress", "blocked", "done"]
+                .filter((s) => s !== task?.status)
+                .map((s) => (
+                  <button key={s} className="opt-btn" onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</button>
+                ))}
+            </div>
+          )}
+        </div>
       </aside>
     </>
   );
