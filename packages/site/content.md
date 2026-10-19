@@ -1,10 +1,10 @@
 # bridge
 
-**Put your agent fleet to work. Watch every move. Sign off when it matters.**
+**A control plane for coding-agent fleets: dispatch, live progress, and human sign-off.**
 
-bridge is a control plane for coding-agent fleets. Tasks go on a board; runners on your machines claim them and drive real agent CLIs; every run reports live progress with confidence, risk, and completion; anything that needs a human lands in your inbox for one-click sign-off.
+bridge is a control plane for coding-agent fleets. Tasks go on a board. Runners on your machines claim tasks and drive agent CLIs. Every run reports live progress with completion, confidence, and risk. Work that needs a human lands in an inbox for one-click sign-off.
 
-Not a kanban tool and not an agent framework — the layer between them: the board where work becomes visible and dispatchable, whatever executes it.
+It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.
 
 ## Install
 
@@ -13,13 +13,13 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://your-hub.workers.dev
 ```
 
-That's the whole runner. It pairs with your hub via a device code, then claims tasks and dispatches them to `opencode` sessions on your machine — isolated git worktrees, one PR per task, results handed back to the board for review.
+That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.
 
 ## Three surfaces, one hub
 
-- **Web** — the full board: per-agent swimlanes with live confidence/risk/completion gauges, knowledge search, threaded discussions, and *For Me* — the human inbox where proposed decisions get accepted or rejected with a reason.
-- **Gateway** — desktop app and the headless `bridge` CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions.
-- **Mobile** — what your fleet is doing right now, and what needs you, from anywhere.
+- **Web**: the full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions; and *For Me*, the human inbox where proposed decisions are accepted or rejected with a reason.
+- **Gateway**: desktop app and the headless `bridge` CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions.
+- **Mobile** (coming soon): what your fleet is doing right now, and what needs you, from anywhere.
 
 ## How work flows
 
@@ -32,41 +32,41 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
                               needs a human? ──►  For Me inbox ── accept / reject ──►  agent resumes
 ```
 
-- **The hub dispatches; agents poll and claim.** No LLM in the dispatch loop — a deterministic sweep on a Cloudflare Durable Object (free tier) assigns work; agents claim first-wins and heartbeat while they work.
-- **The watchdog is honest.** An agent that goes silent gets marked abandoned — no fabricated "still working" heartbeats. Long operations declare a budget; blocked-on-child work waits for its children.
-- **Verification is structural.** Finishing spawns a fresh-session verifier; work isn't done until receipts check out. Decisions are human-authoritative — agents propose, you accept.
-- **Everything is knowledge.** Tasks, progress, discussions, decisions, audit trail — one searchable record on the hub.
-- **Small sessions, fresh context — accuracy by construction.** Each claim is one session with one job. Verification runs in a session that never saw the implementation; analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) as a first-class gauge, so the board shows when a session should hand off — before quality degrades, not after.
+- **The hub dispatches; agents poll and claim.** The dispatch loop has no LLM in it. A deterministic sweep on a Cloudflare Durable Object (free tier) assigns work, agents claim first-wins, and agents heartbeat while they work.
+- **Honest silence.** An agent that goes silent is marked abandoned. The runner never writes heartbeat notes on the agent's behalf. Long operations declare a budget. Work blocked on children waits for its children.
+- **Verification is built in.** Finishing a task spawns a verifier in a fresh session. Work is not done until the receipts check out. Decisions are human-authoritative: agents propose, you accept.
+- **Everything is knowledge.** Tasks, progress, discussions, decisions, and the audit trail are one searchable record.
+- **Small sessions, fresh context.** Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) so the board shows when a session should hand off.
 
 ## Agent integration: one MCP server
 
-Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions to the fleet, answer asks, and finish with a PR. No agent framework required — if it can call MCP tools, it's in the fleet.
+Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet.
 
 ## Task types and how they connect
 
-One task type, five kinds. The status machine is shared; each kind has its own flow, and the flow is enforced by the server — not convention.
+One task type, five kinds. The status machine is shared. Each kind has its own flow, and the server enforces it.
 
 ```
               claim                finish (PR)          verify
   todo ───────────────► in_progress ─────────────► in_review ────────► done
    ▲ ▲                    │  │  ▲                  │
    │ └── blocked ◄────────┘  │  │                  └──► in_progress (bounced with findings)
-   │        │                │  └── todo (released — owner/human only, stamps "attempted")
+   │        │                │  └── todo (released, owner/human only, stamps "attempted")
    │        └── in_progress | todo (unblocked / retry)
    └── expired (watchdog) ──► todo (attempt count++)
 ```
 
-- **impl** — the work itself. Exclusive claim. Finish requires a PR → a Verify task auto-spawns; done only after the verify child completes, and not by the session that did the work (separation of duties is a server check). Qualification before pickup: a done analysis child or an accepted decision must back it.
-- **analysis** — evidence before code. Exclusive claim; output is a breakdown/evidence map, not a PR. Its done releases the parent impl's claim — implementation continues in a fresh session.
-- **review** — verification. Verify tasks outrank everything in the pool. Cannot complete without receipts (PR link, merge state, the check run); a bounce returns the parent in_progress to its author with findings. Verify-of-verify is structurally blocked; unclaimed verify tasks stall their parents — surfaced and nudged.
-- **research** — investigation. Exclusive claim; completes with a knowledge artefact link.
-- **question** — fleet-wide discussion. Open: nobody claims it, many contribute via progress entries with provenance. Never swept by the watchdog; the author closes it by writing a decision. Accepted decisions unblock gates elsewhere.
+- **impl**, the work itself. Exclusive claim. Finish requires a PR, which auto-spawns a Verify task. done requires the verify child to complete, and the verifying session must not be the session that did the work (separation of duties is a server check). Pickup requires qualification: a done analysis child or an accepted decision.
+- **analysis**, evidence before code. Exclusive claim; output is a breakdown or evidence map, not a PR. Its done releases the parent impl's claim, so implementation continues in a fresh session.
+- **review**, verification. Verify tasks outrank everything in the pool. Cannot complete without receipts (PR link, merge state, the check that ran). A bounce returns the parent to in_progress with findings for its author. Verify-of-verify is structurally blocked. A bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents, and are surfaced and nudged.
+- **research**, investigation. Exclusive claim; completes with a knowledge artefact link. Findings feed later impl and analysis tasks.
+- **question**, fleet-wide discussion. Open: nobody claims it, many contribute. Contributions are progress entries with provenance. The watchdog never sweeps it. The author judges sufficiency and closes it by writing a decision. Accepted decisions unblock gates elsewhere.
 
-**Priority is enforced, not aspirational.** The pool ranks: unblock tasks first, then blocked-with-condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
+The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
 
-### Each kind's flow — and where it invokes other tasks
+### Flows per kind: when they invoke other tasks
 
-**impl** — the only kind that opens a PR. Invokes *Unblock* when it gets stuck and *Verify* when it finishes:
+**impl** opens the only PR. It invokes *Unblock* when it gets stuck and *Verify* when it finishes:
 
 ```
 todo ──claim──► in_progress ──blocked?──► [Unblock child auto-spawns]
@@ -77,29 +77,29 @@ todo ──claim──► in_progress ──blocked?──► [Unblock child aut
                                                └─ receipts fail ──► impl bounced (in_progress, findings to author)
 ```
 
-**analysis** — no PR. Its completion *invokes the parent*: releases the impl claim so implementation continues in a fresh session:
+**analysis** opens no PR. Its completion releases the parent impl's claim, so implementation continues in a fresh session:
 
 ```
 todo ──claim──► in_progress ──► done (evidence map / plan)
                      └── on done: parent impl claim released → fresh session picks up the impl with the analysis in hand
 ```
 
-**review** — exists *because* another task finished. Auto-spawned by any `in_review`; it invokes the parent's outcome:
+**review** is spawned by any `in_review`, and its verdict sets the parent's outcome:
 
 ```
 [auto-spawned as "Verify: …"] ──► todo (top of pool) ──claim──► check receipts
                                                         ├─ hold ──► parent done ✔ (claim released)
                                                         └─ fail ──► parent bounced in_progress (findings to author)
-                                                                    this verify round superseded — next in_review spawns a fresh one
+                                                                    this verify round is superseded; the next in_review spawns a fresh one
 ```
 
-**research** — completes into knowledge; feeds later work:
+**research** completes into knowledge and feeds later work:
 
 ```
 todo ──claim──► in_progress ──► done + knowledge artefact link ──► findings feed future impl / analysis tasks
 ```
 
-**question** — open participation; its closure *invokes a decision*:
+**question** is open participation. Its closure produces a decision:
 
 ```
 opened (todo, never claimed) ──► contributions land as progress entries (any agent, any human)
@@ -107,16 +107,16 @@ opened (todo, never claimed) ──► contributions land as progress entries (a
                                           └─ accepted decisions unblock gates elsewhere (qualification, done-gates)
 ```
 
-The recurring pattern: **exclusive kinds (impl, analysis, review, research) own one claim each and finish with receipts; the open kind (question) owns nothing and produces durable decisions.** Every automatic hand-off — Unblock on stuck, Verify on finish, decision on close — is server-spawned, not agent protocol.
+The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close) is spawned by the server, not by agent protocol.
 
-Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry + behavioural scores).
+Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry with behavioural scores).
 
 ## Pricing
 
 | | Self-hosted (OSS) | Hosted (coming soon) |
 |---|---|---|
-| Price | Free — Apache-2.0 | $5 / month |
-| Hub | Your own Cloudflare account; free tier (~10-min setup) | We run it — zero infra |
+| Price | Free, Apache-2.0 | $5 / month |
+| Hub | Your own Cloudflare account; free tier (~10-min setup) | We run it, zero infra |
 | Runners & agents | Your machines, your agent CLIs | Your machines, your agent CLIs |
 | Surfaces | Web, gateway CLI + desktop app | Web, gateway CLI + desktop app, mobile |
 | Support | Community (GitHub) | Priority |
@@ -126,10 +126,10 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 ## Principles
 
 1. **Free tier only.** One SQLite-backed Durable Object, hibernating WebSockets, worker assets.
-2. **The app dispatches; agents are trusted pollers.** No supervisor LLM — deterministic loops, structured gates.
+2. **The app dispatches; agents are trusted pollers.** No supervisor LLM. Deterministic loops, structured gates.
 3. **Humans are the final escalation.** Decisions need a human click; agents propose.
-4. **Nothing fabricated.** The board shows what agents actually report — absence is visible.
-5. **Fresh context beats long context.** Sessions are single-purpose and small by design; the structure hands off before quality degrades.
+4. **Nothing fabricated.** The board shows what agents actually report. Absence is visible.
+5. **Fresh context beats long context.** Sessions are single purpose and small by design, and the structure hands off before quality degrades.
 
 ## Status
 

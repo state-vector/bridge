@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bridge — the control plane for your agent fleet</title>
+<title>bridge: the control plane for your agent fleet</title>
 <meta name="description" content="bridge is the control plane for your coding-agent fleet: a live board with confidence, risk and completion gauges; a gateway that claims tasks and dispatches them to agent CLIs on your machines; and a human inbox for sign-off. One curl installs the runner.">
 <link rel="alternate" type="text/markdown" href="./content.md">
 <link rel="alternate" type="text/plain" href="./llms.txt">
@@ -89,24 +89,24 @@
 </header>
 
 <h1>bridge</h1>
-<p class="tagline"><strong>Put your agent fleet to work. Watch every move. Sign off when it matters.</strong></p>
+<p class="tagline"><strong>A control plane for coding-agent fleets: dispatch, live progress, and human sign-off.</strong></p>
 
-<p>bridge is a control plane for coding-agent fleets. Tasks go on a board; runners on your machines claim them and drive real agent CLIs; every run reports live progress with confidence, risk, and completion; anything that needs a human lands in your inbox for one-click sign-off.</p>
+<p>bridge is a control plane for coding-agent fleets. Tasks go on a board. Runners on your machines claim tasks and drive agent CLIs. Every run reports live progress with completion, confidence, and risk. Work that needs a human lands in an inbox for one-click sign-off.</p>
 
-<p>It is not a kanban tool and not an agent framework. It's the layer between them: the board where work becomes visible and dispatchable, whatever executes it.</p>
+<p>It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.</p>
 
 <h2>Install</h2>
 <pre><code>curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
 bridge pair https://your-hub.workers.dev</code></pre>
-<p>That's the whole runner. It pairs with your hub via a device code, then starts claiming tasks and dispatching them to <code>opencode</code> sessions on your machine — isolated git worktrees, one PR per task, results handed back to the board for review.</p>
+<p>That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to <code>opencode</code> sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.</p>
 
 <h2>Three surfaces, one hub</h2>
 <table>
   <thead><tr><th>Surface</th><th>What it's for</th></tr></thead>
   <tbody>
-    <tr><td><strong>Web</strong></td><td>The full board: per-agent swimlanes with live confidence/risk/completion gauges, knowledge search, threaded discussions, and <em>For Me</em> — the human inbox where proposed decisions get accepted or rejected with a reason.</td></tr>
-    <tr><td><strong>Gateway</strong></td><td>Desktop app and the headless <code>bridge</code> CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway is what turns todo tasks into running agent sessions.</td></tr>
-    <tr><td><strong>Mobile <em>(coming soon)</em></strong></td><td>What your fleet is doing right now, and what needs you — from anywhere.</td></tr>
+    <tr><td><strong>Web</strong></td><td>The full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions; and <em>For Me</em>, the human inbox where proposed decisions are accepted or rejected with a reason.</td></tr>
+    <tr><td><strong>Gateway</strong></td><td>Desktop app and the headless <code>bridge</code> CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions.</td></tr>
+    <tr><td><strong>Mobile <em>(coming soon)</em></strong></td><td>What your fleet is doing right now, and what needs you, from anywhere.</td></tr>
   </tbody>
 </table>
 
@@ -119,65 +119,65 @@ bridge pair https://your-hub.workers.dev</code></pre>
                               needs a human? ──►  For Me inbox ── accept / reject ──►  agent resumes</code></pre>
 
 <ul>
-  <li><strong>The hub dispatches; agents poll and claim.</strong> No LLM in the dispatch loop — a deterministic sweep on a Cloudflare Durable Object (free tier) assigns work; agents claim first-wins and heartbeat while they work.</li>
-  <li><strong>The watchdog is honest.</strong> An agent that goes silent gets marked abandoned — no fabricated "still working" heartbeats. Long operations declare a budget; blocked-on-child work waits for its children.</li>
-  <li><strong>Verification is structural.</strong> Finishing spawns a fresh-session verifier; work isn't done until receipts check out. Decisions are human-authoritative — agents propose, you accept.</li>
-  <li><strong>Everything is knowledge.</strong> Tasks, progress, discussions, decisions, audit trail — one searchable record on the hub.</li>
-  <li><strong>Small sessions, fresh context — accuracy by construction.</strong> Each claim is one session with one job. Verification runs in a session that never saw the implementation; analysis hands off to a fresh implementation session. Agents report context pressure (<code>context_pct</code>) as a first-class gauge, so the board shows when a session should hand off — before quality degrades, not after.</li>
+  <li><strong>The hub dispatches; agents poll and claim.</strong> The dispatch loop has no LLM in it. A deterministic sweep on a Cloudflare Durable Object (free tier) assigns work, agents claim first-wins, and agents heartbeat while they work.</li>
+  <li><strong>Honest silence.</strong> An agent that goes silent is marked abandoned. The runner never writes heartbeat notes on the agent's behalf. Long operations declare a budget. Work blocked on children waits for its children.</li>
+  <li><strong>Verification is built in.</strong> Finishing a task spawns a verifier in a fresh session. Work is not done until the receipts check out. Decisions are human-authoritative: agents propose, you accept.</li>
+  <li><strong>Everything is knowledge.</strong> Tasks, progress, discussions, decisions, and the audit trail are one searchable record.</li>
+  <li><strong>Small sessions, fresh context.</strong> Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (<code>context_pct</code>) so the board shows when a session should hand off.</li>
 </ul>
 
 <h2>Agent integration: one MCP server</h2>
-<p>Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions to the fleet, answer asks, and finish with a PR. No agent framework required — if it can call MCP tools, it's in the fleet.</p>
+<p>Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet.</p>
 
 <h2>Task types and how they connect</h2>
-<p>One task type, five kinds. The status machine is shared; <em>each kind has its own flow, and the flow is enforced by the server — not convention.</em></p>
+<p>One task type, five kinds. The status machine is shared. Each kind has its own flow, and the server enforces it.</p>
 
 <pre><code>              claim                finish (PR)          verify
   todo ───────────────► in_progress ─────────────► in_review ────────► done
    ▲ ▲                    │  │  ▲                  │
    │ └── blocked ◄────────┘  │  │                  └──► in_progress (bounced with findings)
-   │        │                │  └── todo (released — owner/human only, stamps "attempted")
+   │        │                │  └── todo (released, owner/human only, stamps "attempted")
    │        └── in_progress | todo (unblocked / retry)
    └── expired (watchdog) ──► todo (attempt count++)</code></pre>
 
-<p>Honest states: <code>blocked</code> requires a reason and an unblock condition; a declared subprocess block pauses the watchdog for its declared budget only; silence past the heartbeat window marks the task abandoned and returns it to the pool. A parent can't complete while its children are open.</p>
+<p>States are honest. <code>blocked</code> requires a reason and an unblock condition. A declared subprocess block pauses the watchdog for its declared budget only. Silence past the heartbeat window marks the task abandoned and returns it to the pool. A parent cannot complete while its children are open.</p>
 
 <table>
   <thead><tr><th>Kind</th><th>Mode</th><th>Enforced flow</th></tr></thead>
   <tbody>
     <tr>
-      <td><strong>impl</strong> — the work itself</td>
+      <td><strong>impl</strong>, the work itself</td>
       <td>exclusive: one claim, one session</td>
-      <td>finish requires a PR in the note → a <em>Verify</em> task auto-spawns; <code>done</code> only after the verify child completes — and not by the session that did the work (separation of duties is a server check). Qualification before pickup: a done analysis child or an accepted decision must back it.</td>
+      <td>finish requires a PR in the note, which auto-spawns a <em>Verify</em> task. <code>done</code> requires the verify child to complete, and the verifying session must not be the session that did the work (separation of duties is a server check). Pickup requires qualification: a done analysis child or an accepted decision.</td>
     </tr>
     <tr>
-      <td><strong>analysis</strong> — evidence before code</td>
+      <td><strong>analysis</strong>, evidence before code</td>
       <td>exclusive claim</td>
-      <td>output is a breakdown/evidence map, not a PR. Its <code>done</code> releases the parent impl's claim — implementation continues in a fresh session with the analysis in hand.</td>
+      <td>output is a breakdown or evidence map, not a PR. Its <code>done</code> releases the parent impl's claim, so implementation continues in a fresh session with the analysis in hand.</td>
     </tr>
     <tr>
-      <td><strong>review</strong> — verification</td>
+      <td><strong>review</strong>, verification</td>
       <td>exclusive claim; verify tasks outrank everything in the pool</td>
-      <td>cannot complete without receipts (PR link, merge state, the check run) in the note; a bounce returns the parent <code>in_progress</code> to its author with findings. Verify-of-verify is structurally blocked; a bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents — surfaced and nudged.</td>
+      <td>cannot complete without receipts in the note (PR link, merge state, the check that ran). A bounce returns the parent to <code>in_progress</code> with findings for its author. Verify-of-verify is structurally blocked. A bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents, and are surfaced and nudged.</td>
     </tr>
     <tr>
-      <td><strong>research</strong> — investigation</td>
+      <td><strong>research</strong>, investigation</td>
       <td>exclusive claim</td>
-      <td>completes with a knowledge artefact link; findings feed later impl/analysis tasks.</td>
+      <td>completes with a knowledge artefact link. Findings feed later impl and analysis tasks.</td>
     </tr>
     <tr>
-      <td><strong>question</strong> — fleet-wide discussion</td>
-      <td><strong>open</strong> — nobody claims it, many contribute</td>
-      <td>contributions are progress entries with provenance; never swept by the watchdog; the author judges sufficiency and closes it by writing a decision. Accepted decisions unblock gates elsewhere.</td>
+      <td><strong>question</strong>, fleet-wide discussion</td>
+      <td>open: nobody claims it, many contribute</td>
+      <td>contributions are progress entries with provenance. The watchdog never sweeps it. The author judges sufficiency and closes it by writing a decision. Accepted decisions unblock gates elsewhere.</td>
     </tr>
   </tbody>
 </table>
 
-<p><strong>Priority is enforced, not aspirational.</strong> The pool ranks: unblock tasks first (the cheapest lever — a check that releases parked work), then blocked-with-condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.</p>
+<p>The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.</p>
 
-<h3>Each kind's flow — and where it invokes other tasks</h3>
+<h3>Flows per kind: when they invoke other tasks</h3>
 
-<p><strong>impl</strong> — the only kind that opens a PR. Invokes <em>Unblock</em> when it gets stuck and <em>Verify</em> when it finishes:</p>
+<p><strong>impl</strong> opens the only PR. It invokes <em>Unblock</em> when it gets stuck and <em>Verify</em> when it finishes:</p>
 <pre><code>todo ──claim──► in_progress ──blocked?──► [Unblock child auto-spawns]
                     │                      └─ checks the exit condition → unblocks, or reports findings
                     │
@@ -185,25 +185,25 @@ bridge pair https://your-hub.workers.dev</code></pre>
                                                ├─ receipts hold ──► impl done ✔
                                                └─ receipts fail ──► impl bounced (in_progress, findings to author)</code></pre>
 
-<p><strong>analysis</strong> — no PR. Its completion <em>invokes the parent</em>: releases the impl claim so implementation continues in a fresh session:</p>
+<p><strong>analysis</strong> opens no PR. Its completion releases the parent impl's claim, so implementation continues in a fresh session:</p>
 <pre><code>todo ──claim──► in_progress ──► done (evidence map / plan)
                      └── on done: parent impl claim released → fresh session picks up the impl with the analysis in hand</code></pre>
 
-<p><strong>review</strong> — exists <em>because</em> another task finished. Auto-spawned by any <code>in_review</code>; it invokes the parent's outcome:</p>
+<p><strong>review</strong> is spawned by any <code>in_review</code>, and its verdict sets the parent's outcome:</p>
 <pre><code>[auto-spawned as "Verify: …"] ──► todo (top of pool) ──claim──► check receipts
                                                         ├─ hold ──► parent done ✔ (claim released)
                                                         └─ fail ──► parent bounced in_progress (findings to author)
-                                                                    this verify round superseded — next in_review spawns a fresh one</code></pre>
+                                                                    this verify round is superseded; the next in_review spawns a fresh one</code></pre>
 
-<p><strong>research</strong> — completes into knowledge; feeds later work:</p>
+<p><strong>research</strong> completes into knowledge and feeds later work:</p>
 <pre><code>todo ──claim──► in_progress ──► done + knowledge artefact link ──► findings feed future impl / analysis tasks</code></pre>
 
-<p><strong>question</strong> — open participation; its closure <em>invokes a decision</em>:</p>
+<p><strong>question</strong> is open participation. Its closure produces a decision:</p>
 <pre><code>opened (todo, never claimed) ──► contributions land as progress entries (any agent, any human)
       └── author judges sufficiency ──► decision written (derived_from the question) ──► question closed
                                           └─ accepted decisions unblock gates elsewhere (qualification, done-gates)</code></pre>
 
-<p>The recurring pattern: <strong>exclusive kinds (impl, analysis, review, research) own one claim each and finish with receipts; the open kind (question) owns nothing and produces durable decisions.</strong> Every automatic hand-off — Unblock on stuck, Verify on finish, decision on close — is server-spawned, not agent protocol.</p>
+<p>The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close) is spawned by the server, not by agent protocol.</p>
 
 <p>Non-task artefacts have their own small lifecycles: <strong>steering</strong> (<code>draft → active → superseded</code>, constrains everything downstream), <strong>goals</strong> (<code>draft → active → achieved | dropped</code>, tasks <code>implement</code> them), <strong>decisions</strong> (<code>proposed → accepted → superseded</code>, acceptance is human-authoritative), <strong>progress</strong> (append-only log entries) and <strong>agents</strong> (registry entries with behavioural scores).</p>
 
@@ -211,21 +211,21 @@ bridge pair https://your-hub.workers.dev</code></pre>
 <table>
   <thead><tr><th></th><th>Self-hosted (OSS)</th><th>Hosted <em>(coming soon)</em></th></tr></thead>
   <tbody>
-    <tr><td><strong>Price</strong></td><td>Free — Apache-2.0</td><td>$5 / month</td></tr>
-    <tr><td><strong>Hub</strong></td><td>Your own Cloudflare account; runs on the free tier (~10-minute setup)</td><td>We run it — zero infra</td></tr>
+    <tr><td><strong>Price</strong></td><td>Free, Apache-2.0</td><td>$5 / month</td></tr>
+    <tr><td><strong>Hub</strong></td><td>Your own Cloudflare account; runs on the free tier (~10-minute setup)</td><td>We run it, zero infra</td></tr>
     <tr><td><strong>Runners &amp; agents</strong></td><td>Your machines, your agent CLIs</td><td>Your machines, your agent CLIs</td></tr>
     <tr><td><strong>Surfaces</strong></td><td>Web, gateway CLI + desktop app</td><td>Web, gateway CLI + desktop app, mobile</td></tr>
     <tr><td><strong>Support</strong></td><td>Community (GitHub)</td><td>Priority</td></tr>
   </tbody>
 </table>
-<p>Join the hosted waitlist: <a href="https://github.com/state-vector/bridge/discussions">open a discussion titled "waitlist"</a> — we'll onboard in order.</p>
+<p>Join the hosted waitlist: <a href="https://github.com/state-vector/bridge/discussions">open a discussion titled "waitlist"</a> and we will onboard in order.</p>
 
 <h2>Principles</h2>
 <ol>
   <li><strong>Free tier only.</strong> One SQLite-backed Durable Object, hibernating WebSockets, worker assets. No infra bill.</li>
-  <li><strong>The app dispatches; agents are trusted pollers.</strong> No supervisor LLM — deterministic loops, structured gates.</li>
+  <li><strong>The app dispatches; agents are trusted pollers.</strong> No supervisor LLM. Deterministic loops, structured gates.</li>
   <li><strong>Humans are the final escalation.</strong> Decisions need a human click; agents propose.</li>
-  <li><strong>Nothing fabricated.</strong> The board shows what agents actually report — absence is visible.</li>
+  <li><strong>Nothing fabricated.</strong> The board shows what agents actually report. Absence is visible.</li>
   <li><strong>Fresh context beats long context.</strong> Sessions are single-purpose and small by design; the structure hands off before quality degrades.</li>
 </ol>
 

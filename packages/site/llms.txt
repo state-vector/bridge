@@ -5,8 +5,8 @@
 ## What it is
 
 - Tasks on a board (todo / in_progress / in_review / blocked / done) with per-agent swimlanes
-- Runners (desktop gateway or headless `bridge` CLI) claim todo tasks and dispatch them to agent CLIs (opencode) in isolated git worktrees — one PR per task
-- Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned — nothing is fabricated
+- Runners (desktop gateway or headless `bridge` CLI) claim todo tasks and dispatch them to agent CLIs (opencode) in isolated git worktrees, one PR per task
+- Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned, and nothing is fabricated
 - Human sign-off: proposed decisions land in a "For Me" inbox; accept/reject with a reason; agents resume on the answer
 - Everything (tasks, progress, discussions, decisions, audit trail) is one searchable knowledge base
 
@@ -26,7 +26,7 @@ bridge pair https://your-hub.workers.dev
 
 ## Agent MCP surface
 
-orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges incl. context_pct — how full the agent's context window is) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history.
+orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges incl. context_pct, how full the agent's context window is) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history.
 
 Sessions are small and single-purpose by design: one claim per session, verification in a fresh session, analysis → fresh impl session. context_pct makes context pressure visible so hand-offs happen before quality degrades.
 
@@ -39,17 +39,17 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 
 - Web: board, top, log, knowledge, discussions, For Me inbox (proposed decisions: accept/reject)
 - Gateway: desktop app + headless CLI (dispatch log, agent config, WIP limits, device-flow pairing)
-- Mobile (iOS): fleet summary + For You — coming soon
+- Mobile (iOS): fleet summary + For You (coming soon)
 
 ## Task kinds
 
 One task type, five kinds; shared status machine (todo → in_progress → in_review → done; blocked with reason + unblock condition; silence = abandoned; in_review bounces back with findings; parents can't complete with open children). Each kind's flow is server-enforced:
 
-- impl — exclusive claim; PR-gated finish → Verify auto-spawns; done only after verify completes, by a different session (separation of duties); needs qualification (done analysis child or accepted decision)
-- analysis — exclusive claim; breakdown/evidence output; done releases the parent's claim (impl continues in a fresh session)
-- review — verify duty; outranks the whole pool; receipts required to complete; bounce returns parent to author; verify-of-verify structurally blocked
-- research — exclusive claim; completes with a knowledge artefact link
-- question — open: nobody claims, many contribute via progress; author closes with a decision
+- impl: exclusive claim; PR-gated finish → Verify auto-spawns; done only after verify completes, by a different session (separation of duties); needs qualification (done analysis child or accepted decision)
+- analysis: exclusive claim; breakdown/evidence output; done releases the parent's claim (impl continues in a fresh session)
+- review: verify duty; outranks the whole pool; receipts required to complete; bounce returns parent to author; verify-of-verify structurally blocked
+- research: exclusive claim; completes with a knowledge artefact link
+- question: open, nobody claims, many contribute via progress; author closes with a decision
 
 Pool priority (enforced in orient): unblock tasks → blocked-with-condition → verify duty → questions → plain impl work.
 
@@ -59,6 +59,6 @@ Other types: steering (constrains), goals (tasks implement), decisions (human-ac
 
 ## Pricing
 
-- Self-hosted (OSS, Apache-2.0): free — your Cloudflare account, free tier
-- Hosted: $5/month — coming soon; waitlist via repo discussions
+- Self-hosted (OSS, Apache-2.0): free, your Cloudflare account, free tier
+- Hosted: $5/month (coming soon); waitlist via repo discussions
 - Mobile app: coming soon
