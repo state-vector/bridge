@@ -401,6 +401,35 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .forme-link { cursor: pointer; }
 .forme-link:hover { border-color: var(--accent); }
 
+/* markdown rendering (decisions, comments) */
+.md-body { font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.md-body h1, .md-body h2, .md-body h3 { font-size: 13.5px; margin: 10px 0 4px; font-weight: 650; }
+.md-body h1:first-child, .md-body h2:first-child, .md-body h3:first-child { margin-top: 0; }
+.md-body p { margin: 6px 0; }
+.md-body ul, .md-body ol { margin: 6px 0; padding-left: 18px; }
+.md-body code { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; }
+.md-body pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; overflow-x: auto; }
+.md-body pre code { border: none; background: none; padding: 0; }
+.md-body blockquote { border-left: 3px solid var(--line); margin: 6px 0; padding-left: 8px; color: var(--text-dim); }
+.md-body table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.md-body th, .md-body td { border: 1px solid var(--line); padding: 3px 7px; text-align: left; }
+.md-body hr { border: none; border-top: 1px solid var(--line); margin: 8px 0; }
+
+/* decision popover */
+.forme-pop {
+  width: min(680px, 94vw); max-height: 86vh; overflow-y: auto;
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 16px 18px; display: flex; flex-direction: column; gap: 8px;
+}
+.forme-close { margin-left: auto; }
+.forme-body {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; max-height: 40vh; overflow-y: auto;
+}
+.forme-sub { margin: 8px 0 0; font-size: 12.5px; font-weight: 650; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+.forme-comments { display: flex; flex-direction: column; gap: 6px; max-height: 26vh; overflow-y: auto; }
+.forme-reject input { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); }
+
 /* ---------- aggregate sentiment ---------- */
 .sentiment-bar-box { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .sentiment-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; flex: 1; max-width: 300px; background: var(--bg-raised); }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import snarkdown from "snarkdown";
 import { useKb } from "../store/kb";
 import { useBridge } from "../lib/store";
 import { kbApi, type KbArtefact } from "../lib/kb";
@@ -6,26 +7,95 @@ import { rel } from "../lib/views";
 
 /** For Me — the human's inbox. First tab. Surfaces everything awaiting a
  *  human decision or attention:
- *   - proposed KB decisions (BR#621-class) — accept/reject inline; the
- *     transition POST route acts as actor "web" which satisfies the
- *     human-authoritative acceptance gate
+ *   - proposed KB decisions (BR#621-class) — markdown popover, comment,
+ *     accept / reject-with-reason inline; the transition POST route acts
+ *     as actor "web" which satisfies the human-authoritative gate
  *   - open agent asks addressed to the human (hub plane)
  *   - open question threads (link into Discussions)
  */
 
 const KIND_CHIP: Record<string, string> = { proposed: "chip-needs", accepted: "chip-done", rejected: "chip-done" };
 
-function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
-  const [open, setOpen] = useState(false);
+/** snarkdown → sanitized-enough HTML: strip script/on* attrs (trusted-ish
+ *  content — our own KB — but defence in depth costs one line). */
+function md(src: string): string {
+  const html = snarkdown(src ?? "");
+  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/ on\w+="[^"]*"/gi, "");
+}
+
+interface HistoryEntry {
+  seq: number;
+  ts: number;
+  actor: string;
+  action: string;
+  summary: string;
+  data: Record<string, unknown>;
+}
+
+function Comment({ v }: { v: HistoryEntry }) {
+  const note = (v.data?.note as string | undefined) ?? v.summary;
+  if (!note?.trim()) return null;
+  const isComment = v.action === "comment";
+  return (
+    <div className={`resp ${isComment ? "resp-note" : ""}`}>
+      <div className="ask-chips">
+        <span className="resp-actor">{v.actor}</span>
+        <span className="why-line">{rel(v.ts)}</span>
+      </div>
+      <div className="resp-body md-body" dangerouslySetInnerHTML={{ __html: md(note) }} />
+    </div>
+  );
+}
+
+function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
+  const [comments, setComments] = useState<HistoryEntry[] | null>(null);
+  const [comment, setComment] = useState("");
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const act = async (to: "accepted" | "rejected") => {
+  useEffect(() => {
+    let dead = false;
+    setComments(null);
+    kbApi.history(d.id)
+      .then((r) => { if (!dead) setComments((r.versions ?? []) as HistoryEntry[]); })
+      .catch(() => { if (!dead) setComments([]); });
+    return () => { dead = true; };
+  }, [d.id, d.updated_ts]);
+
+  const reloadComments = async () => {
+    try {
+      const r = await kbApi.history(d.id);
+      setComments((r.versions ?? []) as HistoryEntry[]);
+    } catch { /* keep stale */ }
+  };
+
+  const addComment = async () => {
+    if (!comment.trim()) return;
     setBusy(true);
     try {
-      await kbApi.transition(d.id, to, { note: to === "accepted" ? "accepted by human (For Me)" : "rejected by human (For Me)" });
+      await kbApi.progress(d.id, comment.trim());
+      setComment("");
+      await reloadComments();
+    } catch (e) {
+      setMsg(`comment failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const act = async (to: "accepted" | "rejected") => {
+    if (to === "rejected" && !rejectReason.trim()) return;
+    setBusy(true);
+    try {
+      const note = to === "accepted"
+        ? `accepted by human (For Me)${comment.trim() ? ` — ${comment.trim()}` : ""}`
+        : `rejected by human (For Me) — ${rejectReason.trim()}`;
+      await kbApi.transition(d.id, to, { note });
       setMsg(to === "accepted" ? "accepted" : "rejected");
-      onDone(d.id);
+      onChanged();
+      onClose();
     } catch (e) {
       setMsg(`failed: ${(e as Error).message}`);
     } finally {
@@ -35,20 +105,71 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
   };
 
   return (
+    <div className="overlay-backdrop" onClick={onClose}>
+      <div className="forme-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="ask-chips">
+          <span className="chip chip-urgent">DECISION</span>
+          <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
+          <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
+          <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
+        </div>
+        <h2>{d.title}</h2>
+        <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.body_md ?? "") }} />
+
+        <h3 className="forme-sub">Comments</h3>
+        <div className="forme-comments">
+          {(comments ?? []).length === 0 && comments !== null && <p className="empty">no comments yet</p>}
+          {(comments ?? []).map((v) => <Comment key={v.seq} v={v} />)}
+          {comments === null && <p className="empty">loading…</p>}
+        </div>
+        <div className="steer-box">
+          <input
+            value={comment}
+            placeholder="Add a comment…"
+            onChange={(e) => setComment(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) void addComment(); }}
+          />
+          <button className="opt-btn" disabled={busy || !comment.trim()} onClick={() => void addComment()}>Comment</button>
+        </div>
+
+        {rejectOpen && (
+          <div className="steer-box forme-reject">
+            <input
+              autoFocus
+              value={rejectReason}
+              placeholder="Why reject? (required)"
+              onChange={(e) => setRejectReason(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void act("rejected"); }}
+            />
+            <button className="opt-btn" disabled={busy || !rejectReason.trim()} onClick={() => void act("rejected")}>Confirm reject</button>
+            <button className="opt-btn opt-ghost" onClick={() => setRejectOpen(false)}>Cancel</button>
+          </div>
+        )}
+
+        <div className="ask-actions">
+          <button className="opt-btn" disabled={busy} onClick={() => void act("accepted")}>Accept</button>
+          <button className="opt-btn opt-ghost" disabled={busy} onClick={() => setRejectOpen(true)}>Reject…</button>
+        </div>
+        {msg && <p className="ok">{msg}</p>}
+      </div>
+    </div>
+  );
+}
+
+function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
     <div className="card ask-urgent forme-item">
       <div className="ask-chips">
         <span className="chip chip-urgent">DECISION</span>
         <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
         <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
       </div>
-      <h3 className="ask-question" onClick={() => setOpen((o) => !o)}>{d.title}</h3>
-      {open && <pre className="know-body">{d.body_md}</pre>}
+      <h3 className="ask-question" onClick={() => setOpen(true)}>{d.title}</h3>
       <div className="ask-actions">
-        <button className="opt-btn" disabled={busy} onClick={() => void act("accepted")}>Accept</button>
-        <button className="opt-btn opt-ghost" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
-        <button className="opt-btn opt-ghost" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : "Read"}</button>
+        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Open ↗</button>
       </div>
-      {msg && <p className="ok">{msg}</p>}
+      {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
     </div>
   );
 }
@@ -72,7 +193,7 @@ function AskRow({ d, onDone }: { d: any; onDone: (id: string) => void }) {
       <div className="ask-chips">
         <span className="chip chip-needs">ASK</span>
         {d.urgent && <span className="chip chip-urgent">URGENT</span>}
-        <span className="why-line">{d.asker ?? d.from_label ?? "agent"} · {rel(d.created_ts ?? d.ts ?? Date.now())}</span>
+        <span className="why-line">{d.asker ?? d.from_label ?? "agent"} · {rel(d.opened_ts ?? d.created_ts ?? d.ts ?? Date.now())}</span>
       </div>
       <h3 className="ask-question">{d.title ?? d.question}</h3>
       {d.reason && <p className="ask-reason">{d.reason}</p>}
