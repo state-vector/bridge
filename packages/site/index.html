@@ -81,6 +81,12 @@
   }
   .figure { margin: 1.5rem 0; }
   .figure img { max-width: 100%; border-radius: 8px; border: 1px solid #e2e2e6; }
+  .figure.hero img { width: 100%; image-rendering: pixelated; border-color: color-mix(in srgb, var(--green) 35%, #e2e2e6); }
+  .figure.hero figcaption { color: #555; }
+  @media (prefers-color-scheme: dark) {
+    .figure.hero img { border-color: color-mix(in srgb, var(--green) 35%, #2a2a32); }
+    .figure.hero figcaption { color: #9a9aa2; }
+  }
   .figure figcaption { font-size: .85rem; color: #555; margin-top: .4rem; }
   .placeholder {
     display: flex; align-items: center; justify-content: center;
@@ -112,6 +118,11 @@
 <p>Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.</p>
 
 <p>It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible, dispatchable, and accountable, whatever executes it.</p>
+
+<figure class="figure hero">
+  <img src="./assets/hero.png" alt="A ship's bridge at night: instrument panels glowing green, radar sweeping, the fleet visible through the windows" loading="eager">
+  <figcaption>The bridge at night. Instruments live, the fleet in view, the watch kept for you.</figcaption>
+</figure>
 
 <h2>Install</h2>
 <pre><code><span style="color: var(--green);">$</span> curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash

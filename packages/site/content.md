@@ -6,6 +6,8 @@ Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer 
 
 It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.
 
+![A ship's bridge at night: instruments glowing, radar sweeping, the fleet in view](./assets/hero.png)
+
 ## Install
 
 ```bash
