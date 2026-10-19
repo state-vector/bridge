@@ -117,3 +117,14 @@ body {
 .gw-notes { border-top: 1px solid var(--line); padding-top: 6px; }
 .gw-conc { font-family: var(--mono); font-size: 18px; font-weight: 700; min-width: 2ch; text-align: center; }
 .gw-btn-on { border-color: var(--green); color: var(--green); }
+
+/* per-provider config sections (Settings) */
+.gw-provider {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin-top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.gw-provider-head {
+  margin: 0; font-size: 13px; font-weight: 700; font-family: var(--mono);
+  color: var(--accent);
+}

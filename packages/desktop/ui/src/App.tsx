@@ -46,6 +46,7 @@ interface Cfg {
   backend: string | null;
   backends?: string[] | null;
   models?: Record<string, string> | null;
+  agents?: Record<string, string> | null;
   report_minutes?: number | null;
 }
 
@@ -57,6 +58,24 @@ const KIND_CLASS: Record<string, string> = {
 };
 
 const BACKENDS = ["opencode", "kiro"];
+
+/** Per-backend config shape: opencode dispatches a bare CLI whose default model
+ *  is whatever its own config file says — there a model is REQUIRED. Kiro is
+ *  profile-driven (its profiles pin provider + model), so it needs no model. */
+const BACKEND_META: Record<string, { label: string; note: string; modelRequired: boolean; modelPlaceholder: string }> = {
+  opencode: {
+    label: "opencode",
+    note: "CLI default comes from ~/.config/opencode/opencode.json — pin an explicit model so spend is predictable",
+    modelRequired: true,
+    modelPlaceholder: "model — REQUIRED (e.g. openrouter/~anthropic/claude-haiku-latest)",
+  },
+  kiro: {
+    label: "kiro",
+    note: "profile-driven: the kiro profile pins provider + model, so no model here",
+    modelRequired: false,
+    modelPlaceholder: "model — optional (profile usually decides)",
+  },
+};
 
 function ts(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -81,8 +100,8 @@ export function App() {
   const [cfg, setCfg] = useState<Cfg | null>(null);
   const [maxSessions, setMaxSessions] = useState(1);
   const [backends, setBackends] = useState<string[]>(["opencode"]);
-  const [agent, setAgent] = useState("");
-  const [models, setModels] = useState<Record<string, string>>({});
+  const [backendModels, setBackendModels] = useState<Record<string, string>>({});
+  const [backendAgents, setBackendAgents] = useState<Record<string, string>>({});
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
 
@@ -101,9 +120,10 @@ export function App() {
       if (c) {
         setCfg(c);
         setMaxSessions(c.max_sessions);
-        setBackends(c.backends?.length ? c.backends : c.backend ? [c.backend] : ["opencode"]);
-        setAgent(c.agent ?? "");
-        setModels({ ...(c.models ?? (c.model ? { [c.backend ?? "opencode"]: c.model } : {})) });
+        const enabled = c.backends?.length ? c.backends : c.backend ? [c.backend] : ["opencode"];
+        setBackends(enabled);
+        setBackendModels({ ...(c.models ?? (c.model ? { [c.backend ?? "opencode"]: c.model } : {})) });
+        setBackendAgents({ ...(c.agents ?? (c.agent ? { [c.backend ?? "opencode"]: c.agent } : {})) });
         setHubUrl(c.url);
       }
     } catch { /* no shell */ }
@@ -147,20 +167,28 @@ export function App() {
       return;
     }
     const ordered = BACKENDS.filter((b) => backends.includes(b));
-    const missing = ordered.filter((b) => !(models[b] ?? "").trim());
+    const missing = ordered.filter((b) => BACKEND_META[b]?.modelRequired && !(backendModels[b] ?? "").trim());
     if (missing.length) {
       setApplyMsg(`model required for: ${missing.join(", ")}`);
       return;
     }
+    // only backends that are actually enabled carry their section's values
+    const modelsOut = Object.fromEntries(
+      ordered.map((b) => [b, (backendModels[b] ?? "").trim()]).filter(([, v]) => v !== ""),
+    );
+    const agentsOut = Object.fromEntries(
+      ordered.map((b) => [b, (backendAgents[b] ?? "").trim()]).filter(([, v]) => v !== ""),
+    );
     const next: Cfg = {
       ...cfg,
       url: hubUrl.trim().replace(/\/$/, "") || cfg.url,
       max_sessions: Math.max(1, maxSessions),
       backend: ordered[0] ?? null,
       backends: ordered,
-      agent: agent.trim() || null,
-      model: null,
-      models: Object.fromEntries(ordered.map((b) => [b, (models[b] ?? "").trim()])),
+      agent: agentsOut[ordered[0]] ?? null,
+      model: modelsOut[ordered[0]] ?? null,
+      models: modelsOut,
+      agents: agentsOut,
     };
     setApplyMsg("applying…");
     try {
@@ -272,7 +300,7 @@ export function App() {
           </div>
 
           <div className="gw-card">
-            <h2>Agent types</h2>
+            <h2>Providers</h2>
             <div className="gw-row">
               {BACKENDS.map((b) => (
                 <button key={b} className={`gw-btn ${backends.includes(b) ? "gw-btn-on" : ""}`} onClick={() => toggleBackend(b)}>
@@ -280,20 +308,26 @@ export function App() {
                 </button>
               ))}
             </div>
-            <span className="gw-note">tasks rotate across the enabled agent CLIs</span>
-            {backends.map((b) => (
-              <div key={b} className="gw-row">
-                <span className="gw-agent-name gw-mono" style={{ width: 80 }}>{b}</span>
-                <input className="gw-input" style={{ flex: 1 }} value={models[b] ?? ""}
-                  placeholder="model — REQUIRED (e.g. anthropic/claude-sonnet-4-5)"
-                  onChange={(e) => setModels((m) => ({ ...m, [b]: e.target.value }))} />
-              </div>
-            ))}
-            <div className="gw-row">
-              <input className="gw-input" style={{ flex: 1 }} value={agent} placeholder="agent profile name (optional)"
-                onChange={(e) => setAgent(e.target.value)} />
-            </div>
-            <span className="gw-note">the runner refuses to dispatch to an agent without a model — no implicit defaults</span>
+            <span className="gw-note">tasks rotate across the enabled provider CLIs</span>
+            {backends.map((b) => {
+              const meta = BACKEND_META[b] ?? { label: b, note: "", modelRequired: true, modelPlaceholder: "model" };
+              return (
+                <div key={b} className="gw-provider">
+                  <h3 className="gw-provider-head">{meta.label}</h3>
+                  <div className="gw-row">
+                    <input className="gw-input" style={{ flex: 1 }} value={backendModels[b] ?? ""}
+                      placeholder={meta.modelPlaceholder}
+                      onChange={(e) => setBackendModels((m) => ({ ...m, [b]: e.target.value }))} />
+                  </div>
+                  <div className="gw-row">
+                    <input className="gw-input" style={{ flex: 1 }} value={backendAgents[b] ?? ""}
+                      placeholder="agent profile (optional — the CLI's own default profile if empty)"
+                      onChange={(e) => setBackendAgents((m) => ({ ...m, [b]: e.target.value }))} />
+                  </div>
+                  <span className="gw-note">{meta.note}</span>
+                </div>
+              );
+            })}
           </div>
 
           <div className="gw-card">

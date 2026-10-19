@@ -76,9 +76,14 @@ edit by hand — settings in the desktop app apply by updating the same file):
   "token": "<from pairing>",
   "workdir": "/path/to/repo",          // repo the runner works in
   "max_sessions": 1,                   // concurrency: concurrent agent sessions (WIP limit)
-  "backends": ["opencode"],            // agent CLIs to rotate across ("kiro" also supported)
-  "agent": null,                       // opencode agent profile name (optional)
-  "model": null,                       // model override for RESUMED sessions; unset = the agent CLI's own config decides
+  "backends": ["opencode", "kiro"],    // provider CLIs to rotate across
+  "models": {                          // per-provider model (each CLI talks to different providers)
+    "opencode": "openrouter/~anthropic/claude-haiku-latest"   // REQUIRED for opencode
+    // "kiro": …        // optional: kiro is profile-driven — its profile pins provider+model
+  },
+  "agents": {                          // per-provider agent profile (optional)
+    "opencode": "reviewer"
+  },
   "report_minutes": null,              // null = agents report like a human (at natural milestones);
                                        // number 1-60 = fixed heartbeat cadence, in minutes
   "poll_secs": 60,                     // how often the runner polls the board
@@ -89,10 +94,13 @@ edit by hand — settings in the desktop app apply by updating the same file):
 
 Notes:
 
-- **Model cost**: with `"model": null` a fresh agent session uses the agent
-  CLI's own default model — check `~/.config/opencode/opencode.json` (`"model"`
-  key) if spend looks high. The `"model"` runner key only reliably applies to
-  resumed sessions (the CLI pins a session's original model).
+- **Per-provider config**: models live in the `models` map keyed by provider —
+  opencode needs an explicit model (the runner refuses to dispatch without
+  one; the CLI's own default is how a stale pin silently downgrades a fleet).
+  Kiro is profile-driven, so it needs no model entry.
+- **Model cost**: whatever you set here is what every dispatched session uses.
+  Check the opencode CLI's own config (`~/.config/opencode/opencode.json`,
+  `"model"` key) if spend looks high despite a pin here.
 - **Reporting**: the runner relays each agent's real stdout lines to the board
   as it works, so narration = liveness. Set `"report_minutes": 5` only if your
   agent produces no narration at all.

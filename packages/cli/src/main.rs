@@ -105,6 +105,7 @@ fn run(cfg: Option<DispatchConfig>) {
                     models: std::env::var("BRIDGE_MODEL")
                         .ok()
                         .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
+                    agents: None,
                     report_minutes: std::env::var("BRIDGE_REPORT_MINUTES").ok().and_then(|v| v.parse().ok()),
                     max_sessions: v.max(1),
                     isolate: !matches!(std::env::var("BRIDGE_ISOLATE").as_deref(), Ok("0") | Ok("false") | Ok("no")),

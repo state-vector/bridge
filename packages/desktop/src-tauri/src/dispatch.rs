@@ -46,7 +46,9 @@ pub struct DispatchConfig {
     #[serde(default)]
     pub backends: Option<Vec<String>>, // multiple agent types; rotate per dispatch
     #[serde(default)]
-    pub models: Option<std::collections::HashMap<String, String>>, // REQUIRED: model per backend — no implicit defaults
+    pub models: Option<std::collections::HashMap<String, String>>, // model per backend — required for opencode (explicit-model policy)
+    #[serde(default)]
+    pub agents: Option<std::collections::HashMap<String, String>>, // agent profile per backend (opencode profiles; kiro profiles)
 }
 
 fn default_max_sessions() -> usize {
@@ -112,6 +114,7 @@ impl DispatchConfig {
             models: std::env::var("BRIDGE_MODEL")
                 .ok()
                 .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
+            agents: None,
             label: None,
             ws: None,
         })
@@ -252,6 +255,7 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                 isolate: default_isolate(),
                     backends: None,
                     models: None,
+                    agents: None,
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
@@ -705,23 +709,32 @@ fn spawn_opencode(
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
     };
-    // explicit-model policy: the runner never dispatches without a user-set
-    // model for the chosen backend. Implicit inheritance is how a stale haiku
-    // pin silently downgraded an entire fleet.
+    // per-backend settings: each CLI talks to different providers, so model
+    // requirements differ. opencode dispatches a bare CLI whose default model
+    // is whatever its own config says (the stale-haiku lesson) — there a model
+    // is REQUIRED. kiro is profile-driven (its profiles pin provider+model),
+    // so a model here is optional; the profile is the config.
+    let agent_profile = cfg
+        .agents
+        .as_ref()
+        .and_then(|m| m.get(backend_name))
+        .cloned()
+        .or_else(|| cfg.agent.clone());
     let model = cfg
         .models
         .as_ref()
         .and_then(|m| m.get(backend_name))
         .cloned()
         .or_else(|| cfg.model.clone());
-    let Some(model) = model else {
+    if model.is_none() && backend == opencode::Backend::OpenCode {
         let msg = format!(
-            "runner: no model configured for backend '{backend_name}' — set it in Settings (model is required per agent); task {tid} not dispatched",
+            "runner: no model configured for backend '{backend_name}' — set it in Settings (opencode needs an explicit model); task {tid} not dispatched",
         );
         eprintln!("[dispatch] {msg}");
         snap_activity(snap, "error", &msg);
         return;
-    };
+    }
+    let model_str = model.clone().unwrap_or_default();
     let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
@@ -793,8 +806,8 @@ fn spawn_opencode(
                 &run_dir,
                 &cfg2.opencode_bin,
                 backend,
-                cfg2.agent.as_deref(),
-                Some(model.as_str()),
+                agent_profile.as_deref(),
+                Some(model_str.as_str()).filter(|s| !s.is_empty()),
                 &prompt,
                 Duration::from_secs(cfg2.timeout_mins * 60),
                 Some(&format!("bridge-{tid2}")),
