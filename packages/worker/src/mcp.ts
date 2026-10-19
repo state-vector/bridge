@@ -302,6 +302,12 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const a = await call("agents.list", {});
       return text(JSON.stringify(a, null, 1));
     }
+    case "stats": {
+      // watchdog + board liveness: is the alarm firing? how much stale work?
+      // ("is the watchdog alive?" answered without DO internals.)
+      const a = await call("stats", {});
+      return text(JSON.stringify(a, null, 1));
+    }
     case "related_artefacts": {
       const a = await call("related", { id: args.id, limit: args.limit });
       return text(JSON.stringify(a, null, 1));
@@ -446,6 +452,11 @@ const TOOLS = [
   {
     name: "list_agents",
     description: "List connected agents (label, capability tags, online) — use to address ask_agent.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "stats",
+    description: "Board + watchdog liveness: counts by type/status, watchdog last tick and last sweep (stale in_progress/in_review, open asks). Answers 'is the watchdog alive?' and 'how much work is stale?' without touching DO internals.",
     inputSchema: { type: "object", properties: {} },
   },
   {

@@ -45,6 +45,8 @@ interface Cfg {
   model: string | null;
   backend: string | null;
   backends?: string[] | null;
+  models?: Record<string, string> | null;
+  report_minutes?: number | null;
 }
 
 const KIND_CLASS: Record<string, string> = {
@@ -80,7 +82,7 @@ export function App() {
   const [maxSessions, setMaxSessions] = useState(1);
   const [backends, setBackends] = useState<string[]>(["opencode"]);
   const [agent, setAgent] = useState("");
-  const [model, setModel] = useState("");
+  const [models, setModels] = useState<Record<string, string>>({});
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
 
@@ -101,7 +103,7 @@ export function App() {
         setMaxSessions(c.max_sessions);
         setBackends(c.backends?.length ? c.backends : c.backend ? [c.backend] : ["opencode"]);
         setAgent(c.agent ?? "");
-        setModel(c.model ?? "");
+        setModels({ ...(c.models ?? (c.model ? { [c.backend ?? "opencode"]: c.model } : {})) });
         setHubUrl(c.url);
       }
     } catch { /* no shell */ }
@@ -145,6 +147,11 @@ export function App() {
       return;
     }
     const ordered = BACKENDS.filter((b) => backends.includes(b));
+    const missing = ordered.filter((b) => !(models[b] ?? "").trim());
+    if (missing.length) {
+      setApplyMsg(`model required for: ${missing.join(", ")}`);
+      return;
+    }
     const next: Cfg = {
       ...cfg,
       url: hubUrl.trim().replace(/\/$/, "") || cfg.url,
@@ -152,7 +159,8 @@ export function App() {
       backend: ordered[0] ?? null,
       backends: ordered,
       agent: agent.trim() || null,
-      model: model.trim() || null,
+      model: null,
+      models: Object.fromEntries(ordered.map((b) => [b, (models[b] ?? "").trim()])),
     };
     setApplyMsg("applying…");
     try {
@@ -273,12 +281,19 @@ export function App() {
               ))}
             </div>
             <span className="gw-note">tasks rotate across the enabled agent CLIs</span>
+            {backends.map((b) => (
+              <div key={b} className="gw-row">
+                <span className="gw-agent-name gw-mono" style={{ width: 80 }}>{b}</span>
+                <input className="gw-input" style={{ flex: 1 }} value={models[b] ?? ""}
+                  placeholder="model — REQUIRED (e.g. anthropic/claude-sonnet-4-5)"
+                  onChange={(e) => setModels((m) => ({ ...m, [b]: e.target.value }))} />
+              </div>
+            ))}
             <div className="gw-row">
               <input className="gw-input" style={{ flex: 1 }} value={agent} placeholder="agent profile name (optional)"
                 onChange={(e) => setAgent(e.target.value)} />
-              <input className="gw-input" style={{ flex: 1 }} value={model} placeholder="model override — empty = the CLI's own default"
-                onChange={(e) => setModel(e.target.value)} />
             </div>
+            <span className="gw-note">the runner refuses to dispatch to an agent without a model — no implicit defaults</span>
           </div>
 
           <div className="gw-card">

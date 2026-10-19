@@ -742,7 +742,7 @@ export class KnowledgeHub {
     if (!t) return;
     const tmeta = JSON.parse(t.meta ?? "{}");
     const tTags: string[] = parseTags(t.tags);
-    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
+    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
     if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
       delete tmeta.blocked;
@@ -1034,7 +1034,7 @@ export class KnowledgeHub {
       throw new Error(`task ${id} is a human sign-off task (role:human) — completion is human-authoritative; a human marks it done in the webapp.`);
     // ---- swimlane gates: minimal, enforced state-machine barriers ----
     const tTags: string[] = parseTags(row.tags);
-    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
+    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
     if (row.type === "task" && row.status === "todo" && to === "in_progress") {
       const q = this.qualifyCheck(row, "analysis");
       // roles are playbooks, not gates: any agent may claim any task — the pool
@@ -1290,6 +1290,29 @@ export class KnowledgeHub {
         this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
       }
     }
+    // unblock children are ephemeral: their whole job is to test the exit
+    // condition. The moment the parent moves — resumes from blocked, gets
+    // released to todo, done, or bounced — every open unblock child is
+    // superseded. Without this each block episode spawns a fresh child and
+    // the open ones accumulate (and then block the parent's own completion).
+    if (row.type === "task" && ["in_progress", "todo", "done"].includes(to)) {
+      const fromStatuses = ["todo", "in_progress", "blocked"];
+      for (const v of this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`, id,
+      ).toArray() as any[]) {
+        const vm = JSON.parse(v.meta ?? "{}");
+        vm.superseded_reason = to === "in_progress"
+          ? `${id} resumed from blocked — unblock confirmed, child superseded`
+          : `${id} → ${to} — unblock round closed`;
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(vm), ts, ts, v.id,
+        );
+        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
+        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
+      }
+    }
     // stale verification rounds: a bounce or a done closes out ANY open Verify
     // children of this task — regardless of their status (todo, in_progress,
     // blocked). The next in_review spawns exactly one fresh round.
@@ -1329,6 +1352,16 @@ export class KnowledgeHub {
     // yourself". Ask-gated blocks are excluded — the ask answer auto-resumes
     // them, and a spawned unblock task would race the answer.
     if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tTags.includes("role:unblock")) {
+      // at most ONE live unblock child per parent, ever: if any exists in an
+      // open state (todo/in_progress/blocked), reuse it — refresh its body
+      // with the current exit condition instead of spawning a duplicate.
+      const existing = this.one(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%' LIMIT 1`, id,
+      );
+      if (existing) {
+        this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
+      } else {
       const exitCond = String(meta.blocked?.unblock_condition ?? "").trim();
       const blockWhy = String(meta.blocked?.reason ?? "").trim();
       const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
@@ -1346,6 +1379,7 @@ export class KnowledgeHub {
         created.id, id, ts,
       );
       this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
+      }
     }
     return { id, status: to, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
   }
@@ -1459,7 +1493,7 @@ export class KnowledgeHub {
           note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task).",
         };
       }
-      const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review");
+      const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
         return {

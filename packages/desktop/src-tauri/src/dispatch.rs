@@ -45,6 +45,8 @@ pub struct DispatchConfig {
     pub isolate: bool, // per-task git worktrees + PR branch
     #[serde(default)]
     pub backends: Option<Vec<String>>, // multiple agent types; rotate per dispatch
+    #[serde(default)]
+    pub models: Option<std::collections::HashMap<String, String>>, // REQUIRED: model per backend — no implicit defaults
 }
 
 fn default_max_sessions() -> usize {
@@ -107,6 +109,9 @@ impl DispatchConfig {
             backends: std::env::var("BRIDGE_BACKENDS")
                 .ok()
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            models: std::env::var("BRIDGE_MODEL")
+                .ok()
+                .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
             label: None,
             ws: None,
         })
@@ -246,6 +251,7 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                 report_minutes: None,
                 isolate: default_isolate(),
                     backends: None,
+                    models: None,
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
@@ -695,6 +701,27 @@ fn spawn_opencode(
     in_flight: &mut Vec<InFlight>,
 ) {
     let backend = pick_backend(cfg);
+    let backend_name = match backend {
+        opencode::Backend::OpenCode => "opencode",
+        opencode::Backend::Kiro => "kiro",
+    };
+    // explicit-model policy: the runner never dispatches without a user-set
+    // model for the chosen backend. Implicit inheritance is how a stale haiku
+    // pin silently downgraded an entire fleet.
+    let model = cfg
+        .models
+        .as_ref()
+        .and_then(|m| m.get(backend_name))
+        .cloned()
+        .or_else(|| cfg.model.clone());
+    let Some(model) = model else {
+        let msg = format!(
+            "runner: no model configured for backend '{backend_name}' — set it in Settings (model is required per agent); task {tid} not dispatched",
+        );
+        eprintln!("[dispatch] {msg}");
+        snap_activity(snap, "error", &msg);
+        return;
+    };
     let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
@@ -767,7 +794,7 @@ fn spawn_opencode(
                 &cfg2.opencode_bin,
                 backend,
                 cfg2.agent.as_deref(),
-                cfg2.model.as_deref(),
+                Some(model.as_str()),
                 &prompt,
                 Duration::from_secs(cfg2.timeout_mins * 60),
                 Some(&format!("bridge-{tid2}")),
