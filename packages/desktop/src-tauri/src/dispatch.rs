@@ -1372,6 +1372,15 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
     if state.running.load(Ordering::Relaxed) {
         return Err("dispatch loop already running".into());
     }
+    // remember explicit settings (concurrency, backend, model, hub) across
+    // restarts/app runs — the settings page applies by re-starting the loop
+    // with an explicit config, so persist it here (pairing-time saves keep
+    // working too: resolve() order is env > file).
+    if let Some(c) = &cfg {
+        if let Err(e) = c.save() {
+            eprintln!("[dispatch] config save failed: {e}");
+        }
+    }
     state.stop.store(false, Ordering::Relaxed);
     let stop = state.stop.clone();
     let running = state.running.clone();

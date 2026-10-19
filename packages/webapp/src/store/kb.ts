@@ -49,6 +49,7 @@ interface KbState {
   setTokenTags: (id: string, tags: string[]) => Promise<void>;
   saveSettings: (s: Record<string, unknown>) => Promise<void>;
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) => Promise<void>;
+  create: (body: { type: string; title: string; body_md?: string; meta?: object; tags?: string[] }) => Promise<{ id: string }>;
   setPref: (k: keyof BoardPrefs, v: boolean) => void;
   setPrefs: (p: BoardPrefs) => void;
 }
@@ -145,6 +146,11 @@ export const useKb = create<KbState>((set, get) => ({
   transition: async (id, to, extra) => {
     await kbApi.transition(id, to, extra);
     await get().refresh();
+  },
+  create: async (body) => {
+    const r = await kbApi.create(body);
+    await get().refresh();
+    return r;
   },
   setPref: (k, v) => {
     const prefs = { ...get().prefs, [k]: v };

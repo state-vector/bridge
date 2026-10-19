@@ -289,6 +289,64 @@ function FieldsMenu({ onClose }: { onClose: () => void }) {
 
 type GroupBy = "agent" | "tag" | "none";
 
+/** Human task composer: creates an unclaimed task into the pool as "web". */
+function NewTaskComposer({ onCreated }: { onCreated: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [tags, setTags] = useState("");
+  const [msg, setMsg] = useState("");
+  const create = useKb((s) => s.create);
+
+  const submit = async () => {
+    if (!title.trim()) return;
+    try {
+      const r = await create({
+        type: "task",
+        title: title.trim(),
+        body_md: body.trim(),
+        tags: tags.split(",").map((t) => t.trim()).filter(Boolean),
+      });
+      setTitle(""); setBody(""); setTags("");
+      setMsg(`created ${r.id}`);
+      setTimeout(() => { setMsg(""); setOpen(false); }, 900);
+      onCreated(r.id);
+    } catch (e) {
+      setMsg(`failed: ${(e as Error).message}`);
+    }
+  };
+
+  if (!open) return <button className="opt-btn" onClick={() => setOpen(true)}>+ new task</button>;
+  return (
+    <div className="card new-task-card" onClick={(e) => e.stopPropagation()}>
+      <input
+        autoFocus
+        value={title}
+        placeholder="Task title — e.g. #1234 fix verdict drift on retry"
+        onChange={(e) => setTitle(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter" && title.trim()) void submit(); }}
+      />
+      <textarea
+        rows={3}
+        value={body}
+        placeholder="Context — the problem, acceptance, out-of-scope (optional)"
+        onChange={(e) => setBody(e.target.value)}
+      />
+      <input
+        value={tags}
+        placeholder="tags, comma-separated (optional — e.g. gtm, issue:quality)"
+        onChange={(e) => setTags(e.target.value)}
+      />
+      <p>
+        <button className="opt-btn" disabled={!title.trim()} onClick={() => void submit()}>Create</button>{" "}
+        <button className="opt-btn opt-ghost" onClick={() => setOpen(false)}>Cancel</button>{" "}
+        {msg && <span className="ok">{msg}</span>}
+      </p>
+      <span className="muted-note">lands as an unclaimed pool task (attributed to you); agents pick it up like any other work. For an open-ended question use the Discussions tab.</span>
+    </div>
+  );
+}
+
 export function BoardView() {
   const tasks = useKb((s) => s.tasks) as any[];
   const sessions = useKb((s) => s.sessions);
@@ -365,6 +423,7 @@ export function BoardView() {
       <div className="view-head">
         <h2>Board</h2>
         <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
+        <NewTaskComposer onCreated={(id) => openTask(id)} />
         <div className="board-controls">
           <select value={groupBy} onChange={(e) => setGroupBy(e.target.value as GroupBy)}>
             <option value="agent">by agent</option>
