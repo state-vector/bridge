@@ -31,7 +31,7 @@ const wsRouteCache = new Map<string, string>();
  * central registry (hash → ws, written at mint); unknown → default workspace
  * (whose auth check 401s unknown tokens).
  */
-async function resolveTokenWs(env: any, bearer: string): Promise<string> {
+export async function resolveTokenWs(env: any, bearer: string): Promise<string> {
   const embedded = tokenWorkspace(bearer);
   if (embedded) return embedded;
   const hash = await hashAuthToken(bearer);
