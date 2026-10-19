@@ -724,7 +724,9 @@ fn tick(
     id: &mut i64,
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
+    fail_counts: &mut HashMap<String, u32>,
     finished_no_pr: &mut HashSet<String>,
+    gave_up: &mut HashSet<String>,
     snap: &SharedSnapshot,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
@@ -933,11 +935,35 @@ fn tick(
                 }
             }
         } else {
-            // failed/timed out — keep in_progress and set backoff so we don't
-            // hammer the same failing task every tick (previously removed the
-            // backoff entry here, causing an immediate re-dispatch loop).
-            attempts.insert(inf.task_id.clone(), Instant::now());
-            msgs.push(format!("{} failed/timed out — left in_progress (backoff)", inf.task_title));
+            // failed/timed out — backoff and retry, capped. Retry loops must
+            // NOT keep logging progress on the task: every runner note
+            // refreshes last_progress.ts and defeats the watchdog (the task
+            // then looks alive forever while the session does nothing).
+            let n = fail_counts.entry(inf.task_id.clone()).or_insert(0);
+            *n += 1;
+            let fails = *n;
+            if fails >= 3 {
+                let note = "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — handed off for attention";
+                let _ = mcp_call(
+                    cfg,
+                    id,
+                    "transition",
+                    json!({
+                        "id": inf.task_id,
+                        "to": "blocked",
+                        "note": note,
+                        "unblock_condition": "fix the failure, then log_progress to re-claim (the runner will re-dispatch)",
+                    }),
+                );
+                gave_up.insert(inf.task_id.clone());
+                attempts.remove(&inf.task_id);
+                fail_counts.remove(&inf.task_id);
+                remove_task_state(&inf.task_id);
+                msgs.push(format!("{} failed {}x — blocked for attention (no more runner retries)", inf.task_title, fails));
+            } else {
+                attempts.insert(inf.task_id.clone(), Instant::now());
+                msgs.push(format!("{} failed/timed out — left in_progress (backoff, attempt {}/3)", inf.task_title, fails));
+            }
         }
         // PR monitoring v1: record the handoff so the review flow can be tracked;
         // automated verdict reaction (CI fail → bounce + fix) lands with the PR watch loop
@@ -1026,22 +1052,19 @@ fn tick(
         }
         // terminal: opencode already finished this task without a PR (analysis
         // /verification work). Never re-dispatch a completed session.
-        if finished_no_pr.contains(tid) {
+        if finished_no_pr.contains(tid) || gave_up.contains(tid) {
             continue;
         }
         // backoff: a task that just failed to spawn shouldn't retry every tick
+        if gave_up.contains(tid) {
+            continue; // handed off for attention — the watchdog owns it now
+        }
         if attempts
             .get(tid)
             .map(|a| a.elapsed() < Duration::from_secs(300))
             .unwrap_or(false)
         {
-            mcp_call(
-                cfg,
-                id,
-                "log_progress",
-                json!({ "id": tid, "note": format!("runner: '{title}' open — dispatch backed off after a failed attempt, retrying"), "sentiment": "neutral" }),
-            )?;
-            continue;
+            continue; // silent backoff: runner bookkeeping must not look like agent activity
         }
         let want_title = format!("bridge-{tid}");
         let sess = sessions.get(&want_title).cloned().or_else(|| {
@@ -1203,7 +1226,9 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
+    let mut fail_counts: HashMap<String, u32> = HashMap::new();
     let mut finished_no_pr: HashSet<String> = HashSet::new();
+    let mut gave_up: HashSet<String> = HashSet::new();
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -1226,7 +1251,9 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut id,
             &mut in_flight,
             &mut attempts,
+            &mut fail_counts,
             &mut finished_no_pr,
+            &mut gave_up,
             &snap,
         ) {
             Ok(msgs) => {

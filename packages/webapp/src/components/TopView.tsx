@@ -103,6 +103,9 @@ export function TopView() {
       // touches alone go stale during long headless opencode runs)
       const lastFresh = Math.max(sessionSeen ?? 0, p?.ts ?? 0);
       const online = now - lastFresh < ONLINE_MS;
+      // task-scoped signal: when THIS task was last touched by anyone (agent
+      // log, transition). Deliberately excludes the label's session ping — a
+      // runner or cron touching the hub must not make idle tasks look alive.
       // blocked cards: the completion column shows the EXIT CONDITION — the
       // actionable part of being blocked. That is the "completion" of a block.
       const unblock: string | undefined = meta.blocked?.unblock_condition;
@@ -132,7 +135,7 @@ export function TopView() {
         unblock: unblock?.slice(0, 140),
         askPending,
         statusTs: (t as any).status_ts,
-        lastSignal: lastFresh || t.updated_ts,
+        lastSignal: Math.max(p?.ts ?? 0, (t as any).updated_ts ?? 0),
       };
     });
     // pinned first (meta.pinned), then subprocess/blocked, then in_progress;
