@@ -92,6 +92,36 @@ export class KnowledgeHub {
   // abandoned; the same agent re-claims it by logging progress again.
   async alarm() {
     await this.ensureSchema();
+    const now0 = Date.now();
+    // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
+    // but an ask to an agent that never answers would pause its task FOREVER
+    // (the 19h+ in_progress rows were this). TTL: 24h. Expiry clears the ask
+    // and any awaiting_ask marker, so the sweep below judges the task on its
+    // own silence.
+    const askTtlMs = 24 * 60 * 60_000;
+    for (const a of this.state.storage.sql.exec(
+      `SELECT id, artefact_id, to_target, created_ts FROM asks WHERE status = 'open' AND created_ts < ?`,
+      now0 - askTtlMs,
+    ).toArray() as any[]) {
+      this.state.storage.sql.exec(
+        `UPDATE asks SET status = 'expired', answered_by = 'system:watchdog', answered_ts = ? WHERE id = ?`,
+        now0, a.id,
+      );
+      if (a.artefact_id) {
+        const t = this.one(`SELECT meta FROM artefacts WHERE id = ?`, a.artefact_id);
+        if (t) {
+          const m = JSON.parse(t.meta ?? "{}");
+          if (m.awaiting_ask?.ask_id === a.id) {
+            delete m.awaiting_ask;
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), a.artefact_id);
+          }
+        }
+      }
+      this.audit("system:watchdog", "ask_expired", String(a.id), {
+        to: a.to_target ?? "", artefact: a.artefact_id ?? "",
+        age_h: Math.round((now0 - Number(a.created_ts ?? 0)) / 3_600_000),
+      });
+    }
     const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
     const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
     const staleMs = staleMin * 60_000;
@@ -189,6 +219,24 @@ export class KnowledgeHub {
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
       });
     }
+    // observability: the board can answer "is the watchdog alive?" via
+    // /api/kb/stats — last tick, stale in-flight count, open asks.
+    this.state.storage.sql.exec(
+      `INSERT INTO settings (key, value) VALUES ('watchdog.last_tick', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      String(now),
+    );
+    const staleNow = this.one(
+      `SELECT COUNT(*) AS n FROM artefacts WHERE type = 'task' AND status = 'in_progress'
+       AND COALESCE(json_extract(meta, '$.last_progress.ts'), 0) < ?`,
+      now - staleMs,
+    )?.n ?? 0;
+    const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
+    this.state.storage.sql.exec(
+      `INSERT INTO settings (key, value) VALUES ('watchdog.sweep', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      JSON.stringify({ ts: now, stale_in_progress: staleNow, open_asks: openAsks }),
+    );
     await this.state.storage.setAlarm(now + 60_000);
   }
 
@@ -1308,7 +1356,18 @@ export class KnowledgeHub {
     const byType = this.state.storage.sql.exec(
       `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
     ).toArray();
-    return { counts: byType };
+    const tick = this.one(`SELECT value FROM settings WHERE key = 'watchdog.last_tick'`);
+    const sweep = this.one(`SELECT value FROM settings WHERE key = 'watchdog.sweep'`);
+    const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
+    let watchdog: Record<string, unknown> | undefined;
+    try {
+      watchdog = {
+        last_tick: tick ? Number(tick.value) : 0,
+        open_asks: openAsks,
+        ...(sweep ? JSON.parse(sweep.value) : {}),
+      };
+    } catch { /* older sweep shape */ }
+    return { counts: byType, watchdog };
   }
 
   /**
