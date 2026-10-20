@@ -1409,7 +1409,14 @@ export class KnowledgeHub {
         const target = String(dm.task ?? dm.verify_target ?? "").trim();
         const isBounce = String(dm.verdict ?? "").toLowerCase() === "bounce";
         if (target) {
-          try {
+          // verifiers often apply their own verdict before proposing it — the
+          // task is already done/bounced. Ratification must be a clean no-op,
+          // not an "apply failed" error the human has to interpret.
+          const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, target);
+          const already = cur && (isBounce ? cur.status === "in_progress" : cur.status === "done");
+          if (already) {
+            this.audit(actor, "verdict_already_applied", target, { decision: id, status: cur.status });
+          } else try {
             await this.transition(
               {
                 id: target,

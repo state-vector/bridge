@@ -67,6 +67,7 @@ function Comment({ v }: { v: HistoryEntry }) {
 }
 
 function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
+  const tasks = useKb((s) => s.tasks) as any[];
   const [comments, setComments] = useState<HistoryEntry[] | null>(null);
   const [comment, setComment] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
@@ -141,14 +142,26 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
         {(() => {
           const f = decisionFrame(d);
           if (f.kind !== "verify") return <h2>{d.title}</h2>;
+          const st = tasks.find((t) => t.id === f.target)?.status;
+          const applied = f.verdict === "bounce" ? st === "in_progress" : st === "done";
+          const frame = applied
+            ? {
+                h: `Ratify the verdict on ${f.target ?? "task"}?`,
+                p: `The verifier already applied it — the task is ${st ?? "in its new state"}. Accepting records your confirmation; nothing else changes.`,
+              }
+            : f.verdict === "bounce"
+            ? {
+                h: `Bounce ${f.target ?? "task"} back to work?`,
+                p: "A fresh-session verifier found the handoff receipts void. Accepting bounces the task to in_progress with the findings; rejecting leaves it as-is.",
+              }
+            : {
+                h: `Accept verification of ${f.target ?? "task"}?`,
+                p: "A fresh-session verifier confirmed the receipts (PR merged, issue closed, on main). Accepting closes the task as done. Rejecting leaves it as-is.",
+              };
           return (
             <>
-              <h2>{f.verdict === "bounce" ? `Bounce ${f.target ?? "task"} back to work?` : `Accept verification of ${f.target ?? "task"}?`}</h2>
-              <p className="ask-reason">
-                {f.verdict === "bounce"
-                  ? "A fresh-session verifier found the handoff receipts void. Accepting bounces the task to in_progress with the findings; rejecting leaves it as-is."
-                  : "A fresh-session verifier confirmed the receipts (PR merged, issue closed, on main). Accepting closes the task as done. Rejecting leaves it as-is."}
-              </p>
+              <h2>{frame.h}</h2>
+              <p className="ask-reason">{frame.p}</p>
               {f.receipts.length > 0 && (
                 <div className="ask-chips">
                   {f.receipts.map(([k, v]) => (
