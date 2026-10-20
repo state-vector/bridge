@@ -87,12 +87,22 @@ VERSION="$("$INSTALL_DIR/$BIN" --version 2>/dev/null || true)" || true
 info "ready. next steps:"
 cat <<EOF
 
-  1. Pair with your hub (prints a code; approve it in the web UI):
+  1. Check your setup (config, models, agent CLIs, git):
+       $INSTALL_DIR/$BIN doctor
+
+  2. Pair with your hub (prints a code; approve it in the web UI):
        $INSTALL_DIR/$BIN pair https://your-hub.workers.dev
 
-  2. The runner starts immediately after pairing and claims todo tasks
-     from the board, dispatching each to a local agent CLI (opencode).
+  3. Set a model per agent in ~/.bridge/config.json ("models") — the runner
+     refuses to dispatch without one. `bridge doctor` tells you if it's right.
+
+  4. Run forever (linux):
+       $INSTALL_DIR/$BIN service install
+       systemctl --user enable --now bridge
+
+  The runner claims todo tasks from the board and dispatches each to a
+  local agent CLI in an isolated git worktree, one PR per task.
 
   Env overrides: BRIDGE_URL BRIDGE_TOKEN BRIDGE_WORKDIR BRIDGE_AGENT
-                 BRIDGE_MAX_SESSIONS BRIDGE_POLL_SECS OPENCODE_BIN
+                 BRIDGE_MAX_SESSIONS BRIDGE_POLL_SECS BRIDGE_BACKENDS BRIDGE_MODEL
 EOF

@@ -63,6 +63,21 @@ cd packages/cli && cargo build --release
 ./target/release/bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
+### Run on a server
+
+The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
+
+```bash
+bridge doctor            # checks config, per-agent models, agent CLIs, git — every failure names the fix
+bridge pair https://bridge.<your-subdomain>.workers.dev
+bridge service install   # linux: writes a systemd user unit
+systemctl --user enable --now bridge
+loginctl enable-linger $USER   # run at boot, survive logout
+journalctl --user -u bridge -f # watch the dispatch log
+```
+
+Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
+
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
 ### Runner config file

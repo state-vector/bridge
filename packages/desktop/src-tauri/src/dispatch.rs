@@ -660,7 +660,7 @@ fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf
         if ok { Some(path) } else { None }
 }
 
-fn cleanup_worktree(workdir: &str, task_id: &str) {
+fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
     let slug = slugify(task_id);
     let Some(home) = std::env::var("HOME").ok() else { return };
     let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
@@ -669,6 +669,75 @@ fn cleanup_worktree(workdir: &str, task_id: &str) {
         .args(["worktree", "remove", "--force"])
         .arg(&path)
         .output();
+    if drop_branch {
+        // terminal (done): the work is merged or rejected — bridge/<slug> has
+        // no future. On todo releases the branch is KEPT: a re-claim attaches
+        // to it, preserving any unpushed stall work.
+        let _ = Command::new("git")
+            .current_dir(workdir)
+            .args(["branch", "-D"])
+            .arg(&format!("bridge/{slug}"))
+            .output();
+    }
+}
+
+/// Reconcile ~/.bridge/worktrees/ with live task status. Terminal tasks (done,
+/// superseded) and released tasks (todo) must not hold worktrees on disk — the finalize
+/// path cleans `done` handoffs, but yielded runs, pre-sweep history and
+/// handoff-rejections leave stragglers. in_progress/in_review/blocked worktrees
+/// are kept: they are the session's resume assets. Capped per tick so a large
+/// backlog drains without stalling the dispatch loop.
+const WORKTREE_SWEEP_CAP: usize = 20;
+static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
+    let Some(home) = std::env::var("HOME").ok() else { return };
+    let dir = PathBuf::from(&home).join(".bridge").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let active: HashSet<String> = in_flight
+        .iter()
+        .filter_map(|inf| inf.worktree.as_ref())
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let mut slugs: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| !s.is_empty() && !active.contains(s))
+        .collect();
+    slugs.sort();
+    let mut swept = 0;
+    for slug in slugs {
+        if swept >= WORKTREE_SWEEP_CAP {
+            break;
+        }
+        // reverse slugify: BR-1003 → BR#1003; TASK-010 → TASK-010
+        let task_id = match slug.strip_prefix("BR-") {
+            Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
+            _ => slug.clone(),
+        };
+        // only explicit statuses — an MCP/network error keeps the worktree
+        let status = mcp_call(cfg, id, "get_artefact", json!({ "id": task_id }))
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from));
+        match status.as_deref() {
+            Some("done") | Some("superseded") => {
+                swept += 1;
+                cleanup_worktree(&cfg.workdir, &task_id, true);
+                let _ = std::fs::remove_dir_all(dir.join(&slug));
+                msgs.push(format!("swept worktree {slug} — task {task_id} is {}", status.unwrap_or_else(|| "done".into())));
+            }
+            Some("todo") => {
+                swept += 1;
+                cleanup_worktree(&cfg.workdir, &task_id, false);
+                let _ = std::fs::remove_dir_all(dir.join(&slug));
+                msgs.push(format!("swept worktree {slug} — task {task_id} released to todo (branch kept for re-claim)"));
+            }
+            _ => {}
+        }
+    }
+    if swept > 0 {
+        let _ = Command::new("git").current_dir(&cfg.workdir).arg("worktree").arg("prune").output();
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -826,7 +895,7 @@ fn spawn_opencode(
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
     };
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
         policy, tid, title, body_md, resume_note, run_dir, branch, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
@@ -919,6 +988,13 @@ fn tick(
     snap: &SharedSnapshot,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
+
+    // worktree hygiene: every 10 ticks reconcile disk worktrees with task
+    // state — done/released tasks must not hold ~/.bridge/worktrees/<slug>
+    let n = SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 10 == 0 {
+        sweep_stale_worktrees(cfg, id, in_flight, &mut msgs);
+    }
 
     // 1. drain finished sessions: finalize each (progress + in_review + cleanup)
     let mut finished: Vec<(InFlight, opencode::RunOutcome)> = Vec::new();
@@ -1099,7 +1175,7 @@ fn tick(
                     finished_no_pr.insert(inf.task_id.clone());
                     if transition_to == "done" && inf.worktree.is_some() {
                         // terminal: worktree + branch served their purpose
-                        cleanup_worktree(&cfg.workdir, &inf.task_id);
+                        cleanup_worktree(&cfg.workdir, &inf.task_id, true);
                     }
                     msgs.push(format!(
                         "{} → {}{}",
