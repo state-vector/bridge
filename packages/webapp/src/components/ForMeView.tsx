@@ -68,6 +68,7 @@ function Comment({ v }: { v: HistoryEntry }) {
 
 function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
   const tasks = useKb((s) => s.tasks) as any[];
+  const { busy: actBusy, act } = useDecisionAct(d, onChanged);
   const [comments, setComments] = useState<HistoryEntry[] | null>(null);
   const [comment, setComment] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
@@ -105,7 +106,7 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
     }
   };
 
-  const act = async (to: "accepted" | "rejected") => {
+  const actWithNote = async (to: "accepted" | "rejected") => {
     if (to === "rejected" && !rejectReason.trim()) return;
     setBusy(true);
     try {
@@ -201,14 +202,14 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
               onChange={(e) => setRejectReason(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") void act("rejected"); }}
             />
-            <button className="opt-btn" disabled={busy || !rejectReason.trim()} onClick={() => void act("rejected")}>Confirm reject</button>
+            <button className="opt-btn act-reject" disabled={busy || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</button>
             <button className="opt-btn opt-ghost" onClick={() => setRejectOpen(false)}>Cancel</button>
           </div>
         )}
 
         <div className="ask-actions">
-          <button className="opt-btn" disabled={busy} onClick={() => void act("accepted")}>Accept</button>
-          <button className="opt-btn opt-ghost" disabled={busy} onClick={() => setRejectOpen(true)}>Reject…</button>
+          <button className="opt-btn act-accept" disabled={busy || actBusy} onClick={() => void actWithNote("accepted")}>Accept</button>
+          <button className="opt-btn opt-ghost" disabled={busy || actBusy} onClick={() => setRejectOpen(true)}>Reject…</button>
         </div>
         {msg && <p className="ok">{msg}</p>}
       </div>
@@ -216,8 +217,29 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
   );
 }
 
+function useDecisionAct(d: KbArtefact, onDone: (id: string) => void) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const act = async (to: "accepted" | "rejected") => {
+    setBusy(true);
+    setErr("");
+    try {
+      await kbApi.transition(d.id, to, { note: to === "accepted" ? "accepted by human (For Me)" : "rejected by human (For Me)" });
+      onDone(d.id);
+      return true;
+    } catch (e) {
+      setErr(`failed: ${(e as Error).message}`);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, err, act };
+}
+
 function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
   const [open, setOpen] = useState(false);
+  const { busy, err, act } = useDecisionAct(d, onDone);
   return (
     <div className="card ask-urgent forme-item">
       {(() => {
@@ -241,7 +263,18 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
         })()}
       </h3>
       <div className="ask-actions">
-        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Open ↗</button>
+        {(() => {
+          const f = decisionFrame(d);
+          const acceptLabel = f.kind === "verify" && f.verdict === "bounce" ? "Bounce it" : "Accept";
+          return (
+            <>
+              <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{acceptLabel}</button>
+              <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
+              <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
+            </>
+          );
+        })()}
+        {err && <span className="gw-err">{err}</span>}
       </div>
       {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
     </div>
