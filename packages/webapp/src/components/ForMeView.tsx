@@ -281,6 +281,59 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
   );
 }
 
+/** One card per TARGET TASK: latest verdict is actionable, identical prior
+ *  rounds collapse into a muted line (the flood fix — round 9 of "unchanged"
+ *  bounce verdicts is loop telemetry, not 9 separate human decisions). */
+function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior: KbArtefact[]; onDone: (id: string) => void }) {
+  const [showPrior, setShowPrior] = useState(false);
+  const m = (latest.meta ?? {}) as Record<string, unknown>;
+  const target = String(m.task ?? m.verify_target ?? "");
+  const verdict = String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : "verified";
+  return (
+    <div className="card ask-urgent forme-item">
+      <div className="ask-chips">
+        <span className="chip chip-urgent">VERDICT</span>
+        <span className={`chip ${verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{verdict.toUpperCase()}</span>
+        <span className="chip chip-scope">{target}</span>
+        <span className="why-line">{latest.id} · proposed {rel(latest.created_ts)}</span>
+      </div>
+      <h3 className="ask-question" onClick={() => void 0}>
+        {(verdict === "bounce" ? `Bounce ${target}` : `Accept verification of ${target}`).slice(0, 110)}
+      </h3>
+      {prior.length > 0 && (
+        <p className="why-line" style={{ margin: "2px 0" }}>
+          <button className="opt-btn" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
+            {showPrior ? "▾" : "▸"} {prior.length} identical prior round{prior.length > 1 ? "s" : ""} collapsed
+          </button>
+        </p>
+      )}
+      {showPrior && prior.map((d) => (
+        <p key={d.id} className="why-line" style={{ margin: "1px 0 1px 12px" }}>
+          {d.id} · {rel(d.created_ts)} · {String((d.meta as any)?.verdict ?? "").toUpperCase()} — {(d.title ?? "").slice(0, 80)}
+        </p>
+      ))}
+      <VerdictActions d={latest} onDone={onDone} />
+    </div>
+  );
+}
+
+function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const { busy, err, act } = useDecisionAct(d, onDone);
+  const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
+  return (
+    <>
+      <div className="ask-actions">
+        <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</button>
+        <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
+        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
+        {err && <span className="gw-err">{err}</span>}
+      </div>
+      {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
+    </>
+  );
+}
+
 function AskRow({ d, onDone }: { d: any; onDone: (id: string) => void }) {
   const resolve = useBridge((s) => s.resolve);
   const [busy, setBusy] = useState(false);
@@ -342,7 +395,31 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
 
   const bump = () => { void refresh(); setTick((x) => x + 1); };
 
-  const total = (proposed?.length ?? 0) + asked.length;
+  // For Me flood fix (BR#1782): verify-verdict decisions group by TARGET TASK —
+  // one card per task (latest verdict + collapsed identical-round history),
+  // not one card per verdict round. Generic decisions stay individual.
+  const grouped = useMemo(() => {
+    const list = proposed ?? [];
+    const verdicts = list.filter((d) => (d.meta as any)?.decision_class === "verify-verdict" && ((d.meta as any)?.task || (d.meta as any)?.verify_target));
+    const generic = list.filter((d) => !verdicts.includes(d));
+    const byTarget = new Map<string, KbArtefact[]>();
+    for (const d of verdicts) {
+      const key = String((d.meta as any).task ?? (d.meta as any).verify_target);
+      const arr = byTarget.get(key) ?? [];
+      arr.push(d);
+      byTarget.set(key, arr);
+    }
+    // newest proposed decision per target = the actionable card; the rest collapse
+    const verdictCards: Array<{ latest: KbArtefact; prior: KbArtefact[] }> = [];
+    for (const [, arr] of byTarget) {
+      arr.sort((a, b) => b.created_ts - a.created_ts);
+      verdictCards.push({ latest: arr[0], prior: arr.slice(1) });
+    }
+    verdictCards.sort((a, b) => b.latest.created_ts - a.latest.created_ts);
+    return { verdictCards, generic };
+  }, [proposed]);
+
+  const total = grouped.verdictCards.length + grouped.generic.length + asked.length;
 
   return (
     <div className="disc-wrap">
@@ -360,7 +437,11 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
         <AskRow key={d.id} d={d} onDone={bump} />
       ))}
 
-      {(proposed ?? []).map((d) => (
+      {grouped.verdictCards.map(({ latest, prior }) => (
+        <VerdictGroupRow key={latest.id} latest={latest} prior={prior} onDone={bump} />
+      ))}
+
+      {grouped.generic.map((d) => (
         <DecisionRow key={d.id} d={d} onDone={bump} />
       ))}
 

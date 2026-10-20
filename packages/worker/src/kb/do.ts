@@ -785,6 +785,62 @@ export class KnowledgeHub {
         bars: Array.isArray(body.await) ? body.await.map(String) : [],
       };
     }
+    // VERIFY-VERDICT DEDUP (For Me flood fix): verify sessions propose a decision
+    // per round — identical findings ("unchanged since round N") presented as
+    // fresh decisions buried the human inbox (45 bounce-cards in 4h). Rule:
+    // a verdict identical to the last PROPOSED verdict for the same target is
+    // applied directly, never proposed. Same verdict + round>=3 → the task
+    // BLOCKS for human intervention (the loop is stalled, that's a blocker
+    // not a decision). Changed verdict or changed receipts still propose.
+    if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      const target = String(createMeta.task ?? createMeta.verify_target ?? "").trim();
+      const verdict = String(createMeta.verdict ?? "").toLowerCase();
+      if (target && verdict) {
+        const prev = this.one(
+          `SELECT id, meta FROM artefacts WHERE type = 'decision' AND status = 'proposed'
+           AND json_extract(meta, '$.decision_class') = 'verify-verdict'
+           AND (json_extract(meta, '$.task') = ? OR json_extract(meta, '$.verify_target') = ?)
+           ORDER BY created_ts DESC LIMIT 1`,
+          target, target,
+        );
+        // receipts fingerprint: any meta keys other than bookkeeping — identical
+        // when the verifier found the same world state
+        const fp = (m: any) => JSON.stringify(Object.entries(m ?? {})
+          .filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round"].includes(k))
+          .sort(([a], [b]) => a.localeCompare(b)));
+        const same = prev && String((JSON.parse(prev.meta ?? "{}") as any).verdict ?? "").toLowerCase() === verdict
+          && fp(createMeta) === fp(JSON.parse(prev.meta ?? "{}"));
+        if (same) {
+          const trow = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, target);
+          if (trow) {
+            const tm = JSON.parse(trow.meta ?? "{}");
+            const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
+            tm.verify_round = round;
+            tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+            const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
+            if (!alreadyRight) {
+              // 3 identical rounds = the loop is stalled; park it for a human
+              if (round >= 3) {
+                await this.transition({
+                  id: trow.id, to: "blocked",
+                  note: `verify loop stalled — ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
+                  unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
+                }, "system:verifier");
+              } else {
+                await this.transition({
+                  id: trow.id, to: verdict === "bounce" ? "in_progress" : "done",
+                  note: `verify round ${round}: identical verdict (${verdict}) — auto-applied (For Me flood fix; no decision card)`,
+                }, "system:verifier");
+              }
+            } else {
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(tm), Date.now(), trow.id);
+            }
+            this.audit("system:verifier", "verdict_deduped", id, { target, verdict, round });
+            return { id, deduped: true, target, round, note: "identical verdict auto-applied — no decision card created" };
+          }
+        }
+      }
+    }
     this.state.storage.sql.exec(
       `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
