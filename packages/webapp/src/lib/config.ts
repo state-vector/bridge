@@ -6,25 +6,17 @@ const LS = {
 
 export type Mode = "live" | "mock";
 
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
 const env = import.meta.env;
-// Hub URL comes from the environment (VITE_HUB_URL at build time) or the
-// browser origin — no personal deployment is baked into the source.
-const DEFAULT_LIVE_URL = (env.VITE_HUB_URL as string | undefined) ?? "";
 
 export function getConfig() {
   const mode =
     ((localStorage.getItem(LS.mode) as Mode | null) ??
       ((env.VITE_HUB_MODE as Mode | undefined) ?? "live"));
+  // The webapp is browser-only: the desktop gateway has its own minimal UI
+  // (packages/desktop/ui), so no shell forks live here. The hub is the
+  // browser origin — no personal deployment is baked into the source.
   const fallback =
-    mode === "mock"
-      ? "http://127.0.0.1:7788"
-      : isTauri()
-        ? DEFAULT_LIVE_URL
-        : window.location.origin;
+    mode === "mock" ? "http://127.0.0.1:7788" : window.location.origin;
   const url = localStorage.getItem(LS.url) || fallback;
   const token = localStorage.getItem(LS.token) || (env.VITE_INGEST_TOKEN as string | undefined) || "";
   return { mode, url: url.replace(/\/$/, ""), token };
