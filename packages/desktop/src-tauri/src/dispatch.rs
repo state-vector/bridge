@@ -177,7 +177,9 @@ fn load_config() -> Option<DispatchConfig> {
 /// Device pairing (bridge-native github-like device flow): request a code, the
 /// human approves it at {url}/pair, poll until the token arrives. The token is
 /// shown once on this device — the approver never sees it.
-fn pair(url: &str) -> Result<DispatchConfig, String> {
+/// Device-flow pairing, shared by the desktop app and the CLI's onboarding:
+/// prints a code, polls until the human approves, returns the half-filled config.
+pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1513,7 +1515,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let cfg = match cfg {
         Some(c) => c,
         None => match std::env::var("BRIDGE_URL") {
-            Ok(url) => match pair(url.trim_end_matches('/')) {
+            Ok(url) => match pair_device(url.trim_end_matches('/')) {
                 Ok(c) => {
                     if let Err(e) = c.save() {
                         eprintln!("[dispatch] config save failed: {e}");
