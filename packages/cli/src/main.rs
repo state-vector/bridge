@@ -38,11 +38,24 @@ fn main() {
                     eprintln!("usage: bridge pair <hub-url>   (or set BRIDGE_URL)");
                     std::process::exit(2);
                 });
-            eprintln!("[bridge] pairing against {url} — approve at {url}/pair, then the runner starts");
+            eprintln!("[bridge] pairing against {url} — approve at {url}/pair");
             // run_loop pairs from BRIDGE_URL — the CLI knows the URL from the
             // arg, not the env; hand it over or pairing dead-ends immediately.
             std::env::set_var("BRIDGE_URL", &url);
-            run(None);
+            let mut cfg = match dispatch::pair_device(&url) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[bridge] pairing failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("[bridge] paired — token saved");
+            onboard(&mut cfg);
+            if let Err(e) = cfg.save() {
+                eprintln!("[bridge] config save failed: {e}");
+            }
+            eprintln!("[bridge] onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
+            run(Some(cfg));
         }
         "status" => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -73,9 +86,8 @@ fn main() {
             match DispatchConfig::resolve() {
                 Some(cfg) => run(Some(cfg)),
                 None => {
-                    // no config: run_loop handles BRIDGE_URL pairing; without
-                    // BRIDGE_URL it exits with the setup message.
-                    run(None);
+                    eprintln!("no config yet — first use is: bridge pair <hub-url> (pairs AND onboards: agent, model, workdir)");
+                    std::process::exit(2);
                 }
             }
         }
@@ -133,6 +145,107 @@ fn run(cfg: Option<DispatchConfig>) {
     let last_error = Arc::new(Mutex::new(None));
     let snap = Arc::new(Mutex::new(dispatch::DispatchSnapshot::default()));
     dispatch::run_loop(cfg, stop, running, last_error, snap);
+}
+
+fn prompt(label: &str, default: Option<&str>) -> String {
+    use std::io::Write;
+    match default {
+        Some(d) => print!("{label} [{d}]: "),
+        None => print!("{label}: "),
+    }
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let v = line.trim().to_string();
+    if v.is_empty() { default.unwrap_or("").to_string() } else { v }
+}
+
+fn bin_detected(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// First-run onboarding: pair leaves a half-filled config (url, token, label).
+/// Nothing dispatchable yet: no agent backend, no model — and the runner
+/// refuses to dispatch without both. Walk the human through the rest BEFORE
+/// the loop starts polling, instead of a zombie runner.
+fn onboard(cfg: &mut DispatchConfig) {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !tty {
+        eprintln!("[bridge] non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends + models are REQUIRED).");
+        return;
+    }
+    println!("\n== onboard: which agents will drive tasks on this machine? ==\n");
+
+    // detect installed agent CLIs
+    let all = [("opencode", "opencode"), ("kiro", "kiro")];
+    let detected: Vec<&str> = all.iter().filter(|(name, _)| bin_detected(name)).map(|(name, _)| *name).collect();
+    if detected.is_empty() {
+        println!("  no agent CLI found on PATH. Install one first:");
+        println!("    opencode: https://opencode.ai  (then authenticate it)");
+        println!("  re-run `bridge pair` after installing, or set backends/models in ~/.bridge/config.json by hand.");
+        std::process::exit(1);
+    }
+    for d in &detected {
+        println!("  detected: {d}");
+    }
+    let default_backend = detected.first().unwrap_or(&"opencode").to_string();
+    let choice = prompt(
+        &format!("agent backends to enable, comma-separated ({})", detected.join(", ")),
+        Some(&default_backend),
+    );
+    let backends: Vec<String> = choice
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| detected.contains(&s.as_str()))
+        .collect::<Vec<_>>();
+    let backends = if backends.is_empty() { vec![default_backend.clone()] } else { backends };
+
+    // model per backend — REQUIRED (the runner refuses dispatch without one)
+    let mut models = std::collections::HashMap::new();
+    println!("\n== a model per agent (REQUIRED — the runner refuses dispatch without it) ==\n");
+    for b in &backends {
+        let example = if b == "kiro" { "anthropic.claude-sonnet-4-5" } else { "openrouter/~z-ai/glm-flash-latest" };
+        let m = loop {
+            let v = prompt(&format!("  model for {b} (e.g. {example})"), None);
+            if !v.trim().is_empty() {
+                break v.trim().to_string();
+            }
+            println!("  a model is required — the runner will not dispatch without one.");
+        };
+        models.insert(b.clone(), m);
+    }
+
+    println!("\n== where the work happens ==\n");
+    let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let workdir = prompt("git workdir for isolated task worktrees", Some(&cwd));
+    let is_git = std::process::Command::new("git")
+        .args(["-C", &workdir, "rev-parse", "--is-inside-work-tree"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !is_git {
+        println!("  warning: {workdir} is not a git repo — dispatch needs one for isolated worktrees. Edit workdir in ~/.bridge/config.json later.");
+    }
+    let max_sessions = prompt("max concurrent agent sessions", Some("1"))
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+
+    cfg.backends = Some(backends.clone());
+    cfg.backend = Some(backends[0].clone());
+    cfg.models = Some(models);
+    cfg.workdir = workdir;
+    cfg.max_sessions = max_sessions;
+    println!();
 }
 
 /// Headless setup check: every failure names the fix. Exit 1 when setup is
