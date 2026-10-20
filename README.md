@@ -98,6 +98,12 @@ Notes:
   opencode needs an explicit model (the runner refuses to dispatch without
   one; the CLI's own default is how a stale pin silently downgrades a fleet).
   Kiro is profile-driven, so it needs no model entry.
+- **Identity**: the gateway's token should be tagged `gateway` in the Connect
+  tab — gateway tokens are infrastructure and never task owners; dispatched
+  work is attributed to the agent the gateway dispatched as, named
+  `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or overridden with
+  `"agent_name"` in the config. Tasks claimed by an untagged gateway token
+  keep the token's label as owner.
 - **Model cost**: whatever you set here is what every dispatched session uses.
   Check the opencode CLI's own config (`~/.config/opencode/opencode.json`,
   `"model"` key) if spend looks high despite a pin here.

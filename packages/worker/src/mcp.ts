@@ -214,6 +214,14 @@ async function seeAlso(a: any, rel: any, identity: Ctx["identity"], call: Ctx["c
 
 async function callTool(name: string, args: any, ctx: Ctx) {
   const { call, identity } = ctx;
+  // Gateway tokens (tagged "gateway") are infrastructure: they claim and
+  // dispatch on behalf of the AGENT they dispatched as, and must never appear
+  // as task owner (the MacBook-Pro-as-owner defect, ADR BR#899). The runner
+  // passes the dispatched agent name in `agent`; the DO honours it only when
+  // this gateway flag is set — a plain agent token cannot attribute away.
+  if (identity.tags.includes("gateway") && !args.gateway) {
+    args.gateway = true;
+  }
   switch (name) {
     case "orient": {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)

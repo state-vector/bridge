@@ -36,6 +36,8 @@ pub struct DispatchConfig {
     #[serde(default)]
     pub label: Option<String>, // agent identity from pairing
     #[serde(default)]
+    pub agent_name: Option<String>, // name dispatched tasks are attributed to (override for the <hostname>-<backend> autogen)
+    #[serde(default)]
     pub ws: Option<String>, // workspace slug from pairing
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize, // WIP limit for this node
@@ -116,6 +118,7 @@ impl DispatchConfig {
                 .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
             agents: None,
             label: None,
+            agent_name: None,
             ws: None,
         })
     }
@@ -249,6 +252,7 @@ fn pair(url: &str) -> Result<DispatchConfig, String> {
                     timeout_mins: default_timeout_mins(),
                     opencode_bin: default_opencode_bin(),
                     label,
+                    agent_name: None,
                 ws: Some(ws),
                 max_sessions: default_max_sessions(),
                 report_minutes: None,
@@ -386,15 +390,40 @@ fn mcp_call_session(
     Ok(parsed)
 }
 
-/// Task-scoped call: session attributed to the task's own dispatch session.
+/// Task-scoped call: session attributed to the task's own dispatch session,
+/// and the call attributed to the AGENT the gateway dispatched as
+/// (ADR BR#899: gateways are infrastructure and never task owners). The
+/// agent name autogens as <hostname>-<backend> (macbookpro-opencode) —
+/// honoured by the hub only when the token carries the "gateway" tag.
 fn mcp_call_task(
     cfg: &DispatchConfig,
     id: &mut i64,
     tool: &str,
-    args: serde_json::Value,
+    mut args: serde_json::Value,
     task_id: &str,
 ) -> Result<serde_json::Value, String> {
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("agent".into(), json!(agent_identity(cfg)));
+    }
     mcp_call_session(cfg, id, tool, args, Some(&format!("dispatch-{}", slugify(task_id))))
+}
+
+/// The agent name dispatched tasks are attributed to: config override
+/// (`agent_name`), else <hostname>-<backend> (autogen, stable per machine).
+fn agent_identity(cfg: &DispatchConfig) -> String {
+    if let Some(a) = &cfg.agent_name {
+        return a.clone();
+    }
+    let host = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "gateway".into());
+    let backend = cfg.backends.as_ref().and_then(|b| b.first().cloned())
+        .or_else(|| cfg.backend.clone())
+        .unwrap_or_else(|| "opencode".into());
+    format!("{}-{}", slugify(&host).to_lowercase(), slugify(&backend).to_lowercase())
 }
 
 // ---- local dispatch snapshot (rendered by the app's Local view) ----

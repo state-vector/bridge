@@ -1207,8 +1207,15 @@ export class KnowledgeHub {
     let owner = row.owner;
     // claim only on fresh pickup or abandoned re-claim — a review bounce returns to the AUTHOR
     const bounceFromReview = row.status === "in_review";
+    // gateway attribution: a gateway-tagged token is infrastructure — it claims
+    // on behalf of the agent it dispatched as (ADR BR#899). body.agent names
+    // that agent; mcp.ts only forwards it when the token carries the "gateway"
+    // tag, so a plain agent token cannot attribute its work elsewhere.
+    const attributedAgent = body.gateway && String(body.agent ?? "").trim()
+      ? String(body.agent).trim().slice(0, 60)
+      : undefined;
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
-      owner = actor;
+      owner = attributedAgent ?? actor;
     }
     // session attribution: stamp which session claimed/acted, first-wins, resolved
     // explicit → the token's most recent session (agents pass session on orient only)
@@ -1314,6 +1321,7 @@ export class KnowledgeHub {
     }
     this.audit(actor, "transition", id, {
       from: row.status, to, note: body.note ?? "", sentiment,
+      ...(attributedAgent ? { agent: attributedAgent } : {}),
       ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
@@ -1567,8 +1575,13 @@ export class KnowledgeHub {
     // blocks re-claim the same way — the agent is back, the subprocess resolved.
     // Legitimately blocked tasks (human reasons) keep their status until explicitly resumed.
     const isSubprocessBlock = meta.blocked?.class === "subprocess";
+    // gateway attribution (ADR BR#899): re-claims via gateway tokens attribute
+    // to the dispatched agent, same as ordinary claims
+    const attributedAgent = body.gateway && String(body.agent ?? "").trim()
+      ? String(body.agent).trim().slice(0, 60)
+      : undefined;
     if (row.status === "blocked" && ((meta.blocked?.reason ?? "").startsWith("abandoned") || isSubprocessBlock)) {
-      await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed — subprocess resolved" : "re-claimed — agent resumed (heartbeat)" }, actor);
+      await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed — subprocess resolved" : "re-claimed — agent resumed (heartbeat)", gateway: body.gateway, agent: body.agent }, actor);
       delete meta.blocked; // transition cleared it in DB — don't resurrect it here
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
@@ -1589,7 +1602,7 @@ export class KnowledgeHub {
           note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`,
         };
       }
-      await this.transition({ id, to: "in_progress", note: "started — progress logged" }, actor);
+      await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
     }
     // (A) declared grace: a silence window for a long op, made while still
     // running. Requires a will (what the silence is FOR). Cleared by the next
@@ -1607,7 +1620,13 @@ export class KnowledgeHub {
       delete meta.subprocess;
     }
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
-    meta.last_progress = { note, will: will || undefined, sentiment, actor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
+    // gateway attribution: progress made by a gateway token on behalf of a
+    // dispatched agent shows the AGENT as the actor on cards (ADR BR#899) —
+    // the gateway stays in the audit trail as the actor of record.
+    const progressActor = body.gateway && String(body.agent ?? "").trim()
+      ? String(body.agent).trim().slice(0, 60)
+      : actor;
+    meta.last_progress = { note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,

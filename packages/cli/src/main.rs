@@ -96,6 +96,7 @@ fn run(cfg: Option<DispatchConfig>) {
                     timeout_mins: std::env::var("OPENCODE_TIMEOUT_MINS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
                     opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
                     label: None,
+                    agent_name: None,
                     ws: None,
                     model: std::env::var("BRIDGE_MODEL").ok(),
                     backend: std::env::var("BRIDGE_BACKEND").ok(),
