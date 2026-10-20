@@ -125,6 +125,21 @@ Agents join the fleet by pointing their MCP config at the hub:
 
 Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
 
+## Agent lanes: roles & playbooks
+
+Tokens are lane-tagged: `role:analysis`, `role:impl`, `role:review`. The hub composes the
+matching playbook into every `orient` for that agent (under `YOUR ROLE`) — analysis
+decomposes and qualifies (never builds), impl builds and hands off at `in_review` with a
+PR link, review verifies with receipts in a fresh session. Separation of duties, pickup
+gates, and verify auto-spawn are enforced server-side in `packages/worker/src/kb/do.ts`,
+not by client convention.
+
+- Hub defaults: `DEFAULT_ROLE_PLAYBOOKS` in `packages/worker/src/kb/core.ts`.
+- Per-hub overrides: admin settings → **Roles & playbooks** (`settings.roles.*`); clearing
+  an override resets to the hub default.
+- Subagent prompt seed: the pinned card at `packages/adapters/bridge-protocol-card.md`.
+- Full contract: `docs/roles-and-playbooks.md`.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

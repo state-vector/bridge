@@ -7,6 +7,7 @@ import {
   isQuestionTask,
   isRelation,
   parseTags,
+  resolveRolePlaybook,
   sanitizeTags,
   taskKind,
   validateRelation,
@@ -172,6 +173,25 @@ const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0,
   asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0,
 };
+
+describe("role playbook resolution (settings.roles overrides)", () => {
+  it("a non-blank override wins over the hub default", () => {
+    expect(resolveRolePlaybook({ impl: "  CUSTOM LANE  " }, "impl")).toBe("CUSTOM LANE");
+  });
+
+  it("a blank override resets to the hub default — never drops the playbook", () => {
+    expect(resolveRolePlaybook({ analysis: "" }, "analysis")).toMatch(/DECOMPOSE/);
+    expect(resolveRolePlaybook({ analysis: "   " }, "analysis")).toMatch(/DECOMPOSE/);
+  });
+
+  it("missing override and unknown roles fall back safely", () => {
+    expect(resolveRolePlaybook(undefined, "review")).toMatch(/VERIFY/);
+    expect(resolveRolePlaybook({}, "review")).toMatch(/VERIFY/);
+    expect(resolveRolePlaybook({ analysis: "x" }, "review")).toMatch(/VERIFY/);
+    expect(resolveRolePlaybook({}, "nonexistent")).toBe("");
+    expect(resolveRolePlaybook({ impl: 42 }, "impl")).toMatch(/BUILD/); // non-string junk = no override
+  });
+});
 
 describe("agent behaviour score", () => {
   it("idle agent sits at 50/fair with a nudge to create", () => {

@@ -47,6 +47,7 @@ import {
   isWsSlug,
   isValidAskTarget,
   parseTags,
+  resolveRolePlaybook,
   sanitizeTags,
   validateRelation,
   validateTransition,
@@ -2037,7 +2038,7 @@ export class KnowledgeHub {
       ?? (isCron ? DEFAULT_CRON_PLAYBOOK : "");
     const playbooks = tags
       .filter((t) => t.startsWith("role:"))
-      .map((t) => ({ role: t.slice(5), playbook: rolesSettings[t.slice(5)] ?? DEFAULT_ROLE_PLAYBOOKS[t.slice(5)] }))
+      .map((t) => ({ role: t.slice(5), playbook: resolveRolePlaybook(rolesSettings, t.slice(5)) }))
       .filter((p) => typeof p.playbook === "string" && p.playbook.trim());
     // reaper: sort out my abandoned work at check-in (see reapAbandoned)
     const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
