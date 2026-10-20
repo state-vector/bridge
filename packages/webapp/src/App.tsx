@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BacklogView, CompletedView } from "./components/BacklogView";
 import { BoardView } from "./components/BoardView";
 import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
@@ -16,11 +17,13 @@ import "./App.css";
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
-type Tab = "forme" | "board" | "top" | "log" | "knowledge" | "discussions" | "connect";
+type Tab = "forme" | "board" | "top" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "forme", label: "For Me" },
   { key: "board", label: "Board" },
   { key: "top", label: "Top" },
+  { key: "backlog", label: "Backlog" },
+  { key: "completed", label: "Completed" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discussions" },
@@ -133,6 +136,8 @@ export default function App() {
         )}
         {tab === "board" && <BoardView />}
         {tab === "top" && <TopView />}
+        {tab === "backlog" && <BacklogView />}
+        {tab === "completed" && <CompletedView />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
