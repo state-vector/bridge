@@ -16,6 +16,18 @@ export default {
     // MCP: machine plane (bearer) — agents talk to the knowledge layer here.
     // machine-plane stats: watchdog liveness for headless observers (token auth).
     // Workspace resolves via the same registry lookup MCP uses, then forwards.
+    if (url.pathname === "/api/kb-machine/rename") {
+      const body = await request.json().catch(() => ({}));
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/token.rename", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ bearer, label: body.label }),
+      });
+    }
     if (url.pathname === "/api/kb-machine/stats") {
       const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");

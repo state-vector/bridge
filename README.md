@@ -133,6 +133,12 @@ npm run build -w @flows/webapp   # webapp dist is committed and served as worker
 npm run test -w packages/worker  # worker tests
 ```
 
+**Docs are part of the change.** README.md and `packages/site/content.md`
+describe shipped behaviour — a change that alters user-visible behaviour
+(UI, config, protocol, gates) updates both in the same commit. Agents get
+the same rule via their protocol card (7b) and the dispatch delivery
+contract.
+
 ## Packages
 
 | package | what |

@@ -545,6 +545,25 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .new-task-card input:focus, .new-task-card textarea:focus { outline: 1px solid var(--accent); }
 
+/* ---------- gateway strip (Top): dispatch runners, online even when idle ---------- */
+.gateway-strip {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
+}
+.gateway-strip-label {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); margin-right: 2px;
+}
+.gateway-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono, monospace); font-size: 12px;
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+}
+.gateway-chip.gw-online { border-color: color-mix(in srgb, var(--green) 40%, var(--line)); }
+.gateway-chip.gw-offline { opacity: .55; }
+.gateway-meta { color: var(--text-faint); font-size: 11px; }
+
 /* ---------- task/knowledge state card (detail panel display half) ---------- */
 .task-state-card { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
 .task-state-card .gauge-row { display: flex; gap: 6px; flex-wrap: wrap; }

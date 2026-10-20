@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { BoardView } from "./components/BoardView";
+import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
 import { ForMeView } from "./components/ForMeView";
@@ -15,7 +16,7 @@ import "./App.css";
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
-type Tab = "forme" | "board" | "top" | "log" | "knowledge" | "discussions";
+type Tab = "forme" | "board" | "top" | "log" | "knowledge" | "discussions" | "connect";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "forme", label: "For Me" },
   { key: "board", label: "Board" },
@@ -23,6 +24,7 @@ const TABS: Array<{ key: Tab; label: string }> = [
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
   { key: "discussions", label: "Discussions" },
+  { key: "connect", label: "Connect" },
 ];
 
 function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
@@ -134,6 +136,7 @@ export default function App() {
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
+        {tab === "connect" && <ConnectView />}
       </main>
       {selectedId && <DecisionDetail />}
       {overlay && (

@@ -78,6 +78,12 @@ interface TopRow {
   lastSignal?: number;
 }
 
+/** Gateway (dispatch runner) liveness: gateways poll orient every tick, so
+ *  their session stays fresh even with zero traffic. Gateway sessions are
+ *  named "dispatch-<label>" (the runner's identity session) and
+ *  "dispatch-<task>" (one per dispatched task) — group by token label. */
+const GATEWAY_FRESH_MS = 3 * 60_000; // poll_secs default 60 → 3 fresh = alive
+
 export function TopView() {
   useClock();
   const tasks = useKb((s) => s.tasks);
@@ -86,6 +92,23 @@ export function TopView() {
   const events = useKb((s) => s.events);
   const now = Date.now();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+
+  const gateways = useMemo(() => {
+    const gw = sessions.filter((s) => (s.name ?? "").startsWith("dispatch-"));
+    const byLabel = new Map<string, { label: string; lastSeen: number; tasksInFlight: number }>();
+    for (const s of gw) {
+      const label = s.label ?? "unknown gateway";
+      const isPerTask = /^dispatch-(BR#|TASK-)/.test(s.name ?? "");
+      const cur = byLabel.get(label) ?? { label, lastSeen: 0, tasksInFlight: 0 };
+      cur.lastSeen = Math.max(cur.lastSeen, s.last_seen_ts ?? 0);
+      // a per-task dispatch session fresh within the poll window = a task in flight
+      if (isPerTask && now - (s.last_seen_ts ?? 0) < GATEWAY_FRESH_MS * 2) cur.tasksInFlight++;
+      byLabel.set(label, cur);
+    }
+    return [...byLabel.values()]
+      .map((g) => ({ ...g, online: now - g.lastSeen < GATEWAY_FRESH_MS }))
+      .sort((a, b) => b.lastSeen - a.lastSeen);
+  }, [sessions, now]);
 
   const rows = useMemo<TopRow[]>(() => {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
@@ -177,6 +200,21 @@ export function TopView() {
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
+      {gateways.length > 0 && (
+        <div className="gateway-strip" title="dispatch gateways — poll the hub every minute, so they show online even with no traffic">
+          <span className="gateway-strip-label">gateways</span>
+          {gateways.map((g) => (
+            <span key={g.label} className={`gateway-chip ${g.online ? "gw-online" : "gw-offline"}`}>
+              <span className={`conn conn-${g.online ? "open" : "closed"}`}>●</span>
+              {g.label}
+              <span className="gateway-meta">
+                {g.online ? age(g.lastSeen, now) : `last seen ${age(g.lastSeen, now)}`}
+                {g.tasksInFlight > 0 ? ` · ${g.tasksInFlight} in flight` : " · idle"}
+              </span>
+            </span>
+          ))}
+        </div>
+      )}
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>

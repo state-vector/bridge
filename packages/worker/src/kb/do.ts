@@ -173,10 +173,14 @@ export class KnowledgeHub {
       if (openAsk) continue;
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+      // STALLED, not blocked: silence means "we haven't heard from the agent"
+      // — blocked is reserved for the agent's own explicit "I cannot continue
+      // until X". Release straight to todo: the claim drops, the attempted tag
+      // records the try, and the next orient reassigns it. No blocked
+      // intermediate, no unblock-child spawn for silence.
       await this.transition({
-        id: r.id, to: "blocked",
-        note: `abandoned — no update for >${staleMin}m${lapsedSub}; auto-blocked by watchdog${will}`,
-        unblock_condition: `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`,
+        id: r.id, to: "todo",
+        note: `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
       }, "system:watchdog");
       } catch (e) {
         // one bad task must not kill the sweep — log and keep going
@@ -234,17 +238,19 @@ export class KnowledgeHub {
       if (b?.class !== "subprocess" || typeof b.deadline_ts !== "number") continue;
       if (b.deadline_ts > now) continue;
       const wasDoing = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
-      b.class = undefined;
-      b.reason = `abandoned — declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed${wasDoing}`;
-      b.unblock_condition = `log_progress to re-claim and resume (ownership stays with ${r.owner || "unknown"})`;
-      b.ts = now;
-      delete b.deadline_ts;
+      // legacy lapsed window: stalled, not blocked — straight to todo
+      delete meta.blocked;
+      delete meta.subprocess;
+      const tags: string[] = parseTags(r.meta ? JSON.parse(r.meta).tags ?? "[]" : "[]");
+      if (!tags.includes("attempted")) tags.push("attempted");
+      const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
+      meta.attempt = { by: r.owner || "unknown", at: now, attempts };
       this.state.storage.sql.exec(
-        `UPDATE artefacts SET meta = ?, updated_ts = ?, status_ts = ? WHERE id = ?`,
-        JSON.stringify(meta), now, now, r.id,
+        `UPDATE artefacts SET status = 'todo', owner = '', tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(tags), JSON.stringify(meta), now, now, r.id,
       );
-      this.audit("system:watchdog", "transition", r.id, { from: "blocked", to: "blocked", note: b.reason });
-      this.version(r.id, "system:watchdog", "transition", b.reason, { from: "blocked", to: "blocked", note: b.reason });
+      this.audit("system:watchdog", "transition", r.id, { from: "blocked", to: "todo", note: `stalled — declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed${wasDoing}` });
+      this.version(r.id, "system:watchdog", "transition", `stalled — declared subprocess window lapsed, released to the pool`, { from: "blocked", to: "todo" });
       } catch (e) {
         this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
       }
@@ -627,6 +633,28 @@ export class KnowledgeHub {
 
     // realtime: hibernating WS fanout of audit events
     if (url.pathname === "/ws") return this.handleWs(request);
+
+    // machine-plane self-rename: the bearer token renames its own label.
+    // The runner sends its hostname at pair/start and the pair page pre-fills
+    // the label from it — but if the approver overrode the label with a
+    // gateway name, the agent can fix its own identity without re-pairing.
+    if (url.pathname === "/token.rename") {
+      const body = await request.json();
+      const identity = await this.identify(String(body.bearer ?? ""));
+      const newLabel = String(body.label ?? "").trim().slice(0, 60);
+      if (!newLabel) throw new Error("label is required");
+      const old = this.one(`SELECT label FROM auth_tokens WHERE id = ?`, identity.token_id);
+      if (!old) throw new Error("auth token not found");
+      this.state.storage.sql.exec(
+        `UPDATE auth_tokens SET label = ? WHERE id = ?`,
+        newLabel, identity.token_id,
+      );
+      // tasks owned by the old label are NOT reassigned — the agent can
+      // release-and-re-claim them, which is the normal flow. But audit it.
+      this.audit(identity.label, "rename", null, { from: old.label, to: newLabel });
+      return this.json({ ok: true, from: old.label, to: newLabel });
+    }
+
     // human-plane GET mirror
     if (request.method === "GET") {
       switch (url.pathname) {
