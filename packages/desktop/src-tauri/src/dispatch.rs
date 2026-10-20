@@ -177,7 +177,9 @@ fn load_config() -> Option<DispatchConfig> {
 /// Device pairing (bridge-native github-like device flow): request a code, the
 /// human approves it at {url}/pair, poll until the token arrives. The token is
 /// shown once on this device — the approver never sees it.
-fn pair(url: &str) -> Result<DispatchConfig, String> {
+/// Device-flow pairing, shared by the desktop app and the CLI's onboarding:
+/// prints a code, polls until the human approves, returns the half-filled config.
+pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -607,16 +609,52 @@ impl DispatchState {
 /// Multiple agent types: rotate across cfg.backends (config order); fall back
 /// to the single `backend` field. Round-robin spreads local work across the
 /// enabled CLIs instead of stacking every task on one.
-fn pick_backend(cfg: &DispatchConfig) -> opencode::Backend {
+fn pick_backend(avail: &[opencode::Backend]) -> opencode::Backend {
     static RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let list: Vec<String> = cfg
+    let i = RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % avail.len().max(1);
+    avail.get(i).copied().unwrap_or(opencode::Backend::OpenCode)
+}
+
+/// Backends actually dispatchable right now: the CLI runs on this machine AND
+/// a model is configured for it (explicit-model policy). The gateway must not
+/// claim work it has no agent to dispatch to — claiming first and failing
+/// spawn second pollutes the board with claimed-but-stuck tasks.
+fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
+    let configured: Vec<(opencode::Backend, String)> = cfg
         .backends
         .clone()
         .filter(|v| !v.is_empty())
         .or_else(|| cfg.backend.clone().map(|b| vec![b]))
-        .unwrap_or_else(|| vec!["opencode".into()]);
-    let i = RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % list.len();
-    opencode::Backend::parse(Some(list[i].as_str()))
+        .unwrap_or_else(|| vec!["opencode".into()])
+        .into_iter()
+        .map(|name| (opencode::Backend::parse(Some(&name)), name))
+        .collect();
+    configured
+        .into_iter()
+        .filter(|(backend, name)| {
+            let model_ok = cfg
+                .models
+                .as_ref()
+                .and_then(|m| m.get(name))
+                .map(|m| !m.trim().is_empty())
+                .unwrap_or(false)
+                || (cfg.backends.is_none()
+                    && cfg.model.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false));
+            let bin = match backend {
+                opencode::Backend::OpenCode => cfg.opencode_bin.clone(),
+                opencode::Backend::Kiro => "kiro".to_string(),
+            };
+            let bin_ok = std::process::Command::new(&bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            model_ok && bin_ok
+        })
+        .map(|(b, _)| b)
+        .collect()
 }
 
 fn slugify(s: &str) -> String {
@@ -660,7 +698,7 @@ fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf
         if ok { Some(path) } else { None }
 }
 
-fn cleanup_worktree(workdir: &str, task_id: &str) {
+fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
     let slug = slugify(task_id);
     let Some(home) = std::env::var("HOME").ok() else { return };
     let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
@@ -669,6 +707,75 @@ fn cleanup_worktree(workdir: &str, task_id: &str) {
         .args(["worktree", "remove", "--force"])
         .arg(&path)
         .output();
+    if drop_branch {
+        // terminal (done): the work is merged or rejected — bridge/<slug> has
+        // no future. On todo releases the branch is KEPT: a re-claim attaches
+        // to it, preserving any unpushed stall work.
+        let _ = Command::new("git")
+            .current_dir(workdir)
+            .args(["branch", "-D"])
+            .arg(&format!("bridge/{slug}"))
+            .output();
+    }
+}
+
+/// Reconcile ~/.bridge/worktrees/ with live task status. Terminal tasks (done,
+/// superseded) and released tasks (todo) must not hold worktrees on disk — the finalize
+/// path cleans `done` handoffs, but yielded runs, pre-sweep history and
+/// handoff-rejections leave stragglers. in_progress/in_review/blocked worktrees
+/// are kept: they are the session's resume assets. Capped per tick so a large
+/// backlog drains without stalling the dispatch loop.
+const WORKTREE_SWEEP_CAP: usize = 20;
+static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
+    let Some(home) = std::env::var("HOME").ok() else { return };
+    let dir = PathBuf::from(&home).join(".bridge").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let active: HashSet<String> = in_flight
+        .iter()
+        .filter_map(|inf| inf.worktree.as_ref())
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let mut slugs: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|s| !s.is_empty() && !active.contains(s))
+        .collect();
+    slugs.sort();
+    let mut swept = 0;
+    for slug in slugs {
+        if swept >= WORKTREE_SWEEP_CAP {
+            break;
+        }
+        // reverse slugify: BR-1003 → BR#1003; TASK-010 → TASK-010
+        let task_id = match slug.strip_prefix("BR-") {
+            Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
+            _ => slug.clone(),
+        };
+        // only explicit statuses — an MCP/network error keeps the worktree
+        let status = mcp_call(cfg, id, "get_artefact", json!({ "id": task_id }))
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from));
+        match status.as_deref() {
+            Some("done") | Some("superseded") => {
+                swept += 1;
+                cleanup_worktree(&cfg.workdir, &task_id, true);
+                let _ = std::fs::remove_dir_all(dir.join(&slug));
+                msgs.push(format!("swept worktree {slug} — task {task_id} is {}", status.unwrap_or_else(|| "done".into())));
+            }
+            Some("todo") => {
+                swept += 1;
+                cleanup_worktree(&cfg.workdir, &task_id, false);
+                let _ = std::fs::remove_dir_all(dir.join(&slug));
+                msgs.push(format!("swept worktree {slug} — task {task_id} released to todo (branch kept for re-claim)"));
+            }
+            _ => {}
+        }
+    }
+    if swept > 0 {
+        let _ = Command::new("git").current_dir(&cfg.workdir).arg("worktree").arg("prune").output();
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -751,9 +858,10 @@ fn spawn_opencode(
     policy: &str,
     resume_session: Option<String>,
     role_work: bool,
+    avail: &[opencode::Backend],
     in_flight: &mut Vec<InFlight>,
 ) {
-    let backend = pick_backend(cfg);
+    let backend = pick_backend(avail);
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
@@ -815,9 +923,19 @@ fn spawn_opencode(
         ),
         None => "- REPORTING: report progress the way you would to a human user — when you complete a meaningful step, hit a finding, or change direction; not on a timer. The runner relays your output to the board automatically, so narrating your work in your normal output (brief, one line at natural milestones) is enough to keep the task visibly alive.".to_string(),
     };
+    // PRs only for CODE work (BR#877: receipts must match the deliverable type):
+    // verify/analysis/unblock tasks deliver on the BOARD (knowledge/progress
+    // notes with receipts) — a PR per receipt-finding was drowning the queue
+    // (51 open docs-PRs in a day). The role flag recorded at claim time
+    // decides which contract the session gets.
+    let delivery_line = if role_work {
+        "- Deliver on the board: your findings, verdicts, and receipts go into log_progress / knowledge artefacts with exact citations (GitHub PR/issue/run URLs only — a non-GitHub URL is not a receipt). No commit or PR unless you actually changed code.\n- If you DID change code: commit your work, push the branch, and open a PR against the default branch (`gh pr create`), and include the PR URL in your summary. Docs ride with the change: user-visible behaviour updates README.md and packages/site/content.md in the same branch."
+    } else {
+        "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
+    };
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch.\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.",
-        policy, tid, title, body_md, resume_note, run_dir, branch, heartbeat_line
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+        policy, tid, title, body_md, resume_note, run_dir, branch, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -907,8 +1025,34 @@ fn tick(
     finished_no_pr: &mut HashSet<String>,
     gave_up: &mut HashSet<String>,
     snap: &SharedSnapshot,
+    avail: &mut Vec<opencode::Backend>,
+    last_avail_ok: &mut bool,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
+
+    // dispatchability gate: re-check every tick (cheap: one --version per
+    // backend). No dispatchable agent -> never claim, never orient; drain
+    // finished sessions only. Edge-detected so the state change is loud once.
+    *avail = available_backends(cfg);
+    let avail_ok = !avail.is_empty();
+    if avail_ok != *last_avail_ok {
+        if !avail_ok {
+            let msg = "no dispatchable agents (CLI missing/unrunnable or model unconfigured) — NOT claiming work until one is available; run `bridge doctor`";
+            eprintln!("[dispatch] {msg}");
+            snap_activity(snap, "error", msg);
+        } else {
+            eprintln!("[dispatch] agents available — resuming claims");
+            snap_activity(snap, "info", "agents available — resuming claims");
+        }
+        *last_avail_ok = avail_ok;
+    }
+
+    // worktree hygiene: every 10 ticks reconcile disk worktrees with task
+    // state — done/released tasks must not hold ~/.bridge/worktrees/<slug>
+    let n = SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 10 == 0 {
+        sweep_stale_worktrees(cfg, id, in_flight, &mut msgs);
+    }
 
     // 1. drain finished sessions: finalize each (progress + in_review + cleanup)
     let mut finished: Vec<(InFlight, opencode::RunOutcome)> = Vec::new();
@@ -1089,7 +1233,7 @@ fn tick(
                     finished_no_pr.insert(inf.task_id.clone());
                     if transition_to == "done" && inf.worktree.is_some() {
                         // terminal: worktree + branch served their purpose
-                        cleanup_worktree(&cfg.workdir, &inf.task_id);
+                        cleanup_worktree(&cfg.workdir, &inf.task_id, true);
                     }
                     msgs.push(format!(
                         "{} → {}{}",
@@ -1238,6 +1382,11 @@ fn tick(
         return Ok(msgs);
     }
 
+    // 3b. dispatchability gate: no agents -> do not orient, do not claim
+    if !avail_ok {
+        return Ok(msgs);
+    }
+
     // 4. orient — once per tick when we have capacity
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
     let policy = orient
@@ -1297,7 +1446,7 @@ fn tick(
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
         };
         let role_work = t.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, in_flight);
+        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1414,7 +1563,7 @@ fn tick(
             None => format!("claimed {tid} — dispatched to opencode"),
         };
         let role_work = task.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, in_flight);
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1427,7 +1576,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let cfg = match cfg {
         Some(c) => c,
         None => match std::env::var("BRIDGE_URL") {
-            Ok(url) => match pair(url.trim_end_matches('/')) {
+            Ok(url) => match pair_device(url.trim_end_matches('/')) {
                 Ok(c) => {
                     if let Err(e) = c.save() {
                         eprintln!("[dispatch] config save failed: {e}");
@@ -1461,6 +1610,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
     let mut finished_no_pr: HashSet<String> = HashSet::new();
     let mut gave_up: HashSet<String> = HashSet::new();
+    let mut avail: Vec<opencode::Backend> = Vec::new();
+    let mut last_avail_ok = true;
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -1487,6 +1638,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut finished_no_pr,
             &mut gave_up,
             &snap,
+            &mut avail,
+            &mut last_avail_ok,
         ) {
             Ok(msgs) => {
                 for msg in msgs {

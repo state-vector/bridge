@@ -7,9 +7,9 @@ Heartbeats are collapsed client-side (≥60s per task) and noise kinds skipped,
 so presence costs ~nothing against the Workers free tier.
 
 Env:
-  FLOWS_INGEST_URL    https://flows.<subdomain>.workers.dev/ingest
-  FLOWS_INGEST_TOKEN  shared bearer token
-  FLOWS_POLL_S        poll interval seconds (default 5)
+  BRIDGE_INGEST_URL    https://<your-subdomain>.workers.dev/ingest
+  BRIDGE_INGEST_TOKEN  shared bearer token
+  BRIDGE_POLL_S        poll interval seconds (default 5)
 """
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ import time
 import urllib.error
 import urllib.request
 
-KANBAN_DIR = os.environ.get("FLOWS_KANBAN_DIR", os.path.expanduser("~/.hermes/kanban"))
+KANBAN_DIR = os.environ.get("BRIDGE_KANBAN_DIR", os.path.expanduser("~/.hermes/kanban"))
 STATE_PATH = os.path.expanduser("~/.hermes/flowsync/cursor.json")
-POLL_S = float(os.environ.get("FLOWS_POLL_S", "5"))
+POLL_S = float(os.environ.get("BRIDGE_POLL_S", "5"))
 HEARTBEAT_MIN_GAP_S = 60
 SKIP_KINDS = {"tip_scratch_workspace", "terminal_worker_reaped"}
 
@@ -129,10 +129,10 @@ def post(endpoint: str, token: str, events: list[dict]) -> bool:
 
 
 def main() -> None:
-    endpoint = os.environ.get("FLOWS_INGEST_URL", "").rstrip("/")
-    token = os.environ.get("FLOWS_INGEST_TOKEN", "")
+    endpoint = os.environ.get("BRIDGE_INGEST_URL", "").rstrip("/")
+    token = os.environ.get("BRIDGE_INGEST_TOKEN", "")
     if not endpoint or not token:
-        print("FLOWS_INGEST_URL and FLOWS_INGEST_TOKEN required", flush=True)
+        print("BRIDGE_INGEST_URL and BRIDGE_INGEST_TOKEN required", flush=True)
         sys.exit(1)
 
     print(f"[shipper] tailing {KANBAN_DIR} -> {endpoint}", flush=True)

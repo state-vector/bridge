@@ -16,6 +16,25 @@ import { rel } from "../lib/views";
 
 const KIND_CHIP: Record<string, string> = { proposed: "chip-needs", accepted: "chip-done", rejected: "chip-done" };
 
+/** Verify-verdict decisions carry meta.decision_class + verdict + receipts —
+ *  frame them as the choice they are: accept the verdict (closes the task) or
+ *  reject it (bounces it back). Generic decisions keep the plain framing. */
+function decisionFrame(d: KbArtefact): { kind: "verify" | "generic"; verdict?: string; target?: string; receipts: [string, string][] } {
+  const m = (d.meta ?? {}) as Record<string, unknown>;
+  if (m.decision_class === "verify-verdict") {
+    const keys = ["pr", "pr_state", "pr_slice2", "pr_slice2_state", "issue_state", "issue_1976", "issue_1977", "merge_commit", "github", "ci_soak_run", "residue"];
+    const receipts: [string, string][] = [];
+    for (const k of keys) if (m[k] != null && String(m[k]).trim()) receipts.push([k.replace(/_/g, " "), String(m[k])]);
+    return {
+      kind: "verify",
+      verdict: String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : String(m.verified === "true" ? "verified" : m.verdict ?? "verify"),
+      target: String(m.task ?? m.verify_target ?? ""),
+      receipts,
+    };
+  }
+  return { kind: "generic", receipts: [] };
+}
+
 /** snarkdown → sanitized-enough HTML: strip script/on* attrs (trusted-ish
  *  content — our own KB — but defence in depth costs one line). */
 function md(src: string): string {
@@ -48,6 +67,8 @@ function Comment({ v }: { v: HistoryEntry }) {
 }
 
 function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
+  const tasks = useKb((s) => s.tasks) as any[];
+  const { busy: actBusy, act } = useDecisionAct(d, onChanged);
   const [comments, setComments] = useState<HistoryEntry[] | null>(null);
   const [comment, setComment] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
@@ -85,7 +106,7 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
     }
   };
 
-  const act = async (to: "accepted" | "rejected") => {
+  const actWithNote = async (to: "accepted" | "rejected") => {
     if (to === "rejected" && !rejectReason.trim()) return;
     setBusy(true);
     try {
@@ -107,14 +128,54 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
   return (
     <div className="overlay-backdrop" onClick={onClose}>
       <div className="forme-pop" onClick={(e) => e.stopPropagation()}>
-        <div className="ask-chips">
-          <span className="chip chip-urgent">DECISION</span>
-          <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
-          <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
-          <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
-        </div>
-        <h2>{d.title}</h2>
-        <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.body_md ?? "") }} />
+        {(() => {
+          const f = decisionFrame(d);
+          return (
+            <div className="ask-chips">
+              <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
+              <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
+              {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
+              <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
+              <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
+            </div>
+          );
+        })()}
+        {(() => {
+          const f = decisionFrame(d);
+          if (f.kind !== "verify") return <h2>{d.title}</h2>;
+          const st = tasks.find((t) => t.id === f.target)?.status;
+          const applied = f.verdict === "bounce" ? st === "in_progress" : st === "done";
+          const frame = applied
+            ? {
+                h: `Ratify the verdict on ${f.target ?? "task"}?`,
+                p: `The verifier already applied it — the task is ${st ?? "in its new state"}. Accepting records your confirmation; nothing else changes.`,
+              }
+            : f.verdict === "bounce"
+            ? {
+                h: `Bounce ${f.target ?? "task"} back to work?`,
+                p: "A fresh-session verifier found the handoff receipts void. Accepting bounces the task to in_progress with the findings; rejecting leaves it as-is.",
+              }
+            : {
+                h: `Accept verification of ${f.target ?? "task"}?`,
+                p: "A fresh-session verifier confirmed the receipts (PR merged, issue closed, on main). Accepting closes the task as done. Rejecting leaves it as-is.",
+              };
+          return (
+            <>
+              <h2>{frame.h}</h2>
+              <p className="ask-reason">{frame.p}</p>
+              {f.receipts.length > 0 && (
+                <div className="ask-chips">
+                  {f.receipts.map(([k, v]) => (
+                    <span key={k} className="chip chip-scope" title={v}>{k}: {v.length > 40 ? `${v.slice(0, 40)}…` : v}</span>
+                  ))}
+                </div>
+              )}
+              <details className="forme-details"><summary>verifier's full verdict</summary>
+                <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.title + "\n\n" + (d.body_md ?? "")) }} />
+              </details>
+            </>
+          );
+        })()}
 
         <h3 className="forme-sub">Comments</h3>
         <div className="forme-comments">
@@ -141,14 +202,14 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
               onChange={(e) => setRejectReason(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") void act("rejected"); }}
             />
-            <button className="opt-btn" disabled={busy || !rejectReason.trim()} onClick={() => void act("rejected")}>Confirm reject</button>
+            <button className="opt-btn act-reject" disabled={busy || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</button>
             <button className="opt-btn opt-ghost" onClick={() => setRejectOpen(false)}>Cancel</button>
           </div>
         )}
 
         <div className="ask-actions">
-          <button className="opt-btn" disabled={busy} onClick={() => void act("accepted")}>Accept</button>
-          <button className="opt-btn opt-ghost" disabled={busy} onClick={() => setRejectOpen(true)}>Reject…</button>
+          <button className="opt-btn act-accept" disabled={busy || actBusy} onClick={() => void actWithNote("accepted")}>Accept</button>
+          <button className="opt-btn opt-ghost" disabled={busy || actBusy} onClick={() => setRejectOpen(true)}>Reject…</button>
         </div>
         {msg && <p className="ok">{msg}</p>}
       </div>
@@ -156,21 +217,120 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
   );
 }
 
+function useDecisionAct(d: KbArtefact, onDone: (id: string) => void) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const act = async (to: "accepted" | "rejected") => {
+    setBusy(true);
+    setErr("");
+    try {
+      await kbApi.transition(d.id, to, { note: to === "accepted" ? "accepted by human (For Me)" : "rejected by human (For Me)" });
+      onDone(d.id);
+      return true;
+    } catch (e) {
+      setErr(`failed: ${(e as Error).message}`);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, err, act };
+}
+
 function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
   const [open, setOpen] = useState(false);
+  const { busy, err, act } = useDecisionAct(d, onDone);
   return (
     <div className="card ask-urgent forme-item">
-      <div className="ask-chips">
-        <span className="chip chip-urgent">DECISION</span>
-        <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
-        <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
-      </div>
-      <h3 className="ask-question" onClick={() => setOpen(true)}>{d.title}</h3>
+      {(() => {
+        const f = decisionFrame(d);
+        return (
+          <div className="ask-chips">
+            <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
+            {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
+            {f.target && <span className="chip chip-scope">{f.target}</span>}
+            <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
+          </div>
+        );
+      })()}
+      <h3 className="ask-question" onClick={() => setOpen(true)}>
+        {(() => {
+          const f = decisionFrame(d);
+          const t = f.kind === "verify"
+            ? `${f.verdict === "bounce" ? "Bounce" : "Accept verification of"} ${f.target ?? "task"}`
+            : d.title;
+          return t.length > 110 ? `${t.slice(0, 110)}…` : t;
+        })()}
+      </h3>
       <div className="ask-actions">
-        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Open ↗</button>
+        {(() => {
+          const f = decisionFrame(d);
+          const acceptLabel = f.kind === "verify" && f.verdict === "bounce" ? "Bounce it" : "Accept";
+          return (
+            <>
+              <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{acceptLabel}</button>
+              <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
+              <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
+            </>
+          );
+        })()}
+        {err && <span className="gw-err">{err}</span>}
       </div>
       {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
     </div>
+  );
+}
+
+/** One card per TARGET TASK: latest verdict is actionable, identical prior
+ *  rounds collapse into a muted line (the flood fix — round 9 of "unchanged"
+ *  bounce verdicts is loop telemetry, not 9 separate human decisions). */
+function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior: KbArtefact[]; onDone: (id: string) => void }) {
+  const [showPrior, setShowPrior] = useState(false);
+  const m = (latest.meta ?? {}) as Record<string, unknown>;
+  const target = String(m.task ?? m.verify_target ?? "");
+  const verdict = String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : "verified";
+  return (
+    <div className="card ask-urgent forme-item">
+      <div className="ask-chips">
+        <span className="chip chip-urgent">VERDICT</span>
+        <span className={`chip ${verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{verdict.toUpperCase()}</span>
+        <span className="chip chip-scope">{target}</span>
+        <span className="why-line">{latest.id} · proposed {rel(latest.created_ts)}</span>
+      </div>
+      <h3 className="ask-question" onClick={() => void 0}>
+        {(verdict === "bounce" ? `Bounce ${target}` : `Accept verification of ${target}`).slice(0, 110)}
+      </h3>
+      {prior.length > 0 && (
+        <p className="why-line" style={{ margin: "2px 0" }}>
+          <button className="opt-btn" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
+            {showPrior ? "▾" : "▸"} {prior.length} identical prior round{prior.length > 1 ? "s" : ""} collapsed
+          </button>
+        </p>
+      )}
+      {showPrior && prior.map((d) => (
+        <p key={d.id} className="why-line" style={{ margin: "1px 0 1px 12px" }}>
+          {d.id} · {rel(d.created_ts)} · {String((d.meta as any)?.verdict ?? "").toUpperCase()} — {(d.title ?? "").slice(0, 80)}
+        </p>
+      ))}
+      <VerdictActions d={latest} onDone={onDone} />
+    </div>
+  );
+}
+
+function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const { busy, err, act } = useDecisionAct(d, onDone);
+  const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
+  return (
+    <>
+      <div className="ask-actions">
+        <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</button>
+        <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
+        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
+        {err && <span className="gw-err">{err}</span>}
+      </div>
+      {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
+    </>
   );
 }
 
@@ -235,7 +395,31 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
 
   const bump = () => { void refresh(); setTick((x) => x + 1); };
 
-  const total = (proposed?.length ?? 0) + asked.length;
+  // For Me flood fix (BR#1782): verify-verdict decisions group by TARGET TASK —
+  // one card per task (latest verdict + collapsed identical-round history),
+  // not one card per verdict round. Generic decisions stay individual.
+  const grouped = useMemo(() => {
+    const list = proposed ?? [];
+    const verdicts = list.filter((d) => (d.meta as any)?.decision_class === "verify-verdict" && ((d.meta as any)?.task || (d.meta as any)?.verify_target));
+    const generic = list.filter((d) => !verdicts.includes(d));
+    const byTarget = new Map<string, KbArtefact[]>();
+    for (const d of verdicts) {
+      const key = String((d.meta as any).task ?? (d.meta as any).verify_target);
+      const arr = byTarget.get(key) ?? [];
+      arr.push(d);
+      byTarget.set(key, arr);
+    }
+    // newest proposed decision per target = the actionable card; the rest collapse
+    const verdictCards: Array<{ latest: KbArtefact; prior: KbArtefact[] }> = [];
+    for (const [, arr] of byTarget) {
+      arr.sort((a, b) => b.created_ts - a.created_ts);
+      verdictCards.push({ latest: arr[0], prior: arr.slice(1) });
+    }
+    verdictCards.sort((a, b) => b.latest.created_ts - a.latest.created_ts);
+    return { verdictCards, generic };
+  }, [proposed]);
+
+  const total = grouped.verdictCards.length + grouped.generic.length + asked.length;
 
   return (
     <div className="disc-wrap">
@@ -253,7 +437,11 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
         <AskRow key={d.id} d={d} onDone={bump} />
       ))}
 
-      {(proposed ?? []).map((d) => (
+      {grouped.verdictCards.map(({ latest, prior }) => (
+        <VerdictGroupRow key={latest.id} latest={latest} prior={prior} onDone={bump} />
+      ))}
+
+      {grouped.generic.map((d) => (
         <DecisionRow key={d.id} d={d} onDone={bump} />
       ))}
 

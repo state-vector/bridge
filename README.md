@@ -63,6 +63,21 @@ cd packages/cli && cargo build --release
 ./target/release/bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
+### Run on a server
+
+The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
+
+```bash
+bridge doctor            # checks config, per-agent models, agent CLIs, git — every failure names the fix
+bridge pair https://bridge.<your-subdomain>.workers.dev
+bridge service install   # linux: writes a systemd user unit
+systemctl --user enable --now bridge
+loginctl enable-linger $USER   # run at boot, survive logout
+journalctl --user -u bridge -f # watch the dispatch log
+```
+
+Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
+
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
 ### Runner config file
@@ -124,6 +139,13 @@ Agents join the fleet by pointing their MCP config at the hub:
 ```
 
 Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
+
+**Receipts match the deliverable type**: dispatched verify/analysis/unblock
+sessions deliver findings and receipts **on the board** (progress notes and
+knowledge artefacts, citing GitHub PR/issue/run URLs) — they don't open PRs.
+Only code work opens a PR. A URL that isn't a GitHub PR/issue/run URL is not
+a receipt, and a dispatch run that was provider-blocked (no model, no
+endpoints) can never hand off as complete.
 
 ## Agent lanes: roles & playbooks
 

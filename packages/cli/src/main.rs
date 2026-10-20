@@ -21,6 +21,7 @@ mod dispatch;
 mod opencode;
 
 use dispatch::DispatchConfig;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 fn main() {
@@ -37,8 +38,24 @@ fn main() {
                     eprintln!("usage: bridge pair <hub-url>   (or set BRIDGE_URL)");
                     std::process::exit(2);
                 });
-            eprintln!("[bridge] pairing against {url} — approve at {url}/pair, then the runner starts");
-            run(None);
+            eprintln!("[bridge] pairing against {url} — approve at {url}/pair");
+            // run_loop pairs from BRIDGE_URL — the CLI knows the URL from the
+            // arg, not the env; hand it over or pairing dead-ends immediately.
+            std::env::set_var("BRIDGE_URL", &url);
+            let mut cfg = match dispatch::pair_device(&url) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[bridge] pairing failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("[bridge] paired — token saved");
+            onboard(&mut cfg);
+            if let Err(e) = cfg.save() {
+                eprintln!("[bridge] config save failed: {e}");
+            }
+            eprintln!("[bridge] onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
+            run(Some(cfg));
         }
         "status" => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -51,6 +68,16 @@ fn main() {
                 }
             }
         }
+        "doctor" => {
+            let bad = doctor();
+            std::process::exit(if bad { 1 } else { 0 });
+        }
+        "service" => {
+            if let Err(e) = service_install() {
+                eprintln!("[bridge] service install failed: {e}");
+                std::process::exit(1);
+            }
+        }
         "run" | "--help" | "-h" | "help" => {
             if cmd != "run" {
                 print_help();
@@ -59,9 +86,8 @@ fn main() {
             match DispatchConfig::resolve() {
                 Some(cfg) => run(Some(cfg)),
                 None => {
-                    // no config: run_loop handles BRIDGE_URL pairing; without
-                    // BRIDGE_URL it exits with the setup message.
-                    run(None);
+                    eprintln!("no config yet — first use is: bridge pair <hub-url> (pairs AND onboards: agent, model, workdir)");
+                    std::process::exit(2);
                 }
             }
         }
@@ -121,6 +147,225 @@ fn run(cfg: Option<DispatchConfig>) {
     dispatch::run_loop(cfg, stop, running, last_error, snap);
 }
 
+fn prompt(label: &str, default: Option<&str>) -> String {
+    use std::io::Write;
+    match default {
+        Some(d) => print!("{label} [{d}]: "),
+        None => print!("{label}: "),
+    }
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let v = line.trim().to_string();
+    if v.is_empty() { default.unwrap_or("").to_string() } else { v }
+}
+
+fn bin_detected(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// First-run onboarding: pair leaves a half-filled config (url, token, label).
+/// Nothing dispatchable yet: no agent backend, no model — and the runner
+/// refuses to dispatch without both. Walk the human through the rest BEFORE
+/// the loop starts polling, instead of a zombie runner.
+fn onboard(cfg: &mut DispatchConfig) {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !tty {
+        eprintln!("[bridge] non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends + models are REQUIRED).");
+        return;
+    }
+    println!("\n== onboard: which agents will drive tasks on this machine? ==\n");
+
+    // detect installed agent CLIs
+    let all = [("opencode", "opencode"), ("kiro", "kiro")];
+    let detected: Vec<&str> = all.iter().filter(|(name, _)| bin_detected(name)).map(|(name, _)| *name).collect();
+    if detected.is_empty() {
+        println!("  no agent CLI found on PATH. Install one first:");
+        println!("    opencode: https://opencode.ai  (then authenticate it)");
+        println!("  re-run `bridge pair` after installing, or set backends/models in ~/.bridge/config.json by hand.");
+        std::process::exit(1);
+    }
+    for d in &detected {
+        println!("  detected: {d}");
+    }
+    let default_backend = detected.first().unwrap_or(&"opencode").to_string();
+    let choice = prompt(
+        &format!("agent backends to enable, comma-separated ({})", detected.join(", ")),
+        Some(&default_backend),
+    );
+    let backends: Vec<String> = choice
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| detected.contains(&s.as_str()))
+        .collect::<Vec<_>>();
+    let backends = if backends.is_empty() { vec![default_backend.clone()] } else { backends };
+
+    // model per backend — REQUIRED (the runner refuses dispatch without one)
+    let mut models = std::collections::HashMap::new();
+    println!("\n== a model per agent (REQUIRED — the runner refuses dispatch without it) ==\n");
+    for b in &backends {
+        let example = if b == "kiro" { "anthropic.claude-sonnet-4-5" } else { "openrouter/~z-ai/glm-flash-latest" };
+        let m = loop {
+            let v = prompt(&format!("  model for {b} (e.g. {example})"), None);
+            if !v.trim().is_empty() {
+                break v.trim().to_string();
+            }
+            println!("  a model is required — the runner will not dispatch without one.");
+        };
+        models.insert(b.clone(), m);
+    }
+
+    println!("\n== where the work happens ==\n");
+    let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let workdir = prompt("git workdir for isolated task worktrees", Some(&cwd));
+    let is_git = std::process::Command::new("git")
+        .args(["-C", &workdir, "rev-parse", "--is-inside-work-tree"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !is_git {
+        println!("  warning: {workdir} is not a git repo — dispatch needs one for isolated worktrees. Edit workdir in ~/.bridge/config.json later.");
+    }
+    let max_sessions = prompt("max concurrent agent sessions", Some("1"))
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+
+    cfg.backends = Some(backends.clone());
+    cfg.backend = Some(backends[0].clone());
+    cfg.models = Some(models);
+    cfg.workdir = workdir;
+    cfg.max_sessions = max_sessions;
+    println!();
+}
+
+/// Headless setup check: every failure names the fix. Exit 1 when setup is
+/// incomplete so scripts can gate on it.
+fn doctor() -> bool {
+    let mut bad = false;
+    let ok = |name: &str, detail: &str, bad: &mut bool, fatal: bool| {
+        if detail.is_empty() {
+            println!("  \x1b[32mok\x1b[0m   {name}");
+        } else {
+            if fatal { *bad = true; }
+            let tag = if fatal { "\x1b[31mFAIL\x1b[0m " } else { "\x1b[33mwarn\x1b[0m " };
+            println!("  {tag}{name} — {detail}");
+        }
+    };
+    println!("bridge doctor");
+
+    let cfg = DispatchConfig::resolve();
+    match &cfg {
+        None => {
+            println!("  \x1b[31mFAIL\x1b[0m  config — none found. Run `bridge pair <hub-url>` or set BRIDGE_URL + BRIDGE_TOKEN");
+            return true;
+        }
+        Some(c) => {
+            ok("hub url", if c.url.is_empty() { "not set" } else { "" }, &mut bad, true);
+            ok("token", if c.token.is_empty() { "not set — re-pair or set BRIDGE_TOKEN" } else { "" }, &mut bad, true);
+            ok("workdir", if c.workdir.is_empty() { "not set" } else { "" }, &mut bad, true);
+        }
+    }
+    let cfg = cfg.unwrap();
+
+    // explicit-model policy: the runner refuses dispatch without a model per backend
+    let backends: Vec<String> = cfg
+        .backends
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg.backend.clone().map(|b| vec![b]))
+        .unwrap_or_else(|| vec!["opencode".into()]);
+    let models = cfg.models.clone().unwrap_or_default();
+    for b in &backends {
+        match models.get(b) {
+            Some(m) if !m.trim().is_empty() => println!("  \x1b[32mok\x1b[0m   model[{b}] = {m}"),
+            _ => {
+                bad = true;
+                println!("  \x1b[31mFAIL\x1b[0m  model[{b}] — REQUIRED (the runner refuses dispatch without it). Edit ~/.bridge/config.json: \"models\": {{ \"{b}\": \"<model-id>\" }}");
+            }
+        }
+    }
+
+    // agent CLI binaries reachable?
+    for b in &backends {
+        let bin = if b == "kiro" { "kiro" } else { cfg.opencode_bin.as_str() };
+        let found = std::process::Command::new(bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if found {
+            println!("  \x1b[32mok\x1b[0m   {bin} CLI on PATH");
+        } else {
+            bad = true;
+            println!("  \x1b[31mFAIL\x1b[0m  {bin} CLI not runnable — install it and authenticate (it must work non-interactively in {workdir})", workdir = cfg.workdir);
+        }
+    }
+
+    // git + workdir sanity
+    let git_ok = std::process::Command::new("git")
+        .args(["-C", &cfg.workdir, "rev-parse", "--is-inside-work-tree"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if git_ok {
+        println!("  \x1b[32mok\x1b[0m   workdir is a git repo (isolated worktrees + PR branches)");
+    } else {
+        bad = true;
+        println!("  \x1b[31mFAIL\x1b[0m  workdir is not a git repo — dispatch needs one for isolated worktrees");
+    }
+
+    if bad {
+        println!("\nsetup incomplete — fix the FAIL lines, then `bridge run` (or `bridge service install`)");
+    } else {
+        println!("\nready — `bridge run` to start, or `bridge service install` to run it under systemd");
+    }
+    bad
+}
+
+/// systemd user unit (linux): run forever, restart on failure, survive logout.
+/// macOS has no systemd — prints the launchd/nohup alternative.
+fn service_install() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        println!("no systemd on this OS. run the runner persistently with:");
+        println!("  nohup ~/.local/bin/bridge run >> ~/.bridge/bridge.log 2>&1 &");
+        println!("or a LaunchAgent — see README (Run on a server).");
+        return Ok(());
+    }
+    let bin = std::env::current_exe().map_err(|e| e.to_string())?;
+    let home = std::env::var("HOME").map_err(|_| "no HOME")?;
+    let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir).map_err(|e| e.to_string())?;
+    let unit = format!(
+        "[Unit]\nDescription=bridge fleet runner\nAfter=network-online.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=10\nWorkingDirectory={}\nEnvironmentFile=-{}\n\n[Install]\nWantedBy=default.target\n",
+        bin.display(),
+        std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+        PathBuf::from(&home).join(".bridge/env").display(),
+    );
+    let path = unit_dir.join("bridge.service");
+    std::fs::write(&path, unit).map_err(|e| e.to_string())?;
+    println!("wrote {}", path.display());
+    println!("next steps:");
+    println!("  systemctl --user daemon-reload");
+    println!("  systemctl --user enable --now bridge");
+    println!("  loginctl enable-linger $USER    # survive logout / run at boot");
+    println!("  journalctl --user -u bridge -f  # watch the dispatch log");
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "bridge — headless runner for the bridge fleet hub
@@ -129,6 +374,8 @@ USAGE:
   bridge                 run the dispatch loop (BRIDGE_URL + BRIDGE_TOKEN, or ~/.bridge/config.json)
   bridge pair <url>      device-flow pairing: prints a code, you approve at <url>/pair, then it runs
   bridge status          print current runner state
+  bridge doctor          check headless setup (config, models, agent CLIs, git)
+  bridge service install write a systemd user unit (linux) — run forever, restart on failure
   --max-sessions N       cap concurrent agent sessions (default 1)
 
 ENV:

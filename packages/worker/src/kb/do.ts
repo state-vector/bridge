@@ -786,6 +786,62 @@ export class KnowledgeHub {
         bars: Array.isArray(body.await) ? body.await.map(String) : [],
       };
     }
+    // VERIFY-VERDICT DEDUP (For Me flood fix): verify sessions propose a decision
+    // per round — identical findings ("unchanged since round N") presented as
+    // fresh decisions buried the human inbox (45 bounce-cards in 4h). Rule:
+    // a verdict identical to the last PROPOSED verdict for the same target is
+    // applied directly, never proposed. Same verdict + round>=3 → the task
+    // BLOCKS for human intervention (the loop is stalled, that's a blocker
+    // not a decision). Changed verdict or changed receipts still propose.
+    if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      const target = String(createMeta.task ?? createMeta.verify_target ?? "").trim();
+      const verdict = String(createMeta.verdict ?? "").toLowerCase();
+      if (target && verdict) {
+        const prev = this.one(
+          `SELECT id, meta FROM artefacts WHERE type = 'decision' AND status = 'proposed'
+           AND json_extract(meta, '$.decision_class') = 'verify-verdict'
+           AND (json_extract(meta, '$.task') = ? OR json_extract(meta, '$.verify_target') = ?)
+           ORDER BY created_ts DESC LIMIT 1`,
+          target, target,
+        );
+        // receipts fingerprint: any meta keys other than bookkeeping — identical
+        // when the verifier found the same world state
+        const fp = (m: any) => JSON.stringify(Object.entries(m ?? {})
+          .filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round"].includes(k))
+          .sort(([a], [b]) => a.localeCompare(b)));
+        const same = prev && String((JSON.parse(prev.meta ?? "{}") as any).verdict ?? "").toLowerCase() === verdict
+          && fp(createMeta) === fp(JSON.parse(prev.meta ?? "{}"));
+        if (same) {
+          const trow = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, target);
+          if (trow) {
+            const tm = JSON.parse(trow.meta ?? "{}");
+            const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
+            tm.verify_round = round;
+            tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+            const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
+            if (!alreadyRight) {
+              // 3 identical rounds = the loop is stalled; park it for a human
+              if (round >= 3) {
+                await this.transition({
+                  id: trow.id, to: "blocked",
+                  note: `verify loop stalled — ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
+                  unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
+                }, "system:verifier");
+              } else {
+                await this.transition({
+                  id: trow.id, to: verdict === "bounce" ? "in_progress" : "done",
+                  note: `verify round ${round}: identical verdict (${verdict}) — auto-applied (For Me flood fix; no decision card)`,
+                }, "system:verifier");
+              }
+            } else {
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(tm), Date.now(), trow.id);
+            }
+            this.audit("system:verifier", "verdict_deduped", id, { target, verdict, round });
+            return { id, deduped: true, target, round, note: "identical verdict auto-applied — no decision card created" };
+          }
+        }
+      }
+    }
     this.state.storage.sql.exec(
       `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1398,6 +1454,47 @@ export class KnowledgeHub {
       ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
+    // verify-verdict decisions are actionable: the human's answer DOES the
+    // thing, not just records it. Accepting a VERIFIED verdict closes the
+    // verified task (the accepted decision satisfies its done-gate via the
+    // supports link). Accepting a BOUNCE verdict bounces the task back to
+    // work with the findings. Without this, verdicts pile up as prose and the
+    // human's click changes nothing — 35 proposed decisions taught us that.
+    if (row.type === "decision" && to === "accepted") {
+      const dm = meta ?? {};
+      if (dm.decision_class === "verify-verdict") {
+        const target = String(dm.task ?? dm.verify_target ?? "").trim();
+        const isBounce = String(dm.verdict ?? "").toLowerCase() === "bounce";
+        if (target) {
+          // verifiers often apply their own verdict before proposing it — the
+          // task is already done/bounced. Ratification must be a clean no-op,
+          // not an "apply failed" error the human has to interpret.
+          const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, target);
+          const already = cur && (isBounce ? cur.status === "in_progress" : cur.status === "done");
+          if (already) {
+            this.audit(actor, "verdict_already_applied", target, { decision: id, status: cur.status });
+          } else try {
+            await this.transition(
+              {
+                id: target,
+                to: isBounce ? "in_progress" : "done",
+                note: isBounce
+                  ? `verdict ${id} rejected by human — bounce with the verifier's findings`
+                  : `verdict ${id} accepted by human — closed on a verified (non-void) verdict`,
+              },
+              actor,
+            );
+            this.audit(actor, "verdict_applied", target, { decision: id, effect: isBounce ? "bounced" : "closed" });
+          } catch (e) {
+            // gate refused (e.g. open children) — surface it on the decision
+            // instead of silently swallowing the human's click
+            const msg = String((e as Error).message ?? e).slice(0, 300);
+            this.audit("decision:verdict", "apply_failed", target, { decision: id, error: msg });
+            this.version(id, "decision:verdict", "note", `verdict apply failed on ${target}: ${msg}`, { target, error: msg });
+          }
+        }
+      }
+    }
     // verification duty: entering review auto-spawns the Verify task into the
     // unclaimed pool. A verifier (any agent, fresh session) picks it up, checks
     // receipts (PR/merge state), completes it, then closes the parent (done) or
@@ -1937,11 +2034,15 @@ export class KnowledgeHub {
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
-    // priority work). Ranked: blocked-with-condition first, then todo.
+    // priority work). Rank-then-slice: fetch the full open pool FIRST, rank in
+    // JS, then cut the top 10. The old 40-newest window was the Oct-20
+    // frozen-backlog bug — churn (every claim/progress bumps updated_ts)
+    // constantly displaced older-but-ranked items, so they were invisible to
+    // the runner and sat in Backlog "blocked" forever.
     const pool = this.state.storage.sql.exec(
       `SELECT id, title, tags, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
-       ORDER BY updated_ts DESC LIMIT 40`,
+       ORDER BY updated_ts DESC LIMIT 400`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(

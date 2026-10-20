@@ -4,7 +4,7 @@ Everything publishes to the same endpoint:
 
 ```
 POST https://flows.<subdomain>.workers.dev/ingest
-Authorization: Bearer <FLOWS_INGEST_TOKEN>
+Authorization: Bearer <BRIDGE_INGEST_TOKEN>
 Content-Type: application/json
 
 { "events": [ {...}, ... ] }        # or a single event object

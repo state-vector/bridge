@@ -432,7 +432,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .forme-sub { margin: 8px 0 0; font-size: 12.5px; font-weight: 650; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
 .forme-comments { display: flex; flex-direction: column; gap: 6px; max-height: 26vh; overflow-y: auto; }
+.forme-details summary { cursor: pointer; color: var(--text-faint); font-size: 12px; margin: 4px 0; }
 .forme-reject input { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); }
+.act-accept { background: color-mix(in srgb, var(--green) 18%, var(--bg-raised)); border-color: var(--green); color: var(--green); font-weight: 650; }
+.act-accept:hover { background: color-mix(in srgb, var(--green) 28%, var(--bg-raised)); }
+.act-reject { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); color: var(--red); font-weight: 650; }
+.act-reject:hover { background: color-mix(in srgb, var(--red) 12%, var(--bg-raised)); }
 
 /* ---------- aggregate sentiment ---------- */
 .sentiment-bar-box { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
