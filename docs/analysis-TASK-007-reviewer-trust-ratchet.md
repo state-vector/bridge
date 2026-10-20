@@ -44,3 +44,14 @@ No new impl child was created deliberately: lever 2 is merged, lever 1 is owned 
 ## What lifts the parent's gate
 
 This document + the qualifying analysis child (role:analysis, transitioned done) record the plan and open questions. The parent's acceptance criteria map to children: AC1 + AC5 → BR#923; AC2 → BR#922 (c); AC3 → BR#924; AC4 → TASK-009/TASK-012 residue (roster decision).
+
+## Verification round 1 (BR#927, 2026-10-20) — verdict BOUNCE, actioned
+
+Independent verifier (session BR-927-verify-1) re-checked all receipts via GH API: decomposition **confirmed** (children exist, premise corrections re-verified live, PR contents match BR#925), but the parent was bounced to in_progress — **0/5 acceptance criteria met**, and closing now would mark the dilution-curve thesis "verified" without BR#924's dated measurement. Remaining path per the verdict: BR#922 + BR#923 receipts → AC4 roster decision → BR#924 checkpoint (~Oct 23+) → re-handoff.
+
+### Actioned on this round
+
+1. **PR #15 workers-build residual (verifier finding 6) — diagnosed as systemic, not ours.** `Workers Builds: bridge` FAILS on PR branches systemically: PR #11 and PR #14 (unrelated) show the identical rollup — `Test` SUCCESS + `Workers Builds: bridge` FAILURE — while `main`'s workers build is SUCCESS (sha 2323efd7). Docs-only PR; CI `Test` green. Merge decision unaffected by the check; coordinator may merge with this receipt.
+2. **Children superseded by the bounce — re-issued.** The verify round's close auto-superseded BR#922, BR#923, BR#924 ("TASK-007 bounced — verification round closed"), killing receipt work in flight (BR#922 claimed-only; BR#924 mid-exploration). Re-issued as fresh children with the round-1 lesson baked into each body: **verify-class tasks close directly via done with receipts — an in_review transition is rejected by the gate** (BR#923's round-1 session died on exactly that rejection, BR#936 carries the unblock record).
+3. **AC4 state tightened:** TASK-009 closed done with fresh verification (BR#926) — floor HOLDS: FPR 1/11 = 9.1% < 10% (gate slice 27 draws + full-matrix CI Eval); the "data-lifecycle model fix" premise was stale (already nova-lite at the PR base; the 2/11→1/11 gain came from #1912 prompt fixes). Residue: 3 confirmed Eval pairs outside the PR's diff-block merge, parked as Ray's roster/model decision. Decision ask filed (bound to TASK-007): which governs AC4's final disposition — the floor-holds verification, or the parked roster residue (which includes `deleted_prelock_write_clean × nova-lite` stable FFF 7/7, in tension with the 1/11 floor measurement).
+4. **Nightly-corpus receipts in flight:** BR#936's session (mac-modem-opencode) was reading the Oct-19 nightly recordings for 010b9703 / 5c68129a / 9940d21c when the round closed; the fresh BR#923 re-issue is the receipt home for that evidence.
