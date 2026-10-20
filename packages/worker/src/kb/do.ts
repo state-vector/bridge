@@ -365,7 +365,7 @@ export class KnowledgeHub {
       const analysisOk = declared === "qualified"
         || analysisEv.has(t.id)
         || (parent && (pq.state === "qualified" || parent.meta.qualified === true || analysisEv.has(parent.id))) === true;
-      const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
+      const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
       t.qualification = { state: declared ?? (analysisOk ? "qualified" : "open"), how: q.how, by: q.by, bars, unmet_bars: unmet, ready: analysisOk && unmet.length === 0 };
     }
     const sessions = this.state.storage.sql.exec(
@@ -1029,10 +1029,22 @@ export class KnowledgeHub {
 
   /** Requested-but-unmet qualification bars (qualifications stack: a publisher may
    *  self-qualify AND ask for further confirmation before the task goes ready). */
+  /** Bars that can actually gate a CLAIM: things satisfiable before work
+   *  starts (human sign-off, an accepted decision...). Qualifier-role bars
+   *  (role:analysis/review/impl/unblock) are NOT enforceable pre-claim —
+   *  they demand a done role child of the task itself, i.e. a review of
+   *  work the gate prevents from existing (the Oct-20 empty-pool incident:
+   *  10/10 backlog items unclaimable, runner churning failed claims).
+   *  Roles are playbooks, not gates — the done-gate already enforces
+   *  review-before-completion where it belongs. */
+  private enforceableBars(bars: string[]): string[] {
+    return bars.filter((b) => !/^role:(analysis|review|impl|unblock)$/.test(String(b)));
+  }
+
   private unmetBars(row: any): string[] {
     const meta = JSON.parse(row.meta ?? "{}");
     const bars: string[] = (meta.qualification ?? {}).bars ?? [];
-    return bars.filter((b) => !this.hasEvidence(row, /review/.test(b) ? "review" : "analysis").ok);
+    return this.enforceableBars(bars).filter((b) => !this.hasEvidence(row, /review/.test(b) ? "review" : "analysis").ok);
   }
 
   /** Bulk evidence for readiness projections: done role-tagged children per parent +
@@ -1876,7 +1888,7 @@ export class KnowledgeHub {
       const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
-      const unmet = bars.filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
+      const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
       // roles are playbooks, not gates: every agent sees everything claimable.
       // Flag instead of filter — agents stand down on work they can't do, and
       // the server's separation-of-duties check is the actual integrity gate.

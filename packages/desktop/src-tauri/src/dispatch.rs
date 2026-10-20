@@ -1312,6 +1312,12 @@ fn tick(
         {
             continue;
         }
+        // bar-gated work is not claimable by the pool (publisher requested
+        // further confirmation) — the claim gate would reject it every tick.
+        // Never churn: skip and let the hub surface it as gated (BR#903-class).
+        if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false) {
+            continue;
+        }
         let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");
         if is_blocked {
             // resume the blocked task. Preferred context: the unblock condition
