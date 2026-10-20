@@ -609,16 +609,52 @@ impl DispatchState {
 /// Multiple agent types: rotate across cfg.backends (config order); fall back
 /// to the single `backend` field. Round-robin spreads local work across the
 /// enabled CLIs instead of stacking every task on one.
-fn pick_backend(cfg: &DispatchConfig) -> opencode::Backend {
+fn pick_backend(avail: &[opencode::Backend]) -> opencode::Backend {
     static RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let list: Vec<String> = cfg
+    let i = RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % avail.len().max(1);
+    avail.get(i).copied().unwrap_or(opencode::Backend::OpenCode)
+}
+
+/// Backends actually dispatchable right now: the CLI runs on this machine AND
+/// a model is configured for it (explicit-model policy). The gateway must not
+/// claim work it has no agent to dispatch to — claiming first and failing
+/// spawn second pollutes the board with claimed-but-stuck tasks.
+fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
+    let configured: Vec<(opencode::Backend, String)> = cfg
         .backends
         .clone()
         .filter(|v| !v.is_empty())
         .or_else(|| cfg.backend.clone().map(|b| vec![b]))
-        .unwrap_or_else(|| vec!["opencode".into()]);
-    let i = RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % list.len();
-    opencode::Backend::parse(Some(list[i].as_str()))
+        .unwrap_or_else(|| vec!["opencode".into()])
+        .into_iter()
+        .map(|name| (opencode::Backend::parse(Some(&name)), name))
+        .collect();
+    configured
+        .into_iter()
+        .filter(|(backend, name)| {
+            let model_ok = cfg
+                .models
+                .as_ref()
+                .and_then(|m| m.get(name))
+                .map(|m| !m.trim().is_empty())
+                .unwrap_or(false)
+                || (cfg.backends.is_none()
+                    && cfg.model.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false));
+            let bin = match backend {
+                opencode::Backend::OpenCode => cfg.opencode_bin.clone(),
+                opencode::Backend::Kiro => "kiro".to_string(),
+            };
+            let bin_ok = std::process::Command::new(&bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            model_ok && bin_ok
+        })
+        .map(|(b, _)| b)
+        .collect()
 }
 
 fn slugify(s: &str) -> String {
@@ -822,9 +858,10 @@ fn spawn_opencode(
     policy: &str,
     resume_session: Option<String>,
     role_work: bool,
+    avail: &[opencode::Backend],
     in_flight: &mut Vec<InFlight>,
 ) {
-    let backend = pick_backend(cfg);
+    let backend = pick_backend(avail);
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
@@ -988,8 +1025,27 @@ fn tick(
     finished_no_pr: &mut HashSet<String>,
     gave_up: &mut HashSet<String>,
     snap: &SharedSnapshot,
+    avail: &mut Vec<opencode::Backend>,
+    last_avail_ok: &mut bool,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
+
+    // dispatchability gate: re-check every tick (cheap: one --version per
+    // backend). No dispatchable agent -> never claim, never orient; drain
+    // finished sessions only. Edge-detected so the state change is loud once.
+    *avail = available_backends(cfg);
+    let avail_ok = !avail.is_empty();
+    if avail_ok != *last_avail_ok {
+        if !avail_ok {
+            let msg = "no dispatchable agents (CLI missing/unrunnable or model unconfigured) — NOT claiming work until one is available; run `bridge doctor`";
+            eprintln!("[dispatch] {msg}");
+            snap_activity(snap, "error", msg);
+        } else {
+            eprintln!("[dispatch] agents available — resuming claims");
+            snap_activity(snap, "info", "agents available — resuming claims");
+        }
+        *last_avail_ok = avail_ok;
+    }
 
     // worktree hygiene: every 10 ticks reconcile disk worktrees with task
     // state — done/released tasks must not hold ~/.bridge/worktrees/<slug>
@@ -1326,6 +1382,11 @@ fn tick(
         return Ok(msgs);
     }
 
+    // 3b. dispatchability gate: no agents -> do not orient, do not claim
+    if !avail_ok {
+        return Ok(msgs);
+    }
+
     // 4. orient — once per tick when we have capacity
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
     let policy = orient
@@ -1385,7 +1446,7 @@ fn tick(
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
         };
         let role_work = t.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, in_flight);
+        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1502,7 +1563,7 @@ fn tick(
             None => format!("claimed {tid} — dispatched to opencode"),
         };
         let role_work = task.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, in_flight);
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1549,6 +1610,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
     let mut finished_no_pr: HashSet<String> = HashSet::new();
     let mut gave_up: HashSet<String> = HashSet::new();
+    let mut avail: Vec<opencode::Backend> = Vec::new();
+    let mut last_avail_ok = true;
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -1575,6 +1638,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut finished_no_pr,
             &mut gave_up,
             &snap,
+            &mut avail,
+            &mut last_avail_ok,
         ) {
             Ok(msgs) => {
                 for msg in msgs {
