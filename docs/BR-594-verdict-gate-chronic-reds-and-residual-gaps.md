@@ -3,6 +3,13 @@
 Parent: BR#41 (GH#1305). Track A. Analysis-only: no implementation, no code edits, no parent closure.
 Evidence collected live 2026-10-20 ~02:30–03:00 UTC from `gh` against `state-vector/superpositional`, Bridge knowledge search, and the worktree.
 
+> **REFRESH 2026-10-21 (session `br594-analysis-verdict-gates`)** — sections below reflect the 10-20 state; the addendum at §6 reflects the current live state (verified via `gh issue view 1305` + Bridge knowledge, 2026-10-21):
+> - **GH#1305 is CLOSED COMPLETED.** Fix PR **#2087 MERGED** (squash `778556710`, 2026-10-20T08:57:35Z): one parse-failure redraw with `GUARD_REPAIR_NUDGE` per guard; unusable redraw → explicit inconclusive (`guard_inconclusive_caveat`), never silent; metering covers every draw.
+> - **Night #2 (10-20) RED** — run 39362021328, 16/17, `ghost_secret_logging` FF both draws → streak RESET. Root cause pinned from logs: `failure-handling` guard JSON missing `principle_slug` → strict parse fail → error verdict → silent facet loss; `is_principle_slug` helper present but unwired (dead code, guards source ~:1247). Deploy receipt: run head == dev deploy 7190387232 (`c0a2e958e`).
+> - **A2 ruled NO-GO**: `pydantic_silent_coercion` PP/PP both nights — passing-unattributed, not still-open at gate level; the coercion detector child is cancelled (G1 downgraded to an attribution-only watch).
+> - **A3 = GO and LANDED as #2087** (parse-repair branch per the pinned spec; BOUNCE-narrow verdicts BR#1294/BR#1427 confirm merge + issue-close + Deploy Dev 39383821268 SUCCESS).
+> - **Sole remaining close-gate leg**: BR#552 §3 2-green-nights streak on deployed main — 0 post-fix nights so far; 10-21 ~03:00Z run is the first candidate (night #1 of 2).
+
 ---
 
 ## 1. Umbrella state (live receipts)
@@ -117,3 +124,37 @@ Acceptance criteria:
 ## Out of scope (restated)
 
 No implementation, no PRs of code, no code edits, no closure of BR#41/GH#1305, no changes to the majority gate, no guard model roster changes, no Quality Daily (#1253) work.
+
+## 6. Addendum — live state at refresh (2026-10-21)
+
+### 6.1 Current umbrella state
+
+| Item | State | Receipt |
+|---|---|---|
+| GH#1305 | CLOSED COMPLETED | issue state via `gh`, last update 10-20 |
+| PR #2087 (A3 parse-repair) | MERGED squash `778556710` | merged 2026-10-20T08:57:35Z |
+| Deploy Dev | SUCCESS | run 39383821268 |
+| Night #1 (10-19, run 39192638477) | green 17/17 majority, but `principle_slug` WARN fired 3× (majority-masked) | run logs |
+| Night #2 (10-20, run 39362021328) | RED 16/17, `ghost_secret_logging` FF → streak RESET | run logs + BR#41 comment (rayh, 10-20T03:29Z) |
+| Verify chain | BOUNCE-narrow rounds 3–7 (BR#1202 → BR#1262 → BR#1294 → BR#1427), all accepted: merge+close+deploy legs green, streak leg unmet | Bridge decisions BR#1294, BR#1427 |
+| Close gate | 2 green consecutive nights on deployed main; 0 post-#2087 nights; 10-21 ~03:00Z = night #1 candidate | BR#552 §3 |
+
+### 6.2 Residual detection gaps after #2087
+
+- **G-R1 — streak exposure, not detection.** No open lens/guard detection gap is currently red at the gate: pydantic PP/PP both nights (A2 no-go), ghost_fire_and_forget FPP→PP recovering, ghost_optimistic_catch_all PP/PP. The only live blocker is the 2-night streak. Any new impl child spawned now risks fixing a green state — do not spawn one without a fresh red receipt.
+- **G-R2 — majority-masked parse WARN class.** The 10-19 "green" night carried 3× `principle_slug` parse WARNs masked by majority. #2087's redraw+caveat addresses the silent-loss mechanism; residual risk is whether a guard whose redraw also fails still degrades gracefully on single-draw production reviews (the gate is majority-based; production is not). Watch, don't fix, until a production-shape failure is observed.
+- **G-R3 — `is_principle_slug` unwired helper.** The dead-code corroboration (~:1247) is a latent wiring defect independent of #2087's redraw path. Candidate hygiene fix, but low priority: only wire it if the redraw path leaves a recovery gap. Do not touch in a streak-observation window.
+- **G-R4 — hyperswitch-like class beyond #2005's two shapes.** Unchanged from §2 G3 (sibling safety-guard-removal shapes: removed validation, feature-flag gating, retry-eats-error). No red evidence at the gate; classification-only work remains, no impl.
+
+### 6.3 Updated child plan (supersedes §4)
+
+- **A1 (attribution)** — RESOLVED by evidence: pydantic pass is unattributed but passing-unattributed ≠ still-open at gate level → A2 no-go (pinned in BR#41 night-2 comment). No child needed.
+- **A2 (coercion detector)** — CANCELLED (no-go). Rescope trigger: pydantic_silent_coercion fails a future nightly or a production review misses the shape; then re-run attribution and re-open with fresh red evidence.
+- **A3 (ghost/parse robustness)** — DELIVERED as PR #2087 (merged) with deploy receipt. Done.
+- **A4 (close-gate audit)** — the ONLY live child. Fresh role:review session: fetch the 10-21 and (if needed) 10-22 ~03:00Z Verdict Gate nightly runs; verify 2 consecutive green nights on deployed main; cite run URLs + per-scenario lines + deploy receipt; then close BR#41 done. Red night → attach per-scenario receipts + trace id for a cold-start impl slice.
+
+### 6.4 Open questions at refresh
+
+- **Q-R1:** none blocking decomposition — the plan has collapsed to a single A4 audit child; nothing is pending a decision.
+- **Q-R2 (watch item):** if the 10-21 run is red, is the red a regression of the parse class (→ #2087 fix insufficient) or a new family (→ new attribution round)? A4's receipts should classify before any impl child spawns.
+- **Q-R3 (scope):** Quality Daily (#1253 axis) reds remain adjacent, not #1305. Still do not conflate.
