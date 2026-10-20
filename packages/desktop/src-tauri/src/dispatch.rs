@@ -1324,10 +1324,12 @@ fn tick(
         {
             continue;
         }
-        // bar-gated work is not claimable by the pool (publisher requested
-        // further confirmation) — the claim gate would reject it every tick.
-        // Never churn: skip and let the hub surface it as gated (BR#903-class).
-        if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false) {
+        // not dispatchable at all: question tasks (answered, not claimed),
+        // operator gates, bar-gated work — the claim gate would reject or the
+        // claim is wrong by definition. Respect the verdict; no churn.
+        if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false)
+            || task.get("is_claimable").and_then(|q| q.as_bool()) == Some(false)
+        {
             continue;
         }
         let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");

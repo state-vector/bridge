@@ -367,6 +367,22 @@ export class KnowledgeHub {
         || (parent && (pq.state === "qualified" || parent.meta.qualified === true || analysisEv.has(parent.id))) === true;
       const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
       t.qualification = { state: declared ?? (analysisOk ? "qualified" : "open"), how: q.how, by: q.by, bars, unmet_bars: unmet, ready: analysisOk && unmet.length === 0 };
+      // claimability projection — same semantics as orient's pool: question
+      // tasks and operator gates are never dispatchable; role-tagged tasks
+      // dispatch via their gateway; the rest needs qualification evidence.
+      const tagsArr: string[] = t.tags ?? [];
+      const roleTagged = tagsArr.some((x) => ["role:analysis", "role:review", "role:impl", "role:unblock"].includes(x));
+      const isQ = tagsArr.includes("question") || (t.meta.kind === "question");
+      const gated = t.meta.operator_gated;
+      const roleWorkReady = roleTagged && t.qualification.ready !== false ? true : roleTagged;
+      t.is_claimable = t.status === "todo" && !isQ && !gated && (roleWorkReady || t.qualification.ready !== false);
+      if (!t.is_claimable && t.status === "todo") {
+        t.claim_reason = isQ
+          ? "question — answered, not claimed (contribute via log_progress)"
+          : gated
+            ? `operator gated: ${gated} — a human clears the gate`
+            : roleTagged ? "" : "needs qualification — a done analysis child, an accepted decision, or the publisher's declaration";
+      }
     }
     const sessions = this.state.storage.sql.exec(
       `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label

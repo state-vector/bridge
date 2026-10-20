@@ -575,6 +575,9 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .backlog-boosted .backlog-rank { background: color-mix(in srgb, var(--green) 20%, transparent); color: var(--green); }
 .boost-btn { font-size: 10.5px; padding: 2px 8px; }
 .boost-btn.boost-on { border-color: var(--green); color: var(--green); }
+.backlog-parked { opacity: .6; }
+.backlog-parked:hover { opacity: .9; }
+.backlog-rank-parked { background: transparent; color: var(--text-faint); }
 
 /* ---------- gateway strip (Top): dispatch runners, online even when idle ---------- */
 .gateway-strip {

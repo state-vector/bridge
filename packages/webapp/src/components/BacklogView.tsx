@@ -31,27 +31,43 @@ export function BacklogView() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
 
-  const rows = useMemo(() => {
+  const { queue, parked } = useMemo(() => {
     const parentOf = new Map<string, string>();
     for (const t of tasks as any[]) if ((t as any).part_of) parentOf.set(t.id, (t as any).part_of);
     const inReview = new Set((tasks as any[]).filter((t) => t.status === "in_review").map((t) => t.id));
-    return (tasks as any[])
-      .filter((t) => t.status === "todo" || t.status === "blocked")
-      .map((t) => {
-        const tags: string[] = t.tags ?? [];
-        const isVerify = tags.includes("role:review") && parentOf.get(t.id) && inReview.has(parentOf.get(t.id)!);
-        const { rank, why } = rankOf(t, parentOf);
-        const boosted = !!(t.meta?.boosted);
-        return {
-          t,
-          rank: boosted ? -1 : (isVerify ? 2 : rank),
-          why: boosted ? "boosted — priority 0 (human)" : (isVerify ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why),
-          boosted,
-          attempts: t.meta?.attempt?.attempts ?? 0,
-        };
-      })
+    const decorate = (t: any) => {
+      const tags: string[] = t.tags ?? [];
+      const isVerify = tags.includes("role:review") && parentOf.get(t.id) && inReview.has(parentOf.get(t.id)!);
+      const { rank, why } = rankOf(t, parentOf);
+      const boosted = !!(t.meta?.boosted);
+      return {
+        t,
+        rank: boosted ? -1 : (isVerify ? 2 : rank),
+        why: boosted ? "boosted — priority 0 (human)" : (isVerify ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why),
+        boosted,
+        attempts: t.meta?.attempt?.attempts ?? 0,
+      };
+    };
+    const all = (tasks as any[]).filter((t) => t.status === "todo" || t.status === "blocked").map(decorate);
+    // parked = structurally not dispatchable (server-projected is_claimable) —
+    // shown separately so hours-old items don't masquerade as a stuck queue
+    const parked = all.filter(({ t }) => {
+      const claimable = (t as any).is_claimable;
+      if (t.status === "blocked") return !(t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id);
+      return claimable === false;
+    });
+    const queue = all.filter((r) => !parked.includes(r))
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
+    parked.sort((a, b) => b.t.updated_ts - a.t.updated_ts);
+    return { queue, parked };
   }, [tasks]);
+
+  const parkedReason = (t: any): string => {
+    if (t.status === "blocked") return "blocked without an exit condition — open the card, resolve or re-scope";
+    if ((t.tags ?? []).includes("question") || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
+    if (t.meta?.operator_gated) return `operator gate: ${t.meta.operator_gated} — a human clears it`;
+    return (t as any).claim_reason || "not dispatchable — see card";
+  };
 
   const boost = async (id: string, on: boolean, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -70,11 +86,11 @@ export function BacklogView() {
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
       <div className="view-head">
         <h2>Backlog</h2>
-        <span className="muted-note">{rows.length} items — ranked by what gets picked up next; boosted → unblock and verify duty first, oldest first within a rank</span>
+        <span className="muted-note">{queue.length} dispatchable · {parked.length} parked — ranked by what gets picked up next</span>
         {msg && <span className="ok">{msg}</span>}
       </div>
       <div className="backlog-list">
-        {rows.map(({ t, rank, why, boosted, attempts }) => {
+        {queue.map(({ t, rank, why, boosted, attempts }) => {
           const kind = kindOf(t);
           return (
             <div key={t.id} className={`backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => setSelectedTaskId(t.id)}>
@@ -106,8 +122,38 @@ export function BacklogView() {
             </div>
           );
         })}
-        {rows.length === 0 && <p className="empty">Backlog empty — everything in flight or done.</p>}
+        {queue.length === 0 && <p className="empty">Queue empty — everything in flight, parked, or done.</p>}
       </div>
+
+      {parked.length > 0 && (
+        <>
+          <div className="view-head">
+            <h2>Parked — not dispatchable</h2>
+            <span className="muted-note">{parked.length} items waiting on a human, an author, or a gate — these will not move on their own</span>
+          </div>
+          <div className="backlog-list">
+            {parked.map(({ t, attempts }) => {
+              const kind = kindOf(t);
+              return (
+                <div key={t.id} className="backlog-row backlog-parked" onClick={() => setSelectedTaskId(t.id)}>
+                  <span className="backlog-rank backlog-rank-parked">▪</span>
+                  <span className="backlog-id">{t.id}</span>
+                  <span className="backlog-main">
+                    <span className={`chip chip-kind kind-pill kp-${kind}`}>{kind}</span>
+                    <span className="backlog-title">{t.title}</span>
+                    <span className="backlog-why"><span className="chip chip-scope">why</span> {parkedReason(t)}</span>
+                  </span>
+                  <span className="backlog-meta">
+                    {attempts > 0 && <span className="chip chip-urgent" title={`attempted ${attempts}x`}>×{attempts}</span>}
+                    {t.owner ? <span>{t.owner}</span> : <span className="backlog-pool">pool</span>}
+                  </span>
+                  <span className="backlog-age top-num" title="last updated">{rel(t.updated_ts)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
