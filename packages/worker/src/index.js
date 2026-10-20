@@ -216,7 +216,7 @@ export default {
 async function handleIngest(request, env) {
   if (request.method !== "POST") return json({ error: "POST only" }, 405);
   const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!token || token !== env.FLOWS_INGEST_TOKEN) return json({ error: "unauthorized" }, 401);
+  if (!token || token !== (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) return json({ error: "unauthorized" }, 401);
 
   let body;
   try { body = await request.json(); } catch { return json({ error: "bad json" }, 400); }

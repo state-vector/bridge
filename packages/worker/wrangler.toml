@@ -35,6 +35,6 @@ run_worker_first = ["/ingest", "/api/state", "/api/session", "/api/workspaces", 
 # Overridden by `wrangler secret put` at deploy:
 #   GITHUB_CLIENT_ID      GitHub OAuth app client id (human sign-in)
 #   GITHUB_CLIENT_SECRET  GitHub OAuth app client secret (also HMAC-signs session cookies)
-#   FLOWS_INGEST_TOKEN    shared bearer for POST /ingest
+#   BRIDGE_INGEST_TOKEN    shared bearer for POST /ingest (legacy FLOWS_INGEST_TOKEN still accepted during rotation)
 #   CF_ACCESS_TEAM        optional: https://<team>.cloudflareaccess.com (edge JWT mode)
 #   CF_ACCESS_AUD         optional: Access application AUD tag

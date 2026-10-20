@@ -1,4 +1,4 @@
-/** Full KB e2e against `wrangler dev` on :8799 (.dev.vars: GITHUB_CLIENT_SECRET, FLOWS_INGEST_TOKEN). Run: node e2e.mjs */
+/** Full KB e2e against `wrangler dev` on :8799 (.dev.vars: GITHUB_CLIENT_SECRET, BRIDGE_INGEST_TOKEN). Run: node e2e.mjs */
 import WebSocket from "ws";
 const base = "http://127.0.0.1:8801";
 let cookie = "", id = 0;

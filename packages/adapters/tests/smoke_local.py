@@ -47,7 +47,7 @@ print("[t4] do.js contains schema/decision/heartbeat-collapse logic OK")
 
 # ---- 3. router: auth gates present in source ----
 ix = open("/home/hermes/flows/packages/worker/src/index.js").read()
-for frag in ["FLOWS_INGEST_TOKEN", "Cf-Access-Jwt-Assertion", "jwtVerify", "requireAccess"]:
+for frag in ["BRIDGE_INGEST_TOKEN", "Cf-Access-Jwt-Assertion", "jwtVerify", "requireAccess"]:
     assert frag in ix, f"index.js missing: {frag}"
 print("[t5] ingest bearer + Access JWT gates wired OK")
 

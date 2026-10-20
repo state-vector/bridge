@@ -71,7 +71,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
 
   // tokens are opaque — the workspace comes from the routing order above,
   // never from the secret itself. The shared ingest token is default-workspace.
-  const ws = bearer === env.FLOWS_INGEST_TOKEN
+  const ws = bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)
     ? DEFAULT_WS_SLUG
     : await resolveTokenWs(env, bearer);
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
@@ -79,7 +79,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   // identity: registry auth token (bkw_…) or the legacy shared ingest token
   let identity: { token_id: string; label: string; tags: string[] };
   try {
-    if (bearer === env.FLOWS_INGEST_TOKEN) {
+    if (bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) {
       identity = { token_id: "shared", label: "shared", tags: [] };
     } else {
       identity = await kb(hub, "auth.identify", { bearer });

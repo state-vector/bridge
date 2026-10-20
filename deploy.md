@@ -17,7 +17,7 @@ npx wrangler deploy
 Secrets (not in wrangler.toml):
 
 ```bash
-npx wrangler secret put FLOWS_INGEST_TOKEN   # generate: openssl rand -hex 24
+npx wrangler secret put BRIDGE_INGEST_TOKEN   # generate: openssl rand -hex 24 (legacy FLOWS_INGEST_TOKEN still accepted)
 
 
 ```
@@ -69,7 +69,7 @@ switches to Cloudflare Access JWT validation at the edge — both paths ship.)
 
 ```bash
 # one-time env (in ~/.hermes/.env so the unit's EnvironmentFile picks it up):
-#   FLOWS_INGEST_TOKEN=<same token as step 1>
+#   BRIDGE_INGEST_TOKEN=<same token as step 1>
 sed -i "s/REPLACE-SUBDOMAIN/<subdomain>/" ~/bridge/packages/adapters/flows-shipper.service
 mkdir -p ~/.config/systemd/user && cp ~/bridge/packages/adapters/flows-shipper.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now flows-shipper
