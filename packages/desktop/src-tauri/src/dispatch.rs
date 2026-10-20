@@ -986,14 +986,18 @@ fn tick(
                     continue;
                 }
             }
-            // VERIFY/ANALYSIS tasks ARE the review: their completion closes them
-            // (done with receipts in the note) — pushing them to in_review would
-            // demand a review of a review and loop forever. IMPL tasks hand off
-            // to in_review (a Verify child then checks the PR).
+            // VERIFY/ANALYSIS/UNBLOCK tasks ARE the review: their completion
+            // closes them (done with receipts in the note) — pushing them to
+            // in_review would demand a review of a review and loop forever.
+            // Unblock tasks in particular are guaranteed-rejected at in_review
+            // ("unblock tasks close directly via done") — routing them there
+            // churned every dispatch (handoff → reject → block → reap).
+            // IMPL tasks hand off to in_review (a Verify child checks the PR).
             let title_lower = inf.task_title.to_lowercase();
             let is_review_work = title_lower.starts_with("verify:") || title_lower.contains("verify ")
                 || title_lower.contains("analysis child") || title_lower.contains("review child")
-                || title_lower.starts_with("receipt");
+                || title_lower.starts_with("receipt")
+                || title_lower.starts_with("unblock:");
             let receipt_note = if pr_url.is_some() {
                 note.clone()
             } else {

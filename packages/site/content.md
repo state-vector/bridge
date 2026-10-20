@@ -35,7 +35,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 ```
 
 - **The hub dispatches; agents poll and claim.** The dispatch loop has no LLM in it. A deterministic sweep on a Cloudflare Durable Object (free tier) assigns work, agents claim first-wins, and agents heartbeat while they work.
-- **Honest silence.** An agent that goes silent is marked abandoned. The runner never writes heartbeat notes on the agent's behalf. Long operations declare a budget. Work blocked on children waits for its children.
+- **Honest silence.** An agent that goes silent is marked abandoned. The runner never writes heartbeat notes on the agent's behalf. Long operations declare a budget. Work blocked on children waits for its children — and nothing parks forever: stale reviews bounce back to the pool, gate-rejection blocks are reaped after 24h.
 - **Verification is built in.** Finishing a task spawns a verifier in a fresh session. Work is not done until the receipts check out. Decisions are human-authoritative: agents propose, you accept.
 - **Everything is knowledge.** Tasks, progress, discussions, decisions, and the audit trail are one searchable record.
 - **Small sessions, fresh context.** Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) so the board shows when a session should hand off.
@@ -55,12 +55,14 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
    │ └── blocked ◄────────┘  │  │                  └──► in_progress (bounced with findings)
    │        │                │  └── todo (released, owner/human only, stamps "attempted")
    │        └── in_progress | todo (unblocked / retry)
-   └── expired (watchdog) ──► todo (attempt count++)
+   └── expired or stale review (watchdog) ──► todo (attempt count++)
 ```
+
+The watchdog never lets work park forever. Silent agents are released from `in_progress`. A task parked `in_review` past `review_stale_minutes` (a setting, default 360) with no verifier actively running is bounced and released to the pool too. And a gate-rejection block (a runner handoff a gate refused) is reaped after 24h of no movement — the rejection history stays on the card.
 
 - **impl**, the work itself. Exclusive claim. Finish requires a PR, which auto-spawns a Verify task. done requires the verify child to complete, and the verifying session must not be the session that did the work (separation of duties is a server check). Pickup requires qualification: a done analysis child or an accepted decision.
 - **analysis**, evidence before code. Exclusive claim; output is a breakdown or evidence map, not a PR. Its done releases the parent impl's claim, so implementation continues in a fresh session.
-- **review**, verification. Verify tasks outrank everything in the pool. Cannot complete without receipts (PR link, merge state, the check that ran). A bounce returns the parent to in_progress with findings for its author. Verify-of-verify is structurally blocked. A bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents, and are surfaced and nudged.
+- **review**, verification. Verify tasks outrank everything in the pool. Cannot complete without receipts (PR link, merge state, the check that ran). A bounce returns the parent to in_progress with findings for its author. Verify-of-verify is structurally blocked. A bounce or done supersedes open verify rounds. Unclaimed verify tasks stall their parents, and are surfaced and nudged; a stalled round nobody picks up eventually bounces the parent back to the pool (watchdog, `review_stale_minutes` default 360).
 - **research**, investigation. Exclusive claim; completes with a knowledge artefact link. Findings feed later impl and analysis tasks.
 - **question**, fleet-wide discussion. Open: nobody claims it, many contribute. Contributions are progress entries with provenance. The watchdog never sweeps it. The author judges sufficiency and closes it by writing a decision. Accepted decisions unblock gates elsewhere.
 
@@ -73,6 +75,8 @@ The pool ranks work in this order: unblock tasks first, then blocked tasks with 
 ```
 todo ──claim──► in_progress ──blocked?──► [Unblock child auto-spawns]
                     │                      └─ checks the exit condition → unblocks, or reports findings
+                    │                         the unblock child closes itself done with its verdict —
+                    │                         it is never reviewed (a review of an unblock would deadlock it)
                     │
                     └──PR──► in_review ──► [Verify child auto-spawns]
                                                ├─ receipts hold ──► impl done ✔
