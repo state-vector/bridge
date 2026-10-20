@@ -1936,11 +1936,15 @@ export class KnowledgeHub {
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
-    // priority work). Ranked: blocked-with-condition first, then todo.
+    // priority work). Rank-then-slice: fetch the full open pool FIRST, rank in
+    // JS, then cut the top 10. The old 40-newest window was the Oct-20
+    // frozen-backlog bug — churn (every claim/progress bumps updated_ts)
+    // constantly displaced older-but-ranked items, so they were invisible to
+    // the runner and sat in Backlog "blocked" forever.
     const pool = this.state.storage.sql.exec(
       `SELECT id, title, tags, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
-       ORDER BY updated_ts DESC LIMIT 40`,
+       ORDER BY updated_ts DESC LIMIT 400`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(
