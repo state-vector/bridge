@@ -554,6 +554,10 @@ fn write_runner_state(snap: &SharedSnapshot) {
 struct InFlight {
     task_id: String,
     task_title: String,
+    /// role tags recorded at claim time — decide done-vs-in_review from what
+    /// the task IS, not title heuristics (analysis/unblock work finished with
+    /// no PR used to bounce off the in_review handoff gate and loop forever)
+    role_work: bool,
     started: std::time::Instant,
     last_note: String,
     worktree: Option<PathBuf>, // isolated worktree to clean up on finalize
@@ -731,6 +735,7 @@ fn spawn_opencode(
     body_md: &str,
     policy: &str,
     resume_session: Option<String>,
+    role_work: bool,
     in_flight: &mut Vec<InFlight>,
 ) {
     let backend = pick_backend(cfg);
@@ -855,6 +860,7 @@ fn spawn_opencode(
     in_flight.push(InFlight {
         task_id: tid.to_string(),
         task_title: title.to_string(),
+        role_work,
         started: std::time::Instant::now(),
         last_note: String::new(),
         worktree,
@@ -897,6 +903,7 @@ fn tick(
                 InFlight {
                     task_id: inf.task_id.clone(),
                     task_title: inf.task_title.clone(),
+                    role_work: inf.role_work,
                     started: inf.started,
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
@@ -915,6 +922,7 @@ fn tick(
                 InFlight {
                     task_id: inf.task_id.clone(),
                     task_title: inf.task_title.clone(),
+                    role_work: inf.role_work,
                     started: inf.started,
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
@@ -1019,8 +1027,11 @@ fn tick(
             // (done with receipts in the note) — pushing them to in_review would
             // demand a review of a review and loop forever. IMPL tasks hand off
             // to in_review (a Verify child then checks the PR).
+            // role tags recorded at claim time are authoritative; the title
+            // heuristic remains as fallback for legacy in-flight entries
             let title_lower = inf.task_title.to_lowercase();
-            let is_review_work = title_lower.starts_with("verify:") || title_lower.contains("verify ")
+            let is_review_work = inf.role_work
+                || title_lower.starts_with("verify:") || title_lower.contains("verify ")
                 || title_lower.contains("analysis child") || title_lower.contains("review child")
                 || title_lower.starts_with("receipt");
             let receipt_note = if pr_url.is_some() {
@@ -1262,7 +1273,8 @@ fn tick(
             Some(s) => format!("resumed {tid} — continuing opencode session {s}"),
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
         };
-        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, in_flight);
+        let role_work = t.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
+        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1376,7 +1388,8 @@ fn tick(
             Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
             None => format!("claimed {tid} — dispatched to opencode"),
         };
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, in_flight);
+        let role_work = task.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);

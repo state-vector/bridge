@@ -1158,7 +1158,13 @@ export class KnowledgeHub {
     const tTags: string[] = parseTags(row.tags);
     const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
     if (row.type === "task" && row.status === "todo" && to === "in_progress") {
-      const q = this.qualifyCheck(row, "analysis");
+      // gateway-attributed claims: the role lives in the TASK, not the token —
+      // a role-tagged task (analysis/review/impl/unblock) dispatched by its
+      // gateway IS that work. Token-level qualification was a category error
+      // under dispatch: the one gateway token does everything, so qualifier
+      // requirements could never be met and whole backlog slices froze.
+      const dispatchedRoleWork = body.gateway && isQualifier;
+      const q = dispatchedRoleWork ? { ok: true, via: "dispatch" } : this.qualifyCheck(row, "analysis");
       // roles are playbooks, not gates: any agent may claim any task — the pool
       // surfaces everything claimable, ranked verify-first, and an agent that
       // can't do the work stands down (log it back / bounce). Role tags steer
@@ -1927,10 +1933,13 @@ export class KnowledgeHub {
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
       const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
+      // role-tagged tasks are claimable by their gateway: the role lives in the
+      // task, and dispatch IS that work (the Oct-20 frozen-backlog lesson)
+      const dispatchedRoleWork = (t.tags ?? []).some((x: string) => ["role:analysis", "role:review", "role:impl", "role:unblock"].includes(x));
       // roles are playbooks, not gates: every agent sees everything claimable.
       // Flag instead of filter — agents stand down on work they can't do, and
       // the server's separation-of-duties check is the actual integrity gate.
-      t.needs_qualification = !qualified || unmet.length > 0;
+      t.needs_qualification = !dispatchedRoleWork && (!qualified || unmet.length > 0);
       if (need.length) t.target_roles = need;
       return true;
     }).sort((a: any, b: any) => {
