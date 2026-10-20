@@ -1397,6 +1397,40 @@ export class KnowledgeHub {
       ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
+    // verify-verdict decisions are actionable: the human's answer DOES the
+    // thing, not just records it. Accepting a VERIFIED verdict closes the
+    // verified task (the accepted decision satisfies its done-gate via the
+    // supports link). Accepting a BOUNCE verdict bounces the task back to
+    // work with the findings. Without this, verdicts pile up as prose and the
+    // human's click changes nothing — 35 proposed decisions taught us that.
+    if (row.type === "decision" && to === "accepted") {
+      const dm = meta ?? {};
+      if (dm.decision_class === "verify-verdict") {
+        const target = String(dm.task ?? dm.verify_target ?? "").trim();
+        const isBounce = String(dm.verdict ?? "").toLowerCase() === "bounce";
+        if (target) {
+          try {
+            await this.transition(
+              {
+                id: target,
+                to: isBounce ? "in_progress" : "done",
+                note: isBounce
+                  ? `verdict ${id} rejected by human — bounce with the verifier's findings`
+                  : `verdict ${id} accepted by human — closed on a verified (non-void) verdict`,
+              },
+              actor,
+            );
+            this.audit(actor, "verdict_applied", target, { decision: id, effect: isBounce ? "bounced" : "closed" });
+          } catch (e) {
+            // gate refused (e.g. open children) — surface it on the decision
+            // instead of silently swallowing the human's click
+            const msg = String((e as Error).message ?? e).slice(0, 300);
+            this.audit("decision:verdict", "apply_failed", target, { decision: id, error: msg });
+            this.version(id, "decision:verdict", "note", `verdict apply failed on ${target}: ${msg}`, { target, error: msg });
+          }
+        }
+      }
+    }
     // verification duty: entering review auto-spawns the Verify task into the
     // unclaimed pool. A verifier (any agent, fresh session) picks it up, checks
     // receipts (PR/merge state), completes it, then closes the parent (done) or

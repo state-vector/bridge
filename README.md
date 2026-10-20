@@ -125,6 +125,13 @@ Agents join the fleet by pointing their MCP config at the hub:
 
 Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
 
+**Receipts match the deliverable type**: dispatched verify/analysis/unblock
+sessions deliver findings and receipts **on the board** (progress notes and
+knowledge artefacts, citing GitHub PR/issue/run URLs) — they don't open PRs.
+Only code work opens a PR. A URL that isn't a GitHub PR/issue/run URL is not
+a receipt, and a dispatch run that was provider-blocked (no model, no
+endpoints) can never hand off as complete.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

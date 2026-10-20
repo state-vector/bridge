@@ -16,6 +16,25 @@ import { rel } from "../lib/views";
 
 const KIND_CHIP: Record<string, string> = { proposed: "chip-needs", accepted: "chip-done", rejected: "chip-done" };
 
+/** Verify-verdict decisions carry meta.decision_class + verdict + receipts —
+ *  frame them as the choice they are: accept the verdict (closes the task) or
+ *  reject it (bounces it back). Generic decisions keep the plain framing. */
+function decisionFrame(d: KbArtefact): { kind: "verify" | "generic"; verdict?: string; target?: string; receipts: [string, string][] } {
+  const m = (d.meta ?? {}) as Record<string, unknown>;
+  if (m.decision_class === "verify-verdict") {
+    const keys = ["pr", "pr_state", "pr_slice2", "pr_slice2_state", "issue_state", "issue_1976", "issue_1977", "merge_commit", "github", "ci_soak_run", "residue"];
+    const receipts: [string, string][] = [];
+    for (const k of keys) if (m[k] != null && String(m[k]).trim()) receipts.push([k.replace(/_/g, " "), String(m[k])]);
+    return {
+      kind: "verify",
+      verdict: String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : String(m.verified === "true" ? "verified" : m.verdict ?? "verify"),
+      target: String(m.task ?? m.verify_target ?? ""),
+      receipts,
+    };
+  }
+  return { kind: "generic", receipts: [] };
+}
+
 /** snarkdown → sanitized-enough HTML: strip script/on* attrs (trusted-ish
  *  content — our own KB — but defence in depth costs one line). */
 function md(src: string): string {
@@ -107,14 +126,42 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
   return (
     <div className="overlay-backdrop" onClick={onClose}>
       <div className="forme-pop" onClick={(e) => e.stopPropagation()}>
-        <div className="ask-chips">
-          <span className="chip chip-urgent">DECISION</span>
-          <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
-          <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
-          <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
-        </div>
-        <h2>{d.title}</h2>
-        <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.body_md ?? "") }} />
+        {(() => {
+          const f = decisionFrame(d);
+          return (
+            <div className="ask-chips">
+              <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
+              <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
+              {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
+              <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
+              <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
+            </div>
+          );
+        })()}
+        {(() => {
+          const f = decisionFrame(d);
+          if (f.kind !== "verify") return <h2>{d.title}</h2>;
+          return (
+            <>
+              <h2>{f.verdict === "bounce" ? `Bounce ${f.target ?? "task"} back to work?` : `Accept verification of ${f.target ?? "task"}?`}</h2>
+              <p className="ask-reason">
+                {f.verdict === "bounce"
+                  ? "A fresh-session verifier found the handoff receipts void. Accepting bounces the task to in_progress with the findings; rejecting leaves it as-is."
+                  : "A fresh-session verifier confirmed the receipts (PR merged, issue closed, on main). Accepting closes the task as done. Rejecting leaves it as-is."}
+              </p>
+              {f.receipts.length > 0 && (
+                <div className="ask-chips">
+                  {f.receipts.map(([k, v]) => (
+                    <span key={k} className="chip chip-scope" title={v}>{k}: {v.length > 40 ? `${v.slice(0, 40)}…` : v}</span>
+                  ))}
+                </div>
+              )}
+              <details className="forme-details"><summary>verifier's full verdict</summary>
+                <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.title + "\n\n" + (d.body_md ?? "")) }} />
+              </details>
+            </>
+          );
+        })()}
 
         <h3 className="forme-sub">Comments</h3>
         <div className="forme-comments">
@@ -160,12 +207,26 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
   const [open, setOpen] = useState(false);
   return (
     <div className="card ask-urgent forme-item">
-      <div className="ask-chips">
-        <span className="chip chip-urgent">DECISION</span>
-        <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
-        <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
-      </div>
-      <h3 className="ask-question" onClick={() => setOpen(true)}>{d.title}</h3>
+      {(() => {
+        const f = decisionFrame(d);
+        return (
+          <div className="ask-chips">
+            <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
+            {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
+            {f.target && <span className="chip chip-scope">{f.target}</span>}
+            <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
+          </div>
+        );
+      })()}
+      <h3 className="ask-question" onClick={() => setOpen(true)}>
+        {(() => {
+          const f = decisionFrame(d);
+          const t = f.kind === "verify"
+            ? `${f.verdict === "bounce" ? "Bounce" : "Accept verification of"} ${f.target ?? "task"}`
+            : d.title;
+          return t.length > 110 ? `${t.slice(0, 110)}…` : t;
+        })()}
+      </h3>
       <div className="ask-actions">
         <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Open ↗</button>
       </div>

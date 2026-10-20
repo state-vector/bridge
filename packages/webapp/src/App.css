@@ -432,6 +432,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .forme-sub { margin: 8px 0 0; font-size: 12.5px; font-weight: 650; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
 .forme-comments { display: flex; flex-direction: column; gap: 6px; max-height: 26vh; overflow-y: auto; }
+.forme-details summary { cursor: pointer; color: var(--text-faint); font-size: 12px; margin: 4px 0; }
 .forme-reject input { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); }
 
 /* ---------- aggregate sentiment ---------- */
