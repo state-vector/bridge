@@ -39,6 +39,9 @@ fn main() {
                     std::process::exit(2);
                 });
             eprintln!("[bridge] pairing against {url} — approve at {url}/pair, then the runner starts");
+            // run_loop pairs from BRIDGE_URL — the CLI knows the URL from the
+            // arg, not the env; hand it over or pairing dead-ends immediately.
+            std::env::set_var("BRIDGE_URL", &url);
             run(None);
         }
         "status" => {
