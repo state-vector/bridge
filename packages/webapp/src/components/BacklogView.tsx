@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useKb } from "../store/kb";
+import { kbApi } from "../lib/kb";
 import { TaskDetail } from "./TaskDetail";
 import { kindOf, rel } from "../lib/views";
 
@@ -28,6 +29,7 @@ function rankOf(t: any, parentIdOf: Map<string, string>): { rank: number; why: s
 export function BacklogView() {
   const tasks = useKb((s) => s.tasks);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [msg, setMsg] = useState("");
 
   const rows = useMemo(() => {
     const parentOf = new Map<string, string>();
@@ -39,29 +41,44 @@ export function BacklogView() {
         const tags: string[] = t.tags ?? [];
         const isVerify = tags.includes("role:review") && parentOf.get(t.id) && inReview.has(parentOf.get(t.id)!);
         const { rank, why } = rankOf(t, parentOf);
+        const boosted = !!(t.meta?.boosted);
         return {
           t,
-          rank: isVerify ? 2 : rank,
-          why: isVerify ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why,
+          rank: boosted ? -1 : (isVerify ? 2 : rank),
+          why: boosted ? "boosted — priority 0 (human)" : (isVerify ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why),
+          boosted,
           attempts: t.meta?.attempt?.attempts ?? 0,
         };
       })
-      .sort((a, b) => a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
+      .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
   }, [tasks]);
+
+  const boost = async (id: string, on: boolean, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await kbApi.boost(id, on);
+      await useKb.getState().refresh();
+      setMsg(on ? `boosted ${id} + dependencies` : `boost removed from ${id}`);
+      setTimeout(() => setMsg(""), 2500);
+    } catch (err) {
+      setMsg(`failed: ${(err as Error).message}`);
+    }
+  };
 
   return (
     <div className="backlog-wrap">
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
       <div className="view-head">
         <h2>Backlog</h2>
-        <span className="muted-note">{rows.length} items — ranked by what gets picked up next; unblock and verify duty first, oldest first within a rank</span>
+        <span className="muted-note">{rows.length} items — ranked by what gets picked up next; boosted → unblock and verify duty first, oldest first within a rank</span>
+        {msg && <span className="ok">{msg}</span>}
       </div>
       <div className="backlog-list">
-        {rows.map(({ t, rank, why, attempts }) => {
+        {rows.map(({ t, rank, why, boosted, attempts }) => {
           const kind = kindOf(t);
           return (
-            <div key={t.id} className="backlog-row" onClick={() => setSelectedTaskId(t.id)}>
-              <span className="backlog-rank" title={`pickup rank ${rank}: ${why}`}>{rank + 1}</span>
+            <div key={t.id} className={`backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => setSelectedTaskId(t.id)}>
+              <span className="backlog-rank" title={`pickup rank: ${why}`}>{boosted ? "▲" : rank + 1}</span>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
                 <span className={`chip chip-kind kind-pill kp-${kind}`}>{kind}</span>
@@ -75,6 +92,13 @@ export function BacklogView() {
                 )}
               </span>
               <span className="backlog-meta">
+                <button
+                  className={`opt-btn boost-btn ${boosted ? "boost-on" : ""}`}
+                  title={boosted ? "remove boost (this task + its open children)" : "boost to priority 0 (this task + its open children)"}
+                  onClick={(e) => void boost(t.id, !boosted, e)}
+                >
+                  {boosted ? "▼ unboost" : "▲ boost"}
+                </button>
                 {attempts > 0 && <span className="chip chip-urgent" title={`attempted ${attempts}x`}>×{attempts}</span>}
                 {t.owner ? <span title={`claimed by ${t.owner}`}>{t.owner}</span> : <span className="backlog-pool">pool</span>}
               </span>

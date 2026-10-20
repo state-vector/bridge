@@ -62,6 +62,7 @@ interface TopRow {
   blockedClass?: string;
   subprocess?: boolean;
   pinned?: boolean;
+  boosted?: boolean;
   kind?: string;
   partOf?: string;
   score?: number;
@@ -145,6 +146,7 @@ export function TopView() {
         blockedClass: meta.blocked?.class,
         subprocess: !!meta.subprocess,
         pinned: !!meta.pinned,
+        boosted: !!meta.boosted,
         kind: kindOf(t as any),
         partOf: (t as any).part_of,
         score: sc?.score,
@@ -165,7 +167,8 @@ export function TopView() {
     // within a bucket, most recent signal first
     const weight: Record<string, number> = { blocked: 0, in_progress: 1 };
     return taskRows.sort(
-      (a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
+      (a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0)
+        || (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
         || (weight[a.status ?? ""] ?? 2) - (weight[b.status ?? ""] ?? 2)
         || (b.lastSignal ?? b.lastSeen ?? 0) - (a.lastSignal ?? a.lastSeen ?? 0),
     );

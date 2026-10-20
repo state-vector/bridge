@@ -69,7 +69,7 @@ export default {
         return env.KB.get(kbId).fetch(kbUrl + url.search, request);
       }
       if (request.method === "POST") {
-        const op = ["create", "update", "transition", "link", "progress", "enrich"].includes(sub) ? sub : null;
+        const op = ["create", "update", "transition", "link", "progress", "enrich", "boost"].includes(sub) ? sub : null;
         if (!op) return new Response("not found", { status: 404 });
         const body = await request.json().catch(() => ({}));
         body.actor = "web";

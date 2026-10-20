@@ -571,6 +571,10 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .backlog-age { color: var(--text-faint); font-size: 11.5px; text-align: right; }
 .backlog-done { opacity: .78; }
 .backlog-done:hover { opacity: 1; }
+.backlog-boosted { background: color-mix(in srgb, var(--green) 7%, transparent); }
+.backlog-boosted .backlog-rank { background: color-mix(in srgb, var(--green) 20%, transparent); color: var(--green); }
+.boost-btn { font-size: 10.5px; padding: 2px 8px; }
+.boost-btn.boost-on { border-color: var(--green); color: var(--green); }
 
 /* ---------- gateway strip (Top): dispatch runners, online even when idle ---------- */
 .gateway-strip {

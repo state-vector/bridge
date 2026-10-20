@@ -677,6 +677,7 @@ export class KnowledgeHub {
     try {
       switch (op) {
         case "create": return this.json(await this.create(body, actor));
+        case "boost": return this.json(await this.boost(body, actor));
         case "get": return this.json(await this.get(String(body.id)));
         case "list": return this.json(await this.list(body));
         case "search": return this.json(await this.search(body));
@@ -821,6 +822,43 @@ export class KnowledgeHub {
     );
     this.version(t.id, actor, "progress", title.slice(0, 500), { note: title.slice(0, 200) });
     this.audit(actor, "progress", t.id, { note: title.slice(0, 200), via: "progress_artefact" });
+  }
+
+  /** Human boost: priority 0 in the pickup ranking, above unblock duty.
+   *  Cascades to all TRANSITIVE OPEN children (todo/blocked/in_progress) —
+   *  a task cannot complete while its children are open, so the dependency
+   *  set IS the children. Audited per task; boost ts orders multiple boosts. */
+  private async boost(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const on = body.boost !== false;
+    const row = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "task") throw new Error(`boost applies to tasks, not ${row.type}`);
+    const boosted: string[] = [];
+    const queue = [id];
+    const seen = new Set<string>([id]);
+    while (queue.length) {
+      const tid = queue.shift()!;
+      const t = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, tid);
+      if (!t || t.status === "done" || t.status === "superseded") continue;
+      const meta = JSON.parse(t.meta ?? "{}");
+      if (on) meta.boosted = Date.now();
+      else delete meta.boosted;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(meta), Date.now(), t.id,
+      );
+      this.audit(actor, on ? "boost" : "unboost", t.id, { root: id });
+      this.version(t.id, actor, "update", on ? `boosted (priority 0, via ${id})` : `boost removed (via ${id})`, {});
+      boosted.push(t.id);
+      for (const c of this.state.storage.sql.exec(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ?`, t.id,
+      ).toArray() as any[]) {
+        if (!seen.has(c.id)) { seen.add(c.id); queue.push(c.id); }
+      }
+    }
+    return { id, boosted, on };
   }
 
   private async get(id: string) {
@@ -1901,6 +1939,9 @@ export class KnowledgeHub {
       // duty, questions, plain todo.
       const rank = (t: any) => {
         const m = JSON.parse(t.meta ?? "{}");
+        // human boost: priority 0, above unblock duty — the human's explicit
+        // "process this (and its dependencies) first" (BR#911)
+        if (m.boosted) return -1;
         if (t.tags?.includes("role:unblock")) return 0;
         if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
         if (verifyParents.has(t.id)) return 2;

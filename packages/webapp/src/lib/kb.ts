@@ -111,6 +111,8 @@ export const kbApi = {
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
   create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
+  boost: (id: string, on = true) =>
+    j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
   update: (id: string, patch: { title?: string; body_md?: string; meta?: object }) =>

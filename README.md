@@ -129,6 +129,7 @@ Mint agent tokens in the web UI under **Connect**. Agents call `orient` first �
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
+- **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
 - Anything needing a human lands in **For Me**
 
 ## Local development
