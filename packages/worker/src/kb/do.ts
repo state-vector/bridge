@@ -52,6 +52,19 @@ import {
   validateTransition,
 } from "./core.ts";
 
+/** Verify-stall threshold: how long an unclaimed verify task may sit before it
+ *  counts as "stalled" — nudged by the watchdog, surfaced as verification_stalled
+ *  in orient, and score-counted for role:review agents. Derived from the parent
+ *  bounce threshold (review_stale_minutes, default 360m): the stall signal must
+ *  fire well BEFORE the watchdog releases the parked parent, so nudges always
+ *  precede reaping. Capped at 60m, floored at 10m (360/6 = 60 by default). */
+export function verifyStallMinutes(reviewStaleMinutesSetting: string | null | undefined): number {
+  const reviewStaleMin = reviewStaleMinutesSetting
+    ? Math.max(30, Math.min(2880, parseInt(reviewStaleMinutesSetting, 10) || 360))
+    : 360;
+  return Math.min(60, Math.max(10, Math.floor(reviewStaleMin / 6)));
+}
+
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
 
@@ -250,9 +263,13 @@ export class KnowledgeHub {
       }
     }
     // (C) verification nudge: an unclaimed verify task parks its parent's owner —
-    // never reaped (you can't be "abandoned" from work you never picked up). Past
-    // the threshold, nudge once per hour: audit line (Log + ws broadcast) for the
-    // role:review agents and the waiting owner. The score signal does the rest.
+    // never reaped (you can't be "abandoned" from work you never picked up; the
+    // parent bounces on its own schedule at review_stale_minutes, and these
+    // nudges always precede that — see verifyStallMinutes). Past the stall
+    // threshold, nudge once per hour: an audit line (Log + ws broadcast)
+    // addressed to the ONLINE role:review agents — or everyone when none are.
+    // The score signal does the rest.
+    const verifyStallMin = verifyStallMinutes(rs?.value);
     const nudgeRows = this.state.storage.sql.exec(
       `SELECT r.src_id AS verify_task, r.dst_id AS parent_id, c.updated_ts AS age_ts, p.owner AS parent_owner
        FROM relations r
@@ -265,15 +282,20 @@ export class KnowledgeHub {
     ).toArray() as any[];
     for (const v of nudgeRows) {
       const age = now - (v.age_ts ?? now);
-      if (age <= 60 * 60_000) continue;
+      if (age <= verifyStallMin * 60_000) continue;
       const lastNudge = this.one(
         `SELECT ts FROM events WHERE artefact_id = ? AND op = 'nudge' ORDER BY ts DESC LIMIT 1`, v.verify_task,
       );
       if (lastNudge && now - Number(lastNudge.ts) <= 60 * 60_000) continue;
       const mins = Math.round(age / 60_000);
+      const onlineReview = (this.state.storage.sql.exec(
+        `SELECT label FROM auth_tokens WHERE revoked_ts IS NULL AND last_seen_ts >= ? AND tags LIKE '%"role:review"%'`,
+        now - 10 * 60_000,
+      ).toArray() as any[]).map((a) => String(a.label));
       this.audit("system:pool", "nudge", v.verify_task, {
-        note: `verify task unclaimed ${mins}m — this blocks ${v.parent_id}'s owner (${v.parent_owner || "unknown"}). Pick it up: check receipts, close or bounce the parent.`,
+        note: `verify task aging — this blocks ${v.parent_id}'s owner (${v.parent_owner || "unknown"}). Pick it up: check receipts, close or bounce the parent.`,
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
+        audience: onlineReview.length ? onlineReview : ["everyone"],
       });
     }
     // observability: the board can answer "is the watchdog alive?" via
@@ -447,12 +469,19 @@ export class KnowledgeHub {
          AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, windowTs,
       )?.n ?? 0;
       // verification duty backlog: role:review agents carry the pool's stalled
-      // verify rounds — each one is an implementer parked in in_review.
+      // verify rounds — each one is an implementer parked in in_review. Counted
+      // only once the round is NUDGED-BUT-IGNORED: unclaimed past the stall
+      // threshold (the sweep nudges within a minute of crossing it), same shape
+      // as unanswered asks.
       if (tags.includes("role:review")) {
+        const stallMin = verifyStallMinutes(
+          (this.one(`SELECT value FROM settings WHERE key = 'review_stale_minutes'`) as any)?.value,
+        );
         s.verify_duty_backlog = this.one(
           `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-           AND c.tags LIKE '%"role:review"%' AND p.status = 'in_review'`,
+           AND c.tags LIKE '%"role:review"%' AND p.status = 'in_review' AND c.updated_ts < ?`,
+          Date.now() - stallMin * 60_000,
         )?.n ?? 0;
       }
     }
@@ -1839,12 +1868,14 @@ export class KnowledgeHub {
     }).sort((a: any, b: any) => {
       // ranking: unblock children first (cheapest unblocking lever — a check
       // that releases parked work), then blocked-with-condition, then verify
-      // duty, questions, plain todo.
+      // duty (each unclaimed verify task parks an implementer in in_review),
+      // questions, plain todo. Verify duty means role:review children only —
+      // an unclaimed analysis child of an in_review parent is not verification.
       const rank = (t: any) => {
         const m = JSON.parse(t.meta ?? "{}");
         if (t.tags?.includes("role:unblock")) return 0;
         if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
-        if (verifyParents.has(t.id)) return 2;
+        if (t.tags?.includes("role:review") && verifyParents.has(t.id)) return 2;
         if (t.tags?.includes("question")) return 3;
         return 4;
       };
@@ -1904,7 +1935,12 @@ export class KnowledgeHub {
     // verification_stalled: an in_review parent's verify child is unclaimed — the
     // parent's owner is parked waiting on a verdict that only pickup can produce.
     // Tell the waiting owner (this is a pickup problem, not a review problem) and
-    // any role:review agent (pickup is their duty). 48h = stalled.
+    // any role:review agent (pickup is their duty). Stalled = unclaimed past the
+    // nudge threshold — the watchdog is nudging role:review agents at this point
+    // and the parent bounce (review_stale_minutes) is still ahead of us.
+    const verifyStallMin = verifyStallMinutes(
+      (this.one(`SELECT value FROM settings WHERE key = 'review_stale_minutes'`) as any)?.value,
+    );
     const stalledVerify = this.state.storage.sql.exec(
       `SELECT r.src_id AS verify_task, r.dst_id AS parent_id, p.title AS parent_title, p.owner AS parent_owner, c.updated_ts AS age_ts
        FROM relations r
@@ -1914,26 +1950,28 @@ export class KnowledgeHub {
          AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
          AND c.tags LIKE '%"role:review"%'
          AND p.type = 'task' AND p.status = 'in_review'
-         AND p.updated_ts < ?`,
-      [Date.now() - 48 * 60 * 60 * 1000],
+         AND c.updated_ts < ?`,
+      [Date.now() - verifyStallMin * 60_000],
     ).toArray() as any[];
 
     const reviewPending = stalledVerify.filter(v => v.parent_owner === label).map(v => ({
+      kind: "verification_stalled",
       task_id: v.verify_task,
       parent_id: v.parent_id,
       parent_title: v.parent_title,
       age_minutes: Math.ceil((Date.now() - v.age_ts) / 60000),
-      message: `Verification for '${v.parent_title}' (Task ${v.parent_id}) is stalled — verify task ${v.verify_task} unclaimed for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m.`,
+      message: `Verification for '${v.parent_title}' (Task ${v.parent_id}) is stalled — verify task ${v.verify_task} unclaimed for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m. This is a pickup problem, not a review problem — nudge role:review agents or wait for the pool to clear it.`,
       required_action: "CLAIM_VERIFY_TASK",
     }));
 
     const reviewDuty = tags.includes('role:review')
       ? stalledVerify.filter(v => v.parent_owner !== label).map(v => ({
+        kind: "verification_stalled",
         task_id: v.verify_task,
         parent_id: v.parent_id,
         parent_title: v.parent_title,
         age_minutes: Math.ceil((Date.now() - v.age_ts) / 60000),
-        message: `Stalled review: '${v.parent_title}' (Task ${v.parent_id}) has unclaimed verify task ${v.verify_task} for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m.`,
+        message: `Stalled review: '${v.parent_title}' (Task ${v.parent_id}) has unclaimed verify task ${v.verify_task} for ${Math.ceil((Date.now() - v.age_ts) / 60000)}m — this blocks the parent's owner.`,
         required_action: "PICKUP_REVIEW",
       }))
       : [];

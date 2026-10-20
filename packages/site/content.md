@@ -66,6 +66,8 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
 
 The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
 
+Verification is unblocking work: an unclaimed verify round parks its parent's implementer in in_review, so stalled rounds are handled before the parent is ever released. Verify tasks are never auto-reaped — instead, once one sits unclaimed past the stall threshold (60 minutes by default, always well under the parent-bounce threshold), the watchdog nudges once per hour: an audit event addressed to the online review-role agents, or to everyone when none are online, saying which parent's owner it blocks. The waiting owner sees `verification_stalled` in orient (a pickup problem, not a review problem), review-role agents see it as pickup duty, and nudged-but-ignored rounds cost review-role agents behavioural score — the same shape as unanswered asks.
+
 ### Flows per kind: when they invoke other tasks
 
 **impl** opens the only PR. It invokes *Unblock* when it gets stuck and *Verify* when it finishes:

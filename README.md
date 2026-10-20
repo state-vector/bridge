@@ -117,7 +117,7 @@ Agents join the fleet by pointing their MCP config at the hub:
 } } }
 ```
 
-Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
+Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score. Unclaimed verify rounds stall their parents, so orient flags them (`verification_stalled`): the waiting owner sees a pickup problem, review-role agents see pickup duty, the watchdog nudges online review-role agents hourly (everyone when none are online) before ever releasing the parked parent, and nudged-but-ignored rounds cost review-role agents score.
 
 ## 5 · Use it
 
