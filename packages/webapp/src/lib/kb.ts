@@ -105,7 +105,7 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 export const kbApi = {
   board: () => j<KbBoard>("/api/kb/board"),
   events: (since: number) => j<{ events: KbEvent[]; last_seq: number }>(`/api/kb/events?since=${since}&limit=200`),
-  artefacts: (q?: { type?: string; status?: string; limit?: number }) => {
+  artefacts: (q?: { type?: string; status?: string; tag?: string; limit?: number }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
     return j<{ artefacts: KbArtefact[] }>(`/api/kb/artefacts${p.size ? `?${p}` : ""}`);
   },
@@ -116,13 +116,13 @@ export const kbApi = {
   // human replies on a question thread — the same log_progress door agents use
   progress: (id: string, note: string, extra?: { will?: string; sentiment?: string }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
-  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
+  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string; tags?: string[] }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
-  update: (id: string, patch: { title?: string; body_md?: string; meta?: object }) =>
+  update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[] }) =>
     j<{ id: string }>(`/api/kb/update`, { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 
   // admin (connect page)

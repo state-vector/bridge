@@ -744,3 +744,19 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .wt-state { font-size: 11px; color: var(--text-dim); }
 .wt-time { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
 .wt-active .wt-time, .wt-row.wt-active .wt-time { color: var(--text-dim); }
+/* ---- discussions: threaded view over question tasks (TASK-016) ---- */
+.disc-controls { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.disc-controls select { background: var(--panel, #14192b); color: var(--text); border: 1px solid color-mix(in srgb, var(--text) 15%, transparent); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
+.thread-responses { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); padding-left: 10px; }
+.thread-contribute { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+
+/* ---- in-board task form (TASK-016) ---- */
+.task-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.task-form input, .task-form textarea {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 15%, transparent);
+  border-radius: 6px; color: var(--text); padding: 6px 8px; font-size: 13px;
+  font-family: inherit;
+}
+.task-form textarea { resize: vertical; }
+.task-form input:focus, .task-form textarea:focus { outline: 1px solid var(--accent); }
