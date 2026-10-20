@@ -68,13 +68,49 @@ hourly Actions list (C6-only) is a false positive; the gate is the ledger
 - **C3.\*** (4 checks) → **GH#1255** (OPEN, touched 10-20): ask-path quality on
   healthy index; fix lane BR#32 (#qps GH#1255) in progress. PR #2014 (sub-entity
   chunking) is merged AND deployed, yet C3.a/b are red on every post-fix deploy
-  — the red is not absence-of-deploy.
-
-Open question recorded for the C3 lane (BR#868, still open): does the dogfood
-index need a re-index for re-chunked entities to reflect before judging the
-#2014 fix insufficient? Coordination ask filed to the BR#32 owner session.
+  — the red is not absence-of-deploy, and (per the addendum below) **not
+  evidence against the fix**: it is index staleness on unchanged files.
 
 C4 ownership is resolved live (both goldens green — no follow-up needed).
+
+## Addendum 2026-10-20T13:5xZ — C3 reds diagnosed as index staleness (ask ASK-mvgpy2pr-4klh answered)
+
+Answer of record from the BR#32/#1255 lane (openhands-cody2,
+session openhands-cody-worker-20261020T1330), receipts: PR #2014 diff scope +
+accepted analysis BR#584 (fresh-session trace 27512736):
+
+- **Yes — the dogfood index needs the replacing re-index (GH#1980) before the
+  #2014 fix can be judged insufficient vs insufficient-fix.** Today's correct
+  classification is **insufficient evidence**, not fix insufficiency.
+- Mechanism: PR #2014's sub-entity chunking lives in the embedding/write path
+  (contracts/embedding.rs, lambda-lodestar-embedder, sfn_write/embed_items_inline.rs,
+  storage/s3vectors.rs) and applies only to content indexed AFTER the merge
+  (2026-10-17T06:28:17Z). Unchanged files keep pre-merge whole-function chunks.
+- BR#584 proved the fix works where re-chunking occurred: ask named
+  RequeueBudgetChoice (sp_indexing.rs:448), requeue_count < 3 budget,
+  States.MathAdd, Overseer.PrReviewRequeued — 2 of 3 acceptance facts met live.
+- BR#584's Residual 1 names the cause of the remaining reds: hermes.ts is
+  unnameable BECAUSE unchanged files are not re-chunked until the replacing
+  re-index (#1980) completes — hermes.ts has no adjacency coverage. The canary
+  reds map exactly: **C3.c's fabricated `/.yarn/releases/yarn-4.12.0.cjs`
+  (rules-home question = hermes.ts) and C3.b's supersession misses are
+  unchanged-file failures — index staleness, not fix insufficiency.**
+
+Consequences for the streak gate:
+
+1. **The 7-day streak clock cannot start from the next deploy** — the
+   unchanged-file reds (C3.b/c, likely parts of C3.a and C2) persist until the
+   re-index runs; they are not evidence against #2014.
+2. **The streak clock starts from the first post-re-index deploy.** Expected
+   recovery sequencing after re-index: C3.a first (already proven by BR#584),
+   C3.b/c once supersession.rs / hermes.ts are re-chunked.
+3. A partial-green post-re-index run is **streak-legitimate on legs where
+   re-chunking landed** — but the close gate is the full-suite ledger record,
+   so the streak in practice needs the re-index to land first regardless.
+4. The re-index GO remains **Ray-personal and OPEN** (BR#32 parked
+   blocked-on-decision on it, ask ASK-mvgpuqdb-7qj9; runbook BR#255 "Ray go
+   before execution"). No agent session can grant it (settled precedent
+   BR#1042/BR#1023/BR#1347).
 
 ## Task mechanics (for the verifier reading this)
 
@@ -85,10 +121,13 @@ accounting. The honest task status between streak days is **blocked** with the
 unblock condition below — not repeated in_review rounds that a verifier must
 bounce on the streak gate.
 
-Unblock condition (BR#50): GH#1980 and GH#1255 both CLOSED with their fixes
-deployed to dev, then the next full-suite `nightly`/`post-deploy` canary run
-green → the 7-day ledger streak starts; a fresh role:review session closes
-BR#50 done citing the 7 green ledger records.
+Unblock condition (BR#50): the **replacing dogfood re-index (GH#1980) lands**
+(operator-gated, Ray GO — see addendum; it also clears the C2 purge tail), the
+C3/#1255 lane closes with its fix judged on post-re-index evidence, and then the
+next full-suite `nightly`/`post-deploy` canary run green → the 7-day ledger
+streak starts (clock origin = first post-re-index full-suite green per the
+addendum); a fresh role:review session closes BR#50 done citing the 7 green
+ledger records.
 
 ## Overlap map (updated 10-20)
 
