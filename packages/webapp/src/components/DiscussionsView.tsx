@@ -39,7 +39,7 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
     setVersions(null);
     kbApi.history(task.id)
       .then((r) => { if (!dead) setVersions(r.versions ?? []); })
-      .catch(() => { if (!dead) setVersions([]); });
+      .catch((e) => { if (!dead) { setVersions([]); setMsg(`failed to load responses: ${(e as Error).message}`); } });
     return () => { dead = true; };
   }, [task.id]);
 
