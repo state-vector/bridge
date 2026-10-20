@@ -1,5 +1,5 @@
 {
-  "name": "@flows/mobile-ui",
+  "name": "@bridge/mobile-ui",
   "version": "0.1.0",
   "private": true,
   "type": "module",

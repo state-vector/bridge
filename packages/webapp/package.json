@@ -1,9 +1,9 @@
 {
-  "name": "@flows/webapp",
+  "name": "@bridge/webapp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "bridge webapp \u2014 decisions + presence panel; served by the worker (assets) and embedded in @flows/desktop",
+  "description": "bridge webapp \u2014 decisions + presence panel; served by the worker (assets) and embedded in @bridge/desktop",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -12,7 +12,7 @@
     "demo": "concurrently -k -n hub,vite -c blue,green \"npm:hub\" \"npm:dev\""
   },
   "dependencies": {
-    "@flows/specs": "*",
+    "@bridge/specs": "*",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "snarkdown": "^2.0.0",

@@ -1423,23 +1423,35 @@ export class KnowledgeHub {
       if (guardHit) {
         this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: guardHit });
       } else {
-        const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
-        const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
-        const created = await this.create(
-          {
-            type: "task",
-            title: `Verify: ${rootTitle.slice(0, 200)}`,
-            body_md: `Verification duty for ${id} — "${rootTitle}".\n\nDouble-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
-            tags: ["role:review"],
-          },
-          actor,
+        // reuse an OPEN verify round when one exists — a re-handoff re-enters
+        // the same round instead of stacking a fresh card per bounce cycle
+        const existing = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
         );
-        verifyTaskId = created.id;
-        this.state.storage.sql.exec(
-          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-          verifyTaskId, id, ts,
-        );
-        this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+        if (existing) {
+          verifyTaskId = existing.id;
+          this.audit("system:separation", "verify_reused", id, { verify: existing.id });
+        } else {
+          const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+          const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
+          const created = await this.create(
+            {
+              type: "task",
+              title: `Verify: ${rootTitle.slice(0, 200)}`,
+              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nDouble-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+              tags: ["role:review"],
+            },
+            actor,
+          );
+          verifyTaskId = created.id;
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+            verifyTaskId, id, ts,
+          );
+          this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+        }
       }
     }
     // unblock children are ephemeral: their whole job is to test the exit
@@ -1465,23 +1477,28 @@ export class KnowledgeHub {
         this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
       }
     }
-    // stale verification rounds: a bounce or a done closes out ANY open Verify
-    // children of this task — regardless of their status (todo, in_progress,
-    // blocked). The next in_review spawns exactly one fresh round.
+    // stale verification rounds: a done closes out ANY open Verify children.
+    // A BOUNCE (in_review → in_progress) keeps the NEWEST open Verify child
+    // alive and supersedes the rest — the bounce should re-enter the SAME
+    // verify round, not supersede-and-respawn (the churn that drowned the
+    // pool: 3-6 cards per parent, real claims starving behind them).
     if (row.type === "task" && (to === "done" || (row.status === "in_review" && to === "in_progress"))) {
-      for (const v of this.state.storage.sql.exec(
-        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:review"%'`, id,
-      ).toArray() as any[]) {
+      const isBounce = row.status === "in_review" && to === "in_progress";
+      const verifyChildren = this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC`, id,
+      ).toArray() as any[];
+      verifyChildren.forEach((v, i) => {
+        if (isBounce && i === 0) return; // newest survives the bounce — same round re-enters
         const vm = JSON.parse(v.meta ?? "{}");
-        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — verification round closed`;
+        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — ${isBounce ? "older verification round superseded (newest kept for re-entry)" : "verification round closed"}`;
         this.state.storage.sql.exec(
           `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
           JSON.stringify(vm), ts, ts, v.id,
         );
         this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
         this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-      }
+      });
       // same for open unblock children: one per block episode, superseded when
       // the parent moves on (done or bounce) — never accumulating orphans
       for (const v of this.state.storage.sql.exec(

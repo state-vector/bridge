@@ -420,6 +420,25 @@ async function handleGithubCallback(request, env) {
   const u = await uRes.json().catch(() => ({}));
   if (!u.login) return oauthFailure(url.origin, "github_user");
 
+  // GitHub user allowlist — GITHUB_ALLOWED_USERS secret. Default is DENY:
+  // unless the secret exists, no GitHub login may sign in at all. Values:
+  //   "*"              any GitHub account may sign in (fully open mode)
+  //   "rayh,alice"     comma-separated allowlist (case-insensitive)
+  // An empty/unset secret = nobody gets in. This is the access gate for the
+  // whole hub; workspace scoping (WORKSPACE_MEMBERS) is a second, finer gate.
+  const allowed = (env.GITHUB_ALLOWED_USERS ?? "").trim();
+  if (!allowed) {
+    console.error("login: refused — GITHUB_ALLOWED_USERS is not set (default deny)");
+    return oauthFailure(url.origin, "not_allowed");
+  }
+  if (allowed !== "*") {
+    const list = allowed.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (!list.includes(u.login.toLowerCase())) {
+      console.error(`login: refused — ${u.login} not in GITHUB_ALLOWED_USERS`);
+      return oauthFailure(url.origin, "not_allowed");
+    }
+  }
+
   // workspace resolution is dynamic: seed the registry, ensure the login's
   // personal workspace exists, land in the default ws if they're a member
   let ws;

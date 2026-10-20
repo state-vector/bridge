@@ -1,6 +1,6 @@
 /**
  * Contract-faithful mock of packages/worker (FlowsHub) for offline dev/demo.
- * Implements the same wire contract as @flows/specs:
+ * Implements the same wire contract as @bridge/specs:
  *   WS   /ws         snapshot | event | decisions | presence  (server-push only)
  *   GET  /api/state  { events, decisions, presence, now }
  *   POST /ingest     bearer "x" (any token accepted in mock) → dedupe, decision lifecycle

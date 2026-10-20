@@ -9,7 +9,7 @@ import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { TopView } from "./components/TopView";
-import type { WsFrame } from "@flows/specs";
+import type { WsFrame } from "@bridge/specs";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "./App.css";

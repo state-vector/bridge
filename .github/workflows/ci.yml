@@ -20,8 +20,8 @@ jobs:
       - name: Worker unit tests (kb core) + webapp build + specs gate
         run: |
           npm run test -w packages/worker
-          npm run build -w @flows/webapp
-          npm run test -w @flows/specs
+          npm run build -w @bridge/webapp
+          npm run test -w @bridge/specs
       - name: Worker bundle check (wrangler dry-run)
         working-directory: packages/worker
         run: npx wrangler deploy --dry-run

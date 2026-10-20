@@ -23,7 +23,7 @@ new_sqlite_classes = ["FlowsHub"]
 tag = "v2"
 new_sqlite_classes = ["KnowledgeHub"]
 
-# Webapp deployment: @flows/webapp is built to dist and served as worker assets,
+# Webapp deployment: @bridge/webapp is built to dist and served as worker assets,
 # same origin as /ws + /api/state (Access cookie just works; no CORS).
 # API/WS/legacy-UI routes hit the worker first; everything else is the SPA.
 [assets]

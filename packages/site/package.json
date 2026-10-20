@@ -1,5 +1,5 @@
 {
-  "name": "@flows/site",
+  "name": "@bridge/site",
   "private": true,
   "version": "0.1.0",
   "description": "bridge marketing site — static, markdown-shaped, agent-friendly",

@@ -1,4 +1,4 @@
-# @flows/site — marketing site
+# @bridge/site — marketing site
 
 Static, zero-dependency landing page for bridge. Designed to look like a rendered markdown file and to be trivially readable by agents/LLMs.
 

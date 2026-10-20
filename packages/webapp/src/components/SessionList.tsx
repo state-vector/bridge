@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { Presence } from "@flows/specs";
+import type { Presence } from "@bridge/specs";
 import { useBridge } from "../lib/store";
 import { actorEvents, latestTaskId, presenceLabel, rel } from "../lib/views";
 import { Avatar, ActorChip } from "./ui";

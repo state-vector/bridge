@@ -1,4 +1,4 @@
-import type { Decision, EventView, Presence } from "@flows/specs";
+import type { Decision, EventView, Presence } from "@bridge/specs";
 
 /** The API doc says EventView.ts is ms epoch; tolerate seconds-valued ts from early adapters. */
 export function normTs(ts: number): number {

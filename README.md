@@ -63,7 +63,7 @@ cd packages/cli && cargo build --release
 ./target/release/bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @flows/desktop`.
+The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
 ### Runner config file
 
@@ -135,8 +135,8 @@ Mint agent tokens in the web UI under **Connect**. Agents call `orient` first â€
 ## Local development
 
 ```bash
-npm run demo -w @flows/webapp    # mock hub + web UI, offline
-npm run build -w @flows/webapp   # webapp dist is committed and served as worker assets
+npm run demo -w @bridge/webapp    # mock hub + web UI, offline
+npm run build -w @bridge/webapp   # webapp dist is committed and served as worker assets
 npm run test -w packages/worker  # worker tests
 ```
 

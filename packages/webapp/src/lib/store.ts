@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Decision, EventView, Presence, WsFrame } from "@flows/specs";
+import type { Decision, EventView, Presence, WsFrame } from "@bridge/specs";
 import { getConfig, setConfig } from "./config";
 import type { Mode } from "./config";
 import { connectHub, disconnectHub, ingest, reconnect, fetchSession, logout, signIn } from "./hub";

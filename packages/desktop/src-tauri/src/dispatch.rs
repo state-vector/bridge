@@ -724,6 +724,21 @@ fn extract_pr(stdout: &str) -> Option<String> {
     None
 }
 
+/// VOID-RUN detection (BR#877 rule 3, hard runner rule): a dispatch that
+/// performed NO work — model blocked by provider guardrails, zero endpoints —
+/// still exits 0 (the CLI prints the error and quits cleanly). Such a run
+/// must never hand off: its "receipts" would be void (the guardrails error
+/// page cited as a PR — BR#860/863/866/844/855 class). Treated as failure:
+/// backoff, then blocked-for-attention, never done, never in_review.
+fn void_run(stdout: &str, stderr: &str) -> bool {
+    const SIGS: [&str; 3] = [
+        "Model blocked by guardrail",
+        "0 endpoints out of",
+        "no endpoints are available matching your guardrail",
+    ];
+    SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
+}
+
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
 /// delivery contract (commit, push branch, open PR). Uses an isolated worktree
 /// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
@@ -987,13 +1002,17 @@ fn tick(
         // final progress (with 100% on success) is logged AFTER the handoff —
         // a task must never sit in_progress showing 100% because a gate
         // rejected the close. See the handoff match below.
+        // hard rule (BR#877): a run that performed no work — non-zero exit,
+        // timeout, or a guardrail-void dispatch — can NEVER hand off. Void
+        // runs still exit 0, so the exit code alone is not enough.
+        let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
         // persist final state (incl. PR link and exit code) before handoff
         write_task_state(
             &inf.task_id,
             &serde_json::json!({
                 "task_id": &inf.task_id,
                 "task_title": &inf.task_title,
-                "status": if outcome.ok { "finished" } else { "failed" },
+                "status": if outcome_ok { "finished" } else { "failed" },
                 "started_ts": now_ms() - inf.started.elapsed().as_millis() as u64,
                 "ended_ts": now_ms(),
                 "exit_code": outcome.exit_code,
@@ -1001,8 +1020,7 @@ fn tick(
                 "last_note": &note,
                 "stdout_tail": &outcome.stdout_tail,
             }),
-        );
-        if outcome.ok {
+        );        if outcome_ok {
             // YIELD check first: the agent may have blocked/bounced/closed the
             // task mid-run (ask filed, yielded per the contract). Query the live
             // status — if the task is no longer in_progress, the agent's state
@@ -1119,7 +1137,12 @@ fn tick(
             *n += 1;
             let fails = *n;
             if fails >= 3 {
-                let note = "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — handed off for attention";
+                let void_cause = void_run(&outcome.stdout_tail, &outcome.stderr_tail);
+                let note = if void_cause {
+                    "runner: dispatch VOID — provider guardrails blocked the model (0 endpoints), no work performed, 3 attempts — handed off for attention (BR#877: void runs never hand off as complete)"
+                } else {
+                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — handed off for attention"
+                };
                 let _ = mcp_call(
                     cfg,
                     id,

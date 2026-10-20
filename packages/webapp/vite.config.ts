@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@flows/specs": path.resolve(import.meta.dirname, "../specs/src/index.ts"),
+      "@bridge/specs": path.resolve(import.meta.dirname, "../specs/src/index.ts"),
     },
   },
   server: { port: 1420, strictPort: true },

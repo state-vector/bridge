@@ -1,4 +1,4 @@
-import type { Decision, Presence } from "@flows/specs";
+import type { Decision, Presence } from "@bridge/specs";
 import { normTs, presenceLabel } from "../lib/views";
 
 export function rel(ms: number): string {

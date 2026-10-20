@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.statevector.bridge",
   "build": {
-    "beforeDevCommand": "npm run dev -w @flows/gateway-ui",
+    "beforeDevCommand": "npm run dev -w @bridge/gateway-ui",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build -w @flows/gateway-ui",
+    "beforeBuildCommand": "npm run build -w @bridge/gateway-ui",
     "frontendDist": "../ui/dist"
   },
   "app": {

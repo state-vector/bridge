@@ -1,4 +1,4 @@
-import type { Event, WsFrame } from "@flows/specs";
+import type { Event, WsFrame } from "@bridge/specs";
 import type { ConnStatus } from "./status";
 
 /**

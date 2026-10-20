@@ -1,8 +1,8 @@
 {
-  "name": "flows-monorepo",
+  "name": "bridge-monorepo",
   "private": true,
   "type": "module",
-  "description": "bridge: work orchestration for agents + humans — web app first",
+  "description": "bridge: work orchestration for agents + humans \u2014 web app first",
   "workspaces": [
     "packages/specs",
     "packages/worker",

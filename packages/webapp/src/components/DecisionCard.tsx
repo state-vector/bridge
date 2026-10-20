@@ -1,4 +1,4 @@
-import type { Decision } from "@flows/specs";
+import type { Decision } from "@bridge/specs";
 import { useBridge } from "../lib/store";
 import { rel } from "../lib/views";
 import { BoardChip, KindBadge, UrgencyBadge } from "./ui";
