@@ -127,12 +127,13 @@ Carried verbatim-in-substance from BR#554 (analysis, in_review; PR state-vector/
 | OQ-4 | BR#141 (done) settled #1361's acceptance (PRs #1970/#1972; live-feed verification or BLOCKED on #1939) — cite its receipts, do not re-derive. | No open action |
 | OQ-5 | #1523 tracked miss 6faf19e2 is live residual work (BR#470 todo; BR#938 nightly receipt still shows the miss, invalid=2). Keep #1523 floor-based — #1260's 100% bar must not leak into it. | BR#470 |
 | OQ-6 | #1305's 2-night streak interacts with the dominant infra_failure class (BR#920) and chronic verdict-gate reds (BR#594 todo / BR#260 in_review) — infra reds should triage as systemic P1, not charge the fix. | BR#41 umbrella |
-| OQ-7 | Staleness impl child BR#560 (in_progress) builds the fix whose receipts §2's check will consume — keep the observable consistent. | BR#560 owner |
+| OQ-7 | Staleness impl child BR#560 is **DONE** (PR #2058 MERGED b4f709f0dc 2026-10-19T12:10:52Z; GH#1474 CLOSED COMPLETED — verify BR#1145/BR#1142) — §2's #1470 observable (staleness 0 in Signal DB routing key) now awaits the next deploy + a post-deploy check on merged head. Family residual: BR#255 operator-gated purge. | Deploy owner |
 | OQ-8 | Schedule drift — §3 names cortex-quality-daily ~03:30Z for #747, but the QPS cron map (BR#67) lists corpus ~02:41Z / verdict ~03:00Z / meta-review ~04:06Z / canary ~06:00Z. Re-verify workflow names/times before relying on them. | BR#552 author + coordinator |
 
 ---
 
 ## Change Log
 
+- **v2.1 (round-2 amendment, post verify BR#1152/BR#1157):** Annex OQ-7 updated to live state (BR#560 done — PR #2058 merged, GH#1474 closed); branch rebased onto main (was 51 behind). No policy text changed.
 - **v2 (this update):** §3 rewritten from a single "2-green-nights" clock to per-issue close gates encoded from each issue's own stated condition (BR#50, BR#40, BR#29, BR#47, BR#42, BR#41, BR#45, BR#81/86); §1 and §4 aligned to the binding BR#551 ruling verbatim (never merge onto red main; case (c) receipts = predate-diff + diff-untouched CI links; reds-from-red-main wait for the hotfix). §4 gains the BR#322 worked precedent; §5 step 4 aligned to §3's streak-vs-threshold vocabulary (BR#554 analysis); Annex A carries BR#554's open questions.
 - **v1:** initial draft.
