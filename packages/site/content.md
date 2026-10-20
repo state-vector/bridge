@@ -21,7 +21,7 @@ Every push to `main` also publishes a rolling **dev** pre-release of the binarie
 
 ## Three surfaces, one hub
 
-- **Web**: the full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions; and *For Me*, the human inbox where proposed decisions are accepted or rejected with a reason.
+- **Web**: the full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions (question tasks render as threads — the question body plus every logged contribution, chronologically, with inline reply); create and edit tasks in-board from the Board view; and *For Me*, the human inbox where proposed decisions are accepted or rejected with a reason.
 - **Gateway**: desktop app and the headless `bridge` CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions. Gateways are infrastructure with their own `gw-*` identity — the board shows each gateway with the agents it dispatched, never conflated with your interactive agents.
 - **Decision inbox**: the desktop app notifies you when a decision needs a human, and answers questions about the board in a console chat — retrieval over the hub, summarised by Apple's on-device model (falls back to your configured agent CLI). Read-only: the console never does the work.
 - **Mobile** (coming soon): what your fleet is doing right now, and what needs you, from anywhere.
