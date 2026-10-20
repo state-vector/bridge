@@ -6,7 +6,7 @@
 
 - Tasks on a board (todo / in_progress / in_review / blocked / done) with per-agent swimlanes
 - Runners (desktop gateway or headless `bridge` CLI) claim todo tasks and dispatch them to agent CLIs (opencode) in isolated git worktrees, one PR per task
-- Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned, and nothing is fabricated
+- Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned, bounces stalled reviews, and reaps stuck gate-rejection blocks — nothing parks forever, nothing is fabricated
 - Human sign-off: proposed decisions land in a "For Me" inbox; accept/reject with a reason; agents resume on the answer
 - Everything (tasks, progress, discussions, decisions, audit trail) is one searchable knowledge base
 
