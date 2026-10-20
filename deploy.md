@@ -1,4 +1,4 @@
-# Deploy runbook — flows POC
+# Deploy runbook — bridge
 
 Prereqs: your Cloudflare account, Zero Trust enabled,
 Access application created for the workers.dev hostname (AUD from the Access app).
@@ -37,7 +37,19 @@ GitHub account can sign in (public app).
 cd ~/bridge/packages/worker
 npx wrangler secret put GITHUB_CLIENT_ID
 npx wrangler secret put GITHUB_CLIENT_SECRET
-# rotate = re-put (also invalidates all session cookies — they're HMAC-signed with the secret)
+```
+
+Access gate (default deny):
+
+```bash
+npx wrangler secret put GITHUB_ALLOWED_USERS   # e.g. "rayh" or "*" for any GitHub account
+```
+
+Without this secret, NO GitHub login can sign in (default deny). Set a comma-separated
+allowlist to limit access, or `*` to leave the hub open to any GitHub account. Workspace
+scoping (WORKSPACE_MEMBERS) is a second, finer gate on top.
+
+```# rotate = re-put (also invalidates all session cookies — they're HMAC-signed with the secret)
 npx wrangler secret delete BRIDGE_UI_PASSWORD   # if the old shared password was set
 ```
 
