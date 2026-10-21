@@ -227,80 +227,11 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
   );
 }
 
-/** Console chat — read-only Q&A over the board. Retrieval + summarisation on
- *  the Rust side (Apple's on-device model, fallback: the configured backend
- *  CLI); the webview only carries the conversation. */
-interface ChatSource { id: string; title: string; status: string }
-interface ChatMsg { role: "user" | "assistant"; text: string; sources?: ChatSource[]; engine?: string }
-
-function Chat() {
-  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [msgs.length, busy]);
-
-  const send = async () => {
-    const question = input.trim();
-    if (!question || busy) return;
-    setInput("");
-    setErr("");
-    setMsgs((m) => [...m, { role: "user", text: question }]);
-    setBusy(true);
-    try {
-      const history = msgs.slice(-6).map((m) => ({ role: m.role, text: m.text }));
-      const r = await invoke<any>("chat_send", { question, history });
-      setMsgs((m) => [...m, { role: "assistant", text: r.answer ?? String(r), sources: r.sources ?? [], engine: r.engine }]);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <main className="gw-main chat">
-      <div className="gw-card chat-head">
-        <h2>Console</h2>
-        <span className="gw-note">read-only Q&amp;A over the board — on-device model, no work dispatched</span>
-      </div>
-      <div className="chat-scroll" ref={scrollRef}>
-        {msgs.length === 0 && (
-          <span className="gw-log-empty">ask about the board — "what's blocked?", "recap BR#46", "what needs my decision?"</span>
-        )}
-        {msgs.map((m, i) => (
-          <div key={i} className={`chat-msg chat-msg-${m.role}`}>
-            <div className="chat-bubble">{m.text}</div>
-            {m.role === "assistant" && (m.sources?.length ?? 0) > 0 && (
-              <div className="chat-srcs">
-                {m.sources!.map((s) => <span key={s.id} className="chat-src gw-mono" title={s.title}>{s.id}</span>)}
-                {m.engine && <span className="gw-fmeta">{m.engine}</span>}
-              </div>
-            )}
-          </div>
-        ))}
-        {busy && <span className="gw-log-empty chat-busy">reading the board…</span>}
-      </div>
-      {err && <div className="gw-card"><span className="gw-err">{err}</span></div>}
-      <div className="chat-inputrow">
-        <input className="gw-input chat-input" value={input}
-          placeholder="ask the board…"
-          disabled={busy}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") void send(); }} />
-        <button className="gw-btn gw-btn-run" disabled={busy || !input.trim()} onClick={() => void send()}>Send</button>
-      </div>
-    </main>
-  );
-}
 
 
-/** Top — live fleet work: in_progress + in_review, newest signal first. */
 interface BoardTask { id: string; title: string; status: string; meta?: Record<string, any>; updated_ts?: number; status_ts?: number }
+
+
 function Top() {
   const [rows, setRows] = useState<BoardTask[] | null>(null);
   const [err, setErr] = useState("");
@@ -382,8 +313,9 @@ function Backlog() {
   );
 }
 
+
 export function App() {
-  const [page, setPage] = useState<"forme" | "top" | "backlog" | "chat" | "log" | "settings">("forme");
+  const [page, setPage] = useState<"forme" | "top" | "backlog" | "log" | "settings">("forme");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -530,7 +462,6 @@ export function App() {
           <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
           <button className={page === "top" ? "active" : ""} onClick={() => setPage("top")}>Top</button>
           <button className={page === "backlog" ? "active" : ""} onClick={() => setPage("backlog")}>Backlog</button>
-          <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
         </nav>
@@ -541,7 +472,6 @@ export function App() {
       {page === "top" && <Top />}
       {page === "backlog" && <Backlog />}
 
-      {page === "chat" && <Chat />}
 
       {page === "log" && (
         <main className="gw-main">

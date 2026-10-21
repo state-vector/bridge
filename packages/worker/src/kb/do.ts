@@ -2201,13 +2201,18 @@ export class KnowledgeHub {
       : "";
     const my_score = this.agentScores().find((a) => a.label === label)
       ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
+    // score optimisation is an explicit standing directive: the agent sees its
+    // number, its grade, and the concrete actions that raise it — every
+    // check-in, not as trivia at the bottom of the payload.
+    const scoreDirective = `\n\nYOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it — it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") : "No deductions — keep heartbeats ≤10m, finish with receipts, answer asks fast."}`;
     return {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
         + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : "")
         + (kindPlaybook ? `\n\nYOUR KIND: ${isCron ? "cron" : "interactive"}\n${kindPlaybook}` : "")
         + playbooks.map((p) => `\n\nYOUR ROLE: ${p.role}\n${p.playbook}`).join("")
-        + gaugeDebtNote,
+        + gaugeDebtNote
+        + scoreDirective,
       board: settings.board ?? DEFAULT_BOARD,
       counts,
       open_artefacts: open,

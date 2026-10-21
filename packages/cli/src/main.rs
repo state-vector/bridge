@@ -336,36 +336,65 @@ fn onboard(cfg: &mut DispatchConfig) {
 /// Install (or verify) the bridge agent persona into opencode's config dir.
 /// Returns lines to print. "FAIL" lines indicate doctor-reportable problems.
 fn agent_op(md: &str, name: &str, install: bool) -> Result<Vec<String>, String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     let home = std::env::var("HOME").map_err(|_| "no HOME")?;
-    let xdg = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| format!("{home}/.config"));
-    let dir = PathBuf::from(xdg).join("opencode/agent");
-    let path = dir.join(format!("{name}.md"));
+    let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+    let link_dir = PathBuf::from(&xdg).join("opencode/agent");
+    let link_path = link_dir.join(format!("{name}.md"));
+    // canonical copy lives in BRIDGE's own config dir — the agent CLI's entry
+    // is a symlink, so opencode reads our file instead of owning a copy.
+    let canonical_dir = PathBuf::from(&home).join(".bridge/agent");
+    let canonical = canonical_dir.join(format!("{name}.md"));
     let mut out = Vec::new();
 
-    let existing = std::fs::read_to_string(&path).ok();
-    match existing {
+    if install {
+        std::fs::create_dir_all(&canonical_dir).map_err(|e| e.to_string())?;
+        std::fs::write(&canonical, md).map_err(|e| e.to_string())?;
+    }
+
+    // canonical state
+    let canonical_cur = std::fs::read_to_string(&canonical).ok();
+    match canonical_cur {
         Some(cur) if cur == md => {
-            out.push(format!("\x1b[32mok\x1b[0m   agent profile `{name}` installed ({})", path.display()));
+            out.push(format!("\x1b[32mok\x1b[0m   persona `{name}` up to date ({})", canonical.display()));
         }
-        Some(_) => {
+        _ => {
+            let msg = format!("persona `{name}` {} — run `bridge agent install`", if canonical_cur.is_some() { "outdated" } else { "not installed" });
             if install {
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                std::fs::write(&path, md).map_err(|e| e.to_string())?;
-                out.push(format!("updated agent profile `{name}` ({})", path.display()));
-            } else {
-                out.push(format!("\x1b[31mFAIL\x1b[0m  agent profile `{name}` outdated — run `bridge agent install` ({})", path.display()));
+                return Err(msg); // install already wrote it; a failure here is fs-level
             }
+            out.push(format!("\x1b[31mFAIL\x1b[0m  {msg} ({})", canonical.display()));
+            return Ok(out);
         }
-        None => {
-            if install {
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                std::fs::write(&path, md).map_err(|e| e.to_string())?;
-                out.push(format!("installed agent profile `{name}` ({})", path.display()));
-            } else {
-                out.push(format!("\x1b[31mFAIL\x1b[0m  agent profile `{name}` not installed — run `bridge agent install`"));
-            }
+    }
+
+    // link state (opencode reads through the symlink)
+    let meta = std::fs::symlink_metadata(&link_path).ok();
+    let existed = meta.is_some();
+    let is_symlink_to_canonical = meta
+        .map(|m| m.file_type().is_symlink() && std::fs::read_to_string(&link_path).is_ok_and(|c| c == md))
+        .unwrap_or(false);
+    if is_symlink_to_canonical {
+        out.push(format!("\x1b[32mok\x1b[0m   agent profile `{name}` linked into opencode ({})", link_path.display()));
+        return Ok(out);
+    }
+    if install {
+        std::fs::create_dir_all(&link_dir).map_err(|e| e.to_string())?;
+        if existed {
+            std::fs::remove_file(&link_path).map_err(|e| e.to_string())?; // replaces a stale copy
         }
+        #[cfg(unix)]
+        symlink(&canonical, &link_path).map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        std::fs::copy(&canonical, &link_path).map_err(|e| e.to_string())?;
+        out.push(format!("linked agent profile `{name}` into opencode ({})", link_path.display()));
+    } else {
+        out.push(format!(
+            "\x1b[31mFAIL\x1b[0m  agent profile `{name}` not linked into opencode — run `bridge agent install` ({})",
+            link_path.display()
+        ));
     }
     Ok(out)
 }

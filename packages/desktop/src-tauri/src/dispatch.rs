@@ -1393,6 +1393,7 @@ fn tick(
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
     fail_counts: &mut HashMap<String, u32>,
+    silent_cycles: &mut HashMap<String, u32>,
     finished_no_pr: &mut HashSet<String>,
     gave_up: &mut HashSet<String>,
     snap: &SharedSnapshot,

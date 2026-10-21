@@ -57,9 +57,11 @@ exactly what's missing, with the fix on each line.
 3. **Agent profile (optional)** — the default agent (`build`) works out of the
    box. bridge ships its own fleet persona with the CLI — the recommended path:
    ```bash
-   bridge agent install     # installs the persona into opencode's agent dir
+   bridge agent install     # canonical file in ~/.bridge/agent + symlink into opencode
    bridge agent check       # verify it matches the version you run
    ```
+   The symlink means opencode always reads bridge's file — upgrades apply by
+   re-running install, never by copying into opencode's config.
    Then set `"agents": {"opencode": "bridge"}` in `~/.bridge/config.json`
    (onboarding offers this automatically).
 
