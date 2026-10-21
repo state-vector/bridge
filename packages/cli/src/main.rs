@@ -339,6 +339,37 @@ fn doctor() -> bool {
         }
     }
 
+    // configured agent profiles must actually exist in the agent CLI's own
+    // config — a stale profile name (opencode-glm class) fails every dispatch
+    // identically and deterministically.
+    if let Ok(list) = std::process::Command::new("opencode")
+        .args(["agent", "list"])
+        .output()
+    {
+        let out = String::from_utf8_lossy(&list.stdout).to_string();
+        let known: Vec<&str> = out
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.find(" (").map(|i| &l[..i])
+            })
+            .collect();
+        let configured = cfg.agents.clone().unwrap_or_default();
+        let mut named: Vec<(String, String)> = configured.into_iter().collect();
+        if let Some(a) = &cfg.agent {
+            named.push(("opencode".into(), a.clone()));
+        }
+        for (backend, profile) in named {
+            if profile.trim().is_empty() { continue; }
+            if known.iter().any(|k| *k == profile.as_str()) {
+                println!("  \x1b[32mok\x1b[0m   agent profile [{backend}] = {profile}");
+            } else {
+                bad = true;
+                println!("  \x1b[31mFAIL\x1b[0m  agent profile [{backend}] = {profile} — NOT FOUND in the agent CLI's config. Clear \"agents\" in ~/.bridge/config.json (default agent is fine), or create the profile (`opencode agent create`)");
+            }
+        }
+    }
+
     // agent CLI binaries reachable?
     for b in &backends {
         let bin = if b == "kiro" { "kiro" } else { cfg.opencode_bin.as_str() };
