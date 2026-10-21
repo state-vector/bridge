@@ -55,11 +55,16 @@ exactly what's missing, with the fix on each line.
    opencode run --model "<your-model-id>" "Reply OK"
    ```
 3. **Agent profile (optional)** — the default agent (`build`) works out of the
-   box. For a fleet-tuned persona (own prompt, pinned permissions), either:
+   box. bridge ships its own fleet persona with the CLI — the recommended path:
    ```bash
-   opencode agent create    # interactive; needs a working model (auth required)
+   bridge agent install     # installs the persona into opencode's agent dir
+   bridge agent check       # verify it matches the version you run
    ```
-   or hand-write the file directly (no auth needed):
+   Then set `"agents": {"opencode": "bridge"}` in `~/.bridge/config.json`
+   (onboarding offers this automatically).
+
+   For a custom persona, either `opencode agent create` (interactive; needs a
+   working model) or hand-write the file (no auth needed):
    ```markdown
    <!-- ~/.config/opencode/agent/bridge.md -->
    ---
@@ -73,6 +78,11 @@ exactly what's missing, with the fix on each line.
    List what exists: `opencode agent list`. Then set `"agents": {"opencode": "<name>"}` in
    `~/.bridge/config.json`. No profile at all? Also fine — omit `agents` and the
    CLI's default agent is used.
+
+The shipped persona carries bridge's standing behavioural directives (honest
+reporting, delivery receipts, worktree discipline). The hub injects the dynamic
+per-session protocol at dispatch time (orient), so the two never drift: persona
+ships with the CLI, protocol ships with the hub.
 
 ## Backend: kiro
 
