@@ -299,19 +299,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "device".into());
 
-    let start: serde_json::Value = client
-        .post(format!("{url}/api/pair/start"))
-        .header("content-type", "application/json")
-        .body(json!({ "device": device }).to_string())
-        .send()
-        .map_err(|e| format!("bridge unreachable: {e}"))?
-        .json()
-        .map_err(|e| e.to_string())?;
-    let code = start
-        .get("code")
-        .and_then(|c| c.as_str())
-        .ok_or("pair start failed")?
-        .to_string();
+    let code = pair_start(&client, url, &device)?;
     eprintln!("[pair] open {url}/pair and enter code {code}");
     println!("[pair] open {url}/pair and enter code {code}");
 
@@ -321,61 +309,122 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
             return Err("pairing timed out — run again to get a fresh code".into());
         }
         std::thread::sleep(Duration::from_secs(3));
-        let resp: serde_json::Value = client
-            .post(format!("{url}/api/pair/poll"))
-            .header("content-type", "application/json")
-            .body(json!({ "code": code }).to_string())
-            .send()
-            .map_err(|e| format!("poll failed: {e}"))?
-            .json()
-            .map_err(|e| e.to_string())?;
-        match resp.get("status").and_then(|s| s.as_str()) {
-            Some("pending") => continue,
-            Some("slow_down") => {
+        match pair_poll(&client, url, &code)? {
+            PairPoll::Pending => continue,
+            PairPoll::SlowDown => {
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
-            Some("authorized") => {
-                let token = resp
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .ok_or("authorized but no token")?
-                    .to_string();
-                let ws = resp
-                    .get("ws")
-                    .and_then(|w| w.as_str())
-                    .unwrap_or("state-vector")
-                    .to_string();
-                let label = resp
-                    .get("label")
-                    .and_then(|l| l.as_str())
-                    .map(|s| s.to_string());
-                eprintln!("[pair] authorized — token for workspace '{ws}' saved");
-                return Ok(DispatchConfig {
-                    url: url.to_string(),
-                    token,
-                    workdir: default_workdir(),
-                    agent: std::env::var("BRIDGE_AGENT").ok(),
-                    model: std::env::var("BRIDGE_MODEL").ok(),
-                    backend: std::env::var("BRIDGE_BACKEND").ok(),
-                    poll_secs: default_poll_secs(),
-                    timeout_mins: default_timeout_mins(),
-                    opencode_bin: default_opencode_bin(),
-                    label,
-                    agent_name: None,
-                ws: Some(ws),
+            PairPoll::Authorized(cfg) => {
+                eprintln!("[pair] authorized — token saved");
+                return Ok(cfg);
+            }
+            PairPoll::Expired => return Err("pairing code expired — run again".into()),
+            PairPoll::Failed(other) => return Err(format!("pairing failed: {other}")),
+        }
+    }
+}
+
+/// First half of the device flow: register this device, get the enter-code.
+pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str) -> Result<String, String> {
+    let start: serde_json::Value = client
+        .post(format!("{url}/api/pair/start"))
+        .header("content-type", "application/json")
+        .body(json!({ "device": device }).to_string())
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    start
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(String::from)
+        .ok_or_else(|| "pair start failed".into())
+}
+
+/// One pairing poll. Authorized merges the vended token into the EXISTING
+/// config (settings survive a logout → pair cycle) and saves it.
+pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> Result<PairPoll, String> {
+    let resp: serde_json::Value = client
+        .post(format!("{url}/api/pair/poll"))
+        .header("content-type", "application/json")
+        .body(json!({ "code": code }).to_string())
+        .send()
+        .map_err(|e| format!("poll failed: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("pending") => Ok(PairPoll::Pending),
+        Some("slow_down") => Ok(PairPoll::SlowDown),
+        Some("authorized") => {
+            let token = resp
+                .get("token")
+                .and_then(|t| t.as_str())
+                .ok_or("authorized but no token")?
+                .to_string();
+            let ws = resp
+                .get("ws")
+                .and_then(|w| w.as_str())
+                .unwrap_or("state-vector")
+                .to_string();
+            let label = resp
+                .get("label")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string());
+            // merge into the existing config so user settings survive;
+            // fresh defaults only when there is nothing to merge with
+            let mut cfg = load_config().unwrap_or_else(|| DispatchConfig {
+                url: url.to_string(),
+                token: String::new(),
+                workdir: default_workdir(),
+                agent: std::env::var("BRIDGE_AGENT").ok(),
+                model: std::env::var("BRIDGE_MODEL").ok(),
+                backend: std::env::var("BRIDGE_BACKEND").ok(),
+                poll_secs: default_poll_secs(),
+                timeout_mins: default_timeout_mins(),
+                opencode_bin: default_opencode_bin(),
+                label: None,
+                agent_name: None,
+                ws: None,
                 max_sessions: default_max_sessions(),
                 report_minutes: None,
                 isolate: default_isolate(),
                 backends: Default::default(),
                 models: None,
                 agents: None,
-                });
-            }
-            Some("expired") => return Err("pairing code expired — run again".into()),
-            other => return Err(format!("pairing failed: {other:?}")),
+            });
+            cfg.url = url.trim_end_matches('/').to_string();
+            cfg.token = token;
+            cfg.ws = Some(ws);
+            cfg.label = label;
+            cfg.normalize();
+            cfg.save()?;
+            eprintln!("[pair] authorized — token for workspace '{}' saved (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
+            Ok(PairPoll::Authorized(cfg))
         }
+        Some("expired") => Ok(PairPoll::Expired),
+        Some(other) => Ok(PairPoll::Failed(other.to_string())),
+        None => Ok(PairPoll::Failed("no status in poll response".into())),
     }
+}
+
+pub enum PairPoll {
+    Pending,
+    SlowDown,
+    Authorized(DispatchConfig),
+    Expired,
+    Failed(String),
+}
+
+/// Resolve the config and require a vendored token. The machine-plane board
+/// endpoints currently answer empty-token requests, so an unpaired desktop
+/// would keep rendering board data after logout — refuse client-side instead.
+fn paired_config() -> Result<DispatchConfig, String> {
+    let cfg = paired_config()?;
+    if cfg.token.is_empty() {
+        return Err("logged out — pair first".into());
+    }
+    Ok(cfg)
 }
 
 /// Snapshot of resumable opencode sessions: title → session id. Dispatched runs
@@ -700,7 +749,7 @@ pub fn external_runner_pid() -> Option<u32> {
 /// task on the hub through MCP (the paired token's one legitimate write for
 /// the console — creation only, never claims/transitions).
 pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("no bridge config — pair first")?;
+    let cfg = paired_config()?;
     let mut id = 0i64;
     mcp_call(
         &cfg,
@@ -716,7 +765,7 @@ pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String>
 }
 
 pub fn for_you_payload() -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -749,7 +798,7 @@ pub fn for_you_payload() -> Result<serde_json::Value, String> {
 /// Board lists for the desktop Top/Backlog views: live in-progress work
 /// (Top) and the ranked-ish dispatch queue + completed ledger (Backlog).
 pub fn board_lists_payload() -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -805,7 +854,7 @@ pub fn board_lists_payload() -> Result<serde_json::Value, String> {
 /// so accept/reject opens the board in the browser. This command exists to
 /// REJECT (withdraw) a stale verdict — machine-plane supersede is allowed.
 pub fn decision_act_payload(id: &str, act: &str) -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()

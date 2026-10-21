@@ -351,6 +351,41 @@ export function App() {
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
   const [logoutMsg, setLogoutMsg] = useState("");
+  const [pairCode, setPairCode] = useState<string | null>(null);
+  const [pairingUrl, setPairingUrl] = useState("");
+  const [pairErr, setPairErr] = useState("");
+
+  // logged-out / first-use: config exists but no vendored gateway token
+  const paired = !!cfg?.token;
+
+  const onboarding = (
+    <main className="gw-main">
+      <div className="gw-card">
+        <h2>Pair this desktop</h2>
+        <div className="gw-row">
+          <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
+            onChange={(e) => setHubUrl(e.target.value)} />
+          <button className="gw-btn gw-btn-run" disabled={!!pairCode} onClick={() => void startPair()}>Pair</button>
+        </div>
+        {pairCode && (
+          <div className="gw-row" style={{ marginTop: 8 }}>
+            <span className="gw-note">
+              Enter code <span className="gw-mono">{pairCode}</span> at{" "}
+              <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(`${pairingUrl}/pair`, "_blank"); }}>
+                {pairingUrl}/pair
+              </a>{" "}
+              — waiting for approval…
+            </span>
+          </div>
+        )}
+        {pairErr && (
+          <div className="gw-row" style={{ marginTop: 8 }}>
+            <span className="gw-err">{pairErr}</span>
+          </div>
+        )}
+      </div>
+    </main>
+  );
 
   const doLogout = async () => {
     if (!window.confirm("Log out? This stops the runner and clears the gateway token — your settings are kept; pair again to onboard.")) return;
@@ -404,6 +439,51 @@ export function App() {
       }
     } catch { /* no shell */ }
   }, []);
+
+  const startPair = async () => {
+    const url = hubUrl.trim().replace(/\/$/, "");
+    if (!url) {
+      setPairErr("hub url required");
+      return;
+    }
+    setPairErr("");
+    setPairingUrl(url);
+    try {
+      setPairCode(await invoke<string>("pair_start", { url }));
+    } catch (e) {
+      setPairErr(String(e));
+    }
+  };
+
+  // pairing poll: every 3s until authorized (token merged + saved) or expired
+  useEffect(() => {
+    if (!pairCode || !pairingUrl) return;
+    let stop = false;
+    const t = setInterval(async () => {
+      try {
+        const r = await invoke<any>("pair_poll", { url: pairingUrl, code: pairCode });
+        if (stop) return;
+        if (r?.status === "authorized") {
+          setPairCode(null);
+          await loadCfg();
+          await pull();
+          setLogoutMsg("");
+        } else if (r?.status === "expired") {
+          setPairErr("code expired — pair again");
+          setPairCode(null);
+        }
+      } catch (e) {
+        if (!stop) {
+          setPairErr(String(e));
+          setPairCode(null);
+        }
+      }
+    }, 3000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [pairCode, pairingUrl, loadCfg, pull]);
 
   useEffect(() => {
     void pull();
@@ -504,10 +584,10 @@ export function App() {
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
-      {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
-      {page === "top" && <Top />}
-      {page === "backlog" && <Backlog />}
-      {page === "chat" && <Chat />}
+      {page === "forme" && (paired ? <ForYou hubUrl={snap?.url ?? null} /> : onboarding)}
+      {page === "top" && (paired ? <Top /> : onboarding)}
+      {page === "backlog" && (paired ? <Backlog /> : onboarding)}
+      {page === "chat" && (paired ? <Chat /> : onboarding)}
 
 
       {page === "log" && (
@@ -527,16 +607,8 @@ export function App() {
         </main>
       )}
 
-      {page === "settings" && (
+      {page === "settings" && (paired ? (
         <main className="gw-main">
-          {cfg && !cfg.token && (
-            <div className="gw-card">
-              <h2>Logged out</h2>
-              <span className="gw-note">
-                No gateway token — pair again to onboard: <span className="gw-mono">bridge pair {hubUrl || "<hub-url>"}</span>. Your settings are preserved below.
-              </span>
-            </div>
-          )}
           <div className="gw-card">
             <h2>Runner</h2>
             <div className="gw-row">
@@ -639,11 +711,11 @@ export function App() {
             <div className="gw-row" style={{ marginTop: 10 }}>
               <button className="gw-btn gw-btn-stop" onClick={() => void doLogout()}>Log out</button>
               {logoutMsg && <span className="gw-note">{logoutMsg}</span>}
-              <span className="gw-note">stops the runner and erases the pairing — pair again to onboard</span>
+              <span className="gw-note">stops the runner and clears the token — settings kept, pair again to onboard</span>
             </div>
           </div>
         </main>
-      )}
+      ) : onboarding)}
     </div>
   );
 }
