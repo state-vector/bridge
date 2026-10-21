@@ -1305,7 +1305,7 @@ fn spawn_opencode(
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
     };
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree of {}).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree of {}).\n{}\n{}\n- Blocked on a decision or missing input? You have NO bridge access — the gateway owns all state transitions and reports on your behalf. To signal a blocker or ask a question, END your output with a line exactly: BR-BLOCKED: <what is blocked and what would unblock it>. The gateway files the ask and parks the task; a later session picks it up when answered.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
         policy, tid, title, body_md, resume_note, run_dir, branch, repo_url, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
@@ -1614,7 +1614,18 @@ fn tick(
             } else {
                 format!("{note}\nverified against: task artefact + history receipts (exit 0, session dispatch-{})", slugify(&inf.task_id))
             };
-            let (transition_to, handoff_note) = if is_review_work {
+            // worker-lane signal: a session that ended with BR-BLOCKED: hit a
+            // blocker mid-run. The gateway files the block (and the ask the
+            // session cannot file itself — it has no bridge access). This
+            // takes precedence over done/in_review handoff.
+            let blocked_marker = outcome
+                .stdout_tail
+                .lines()
+                .rev()
+                .find_map(|l| l.trim().strip_prefix("BR-BLOCKED:").map(|r| r.trim().to_string()));
+            let (transition_to, handoff_note) = if let Some(reason) = &blocked_marker {
+                ("blocked", format!("worker session blocked itself — {reason}"))
+            } else if is_review_work {
                 ("done", receipt_note)
             } else {
                 ("in_review", note)
@@ -1623,7 +1634,14 @@ fn tick(
                 cfg,
                 id,
                 "transition",
-                json!({ "id": inf.task_id, "to": transition_to, "note": handoff_note }),
+                json!({
+                    "id": inf.task_id,
+                    "to": transition_to,
+                    "note": handoff_note,
+                    // blocked transitions require an exit condition — the worker's
+                    // marker text IS the condition ("what would unblock it")
+                    "unblock_condition": blocked_marker.as_deref().unwrap_or(""),
+                }),
                 &inf.task_id,
             ) {
                 Ok(_) => {
