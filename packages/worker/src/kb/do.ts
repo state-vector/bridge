@@ -547,6 +547,7 @@ export class KnowledgeHub {
         label TEXT NOT NULL UNIQUE,
         hash TEXT NOT NULL UNIQUE,
         tags TEXT NOT NULL DEFAULT '[]',
+        device_id TEXT,
         transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
         last_seen_ts INTEGER,
@@ -593,6 +594,7 @@ export class KnowledgeHub {
         code TEXT PRIMARY KEY,
         device TEXT NOT NULL,
         type TEXT,
+        device_id TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         ws TEXT,
         label TEXT,
@@ -641,6 +643,9 @@ export class KnowledgeHub {
       `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
       `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE pairings ADD COLUMN type TEXT`,
+      `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
+      `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -2479,7 +2484,6 @@ export class KnowledgeHub {
 
   private pairPurge() {
     const cutoff = Date.now() - KnowledgeHub.PAIR_TTL_MS;
-    try { this.state.storage.sql.exec(`ALTER TABLE pairings ADD COLUMN type TEXT`); } catch { /* existing table */ }
     this.state.storage.sql.exec(`DELETE FROM pairings WHERE created_ts < ?`, cutoff);
     // hard cap on pending rows so /api/pair/start can't be spammed into bloat
     const n = this.one(`SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending'`)?.n ?? 0;
@@ -2498,9 +2502,10 @@ export class KnowledgeHub {
     // the DEVICE declares its class at start; the approver never chooses —
     // streams cannot cross because the request, not the human, sets the type
     const type = body.type === "gateway" ? "gateway" : "agent";
+    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     this.state.storage.sql.exec(
-      `INSERT INTO pairings (code, device, type, status, created_ts) VALUES (?, ?, ?, 'pending', ?)`,
-      code, String(body.device ?? "device").slice(0, 80), type, now,
+      `INSERT INTO pairings (code, device, type, device_id, status, created_ts) VALUES (?, ?, ?, ?, 'pending', ?)`,
+      code, String(body.device ?? "device").slice(0, 80), type, device_id, now,
     );
     return { code, type, expires_ts: now + KnowledgeHub.PAIR_TTL_MS };
   }
@@ -2523,7 +2528,7 @@ export class KnowledgeHub {
     const ws = String(body.ws ?? "").trim();
     const label = String(body.label ?? "").trim();
     const login = String(body.login ?? "").toLowerCase();
-    const row = this.one(`SELECT code, created_ts, status, device, type FROM pairings WHERE code = ?`, code);
+    const row = this.one(`SELECT code, created_ts, status, device, type, device_id FROM pairings WHERE code = ?`, code);
     if (!row || row.status !== "pending") throw new Error("pairing code not pending");
     if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
       this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
@@ -2543,11 +2548,14 @@ export class KnowledgeHub {
     const mintRes = await stub.fetch("https://kb/admin.mint", {
       method: "POST",
       headers: { "content-type": "application/json", "x-kb-admin": "1" },
-      body: JSON.stringify({ label, tags }),
+      body: JSON.stringify({ label, tags, device_id: row.device_id ?? null }),
     });
     const minted = await (mintRes as any).json();
     if (!(mintRes as any).ok || !minted.secret) {
       throw new Error(String(minted?.error ?? "token mint failed"));
+    }
+    if (minted.reassociated) {
+      this.audit(login, "pair.reassociate", code, { device: row.device, ws, label, token: minted.id });
     }
     this.state.storage.sql.exec(
       `UPDATE pairings SET status = 'authorized', ws = ?, label = ?, tags = ?, secret = ?, approved_ts = ? WHERE code = ?`,
@@ -2613,7 +2621,7 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?)`,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
       id, label, hash, tags, ts,
     );
     const ws = this.wsSlug();
@@ -2631,6 +2639,31 @@ export class KnowledgeHub {
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
+    // re-pairing the same physical machine re-associates: rotate the token,
+    // keep the identity — the label collision is with ITSELF, which is fine
+    if (device_id) {
+      const own = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id);
+      if (own) {
+        if (own.revoked_ts) throw new Error(`token '${own.label}' for this device was revoked — un-revoke it first`);
+        const secret = generateAuthToken();
+        const hash = await hashAuthToken(secret);
+        this.state.storage.sql.exec(
+          `UPDATE auth_tokens SET hash = ?, label = ? WHERE id = ?`,
+          hash, label, own.id,
+        );
+        const ws = this.wsSlug();
+        if (ws) {
+          const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+          await reg.fetch("https://kb/ws.token_register", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ hash, ws }),
+          });
+        }
+        this.audit("pair", "reassociate", own.id, { label });
+        return { id: own.id, label, secret, reassociated: true };
+      }
+    }
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
@@ -2639,8 +2672,8 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, created_ts) VALUES (?, ?, ?, ?, ?, ?)`,
-      id, label, hash, JSON.stringify(tags), transport, ts,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      id, label, hash, JSON.stringify(tags), transport, device_id, ts,
     );
     // register hash → workspace in the central registry so /mcp routes this
     // token here. Registry failure must fail the mint — a silently unregistered

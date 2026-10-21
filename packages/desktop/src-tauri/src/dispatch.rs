@@ -325,14 +325,45 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
     }
 }
 
+/// Stable machine identity for re-pairing: IOPlatformUUID (survives hostname
+/// renames; unlike a MAC address it can't drift with hardware). The hub
+/// re-associates a re-pairing device with its existing token by this id —
+/// rotation, not a label collision. Fallback: hostname.
+fn device_id() -> String {
+    if let Ok(out) = Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if line.contains("\"IOPlatformUUID\"") {
+                if let Some(v) = line.split('=').nth(1) {
+                    let v = v.trim().trim_matches('"').trim_end_matches(';').trim();
+                    if !v.is_empty() {
+                        return format!("uuid-{v}");
+                    }
+                }
+            }
+        }
+    }
+    let host = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-device".into());
+    format!("host-{host}")
+}
+
 /// First half of the device flow: register this device, get the enter-code.
 /// This app IS a gateway — the pairing declares that class; the hub vends a
-/// gateway-class token on approval. The approver never chooses.
+/// gateway-class token on approval. The approver never chooses. The stable
+/// device id lets the hub re-associate re-pairings (rotate, not collide).
 pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str) -> Result<String, String> {
     let start: serde_json::Value = client
         .post(format!("{url}/api/pair/start"))
         .header("content-type", "application/json")
-        .body(json!({ "device": device, "type": "gateway" }).to_string())
+        .body(json!({ "device": device, "type": "gateway", "device_id": device_id() }).to_string())
         .send()
         .map_err(|e| format!("bridge unreachable: {e}"))?
         .json()
