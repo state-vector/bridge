@@ -83,6 +83,12 @@ const BACKEND_META: Record<string, { label: string; note: string; modelRequired:
   },
 };
 
+/** window.open is trapped inside the Tauri webview — external URLs go
+ *  through the opener plugin (Rust) into the system browser. */
+const openExternal = (url: string) => {
+  void invoke("open_external", { url }).catch(() => window.open(url, "_blank"));
+};
+
 function ts(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -190,7 +196,7 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
             {f.verdict === "BOUNCE" ? "Bounce it" : "Accept"}
           </button>
           <button className="gw-btn act-reject" disabled={busy} onClick={() => void act(d.id, "rejected")}>Reject</button>
-          {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(`${hubUrl}/?task=${d.id}`, "_blank"); }}>comment ↗</a>}
+          {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${hubUrl}/?task=${d.id}`); }}>comment ↗</a>}
         </div>
       </div>
     );
@@ -371,7 +377,7 @@ export function App() {
           <div className="gw-row" style={{ marginTop: 8 }}>
             <span className="gw-note">
               Enter code <span className="gw-mono">{pairCode}</span> at{" "}
-              <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(`${pairingUrl}/pair`, "_blank"); }}>
+              <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${pairingUrl}/pair`); }}>
                 {pairingUrl}/pair
               </a>{" "}
               — waiting for approval…
@@ -514,7 +520,7 @@ export function App() {
   };
 
   const openWeb = () => {
-    if (snap?.url) window.open(snap.url, "_blank");
+    if (snap?.url) openExternal(snap.url);
   };
 
   const toggleBackend = (b: string) => {

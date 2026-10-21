@@ -200,6 +200,17 @@ async fn pair_poll(url: String, code: String) -> Result<serde_json::Value, Strin
     .map_err(|e| e.to_string())?
 }
 
+/// Open a URL in the system browser. The webview's window.open does not
+/// reach the OS (and target=_blank is trapped) — everything that must open
+/// externally goes through the opener plugin here.
+#[tauri::command]
+fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// CLI flag lookup: `--flag value` → parsed value (u64), None when absent/invalid.
 fn cli_u64(name: &str) -> Option<u64> {
     let args: Vec<String> = std::env::args().collect();
@@ -231,6 +242,7 @@ pub fn run() {
             logout,
             pair_start,
             pair_poll,
+            open_external,
             menubar::show_panel,
             menubar::hide_panel
         ])
