@@ -113,7 +113,7 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> (Option<std::process::E
 pub struct OpencodeRun;
 
 impl AgentTransport for OpencodeRun {
-    fn dispatch(&self, req: &RunRequest, timeout: Duration, _live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+    fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
         cmd.arg("run")
             .current_dir(req.workdir)
@@ -226,7 +226,7 @@ pub struct OpencodeAcp;
 const ACP_UNAVAILABLE: &str = "ACP_UNAVAILABLE:";
 
 impl AgentTransport for OpencodeAcp {
-    fn dispatch(&self, req: &RunRequest, timeout: Duration, _live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+    fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
         cmd.arg("acp")
             .current_dir(req.workdir)

@@ -137,13 +137,6 @@ impl DispatchConfig {
         fold(&agents, |e, v| e.agent = Some(v));
     }
 
-    /// Enabled provider names, config order (alphabetical by key).
-    pub fn enabled_backends(&self) -> Vec<(String, BackendConfig)> {
-        self.backends
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
 }
 
 fn default_max_sessions() -> usize {
