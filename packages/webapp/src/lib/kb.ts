@@ -44,6 +44,13 @@ export interface KbAuthToken {
   revoked_ts?: number | null;
 }
 
+/** gateway → dispatched-agent attribution edge (Connect grouping, BR#2455) */
+export interface KbGatewayAgentEdge {
+  gateway: string;
+  agent: string;
+  last_seen_ts: number;
+}
+
 export interface KbProgress {
   seq: number;
   ts: number;
@@ -119,7 +126,7 @@ export const kbApi = {
     j<{ id: string }>(`/api/kb/update`, { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 
   // admin (connect page)
-  tokens: () => j<{ tokens: KbAuthToken[]; sessions: KbSession[] }>("/api/kb/admin/tokens"),
+  tokens: () => j<{ tokens: KbAuthToken[]; sessions: KbSession[]; gateway_agents?: KbGatewayAgentEdge[] }>("/api/kb/admin/tokens"),
   mint: (label: string, tags: string[], transport?: string) =>
     j<{ id: string; label: string; tags: string[]; transport?: string; secret: string }>("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags, transport }) }),
   revoke: (id: string) => j<{ id: string }>("/api/kb/admin/tokens/revoke", { method: "POST", body: JSON.stringify({ id }) }),

@@ -46,6 +46,8 @@ import {
   isQuestionTask,
   isWsSlug,
   isValidAskTarget,
+  labelClassError,
+  tagsSayGateway,
   parseTags,
   sanitizeTags,
   validateRelation,
@@ -551,6 +553,15 @@ export class KnowledgeHub {
         last_seen_ts INTEGER,
         revoked_ts INTEGER
       );
+      -- gateway → dispatched-agent attribution (BR#2455): stamped whenever a
+      -- gateway-tagged token claims/progresses as an agent. Feeds Connect's
+      -- "gateways with their agents" grouping; audit stays the full trail.
+      CREATE TABLE IF NOT EXISTS gateway_agents (
+        gateway TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        last_seen_ts INTEGER NOT NULL,
+        PRIMARY KEY (gateway, agent)
+      );
       CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         token_id TEXT NOT NULL,
@@ -660,13 +671,20 @@ export class KnowledgeHub {
     // The runner sends its hostname at pair/start and the pair page pre-fills
     // the label from it — but if the approver overrode the label with a
     // gateway name, the agent can fix its own identity without re-pairing.
+    // Same write-law as mint (BR#2455): charset, uniqueness, and the gw-*
+    // class boundary — a token can never rename across the class line.
     if (url.pathname === "/token.rename") {
       const body = await request.json();
       const identity = await this.identify(String(body.bearer ?? ""));
-      const newLabel = String(body.label ?? "").trim().slice(0, 60);
-      if (!newLabel) throw new Error("label is required");
-      const old = this.one(`SELECT label FROM auth_tokens WHERE id = ?`, identity.token_id);
+      const newLabel = String(body.label ?? "").trim();
+      if (!/^[a-zA-Z0-9._-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+      const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
       if (!old) throw new Error("auth token not found");
+      if (newLabel !== old.label) {
+        if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, newLabel)) throw new Error(`label '${newLabel}' already exists`);
+        const classErr = labelClassError(newLabel, tagsSayGateway(old.tags));
+        if (classErr) throw new Error(classErr);
+      }
       this.state.storage.sql.exec(
         `UPDATE auth_tokens SET label = ? WHERE id = ?`,
         newLabel, identity.token_id,
@@ -713,6 +731,7 @@ export class KnowledgeHub {
         case "get_history": return this.json(await this.getHistory(String(body.id ?? ""), Number(body.limit ?? 100)));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
+        case "agent.provision": return this.json(await this.agentProvision(body, actor));
         case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
@@ -1296,6 +1315,12 @@ export class KnowledgeHub {
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = attributedAgent ?? actor;
     }
+    // attribution bookkeeping (BR#2455): when a gateway-tagged token acts as
+    // another agent, record the gateway→agent edge for Connect grouping. The
+    // token row is the authority — a forged body.gateway without the tag no-ops.
+    if (attributedAgent && attributedAgent !== actor && this.isGatewayActor(actor)) {
+      this.gatewayTouch(actor, attributedAgent);
+    }
     // session attribution: stamp which session claimed/acted, first-wins, resolved
     // explicit → the token's most recent session (agents pass session on orient only)
     if (row.type === "task" && !meta.session) {
@@ -1771,6 +1796,9 @@ export class KnowledgeHub {
     const progressActor = body.gateway && String(body.agent ?? "").trim()
       ? String(body.agent).trim().slice(0, 60)
       : actor;
+    if (progressActor !== actor && this.isGatewayActor(actor)) {
+      this.gatewayTouch(actor, progressActor); // gateway→agent edge (BR#2455)
+    }
     meta.last_progress = { note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
@@ -1821,21 +1849,48 @@ export class KnowledgeHub {
     return { token_id: row.id, label: row.label, tags: parseTags(row.tags) };
   }
 
-  /** Active agents (for ask addressing). Labels + capability tags only. */
+  /**
+   * Connected identities, separated by class (BR#2455): `gateways` are the
+   * infrastructure tokens (each with the agent labels it dispatched recently),
+   * `agents` is everyone else. MCP peers never see gateways inside the agents
+   * array — a gateway is not an agent.
+   */
   private async listAgents() {
     const cutoff = Date.now() - 10 * 60_000;
-    const agents = this.state.storage.sql.exec(
-      `SELECT label, tags, transport, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC LIMIT 100`,
-    ).toArray()
-      .filter((a) => !a.revoked_ts)
-      .map((a) => ({
-        label: a.label,
-        tags: parseTags(a.tags),
-        transport: a.transport ?? "mcp",
-        online: a.last_seen_ts >= cutoff,
-        last_seen_ts: a.last_seen_ts,
-      }));
-    return { agents, note: "bridge routes between agents — transport shows how each is reachable today (mcp) or next (a2a, acp-proxy, board)" };
+    const rows = this.state.storage.sql.exec(
+      `SELECT label, tags, transport, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC`,
+    ).toArray().filter((a) => !a.revoked_ts);
+    const shape = (a: any) => ({
+      label: a.label,
+      tags: parseTags(a.tags),
+      transport: a.transport ?? "mcp",
+      online: a.last_seen_ts >= cutoff,
+      last_seen_ts: a.last_seen_ts,
+    });
+    const agents = rows.filter((a) => !tagsSayGateway(a.tags)).map(shape);
+    const gateways = rows.filter((a) => tagsSayGateway(a.tags)).map((g: any) => ({
+      ...shape(g),
+      agents: this.state.storage.sql.exec(
+        `SELECT agent AS label, last_seen_ts FROM gateway_agents WHERE gateway = ? ORDER BY last_seen_ts DESC LIMIT 20`,
+        g.label,
+      ).toArray(),
+    }));
+    return { agents, gateways, note: "bridge routes between agents — gateways are listed separately with the agents they dispatched; transport shows how each is reachable today (mcp) or next (a2a, acp-proxy, board)" };
+  }
+
+  /** Does this label's token carry the gateway tag? (attribution authority) */
+  private isGatewayActor(label: string): boolean {
+    const row = this.one(`SELECT tags FROM auth_tokens WHERE label = ?`, label);
+    return !!row && tagsSayGateway(row.tags);
+  }
+
+  /** Stamp/refresh the gateway→dispatched-agent edge (Connect grouping). */
+  private gatewayTouch(gateway: string, agent: string) {
+    this.state.storage.sql.exec(
+      `INSERT INTO gateway_agents (gateway, agent, last_seen_ts) VALUES (?, ?, ?)
+       ON CONFLICT(gateway, agent) DO UPDATE SET last_seen_ts = excluded.last_seen_ts`,
+      gateway.slice(0, 80), agent.slice(0, 80), Date.now(),
+    );
   }
 
   /** The session a write belongs to: explicit, else the token's most recent session. */
@@ -2469,6 +2524,9 @@ export class KnowledgeHub {
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
     if (!isWsSlug(ws)) throw new Error("bad workspace slug");
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    // namespace law (BR#2455): a gateway-class pairing must be named gw-*
+    const classErr = labelClassError(label, tagsSayGateway(tags));
+    if (classErr) throw new Error(classErr);
     const row = this.one(`SELECT code, created_ts, status, device FROM pairings WHERE code = ?`, code);
     if (!row || row.status !== "pending") throw new Error("pairing code not pending");
     if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
@@ -2526,11 +2584,56 @@ export class KnowledgeHub {
     };
   }
 
+  /** Gateway-provisioned agent tokens (per agent, not per session).
+   *  A gw-* caller mints (or rotates) a token FOR a worker it spawns — the
+   *  worker's bridge MCP carries this token, so its board actions attribute
+   *  to the agent, not the gateway. Secrets are shown once; the gateway
+   *  stores them. Exists w/o rotate = { exists: true } (no secret re-exposed). */
+  private async agentProvision(body: any, actor: string) {
+    const caller = String(body.provisioned_by ?? actor);
+    if (!/^gw-/.test(caller)) throw new Error("agent provisioning requires a gateway-class (gw-*) caller");
+    const label = String(body.label ?? "").trim();
+    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
+    if (label.startsWith("gw-")) throw new Error(`agent labels must not start with gw- (reserved for gateways)`);
+    const rotate = body.rotate === true;
+    const ts = Date.now();
+    const existing = this.one(`SELECT id, revoked_ts FROM auth_tokens WHERE label = ?`, label);
+    if (existing && !rotate) {
+      if (existing.revoked_ts) throw new Error(`token '${label}' was revoked — provision with rotate to re-mint`);
+      return { exists: true, id: existing.id, label };
+    }
+    if (existing) {
+      this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, ts, existing.id);
+      this.audit(caller, "rotate", label, { old: existing.id });
+    }
+    const secret = generateAuthToken();
+    const hash = await hashAuthToken(secret);
+    const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+    const tags = JSON.stringify(["provisioned", `by:${caller}`]);
+    this.state.storage.sql.exec(
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?)`,
+      id, label, hash, tags, ts,
+    );
+    const ws = this.wsSlug();
+    if (ws) {
+      const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+      await reg.fetch("https://kb/ws.token_register", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hash, ws }),
+      });
+    }
+    this.audit(caller, "agent_provision", id, { label, rotate: existing ? true : false });
+    return { id, label, secret, provisioned_by: caller };
+  }
+
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
+    // namespace law (BR#2455): gateway-tagged tokens are gw-*, agent labels never are
+    const classErr = labelClassError(label, tagsSayGateway(tags));
+    if (classErr) throw new Error(classErr);
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
     const secret = generateAuthToken(); // opaque — the workspace is NOT embedded; routing goes through the central registry
     const hash = await hashAuthToken(secret);
@@ -2552,7 +2655,7 @@ export class KnowledgeHub {
         body: JSON.stringify({ hash, ws }),
       });
     }
-    this.audit("admin", "mint", id, { label, transport });
+    this.audit("admin", "mint", id, { label, transport, tags });
     return { id, label, tags, transport, secret }; // secret shown exactly once
   }
 
@@ -2563,7 +2666,11 @@ export class KnowledgeHub {
     const sessions = this.state.storage.sql.exec(
       `SELECT token_id, name, first_seen_ts, last_seen_ts FROM sessions ORDER BY last_seen_ts DESC`,
     ).toArray();
-    return { tokens: rows.map((r) => ({ ...r, tags: parseTags(r.tags) })), sessions };
+    // gateway → dispatched-agent edges for Connect's grouping (BR#2455)
+    const gateway_agents = this.state.storage.sql.exec(
+      `SELECT gateway, agent, last_seen_ts FROM gateway_agents ORDER BY last_seen_ts DESC LIMIT 200`,
+    ).toArray();
+    return { tokens: rows.map((r) => ({ ...r, tags: parseTags(r.tags) })), sessions, gateway_agents };
   }
 
   private async tokenRevoke(body: any) {
@@ -2581,6 +2688,15 @@ export class KnowledgeHub {
     const row = this.one(`SELECT id, label, tags FROM auth_tokens WHERE id = ?`, id);
     if (!row) throw new Error(`no such auth token: ${id}`);
     const tags = sanitizeTags(body.tags);
+    // namespace law (BR#2455): tag edits cannot push a label across the gw-*
+    // class boundary. Same-class edits on legacy rows (e.g. 'macbookpro' kept
+    // per the BR#899 migration stance) stay legal; what's rejected is any
+    // crossing that would make (label, class) illegal — tagging an agent label
+    // as a gateway, or stripping the gateway tag off a gw-* identity.
+    if (!!tagsSayGateway(row.tags) !== tagsSayGateway(tags ?? [])) {
+      const classErr = labelClassError(row.label, tagsSayGateway(tags ?? []));
+      if (classErr) throw new Error(classErr);
+    }
     this.state.storage.sql.exec(
       `UPDATE auth_tokens SET tags = ? WHERE id = ?`,
       tags ? JSON.stringify(tags) : "[]", id,

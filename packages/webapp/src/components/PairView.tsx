@@ -21,10 +21,17 @@ async function api<T>(path: string, body: unknown): Promise<T> {
 
 const ROLES = ["impl", "analysis", "review"];
 
+/** Device-pairing label prefill: gateways are gw-<device>, agents keep the device name. */
+function prefillLabel(device: string, gateway: boolean): string {
+  const slug = device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device";
+  return gateway ? `gw-${slug.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+/, "")}` : slug;
+}
+
 export function PairView() {
   const [code, setCode] = useState("");
   const [info, setInfo] = useState<{ device: string; created_ts: number } | null>(null);
   const [label, setLabel] = useState("");
+  const [gateway, setGateway] = useState(false);
   const [ws, setWs] = useState("");
   const [workspaces, setWorkspaces] = useState<Array<{ slug: string }>>([]);
   const [roles, setRoles] = useState<string[]>(["impl"]);
@@ -52,7 +59,7 @@ export function PairView() {
         return;
       }
       setInfo({ device: d.device, created_ts: d.created_ts });
-      setLabel(d.device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device");
+      setLabel(prefillLabel(d.device, gateway));
     } catch (e) {
       setMsg((e as Error).message);
     } finally {
@@ -68,7 +75,7 @@ export function PairView() {
         code: code.trim().toUpperCase(),
         ws,
         label: label.trim(),
-        tags: roles.map((r) => `role:${r}`),
+        tags: gateway ? ["gateway"] : roles.map((r) => `role:${r}`),
       });
       setDone(true);
     } catch (e) {
@@ -120,7 +127,11 @@ export function PairView() {
             <p className="auth-host">
               Pair <b>{info.device}</b>?
             </p>
-            <label>Token label (agent name)</label>
+            <label className="ask-chips-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input type="checkbox" checked={gateway} onChange={(e) => { setGateway(e.target.checked); setLabel(prefillLabel(info.device, e.target.checked)); }} />
+              <span>this device is a <b>gateway</b> (runner host — identity becomes <code>gw-&lt;name&gt;</code>, not an agent)</span>
+            </label>
+            <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
             <input className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>
             <select className="login-input" value={ws} onChange={(e) => setWs(e.target.value)}>
@@ -129,18 +140,22 @@ export function PairView() {
                 <option key={w.slug} value={w.slug}>{w.slug}</option>
               ))}
             </select>
-            <label>Roles</label>
-            <div className="ask-chips">
-              {ROLES.map((r) => (
-                <button
-                  key={r}
-                  className={`chip ${roles.includes(r) ? "chip-scope" : ""}`}
-                  onClick={() => setRoles(roles.includes(r) ? roles.filter((x) => x !== r) : [...roles, r])}
-                >
-                  role:{r}
-                </button>
-              ))}
-            </div>
+            {!gateway && (
+              <>
+                <label>Roles</label>
+                <div className="ask-chips">
+                  {ROLES.map((r) => (
+                    <button
+                      key={r}
+                      className={`chip ${roles.includes(r) ? "chip-scope" : ""}`}
+                      onClick={() => setRoles(roles.includes(r) ? roles.filter((x) => x !== r) : [...roles, r])}
+                    >
+                      role:{r}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             <button className="opt-btn auth-submit" disabled={!ws || !label.trim() || busy} onClick={() => void approve()}>
               {busy ? "…" : "Approve & mint token"}
             </button>

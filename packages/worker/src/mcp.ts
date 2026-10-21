@@ -19,7 +19,7 @@ import {
 import { KnowledgeHub } from "./kb/do.ts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.3.4";
+export const BUILD = "0.3.5";
 
 // per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
 const wsRouteCache = new Map<string, string>();
@@ -216,12 +216,14 @@ async function callTool(name: string, args: any, ctx: Ctx) {
   const { call, identity } = ctx;
   // Gateway tokens (tagged "gateway") are infrastructure: they claim and
   // dispatch on behalf of the AGENT they dispatched as, and must never appear
-  // as task owner (the MacBook-Pro-as-owner defect, ADR BR#899). The runner
-  // passes the dispatched agent name in `agent`; the DO honours it only when
-  // this gateway flag is set — a plain agent token cannot attribute away.
-  if (identity.tags.includes("gateway") && !args.gateway) {
-    args.gateway = true;
-  }
+  // as task owner (the MacBook-Pro-as-owner defect, ADR BR#899). The gateway
+  // flag is DERIVED from the token, never accepted from client args — and a
+  // plain agent token's `agent` field is stripped, so attribution cannot be
+  // forged (BR#2455: the namespace law holds at the protocol boundary too).
+  const isGatewayToken = identity.tags.some((t) => t.toLowerCase() === "gateway");
+  args.gateway = isGatewayToken;
+  if (!isGatewayToken) delete args.agent;
+  else if (args.agent != null) args.agent = String(args.agent).trim().slice(0, 60);
   switch (name) {
     case "orient": {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
@@ -459,7 +461,7 @@ const TOOLS = [
   },
   {
     name: "list_agents",
-    description: "List connected agents (label, capability tags, online) — use to address ask_agent.",
+    description: "List connected identities — `agents` (label, capability tags, online) and `gateways` (each with the agent labels it dispatched recently). Address ask_agent at agent labels; gateways are infrastructure, not peers.",
     inputSchema: { type: "object", properties: {} },
   },
   {

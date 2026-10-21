@@ -79,6 +79,29 @@ export default {
       return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" });
     }
 
+    // machine-plane agent provisioning (bearer): a GATEWAY-class token mints
+    // (or rotates) an agent token for a worker it spawns — per agent, not per
+    // session. The secret flows back once; the gateway stores it.
+    if (url.pathname === "/api/kb-machine/provision") {
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      const body = await request.json().catch(() => ({}));
+      const kbId = env.KB.get(env.KB.idFromName(doWs(ws)));
+      const ident = await kbId.fetch("https://kb/auth.identify", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ bearer }),
+      }).then((r) => r.json()).catch(() => null);
+      if (!ident?.label) return new Response("unauthorized", { status: 401 });
+      if (!/^gw-/.test(ident.label)) return json({ error: "only gateway-class tokens (gw-*) may provision agent tokens" }, 403);
+      return kbId.fetch("https://kb/agent.provision", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
+      });
+    }
+
     if (url.pathname === "/mcp") {
       return handleMcp(request, env);
     }

@@ -82,6 +82,7 @@ function AgentSetupModal({ label, secret, projectName, onClose }: { label: strin
 
 export function ConnectView() {
   const tokens = useKb((s) => s.tokens);
+  const gatewayAgents = useKb((s) => s.gatewayAgents);
   const sessions = useKb((s) => s.sessions);
   const settings = useKb((s) => s.settings);
   const mint = useKb((s) => s.mint);
@@ -90,6 +91,8 @@ export function ConnectView() {
 
   const [label, setLabel] = useState("");
   const [transport, setTransport] = useState("mcp");
+  // identity class (BR#2455): gateways are infrastructure named gw-*; agents never are
+  const [isGateway, setIsGateway] = useState(false);
   const [setupFor, setSetupFor] = useState<{ label: string; secret: string | null } | null>(null);
   const [msg, setMsg] = useState("");
   // inline tags editor: tokenId -> current draft (roles/capabilities, replaces on save)
@@ -110,18 +113,17 @@ export function ConnectView() {
 
   const projectName = settings.project_name || "Superpositional";
 
-  const ROLES = ["impl", "analysis", "review"];
-  const [roles, setRoles] = useState<string[]>(["impl", "analysis", "review"]);
-  const [extraRoles, setExtraRoles] = useState("");
+
+  const isGwToken = (t: { tags?: string[] }) => (t.tags ?? []).some((x) => x.toLowerCase() === "gateway");
+  const gateways = tokens.filter(isGwToken);
+  const agents = tokens.filter((t) => !isGwToken(t));
 
   const doMint = async () => {
-    const extras = extraRoles.split(",").map((x) => x.trim().toLowerCase().replace(/\s+/g, "-")).filter(Boolean).map((x) => x.startsWith("role:") ? x : `role:${x}`);
-    const tagList = [...roles.map((r) => `role:${r}`), ...extras];
+    const tagList = isGateway ? ["gateway"] : [];
     try {
       const t = await mint(label.trim(), tagList, transport);
       setSetupFor({ label: t.label, secret: t.secret });
       setLabel("");
-      setExtraRoles("");
     } catch (e) {
       setMsg(`mint failed: ${(e as Error).message}`);
     }
@@ -130,29 +132,80 @@ export function ConnectView() {
   return (
     <div className="connect-wrap">
       <div className="view-head">
-        <h2>Connect agents</h2>
-        <span className="muted-note">one auth token per agent client · sessions self-name</span>
+        <h2>Connect</h2>
+        <span className="muted-note">gateways are infrastructure (gw-*), agents are peers · sessions self-name</span>
       </div>
 
       {setupFor && <AgentSetupModal label={setupFor.label} secret={setupFor.secret} projectName={projectName} onClose={() => setSetupFor(null)} />}
 
       <div className="card">
-        <h2>Auth tokens</h2>
+        <h2>Gateways</h2>
+        <p className="muted-note">infrastructure identities (gw-*): each lists the agents it dispatched recently — attributed agents are nested here, never peers.</p>
+        <table className="log-table">
+          <thead><tr><th>gateway</th><th>dispatched agents</th><th>tags</th><th>last seen</th><th>state</th><th></th></tr></thead>
+          <tbody>
+            {gateways.length === 0 && (
+              <tr><td colSpan={6}><span className="muted-note">no gateways — pair a device as a gateway (gw-&lt;hostname&gt;) or mint one below</span></td></tr>
+            )}
+            {gateways.map((t) => (
+              <tr key={t.id}>
+                <td>{t.label}</td>
+                <td>
+                  {(gatewayAgents.filter((e) => e.gateway === t.label).length
+                    ? gatewayAgents.filter((e) => e.gateway === t.label).map((e) => (
+                        <span key={e.agent} title={`dispatched ${rel(e.last_seen_ts)} ago`}>{e.agent}{" "}</span>
+                      ))
+                    : <span className="muted-note">none yet</span>)}
+                </td>
+                <td>
+                  {editTags?.id === t.id ? (
+                    <span className="row">
+                      <input
+                        className="login-input"
+                        value={editTags.draft}
+                        placeholder="gateway"
+                        autoFocus
+                        onChange={(e) => setEditTags({ id: t.id, draft: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === "Enter") void saveTags(); if (e.key === "Escape") setEditTags(null); }}
+                      />
+                      <button className="opt-btn" onClick={() => void saveTags()}>save</button>
+                      <button className="opt-btn opt-ghost" onClick={() => setEditTags(null)}>cancel</button>
+                    </span>
+                  ) : (
+                    <span title="gateway class + capabilities">{(t.tags ?? []).join(", ") || <span className="muted-note">none</span>}</span>
+                  )}
+                </td>
+                <td>{t.last_seen_ts ? rel(t.last_seen_ts) : "never"}</td>
+                <td>{t.revoked_ts ? <span className="login-error">revoked</span> : <span className="ok">active</span>}</td>
+                <td>
+                  {!t.revoked_ts && (
+                    <>
+                      <button className="opt-btn" onClick={() => setEditTags({ id: t.id, draft: (t.tags ?? []).join(", ") })}>tags</button>{" "}
+                      <button className="opt-btn danger" onClick={() => void revoke(t.id)}>revoke</button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <h2>Agents</h2>
         <div className="row">
-          <div><label>Agent label</label><input value={label} placeholder="opencode-ray" onChange={(e) => setLabel(e.target.value)} /></div>
+          <div>
+            <label>Identity class</label>
+            <div className="role-picker">
+              <label className="role-opt">
+                <input type="checkbox" checked={isGateway} onChange={(e) => setIsGateway(e.target.checked)} />
+                <span className="gateway">gateway (gw-*)</span>
+              </label>
+            </div>
+          </div>
         </div>
-        <label>Roles</label>
-        <div className="role-picker">
-          {ROLES.map((r) => (
-            <label key={r} className="role-opt">
-              <input type="checkbox" checked={roles.includes(r)} onChange={(e) => setRoles(e.target.checked ? [...roles, r] : roles.filter((x) => x !== r))} />
-              <span className={r}>role:{r}</span>
-            </label>
-          ))}
+        <div className="row">
+          <div><label>{isGateway ? "Gateway label (gw-<hostname>)" : "Agent label"}</label><input value={label} placeholder={isGateway ? "gw-macbookpro" : "opencode-ray"} onChange={(e) => setLabel(e.target.value)} /></div>
         </div>
-        <label>Extra roles (comma-sep)</label>
-        <input value={extraRoles} placeholder="deploy, dba" onChange={(e) => setExtraRoles(e.target.value)} />
-        <p className="muted-note">roles gate which pool tasks the agent can see and claim (role:analysis / role:review may claim unqualified work; role:impl does qualified work). tools/access are not registered — agents self-select from the task pool, requirements live in task bodies.</p>
+        {isGateway && <p className="muted-note">gateways claim and dispatch on behalf of the agents they run — they never own tasks as themselves. labels must be gw-&lt;name&gt; (lowercase); the class boundary is enforced at mint/rename.</p>}
         <label>Transport</label>
         <select value={transport} onChange={(e) => setTransport(e.target.value)}>
           <option value="mcp">mcp</option>
@@ -165,7 +218,7 @@ export function ConnectView() {
         <table className="log-table">
           <thead><tr><th>agent</th><th>tags</th><th>transport</th><th>created</th><th>last seen</th><th>state</th><th></th></tr></thead>
           <tbody>
-            {tokens.map((t) => (
+            {agents.map((t) => (
               <tr key={t.id}>
                 <td>{t.label}</td>
                 <td>

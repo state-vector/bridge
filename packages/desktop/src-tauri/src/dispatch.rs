@@ -1397,9 +1397,21 @@ fn spawn_opencode(
     let live_for_task = live.clone();
     // Mode A provisioning: inject the bridge MCP server into the spawned
     // session. Merged per-server-key with the host's own opencode config, so
-    // existing MCP servers are honoured; only a user-defined `bridge` entry is
-    // shadowed — deliberately, the runner owns the hub identity for its spawns.
-    let mcp_json = if cfg.url.is_empty() || cfg.token.is_empty() {
+    // existing MCP servers are honoured. The MCP auth uses a PER-AGENT token
+    // the gateway provisions from the hub on the worker's behalf (per agent,
+    // not per session) — board actions attribute to the agent, not the
+    // gateway. Fallback: the gateway's own token if provisioning fails, with
+    // a loud note (attribution then reads as the gateway).
+    let agent_label = agent_identity(cfg);
+    let agent_token = match provision_agent_token(cfg, &agent_label) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — falling back to gateway token");
+            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — sessions attribute to the gateway until fixed"));
+            cfg.token.clone()
+        }
+    };
+    let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
     } else {
         Some(
@@ -1410,7 +1422,7 @@ fn spawn_opencode(
                     "url": format!("{}/mcp", cfg.url.trim_end_matches('/')),
                     "enabled": true,
                     "oauth": false,
-                    "headers": { "Authorization": format!("Bearer {}", cfg.token) }
+                    "headers": { "Authorization": format!("Bearer {}", agent_token) }
                 }}
             })
             .to_string(),
@@ -2307,4 +2319,49 @@ mod tests {
         assert!(json_tags(&nested).is_empty());
         assert!(json_tags(&serde_json::json!({})).is_empty());
     }
+}
+
+/// Provision (or reuse) the per-agent hub token for `agent_label` via the
+/// gateway's own credentials. Secret cached in ~/.bridge/agent-tokens.json
+/// (0600 dir); hub dedupes by label — re-provision without a cached secret
+/// rotates (old token revoked, new secret issued).
+fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<String, String> {
+    if !cfg.token.is_empty() && agent_label == "gateway" {
+        return Ok(cfg.token.clone());
+    }
+    let cache_dir = dispatch_dir().ok_or("no dispatch dir")?;
+    let cache_path = cache_dir.join("agent-tokens.json");
+    let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    if let Some(secret) = cache.get(agent_label) {
+        if !secret.is_empty() {
+            return Ok(secret.clone());
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{}/api/kb-machine/provision", cfg.url.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", cfg.token))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&json!({ "label": agent_label })).unwrap_or_default())
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("hub {status}: {}", body.get("error").and_then(|e| e.as_str()).unwrap_or("?")));
+    }
+    let secret = body
+        .get("secret")
+        .and_then(|s| s.as_str())
+        .map(String::from)
+        .ok_or_else(|| "hub returned no secret — token exists but no cached copy; provision with rotate".to_string())?;
+    cache.insert(agent_label.to_string(), secret.clone());
+    let _ = std::fs::write(&cache_path, serde_json::to_string_pretty(&cache).unwrap_or_default());
+    Ok(secret)
 }

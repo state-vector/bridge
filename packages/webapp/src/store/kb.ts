@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { connectKbWs, kbApi, KbAuthError } from "../lib/kb";
-import type { KbArtefact, KbAuthToken, KbEvent, KbProgress, KbSeriesPoint, KbSession } from "../lib/kb";
+import type { KbArtefact, KbAuthToken, KbEvent, KbGatewayAgentEdge, KbProgress, KbSeriesPoint, KbSession } from "../lib/kb";
 import { getConfig } from "../lib/config";
 import { useBridge } from "../lib/store";
 
@@ -35,6 +35,7 @@ interface KbState {
   prefs: BoardPrefs;
   lastSeq: number;
   tokens: KbAuthToken[];
+  gatewayAgents: KbGatewayAgentEdge[];
   settings: Record<string, any>;
   /** cross-tab handoff: thread id For Me wants Discussions to open */
   initialThread: string | null;
@@ -67,6 +68,7 @@ export const useKb = create<KbState>((set, get) => ({
   prefs: loadPrefs(),
   lastSeq: 0,
   tokens: [],
+  gatewayAgents: [],
   settings: {},
   initialThread: null,
 
@@ -98,7 +100,7 @@ export const useKb = create<KbState>((set, get) => ({
   reset: () => {
     stopWs?.();
     stopWs = null;
-    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], settings: {}, initialThread: null });
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], gatewayAgents: [], settings: {}, initialThread: null });
   },
 
   refresh: async () => {
@@ -120,7 +122,7 @@ export const useKb = create<KbState>((set, get) => ({
     try {
       const t = await kbApi.tokens();
       const s = await kbApi.settings();
-      set({ tokens: t.tokens, sessions: t.sessions, settings: s.settings ?? {} });
+      set({ tokens: t.tokens, sessions: t.sessions, gatewayAgents: t.gateway_agents ?? [], settings: s.settings ?? {} });
     } catch (e) {
       escalateAuth(e); /* not signed in yet */
     }
