@@ -21,3 +21,6 @@ packages/mobile/ui/node_modules/
 # runner scratch (when workdir points at a checkout — BR#2460)
 repos/
 sessions/
+
+# webapp build artifact — built at deploy time ([build] hook in worker/wrangler.toml)
+packages/webapp/dist/

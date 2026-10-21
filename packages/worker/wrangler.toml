@@ -1,12 +1,13 @@
 name = "bridge"
 main = "src/index.js"
-
-# the served UI lives in @bridge/webapp and is COMMITTED as dist — rebuild it
-# on every deploy so the bundle can never go stale against its source
-[build]
-command = "npm run build -w @bridge/webapp"
 compatibility_date = "2026-01-15"
 # account_id comes from CLOUDFLARE_ACCOUNT_ID in the environment — not committed.
+
+# The served UI lives in @bridge/webapp, built to dist at deploy time by this
+# hook — dist is a build ARTIFACT, never committed; the source of truth is
+# packages/webapp/src and Cloudflare builds from it on every deploy.
+[build]
+command = "npm run build -w @bridge/webapp"
 
 # Your deployment lives at https://<your-subdomain>.workers.dev once deployed.
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
