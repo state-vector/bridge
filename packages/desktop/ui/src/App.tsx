@@ -507,7 +507,9 @@ export function App() {
 
   const doLogoutRef = useRef<(() => void) | null>(null);
   const doLogout = async () => {
-    if (!window.confirm("Log out? This stops the runner and clears the gateway token — your settings are kept; pair again to onboard.")) return;
+    // no confirm() here: Tauri v2 dialogs are no-ops without the dialog
+    // plugin, so the gate silently swallowed every logout. Logout is cheap
+    // and reversible (pair again) — it does not need a modal.
     try {
       await invoke("logout");
       await loadCfg();
