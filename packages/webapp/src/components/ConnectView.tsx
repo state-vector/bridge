@@ -87,26 +87,10 @@ export function ConnectView() {
   const settings = useKb((s) => s.settings);
   const mint = useKb((s) => s.mint);
   const revoke = useKb((s) => s.revoke);
-  const setTokenTags = useKb((s) => s.setTokenTags);
 
   const [label, setLabel] = useState("");
   const [setupFor, setSetupFor] = useState<{ label: string; secret: string | null } | null>(null);
   const [msg, setMsg] = useState("");
-  // inline tags editor: tokenId -> current draft (roles/capabilities, replaces on save)
-  const [editTags, setEditTags] = useState<{ id: string; draft: string } | null>(null);
-
-  const saveTags = async () => {
-    if (!editTags) return;
-    try {
-      const tags = editTags.draft.split(",").map((x) => x.trim()).filter(Boolean);
-      await setTokenTags(editTags.id, tags);
-      setEditTags(null);
-      setMsg("");
-    } catch (e) {
-      setMsg(`tags update failed: ${(e as Error).message}`);
-    }
-  };
-
   const projectName = settings.project_name || "Superpositional";
 
   const isGwToken = (t: { tags?: string[] }) => (t.tags ?? []).some((x) => x.toLowerCase() === "gateway");
@@ -146,7 +130,7 @@ export function ConnectView() {
         </div>
         {msg && <p className="login-error">{msg}</p>}
         <table className="log-table">
-          <thead><tr><th>agent</th><th>tags</th><th>created</th><th>last seen</th><th>state</th><th></th></tr></thead>
+          <thead><tr><th>agent</th><th>created</th><th>last seen</th><th>state</th><th></th></tr></thead>
           <tbody>
             {agents.length === 0 && (
               <tr><td colSpan={6}><span className="muted-note">no agents yet — add one above</span></td></tr>
@@ -154,31 +138,12 @@ export function ConnectView() {
             {agents.map((t) => (
               <tr key={t.id}>
                 <td>{t.label}</td>
-                <td>
-                  {editTags?.id === t.id ? (
-                    <span className="row">
-                      <input
-                        className="login-input"
-                        value={editTags.draft}
-                        placeholder="role:analysis, role:impl, …"
-                        autoFocus
-                        onChange={(e) => setEditTags({ id: t.id, draft: e.target.value })}
-                        onKeyDown={(e) => { if (e.key === "Enter") void saveTags(); if (e.key === "Escape") setEditTags(null); }}
-                      />
-                      <button className="opt-btn" onClick={() => void saveTags()}>save</button>
-                      <button className="opt-btn opt-ghost" onClick={() => setEditTags(null)}>cancel</button>
-                    </span>
-                  ) : (
-                    <span title="roles + capabilities — used for ask routing (tag:*) and swimlane gates">{(t.tags ?? []).join(", ") || <span className="muted-note">none</span>}</span>
-                  )}
-                </td>
                 <td>{rel(t.created_ts)}</td>
                 <td>{t.last_seen_ts ? rel(t.last_seen_ts) : "never"}</td>
                 <td>{t.revoked_ts ? <span className="login-error">revoked</span> : <span className="ok">active</span>}</td>
                 <td>
                   {!t.revoked_ts && (
                     <>
-                      <button className="opt-btn" onClick={() => setEditTags({ id: t.id, draft: (t.tags ?? []).join(", ") })}>tags</button>{" "}
                       <button className="opt-btn" onClick={() => setSetupFor({ label: t.label, secret: null })}>setup</button>{" "}
                       <button className="opt-btn danger" onClick={() => void revoke(t.id)}>revoke</button>
                     </>

@@ -1883,7 +1883,7 @@ export class KnowledgeHub {
       online: a.last_seen_ts >= cutoff,
       last_seen_ts: a.last_seen_ts,
     });
-    const agents = rows.filter((a) => !tagsSayGateway(a.tags)).map(shape);
+    const agents = rows.filter((a) => !tagsSayGateway(a.tags)).map((a: any) => ({ ...shape(a), tags: [] }));
     const gateways = rows.filter((a) => tagsSayGateway(a.tags)).map((g: any) => ({
       ...shape(g),
       agents: this.state.storage.sql.exec(
