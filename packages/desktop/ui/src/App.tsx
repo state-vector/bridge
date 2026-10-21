@@ -494,6 +494,7 @@ export function App() {
       {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
       {page === "top" && <Top />}
       {page === "backlog" && <Backlog />}
+      {page === "chat" && <Chat />}
 
 
       {page === "log" && (
