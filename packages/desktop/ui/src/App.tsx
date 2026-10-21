@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
 
 /** Bridge gateway UI. Four pages (For you first — the unblock inbox is the
@@ -315,7 +316,7 @@ function Backlog() {
 
 
 export function App() {
-  const [page, setPage] = useState<"forme" | "top" | "backlog" | "log" | "settings">("forme");
+  const [page, setPage] = useState<"forme" | "top" | "backlog" | "chat" | "log" | "settings">("forme");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -462,6 +463,7 @@ export function App() {
           <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
           <button className={page === "top" ? "active" : ""} onClick={() => setPage("top")}>Top</button>
           <button className={page === "backlog" ? "active" : ""} onClick={() => setPage("backlog")}>Backlog</button>
+          <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
         </nav>

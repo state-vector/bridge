@@ -693,6 +693,25 @@ pub fn external_runner_pid() -> Option<u32> {
 /// Machine-plane list queries (agent token) — decisions/blocked/questions.
 /// Human-authoritative actions (accept/reject) stay in the webapp; rows carry
 /// the hub URL so the panel can deep-link. Runs on a blocking thread.
+/// Console chat task creation: the human confirmed a draft, so create the
+/// task on the hub through MCP (the paired token's one legitimate write for
+/// the console — creation only, never claims/transitions).
+pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String> {
+    let cfg = DispatchConfig::resolve().ok_or("no bridge config — pair first")?;
+    let mut id = 0i64;
+    mcp_call(
+        &cfg,
+        &mut id,
+        "create_artefact",
+        json!({
+            "type": "task",
+            "title": title,
+            "body_md": body,
+            "meta": { "kind": "impl", "origin": "console-chat" }
+        }),
+    )
+}
+
 pub fn for_you_payload() -> Result<serde_json::Value, String> {
     let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
     let client = reqwest::blocking::Client::builder()
@@ -1274,6 +1293,18 @@ fn spawn_opencode(
     } else {
         None
     };
+    // isolation guard: a shared checkout is a shared branch and a shared git
+    // index — dispatched sessions have switched branches under humans and
+    // reverted committed work (three times). If isolation was requested and
+    // failed, refuse: never dispatch into cfg.workdir.
+    if cfg.isolate && worktree.is_none() {
+        let msg = format!(
+            "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
+        );
+        eprintln!("[dispatch] {msg}");
+        snap_activity(snap, "error", &msg);
+        return;
+    }
     let run_dir = worktree
         .clone()
         .map(|p| p.to_string_lossy().to_string())

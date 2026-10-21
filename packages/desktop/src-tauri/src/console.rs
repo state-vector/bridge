@@ -90,7 +90,7 @@ fn context_block(artefacts: &[Value]) -> String {
         .join("\n\n")
 }
 
-const INSTRUCTIONS: &str = "You are the Bridge console assistant — a human operator's window into their agent-coordination board (tasks, decisions, questions, progress). Answer ONLY from the supplied board artefacts and the conversation so far; never invent artefacts, ids, or statuses. Cite artefact ids like BR#123 when you use them. Be concise and factual. You cannot claim, dispatch, or modify work — if the human asks for that, tell them to use the board or the dispatch runner.";
+const INSTRUCTIONS: &str = "You are the Bridge console assistant — a human operator's window into their agent-coordination board (tasks, decisions, questions, progress). Answer ONLY from the supplied board artefacts and the conversation so far; never invent artefacts, ids, or statuses. Cite artefact ids like BR#123 when you use them. Be concise and factual. You cannot claim, dispatch, or modify work. If the human's request implies NEW work (a task should exist), end your answer with a line starting `PROPOSE TASK:` followed by a one-sentence task title — the console will draft it for confirmation.";
 
 fn history_block(history: &[Value]) -> String {
     history
@@ -206,6 +206,42 @@ pub fn chat_turn(question: &str, history: &[Value]) -> Result<Value, String> {
         "sources": sources,
         "engine": "none",
     }))
+}
+
+/// Draft a task from the exchange: deterministic second pass over the same
+/// engines with a strict extraction prompt. Returns Some({title, body}) when
+/// the exchange yields a concrete task. NEVER creates anything — the UI asks
+/// for confirmation and calls create_task itself.
+pub fn propose_task(question: &str, answer: &str) -> Result<Option<Value>, String> {
+    let prompt = format!(
+        "{INSTRUCTIONS}\n\nThe human asked:\n{question}\n\nYou answered:\n{answer}\n\nIf that answer implies a NEW board task should exist (work, investigation, decision), output ONLY:\nTITLE: <one-line title>\nBODY: <2-4 sentence task body with context>\nIf no task is warranted, output ONLY: NO TASK"
+    );
+    if let Some(raw) = local_answer(&prompt)? {
+        return Ok(parse_proposal(&raw));
+    }
+    let Some((raw, _)) = cli_answer("draft the task", "", &prompt)? else {
+        return Ok(None);
+    };
+    Ok(parse_proposal(&raw))
+}
+
+fn parse_proposal(raw: &str) -> Option<Value> {
+    let text = raw.trim();
+    if text.starts_with("NO TASK") || !text.contains("TITLE:") {
+        return None;
+    }
+    let title = text
+        .split("TITLE:")
+        .nth(1)
+        .and_then(|seg| seg.split("BODY:").next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let body = text
+        .split("BODY:")
+        .nth(1)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    Some(json!({ "title": title.chars().take(160).collect::<String>(), "body": body }))
 }
 
 // ---- decision watch ----

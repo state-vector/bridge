@@ -110,6 +110,28 @@ async fn chat_send(question: String, history: Vec<serde_json::Value>) -> Result<
         .map_err(|e| e.to_string())?
 }
 
+/// Second pass after an answer: does the exchange imply a new task? Returns
+/// a DRAFT ({title, body}) or null — the UI must confirm before creating.
+#[tauri::command]
+async fn chat_propose_task(question: String, answer: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || console::propose_task(&question, &answer))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|v| v.unwrap_or(serde_json::Value::Null))
+}
+
+/// The human CONFIRMED a chat-drafted task — create it on the hub via MCP.
+#[tauri::command]
+async fn dispatch_create_task(title: String, body: String) -> Result<serde_json::Value, String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("title required".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || dispatch::create_task(&title, body.trim()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn dispatch_start(
     state: tauri::State<'_, dispatch::DispatchState>,
@@ -148,6 +170,8 @@ pub fn run() {
             board_lists,
             decision_act,
             chat_send,
+            chat_propose_task,
+            dispatch_create_task,
             dispatch_start,
             dispatch_stop,
             menubar::show_panel,

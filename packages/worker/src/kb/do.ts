@@ -49,8 +49,14 @@ import {
   parseTags,
   sanitizeTags,
   validateRelation,
-  validateTransition,
 } from "./core.ts";
+import {
+  check as checkRules,
+  invariants as checkInvariants,
+  CHURN_REDIRECT_ATTEMPTS,
+  CHURN_ESCALATE_ATTEMPTS,
+  RuleCtx,
+} from "./machine.ts";
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
