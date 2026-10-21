@@ -2689,8 +2689,6 @@ export class KnowledgeHub {
     }
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
-    const secret = generateAuthToken(); // opaque — the workspace is NOT embedded; routing goes through the central registry
-    const hash = await hashAuthToken(secret);
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();
     this.state.storage.sql.exec(
