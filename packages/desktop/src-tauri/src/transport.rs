@@ -10,10 +10,13 @@
 //!                     opencode 1.3.10 once desktop-shell env vars are stripped.
 //! - `KiroChat`      — `kiro chat --no-interactive` (stream-json).
 //!
-//! Lane rule (BR#550, worker vs leader): dispatched sessions get bridge MCP
-//! disabled via `OPENCODE_CONFIG_CONTENT` regardless of transport. The
-//! gateway owns all hub state changes; workers emit output (stdout or ACP
-//! updates) that the gateway relays.
+//! Lane rule (BR#2451, gateway-run mode): the gateway INJECTS the bridge MCP
+//! config + token into every spawned session (Mode A provisioning — the
+//! runner owns the hub identity for its spawns). Spawned workers may report
+//! progress, block with findings, and ask; "no spawning/claiming other work"
+//! for workers is enforced hub-side via worker-scoped tokens (pending slice).
+//! The caller passes that provisioning as RunRequest.extra_config; both
+//! transports apply it via OPENCODE_CONFIG_CONTENT.
 
 use std::io::{BufRead, BufWriter, Read, Write};
 use std::process::{Child, Command, Stdio};
