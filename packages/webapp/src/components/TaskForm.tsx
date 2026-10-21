@@ -25,7 +25,7 @@ export function TaskForm({ taskId, onClose }: { taskId?: string; onClose: () => 
         setBody(a.body_md ?? "");
         setOwner(a.owner ?? "");
         setTags((a.tags ?? []).join(", "));
-      } catch (e) { setMsg(`failed to load: ${(e as Error).message}`); }
+      } catch (e) { console.error("[task-form] load failed:", e); setMsg(`failed to load: ${(e as Error).message}`); }
     })();
   }, [taskId]);
 
@@ -56,6 +56,7 @@ export function TaskForm({ taskId, onClose }: { taskId?: string; onClose: () => 
       onClose();
       void refresh();
     } catch (e) {
+      console.error("[task-form] save failed:", e);
       setMsg(`failed: ${(e as Error).message}`);
     } finally {
       setLoading(false);
