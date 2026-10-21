@@ -1529,31 +1529,25 @@ fn spawn_opencode(
     // gateway. Identity law (BR#2455): this app is a gateway; the pair flow
     // vends a gw-* token; run_loop refuses to start on anything else.
     let agent_label = agent_identity(cfg);
-    let agent_token = if cfg.token.starts_with("gw-") {
-        match provision_agent_token(cfg, &agent_label) {
-            Ok(t) => t,
-            Err(e) => {
-                // No fallback: dispatching under the gateway's own token would
-                // mis-attribute every board action the session makes. Release
-                // the claim instead — transient hub failures self-heal on the
-                // next tick (the runner may release its own claims, BR#2419).
-                eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
-                snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
-                release_claim(
-                    cfg,
-                    tid,
-                    &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
-                );
-                return;
-            }
+    // Provision the worker's per-agent token. There is NO second class check
+    // here: the token secret is opaque (bkw_*), so a prefix test can never
+    // work, and the class gate is run_loop's (config gateway flag). If
+    // provisioning fails there is no fallback — dispatching under the
+    // gateway's own token would mis-attribute every board action. Release
+    // the claim instead; transient hub failures self-heal next tick (the
+    // runner may release its own claims, BR#2419).
+    let agent_token = match provision_agent_token(cfg, &agent_label) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
+            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
+            release_claim(
+                cfg,
+                tid,
+                &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
+            );
+            return;
         }
-    } else {
-        // unreachable via run_loop (gateway token class is validated at
-        // startup) — defensive: never dispatch under an agent-class identity
-        let msg = "gateway token is not gateway-class (gw-*) — refusing to dispatch; re-pair this device to vend a gateway token (identity law BR#2455)";
-        eprintln!("[dispatch] {msg}");
-        snap_activity(snap, "error", msg);
-        return;
     };
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
