@@ -878,6 +878,21 @@ fn save_session_id(task_id: &str, session_id: &str) {
     );
 }
 
+/// Config-class agent errors: identical on every retry, so retrying is pure
+/// churn (the 104-attempt family). Tight list — false positives here would
+/// block tasks that a transient retry could have saved.
+fn is_config_error(text: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "not found. Falling back to default agent",
+        "ProviderModelNotFoundError",
+        "Unknown model",
+        "Model blocked by guardrail",
+        "is not a valid model",
+        "no such agent",
+    ];
+    MARKERS.iter().any(|m| text.contains(m))
+}
+
 fn extract_pr(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
         // URLs are often wrapped in markdown ("[View PR](https://…/pull/1)")
@@ -1341,6 +1356,38 @@ fn tick(
                 }
             }
         } else {
+            // deterministic config errors (bad agent profile, bad model id,
+            // auth) replay identically on every retry — retrying is pure
+            // churn. Block immediately with the agent's own error text.
+            if is_config_error(&outcome.stdout_tail) || is_config_error(&outcome.stderr_tail) {
+                let block_note = "runner: agent CLI config error (deterministic — not retrying)";
+                let unblock = format!(
+                    "fix the agent config named in the error, then re-claim: {}",
+                    truncate(&tail, 220)
+                );
+                let _ = mcp_call(
+                    cfg,
+                    id,
+                    "transition",
+                    json!({
+                        "id": inf.task_id,
+                        "to": "blocked",
+                        "note": block_note,
+                        "unblock_condition": unblock,
+                    }),
+                );
+                gave_up.insert(inf.task_id.clone());
+                attempts.remove(&inf.task_id);
+                fail_counts.remove(&inf.task_id);
+                remove_task_state(&inf.task_id);
+                msgs.push(format!("{} blocked (agent config error — no retries): {}", inf.task_title, truncate(&tail, 120)));
+                snap_activity(snap, "error", &format!("{} blocked — deterministic agent config error", inf.task_id));
+                if inf.worktree.is_some() {
+                    cleanup_worktree(&cfg.workdir, &inf.task_id, false);
+                }
+                snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
+                continue;
+            }
             // failed/timed out — backoff and retry, capped. Retry loops must
             // NOT keep logging progress on the task: every runner note
             // refreshes last_progress.ts and defeats the watchdog (the task
