@@ -11,6 +11,7 @@ import {
   taskKind,
   validateRelation,
   validateTransition,
+  verifyVerdictStatement,
 } from "../src/kb/core.ts";
 
 describe("tag parsing (stored column is untrusted)", () => {
@@ -197,5 +198,48 @@ describe("agent behaviour score", () => {
   it("effective range is 15..95 (base 50, penalties capped at 35, bonuses at 45)", () => {
     expect(scoreAgent({ ...zero, abandoned: 99, thin_notes: 99 }).score).toBe(15);
     expect(scoreAgent({ ...zero, gauge_count: 99, asks_answered_on_time: 99, artefacts_created: 99 }).score).toBe(95);
+  });
+});
+
+describe("verify-verdict decision statement (human-facing ask prepended at creation)", () => {
+  it("PASS frames the accept-and-close ask with target, receipts source and round", () => {
+    const s = verifyVerdictStatement({
+      decision_class: "verify-verdict",
+      verify_target: "BR#1865",
+      verdict: "pass",
+      round: "1",
+      session: "dispatch-BR-2391",
+    });
+    expect(s).toContain("What you are deciding");
+    expect(s).toContain("agents propose, only a human accepts");
+    expect(s).toContain("closes **BR#1865** as **done**");
+    expect(s).toContain("dispatch-BR-2391");
+    expect(s).toContain("round 1");
+    expect(s).toContain("auto-added"); // clearly marked as machine-generated
+  });
+
+  it("BOUNCE frames the bounce-back ask", () => {
+    const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#42", verdict: "bounce" });
+    expect(s).toContain("bounces **BR#42** back to `in_progress` with the findings");
+    expect(s).not.toContain("closes **");
+  });
+
+  it("falls back gracefully when meta fields are missing", () => {
+    const s = verifyVerdictStatement({ decision_class: "verify-verdict" });
+    expect(s).toContain("the task");
+    expect(s).not.toContain("by session"); // no session clause when absent
+    expect(s).not.toContain("round ");
+  });
+
+  it("accepts meta-shaped round numbers and prefers task over verify_target", () => {
+    const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#9", verify_target: "BR#8", verdict: "pass", round: 4, session: "s1" });
+    expect(s).toContain("**BR#9**");
+    expect(s).not.toContain("BR#8");
+    expect(s).toContain("round 4");
+  });
+
+  it("stays well under the body limit so prepending never trips checkLimits", () => {
+    const s = verifyVerdictStatement({ decision_class: "verify-verdict", verify_target: "BR#123456", verdict: "pass", round: "12", session: "a-very-long-session-name-indeed" });
+    expect(s.length).toBeLessThan(1000);
   });
 });

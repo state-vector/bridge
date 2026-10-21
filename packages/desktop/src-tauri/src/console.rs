@@ -283,20 +283,84 @@ pub fn start_decision_watch(app: tauri::AppHandle) {
                 let title = artefact
                     .and_then(|d| d.get("title").and_then(|v| v.as_str()))
                     .unwrap_or("");
-                let awaiting = artefact
-                    .and_then(|d| d.get("meta"))
-                    .and_then(|m| m.get("awaiting_decision"))
-                    .map(|v| !v.is_null() && v.as_bool().unwrap_or(true))
-                    .unwrap_or(false);
-                let body = if awaiting {
-                    format!("AWAITING DECISION · {id} — {}", snippet(title, 140))
-                } else {
-                    format!("{id} — {}", snippet(title, 140))
-                };
+                let meta = artefact.and_then(|d| d.get("meta")).cloned().unwrap_or(Value::Null);
+                let body = decision_notify_body(id, title, &meta);
                 notify_decision(&app, id, &body);
             }
         }
     });
+}
+
+/// Human-readable notification line for a proposed decision. Verify-verdicts
+/// get the ASK ("Accept verification of BR#X — verdict PASS?"), not the raw
+/// title: verifier titles are receipts-dense and never say what the human is
+/// deciding or why it lands on them (BR#2453). Generic decisions keep the
+/// title snippet.
+fn decision_notify_body(id: &str, title: &str, meta: &Value) -> String {
+    let awaiting = meta
+        .get("awaiting_decision")
+        .map(|v| !v.is_null() && v.as_bool().unwrap_or(true))
+        .unwrap_or(false);
+    let prefix = if awaiting {
+        format!("AWAITING DECISION · {id} — ")
+    } else {
+        format!("{id} — ")
+    };
+    if meta.get("decision_class").and_then(|v| v.as_str()) == Some("verify-verdict") {
+        let target = meta
+            .get("task")
+            .and_then(|v| v.as_str())
+            .or_else(|| meta.get("verify_target").and_then(|v| v.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("task");
+        let verdict = meta.get("verdict").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let line = if verdict.eq_ignore_ascii_case("bounce") {
+            format!("Bounce {target} back to work? — verifier findings inside")
+        } else if verdict.is_empty() {
+            format!("Accept verification of {target}?")
+        } else {
+            format!("Accept verification of {target}? — verdict {}", verdict.to_uppercase())
+        };
+        return format!("{prefix}{line}");
+    }
+    format!("{prefix}{}", snippet(title, 140))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decision_notify_body;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn verify_verdict_notification_states_the_ask() {
+        let m = json!({ "decision_class": "verify-verdict", "verify_target": "BR#1865", "verdict": "pass" });
+        assert_eq!(
+            decision_notify_body("BR#2453", "BR#1865 verify verdict …dense receipts…", &m),
+            "BR#2453 — Accept verification of BR#1865? — verdict PASS"
+        );
+    }
+
+    #[test]
+    fn bounce_notification_asks_about_bouncing() {
+        let m = json!({ "decision_class": "verify-verdict", "task": "BR#42", "verdict": "bounce" });
+        assert_eq!(
+            decision_notify_body("BR#1", "dense title", &m),
+            "BR#1 — Bounce BR#42 back to work? — verifier findings inside"
+        );
+    }
+
+    #[test]
+    fn generic_decisions_keep_the_title_snippet_and_awaiting_flag() {
+        let m = json!({ "awaiting_decision": true });
+        assert_eq!(
+            decision_notify_body("BR#2", "some generic decision title", &m),
+            "AWAITING DECISION · BR#2 — some generic decision title"
+        );
+        assert_eq!(
+            decision_notify_body("BR#3", "plain", &Value::Null),
+            "BR#3 — plain"
+        );
+    }
 }
 
 fn notify_decision(app: &tauri::AppHandle, id: &str, body: &str) {

@@ -380,6 +380,35 @@ export function checkLimits(title: string, body: string, meta?: unknown): string
   return null;
 }
 
+// ---------- verify-verdict decision statement ----------
+
+/** Human-facing ask for verify-verdict decisions, prepended to body_md at
+ *  creation (do.ts). Verifiers file receipts-dense cards whose title/body
+ *  never say what the human is deciding or why it lands on them — BR#2453
+ *  taught us that. The statement mirrors the accept-side effect EXACTLY
+ *  (do.ts transition: accept + verdict=bounce → target in_progress, else
+ *  target done) so the card never overpromises. Pure: meta in, markdown out. */
+export function verifyVerdictStatement(meta: unknown): string {
+  const m = (meta ?? {}) as Record<string, unknown>;
+  const target = String(m.task ?? m.verify_target ?? "").trim() || "the task";
+  const isBounce = String(m.verdict ?? "").toLowerCase() === "bounce";
+  const session = String(m.session ?? "").trim();
+  const roundRaw = m.round ?? m.verify_round;
+  const round = roundRaw == null || roundRaw === "" ? null : Number(roundRaw);
+  const effect = isBounce
+    ? `bounces **${target}** back to \`in_progress\` with the findings`
+    : `closes **${target}** as **done**`;
+  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}${round ? ` (round ${round})` : ""}`;
+  return [
+    `> ⚖️ **What you are deciding** — *auto-added, not part of the verifier's receipts*`,
+    `>`,
+    `> You are the acceptance gate: agents propose, only a human accepts. Your click settles the verdict.`,
+    `> - **Accept** = ratify it — the verdict ${effect}.`,
+    `> - **Supersede** = the verdict doesn't hold; record why.`,
+    `> You are NOT being asked to re-verify — ${checked}.`,
+  ].join("\n");
+}
+
 
 // ---------- semantic search (fuzzy smarts) ----------
 
