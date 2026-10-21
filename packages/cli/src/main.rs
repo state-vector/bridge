@@ -177,6 +177,7 @@ fn run(cfg: Option<DispatchConfig>) {
                     label: None,
                     agent_name: None,
                     ws: None,
+                    gateway: None,
                     model: std::env::var("BRIDGE_MODEL").ok(),
                     backend: std::env::var("BRIDGE_BACKEND").ok(),
                     backends: std::env::var("BRIDGE_BACKENDS")
@@ -434,8 +435,8 @@ fn doctor() -> bool {
 
     // per-provider sections: model optional (unset = the CLI's own default
     // config decides for opencode; kiro profiles pin provider+model)
-    let backends = cfg.enabled_backends();
-    for (b, section) in &backends {
+    let backends = &cfg.backends;
+    for (b, section) in backends {
         match &section.model {
             Some(m) if !m.trim().is_empty() => println!("  \x1b[32mok\x1b[0m   model[{b}] = {m}"),
             _ => println!("  \x1b[33mwarn\x1b[0m  model[{b}] — not set; the CLI's own default config decides (set \"backends.{b}.model\" to pin spend)"),
@@ -498,7 +499,7 @@ fn doctor() -> bool {
     }
 
     // agent CLI binaries reachable?
-    for (b, section) in &backends {
+    for (b, section) in backends {
         let bin = section.bin.clone().unwrap_or_else(|| if b == "kiro" { "kiro".to_string() } else { cfg.opencode_bin.clone() });
         let bin = bin.as_str();
         let found = std::process::Command::new(bin)

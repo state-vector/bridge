@@ -40,6 +40,7 @@ pub struct DispatchConfig {
     pub agent_name: Option<String>, // name dispatched tasks are attributed to (override for the <hostname>-<backend> autogen)
     #[serde(default)]
     pub ws: Option<String>, // workspace slug from pairing
+    #[serde(default)]
     pub gateway: Option<bool>, // Some(true): paired as gateway-class — set by pairing from the vended tags (the secret is opaque; class is a trait)
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize, // WIP limit for this node
