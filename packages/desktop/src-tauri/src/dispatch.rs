@@ -2219,6 +2219,11 @@ fn tick(
         if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false)
             || task.get("is_claimable").and_then(|q| q.as_bool()) == Some(false)
         {
+            // silence here reads as a dead runner: the queue looks full and
+            // nothing moves, with no errors anywhere. Say why — once per
+            // backoff window (the attempts insert paces the note too).
+            attempts.insert(tid.to_string(), Instant::now());
+            msgs.push(format!("{tid} not claimable (qualification/attempted gate) — needs a role:analysis pass or a human re-issue"));
             continue;
         }
         if gave_up.contains(tid) {
