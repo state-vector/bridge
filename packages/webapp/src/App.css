@@ -22,6 +22,27 @@
 body, #root { margin: 0; height: 100%; }
 body { background: transparent; color: var(--text); }
 
+/* ---- form baseline: a raw element is a styled element ----
+   One coherent look for every input/select/textarea in the app; scoped
+   overrides (.login-input, .settings-drawer input, …) layer on top. No
+   form element in this app should ever render browser-default. */
+input, select, textarea {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: var(--text-faint); }
+input[type="checkbox"] { width: 15px; height: 15px; padding: 0; accent-color: var(--accent); vertical-align: middle; }
+input[type="number"] { width: 76px; }
+select { cursor: pointer; }
+textarea { resize: vertical; line-height: 1.5; }
+
 .app {
   display: flex; flex-direction: column;
   height: calc(100vh - 12px); margin: 6px;
