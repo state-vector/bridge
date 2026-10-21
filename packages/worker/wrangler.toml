@@ -1,5 +1,10 @@
 name = "bridge"
 main = "src/index.js"
+
+# the served UI lives in @bridge/webapp and is COMMITTED as dist — rebuild it
+# on every deploy so the bundle can never go stale against its source
+[build]
+command = "npm run build -w @bridge/webapp"
 compatibility_date = "2026-01-15"
 # account_id comes from CLOUDFLARE_ACCOUNT_ID in the environment — not committed.
 
