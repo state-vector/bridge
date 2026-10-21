@@ -180,21 +180,15 @@ export function tokenWorkspace(secret: string): string | null {
   return m ? m[1] : null;
 }
 
-// ---------- identity namespace law (BR#2455) ----------
+// ---------- identity namespace law (BR#2455, revised) ----------
 /**
- * One label namespace, two classes. Gateways are infrastructure and MUST be
- * named `gw-*`; agent labels MUST NOT take the prefix. Enforced at every label
- * write (mint, pair-approve, rename, tags-update) so the Connect conflation —
- * a gateway presenting under an agent's label (BR#50/BR#887) — becomes
- * unrepresentable. Existing rows keep their labels (BR#899 migration stance):
- * the law governs new writes only, no history rewrite.
+ * Gateway is a token TRAIT (the `gateway` tag — attribution authority:
+ * isGatewayActor / tagsSayGateway), not a naming convention. Labels are
+ * free-form identity names: a gateway named after its host and an agent with
+ * any label are equally legal. Provisioning gates on the TAG, never the
+ * prefix — the streams cannot cross because the class never derives from the
+ * name. (Revokes the earlier gw-* label law: same protection, no coupling.)
  */
-export const GW_LABEL_RE = /^gw-[a-z0-9][a-z0-9-]{0,37}$/;
-
-export function isGatewayLabel(label: unknown): boolean {
-  return typeof label === "string" && GW_LABEL_RE.test(label);
-}
-
 /**
  * Gateway classification from a token's tags. Tags are user-malleable and
  * mint does not sanitize them, so match the literal case-insensitively —

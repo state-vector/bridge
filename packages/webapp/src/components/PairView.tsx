@@ -3,8 +3,12 @@ import { useEffect, useState } from "react";
 /**
  * Device pairing approval (GitHub-like device flow, bridge-native).
  * Reached at /pair by a human already signed in via GitHub. The device shows a
- * code; approving mints an agent token in the chosen workspace — the token
- * flows to the DEVICE via its poll loop, never to the approver.
+ * code; approving mints a token in the chosen workspace — the token flows to
+ * the DEVICE via its poll loop, never to the approver.
+ *
+ * The device declares its class at pair/start (gateway | agent); the approver
+ * never chooses it — they only name the identity and pick the workspace.
+ * Gateway is a token trait, not a naming convention: the label is free-form.
  */
 
 async function api<T>(path: string, body: unknown): Promise<T> {
@@ -21,17 +25,14 @@ async function api<T>(path: string, body: unknown): Promise<T> {
 
 const ROLES = ["impl", "analysis", "review"];
 
-/** Device-pairing label prefill: gateways are gw-<device>, agents keep the device name. */
-function prefillLabel(device: string, gateway: boolean): string {
-  const slug = device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device";
-  return gateway ? `gw-${slug.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+/, "")}` : slug;
+function prefillLabel(device: string): string {
+  return device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device";
 }
 
 export function PairView() {
   const [code, setCode] = useState("");
-  const [info, setInfo] = useState<{ device: string; created_ts: number } | null>(null);
+  const [info, setInfo] = useState<{ device: string; type: string; created_ts: number } | null>(null);
   const [label, setLabel] = useState("");
-  const [gateway, setGateway] = useState(false);
   const [ws, setWs] = useState("");
   const [workspaces, setWorkspaces] = useState<Array<{ slug: string }>>([]);
   const [roles, setRoles] = useState<string[]>(["impl"]);
@@ -50,7 +51,7 @@ export function PairView() {
     setMsg("");
     setBusy(true);
     try {
-      const d = await api<{ device: string; created_ts: number; status: string }>("/api/pair/get", {
+      const d = await api<{ device: string; type: string; created_ts: number; status: string }>("/api/pair/get", {
         code: code.trim().toUpperCase(),
       });
       if (d.status !== "pending") {
@@ -58,8 +59,8 @@ export function PairView() {
         setMsg(`code is ${d.status}`);
         return;
       }
-      setInfo({ device: d.device, created_ts: d.created_ts });
-      setLabel(prefillLabel(d.device, gateway));
+      setInfo({ device: d.device, type: d.type ?? "agent", created_ts: d.created_ts });
+      setLabel(prefillLabel(d.device));
     } catch (e) {
       setMsg((e as Error).message);
     } finally {
@@ -71,11 +72,12 @@ export function PairView() {
     setMsg("");
     setBusy(true);
     try {
+      const gateway = info?.type === "gateway";
       await api("/api/pair/approve", {
         code: code.trim().toUpperCase(),
         ws,
         label: label.trim(),
-        tags: gateway ? ["gateway"] : roles.map((r) => `role:${r}`),
+        ...(gateway ? {} : { tags: roles.map((r) => `role:${r}`) }),
       });
       setDone(true);
     } catch (e) {
@@ -99,6 +101,8 @@ export function PairView() {
       </div>
     );
   }
+
+  const gateway = info?.type === "gateway";
 
   return (
     <div className="auth-gate">
@@ -127,10 +131,11 @@ export function PairView() {
             <p className="auth-host">
               Pair <b>{info.device}</b>?
             </p>
-            <label className="ask-chips-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type="checkbox" checked={gateway} onChange={(e) => { setGateway(e.target.checked); setLabel(prefillLabel(info.device, e.target.checked)); }} />
-              <span>this device is a <b>gateway</b> (runner host — identity becomes <code>gw-&lt;name&gt;</code>, not an agent)</span>
-            </label>
+            <p className="muted-note">
+              {gateway
+                ? "This device declared itself a gateway (runner host) — it will join as gateway-class infrastructure and provision tokens for the workers it spawns."
+                : "This device will join as an agent."}
+            </p>
             <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
             <input className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>

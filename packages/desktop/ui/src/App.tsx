@@ -360,38 +360,43 @@ export function App() {
   const [pairCode, setPairCode] = useState<string | null>(null);
   const [pairingUrl, setPairingUrl] = useState("");
   const [pairErr, setPairErr] = useState("");
+  const [copied, setCopied] = useState(false);
 
   // logged-out / first-use: config exists but no vendored gateway token
   const paired = !!cfg?.token;
 
-  const onboarding = (
-    <main className="gw-main">
-      <div className="gw-card">
-        <h2>Pair this desktop</h2>
-        <div className="gw-row">
-          <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
-            onChange={(e) => setHubUrl(e.target.value)} />
-          <button className="gw-btn gw-btn-run" disabled={!!pairCode} onClick={() => void startPair()}>Pair</button>
-        </div>
-        {pairCode && (
-          <div className="gw-row" style={{ marginTop: 8 }}>
-            <span className="gw-note">
-              Enter code <span className="gw-mono">{pairCode}</span> at{" "}
-              <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${pairingUrl}/pair`); }}>
-                {pairingUrl}/pair
-              </a>{" "}
-              — waiting for approval…
-            </span>
-          </div>
-        )}
-        {pairErr && (
-          <div className="gw-row" style={{ marginTop: 8 }}>
-            <span className="gw-err">{pairErr}</span>
-          </div>
-        )}
-      </div>
-    </main>
-  );
+  const startPair = async () => {
+    const url = hubUrl.trim().replace(/\/$/, "");
+    if (!url) {
+      setPairErr("hub url required");
+      return;
+    }
+    setPairErr("");
+    setPairingUrl(url);
+    try {
+      const code = await invoke<string>("pair_start", { url });
+      setPairCode(code);
+      // persist so a relaunch resumes the poll instead of orphaning the code
+      localStorage.setItem("bridge-pair-pending", JSON.stringify({ url, code, ts: Date.now() }));
+      // the approval page opens itself — pairing is one button, not a hunt
+      openExternal(`${url}/pair`);
+    } catch (e) {
+      setPairErr(String(e));
+    }
+  };
+
+  const copyCode = async () => {
+    if (!pairCode) return;
+    try {
+      await navigator.clipboard.writeText(pairCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* clipboard unavailable — the code is on screen anyway */ }
+  };
+
+
+
+
 
   const doLogout = async () => {
     if (!window.confirm("Log out? This stops the runner and clears the gateway token — your settings are kept; pair again to onboard.")) return;
@@ -446,20 +451,24 @@ export function App() {
     } catch { /* no shell */ }
   }, []);
 
-  const startPair = async () => {
-    const url = hubUrl.trim().replace(/\/$/, "");
-    if (!url) {
-      setPairErr("hub url required");
-      return;
-    }
-    setPairErr("");
-    setPairingUrl(url);
+
+
+  // resume a pending pairing from a previous run (crash/relaunch): the code
+  // is still valid hub-side for 15 minutes, so keep polling for it
+  useEffect(() => {
     try {
-      setPairCode(await invoke<string>("pair_start", { url }));
-    } catch (e) {
-      setPairErr(String(e));
-    }
-  };
+      const raw = localStorage.getItem("bridge-pair-pending");
+      if (!raw) return;
+      const p = JSON.parse(raw) as { url: string; code: string; ts: number };
+      if (p.url && p.code && Date.now() - p.ts < 14 * 60_000) {
+        setPairingUrl(p.url);
+        setPairCode(p.code);
+      } else {
+        localStorage.removeItem("bridge-pair-pending");
+      }
+    } catch { /* no pending pairing */ }
+  }, []);
+
 
   // pairing poll: every 3s until authorized (token merged + saved) or expired
   useEffect(() => {
@@ -470,16 +479,19 @@ export function App() {
         const r = await invoke<any>("pair_poll", { url: pairingUrl, code: pairCode });
         if (stop) return;
         if (r?.status === "authorized") {
+          localStorage.removeItem("bridge-pair-pending");
           setPairCode(null);
           await loadCfg();
           await pull();
           setLogoutMsg("");
         } else if (r?.status === "expired") {
+          localStorage.removeItem("bridge-pair-pending");
           setPairErr("code expired — pair again");
           setPairCode(null);
         }
       } catch (e) {
         if (!stop) {
+          localStorage.removeItem("bridge-pair-pending");
           setPairErr(String(e));
           setPairCode(null);
         }
@@ -490,6 +502,44 @@ export function App() {
       clearInterval(t);
     };
   }, [pairCode, pairingUrl, loadCfg, pull]);
+
+  // logged out / first use = ONE screen: pair this desktop. No nav, no pages,
+  // no board chrome — nothing else is reachable without an identity.
+  if (!paired) {
+    return (
+      <div className="gw">
+        <header className="gw-head">
+          <span className="gw-brand">bridge<span className="cursor" /></span>
+        </header>
+        <main className="gw-main">
+          <div className="gw-card">
+            <h2>Pair this desktop</h2>
+            <div className="gw-row">
+              <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
+                onChange={(e) => setHubUrl(e.target.value)} />
+              <button className="gw-btn gw-btn-run" disabled={!!pairCode} onClick={() => void startPair()}>Pair</button>
+            </div>
+            {pairCode && (
+              <>
+                <div className="gw-row" style={{ marginTop: 14 }}>
+                  <span className="gw-mono" style={{ fontSize: 30, letterSpacing: 6, fontWeight: 600 }}>{pairCode}</span>
+                  <button className="gw-btn" onClick={() => void copyCode()}>{copied ? "copied ✓" : "Copy"}</button>
+                </div>
+                <span className="gw-note">
+                  Enter this code at <span className="gw-mono">{pairingUrl}/pair</span> (just opened in your browser) — waiting for approval…
+                </span>
+              </>
+            )}
+            {pairErr && (
+              <div className="gw-row" style={{ marginTop: 8 }}>
+                <span className="gw-err">{pairErr}</span>
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+    );
+  }
 
   useEffect(() => {
     void pull();
@@ -590,10 +640,10 @@ export function App() {
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
-      {page === "forme" && (paired ? <ForYou hubUrl={snap?.url ?? null} /> : onboarding)}
-      {page === "top" && (paired ? <Top /> : onboarding)}
-      {page === "backlog" && (paired ? <Backlog /> : onboarding)}
-      {page === "chat" && (paired ? <Chat /> : onboarding)}
+      {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
+      {page === "top" && <Top />}
+      {page === "backlog" && <Backlog />}
+      {page === "chat" && <Chat />}
 
 
       {page === "log" && (
@@ -613,7 +663,7 @@ export function App() {
         </main>
       )}
 
-      {page === "settings" && (paired ? (
+      {page === "settings" && (
         <main className="gw-main">
           <div className="gw-card">
             <h2>Runner</h2>
@@ -721,7 +771,7 @@ export function App() {
             </div>
           </div>
         </main>
-      ) : onboarding)}
+      )}
     </div>
   );
 }

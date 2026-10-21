@@ -3,11 +3,9 @@ import {
   composeBootstrap,
   generateAuthToken,
   hashAuthToken,
-  isGatewayLabel,
   isWsSlug,
   isValidAskTarget,
   isValidAuthTokenShape,
-  labelClassError,
   tagsSayGateway,
   tokenWorkspace,
   DEFAULT_BOARD,
@@ -60,29 +58,13 @@ describe("ask targets", () => {
   });
 });
 
-describe("identity namespace law (BR#2455)", () => {
-  it("gateway labels are gw-* (lowercase, hyphenated), nothing else", () => {
-    expect(isGatewayLabel("gw-macbookpro")).toBe(true);
-    expect(isGatewayLabel("gw-1")).toBe(true);
-    expect(isGatewayLabel(`gw-${"a".repeat(38)}`)).toBe(true);
-    expect(isGatewayLabel("macbookpro")).toBe(false);
-    expect(isGatewayLabel("opencode-ray")).toBe(false);
-    expect(isGatewayLabel("gw-")).toBe(false); // empty name
-    expect(isGatewayLabel("gw-MacBookPro")).toBe(false); // lowercase only
-    expect(isGatewayLabel("gw-mac_book")).toBe(false); // no underscores
-    expect(isGatewayLabel("gw-mac.book")).toBe(false); // no dots
-    expect(isGatewayLabel(`gw-${"a".repeat(39)}`)).toBe(false); // 43 chars > 40 cap
-    expect(isGatewayLabel("gwx")).toBe(false);
-    expect(isGatewayLabel("")).toBe(false);
-    expect(isGatewayLabel(null)).toBe(false);
-  });
-
-  it("gateway-tagged tokens MUST be gw-*, agent labels MUST NOT be", () => {
-    expect(labelClassError("gw-macbookpro", true)).toBeNull();
-    expect(labelClassError("opencode-ray", false)).toBeNull();
-    expect(labelClassError("macbookpro", true)).toMatch(/gw-/); // the live defect: hostname-named gateway
-    expect(labelClassError("gw-x", false)).toMatch(/reserved/); // agent stealing the gateway prefix
-    expect(labelClassError("GW-Big", true)).toMatch(/gw-/);
+describe("identity namespace law (BR#2455, revised: class is a trait)", () => {
+  it("labels are free-form — the gateway TAG is the class, never the name", () => {
+    // a gateway named after its host and an agent with any label are legal;
+    // there is no reserved namespace, so nothing can be asserted on labels
+    expect(tagsSayGateway(["gateway"])).toBe(true);
+    expect(tagsSayGateway(["role:impl", "gateway"])).toBe(true);
+    expect(tagsSayGateway(["role:impl"])).toBe(false);
   });
 
   it("gateway classification is case-insensitive on the tag, shape-tolerant like parseTags", () => {

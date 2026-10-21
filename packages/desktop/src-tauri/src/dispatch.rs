@@ -326,11 +326,13 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
 }
 
 /// First half of the device flow: register this device, get the enter-code.
+/// This app IS a gateway — the pairing declares that class; the hub vends a
+/// gateway-class token on approval. The approver never chooses.
 pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str) -> Result<String, String> {
     let start: serde_json::Value = client
         .post(format!("{url}/api/pair/start"))
         .header("content-type", "application/json")
-        .body(json!({ "device": device }).to_string())
+        .body(json!({ "device": device, "type": "gateway" }).to_string())
         .send()
         .map_err(|e| format!("bridge unreachable: {e}"))?
         .json()

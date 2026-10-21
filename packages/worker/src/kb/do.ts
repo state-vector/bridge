@@ -46,7 +46,6 @@ import {
   isQuestionTask,
   isWsSlug,
   isValidAskTarget,
-  labelClassError,
   tagsSayGateway,
   parseTags,
   sanitizeTags,
@@ -593,6 +592,7 @@ export class KnowledgeHub {
       CREATE TABLE IF NOT EXISTS pairings (
         code TEXT PRIMARY KEY,
         device TEXT NOT NULL,
+        type TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         ws TEXT,
         label TEXT,
@@ -682,8 +682,6 @@ export class KnowledgeHub {
       if (!old) throw new Error("auth token not found");
       if (newLabel !== old.label) {
         if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, newLabel)) throw new Error(`label '${newLabel}' already exists`);
-        const classErr = labelClassError(newLabel, tagsSayGateway(old.tags));
-        if (classErr) throw new Error(classErr);
       }
       this.state.storage.sql.exec(
         `UPDATE auth_tokens SET label = ? WHERE id = ?`,
@@ -2481,6 +2479,7 @@ export class KnowledgeHub {
 
   private pairPurge() {
     const cutoff = Date.now() - KnowledgeHub.PAIR_TTL_MS;
+    try { this.state.storage.sql.exec(`ALTER TABLE pairings ADD COLUMN type TEXT`); } catch { /* existing table */ }
     this.state.storage.sql.exec(`DELETE FROM pairings WHERE created_ts < ?`, cutoff);
     // hard cap on pending rows so /api/pair/start can't be spammed into bloat
     const n = this.one(`SELECT COUNT(*) AS n FROM pairings WHERE status = 'pending'`)?.n ?? 0;
@@ -2496,16 +2495,19 @@ export class KnowledgeHub {
     this.pairPurge();
     const code = this.pairCode();
     const now = Date.now();
+    // the DEVICE declares its class at start; the approver never chooses —
+    // streams cannot cross because the request, not the human, sets the type
+    const type = body.type === "gateway" ? "gateway" : "agent";
     this.state.storage.sql.exec(
-      `INSERT INTO pairings (code, device, status, created_ts) VALUES (?, ?, 'pending', ?)`,
-      code, String(body.device ?? "device").slice(0, 80), now,
+      `INSERT INTO pairings (code, device, type, status, created_ts) VALUES (?, ?, ?, 'pending', ?)`,
+      code, String(body.device ?? "device").slice(0, 80), type, now,
     );
-    return { code, expires_ts: now + KnowledgeHub.PAIR_TTL_MS };
+    return { code, type, expires_ts: now + KnowledgeHub.PAIR_TTL_MS };
   }
 
   private async wsPairGet(body: any) {
     const row = this.one(
-      `SELECT device, status, created_ts, ws, label FROM pairings WHERE code = ?`,
+      `SELECT device, type, status, created_ts, ws, label FROM pairings WHERE code = ?`,
       String(body.code ?? "").trim().toUpperCase(),
     );
     if (!row) return { status: "expired" };
@@ -2513,7 +2515,7 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, row.code);
       return { status: "expired" };
     }
-    return { status: row.status, device: row.device, created_ts: row.created_ts, ws: row.ws, label: row.label };
+    return { status: row.status, device: row.device, type: row.type ?? "agent", created_ts: row.created_ts, ws: row.ws, label: row.label };
   }
 
   private async wsPairApprove(body: any) {
@@ -2521,18 +2523,18 @@ export class KnowledgeHub {
     const ws = String(body.ws ?? "").trim();
     const label = String(body.label ?? "").trim();
     const login = String(body.login ?? "").toLowerCase();
-    const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
-    if (!isWsSlug(ws)) throw new Error("bad workspace slug");
-    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
-    // namespace law (BR#2455): a gateway-class pairing must be named gw-*
-    const classErr = labelClassError(label, tagsSayGateway(tags));
-    if (classErr) throw new Error(classErr);
-    const row = this.one(`SELECT code, created_ts, status, device FROM pairings WHERE code = ?`, code);
+    const row = this.one(`SELECT code, created_ts, status, device, type FROM pairings WHERE code = ?`, code);
     if (!row || row.status !== "pending") throw new Error("pairing code not pending");
     if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
       this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
       throw new Error("pairing code expired");
     }
+    // class was declared by the DEVICE at pair/start — the approver cannot
+    // change it, only name the identity and pick the workspace
+    const gateway = row.type === "gateway";
+    const tags = gateway ? ["gateway"] : Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
+    if (!isWsSlug(ws)) throw new Error("bad workspace slug");
+    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
     if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
     // mint in the target workspace's DO (registers hash → ws in the central
@@ -2591,10 +2593,10 @@ export class KnowledgeHub {
    *  stores them. Exists w/o rotate = { exists: true } (no secret re-exposed). */
   private async agentProvision(body: any, actor: string) {
     const caller = String(body.provisioned_by ?? actor);
-    if (!/^gw-/.test(caller)) throw new Error("agent provisioning requires a gateway-class (gw-*) caller");
+    // gateway is a token trait: the caller's TAG provisions, its name is irrelevant
+    if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
-    if (label.startsWith("gw-")) throw new Error(`agent labels must not start with gw- (reserved for gateways)`);
     const rotate = body.rotate === true;
     const ts = Date.now();
     const existing = this.one(`SELECT id, revoked_ts FROM auth_tokens WHERE label = ?`, label);
@@ -2631,9 +2633,6 @@ export class KnowledgeHub {
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
-    // namespace law (BR#2455): gateway-tagged tokens are gw-*, agent labels never are
-    const classErr = labelClassError(label, tagsSayGateway(tags));
-    if (classErr) throw new Error(classErr);
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
     const secret = generateAuthToken(); // opaque — the workspace is NOT embedded; routing goes through the central registry
     const hash = await hashAuthToken(secret);
@@ -2688,15 +2687,6 @@ export class KnowledgeHub {
     const row = this.one(`SELECT id, label, tags FROM auth_tokens WHERE id = ?`, id);
     if (!row) throw new Error(`no such auth token: ${id}`);
     const tags = sanitizeTags(body.tags);
-    // namespace law (BR#2455): tag edits cannot push a label across the gw-*
-    // class boundary. Same-class edits on legacy rows (e.g. 'macbookpro' kept
-    // per the BR#899 migration stance) stay legal; what's rejected is any
-    // crossing that would make (label, class) illegal — tagging an agent label
-    // as a gateway, or stripping the gateway tag off a gw-* identity.
-    if (!!tagsSayGateway(row.tags) !== tagsSayGateway(tags ?? [])) {
-      const classErr = labelClassError(row.label, tagsSayGateway(tags ?? []));
-      if (classErr) throw new Error(classErr);
-    }
     this.state.storage.sql.exec(
       `UPDATE auth_tokens SET tags = ? WHERE id = ?`,
       tags ? JSON.stringify(tags) : "[]", id,
