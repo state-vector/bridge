@@ -2640,31 +2640,37 @@ export class KnowledgeHub {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
-    // re-pairing the same physical machine re-associates: rotate the token,
-    // keep the identity — the label collision is with ITSELF, which is fine
-    if (device_id) {
-      const own = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id);
-      if (own) {
-        if (own.revoked_ts) throw new Error(`token '${own.label}' for this device was revoked — un-revoke it first`);
-        const secret = generateAuthToken();
-        const hash = await hashAuthToken(secret);
-        this.state.storage.sql.exec(
-          `UPDATE auth_tokens SET hash = ?, label = ? WHERE id = ?`,
-          hash, label, own.id,
-        );
-        const ws = this.wsSlug();
-        if (ws) {
-          const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
-          await reg.fetch("https://kb/ws.token_register", {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ hash, ws }),
-          });
-        }
-        this.audit("pair", "reassociate", own.id, { label });
-        return { id: own.id, label, secret, reassociated: true };
-      }
+    // Replace semantics (pairing is an approval): the same machine re-pairing
+    // rotates its token — renamed or not — and re-using a label REPLACES the
+    // token that held it. A name has exactly one live token; nothing
+    // accumulates, nothing dead-ends on "already exists".
+    const secret = generateAuthToken();
+    const hash = await hashAuthToken(secret);
+    let own = device_id ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id) : null;
+    const byLabel = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE label = ?`, label);
+    if (own && byLabel && own.id !== byLabel.id) {
+      // renaming this machine onto another token's name: that identity is
+      // replaced (the human approved the pairing; one name, one live token)
+      this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE id = ?`, byLabel.id);
+      this.audit("pair", "replace", byLabel.id, { label });
     }
-    if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label)) throw new Error(`label '${label}' already exists`);
+    const target = (own && !byLabel) ? own : (byLabel ?? own);
+    if (target) {
+      this.state.storage.sql.exec(
+        `UPDATE auth_tokens SET hash = ?, label = ?, device_id = COALESCE(?, device_id), revoked_ts = NULL WHERE id = ?`,
+        hash, label, device_id, target.id,
+      );
+      const ws = this.wsSlug();
+      if (ws) {
+        const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+        await reg.fetch("https://kb/ws.token_register", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ hash, ws }),
+        });
+      }
+      this.audit("pair", "reassociate", target.id, { label });
+      return { id: target.id, label, secret, reassociated: true };
+    }
     const tags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
     const transport = (TRANSPORTS as readonly string[]).includes(body.transport) ? body.transport : "mcp";
     const secret = generateAuthToken(); // opaque — the workspace is NOT embedded; routing goes through the central registry
