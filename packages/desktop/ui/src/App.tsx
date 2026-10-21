@@ -350,6 +350,20 @@ export function App() {
   const [backendAgents, setBackendAgents] = useState<Record<string, string>>({});
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
+  const [logoutMsg, setLogoutMsg] = useState("");
+
+  const doLogout = async () => {
+    if (!window.confirm("Log out? This stops the runner and erases the pairing + saved settings — you will need to pair again to onboard.")) return;
+    try {
+      await invoke("logout");
+      setCfg(null);
+      setHubUrl("");
+      setSnap((s) => (s ? { ...s, running: false, url: null, label: null, agent: null, workspace: null, workdir: null, in_flight: [] } : s));
+      setLogoutMsg("logged out — pair again to onboard");
+    } catch (e) {
+      setLogoutMsg(`failed: ${String(e)}`);
+    }
+  };
 
   const pull = useCallback(async () => {
     try {
@@ -614,6 +628,11 @@ export function App() {
               <button className="gw-btn gw-btn-run" onClick={() => void applySettings()}>Apply</button>
               {applyMsg && <span className="gw-ok">{applyMsg}</span>}
               <span className="gw-note">applying restarts the runner when it is running</span>
+            </div>
+            <div className="gw-row" style={{ marginTop: 10 }}>
+              <button className="gw-btn gw-btn-stop" onClick={() => void doLogout()}>Log out</button>
+              {logoutMsg && <span className="gw-note">{logoutMsg}</span>}
+              <span className="gw-note">stops the runner and erases the pairing — pair again to onboard</span>
             </div>
           </div>
         </main>

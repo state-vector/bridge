@@ -1277,6 +1277,15 @@ fn note_task(cfg: &DispatchConfig, tid: &str, did: &str) {
     let _ = mcp_call(cfg, &mut id, "log_progress", json!({ "id": tid, "did": did }));
 }
 
+/// Release this runner's own claim (in_progress → todo) with a note. BR#2419:
+/// the runner may release its own claims — that is the only card move it makes
+/// besides claiming.
+fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) {
+    let mut id = 0i64;
+    let _ = mcp_call_task(cfg, &mut id, "transition", json!({ "id": tid, "to": "todo" }), &tid);
+    note_task(cfg, tid, did);
+}
+
 fn spawn_opencode(
     cfg: &DispatchConfig,
     snap: &SharedSnapshot,
@@ -1444,13 +1453,18 @@ fn spawn_opencode(
         match provision_agent_token(cfg, &agent_label) {
             Ok(t) => t,
             Err(e) => {
-                // a gw-* host SHOULD be able to provision — a failure here is
-                // transient (hub down, network). Fall back to the gateway's
-                // own token, loudly and accurately: attribution reads as the
-                // gateway until provisioning succeeds.
-                eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — falling back to the gateway token; sessions attribute to the gateway until provisioning succeeds");
-                snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — sessions attribute to the gateway until provisioning succeeds"));
-                cfg.token.clone()
+                // No fallback: dispatching under the gateway's own token would
+                // mis-attribute every board action the session makes. Release
+                // the claim instead — transient hub failures self-heal on the
+                // next tick (the runner may release its own claims, BR#2419).
+                eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
+                snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
+                release_claim(
+                    cfg,
+                    tid,
+                    &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
+                );
+                return;
             }
         }
     } else {
@@ -2217,16 +2231,16 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // Identity law (BR#2455): this app is a gateway. The pair flow vends a
     // gateway-class token (gw-*); running on an agent-class token is an
     // invalid pairing state — per-agent provisioning is impossible and every
-    // claim would carry the wrong identity class. Hard-fail with the fix:
-    // re-pair (a fresh token is vended at pair time).
+    // claim would carry the wrong identity class. Log out automatically:
+    // erase the pairing and return to onboarding (a fresh token is vended at
+    // the next pair).
     if cfg.token.is_empty() || !cfg.token.starts_with("gw-") {
-        let msg = "gateway token invalid (missing or not gateway-class gw-*) — re-pair this device to vend a gateway token; dispatch refused (a gateway never runs on an agent token)";
+        let msg = "logged out — hub token is missing or not gateway-class (gw-*); pair again to onboard";
         eprintln!("[dispatch] {msg}");
-        snap_activity(&snap, "error", msg);
+        logout_core(&stop, &running, &snap);
         if let Ok(mut g) = last_error.lock() {
             *g = Some(msg.to_string());
         }
-        running.store(false, Ordering::Relaxed);
         return;
     }
     running.store(true, Ordering::Relaxed);
@@ -2262,6 +2276,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.workdir = Some(cfg.workdir.clone());
         s.max_sessions = cfg.max_sessions;
     }
+    let mut did_logout = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -2285,6 +2300,22 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 }
             }
             Err(e) => {
+                // A hub-rejected token (401: revoked/expired/rotated away) is
+                // not retryable — every call will fail the same way. Log out
+                // automatically: erase the pairing and return to onboarding.
+                // (Tick errors reaching here are orient's — "bridge {status}
+                // on /mcp" — so the prefix match cannot hit task IDs.)
+                if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
+                    let msg = format!("logged out — hub rejected the token ({e}); pair again to onboard");
+                    eprintln!("[dispatch] {msg}");
+                    snap_activity(&snap, "error", &msg);
+                    logout_core(&stop, &running, &snap);
+                    if let Ok(mut g) = last_error.lock() {
+                        *g = Some(msg);
+                    }
+                    did_logout = true;
+                    break;
+                }
                 eprintln!("[dispatch] error: {e}");
                 snap_activity(&snap, "error", &e);
                 if let Ok(mut g) = last_error.lock() {
@@ -2308,7 +2339,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.running = false;
         s.in_flight = Vec::new();
     }
-    write_runner_state(&snap);
+    // a logout erased the derived state — do not resurrect runner.json here
+    if !did_logout {
+        write_runner_state(&snap);
+    }
     eprintln!("[dispatch] loop stopped");
 }
 
@@ -2347,6 +2381,42 @@ pub fn stop(state: &DispatchState) {
     // persist the stop signal immediately so the flat file reflects it even
     // before the loop drains its current sleep slice
     write_runner_state(&state.snapshot);
+}
+
+/// Erase pairing + derived credentials and reset the snapshot — the shared
+/// core of manual logout (Settings) and automatic logout on an invalid token
+/// (wrong class at startup, hub-rejected at runtime). Stops the loop; the
+/// caller returns/breaks afterwards.
+fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot) {
+    stop.store(true, Ordering::Relaxed);
+    running.store(false, Ordering::Relaxed);
+    let _ = std::fs::remove_file(config_path());
+    if let Some(dir) = dispatch_dir() {
+        // derived ephemeral state — regenerated by the next pairing/run
+        let _ = std::fs::remove_file(dir.join("runner.json"));
+        let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+        let _ = std::fs::remove_file(dir.join("sessions.json"));
+    }
+    if let Ok(mut s) = snap.lock() {
+        s.running = false;
+        s.url = None;
+        s.workspace = None;
+        s.label = None;
+        s.agent = None;
+        s.workdir = None;
+        s.in_flight = Vec::new();
+    }
+    eprintln!("[dispatch] logged out — pairing erased; pair again to onboard");
+}
+
+/// Log out (Settings): stop the runner and erase pairing + derived state,
+/// returning the app to its unconfigured onboarding state. A fresh gateway
+/// token is vended at the next pairing.
+pub fn logout(state: &DispatchState) {
+    logout_core(&state.stop, &state.running, &state.snapshot);
+    if let Ok(mut g) = state.last_error.lock() {
+        *g = None;
+    }
 }
 
 #[cfg(test)]

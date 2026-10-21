@@ -148,6 +148,14 @@ fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
     dispatch::stop(&state);
 }
 
+/// Log out: stop the runner and erase pairing + derived state, returning the
+/// app to its unconfigured onboarding state (pair again to vend a fresh
+/// gateway token).
+#[tauri::command]
+fn logout(state: tauri::State<'_, dispatch::DispatchState>) {
+    dispatch::logout(&state);
+}
+
 /// CLI flag lookup: `--flag value` → parsed value (u64), None when absent/invalid.
 fn cli_u64(name: &str) -> Option<u64> {
     let args: Vec<String> = std::env::args().collect();
@@ -176,6 +184,7 @@ pub fn run() {
             dispatch_create_task,
             dispatch_start,
             dispatch_stop,
+            logout,
             menubar::show_panel,
             menubar::hide_panel
         ])
