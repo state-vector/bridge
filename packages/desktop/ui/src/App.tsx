@@ -372,6 +372,8 @@ export function App() {
       return;
     }
     setPairErr("");
+    localStorage.removeItem("bridge-pair-pending");
+    setPairCode(null);
     setPairingUrl(url);
     try {
       const code = await invoke<string>("pair_start", { url });
@@ -526,22 +528,24 @@ export function App() {
   if (!paired) {
     return (
       <div className="gw">
-        <header className="gw-head">
-          <span className="gw-brand">bridge<span className="cursor" /></span>
-        </header>
         <main className="gw-main">
           <div className="gw-card">
             <h2>Pair this desktop</h2>
             <div className="gw-row">
               <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
                 onChange={(e) => setHubUrl(e.target.value)} />
-              <button className="gw-btn gw-btn-run" disabled={!!pairCode} onClick={() => void startPair()}>Pair</button>
+              <button className="gw-btn gw-btn-run" onClick={() => void startPair()}>Pair</button>
             </div>
             {pairCode && (
               <>
                 <div className="gw-row" style={{ marginTop: 14 }}>
                   <span className="gw-mono" style={{ fontSize: 30, letterSpacing: 6, fontWeight: 600 }}>{pairCode}</span>
                   <button className="gw-btn" onClick={() => void copyCode()}>{copied ? "copied ✓" : "Copy"}</button>
+                  <button className="gw-btn" onClick={() => {
+                    localStorage.removeItem("bridge-pair-pending");
+                    setPairCode(null);
+                    setPairingUrl("");
+                  }}>Cancel</button>
                 </div>
                 <span className="gw-note">
                   Enter this code at <span className="gw-mono">{pairingUrl}/pair</span> (just opened in your browser) — waiting for approval…
@@ -628,7 +632,6 @@ export function App() {
   return (
     <div className="gw">
       <header className="gw-head">
-        <span className="gw-brand">bridge<span className="cursor" /></span>
         <nav className="gw-nav">
           <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
           <button className={page === "top" ? "active" : ""} onClick={() => setPage("top")}>Top</button>
