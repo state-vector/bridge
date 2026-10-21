@@ -48,6 +48,24 @@ export default {
       try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
       return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" });
     }
+    // machine-plane transition (bearer): bounded — only decisions may move, and
+    // only between proposed/accepted/rejected/superseded. Human-authoritative
+    // accept still routes as actor "web:*" from the paired gateway identity.
+    if (url.pathname === "/api/kb-machine/act") {
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      const body = await request.json().catch(() => ({}));
+      if (body.op !== "transition" || body.type !== undefined)
+        return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
+      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/transition", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...body, actor: "web:desktop" }),
+      });
+    }
 
     // machine-plane search mirror (bearer): desktop/console clients retrieve
     // knowledge without a browser cookie — same DO search op the webapp uses

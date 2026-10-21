@@ -113,24 +113,20 @@ interface ForYouArtefact {
 function ForYou({ hubUrl }: { hubUrl: string | null }) {
   const [data, setData] = useState<{ decisions: ForYouArtefact[]; blocked: ForYouArtefact[]; questions: ForYouArtefact[] } | null>(null);
   const [err, setErr] = useState("");
-
-  useEffect(() => {
-    let dead = false;
-    const pull = async () => {
-      try {
-        const d = await invoke<any>("for_you");
-        if (!dead) {
-          setData({ decisions: d.decisions ?? [], blocked: d.blocked ?? [], questions: d.questions ?? [] });
-          setErr("");
-        }
-      } catch (e) {
-        if (!dead) setErr(String(e));
-      }
-    };
-    void pull();
-    const t = setInterval(() => void pull(), 5000);
-    return () => { dead = true; clearInterval(t); };
+  const pull = useCallback(async () => {
+    try {
+      const d = await invoke<any>("for_you");
+      setData({ decisions: d.decisions ?? [], blocked: d.blocked ?? [], questions: d.questions ?? [] });
+      setErr("");
+    } catch (e) {
+      setErr(String(e));
+    }
   }, []);
+  useEffect(() => { void pull(); }, [pull]);
+  useEffect(() => {
+    const t = setInterval(() => void pull(), 5000);
+    return () => clearInterval(t);
+  }, [pull]);
 
   const verdicts = (data?.decisions ?? []).filter((d) => d.meta?.decision_class === "verify-verdict" && (d.meta?.task || d.meta?.verify_target));
   const generic = (data?.decisions ?? []).filter((d) => !verdicts.includes(d));
@@ -144,15 +140,39 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
   const openQuestions = (data?.questions ?? []).filter((t) => t.status !== "done" && t.status !== "superseded");
   const total = verdictCards.length + generic.length + (data?.blocked ?? []).length + openQuestions.length;
 
-  const Row = ({ chips, title, sub, id }: { chips: string[]; title: string; sub?: string | null; id: string }) => (
-    <div className="gw-agent fy-item">
-      <span className="fy-chips">{chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}</span>
-      <span className="gw-fnote" title={title}>{title}</span>
-      {sub && <span className="gw-fmeta">{sub}</span>}
-      {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(hubUrl, "_blank"); }}>open ↗</a>}
-      <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{id}</span>
-    </div>
-  );
+  const [acting, setActing] = useState<string | null>(null);
+  const [comment, setComment] = useState("");
+  const [actMsg, setActMsg] = useState("");
+
+  const act = async (id: string, to: "accepted" | "rejected") => {
+    setActing(id);
+    try {
+      await invoke("decision_act", { id, act: to });
+      setActMsg(`${id} ${to}`);
+      setTimeout(() => setActMsg(""), 2500);
+      await pull();
+    } catch (e) {
+      setActMsg(`failed: ${String(e)}`);
+    } finally {
+      setActing(null);
+      void pull();
+    }
+  };
+
+  const DecisionRow = ({ d, chips }: { d: ForYouArtefact; chips: string[] }) => {
+    const busy = acting === d.id;
+    return (
+      <div className="gw-agent fy-item">
+        <span className="fy-chips">{chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}</span>
+        <span className="gw-fnote" title={d.title}>{d.title}</span>
+        <div className="gw-row" style={{ marginLeft: "auto", gap: 6 }}>
+          <button className="gw-btn gw-btn-run" disabled={busy} onClick={() => void act(d.id, "accepted")}>Accept</button>
+          <button className="gw-btn" disabled={busy} onClick={() => void act(d.id, "rejected")}>Reject</button>
+          {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(`${hubUrl}/?task=${d.id}`, "_blank"); }}>comment ↗</a>}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <main className="gw-main">
@@ -169,31 +189,40 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
             const target = String(latest.meta?.task ?? latest.meta?.verify_target ?? "");
             return (
               <div key={latest.id}>
-                <Row chips={["VERDICT", verdict, target]} title={latest.title} id={latest.id}
-                  sub={prior.length > 0 ? `+ ${prior.length} prior round${prior.length > 1 ? "s" : ""}` : null} />
+                <DecisionRow d={latest} chips={["VERDICT", verdict, target]} />
+                {prior.length > 0 && <div className="gw-note" style={{ marginLeft: 12 }}>+ {prior.length} prior round{prior.length > 1 ? "s" : ""} collapsed</div>}
               </div>
             );
           })}
-          {generic.map((d) => <Row key={d.id} chips={["DECISION"]} title={d.title} id={d.id} />)}
+          {generic.map((d) => <DecisionRow key={d.id} d={d} chips={["DECISION"]} />)}
         </div>
       )}
       {(data?.blocked ?? []).length > 0 && (
         <div className="gw-card">
           <h2>Blocked — unblock work</h2>
           {(data?.blocked ?? []).map((b) => (
-            <Row key={b.id} chips={["BLOCKED"]} title={b.title} sub={b.meta?.unblock_condition ?? b.meta?.blocked_reason ?? null} id={b.id} />
+            <div key={b.id} className="gw-agent fy-item">
+              <span className="fy-chips"><span className="chip chip-urgent">BLOCKED</span></span>
+              <span className="gw-fnote" title={b.title}>{b.title}</span>
+              <span className="gw-fmeta">{b.meta?.unblock_condition ?? b.meta?.blocked_reason ?? null}</span>
+              <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{b.id}</span>
+            </div>
           ))}
         </div>
       )}
       {openQuestions.length > 0 && (
         <div className="gw-card">
           <h2>Open questions</h2>
-          {openQuestions.map((t) => <Row key={t.id} chips={["QUESTION"]} title={t.title} id={t.id} />)}
+          {openQuestions.map((t) => (
+            <div key={t.id} className="gw-agent fy-item">
+              <span className="fy-chips"><span className="chip chip-urgent">QUESTION</span></span>
+              <span className="gw-fnote" title={t.title}>{t.title}</span>
+              <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{t.id}</span>
+            </div>
+          ))}
         </div>
       )}
-      <div className="gw-card">
-        <span className="gw-note">Accept / reject from the full board — human decisions live there.</span>
-      </div>
+      {actMsg && <div className="gw-card"><span className="gw-ok">{actMsg}</span></div>}
     </main>
   );
 }
@@ -269,8 +298,92 @@ function Chat() {
   );
 }
 
+
+/** Top — live fleet work: in_progress + in_review, newest signal first. */
+interface BoardTask { id: string; title: string; status: string; meta?: Record<string, any>; updated_ts?: number; status_ts?: number }
+function Top() {
+  const [rows, setRows] = useState<BoardTask[] | null>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let dead = false;
+    const pull = async () => {
+      try {
+        const d = await invoke<any>("board_lists");
+        if (!dead) { setRows(d.top ?? []); setErr(""); }
+      } catch (e) { if (!dead) setErr(String(e)); }
+    };
+    void pull();
+    const t = setInterval(() => void pull(), 5000);
+    return () => { dead = true; clearInterval(t); };
+  }, []);
+  return (
+    <main className="gw-main">
+      <div className="gw-card"><h2>Top</h2><span className="gw-note">{rows?.length ?? 0} in flight — live</span>{err && <span className="gw-err">{err}</span>}</div>
+      <div className="gw-card">
+        {(rows ?? []).map((t) => {
+          const p = t.meta?.last_progress;
+          return (
+            <div key={t.id} className="gw-agent">
+              <span className="conn conn-open">●</span>
+              <span className="gw-agent-name gw-mono">{t.id}</span>
+              <span className="gw-fnote" title={t.title}>{t.title}</span>
+              <span className="gw-fmeta">{p?.completion_pct != null ? `${p.completion_pct}%` : t.status}</span>
+            </div>
+          );
+        })}
+        {(rows ?? []).length === 0 && <span className="gw-log-empty">nothing in flight</span>}
+      </div>
+    </main>
+  );
+}
+
+/** Backlog — the queue (todo: boosted first, oldest first) + done ledger. */
+function Backlog() {
+  const [data, setData] = useState<{ backlog: BoardTask[]; done: BoardTask[] } | null>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let dead = false;
+    const pull = async () => {
+      try {
+        const d = await invoke<any>("board_lists");
+        if (!dead) { setData({ backlog: d.backlog ?? [], done: d.done ?? [] }); setErr(""); }
+      } catch (e) { if (!dead) setErr(String(e)); }
+    };
+    void pull();
+    const t = setInterval(() => void pull(), 5000);
+    return () => { dead = true; clearInterval(t); };
+  }, []);
+  return (
+    <main className="gw-main">
+      <div className="gw-card"><h2>Backlog</h2><span className="gw-note">{data?.backlog?.length ?? 0} queued · {data?.done?.length ?? 0} done</span>{err && <span className="gw-err">{err}</span>}</div>
+      <div className="gw-card">
+        <h2>Queue</h2>
+        {(data?.backlog ?? []).map((t) => (
+          <div key={t.id} className="gw-agent">
+            {t.meta?.boosted && <span className="chip chip-urgent">▲</span>}
+            <span className="gw-agent-name gw-mono">{t.id}</span>
+            <span className="gw-fnote" title={t.title}>{t.title}</span>
+            {(t.meta?.attempt?.attempts ?? 0) > 0 && <span className="gw-fmeta">×{t.meta?.attempt?.attempts}</span>}
+          </div>
+        ))}
+        {(data?.backlog ?? []).length === 0 && <span className="gw-log-empty">queue empty</span>}
+      </div>
+      <div className="gw-card">
+        <h2>Done</h2>
+        {(data?.done ?? []).slice(0, 25).map((t) => (
+          <div key={t.id} className="gw-agent" style={{ opacity: 0.7 }}>
+            <span className="gw-agent-name gw-mono">{t.id}</span>
+            <span className="gw-fnote" title={t.title}>{t.title}</span>
+          </div>
+        ))}
+        {(data?.done ?? []).length === 0 && <span className="gw-log-empty">nothing done yet</span>}
+      </div>
+    </main>
+  );
+}
+
 export function App() {
-  const [page, setPage] = useState<"forme" | "chat" | "log" | "settings">("forme");
+  const [page, setPage] = useState<"forme" | "top" | "backlog" | "chat" | "log" | "settings">("forme");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -400,6 +513,8 @@ export function App() {
         <span className="gw-brand">bridge<span className="cursor" /></span>
         <nav className="gw-nav">
           <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
+          <button className={page === "top" ? "active" : ""} onClick={() => setPage("top")}>Top</button>
+          <button className={page === "backlog" ? "active" : ""} onClick={() => setPage("backlog")}>Backlog</button>
           <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
@@ -408,6 +523,8 @@ export function App() {
       </header>
 
       {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
+      {page === "top" && <Top />}
+      {page === "backlog" && <Backlog />}
 
       {page === "chat" && <Chat />}
 

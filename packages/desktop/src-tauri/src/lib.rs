@@ -86,6 +86,20 @@ async fn for_you() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+async fn board_lists() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(dispatch::board_lists_payload)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn decision_act(id: String, act: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || dispatch::decision_act_payload(&id, &act))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// One console turn: retrieve board artefacts for the question, then
 /// summarise/answer with the on-device Apple model (fallback: backend CLI).
 /// Read-only — the console never claims or writes work.
@@ -131,6 +145,8 @@ pub fn run() {
             dispatch_config,
             dispatch_snapshot,
             for_you,
+            board_lists,
+            decision_act,
             chat_send,
             dispatch_start,
             dispatch_stop,

@@ -1221,10 +1221,10 @@ export class KnowledgeHub {
     }
     // decisions are human-authoritative: agents propose, a human accepts
     // (consensus of human — the final say always lands with a person)
-    if (row.type === "decision" && to === "accepted" && !/^web$|^human:/.test(actor))
+    if (row.type === "decision" && to === "accepted" && !/^web(:|$)|^human:/.test(actor))
       throw new Error(`decision ${id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`);
     // human sign-off tasks (role:human) are completed by a human, not an agent
-    if (row.type === "task" && to === "done" && parseTags(row.tags).includes("role:human") && !/^web$|^human:/.test(actor))
+    if (row.type === "task" && to === "done" && parseTags(row.tags).includes("role:human") && !/^web(:|$)|^human:/.test(actor))
       throw new Error(`task ${id} is a human sign-off task (role:human) — completion is human-authoritative; a human marks it done in the webapp.`);
     // ---- swimlane gates: minimal, enforced state-machine barriers ----
     const tTags: string[] = parseTags(row.tags);
@@ -1356,7 +1356,7 @@ export class KnowledgeHub {
     // to pick up fresh. Only the current owner or a human may release a claim —
     // agents can't dump each other's work.
     if (row.type === "task" && to === "todo") {
-      const isHuman = actor === "web" || actor.startsWith("human:");
+      const isHuman = actor === "web" || actor.startsWith("web:") || actor.startsWith("human:");
       const isSystem = /^system:/.test(actor);
       if (row.owner && row.owner !== actor && !isHuman && !isSystem)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);

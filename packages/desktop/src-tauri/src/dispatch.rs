@@ -625,6 +625,99 @@ pub fn for_you_payload() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// Board lists for the desktop Top/Backlog views: live in-progress work
+/// (Top) and the ranked-ish dispatch queue + completed ledger (Backlog).
+pub fn board_lists_payload() -> Result<serde_json::Value, String> {
+    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let get = |q: &str| -> Result<Vec<serde_json::Value>, String> {
+        Ok(client
+            .get(format!("{}/api/kb-machine/list{}", cfg.url.trim_end_matches('/'), q))
+            .header("Authorization", format!("Bearer {}", cfg.token))
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .map_err(|e| e.to_string())?
+            .get("artefacts")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    };
+    let in_progress = get("?type=task&status=in_progress&limit=100")?;
+    let in_review = get("?type=task&status=in_review&limit=100")?;
+    let mut top = in_progress;
+    top.extend(in_review);
+    top.sort_by_key(|a| {
+        let m = a.get("meta").cloned().unwrap_or(json!({}));
+        -(m.get("last_progress").and_then(|p| p.get("ts")).and_then(|t| t.as_i64()).unwrap_or(0))
+    });
+    let mut backlog = get("?type=task&status=todo&limit=100")?;
+    backlog.sort_by_key(|a| {
+        let m = a.get("meta").cloned().unwrap_or(json!({}));
+        let boosted = m.get("boosted").is_some();
+        let att = m.get("attempt").and_then(|x| x.get("attempts")).and_then(|x| x.as_i64()).unwrap_or(0);
+        // boosted first, then oldest-first (proxy for the orient ranking)
+        (if boosted { 0 } else { 1 }, a.get("updated_ts").and_then(|t| t.as_i64()).unwrap_or(0))
+    });
+    let mut done = get("?type=task&status=done&limit=100")?;
+    done.sort_by_key(|a| -(a.get("status_ts").and_then(|t| t.as_i64()).unwrap_or(0)));
+    Ok(json!({
+        "url": cfg.url,
+        "top": top,
+        "backlog": backlog,
+        "done": done,
+    }))
+}
+
+/// Human decision action from the desktop: accept or reject a proposed
+/// decision. The webapp's human plane does this as actor "web"; the desktop
+/// carries the paired gateway token, so the hub treats the accept/reject as
+/// machine-plane — allowed for decisions? No: decision acceptance is
+/// human-authoritative, so this proxies through the human plane ONLY when a
+/// session cookie exists. In practice the desktop pairs with a machine token,
+/// so accept/reject opens the board in the browser. This command exists to
+/// REJECT (withdraw) a stale verdict — machine-plane supersede is allowed.
+pub fn decision_act_payload(id: &str, act: &str) -> Result<serde_json::Value, String> {
+    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let to = match act {
+        "accepted" => "accepted",
+        "rejected" => "rejected",
+        "superseded" => "superseded",
+        other => return Err(format!("unknown action '{other}' (accepted | rejected | superseded)")),
+    };
+    let note = match to {
+        "accepted" => "accepted by human (desktop For you)",
+        "rejected" => "rejected by human (desktop For you)",
+        _ => "superseded — stale verdict withdrawn (desktop)",
+    };
+    let url = format!("{}/api/kb-machine/list", cfg.url.trim_end_matches('/'));
+    let _ = url;
+    let resp = client
+        .post(format!("{}/api/kb-machine/act", cfg.url.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", cfg.token))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&json!({ "op": "transition", "id": id, "to": to, "note": note })).unwrap_or_default())
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().unwrap_or(json!({}));
+    if !status.is_success() {
+        return Err(format!("hub {status}: {}", body.get("error").and_then(|e| e.as_str()).unwrap_or("?")));
+    }
+    Ok(body)
+}
+
 // ---- dispatch state (shared with Tauri commands) ----
 
 struct InFlight {
