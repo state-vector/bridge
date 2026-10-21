@@ -1207,107 +1207,52 @@ export class KnowledgeHub {
     }
   }
 
+  /** Lazy SQL-backed context for the machine rules — a guard only queries
+   *  what it actually reads, so cheap transitions stay cheap. */
+  private ruleCtx(row: any, body: any, id: string, tTags: string[]): RuleCtx {
+    return {
+      qualify: (kind) => {
+        if (kind === "analysis") {
+          // gateway-attributed claims: the role lives in the TASK, not the
+          // token — a role-tagged task dispatched by its gateway IS that work.
+          const dispatchedRoleWork =
+            body?.gateway && ["role:analysis", "role:review", "role:impl", "role:unblock"].some((t) => tTags.includes(t));
+          return dispatchedRoleWork ? { ok: true, via: "dispatch" } : this.qualifyCheck(row, "analysis");
+        }
+        return this.qualifyCheck(row, "review");
+      },
+      unmetBars: () => this.unmetBars(row),
+      session: () => this.resolveSession(body, String(body?.token_id ?? "")),
+      evidence: (eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid),
+      parent: () =>
+        this.one(
+          `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+          id,
+        ),
+      openChildren: () =>
+        this.one(
+          `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
+          id,
+        )?.n ?? 0,
+    };
+  }
+
   private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
     let to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
-    const verdict = validateTransition(row.type as ArtefactType, row.status, to);
-    if (!verdict.ok) throw new Error(verdict.reason);
-    // verify and unblock tasks are TERMINAL-AT-BIRTH: they check a thing and
-    // close. They cannot enter in_review — a verify task demanding its own
-    // verification is the verify-of-verify recursion by another door. The
-    // only exits from in_progress are done (with receipts).
-    if (row.type === "task" && to === "in_review") {
-      const rTags = parseTags(row.tags);
-      if (rTags.includes("role:review"))
-        throw new Error(`${id} is a verify task — verification is its own terminal state. Verify tasks close directly via done with receipts; they are never reviewed again.`);
-      if (rTags.includes("role:unblock"))
-        throw new Error(`${id} is an unblock task — unblock tasks close directly via done with their verdict; they are never reviewed.`);
-    }
-    // decisions are human-authoritative: agents propose, a human accepts
-    // (consensus of human — the final say always lands with a person)
-    if (row.type === "decision" && to === "accepted" && !/^web(:|$)|^human:/.test(actor))
-      throw new Error(`decision ${id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`);
-    // human sign-off tasks (role:human) are completed by a human, not an agent
-    if (row.type === "task" && to === "done" && parseTags(row.tags).includes("role:human") && !/^web(:|$)|^human:/.test(actor))
-      throw new Error(`task ${id} is a human sign-off task (role:human) — completion is human-authoritative; a human marks it done in the webapp.`);
-    // ---- swimlane gates: minimal, enforced state-machine barriers ----
+    // ---- the law: one table, one checker (machine.ts). Every role/intent
+    // rule lives in RULES there; this is the only legality gate. ----
     const tTags: string[] = parseTags(row.tags);
-    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
-    if (row.type === "task" && row.status === "todo" && to === "in_progress") {
-      // gateway-attributed claims: the role lives in the TASK, not the token —
-      // a role-tagged task (analysis/review/impl/unblock) dispatched by its
-      // gateway IS that work. Token-level qualification was a category error
-      // under dispatch: the one gateway token does everything, so qualifier
-      // requirements could never be met and whole backlog slices froze.
-      const dispatchedRoleWork = body.gateway && isQualifier;
-      const q = dispatchedRoleWork ? { ok: true, via: "dispatch" } : this.qualifyCheck(row, "analysis");
-      // roles are playbooks, not gates: any agent may claim any task — the pool
-      // surfaces everything claimable, ranked verify-first, and an agent that
-      // can't do the work stands down (log it back / bounce). Role tags steer
-      // what shows first; the server's integrity gates do the enforcement.
-      const bars = this.unmetBars(row);
-      if (bars.length)
-        throw new Error(`task ${id} is qualified but its publisher requested further confirmation before it goes ready — unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`);
-      // separation of duties: the session that produced the analysis evidence
-      // may not implement the same task in that session — fresh session, fresh claim.
-      if (q.via && q.via !== "declared" && !String(q.via).startsWith("parent:")) {
-        const ev = this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, String(q.via));
-        if (ev?.type === "task" && String(ev.tags ?? "").includes("role:analysis")) {
-          const evSession = JSON.parse(ev.meta ?? "{}").session;
-          const sess = await this.resolveSession(body, String(body.token_id ?? ""));
-          if (evSession && sess && evSession === sess)
-            throw new Error(`separation of duties: session "${sess}" completed the analysis on ${id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${id} for implementation.`);
-        }
-      }
-    }
-    // role:unblock tasks are exempt: their contract IS the verification pass
-    // (check the exit condition with receipts, record findings, close done).
-    // Demanding a review child of an unblock task deadlocked the pool — the
-    // unblock children could never close, which kept the parent's open-children
-    // gate shut forever (BR#584: 123 attempts).
-    if (row.type === "task" && to === "done" && !isQualifier && !tTags.includes("role:unblock")) {
-      const r = this.qualifyCheck(row, "review");
-      if (!r.ok)
-        throw new Error(`task ${id} cannot be completed unreviewed — complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`);
-    }
-    // questions are answered, not claimed: a 'question'-tagged task collects
-    // contributions (progress artefacts) from any number of agents and is closed
-    // by its author with an ADR (decision artefact). Claiming would gate others out.
-    if (row.type === "task" && to === "in_progress" && tTags.includes("question")) {
-      throw new Error(`task ${id} is a question (tagged 'question') — questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`);
-    }
-    // operator-gated work needs a human go-before (meta.operator_gated). The gate
-    // clears when a human updates the task without that meta key.
-    if (row.type === "task" && to === "in_progress") {
-      const pre = JSON.parse(row.meta ?? "{}");
-      if (pre.operator_gated)
-        throw new Error(`task ${id} is operator-gated (${pre.operator_gated}) — a human clears this by updating the task (remove operator_gated from meta) before it can be claimed.`);
-    }
-    if (row.status === "blocked" && to === "in_progress") {
-      const resolution = String(body.note ?? body.resolution ?? "").trim();
-      if (!resolution)
-        throw new Error(`moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`);
-    }
-    // handoff gate: "ready for review" must carry the PR — reviewers need something to review
-    if (row.type === "task" && to === "in_review") {
-      const note = String(body.note ?? "").trim();
-      if (!/https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(note))
-        throw new Error(`moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call)`);
-    }
-    // bounce back from review: the reviewer's findings ARE the resolution
-    if (row.status === "in_review" && to === "in_progress") {
-      const findings = String(body.note ?? body.resolution ?? "").trim();
-      if (!findings)
-        throw new Error(`bouncing back from review requires the reviewer's findings (note) — "no" without reasons is not an answer`);
-    }
-    if (to === "blocked") {
-      const reason = String(body.note ?? body.reason ?? "").trim();
-      const unblock = String(body.unblock_condition ?? "").trim();
-      if (!reason || !unblock)
-        throw new Error("moving to blocked requires BOTH a reason (note) and an unblock condition — a blocked card without an unblock path is a dead end");
-    }
+    const rejection = await checkRules(
+      { id, type: row.type, status: row.status, to, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+      this.ruleCtx(row, body, id, tTags),
+    );
+    if (rejection) throw new Error(rejection);
+    // (remaining guard rules live in machine.ts RULES — BR#2420)
     // (B) subprocess class: a declared block on a long/handed-off op, with a
     // budget. The watchdog pauses until the budget lapses; past it the
     // subprocess = declared silence while STILL WORKING: the task stays
@@ -1367,7 +1312,20 @@ export class KnowledgeHub {
       if (row.owner && row.owner !== actor && !isHuman && !isSystem)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
-      if (nextAttempts >= 5 && row.status !== "blocked") {
+      const verdictDuty = tTags.includes("role:review") || tTags.includes("role:unblock");
+      if (verdictDuty && nextAttempts >= CHURN_ESCALATE_ATTEMPTS) {
+        // verdict duties may not block (machine.ts) — repeated gate rejections
+        // escalate to a human instead of redirecting into blocked + spawn.
+        owner = "";
+        meta.escalate = {
+          at: ts,
+          attempts: nextAttempts,
+          reason: `verdict duty released ${nextAttempts} times without completing — the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`,
+        };
+        meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
+        this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tTags.find((t) => t.startsWith("role:")) ?? "unknown" });
+        this.version(id, "system:churn-guard", "transition", `escalated to human — ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
+      } else if (nextAttempts >= CHURN_REDIRECT_ATTEMPTS && row.status !== "blocked") {
         // churn guard: the pool has re-run this task N times and a gate keeps
         // rejecting the completion. Re-releasing just loops claim → dispatch →
         // reject → release forever (104-attempt rows taught us this), and each
@@ -1396,25 +1354,7 @@ export class KnowledgeHub {
         };
       }
     }
-    // receipts: a review verdict must cite the artifact it verified — for PR
-    // work that's the PR link; verification is a double-check, and the check
-    // leaves a trail. Unblock tasks carry the same receipt duty: what they
-    // found, and what unblocked (or didn't unblock) the parent.
-    if (row.type === "task" && to === "done" && (tTags.includes("role:review") || tTags.includes("role:unblock"))) {
-      const note = String(body.note ?? "").trim();
-      if (!/https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(note))
-        throw new Error(`${tTags.includes("role:unblock") ? "unblock" : "review"} ${id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`);
-      // separation of duties: the session that implemented a task cannot be the
-      // one whose review completes it — review children are done by a different session.
-      const parent = this.one(
-        `SELECT p.id AS id, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
-         WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
-      );
-      const implSession = parent ? JSON.parse(parent.meta ?? "{}").session : undefined;
-      const reviewSession = JSON.parse(row.meta ?? "{}").session;
-      if (implSession && reviewSession && implSession === reviewSession)
-        throw new Error(`separation of duties: session "${reviewSession}" implemented ${parent?.id} — it cannot also produce the review. Review from a different session.`);
-    }
+    // (verdict-done receipts + review separation live in machine.ts RULES)
     // separation of duties, mechanical: a session that completed the analysis
     // child cannot carry the parent into implementation. If the parent is
     // claimed by the same session, release it — impl requires a fresh claim
@@ -1433,18 +1373,17 @@ export class KnowledgeHub {
         );
       }
     }
-    // a parent isn't completable while children are open
-    if (row.type === "task" && to === "done") {
-      const open = this.one(
-        `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
-        id,
-      )?.n ?? 0;
-      if (open > 0) throw new Error(`parent ${id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children)`);
-    }
+    // (done open-children gate lives in machine.ts RULES — BR#2420)
     this.state.storage.sql.exec(
       `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ? WHERE id = ?`, to, ts, JSON.stringify(meta), ts, owner, id,
     );
+    // post-conditions on the single write path: violations are breaches (a
+    // loud audited trail), never silent repairs.
+    const violations = checkInvariants({ type: row.type, status: to, tags: tTags, meta });
+    if (violations.length) {
+      this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
+      this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} → ${to}: ${violations.join("; ")}`, { violations });
+    }
     if (to === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
       if (rep && rep.type === row.type)
@@ -1633,6 +1572,18 @@ export class KnowledgeHub {
       );
       if (existing) {
         this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
+      } else if (
+        meta.last_unblock_spawn &&
+        ts - meta.last_unblock_spawn.at < 60 * 60_000 &&
+        String(meta.last_unblock_spawn.exit ?? "") === String(meta.blocked?.unblock_condition ?? "").trim()
+      ) {
+        // flood guard: a superseded round still counts while fresh and the exit
+        // condition is unchanged — the BR#909 class spawned one child per churn
+        // cycle (17 cards) because each cycle superseded the last.
+        this.audit(actor, "spawn_skipped", id, {
+          auto: "unblock",
+          reason: `unblock round issued ${Math.round((ts - meta.last_unblock_spawn.at) / 60_000)}m ago with the same exit condition — flood guard`,
+        });
       } else {
       const exitCond = String(meta.blocked?.unblock_condition ?? "").trim();
       const blockWhy = String(meta.blocked?.reason ?? "").trim();
@@ -1651,6 +1602,8 @@ export class KnowledgeHub {
         created.id, id, ts,
       );
       this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
+        meta.last_unblock_spawn = { at: ts, exit: exitCond };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
       }
     }
     return { id, status: to, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
@@ -1933,6 +1886,7 @@ export class KnowledgeHub {
             id: artefactId, to: "blocked",
             note: `blocked on decision — ${id}: ${question.slice(0, 120)}`,
             unblock_condition: `answer to ask ${id}`,
+            awaiting_ask_id: id, // machine.ts: the only legal blocked for verdict duties
           }, actor);
           taskStatus = "blocked";
         } else {

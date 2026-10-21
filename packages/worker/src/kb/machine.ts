@@ -61,6 +61,19 @@ const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.
 const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
 const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
 
+/** SQL rows carry meta as a JSON string; tests and callers may pass objects.
+ *  Parse tolerantly either way — garbage parses as empty, never throws. */
+function metaOf(m: unknown): any {
+  if (typeof m === "string") {
+    try {
+      return JSON.parse(m || "{}");
+    } catch {
+      return {};
+    }
+  }
+  return m ?? {};
+}
+
 // Churn policy (server-side single source): a task released to the pool this
 // many times without completing stops re-entering silently.
 export const CHURN_REDIRECT_ATTEMPTS = 5; // impl/analysis: release redirects to blocked
@@ -112,7 +125,7 @@ export const RULES: Rule[] = [
       if (!q.ok || !q.via || q.via === "declared" || String(q.via).startsWith("parent:")) return null;
       const ev = await c.evidence(String(q.via));
       if (!ev || ev.type !== "task" || !ev.tags.includes("role:analysis")) return null;
-      const evSession = JSON.parse(ev.meta ?? "{}").session;
+      const evSession = metaOf(ev.meta).session;
       const sess = await c.session();
       if (evSession && sess && evSession === sess)
         return `separation of duties: session "${sess}" completed the analysis on ${i.id} — analysis and impl are separate sessions. End this session, start a new one, then claim ${i.id} for implementation.`;
@@ -191,8 +204,8 @@ export const RULES: Rule[] = [
     when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
     guard: async (i, c) => {
       const parent = await c.parent();
-      const implSession = parent ? JSON.parse(parent.meta ?? "{}").session : undefined;
-      const reviewSession = JSON.parse(i.meta ?? "{}").session;
+      const implSession = parent ? metaOf(parent.meta).session : undefined;
+      const reviewSession = metaOf(i.meta).session;
       if (implSession && reviewSession && implSession === reviewSession)
         return `separation of duties: session "${reviewSession}" implemented ${parent?.id} — it cannot also produce the review. Review from a different session.`;
       return null;
