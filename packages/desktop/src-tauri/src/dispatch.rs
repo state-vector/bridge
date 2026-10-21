@@ -45,12 +45,102 @@ pub struct DispatchConfig {
     pub report_minutes: Option<u64>, // Some(n): periodic heartbeat cadence for agents; None: report like a human (meaningful steps only)
     #[serde(default)]
     pub isolate: bool, // per-task git worktrees + PR branch
-    #[serde(default)]
-    pub backends: Option<Vec<String>>, // multiple agent types; rotate per dispatch
-    #[serde(default)]
-    pub models: Option<std::collections::HashMap<String, String>>, // model per backend — required for opencode (explicit-model policy)
-    #[serde(default)]
-    pub agents: Option<std::collections::HashMap<String, String>>, // agent profile per backend (opencode profiles; kiro profiles)
+    /// Enabled backends, keyed by provider name. Each section carries that
+    /// provider's own config — model, agent profile, CLI binary override.
+    /// A dict, not an array: providers differ (opencode has its own default
+    /// model config; kiro is profile-driven), so per-provider settings belong
+    /// to the provider. Legacy configs (backends as an array + flat
+    /// models/agents maps) are accepted and folded in on load.
+    #[serde(default, deserialize_with = "backends_de")]
+    pub backends: std::collections::BTreeMap<String, BackendConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<std::collections::HashMap<String, String>>, // legacy: folded into backends on load
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<std::collections::HashMap<String, String>>, // legacy: folded into backends on load
+}
+
+/// Per-provider settings. Everything optional — a provider section can be
+/// empty ({}) and the runner just uses that CLI's own defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackendConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,   // CLI binary override (default: "opencode" / "kiro")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>, // agent profile for this provider
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>, // model override; unset = the CLI's own default config decides
+}
+
+/// Accepts the new dict shape ({ "opencode": { ... } }) or the legacy array
+/// shape (["opencode", "kiro"]) — legacy entries get empty sections and are
+/// folded with the flat models/agents maps in normalize().
+fn backends_de<'de, D>(de: D) -> Result<std::collections::BTreeMap<String, BackendConfig>, D::Error>
+where D: serde::Deserializer<'de> {
+    let v = serde_json::Value::deserialize(de)?;
+    match v {
+        serde_json::Value::Null => Ok(Default::default()),
+        serde_json::Value::Array(a) => {
+            let mut m = std::collections::BTreeMap::new();
+            for item in a {
+                if let Some(name) = item.as_str() {
+                    m.insert(name.to_string(), BackendConfig::default());
+                }
+            }
+            Ok(m)
+        }
+        serde_json::Value::Object(o) => {
+            let mut m = std::collections::BTreeMap::new();
+            for (name, section) in o {
+                let cfg = serde_json::from_value(section).unwrap_or_default();
+                m.insert(name, cfg);
+            }
+            Ok(m)
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "backends must be a dict of provider sections or an array of names, got: {other}"
+        ))),
+    }
+}
+
+impl DispatchConfig {
+    /// Fold legacy flat fields (backends array + models/agents maps) into the
+    /// backends dict. Idempotent; called from every load/resolve path.
+    pub fn normalize(&mut self) {
+        if self.backends.is_empty() {
+            if let Some(list) = self
+                .backend
+                .clone()
+                .map(|b| vec![b])
+                .or_else(|| Some(vec!["opencode".to_string()]))
+            {
+                for name in list {
+                    self.backends.entry(name).or_default();
+                }
+            }
+        }
+        let mut fold = |map: &Option<std::collections::HashMap<String, String>>,
+                        take: fn(&mut BackendConfig, String)| {
+            if let Some(m) = map {
+                for (k, v) in m {
+                    if v.trim().is_empty() { continue; }
+                    let e = self.backends.entry(k.clone()).or_default();
+                    take(e, v.clone());
+                }
+            }
+        };
+        let models = self.models.clone();
+        let agents = self.agents.clone();
+        fold(&models, |e, v| e.model = Some(v));
+        fold(&agents, |e, v| e.agent = Some(v));
+    }
+
+    /// Enabled provider names, config order (alphabetical by key).
+    pub fn enabled_backends(&self) -> Vec<(String, BackendConfig)> {
+        self.backends
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 fn default_max_sessions() -> usize {
@@ -118,7 +208,14 @@ impl DispatchConfig {
             ),
             backends: std::env::var("BRIDGE_BACKENDS")
                 .ok()
-                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(|name| (name, BackendConfig::default()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
             models: std::env::var("BRIDGE_MODEL")
                 .ok()
                 .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
@@ -140,7 +237,9 @@ impl DispatchConfig {
 
     /// Resolution order: env vars > ~/.bridge/config.json > None (→ device pairing).
     pub fn resolve() -> Option<Self> {
-        Self::from_env().or_else(load_config)
+        let mut c = Self::from_env().or_else(load_config)?;
+        c.normalize();
+        Some(c)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -265,9 +364,9 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
                 max_sessions: default_max_sessions(),
                 report_minutes: None,
                 isolate: default_isolate(),
-                    backends: None,
-                    models: None,
-                    agents: None,
+                backends: Default::default(),
+                models: None,
+                agents: None,
                 });
             }
             Some("expired") => return Err("pairing code expired — run again".into()),
@@ -428,7 +527,7 @@ fn agent_identity(cfg: &DispatchConfig) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "gateway".into());
-    let backend = cfg.backends.as_ref().and_then(|b| b.first().cloned())
+    let backend = cfg.backends.keys().next().cloned()
         .or_else(|| cfg.backend.clone())
         .unwrap_or_else(|| "opencode".into());
     format!("{}-{}", slugify(&host).to_lowercase(), slugify(&backend).to_lowercase())
@@ -662,7 +761,6 @@ pub fn board_lists_payload() -> Result<serde_json::Value, String> {
     backlog.sort_by_key(|a| {
         let m = a.get("meta").cloned().unwrap_or(json!({}));
         let boosted = m.get("boosted").is_some();
-        let att = m.get("attempt").and_then(|x| x.get("attempts")).and_then(|x| x.as_i64()).unwrap_or(0);
         // boosted first, then oldest-first (proxy for the orient ranking)
         (if boosted { 0 } else { 1 }, a.get("updated_ts").and_then(|t| t.as_i64()).unwrap_or(0))
     });
@@ -782,45 +880,26 @@ fn pick_backend(avail: &[opencode::Backend]) -> opencode::Backend {
     avail.get(i).copied().unwrap_or(opencode::Backend::OpenCode)
 }
 
-/// Backends actually dispatchable right now: the CLI runs on this machine AND
-/// a model is configured for it (explicit-model policy). The gateway must not
-/// claim work it has no agent to dispatch to — claiming first and failing
-/// spawn second pollutes the board with claimed-but-stuck tasks.
+/// Backends actually dispatchable right now: the provider's CLI runs on this
+/// machine. Model is optional per provider — unset means the CLI's own
+/// default config decides (opencode), or the provider's profile (kiro).
 fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
-    let configured: Vec<(opencode::Backend, String)> = cfg
-        .backends
-        .clone()
-        .filter(|v| !v.is_empty())
-        .or_else(|| cfg.backend.clone().map(|b| vec![b]))
-        .unwrap_or_else(|| vec!["opencode".into()])
-        .into_iter()
-        .map(|name| (opencode::Backend::parse(Some(&name)), name))
-        .collect();
-    configured
-        .into_iter()
-        .filter(|(backend, name)| {
-            let model_ok = cfg
-                .models
-                .as_ref()
-                .and_then(|m| m.get(name))
-                .map(|m| !m.trim().is_empty())
-                .unwrap_or(false)
-                || (cfg.backends.is_none()
-                    && cfg.model.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false));
-            let bin = match backend {
-                opencode::Backend::OpenCode => cfg.opencode_bin.clone(),
+    cfg.backends
+        .iter()
+        .filter(|(name, bc)| {
+            let bin = bc.bin.clone().unwrap_or_else(|| match opencode::Backend::parse(Some(name)) {
                 opencode::Backend::Kiro => "kiro".to_string(),
-            };
-            let bin_ok = std::process::Command::new(&bin)
+                _ => cfg.opencode_bin.clone(),
+            });
+            std::process::Command::new(&bin)
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
-                .unwrap_or(false);
-            model_ok && bin_ok
+                .unwrap_or(false)
         })
-        .map(|(b, _)| b)
+        .map(|(name, _)| opencode::Backend::parse(Some(name)))
         .collect()
 }
 
@@ -1138,31 +1217,12 @@ fn spawn_opencode(
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
     };
-    // per-backend settings: each CLI talks to different providers, so model
-    // requirements differ. opencode dispatches a bare CLI whose default model
-    // is whatever its own config says (the stale-haiku lesson) — there a model
-    // is REQUIRED. kiro is profile-driven (its profiles pin provider+model),
-    // so a model here is optional; the profile is the config.
-    let agent_profile = cfg
-        .agents
-        .as_ref()
-        .and_then(|m| m.get(backend_name))
-        .cloned()
-        .or_else(|| cfg.agent.clone());
-    let model = cfg
-        .models
-        .as_ref()
-        .and_then(|m| m.get(backend_name))
-        .cloned()
-        .or_else(|| cfg.model.clone());
-    if model.is_none() && backend == opencode::Backend::OpenCode {
-        let msg = format!(
-            "runner: no model configured for backend '{backend_name}' — set it in Settings (opencode needs an explicit model); task {tid} not dispatched",
-        );
-        eprintln!("[dispatch] {msg}");
-        snap_activity(snap, "error", &msg);
-        return;
-    }
+    // per-provider config from the backends dict: each CLI has its own config
+    // surface. Model/agent are optional everywhere — unset means that CLI's
+    // own default config decides (opencode default model, kiro profile).
+    let bc = cfg.backends.get(backend_name).cloned().unwrap_or_default();
+    let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
+    let model = bc.model.or_else(|| cfg.model.clone());
     let model_str = model.clone().unwrap_or_default();
     let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
@@ -1238,12 +1298,14 @@ fn spawn_opencode(
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
+        let bin = bc.bin.clone();
         let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
         std::thread::spawn(move || {
             let backend = opencode::Backend::parse(cfg2.backend.as_deref());
+            let cli_bin = bin.as_deref().unwrap_or(&cfg2.opencode_bin);
             let out = opencode::run_task(
                 &run_dir,
-                &cfg2.opencode_bin,
+                cli_bin,
                 backend,
                 agent_profile.as_deref(),
                 Some(model_str.as_str()).filter(|s| !s.is_empty()),

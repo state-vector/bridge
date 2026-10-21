@@ -150,7 +150,14 @@ fn run(cfg: Option<DispatchConfig>) {
                     backend: std::env::var("BRIDGE_BACKEND").ok(),
                     backends: std::env::var("BRIDGE_BACKENDS")
                         .ok()
-                        .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>()),
+                        .map(|v| {
+                            v.split(',')
+                                .map(|x| x.trim().to_string())
+                                .filter(|x| !x.is_empty())
+                                .map(|name| (name, dispatch::BackendConfig::default()))
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        })
+                        .unwrap_or_default(),
                     models: std::env::var("BRIDGE_MODEL")
                         .ok()
                         .map(|m| std::collections::HashMap::from([("opencode".to_string(), m)])),
@@ -284,9 +291,16 @@ fn onboard(cfg: &mut DispatchConfig) {
         .filter(|&n| n >= 1)
         .unwrap_or(1);
 
-    cfg.backends = Some(backends.clone());
-    cfg.backend = Some(backends[0].clone());
-    cfg.models = Some(models);
+    cfg.backends = backends
+        .iter()
+        .map(|b| {
+            let section = dispatch::BackendConfig {
+                model: models.get(b).cloned(),
+                ..Default::default()
+            };
+            (b.clone(), section)
+        })
+        .collect();
     cfg.workdir = workdir;
     cfg.max_sessions = max_sessions;
     println!();
@@ -321,21 +335,13 @@ fn doctor() -> bool {
     }
     let cfg = cfg.unwrap();
 
-    // explicit-model policy: the runner refuses dispatch without a model per backend
-    let backends: Vec<String> = cfg
-        .backends
-        .clone()
-        .filter(|v| !v.is_empty())
-        .or_else(|| cfg.backend.clone().map(|b| vec![b]))
-        .unwrap_or_else(|| vec!["opencode".into()]);
-    let models = cfg.models.clone().unwrap_or_default();
-    for b in &backends {
-        match models.get(b) {
+    // per-provider sections: model optional (unset = the CLI's own default
+    // config decides for opencode; kiro profiles pin provider+model)
+    let backends = cfg.enabled_backends();
+    for (b, section) in &backends {
+        match &section.model {
             Some(m) if !m.trim().is_empty() => println!("  \x1b[32mok\x1b[0m   model[{b}] = {m}"),
-            _ => {
-                bad = true;
-                println!("  \x1b[31mFAIL\x1b[0m  model[{b}] — REQUIRED (the runner refuses dispatch without it). Edit ~/.bridge/config.json: \"models\": {{ \"{b}\": \"<model-id>\" }}");
-            }
+            _ => println!("  \x1b[33mwarn\x1b[0m  model[{b}] — not set; the CLI's own default config decides (set \"backends.{b}.model\" to pin spend)"),
         }
     }
 
@@ -354,8 +360,11 @@ fn doctor() -> bool {
                 l.find(" (").map(|i| &l[..i])
             })
             .collect();
-        let configured = cfg.agents.clone().unwrap_or_default();
-        let mut named: Vec<(String, String)> = configured.into_iter().collect();
+        let mut named: Vec<(String, String)> = cfg
+            .backends
+            .iter()
+            .filter_map(|(b, sec)| sec.agent.clone().map(|a| (b.clone(), a)))
+            .collect();
         if let Some(a) = &cfg.agent {
             named.push(("opencode".into(), a.clone()));
         }
@@ -371,8 +380,9 @@ fn doctor() -> bool {
     }
 
     // agent CLI binaries reachable?
-    for b in &backends {
-        let bin = if b == "kiro" { "kiro" } else { cfg.opencode_bin.as_str() };
+    for (b, section) in &backends {
+        let bin = section.bin.clone().unwrap_or_else(|| if b == "kiro" { "kiro".to_string() } else { cfg.opencode_bin.clone() });
+        let bin = bin.as_str();
         let found = std::process::Command::new(bin)
             .arg("--version")
             .stdout(std::process::Stdio::null())
