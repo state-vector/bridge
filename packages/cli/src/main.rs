@@ -24,6 +24,11 @@ use dispatch::DispatchConfig;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// The bridge agent persona, shipped in source control and installed into the
+/// agent CLI's own config (opencode reads ~/.config/opencode/agent/*.md).
+const BRIDGE_AGENT_MD: &str = include_str!("../agents/bridge.md");
+const BRIDGE_AGENT_NAME: &str = "bridge";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
@@ -64,6 +69,28 @@ fn main() {
                 Ok(s) => println!("{s}"),
                 Err(_) => {
                     eprintln!("no runner state — is a runner running?");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "agent" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("install");
+            if sub != "install" && sub != "check" {
+                eprintln!("usage: bridge agent install|check   (opencode only for now)");
+                std::process::exit(2);
+            }
+            match agent_op(BRIDGE_AGENT_MD, BRIDGE_AGENT_NAME, sub == "install") {
+                Ok(lines) => {
+                    let fail = lines.iter().any(|m| m.contains("FAIL"));
+                    for m in &lines {
+                        println!("{m}");
+                    }
+                    if sub == "check" {
+                        std::process::exit(if fail { 1 } else { 0 });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[bridge] agent {sub} failed: {e}");
                     std::process::exit(1);
                 }
             }
@@ -306,6 +333,43 @@ fn onboard(cfg: &mut DispatchConfig) {
     println!();
 }
 
+/// Install (or verify) the bridge agent persona into opencode's config dir.
+/// Returns lines to print. "FAIL" lines indicate doctor-reportable problems.
+fn agent_op(md: &str, name: &str, install: bool) -> Result<Vec<String>, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME")?;
+    let xdg = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{home}/.config"));
+    let dir = PathBuf::from(xdg).join("opencode/agent");
+    let path = dir.join(format!("{name}.md"));
+    let mut out = Vec::new();
+
+    let existing = std::fs::read_to_string(&path).ok();
+    match existing {
+        Some(cur) if cur == md => {
+            out.push(format!("\x1b[32mok\x1b[0m   agent profile `{name}` installed ({})", path.display()));
+        }
+        Some(_) => {
+            if install {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                std::fs::write(&path, md).map_err(|e| e.to_string())?;
+                out.push(format!("updated agent profile `{name}` ({})", path.display()));
+            } else {
+                out.push(format!("\x1b[31mFAIL\x1b[0m  agent profile `{name}` outdated — run `bridge agent install` ({})", path.display()));
+            }
+        }
+        None => {
+            if install {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                std::fs::write(&path, md).map_err(|e| e.to_string())?;
+                out.push(format!("installed agent profile `{name}` ({})", path.display()));
+            } else {
+                out.push(format!("\x1b[31mFAIL\x1b[0m  agent profile `{name}` not installed — run `bridge agent install`"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Headless setup check: every failure names the fix. Exit 1 when setup is
 /// incomplete so scripts can gate on it.
 fn doctor() -> bool {
@@ -372,9 +436,30 @@ fn doctor() -> bool {
             if profile.trim().is_empty() { continue; }
             if known.iter().any(|k| *k == profile.as_str()) {
                 println!("  \x1b[32mok\x1b[0m   agent profile [{backend}] = {profile}");
+                // the bridge persona is ours: verify content freshness too
+                if profile == BRIDGE_AGENT_NAME {
+                    match agent_op(BRIDGE_AGENT_MD, BRIDGE_AGENT_NAME, false) {
+                        Ok(lines) => {
+                            for line in lines {
+                                if line.contains("FAIL") { bad = true; }
+                                println!("  {line}");
+                            }
+                        }
+                        Err(e) => {
+                            bad = true;
+                            println!("  \x1b[31mFAIL\x1b[0m  agent profile check failed: {e}");
+                        }
+                    }
+                }
             } else {
                 bad = true;
-                println!("  \x1b[31mFAIL\x1b[0m  agent profile [{backend}] = {profile} — NOT FOUND in the agent CLI's config. Clear \"agents\" in ~/.bridge/config.json (default agent is fine), or create the profile (`opencode agent create`)");
+                if profile == BRIDGE_AGENT_NAME {
+                    bad = true;
+                    println!("  \x1b[31mFAIL\x1b[0m  agent profile [{backend}] = {profile} — not in the CLI's agent list. Run `bridge agent install`, then verify with `opencode agent list`");
+                } else {
+                    bad = true;
+                    println!("  \x1b[31mFAIL\x1b[0m  agent profile [{backend}] = {profile} — NOT FOUND in the agent CLI's config. Clear \"agents\" in ~/.bridge/config.json (default agent is fine), or create the profile (`opencode agent create`)");
+                }
             }
         }
     }

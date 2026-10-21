@@ -96,13 +96,13 @@ edit by hand — settings in the desktop app apply by updating the same file):
   "token": "<from pairing>",
   "workdir": "/path/to/repo",          // repo the runner works in
   "max_sessions": 1,                   // concurrency: concurrent agent sessions (WIP limit)
-  "backends": ["opencode", "kiro"],    // provider CLIs to rotate across
-  "models": {                          // per-provider model (each CLI talks to different providers)
-    "opencode": "openrouter/~anthropic/claude-haiku-latest"   // REQUIRED for opencode
-    // "kiro": …        // optional: kiro is profile-driven — its profile pins provider+model
-  },
-  "agents": {                          // per-provider agent profile (optional)
-    "opencode": "reviewer"
+  "backends": {                        // provider sections — each carries its own config
+    "opencode": {                      // model optional: unset = opencode's own default config
+      "model": "openrouter/~anthropic/claude-haiku-latest",
+      "agent": "reviewer"              // optional agent profile
+    },
+    "kiro": {                          // profile-driven: the kiro profile pins provider+model
+    }
   },
   "report_minutes": null,              // null = agents report like a human (at natural milestones);
                                        // number 1-60 = fixed heartbeat cadence, in minutes

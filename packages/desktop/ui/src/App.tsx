@@ -49,7 +49,7 @@ interface Cfg {
   isolate: boolean;
   model: string | null;
   backend: string | null;
-  backends?: string[] | null;
+  backends?: Record<string, { bin?: string | null; agent?: string | null; model?: string | null }> | string[] | null;
   models?: Record<string, string> | null;
   agents?: Record<string, string> | null;
   report_minutes?: number | null;
@@ -412,10 +412,27 @@ export function App() {
       if (c) {
         setCfg(c);
         setMaxSessions(c.max_sessions);
-        const enabled = c.backends?.length ? c.backends : c.backend ? [c.backend] : ["opencode"];
+        // backends dict (new) or legacy array + flat maps
+        const sections: Record<string, { model?: string; agent?: string }> = {};
+        if (Array.isArray(c.backends)) {
+          for (const name of c.backends) sections[name] = {};
+          const legacyModels = c.models ?? {};
+          const legacyAgents = c.agents ?? {};
+          for (const name of c.backends) {
+            if (legacyModels[name]) sections[name].model = legacyModels[name];
+            if (legacyAgents[name]) sections[name].agent = legacyAgents[name];
+          }
+        } else if (c.backends && typeof c.backends === "object") {
+          for (const [name, sec] of Object.entries(c.backends)) {
+            sections[name] = { model: sec?.model ?? undefined, agent: sec?.agent ?? undefined };
+          }
+        } else if (c.backend) {
+          sections[c.backend] = {};
+        }
+        const enabled = Object.keys(sections).length ? Object.keys(sections) : ["opencode"];
         setBackends(enabled);
-        setBackendModels({ ...(c.models ?? (c.model ? { [c.backend ?? "opencode"]: c.model } : {})) });
-        setBackendAgents({ ...(c.agents ?? (c.agent ? { [c.backend ?? "opencode"]: c.agent } : {})) });
+        setBackendModels(Object.fromEntries(enabled.map((b) => [b, sections[b]?.model ?? ""])));
+        setBackendAgents(Object.fromEntries(enabled.map((b) => [b, sections[b]?.agent ?? ""])));
         setHubUrl(c.url);
       }
     } catch { /* no shell */ }
@@ -471,23 +488,21 @@ export function App() {
       setApplyMsg(`model required for: ${missing.join(", ")}`);
       return;
     }
-    // only backends that are actually enabled carry their section's values
-    const modelsOut = Object.fromEntries(
-      ordered.map((b) => [b, (backendModels[b] ?? "").trim()]).filter(([, v]) => v !== ""),
-    );
-    const agentsOut = Object.fromEntries(
-      ordered.map((b) => [b, (backendAgents[b] ?? "").trim()]).filter(([, v]) => v !== ""),
+    // backends dict: each enabled provider carries its own section
+    const backendsOut = Object.fromEntries(
+      ordered.map((b) => [b, {
+        model: (backendModels[b] ?? "").trim() || null,
+        agent: (backendAgents[b] ?? "").trim() || null,
+      }]),
     );
     const next: Cfg = {
       ...cfg,
       url: hubUrl.trim().replace(/\/$/, "") || cfg.url,
       max_sessions: Math.max(1, maxSessions),
       backend: ordered[0] ?? null,
-      backends: ordered,
-      agent: agentsOut[ordered[0]] ?? null,
-      model: modelsOut[ordered[0]] ?? null,
-      models: modelsOut,
-      agents: agentsOut,
+      backends: backendsOut,
+      agent: backendsOut[ordered[0]]?.agent ?? null,
+      model: backendsOut[ordered[0]]?.model ?? null,
     };
     setApplyMsg("applying…");
     try {
