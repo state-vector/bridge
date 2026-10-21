@@ -2476,6 +2476,24 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     let path = config_path();
     if let Ok(raw) = std::fs::read_to_string(&path) {
         if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&raw) {
+            // invalidate the credential hub-side FIRST — a logged-out token
+            // must not stay valid. Best-effort: offline leaves it valid, and
+            // the next pairing replaces it anyway.
+            let token = c.get("token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let url = c.get("url").and_then(|u| u.as_str()).unwrap_or("").trim_end_matches('/').to_string();
+            if !token.is_empty() && !url.is_empty() {
+                if let Ok(client) = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                {
+                    let _ = client
+                        .post(format!("{url}/api/kb-machine/revoke"))
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body("{}")
+                        .send();
+                }
+            }
             if let Some(obj) = c.as_object_mut() {
                 obj.insert("token".into(), serde_json::Value::String(String::new()));
             }

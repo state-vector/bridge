@@ -678,6 +678,19 @@ export class KnowledgeHub {
     // gateway name, the agent can fix its own identity without re-pairing.
     // Same write-law as mint (BR#2455): charset, uniqueness, and the gw-*
     // class boundary — a token can never rename across the class line.
+    if (url.pathname === "/token.self_revoke") {
+      const body = await request.json();
+      let identity;
+      try {
+        identity = await this.identify(String(body.bearer ?? ""));
+      } catch {
+        // unknown or already-revoked: the requested end-state already holds
+        return this.json({ ok: true, revoked: null });
+      }
+      this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, Date.now(), identity.token_id);
+      this.audit(identity.label, "self_revoke", identity.token_id, {});
+      return this.json({ ok: true, revoked: identity.label });
+    }
     if (url.pathname === "/token.rename") {
       const body = await request.json();
       const identity = await this.identify(String(body.bearer ?? ""));

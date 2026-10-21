@@ -171,7 +171,7 @@ export function PairView() {
               ))}
             </select>
             <button className="opt-btn auth-submit" disabled={!ws || !label.trim() || busy} onClick={() => void approve()}>
-              {busy ? "…" : "Approve & mint token"}
+              {busy ? "…" : "Approve"}
             </button>
           </>
         )}

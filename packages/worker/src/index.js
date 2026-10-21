@@ -28,6 +28,17 @@ export default {
         body: JSON.stringify({ bearer, label: body.label }),
       });
     }
+    if (url.pathname === "/api/kb-machine/revoke") {
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("ok"); }
+      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/token.self_revoke", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ bearer }),
+      });
+    }
     if (url.pathname === "/api/kb-machine/stats") {
       const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");

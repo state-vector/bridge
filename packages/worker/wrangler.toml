@@ -41,7 +41,7 @@ new_sqlite_classes = ["KnowledgeHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
+run_worker_first = ["/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/api/kb-machine/revoke", "/kb-ws"]
 
 [vars]
 # Overridden by `wrangler secret put` at deploy:
