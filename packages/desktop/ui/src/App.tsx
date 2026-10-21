@@ -593,6 +593,12 @@ export function App() {
           localStorage.removeItem("bridge-pair-pending");
           setPairCode(null);
           await loadCfg();
+          // pairing fixed the credential — the loop stopped when it was
+          // broken (identity gate / logout); bring it back so the app is
+          // visibly working instead of sitting stopped after a success
+          try {
+            await invoke("dispatch_start");
+          } catch { /* already running, or an external runner owns the claim */ }
           await pull();
           setLogoutMsg("");
         } else if (r?.status === "expired") {
