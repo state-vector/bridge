@@ -2,13 +2,11 @@ import { useEffect, useState } from "react";
 
 /**
  * Device pairing approval (GitHub-like device flow, bridge-native).
- * Reached at /pair by a human already signed in via GitHub. The device shows a
- * code; approving mints a token in the chosen workspace — the token flows to
- * the DEVICE via its poll loop, never to the approver.
- *
- * The device declares its class at pair/start (gateway | agent); the approver
- * never chooses it — they only name the identity and pick the workspace.
- * Gateway is a token trait, not a naming convention: the label is free-form.
+ * Reached at /pair by a human already signed in via GitHub — the page gates
+ * on the session before anything else. The DEVICE declares its class at
+ * pair/start; the approver only names the identity and picks the workspace.
+ * Pairing is a gateway act: agents are provisioned by gateways, never
+ * self-paired, so there are no roles here.
  */
 
 async function api<T>(path: string, body: unknown): Promise<T> {
@@ -23,29 +21,63 @@ async function api<T>(path: string, body: unknown): Promise<T> {
   return out;
 }
 
-const ROLES = ["impl", "analysis", "review"];
-
 function prefillLabel(device: string): string {
   return device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device";
 }
 
 export function PairView() {
+  const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
   const [code, setCode] = useState("");
   const [info, setInfo] = useState<{ device: string; type: string; created_ts: number } | null>(null);
   const [label, setLabel] = useState("");
   const [ws, setWs] = useState("");
   const [workspaces, setWorkspaces] = useState<Array<{ slug: string }>>([]);
-  const [roles, setRoles] = useState<string[]>(["impl"]);
   const [msg, setMsg] = useState("");
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
+    fetch("/api/session", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : { user: null }))
+      .then((d) => setAuthed(!!d.user))
+      .catch(() => setAuthed(false));
+  }, []);
+
+  useEffect(() => {
+    if (!authed) return;
     fetch("/api/workspaces", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : { workspaces: [] }))
       .then((d) => setWorkspaces(d.workspaces ?? []))
       .catch(() => setWorkspaces([]));
-  }, []);
+  }, [authed]);
+
+  if (authed === null) {
+    return (
+      <div className="auth-gate">
+        <div className="auth-card">
+          <div className="brand auth-brand">Bridge</div>
+          <p className="muted-note">…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authed) {
+    return (
+      <div className="auth-gate">
+        <div className="auth-card">
+          <div className="brand auth-brand">Bridge</div>
+          <p className="auth-host">Sign in to approve a pairing</p>
+          <p className="muted-note">
+            Pairing approval is human-plane — sign in with GitHub first, then come back to this page.
+          </p>
+          <a className="opt-btn auth-submit" href="/login" style={{ display: "block", textAlign: "center", textDecoration: "none" }}>
+            Sign in with GitHub
+          </a>
+        </div>
+      </div>
+    );
+  }
 
   const lookup = async () => {
     setMsg("");
@@ -59,7 +91,7 @@ export function PairView() {
         setMsg(`code is ${d.status}`);
         return;
       }
-      setInfo({ device: d.device, type: d.type ?? "agent", created_ts: d.created_ts });
+      setInfo({ device: d.device, type: d.type ?? "gateway", created_ts: d.created_ts });
       setLabel(prefillLabel(d.device));
     } catch (e) {
       setMsg((e as Error).message);
@@ -72,12 +104,10 @@ export function PairView() {
     setMsg("");
     setBusy(true);
     try {
-      const gateway = info?.type === "gateway";
       await api("/api/pair/approve", {
         code: code.trim().toUpperCase(),
         ws,
         label: label.trim(),
-        ...(gateway ? {} : { tags: roles.map((r) => `role:${r}`) }),
       });
       setDone(true);
     } catch (e) {
@@ -140,22 +170,6 @@ export function PairView() {
                 <option key={w.slug} value={w.slug}>{w.slug}</option>
               ))}
             </select>
-            {!gateway && (
-              <>
-                <label>Roles</label>
-                <div className="ask-chips">
-                  {ROLES.map((r) => (
-                    <button
-                      key={r}
-                      className={`chip ${roles.includes(r) ? "chip-scope" : ""}`}
-                      onClick={() => setRoles(roles.includes(r) ? roles.filter((x) => x !== r) : [...roles, r])}
-                    >
-                      role:{r}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
             <button className="opt-btn auth-submit" disabled={!ws || !label.trim() || busy} onClick={() => void approve()}>
               {busy ? "…" : "Approve & mint token"}
             </button>

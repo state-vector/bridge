@@ -2500,8 +2500,11 @@ export class KnowledgeHub {
     const code = this.pairCode();
     const now = Date.now();
     // the DEVICE declares its class at start; the approver never chooses —
-    // streams cannot cross because the request, not the human, sets the type
-    const type = body.type === "gateway" ? "gateway" : "agent";
+    // streams cannot cross because the request, not the human, sets the type.
+    // Pairing IS a gateway act (agents are provisioned by gateways, never
+    // self-paired), so an absent/unrecognized type defaults to gateway —
+    // legacy CLIs that predate the field pair as gateways too.
+    const type = body.type === "agent" ? "agent" : "gateway";
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     this.state.storage.sql.exec(
       `INSERT INTO pairings (code, device, type, device_id, status, created_ts) VALUES (?, ?, ?, ?, 'pending', ?)`,

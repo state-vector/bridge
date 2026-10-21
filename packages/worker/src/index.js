@@ -193,7 +193,7 @@ export default {
           // every pairing to agent and vended the wrong token class
           return json(await wsCall(env, "ws.pair.start", {
             device: String(body.device ?? "device"),
-            type: body.type === "gateway" ? "gateway" : "agent",
+            type: body.type === "agent" ? "agent" : "gateway",
           }));
         }
         if (url.pathname === "/api/pair/poll" && request.method === "POST") {
