@@ -848,8 +848,10 @@ pub fn board_lists_payload() -> Result<serde_json::Value, String> {
     };
     let in_progress = get("?type=task&status=in_progress&limit=100")?;
     let in_review = get("?type=task&status=in_review&limit=100")?;
+    let blocked = get("?type=task&status=blocked&limit=100")?;
     let mut top = in_progress;
     top.extend(in_review);
+    top.extend(blocked);
     top.sort_by_key(|a| {
         let m = a.get("meta").cloned().unwrap_or(json!({}));
         -(m.get("last_progress").and_then(|p| p.get("ts")).and_then(|t| t.as_i64()).unwrap_or(0))
