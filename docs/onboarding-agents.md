@@ -125,5 +125,5 @@ until it works again.
 | every dispatch fails `agent "X" not found` | `agents` names a profile that doesn't exist in the CLI's config | clear `agents` or create the profile |
 | every dispatch fails `ProviderModelNotFoundError` | `models` ID isn't in the CLI's catalog | verify with `opencode models` / the CLI's list |
 | runner idle, log says "no dispatchable agents" | CLI not installed/authed, or model missing | `bridge doctor` |
-| task blocked "references no git repository" | the task carries no `meta.repo` and no repo URL in its body | add `meta.repo` (or a repo URL in the body); the runner clones it into the workdir on demand |
+| task runs in a scratch dir instead of a repo checkout | the task carries no `meta.repo` and no repo URL in its body (BR#2460: nothing is declined) | add `meta.repo` (or a repo URL in the body) if the work needs a provisioned checkout; otherwise the agent self-serves in the scratch dir, which is deleted when the run ends |
 | sessions run a weaker model than intended | model pinned in a global CLI config or an agent profile overriding bridge's `models` | bridge's `--model` wins at dispatch; clean the pin if you want bridge's value |

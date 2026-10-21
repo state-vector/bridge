@@ -189,7 +189,12 @@ export default {
       const body = await request.json().catch(() => ({}));
       try {
         if (url.pathname === "/api/pair/start" && request.method === "POST") {
-          return json(await wsCall(env, "ws.pair.start", { device: String(body.device ?? "device") }));
+          // forward the device-declared class — dropping it here defaulted
+          // every pairing to agent and vended the wrong token class
+          return json(await wsCall(env, "ws.pair.start", {
+            device: String(body.device ?? "device"),
+            type: body.type === "gateway" ? "gateway" : "agent",
+          }));
         }
         if (url.pathname === "/api/pair/poll" && request.method === "POST") {
           return json(await wsCall(env, "ws.pair.poll", { code: String(body.code ?? "") }));

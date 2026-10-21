@@ -148,6 +148,69 @@ fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
     dispatch::stop(&state);
 }
 
+/// Log out: stop the runner and clear the gateway token (settings are kept),
+/// returning the app to its onboarding state (pair again to vend a fresh
+/// gateway token).
+#[tauri::command]
+fn logout(state: tauri::State<'_, dispatch::DispatchState>) {
+    dispatch::logout(&state);
+}
+
+/// UI-driven onboarding, step 1: register the device, return the enter-code.
+/// The user confirms at <hub>/pair; the UI then polls pair_poll.
+#[tauri::command]
+async fn pair_start(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let device = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "device".into());
+        dispatch::pair_start(&client, url.trim_end_matches('/'), &device)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// UI-driven onboarding, step 2: one poll for the entered code. On
+/// authorization the token is merged into the existing config (settings are
+/// preserved) and saved. The UI polls every ~3s.
+#[tauri::command]
+async fn pair_poll(url: String, code: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+        match dispatch::pair_poll(&client, url.trim_end_matches('/'), &code)? {
+            dispatch::PairPoll::Pending => Ok(serde_json::json!({ "status": "pending" })),
+            dispatch::PairPoll::SlowDown => Ok(serde_json::json!({ "status": "pending" })),
+            dispatch::PairPoll::Authorized(cfg) => Ok(serde_json::to_value(&cfg).unwrap_or_default())
+                .map(|v| serde_json::json!({ "status": "authorized", "config": v })),
+            dispatch::PairPoll::Expired => Ok(serde_json::json!({ "status": "expired" })),
+            dispatch::PairPoll::Failed(e) => Err(e),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Open a URL in the system browser. The webview's window.open does not
+/// reach the OS (and target=_blank is trapped) — everything that must open
+/// externally goes through the opener plugin here.
+#[tauri::command]
+fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// CLI flag lookup: `--flag value` → parsed value (u64), None when absent/invalid.
 fn cli_u64(name: &str) -> Option<u64> {
     let args: Vec<String> = std::env::args().collect();
@@ -176,6 +239,10 @@ pub fn run() {
             dispatch_create_task,
             dispatch_start,
             dispatch_stop,
+            logout,
+            pair_start,
+            pair_poll,
+            open_external,
             menubar::show_panel,
             menubar::hide_panel
         ])

@@ -299,19 +299,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "device".into());
 
-    let start: serde_json::Value = client
-        .post(format!("{url}/api/pair/start"))
-        .header("content-type", "application/json")
-        .body(json!({ "device": device }).to_string())
-        .send()
-        .map_err(|e| format!("bridge unreachable: {e}"))?
-        .json()
-        .map_err(|e| e.to_string())?;
-    let code = start
-        .get("code")
-        .and_then(|c| c.as_str())
-        .ok_or("pair start failed")?
-        .to_string();
+    let code = pair_start(&client, url, &device)?;
     eprintln!("[pair] open {url}/pair and enter code {code}");
     println!("[pair] open {url}/pair and enter code {code}");
 
@@ -321,61 +309,155 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
             return Err("pairing timed out — run again to get a fresh code".into());
         }
         std::thread::sleep(Duration::from_secs(3));
-        let resp: serde_json::Value = client
-            .post(format!("{url}/api/pair/poll"))
-            .header("content-type", "application/json")
-            .body(json!({ "code": code }).to_string())
-            .send()
-            .map_err(|e| format!("poll failed: {e}"))?
-            .json()
-            .map_err(|e| e.to_string())?;
-        match resp.get("status").and_then(|s| s.as_str()) {
-            Some("pending") => continue,
-            Some("slow_down") => {
+        match pair_poll(&client, url, &code)? {
+            PairPoll::Pending => continue,
+            PairPoll::SlowDown => {
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
-            Some("authorized") => {
-                let token = resp
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .ok_or("authorized but no token")?
-                    .to_string();
-                let ws = resp
-                    .get("ws")
-                    .and_then(|w| w.as_str())
-                    .unwrap_or("state-vector")
-                    .to_string();
-                let label = resp
-                    .get("label")
-                    .and_then(|l| l.as_str())
-                    .map(|s| s.to_string());
-                eprintln!("[pair] authorized — token for workspace '{ws}' saved");
-                return Ok(DispatchConfig {
-                    url: url.to_string(),
-                    token,
-                    workdir: default_workdir(),
-                    agent: std::env::var("BRIDGE_AGENT").ok(),
-                    model: std::env::var("BRIDGE_MODEL").ok(),
-                    backend: std::env::var("BRIDGE_BACKEND").ok(),
-                    poll_secs: default_poll_secs(),
-                    timeout_mins: default_timeout_mins(),
-                    opencode_bin: default_opencode_bin(),
-                    label,
-                    agent_name: None,
-                ws: Some(ws),
+            PairPoll::Authorized(cfg) => {
+                eprintln!("[pair] authorized — token saved");
+                return Ok(cfg);
+            }
+            PairPoll::Expired => return Err("pairing code expired — run again".into()),
+            PairPoll::Failed(other) => return Err(format!("pairing failed: {other}")),
+        }
+    }
+}
+
+/// Stable machine identity for re-pairing: IOPlatformUUID (survives hostname
+/// renames; unlike a MAC address it can't drift with hardware). The hub
+/// re-associates a re-pairing device with its existing token by this id —
+/// rotation, not a label collision. Fallback: hostname.
+fn device_id() -> String {
+    if let Ok(out) = Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if line.contains("\"IOPlatformUUID\"") {
+                if let Some(v) = line.split('=').nth(1) {
+                    let v = v.trim().trim_matches('"').trim_end_matches(';').trim();
+                    if !v.is_empty() {
+                        return format!("uuid-{v}");
+                    }
+                }
+            }
+        }
+    }
+    let host = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-device".into());
+    format!("host-{host}")
+}
+
+/// First half of the device flow: register this device, get the enter-code.
+/// This app IS a gateway — the pairing declares that class; the hub vends a
+/// gateway-class token on approval. The approver never chooses. The stable
+/// device id lets the hub re-associate re-pairings (rotate, not collide).
+pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str) -> Result<String, String> {
+    let start: serde_json::Value = client
+        .post(format!("{url}/api/pair/start"))
+        .header("content-type", "application/json")
+        .body(json!({ "device": device, "type": "gateway", "device_id": device_id() }).to_string())
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    start
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(String::from)
+        .ok_or_else(|| "pair start failed".into())
+}
+
+/// One pairing poll. Authorized merges the vended token into the EXISTING
+/// config (settings survive a logout → pair cycle) and saves it.
+pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> Result<PairPoll, String> {
+    let resp: serde_json::Value = client
+        .post(format!("{url}/api/pair/poll"))
+        .header("content-type", "application/json")
+        .body(json!({ "code": code }).to_string())
+        .send()
+        .map_err(|e| format!("poll failed: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("pending") => Ok(PairPoll::Pending),
+        Some("slow_down") => Ok(PairPoll::SlowDown),
+        Some("authorized") => {
+            let token = resp
+                .get("token")
+                .and_then(|t| t.as_str())
+                .ok_or("authorized but no token")?
+                .to_string();
+            let ws = resp
+                .get("ws")
+                .and_then(|w| w.as_str())
+                .unwrap_or("state-vector")
+                .to_string();
+            let label = resp
+                .get("label")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string());
+            // merge into the existing config so user settings survive;
+            // fresh defaults only when there is nothing to merge with
+            let mut cfg = load_config().unwrap_or_else(|| DispatchConfig {
+                url: url.to_string(),
+                token: String::new(),
+                workdir: default_workdir(),
+                agent: std::env::var("BRIDGE_AGENT").ok(),
+                model: std::env::var("BRIDGE_MODEL").ok(),
+                backend: std::env::var("BRIDGE_BACKEND").ok(),
+                poll_secs: default_poll_secs(),
+                timeout_mins: default_timeout_mins(),
+                opencode_bin: default_opencode_bin(),
+                label: None,
+                agent_name: None,
+                ws: None,
                 max_sessions: default_max_sessions(),
                 report_minutes: None,
                 isolate: default_isolate(),
                 backends: Default::default(),
                 models: None,
                 agents: None,
-                });
-            }
-            Some("expired") => return Err("pairing code expired — run again".into()),
-            other => return Err(format!("pairing failed: {other:?}")),
+            });
+            cfg.url = url.trim_end_matches('/').to_string();
+            cfg.token = token;
+            cfg.ws = Some(ws);
+            cfg.label = label;
+            cfg.normalize();
+            cfg.save()?;
+            eprintln!("[pair] authorized — token for workspace '{}' saved (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
+            Ok(PairPoll::Authorized(cfg))
         }
+        Some("expired") => Ok(PairPoll::Expired),
+        Some(other) => Ok(PairPoll::Failed(other.to_string())),
+        None => Ok(PairPoll::Failed("no status in poll response".into())),
     }
+}
+
+pub enum PairPoll {
+    Pending,
+    SlowDown,
+    Authorized(DispatchConfig),
+    Expired,
+    Failed(String),
+}
+
+/// Resolve the config and require a vendored token. The machine-plane board
+/// endpoints currently answer empty-token requests, so an unpaired desktop
+/// would keep rendering board data after logout — refuse client-side instead.
+fn paired_config() -> Result<DispatchConfig, String> {
+    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    if cfg.token.is_empty() {
+        return Err("logged out — pair first".into());
+    }
+    Ok(cfg)
 }
 
 /// Snapshot of resumable opencode sessions: title → session id. Dispatched runs
@@ -700,7 +782,7 @@ pub fn external_runner_pid() -> Option<u32> {
 /// task on the hub through MCP (the paired token's one legitimate write for
 /// the console — creation only, never claims/transitions).
 pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("no bridge config — pair first")?;
+    let cfg = paired_config()?;
     let mut id = 0i64;
     mcp_call(
         &cfg,
@@ -716,7 +798,7 @@ pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String>
 }
 
 pub fn for_you_payload() -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -749,7 +831,7 @@ pub fn for_you_payload() -> Result<serde_json::Value, String> {
 /// Board lists for the desktop Top/Backlog views: live in-progress work
 /// (Top) and the ranked-ish dispatch queue + completed ledger (Backlog).
 pub fn board_lists_payload() -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -805,7 +887,7 @@ pub fn board_lists_payload() -> Result<serde_json::Value, String> {
 /// so accept/reject opens the board in the browser. This command exists to
 /// REJECT (withdraw) a stale verdict — machine-plane supersede is allowed.
 pub fn decision_act_payload(id: &str, act: &str) -> Result<serde_json::Value, String> {
-    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let cfg = paired_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -850,6 +932,7 @@ struct InFlight {
     started: std::time::Instant,
     last_note: String,
     worktree: Option<PathBuf>, // isolated worktree to clean up on finalize
+    scratch: Option<PathBuf>,  // repo-less dispatch dir — removed when the outcome lands (BR#2460)
     pr_url: Option<String>,    // PR opened by the session, monitored after handoff
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
     live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
@@ -970,20 +1053,16 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
 // never encodes gate verdicts as state — it releases claims and skips
 // candidates. The drift-alarm test at the bottom of this file enforces it.
 
-fn json_tags(v: &serde_json::Value) -> Vec<String> {
-    v.get("tags")
-        .and_then(|t| t.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(String::from).collect())
-        .unwrap_or_default()
-}
-
-/// Verdict-role duties (unblock, review) are board-side judgment work: the
-/// agent renders a verdict from task history and live receipts, not from a
-/// checkout. A missing repo ref is bounce-with-findings material for them,
-/// never a deterministic runner block — blocking them parks a done-only task
-/// type in blocked and spawns the unblock-spawn loop.
-fn tags_exempt_from_repo_gate(tags: &[String]) -> bool {
-    tags.iter().any(|t| t == "role:unblock" || t == "role:review")
+/// BR#2460 scratch session dir for repo-less dispatches:
+/// <workdir>/sessions/bridge-<tid>/. Litter control and a deterministic cwd,
+/// NOT a sandbox — agents hold full user permissions. Removed when the run
+/// outcome lands; runner startup sweeps orphans.
+fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(workdir)
+        .join("sessions")
+        .join(format!("bridge-{}", slugify(tid)));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
@@ -1036,6 +1115,15 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         return Some(path);
     }
     std::fs::create_dir_all(path.parent()?).ok()?;
+    // Self-heal stale registrations: a worktree dir deleted without
+    // deregistration leaves a "prunable" ghost whose branch lock fails both
+    // worktree adds below, and the isolation guard then refuses dispatch —
+    // churning the task through the watchdog (BR#2421 class). Prune is
+    // idempotent and cheap.
+    let _ = Command::new("git")
+        .current_dir(repo_path)
+        .args(["worktree", "prune"])
+        .output();
         let branch = format!("bridge/{slug}");
         // Base = the clone's default branch. `origin/HEAD` is set by clone.
         let mut cmd = Command::new("git");
@@ -1062,8 +1150,22 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
     let slug = slugify(task_id);
     let Some(home) = std::env::var("HOME").ok() else { return };
     let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
+    // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
+    // Deregistering against cfg.workdir silently failed whenever the worktree
+    // was owned by a clone under <workdir>/repos — the dir was then deleted,
+    // leaving a prunable ghost whose branch lock made the next dispatch of the
+    // same task refuse isolation and churn through the watchdog (BR#2421).
+    let owner = std::fs::read_to_string(path.join(".git"))
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("gitdir: ")
+                .and_then(|g| g.split("/.git/worktrees/").next())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| workdir.to_string());
     let _ = Command::new("git")
-        .current_dir(workdir)
+        .current_dir(&owner)
         .args(["worktree", "remove", "--force"])
         .arg(&path)
         .output();
@@ -1072,7 +1174,7 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
         // no future. On todo releases the branch is KEPT: a re-claim attaches
         // to it, preserving any unpushed stall work.
         let _ = Command::new("git")
-            .current_dir(workdir)
+            .current_dir(&owner)
             .args(["branch", "-D"])
             .arg(&format!("bridge/{slug}"))
             .output();
@@ -1257,6 +1359,15 @@ fn note_task(cfg: &DispatchConfig, tid: &str, did: &str) {
     let _ = mcp_call(cfg, &mut id, "log_progress", json!({ "id": tid, "did": did }));
 }
 
+/// Release this runner's own claim (in_progress → todo) with a note. BR#2419:
+/// the runner may release its own claims — that is the only card move it makes
+/// besides claiming.
+fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) {
+    let mut id = 0i64;
+    let _ = mcp_call_task(cfg, &mut id, "transition", json!({ "id": tid, "to": "todo" }), &tid);
+    note_task(cfg, tid, did);
+}
+
 fn spawn_opencode(
     cfg: &DispatchConfig,
     snap: &SharedSnapshot,
@@ -1272,29 +1383,18 @@ fn spawn_opencode(
 ) {
     let backend = pick_backend(avail);
 
-    // the task names its git repository; the runner clones it on demand.
-    // No reference -> deterministic refusal (nothing to clone = nothing to do).
-    let Some(repo_url) = source_repo(body_md, task_meta) else {
-        // backstop: the caller (tick) blocks repo-less tasks BEFORE claiming;
-        // reaching here means the reference appeared without a URL.
-        eprintln!("[dispatch] {tid} has no repo reference — skipping spawn");
-        snap_activity(snap, "error", &format!("{tid} has no repo reference — not dispatched"));
-        note_task(
-            cfg,
-            tid,
-            "runner: no resolvable repo reference — set meta.repo (owner/repo) or a full clone URL on this task; refusal is board-visible, the card is untouched",
-        );
-        return;
-    };
-    let Some(repo_path) = ensure_repo_clone(&cfg.workdir, &repo_url) else {
-        eprintln!("[dispatch] {tid}: clone failed for {repo_url} — skipping spawn");
-        snap_activity(snap, "error", &format!("{tid}: clone failed ({repo_url})"));
-        note_task(
-            cfg,
-            tid,
-            &format!("runner: git clone failed for {repo_url} — check the repo exists and the runner host has access; will retry next cycle"),
-        );
-        return;
+    // BR#2460: provisioning is a best-effort optimization; capability belongs
+    // to the agent. A resolvable repo reference (meta.repo or the task body)
+    // means the host provisions a checkout; its absence means a scratch dir
+    // and the board delivery contract — never a refusal. Under-provisioning
+    // is survivable (the agent clones what it needs); the old gate that
+    // declined repo-less tasks parked claimed cards with no session
+    // (BR#2456 class).
+    let repo_url = source_repo(body_md, task_meta);
+    let scratch = if repo_url.is_none() {
+        ensure_scratch_dir(&cfg.workdir, tid)
+    } else {
+        None
     };
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
@@ -1314,27 +1414,45 @@ fn spawn_opencode(
         resume_session
     };
     let resume = resume_session.is_some();
-    let worktree = if cfg.isolate {
-        ensure_worktree(&repo_path, tid, resume)
+    let worktree = if let Some(url) = &repo_url {
+        let Some(repo_path) = ensure_repo_clone(&cfg.workdir, url) else {
+            eprintln!("[dispatch] {tid}: clone failed for {url} — skipping spawn");
+            snap_activity(snap, "error", &format!("{tid}: clone failed ({url})"));
+            note_task(
+                cfg,
+                tid,
+                &format!("runner: git clone failed for {url} — check the repo exists and the runner host has access; will retry next cycle"),
+            );
+            return;
+        };
+        let worktree = if cfg.isolate {
+            ensure_worktree(&repo_path, tid, resume)
+        } else {
+            None
+        };
+        // isolation guard: a shared checkout is a shared branch and a shared git
+        // index — dispatched sessions have switched branches under humans and
+        // reverted committed work (three times). If isolation was requested and
+        // failed, refuse: never dispatch into cfg.workdir.
+        if cfg.isolate && worktree.is_none() {
+            let msg = format!(
+                "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
+            );
+            eprintln!("[dispatch] {msg}");
+            snap_activity(snap, "error", &msg);
+            return;
+        }
+        worktree
     } else {
         None
     };
-    // isolation guard: a shared checkout is a shared branch and a shared git
-    // index — dispatched sessions have switched branches under humans and
-    // reverted committed work (three times). If isolation was requested and
-    // failed, refuse: never dispatch into cfg.workdir.
-    if cfg.isolate && worktree.is_none() {
-        let msg = format!(
-            "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
-        );
-        eprintln!("[dispatch] {msg}");
-        snap_activity(snap, "error", &msg);
-        return;
-    }
-    let run_dir = worktree
-        .clone()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| cfg.workdir.clone());
+    let run_dir = if let Some(wt) = &worktree {
+        wt.to_string_lossy().to_string()
+    } else if let Some(s) = &scratch {
+        s.to_string_lossy().to_string()
+    } else {
+        cfg.workdir.clone()
+    };
     let branch = format!("bridge/{}", slugify(tid));
     let resume_note = resume_session
         .as_ref()
@@ -1355,19 +1473,28 @@ fn spawn_opencode(
     // verify/analysis/unblock tasks deliver on the BOARD (knowledge/progress
     // notes with receipts) — a PR per receipt-finding was drowning the queue
     // (51 open docs-PRs in a day). The role flag recorded at claim time
-    // decides which contract the session gets.
-    let delivery_line = if role_work {
+    // decides which contract the session gets. Repo-less dispatches deliver
+    // on the board too: there is no provisioned checkout to open a PR from
+    // (the agent may still self-serve a clone — the board line covers that).
+    let delivery_line = if role_work || repo_url.is_none() {
         "- Deliver on the board: your findings, verdicts, and receipts go into log_progress / knowledge artefacts with exact citations (GitHub PR/issue/run URLs only — a non-GitHub URL is not a receipt). No commit or PR unless you actually changed code.\n- If you DID change code: commit your work, push the branch, and open a PR against the default branch (`gh pr create`), and include the PR URL in your summary. Docs ride with the change: user-visible behaviour updates README.md and packages/site/content.md in the same branch."
     } else {
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
+    };
+    let provisioning_line = if let Some(url) = &repo_url {
+        format!("- You are working in {run_dir} on branch `{branch}` (an isolated git worktree of {url}).")
+    } else {
+        format!(
+            "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
+        )
     };
     let bridge_session = format!("dispatch-{}", slugify(tid));
     let env_block = format!(
         "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
     );
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree of {}).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
-        policy, tid, title, body_md, resume_note, env_block, run_dir, branch, repo_url, heartbeat_line, delivery_line
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract\n\n{}\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+        policy, tid, title, body_md, resume_note, env_block, provisioning_line, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -1381,6 +1508,7 @@ fn spawn_opencode(
         worktree
             .as_ref()
             .map(|p| format!(" (worktree {})", p.display()))
+            .or_else(|| scratch.as_ref().map(|p| format!(" (scratch {})", p.display())))
             .unwrap_or_default(),
     );
     snap_activity(
@@ -1400,16 +1528,34 @@ fn spawn_opencode(
     // existing MCP servers are honoured. The MCP auth uses a PER-AGENT token
     // the gateway provisions from the hub on the worker's behalf (per agent,
     // not per session) — board actions attribute to the agent, not the
-    // gateway. Fallback: the gateway's own token if provisioning fails, with
-    // a loud note (attribution then reads as the gateway).
+    // gateway. Identity law (BR#2455): this app is a gateway; the pair flow
+    // vends a gw-* token; run_loop refuses to start on anything else.
     let agent_label = agent_identity(cfg);
-    let agent_token = match provision_agent_token(cfg, &agent_label) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — falling back to gateway token");
-            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — sessions attribute to the gateway until fixed"));
-            cfg.token.clone()
+    let agent_token = if cfg.token.starts_with("gw-") {
+        match provision_agent_token(cfg, &agent_label) {
+            Ok(t) => t,
+            Err(e) => {
+                // No fallback: dispatching under the gateway's own token would
+                // mis-attribute every board action the session makes. Release
+                // the claim instead — transient hub failures self-heal on the
+                // next tick (the runner may release its own claims, BR#2419).
+                eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
+                snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
+                release_claim(
+                    cfg,
+                    tid,
+                    &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
+                );
+                return;
+            }
         }
+    } else {
+        // unreachable via run_loop (gateway token class is validated at
+        // startup) — defensive: never dispatch under an agent-class identity
+        let msg = "gateway token is not gateway-class (gw-*) — refusing to dispatch; re-pair this device to vend a gateway token (identity law BR#2455)";
+        eprintln!("[dispatch] {msg}");
+        snap_activity(snap, "error", msg);
+        return;
     };
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
@@ -1466,6 +1612,7 @@ fn spawn_opencode(
         started: std::time::Instant::now(),
         last_note: String::new(),
         worktree,
+        scratch,
         pr_url: None,
         rx: outcome,
         live,
@@ -1574,6 +1721,7 @@ fn tick(
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
+                    scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
                 },
@@ -1593,6 +1741,7 @@ fn tick(
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
+                    scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
                 },
@@ -1612,6 +1761,13 @@ fn tick(
         snap_in_flight_list(snap, in_flight);
     }
     for (mut inf, outcome) in finished {
+        // BR#2460: scratch dirs are disposable on every exit path (yield
+        // included) — the board is the only deliverable, and a resumed run
+        // gets a fresh scratch dir. Unlike worktrees, they hold no resume
+        // assets.
+        if let Some(s) = inf.scratch.take() {
+            let _ = std::fs::remove_dir_all(s);
+        }
         let mins = inf.started.elapsed().as_secs() / 60;
         let pr_url = extract_pr(&outcome.stdout_tail);
         inf.pr_url = pr_url.clone();
@@ -2083,25 +2239,13 @@ fn tick(
         if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
             continue;
         }
-        // repo policy (host-side, not law): without a git repository reference
-        // there is nothing to clone, so decline the candidate. Verdict roles
-        // (unblock/review) are board-side judgment work — no checkout needed.
-        // A missing repo ref is the author's metadata gap; the runner never
-        // moves the card (the worker machine owns state), it just declines.
+        // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
+        // dir with the board delivery contract. Provisioning is the runner's
+        // best-effort job; capability is the agent's. Nothing is declined for
+        // missing metadata.
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        if source_repo(&body_md, &task_meta).is_none() && !tags_exempt_from_repo_gate(&json_tags(&art)) {
-            attempts.insert(tid.to_string(), Instant::now());
-            snap_activity(snap, "info", &format!("{tid} skipped — no repo reference (host policy)"));
-            msgs.push(format!("{tid} skipped — no repo reference (add meta.repo or a repo URL; runner declines, card untouched)"));
-            note_task(
-                cfg,
-                tid,
-                "runner: skipped — no resolvable repo reference (set meta.repo as owner/repo, or a full clone URL; receipts-only URLs like pull/commit links do not count)",
-            );
-            continue;
-        }
         if let Err(e) = mcp_call_task(
             cfg,
             id,
@@ -2166,7 +2310,32 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
         },
     };
+    // Identity law (BR#2455): this app is a gateway. The pair flow vends a
+    // gateway-class token (gw-*); running on an agent-class token is an
+    // invalid pairing state — per-agent provisioning is impossible and every
+    // claim would carry the wrong identity class. Log out automatically:
+    // erase the pairing and return to onboarding (a fresh token is vended at
+    // the next pair).
+    if cfg.token.is_empty() || !cfg.token.starts_with("gw-") {
+        let msg = "logged out — hub token is missing or not gateway-class (gw-*); pair again to onboard";
+        eprintln!("[dispatch] {msg}");
+        logout_core(&stop, &running, &snap);
+        if let Ok(mut g) = last_error.lock() {
+            *g = Some(msg.to_string());
+        }
+        return;
+    }
     running.store(true, Ordering::Relaxed);
+    // BR#2460: scratch session dirs are per-run — anything left under
+    // <workdir>/sessions is an orphan from a previous run (crash/kill);
+    // nothing is in flight at startup, so sweep unconditionally. Normal-path
+    // cleanup happens when each run's outcome lands.
+    let sessions_root = PathBuf::from(&cfg.workdir).join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_root) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
@@ -2189,6 +2358,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.workdir = Some(cfg.workdir.clone());
         s.max_sessions = cfg.max_sessions;
     }
+    let mut did_logout = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -2212,6 +2382,22 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 }
             }
             Err(e) => {
+                // A hub-rejected token (401: revoked/expired/rotated away) is
+                // not retryable — every call will fail the same way. Log out
+                // automatically: erase the pairing and return to onboarding.
+                // (Tick errors reaching here are orient's — "bridge {status}
+                // on /mcp" — so the prefix match cannot hit task IDs.)
+                if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
+                    let msg = format!("logged out — hub rejected the token ({e}); pair again to onboard");
+                    eprintln!("[dispatch] {msg}");
+                    snap_activity(&snap, "error", &msg);
+                    logout_core(&stop, &running, &snap);
+                    if let Ok(mut g) = last_error.lock() {
+                        *g = Some(msg);
+                    }
+                    did_logout = true;
+                    break;
+                }
                 eprintln!("[dispatch] error: {e}");
                 snap_activity(&snap, "error", &e);
                 if let Ok(mut g) = last_error.lock() {
@@ -2235,7 +2421,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.running = false;
         s.in_flight = Vec::new();
     }
-    write_runner_state(&snap);
+    // a logout erased the derived state — do not resurrect runner.json here
+    if !did_logout {
+        write_runner_state(&snap);
+    }
     eprintln!("[dispatch] loop stopped");
 }
 
@@ -2276,6 +2465,49 @@ pub fn stop(state: &DispatchState) {
     write_runner_state(&state.snapshot);
 }
 
+/// Log out core: trash the KEY, not the config. Clears the token in place
+/// (every other setting — hub URL, workdir, providers, model — survives, so
+/// onboarding is a re-pair, not a from-scratch setup), removes vendored
+/// per-agent credentials, and resets the snapshot. Shared by manual logout
+/// (Settings) and automatic logout on an invalid token (wrong class at
+/// startup, hub-rejected at runtime). Stops the loop; the caller
+/// returns/breaks afterwards.
+fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot) {
+    stop.store(true, Ordering::Relaxed);
+    running.store(false, Ordering::Relaxed);
+    let path = config_path();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(obj) = c.as_object_mut() {
+                obj.insert("token".into(), serde_json::Value::String(String::new()));
+            }
+            let body = serde_json::to_string_pretty(&c).unwrap_or_default();
+            let _ = std::fs::write(&path, body);
+            #[cfg(unix)]
+            let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        }
+    }
+    if let Some(dir) = dispatch_dir() {
+        // vendored per-agent credentials — re-provisioned after the next pair
+        let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+    }
+    if let Ok(mut s) = snap.lock() {
+        s.running = false;
+        s.in_flight = Vec::new();
+    }
+    eprintln!("[dispatch] logged out — token cleared (settings kept); pair again to onboard");
+}
+
+/// Log out (Settings): stop the runner and erase pairing + derived state,
+/// returning the app to its unconfigured onboarding state. A fresh gateway
+/// token is vended at the next pairing.
+pub fn logout(state: &DispatchState) {
+    logout_core(&state.stop, &state.running, &state.snapshot);
+    if let Ok(mut g) = state.last_error.lock() {
+        *g = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2301,23 +2533,20 @@ mod tests {
     }
 
     #[test]
-    fn repo_gate_exempts_verdict_roles_only() {
-        assert!(tags_exempt_from_repo_gate(&["role:unblock".to_string()]));
-        assert!(tags_exempt_from_repo_gate(&["role:review".to_string()]));
-        assert!(tags_exempt_from_repo_gate(&["role:review".to_string(), "attempted".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&["role:impl".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&["role:analysis".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&[]));
-    }
-
-    #[test]
-    fn json_tags_reads_top_level_array_only() {
-        let v = serde_json::json!({ "tags": ["role:unblock", "attempted"], "meta": { "tags": ["role:impl"] } });
-        assert_eq!(json_tags(&v), vec!["role:unblock".to_string(), "attempted".to_string()]);
-        // meta.tags must not leak into the top-level read
-        let nested = serde_json::json!({ "meta": { "tags": ["role:review"] } });
-        assert!(json_tags(&nested).is_empty());
-        assert!(json_tags(&serde_json::json!({})).is_empty());
+    fn scratch_dirs_are_per_task_deterministic_paths() {
+        // BR#2460: repo-less dispatches provision <workdir>/sessions/bridge-<slug>.
+        // Creation must be idempotent (resume re-enters the same dir) and
+        // task-scoped (no cross-task bleed).
+        let base = std::env::temp_dir().join(format!("bridge-scratch-test-{}", std::process::id()));
+        let a = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
+        let b = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
+        assert_eq!(a, b);
+        let dir = a.expect("scratch dir created");
+        assert!(dir.is_dir());
+        assert!(dir.to_string_lossy().contains("sessions"));
+        let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
+        assert_ne!(dir, other);
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 
