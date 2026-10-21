@@ -80,10 +80,6 @@ export function Chat() {
 
   return (
     <main className="gw-main chat">
-      <div className="gw-card chat-head">
-        <h2>Console</h2>
-        <span className="gw-note">board Q&A — local model; drafts tasks for your confirmation (never dispatches work)</span>
-      </div>
       <div className="chat-scroll" ref={scrollRef}>
         {msgs.length === 0 && !draft && (
           <span className="gw-log-empty">
