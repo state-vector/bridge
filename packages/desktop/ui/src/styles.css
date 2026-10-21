@@ -118,6 +118,21 @@ body {
 .gw-conc { font-family: var(--mono); font-size: 18px; font-weight: 700; min-width: 2ch; text-align: center; }
 .gw-btn-on { border-color: var(--green); color: var(--green); }
 
+/* chips — same vocabulary as the webapp */
+.chip { font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; padding: 3px 8px; border-radius: 999px; border: none; background: var(--line); color: var(--text-dim); display: inline-block; }
+.chip-urgent { background: var(--red); color: #fff; }
+.chip-needs { background: var(--amber); color: #221607; }
+.chip-done { background: var(--green); color: #fff; }
+.chip-scope { background: color-mix(in srgb, var(--accent) 25%, transparent); color: var(--accent); }
+
+/* decision actions — mirror the webapp treatment (green accept / red reject) */
+.gw-btn.act-accept { background: color-mix(in srgb, var(--green) 18%, var(--bg-raised)); border-color: var(--green); color: var(--green); font-weight: 650; }
+.gw-btn.act-accept:hover { background: color-mix(in srgb, var(--green) 28%, var(--bg-raised)); }
+.gw-btn.act-reject { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); color: var(--red); font-weight: 650; }
+.gw-btn.act-reject:hover { background: color-mix(in srgb, var(--red) 12%, var(--bg-raised)); }
+.fy-decision { flex-direction: column; align-items: stretch; }
+.fy-decision .gw-fq { display: block; color: var(--text); font-size: 13px; line-height: 1.45; white-space: normal; margin: 4px 0; }
+
 /* per-provider config sections (Settings) */
 .gw-provider {
   border: 1px solid var(--line); border-radius: 8px;

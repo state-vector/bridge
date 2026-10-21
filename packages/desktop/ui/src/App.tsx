@@ -160,15 +160,36 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
     }
   };
 
+  const frameDecision = (d: ForYouArtefact): { q: string; verdict: string; target: string } => {
+    const m = (d.meta ?? {}) as Record<string, unknown>;
+    const target = String(m.task ?? m.verify_target ?? d.id);
+    if (m.decision_class === "verify-verdict") {
+      const bounce = String(m.verdict ?? "").toLowerCase() === "bounce";
+      return {
+        q: bounce ? `Bounce ${target} back to work? (verifier: receipts void)` : `Accept verification of ${target}? (receipts confirmed)`,
+        verdict: bounce ? "BOUNCE" : "VERIFIED",
+        target,
+      };
+    }
+    return { q: d.title, verdict: "", target: "" };
+  };
+
   const DecisionRow = ({ d, chips }: { d: ForYouArtefact; chips: string[] }) => {
     const busy = acting === d.id;
+    const f = frameDecision(d);
     return (
-      <div className="gw-agent fy-item">
-        <span className="fy-chips">{chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}</span>
-        <span className="gw-fnote" title={d.title}>{d.title}</span>
+      <div className="gw-agent fy-item fy-decision">
+        <span className="fy-chips">
+          {f.verdict && <span className={`chip ${f.verdict === "BOUNCE" ? "chip-needs" : "chip-done"}`}>{f.verdict}</span>}
+          {chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}
+          {f.target && <span className="chip chip-scope">{f.target}</span>}
+        </span>
+        <span className="gw-fq" title={d.title}>{f.q}</span>
         <div className="gw-row" style={{ marginLeft: "auto", gap: 6 }}>
-          <button className="gw-btn gw-btn-run" disabled={busy} onClick={() => void act(d.id, "accepted")}>Accept</button>
-          <button className="gw-btn" disabled={busy} onClick={() => void act(d.id, "rejected")}>Reject</button>
+          <button className="gw-btn act-accept" disabled={busy} onClick={() => void act(d.id, "accepted")}>
+            {f.verdict === "BOUNCE" ? "Bounce it" : "Accept"}
+          </button>
+          <button className="gw-btn act-reject" disabled={busy} onClick={() => void act(d.id, "rejected")}>Reject</button>
           {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(`${hubUrl}/?task=${d.id}`, "_blank"); }}>comment ↗</a>}
         </div>
       </div>

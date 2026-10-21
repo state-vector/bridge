@@ -170,8 +170,9 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
                   ))}
                 </div>
               )}
-              <details className="forme-details"><summary>verifier's full verdict</summary>
-                <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.title + "\n\n" + (d.body_md ?? "")) }} />
+              <div className="md-body forme-body" dangerouslySetInnerHTML={{ __html: md(d.body_md ?? "") }} />
+              <details className="forme-details"><summary>raw decision record</summary>
+                <pre className="know-body">{d.title}</pre>
               </details>
             </>
           );
@@ -253,13 +254,12 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
           </div>
         );
       })()}
-      <h3 className="ask-question" onClick={() => setOpen(true)}>
+      <h3 className="ask-question">
         {(() => {
           const f = decisionFrame(d);
-          const t = f.kind === "verify"
+          return f.kind === "verify"
             ? `${f.verdict === "bounce" ? "Bounce" : "Accept verification of"} ${f.target ?? "task"}`
             : d.title;
-          return t.length > 110 ? `${t.slice(0, 110)}…` : t;
         })()}
       </h3>
       <div className="ask-actions">
