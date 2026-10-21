@@ -243,8 +243,6 @@ pub fn run() {
             pair_start,
             pair_poll,
             open_external,
-            menubar::show_panel,
-            menubar::hide_panel
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -286,14 +284,6 @@ pub fn run() {
                 }
             }
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(false) = event {
-                if window.label() == "main" {
-                    #[cfg(target_os = "macos")]
-                    menubar::hide_panel_win(window.app_handle());
-                }
-            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
