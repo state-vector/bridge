@@ -86,8 +86,30 @@ fn main() {
             match DispatchConfig::resolve() {
                 Some(cfg) => run(Some(cfg)),
                 None => {
-                    eprintln!("no config yet — first use is: bridge pair <hub-url> (pairs AND onboards: agent, model, workdir)");
-                    std::process::exit(2);
+                    // first use: guide the user through the whole setup — hub
+                    // pairing AND agent setup (backend, required model,
+                    // workdir, WIP) — before anything polls.
+                    let hub = prompt("hub url (e.g. https://bridge.your-subdomain.workers.dev)", None);
+                    if hub.trim().is_empty() {
+                        eprintln!("a hub url is required. Run `bridge pair <hub-url>`.");
+                        std::process::exit(2);
+                    }
+                    let url = hub.trim().trim_end_matches('/').to_string();
+                    std::env::set_var("BRIDGE_URL", &url);
+                    println!("\napproving the pairing code at {url}/pair …\n");
+                    let mut cfg = match dispatch::pair_device(&url) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[bridge] pairing failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    onboard(&mut cfg);
+                    if let Err(e) = cfg.save() {
+                        eprintln!("[bridge] config save failed: {e}");
+                    }
+                    eprintln!("[bridge] setup complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
+                    run(Some(cfg));
                 }
             }
         }
@@ -186,9 +208,31 @@ fn onboard(cfg: &mut DispatchConfig) {
     let all = [("opencode", "opencode"), ("kiro", "kiro")];
     let detected: Vec<&str> = all.iter().filter(|(name, _)| bin_detected(name)).map(|(name, _)| *name).collect();
     if detected.is_empty() {
-        println!("  no agent CLI found on PATH. Install one first:");
-        println!("    opencode: https://opencode.ai  (then authenticate it)");
-        println!("  re-run `bridge pair` after installing, or set backends/models in ~/.bridge/config.json by hand.");
+        println!("  no agent CLI found on PATH.");
+        let try_install = prompt("install opencode now? (curl installer, linux/macOS) y/n", Some("y"));
+        if try_install.trim().eq_ignore_ascii_case("y") {
+            println!("  installing opencode…");
+            let script = "curl -fsSL https://opencode.ai/install | bash";
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                // re-detect; install scripts may modify the current shell's PATH —
+                // check the well-known install location too
+                let local_bin = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".opencode/bin/opencode");
+                let found = bin_detected("opencode") || local_bin.exists();
+                if found {
+                    println!("  opencode installed. Authenticate it now (the runner runs it non-interactively):");
+                    let _ = std::process::Command::new("opencode").arg("auth").status();
+                    return onboard(cfg); // restart detection with the new CLI
+                }
+            }
+            println!("  install failed. install manually: https://opencode.ai — then re-run `bridge pair`.");
+        }
+        println!("  set backends/models in ~/.bridge/config.json by hand, or re-run `bridge pair` after installing.");
         std::process::exit(1);
     }
     for d in &detected {
@@ -371,8 +415,8 @@ fn print_help() {
         "bridge — headless runner for the bridge fleet hub
 
 USAGE:
-  bridge                 run the dispatch loop (BRIDGE_URL + BRIDGE_TOKEN, or ~/.bridge/config.json)
-  bridge pair <url>      device-flow pairing: prints a code, you approve at <url>/pair, then it runs
+  bridge                 run the dispatch loop; with no config, walks full first-time setup
+  bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
   bridge service install write a systemd user unit (linux) — run forever, restart on failure
