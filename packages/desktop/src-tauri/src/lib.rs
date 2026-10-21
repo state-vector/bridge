@@ -286,6 +286,17 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // daemon semantics: closing the window keeps the dispatch loop
+            // running — the window hides to the tray; quit via the tray/app
+            // menu Quit.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
