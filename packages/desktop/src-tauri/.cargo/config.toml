@@ -1,0 +1,7 @@
+# Swift Concurrency runtime: the dyld shared cache only serves
+# libswift_Concurrency.dylib to binaries whose deployment target is >= 12.0.
+# The default (11.0) makes @rpath/libswift_Concurrency.dylib unresolvable
+# even though the runtime IS in the OS cache — dyld refuses it ("not in
+# dyld cache"). foundation-models (macOS 26 SDK) needs a modern target.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-args=-Wl,-platform_version,macos,12.0.0,26.5.0"]
