@@ -267,7 +267,9 @@ fn onboard(cfg: &mut DispatchConfig) {
 
     println!("\n== where the work happens ==\n");
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
-    let workdir = prompt("git workdir for isolated task worktrees", Some(&cwd));
+    let home = std::env::var("HOME").unwrap_or_default();
+    let default_wd = if home.is_empty() { cwd.clone() } else { format!("{home}/bridge-work") };
+    let workdir = prompt("scratch workdir (task repos are cloned here)", Some(&default_wd));
     let is_git = std::process::Command::new("git")
         .args(["-C", &workdir, "rev-parse", "--is-inside-work-tree"])
         .stdout(std::process::Stdio::null())
@@ -275,9 +277,7 @@ fn onboard(cfg: &mut DispatchConfig) {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !is_git {
-        println!("  warning: {workdir} is not a git repo — dispatch needs one for isolated worktrees. Edit workdir in ~/.bridge/config.json later.");
-    }
+    let _ = is_git;
     let max_sessions = prompt("max concurrent agent sessions", Some("1"))
         .parse::<usize>()
         .ok()
@@ -389,18 +389,29 @@ fn doctor() -> bool {
     }
 
     // git + workdir sanity
+    // workdir is scratch space: task repos are cloned into it on demand
+    let wd = PathBuf::from(&cfg.workdir);
+    let wd_writable = std::fs::create_dir_all(&wd).is_ok()
+        && std::fs::write(wd.join(".bridge-write-test"), b"ok").is_ok()
+        && std::fs::remove_file(wd.join(".bridge-write-test")).is_ok();
+    if wd_writable {
+        println!("  \x1b[32mok\x1b[0m   workdir writable (task repos cloned into {}/repos on demand)", cfg.workdir);
+    } else {
+        bad = true;
+        println!("  \x1b[31mFAIL\x1b[0m  workdir {} not writable", cfg.workdir);
+    }
     let git_ok = std::process::Command::new("git")
-        .args(["-C", &cfg.workdir, "rev-parse", "--is-inside-work-tree"])
+        .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if git_ok {
-        println!("  \x1b[32mok\x1b[0m   workdir is a git repo (isolated worktrees + PR branches)");
+        println!("  \x1b[32mok\x1b[0m   git present (clone task repos + isolated worktrees)");
     } else {
         bad = true;
-        println!("  \x1b[31mFAIL\x1b[0m  workdir is not a git repo — dispatch needs one for isolated worktrees");
+        println!("  \x1b[31mFAIL\x1b[0m  git not on PATH — dispatch clones task repos");
     }
 
     if bad {

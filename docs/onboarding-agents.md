@@ -55,12 +55,24 @@ exactly what's missing, with the fix on each line.
    opencode run --model "<your-model-id>" "Reply OK"
    ```
 3. **Agent profile (optional)** — the default agent (`build`) works out of the
-   box. For a fleet-tuned persona:
+   box. For a fleet-tuned persona (own prompt, pinned permissions), either:
    ```bash
-   opencode agent create
-   # or hand-write ~/.config/opencode/agent/<name>.md (frontmatter + prompt)
+   opencode agent create    # interactive; needs a working model (auth required)
    ```
-   List what exists: `opencode agent list`. Then set `"agents": {"opencode": "<name>"}`.
+   or hand-write the file directly (no auth needed):
+   ```markdown
+   <!-- ~/.config/opencode/agent/bridge.md -->
+   ---
+   description: Fleet worker — dispatches bridge board tasks
+   mode: primary
+   ---
+   You are a fleet worker for the bridge board. Work each task in isolation:
+   claim context from the prompt, implement exactly what is asked, commit,
+   push a branch, and open a PR. Report honestly what is done and what is not.
+   ```
+   List what exists: `opencode agent list`. Then set `"agents": {"opencode": "<name>"}` in
+   `~/.bridge/config.json`. No profile at all? Also fine — omit `agents` and the
+   CLI's default agent is used.
 
 ## Backend: kiro
 
@@ -101,4 +113,5 @@ until it works again.
 | every dispatch fails `agent "X" not found` | `agents` names a profile that doesn't exist in the CLI's config | clear `agents` or create the profile |
 | every dispatch fails `ProviderModelNotFoundError` | `models` ID isn't in the CLI's catalog | verify with `opencode models` / the CLI's list |
 | runner idle, log says "no dispatchable agents" | CLI not installed/authed, or model missing | `bridge doctor` |
+| task blocked "references no git repository" | the task carries no `meta.repo` and no repo URL in its body | add `meta.repo` (or a repo URL in the body); the runner clones it into the workdir on demand |
 | sessions run a weaker model than intended | model pinned in a global CLI config or an agent profile overriding bridge's `models` | bridge's `--model` wins at dispatch; clean the pin if you want bridge's value |
