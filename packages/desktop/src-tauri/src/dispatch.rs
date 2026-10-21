@@ -1343,6 +1343,7 @@ fn void_run(stdout: &str, stderr: &str) -> bool {
         // opencode server-side crash — the session died before any work
         // (auth expired, local server broken). Deterministic, no work done.
         "Unexpected server error. Check server logs",
+        "Endpoint is unavailable",
         "\"name\": \"UnknownError\"",
     ];
     SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
