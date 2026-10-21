@@ -2645,7 +2645,7 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, 'mcp', NULL, ?)`,
       id, label, hash, tags, ts,
     );
     const ws = this.wsSlug();

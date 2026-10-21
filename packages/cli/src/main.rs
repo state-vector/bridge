@@ -19,6 +19,10 @@
 mod dispatch;
 #[path = "../../desktop/src-tauri/src/opencode.rs"]
 mod opencode;
+#[path = "../../desktop/src-tauri/src/scm.rs"]
+mod scm;
+#[path = "../../desktop/src-tauri/src/transport.rs"]
+mod transport;
 
 use dispatch::DispatchConfig;
 use std::path::PathBuf;
