@@ -556,6 +556,8 @@ USAGE:
   bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
+  bridge agent install   install the bridge agent persona into opencode
+  bridge agent check     verify the installed persona matches this version
   bridge service install write a systemd user unit (linux) — run forever, restart on failure
   --max-sessions N       cap concurrent agent sessions (default 1)
 
