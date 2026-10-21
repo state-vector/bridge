@@ -850,6 +850,7 @@ struct InFlight {
     started: std::time::Instant,
     last_note: String,
     worktree: Option<PathBuf>, // isolated worktree to clean up on finalize
+    scratch: Option<PathBuf>,  // repo-less dispatch dir — removed when the outcome lands (BR#2460)
     pr_url: Option<String>,    // PR opened by the session, monitored after handoff
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
     live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
@@ -970,20 +971,16 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
 // never encodes gate verdicts as state — it releases claims and skips
 // candidates. The drift-alarm test at the bottom of this file enforces it.
 
-fn json_tags(v: &serde_json::Value) -> Vec<String> {
-    v.get("tags")
-        .and_then(|t| t.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(String::from).collect())
-        .unwrap_or_default()
-}
-
-/// Verdict-role duties (unblock, review) are board-side judgment work: the
-/// agent renders a verdict from task history and live receipts, not from a
-/// checkout. A missing repo ref is bounce-with-findings material for them,
-/// never a deterministic runner block — blocking them parks a done-only task
-/// type in blocked and spawns the unblock-spawn loop.
-fn tags_exempt_from_repo_gate(tags: &[String]) -> bool {
-    tags.iter().any(|t| t == "role:unblock" || t == "role:review")
+/// BR#2460 scratch session dir for repo-less dispatches:
+/// <workdir>/sessions/bridge-<tid>/. Litter control and a deterministic cwd,
+/// NOT a sandbox — agents hold full user permissions. Removed when the run
+/// outcome lands; runner startup sweeps orphans.
+fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(workdir)
+        .join("sessions")
+        .join(format!("bridge-{}", slugify(tid)));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
@@ -1272,29 +1269,18 @@ fn spawn_opencode(
 ) {
     let backend = pick_backend(avail);
 
-    // the task names its git repository; the runner clones it on demand.
-    // No reference -> deterministic refusal (nothing to clone = nothing to do).
-    let Some(repo_url) = source_repo(body_md, task_meta) else {
-        // backstop: the caller (tick) blocks repo-less tasks BEFORE claiming;
-        // reaching here means the reference appeared without a URL.
-        eprintln!("[dispatch] {tid} has no repo reference — skipping spawn");
-        snap_activity(snap, "error", &format!("{tid} has no repo reference — not dispatched"));
-        note_task(
-            cfg,
-            tid,
-            "runner: no resolvable repo reference — set meta.repo (owner/repo) or a full clone URL on this task; refusal is board-visible, the card is untouched",
-        );
-        return;
-    };
-    let Some(repo_path) = ensure_repo_clone(&cfg.workdir, &repo_url) else {
-        eprintln!("[dispatch] {tid}: clone failed for {repo_url} — skipping spawn");
-        snap_activity(snap, "error", &format!("{tid}: clone failed ({repo_url})"));
-        note_task(
-            cfg,
-            tid,
-            &format!("runner: git clone failed for {repo_url} — check the repo exists and the runner host has access; will retry next cycle"),
-        );
-        return;
+    // BR#2460: provisioning is a best-effort optimization; capability belongs
+    // to the agent. A resolvable repo reference (meta.repo or the task body)
+    // means the host provisions a checkout; its absence means a scratch dir
+    // and the board delivery contract — never a refusal. Under-provisioning
+    // is survivable (the agent clones what it needs); the old gate that
+    // declined repo-less tasks parked claimed cards with no session
+    // (BR#2456 class).
+    let repo_url = source_repo(body_md, task_meta);
+    let scratch = if repo_url.is_none() {
+        ensure_scratch_dir(&cfg.workdir, tid)
+    } else {
+        None
     };
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
@@ -1314,27 +1300,45 @@ fn spawn_opencode(
         resume_session
     };
     let resume = resume_session.is_some();
-    let worktree = if cfg.isolate {
-        ensure_worktree(&repo_path, tid, resume)
+    let worktree = if let Some(url) = &repo_url {
+        let Some(repo_path) = ensure_repo_clone(&cfg.workdir, url) else {
+            eprintln!("[dispatch] {tid}: clone failed for {url} — skipping spawn");
+            snap_activity(snap, "error", &format!("{tid}: clone failed ({url})"));
+            note_task(
+                cfg,
+                tid,
+                &format!("runner: git clone failed for {url} — check the repo exists and the runner host has access; will retry next cycle"),
+            );
+            return;
+        };
+        let worktree = if cfg.isolate {
+            ensure_worktree(&repo_path, tid, resume)
+        } else {
+            None
+        };
+        // isolation guard: a shared checkout is a shared branch and a shared git
+        // index — dispatched sessions have switched branches under humans and
+        // reverted committed work (three times). If isolation was requested and
+        // failed, refuse: never dispatch into cfg.workdir.
+        if cfg.isolate && worktree.is_none() {
+            let msg = format!(
+                "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
+            );
+            eprintln!("[dispatch] {msg}");
+            snap_activity(snap, "error", &msg);
+            return;
+        }
+        worktree
     } else {
         None
     };
-    // isolation guard: a shared checkout is a shared branch and a shared git
-    // index — dispatched sessions have switched branches under humans and
-    // reverted committed work (three times). If isolation was requested and
-    // failed, refuse: never dispatch into cfg.workdir.
-    if cfg.isolate && worktree.is_none() {
-        let msg = format!(
-            "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
-        );
-        eprintln!("[dispatch] {msg}");
-        snap_activity(snap, "error", &msg);
-        return;
-    }
-    let run_dir = worktree
-        .clone()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| cfg.workdir.clone());
+    let run_dir = if let Some(wt) = &worktree {
+        wt.to_string_lossy().to_string()
+    } else if let Some(s) = &scratch {
+        s.to_string_lossy().to_string()
+    } else {
+        cfg.workdir.clone()
+    };
     let branch = format!("bridge/{}", slugify(tid));
     let resume_note = resume_session
         .as_ref()
@@ -1355,19 +1359,28 @@ fn spawn_opencode(
     // verify/analysis/unblock tasks deliver on the BOARD (knowledge/progress
     // notes with receipts) — a PR per receipt-finding was drowning the queue
     // (51 open docs-PRs in a day). The role flag recorded at claim time
-    // decides which contract the session gets.
-    let delivery_line = if role_work {
+    // decides which contract the session gets. Repo-less dispatches deliver
+    // on the board too: there is no provisioned checkout to open a PR from
+    // (the agent may still self-serve a clone — the board line covers that).
+    let delivery_line = if role_work || repo_url.is_none() {
         "- Deliver on the board: your findings, verdicts, and receipts go into log_progress / knowledge artefacts with exact citations (GitHub PR/issue/run URLs only — a non-GitHub URL is not a receipt). No commit or PR unless you actually changed code.\n- If you DID change code: commit your work, push the branch, and open a PR against the default branch (`gh pr create`), and include the PR URL in your summary. Docs ride with the change: user-visible behaviour updates README.md and packages/site/content.md in the same branch."
     } else {
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
+    };
+    let provisioning_line = if let Some(url) = &repo_url {
+        format!("- You are working in {run_dir} on branch `{branch}` (an isolated git worktree of {url}).")
+    } else {
+        format!(
+            "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
+        )
     };
     let bridge_session = format!("dispatch-{}", slugify(tid));
     let env_block = format!(
         "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
     );
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree of {}).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
-        policy, tid, title, body_md, resume_note, env_block, run_dir, branch, repo_url, heartbeat_line, delivery_line
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract\n\n{}\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+        policy, tid, title, body_md, resume_note, env_block, provisioning_line, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -1381,6 +1394,7 @@ fn spawn_opencode(
         worktree
             .as_ref()
             .map(|p| format!(" (worktree {})", p.display()))
+            .or_else(|| scratch.as_ref().map(|p| format!(" (scratch {})", p.display())))
             .unwrap_or_default(),
     );
     snap_activity(
@@ -1466,6 +1480,7 @@ fn spawn_opencode(
         started: std::time::Instant::now(),
         last_note: String::new(),
         worktree,
+        scratch,
         pr_url: None,
         rx: outcome,
         live,
@@ -1574,6 +1589,7 @@ fn tick(
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
+                    scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
                 },
@@ -1593,6 +1609,7 @@ fn tick(
                     last_note: inf.last_note.clone(),
                     pr_url: inf.pr_url.clone(),
                     worktree: inf.worktree.clone(),
+                    scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
                 },
@@ -1612,6 +1629,13 @@ fn tick(
         snap_in_flight_list(snap, in_flight);
     }
     for (mut inf, outcome) in finished {
+        // BR#2460: scratch dirs are disposable on every exit path (yield
+        // included) — the board is the only deliverable, and a resumed run
+        // gets a fresh scratch dir. Unlike worktrees, they hold no resume
+        // assets.
+        if let Some(s) = inf.scratch.take() {
+            let _ = std::fs::remove_dir_all(s);
+        }
         let mins = inf.started.elapsed().as_secs() / 60;
         let pr_url = extract_pr(&outcome.stdout_tail);
         inf.pr_url = pr_url.clone();
@@ -2083,25 +2107,13 @@ fn tick(
         if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
             continue;
         }
-        // repo policy (host-side, not law): without a git repository reference
-        // there is nothing to clone, so decline the candidate. Verdict roles
-        // (unblock/review) are board-side judgment work — no checkout needed.
-        // A missing repo ref is the author's metadata gap; the runner never
-        // moves the card (the worker machine owns state), it just declines.
+        // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
+        // dir with the board delivery contract. Provisioning is the runner's
+        // best-effort job; capability is the agent's. Nothing is declined for
+        // missing metadata.
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        if source_repo(&body_md, &task_meta).is_none() && !tags_exempt_from_repo_gate(&json_tags(&art)) {
-            attempts.insert(tid.to_string(), Instant::now());
-            snap_activity(snap, "info", &format!("{tid} skipped — no repo reference (host policy)"));
-            msgs.push(format!("{tid} skipped — no repo reference (add meta.repo or a repo URL; runner declines, card untouched)"));
-            note_task(
-                cfg,
-                tid,
-                "runner: skipped — no resolvable repo reference (set meta.repo as owner/repo, or a full clone URL; receipts-only URLs like pull/commit links do not count)",
-            );
-            continue;
-        }
         if let Err(e) = mcp_call_task(
             cfg,
             id,
@@ -2167,6 +2179,16 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         },
     };
     running.store(true, Ordering::Relaxed);
+    // BR#2460: scratch session dirs are per-run — anything left under
+    // <workdir>/sessions is an orphan from a previous run (crash/kill);
+    // nothing is in flight at startup, so sweep unconditionally. Normal-path
+    // cleanup happens when each run's outcome lands.
+    let sessions_root = PathBuf::from(&cfg.workdir).join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_root) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
@@ -2301,23 +2323,20 @@ mod tests {
     }
 
     #[test]
-    fn repo_gate_exempts_verdict_roles_only() {
-        assert!(tags_exempt_from_repo_gate(&["role:unblock".to_string()]));
-        assert!(tags_exempt_from_repo_gate(&["role:review".to_string()]));
-        assert!(tags_exempt_from_repo_gate(&["role:review".to_string(), "attempted".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&["role:impl".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&["role:analysis".to_string()]));
-        assert!(!tags_exempt_from_repo_gate(&[]));
-    }
-
-    #[test]
-    fn json_tags_reads_top_level_array_only() {
-        let v = serde_json::json!({ "tags": ["role:unblock", "attempted"], "meta": { "tags": ["role:impl"] } });
-        assert_eq!(json_tags(&v), vec!["role:unblock".to_string(), "attempted".to_string()]);
-        // meta.tags must not leak into the top-level read
-        let nested = serde_json::json!({ "meta": { "tags": ["role:review"] } });
-        assert!(json_tags(&nested).is_empty());
-        assert!(json_tags(&serde_json::json!({})).is_empty());
+    fn scratch_dirs_are_per_task_deterministic_paths() {
+        // BR#2460: repo-less dispatches provision <workdir>/sessions/bridge-<slug>.
+        // Creation must be idempotent (resume re-enters the same dir) and
+        // task-scoped (no cross-task bleed).
+        let base = std::env::temp_dir().join(format!("bridge-scratch-test-{}", std::process::id()));
+        let a = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
+        let b = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
+        assert_eq!(a, b);
+        let dir = a.expect("scratch dir created");
+        assert!(dir.is_dir());
+        assert!(dir.to_string_lossy().contains("sessions"));
+        let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
+        assert_ne!(dir, other);
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 
