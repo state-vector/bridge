@@ -30,6 +30,7 @@ import {
   DEFAULT_WS_SLUG,
   doWs,
   INITIAL_STATUS,
+  verifyVerdictStatement,
   LIMITS,
   SETTINGS_KEYS,
   ASK_ANSWERED,
@@ -881,6 +882,13 @@ export class KnowledgeHub {
           }
         }
       }
+    }
+    // verify-verdict cards land in the human inbox (For you) — prepend the
+    // plain-English ask (what accepting does, why a human must do it) so the
+    // card is self-describing everywhere it renders: popover, notification
+    // snippet, MCP reads. After the dedup gate above: only real cards.
+    if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      bodyMd = `${verifyVerdictStatement(createMeta)}\n\n${bodyMd.trim()}`.trim();
     }
     this.state.storage.sql.exec(
       `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
@@ -2637,7 +2645,7 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, created_ts) VALUES (?, ?, ?, ?, 'mcp', NULL, ?)`,
       id, label, hash, tags, ts,
     );
     const ws = this.wsSlug();
