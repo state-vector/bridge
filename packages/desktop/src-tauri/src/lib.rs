@@ -245,8 +245,9 @@ pub fn run() {
             open_external,
         ])
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // Regular activation policy: this is a REAL desktop app — Dock
+            // icon, Cmd+Tab presence, closable. (Accessory was the old
+            // tray-panel mode: the app vanished from Cmd+Tab once unfocused.)
 
             let handle = app.handle().clone();
             #[cfg(target_os = "macos")]
