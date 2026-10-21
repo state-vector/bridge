@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::opencode;
+use crate::scm;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatchConfig {
@@ -69,6 +70,8 @@ pub struct BackendConfig {
     pub agent: Option<String>, // agent profile for this provider
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>, // model override; unset = the CLI's own default config decides
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>, // transport: "acp" (default for opencode) | "stdio"
 }
 
 /// Accepts the new dict shape ({ "opencode": { ... } }) or the legacy array
@@ -935,11 +938,14 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
     if let Some(r) = meta.get("repo").and_then(|v| v.as_str()) {
         let r = r.trim();
         if !r.is_empty() {
-            return Some(if r.starts_with("http") || r.starts_with("git@") {
-                r.trim_end_matches('/').trim_end_matches(".git").to_string()
+            let expanded = if r.starts_with("http") || r.starts_with("git@") {
+                r.to_string()
             } else {
-                format!("https://github.com/{}", r.trim_end_matches(".git"))
-            });
+                format!("https://github.com/{r}")
+            };
+            // structured ref wins outright: if it doesn't resolve, that's an
+            // authoring defect — refuse at the gate, never scrape past it
+            return scm::forge_for(&expanded).and_then(|f| f.repo_ref(&expanded));
         }
     }
     let mut rest = body_md;
@@ -951,43 +957,12 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
             })
             .unwrap_or(rest.len());
         let url = &rest[..end];
-        let base = url
-            .trim_end_matches('/')
-            .trim_end_matches('.')
-            .trim_end_matches(".git");
-        if base.contains("github.com/") {
-            if let Some(repo) = github_repo_base(base) {
-                return Some(repo);
-            }
-        } else if base.contains(".git") {
-            return Some(base.trim_end_matches(".git").to_string());
+        if let Some(repo) = scm::forge_for(url).and_then(|f| f.repo_ref(url)) {
+            return Some(repo);
         }
         rest = &rest[end..];
     }
     None
-}
-
-/// Normalize a github.com URL to its owning repository: task bodies lead with
-/// receipts (pull/N, commit/<sha>, blob/tree paths, issues, actions runs), and
-/// the first such citation is not a clone target — its repo is. Returns
-/// `https://github.com/<owner>/<repo>` so a PR-receipt task dispatches into
-/// the right checkout (the agent can `gh pr checkout` from the citation).
-/// None = no owner/repo prefix (bare domain, gist, wrong host) — keep scanning.
-fn github_repo_base(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://github.com/")?;
-    let mut segs = rest.split('/');
-    let owner = segs.next()?;
-    let repo = segs.next()?;
-    let clean = |s: &str, extra: bool| -> String {
-        s.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && !(extra && c == '.'))
-            .trim_end_matches(".git")
-            .to_string()
-    };
-    let (owner, repo) = (clean(owner, false), clean(repo, true));
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("https://github.com/{owner}/{repo}"))
 }
 
 // BR#2419: state legality lives in the worker's machine (machine.ts). The
@@ -1243,13 +1218,12 @@ fn extract_pr(stdout: &str) -> Option<String> {
             None => continue,
         };
         let url = &tok[idx..];
-        if !url.contains("/pull/") {
-            continue;
+        let end = url
+            .find(|c: char| matches!(c, ')' | ']' | '>' | ',' | ';' | '"' | '\''))
+            .unwrap_or(url.len());
+        if let Some(pr) = scm::forge_for(&url[..end]).and_then(|f| f.pull_ref(&url[..end])) {
+            return Some(pr.url);
         }
-        return Some(
-            url.trim_end_matches(|c| c == ')' || c == ',' || c == '.' || c == '"' || c == ']' || c == ';')
-                .to_string(),
-        );
     }
     None
 }
@@ -1276,6 +1250,13 @@ fn void_run(stdout: &str, stderr: &str) -> bool {
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
 /// delivery contract (commit, push branch, open PR). Uses an isolated worktree
 /// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
+/// Leave a runner-attributed note on a task so refusals/failures are visible
+/// where the work lives, not just in runner stderr.
+fn note_task(cfg: &DispatchConfig, tid: &str, did: &str) {
+    let mut id = 0i64;
+    let _ = mcp_call(cfg, &mut id, "log_progress", json!({ "id": tid, "did": did }));
+}
+
 fn spawn_opencode(
     cfg: &DispatchConfig,
     snap: &SharedSnapshot,
@@ -1298,11 +1279,21 @@ fn spawn_opencode(
         // reaching here means the reference appeared without a URL.
         eprintln!("[dispatch] {tid} has no repo reference — skipping spawn");
         snap_activity(snap, "error", &format!("{tid} has no repo reference — not dispatched"));
+        note_task(
+            cfg,
+            tid,
+            "runner: no resolvable repo reference — set meta.repo (owner/repo) or a full clone URL on this task; refusal is board-visible, the card is untouched",
+        );
         return;
     };
     let Some(repo_path) = ensure_repo_clone(&cfg.workdir, &repo_url) else {
         eprintln!("[dispatch] {tid}: clone failed for {repo_url} — skipping spawn");
         snap_activity(snap, "error", &format!("{tid}: clone failed ({repo_url})"));
+        note_task(
+            cfg,
+            tid,
+            &format!("runner: git clone failed for {repo_url} — check the repo exists and the runner host has access; will retry next cycle"),
+        );
         return;
     };
     let backend_name = match backend {
@@ -1313,6 +1304,7 @@ fn spawn_opencode(
     // surface. Model/agent are optional everywhere — unset means that CLI's
     // own default config decides (opencode default model, kiro profile).
     let bc = cfg.backends.get(backend_name).cloned().unwrap_or_default();
+    let bc_mode = bc.mode.clone();
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
     let model = bc.model.or_else(|| cfg.model.clone());
     let model_str = model.clone().unwrap_or_default();
@@ -1403,6 +1395,27 @@ fn spawn_opencode(
     // output line here; the heartbeat reads it so the board shows mid-run activity
     let live = Arc::new(std::sync::Mutex::new(String::new()));
     let live_for_task = live.clone();
+    // Mode A provisioning: inject the bridge MCP server into the spawned
+    // session. Merged per-server-key with the host's own opencode config, so
+    // existing MCP servers are honoured; only a user-defined `bridge` entry is
+    // shadowed — deliberately, the runner owns the hub identity for its spawns.
+    let mcp_json = if cfg.url.is_empty() || cfg.token.is_empty() {
+        None
+    } else {
+        Some(
+            json!({
+                "$schema": "https://opencode.ai/config.json",
+                "mcp": { "bridge": {
+                    "type": "remote",
+                    "url": format!("{}/mcp", cfg.url.trim_end_matches('/')),
+                    "enabled": true,
+                    "oauth": false,
+                    "headers": { "Authorization": format!("Bearer {}", cfg.token) }
+                }}
+            })
+            .to_string(),
+        )
+    };
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
@@ -1421,6 +1434,8 @@ fn spawn_opencode(
                 Duration::from_secs(cfg2.timeout_mins * 60),
                 Some(&format!("bridge-{tid2}")),
                 resume_session.as_deref(),
+                mcp_json.as_deref(),
+                bc_mode.as_deref(),
                 Some(live_for_task),
             );
             if backend == opencode::Backend::Kiro {
@@ -2068,6 +2083,11 @@ fn tick(
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "info", &format!("{tid} skipped — no repo reference (host policy)"));
             msgs.push(format!("{tid} skipped — no repo reference (add meta.repo or a repo URL; runner declines, card untouched)"));
+            note_task(
+                cfg,
+                tid,
+                "runner: skipped — no resolvable repo reference (set meta.repo as owner/repo, or a full clone URL; receipts-only URLs like pull/commit links do not count)",
+            );
             continue;
         }
         if let Err(e) = mcp_call_task(

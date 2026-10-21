@@ -158,6 +158,8 @@ fn cli_answer(question: &str, context: &str, history: &str) -> Result<Option<(St
         CHAT_TIMEOUT,
         Some("bridge-console"),
         None,
+        None, // no extra config — the console is read-only, no bridge MCP
+        None,
         None,
     );
     if outcome.ok {

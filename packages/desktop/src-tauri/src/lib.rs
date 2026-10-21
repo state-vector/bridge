@@ -3,6 +3,8 @@ mod dispatch;
 mod mac_notify;
 mod menubar;
 mod opencode;
+mod transport;
+mod scm;
 
 use serde::Deserialize;
 use tauri::Manager;
