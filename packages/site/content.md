@@ -17,6 +17,8 @@ bridge pair https://your-hub.workers.dev
 
 That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.
 
+Every push to `main` also publishes a rolling **dev** pre-release of the binaries — `install.sh` always resolves to the newest versioned release, never dev. Grab it with `gh release download dev --repo state-vector/bridge`.
+
 ## Three surfaces, one hub
 
 - **Web**: the full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions; and *For Me*, the human inbox where proposed decisions are accepted or rejected with a reason.

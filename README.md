@@ -63,6 +63,12 @@ cd packages/cli && cargo build --release
 ./target/release/bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
+Living on the edge? Every push to `main` rebuilds the binaries into a rolling **dev** pre-release (`releases/latest` and `install.sh` never see it):
+
+```bash
+gh release download dev --repo state-vector/bridge -p 'bridge-<target>.tar.gz'
+```
+
 ### Run on a server
 
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).

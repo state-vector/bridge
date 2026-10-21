@@ -25,3 +25,19 @@ jobs:
       - name: Worker bundle check (wrangler dry-run)
         working-directory: packages/worker
         run: npx wrangler deploy --dry-run
+
+  cli:
+    name: CLI build (packages/cli)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/cli
+      # the CLI vendors the desktop dispatch core via #[path] — a desktop-side
+      # refactor must not be discoverable only when a release builds
+      - name: Compile check (locked)
+        working-directory: packages/cli
+        run: cargo check --locked --all-targets
