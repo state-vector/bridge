@@ -353,13 +353,12 @@ export function App() {
   const [logoutMsg, setLogoutMsg] = useState("");
 
   const doLogout = async () => {
-    if (!window.confirm("Log out? This stops the runner and erases the pairing + saved settings — you will need to pair again to onboard.")) return;
+    if (!window.confirm("Log out? This stops the runner and clears the gateway token — your settings are kept; pair again to onboard.")) return;
     try {
       await invoke("logout");
-      setCfg(null);
-      setHubUrl("");
-      setSnap((s) => (s ? { ...s, running: false, url: null, label: null, agent: null, workspace: null, workdir: null, in_flight: [] } : s));
-      setLogoutMsg("logged out — pair again to onboard");
+      await loadCfg();
+      await pull();
+      setLogoutMsg("logged out — token cleared, settings kept");
     } catch (e) {
       setLogoutMsg(`failed: ${String(e)}`);
     }
@@ -530,6 +529,14 @@ export function App() {
 
       {page === "settings" && (
         <main className="gw-main">
+          {cfg && !cfg.token && (
+            <div className="gw-card">
+              <h2>Logged out</h2>
+              <span className="gw-note">
+                No gateway token — pair again to onboard: <span className="gw-mono">bridge pair {hubUrl || "<hub-url>"}</span>. Your settings are preserved below.
+              </span>
+            </div>
+          )}
           <div className="gw-card">
             <h2>Runner</h2>
             <div className="gw-row">
