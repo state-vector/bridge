@@ -131,11 +131,6 @@ export function PairView() {
             <p className="auth-host">
               Pair <b>{info.device}</b>?
             </p>
-            <p className="muted-note">
-              {gateway
-                ? "This device declared itself a gateway (runner host) — it will join as gateway-class infrastructure and provision tokens for the workers it spawns."
-                : "This device will join as an agent."}
-            </p>
             <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
             <input className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>
