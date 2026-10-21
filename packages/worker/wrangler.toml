@@ -6,11 +6,14 @@ compatibility_date = "2026-01-15"
 # The served UI lives in @bridge/webapp, built to dist at deploy time by this
 # hook — dist is a build ARTIFACT, never committed; the source of truth is
 # packages/webapp/src and Cloudflare builds from it on every deploy.
-# PATH-independent on purpose: `npm run -w` from a subdirectory does not put
-# the hoisted .bin on the script's PATH in every environment (tsc: not found
-# in Workers Builds). Typechecking stays in CI's full-install job.
+# Self-sufficient on purpose: this project's Workers Builds root is
+# packages/worker, so the install step only materializes the worker's
+# dependency subtree (90 pkgs — no vite/tsc/react) and `npm run -w` from a
+# subdirectory does not put the hoisted .bin on the script's PATH anyway.
+# Install what the build needs, then invoke vite by path. Typechecking stays
+# in CI's full-install job.
 [build]
-command = "cd ../webapp && ../../node_modules/.bin/vite build"
+command = "cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
 
 # Your deployment lives at https://<your-subdomain>.workers.dev once deployed.
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
