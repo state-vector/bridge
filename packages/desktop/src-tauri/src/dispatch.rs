@@ -1437,16 +1437,35 @@ fn spawn_opencode(
     // existing MCP servers are honoured. The MCP auth uses a PER-AGENT token
     // the gateway provisions from the hub on the worker's behalf (per agent,
     // not per session) — board actions attribute to the agent, not the
-    // gateway. Fallback: the gateway's own token if provisioning fails, with
-    // a loud note (attribution then reads as the gateway).
+    // gateway. Identity posture (BR#2455 namespace law): only gateway-class
+    // (gw-*) tokens may provision. A host without one dispatches under its
+    // paired agent identity — stated once, never retried as a doomed 403 per
+    // spawn, and never mis-described as "the gateway".
     let agent_label = agent_identity(cfg);
-    let agent_token = match provision_agent_token(cfg, &agent_label) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — falling back to gateway token");
-            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — sessions attribute to the gateway until fixed"));
-            cfg.token.clone()
+    let agent_token = if cfg.token.starts_with("gw-") {
+        match provision_agent_token(cfg, &agent_label) {
+            Ok(t) => t,
+            Err(e) => {
+                // a gw-* host SHOULD be able to provision — a failure here is
+                // transient (hub down, network). Fall back to the gateway's
+                // own token, loudly and accurately: attribution reads as the
+                // gateway until provisioning succeeds.
+                eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — falling back to the gateway token; sessions attribute to the gateway until provisioning succeeds");
+                snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — sessions attribute to the gateway until provisioning succeeds"));
+                cfg.token.clone()
+            }
         }
+    } else {
+        static POSTURE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if POSTURE.get().is_none() {
+            let _ = POSTURE.set(());
+            let msg = format!(
+                "runner identity: hub token is not gateway-class — per-agent token provisioning unavailable (gateway work); dispatching under paired agent identity `{agent_label}`"
+            );
+            eprintln!("[dispatch] {msg}");
+            snap_activity(snap, "info", &msg);
+        }
+        cfg.token.clone()
     };
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
