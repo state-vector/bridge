@@ -18,10 +18,11 @@ function Copyable({ label, body }: { label: string; body: string }) {
   );
 }
 
-/** Agent setup: bootstrap prompt + mcpServers JSON — shown in a modal so it's out of the flow. */
+/** Agent setup: bootstrap prompt + per-client MCP config snippet — shown in a modal so it's out of the flow. */
 function AgentSetupModal({ label, secret, projectName, onClose }: { label: string | null; secret: string | null; projectName: string; onClose: () => void }) {
   const url = `${getConfig().url}/mcp`;
   const [instructions, setInstructions] = useState("");
+  const [client, setClient] = useState<"opencode" | "generic">("opencode");
   const tokenLabel = label ?? "<agent-label>";
   const token = secret ?? "<auth-token>";
 
@@ -36,10 +37,18 @@ function AgentSetupModal({ label, secret, projectName, onClose }: { label: strin
     return () => { on = false; };
   }, [projectName]);
 
-  const mcpJson = JSON.stringify(
-    { "bridge-kb": { url, headers: { Authorization: `Bearer ${token}` } } },
-    null, 2,
-  );
+  const mcpJson = client === "opencode"
+    ? JSON.stringify(
+        { $schema: "https://opencode.ai/config.json", mcp: { bridge: { type: "remote", url, enabled: true, oauth: false, headers: { Authorization: `Bearer ${token}` } } } },
+        null, 2,
+      )
+    : JSON.stringify(
+        { mcpServers: { bridge: { type: "http", url, headers: { Authorization: `Bearer ${token}` } } } },
+        null, 2,
+      );
+  const mcpTarget = client === "opencode"
+    ? "opencode config — ~/.config/opencode/opencode.json"
+    : "generic mcpServers JSON — claude code & similar clients";
   const prompt = [
     instructions || `You are connected to Bridge — the work orchestration layer for "${projectName}".`,
     `Your auth token identifies you as "${tokenLabel}". Name your session on orient (session: "<unique-name>").`,
@@ -54,7 +63,13 @@ function AgentSetupModal({ label, secret, projectName, onClose }: { label: strin
         </div>
         <p className="muted-note">Wire the agent's MCP config, then prepend the bootstrap prompt. {secret ? "The auth token is shown once — store it now." : "Mint a token to slot the real one in."}</p>
         <Copyable label="Bootstrap prompt" body={prompt} />
-        <Copyable label="mcpServers JSON" body={mcpJson} />
+        <div className="connect-row">
+          <select value={client} onChange={(e) => setClient(e.target.value as "opencode" | "generic")}>
+            <option value="opencode">opencode</option>
+            <option value="generic">generic (mcpServers)</option>
+          </select>
+        </div>
+        <Copyable label={mcpTarget} body={mcpJson} />
         {secret && (
           <div className="secret">
             Auth token (shown once):<br />{secret}

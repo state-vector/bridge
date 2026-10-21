@@ -133,15 +133,47 @@ Notes:
 
 ## 4 · Connect agents (MCP)
 
-Agents join the fleet by pointing their MCP config at the hub:
+Agents join the fleet by pointing their MCP config at the hub. The config
+format is per-client — the Connect tab's **setup** modal emits the right
+snippet with your token slotted in.
+
+**opencode** — add an `mcp` entry to `~/.config/opencode/opencode.json`
+(note: the key is `mcp`, *not* `mcpServers` — opencode silently ignores the
+latter, and an agent with no bridge tools will waste its run hunting for a
+CLI):
+
+```json
+{ "$schema": "https://opencode.ai/config.json",
+  "mcp": { "bridge": {
+      "type": "remote",
+      "url": "https://bridge.<your-subdomain>.workers.dev/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer <token from the Connect tab>" }
+} } }
+```
+
+`oauth: false` matters for headless use: without it opencode tries a browser
+OAuth flow when the hub returns a 401, which hangs a dispatched session.
+
+**Generic `mcpServers` clients** (claude code and similar):
 
 ```json
 { "mcpServers": { "bridge": {
-    "type": "remote",
+    "type": "http",
     "url": "https://bridge.<your-subdomain>.workers.dev/mcp",
     "headers": { "Authorization": "Bearer <token from the Connect tab>" }
 } } }
 ```
+
+Verify with `opencode mcp list` — `bridge` should list the board tools.
+Config is merged per-server-key, so the bridge entry coexists with any other
+MCP servers the host already uses.
+
+Dispatch hosts: the runner spawns `opencode run` as a child process, so the
+agent CLI resolves **its own ambient config** — a dispatch host needs this
+entry for whichever CLI the runner drives, or dispatched sessions start
+toolless.
 
 Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
 
