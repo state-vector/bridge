@@ -1437,10 +1437,8 @@ fn spawn_opencode(
     // existing MCP servers are honoured. The MCP auth uses a PER-AGENT token
     // the gateway provisions from the hub on the worker's behalf (per agent,
     // not per session) — board actions attribute to the agent, not the
-    // gateway. Identity posture (BR#2455 namespace law): only gateway-class
-    // (gw-*) tokens may provision. A host without one dispatches under its
-    // paired agent identity — stated once, never retried as a doomed 403 per
-    // spawn, and never mis-described as "the gateway".
+    // gateway. Identity law (BR#2455): this app is a gateway; the pair flow
+    // vends a gw-* token; run_loop refuses to start on anything else.
     let agent_label = agent_identity(cfg);
     let agent_token = if cfg.token.starts_with("gw-") {
         match provision_agent_token(cfg, &agent_label) {
@@ -1456,16 +1454,12 @@ fn spawn_opencode(
             }
         }
     } else {
-        static POSTURE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        if POSTURE.get().is_none() {
-            let _ = POSTURE.set(());
-            let msg = format!(
-                "runner identity: hub token is not gateway-class — per-agent token provisioning unavailable (gateway work); dispatching under paired agent identity `{agent_label}`"
-            );
-            eprintln!("[dispatch] {msg}");
-            snap_activity(snap, "info", &msg);
-        }
-        cfg.token.clone()
+        // unreachable via run_loop (gateway token class is validated at
+        // startup) — defensive: never dispatch under an agent-class identity
+        let msg = "gateway token is not gateway-class (gw-*) — refusing to dispatch; re-pair this device to vend a gateway token (identity law BR#2455)";
+        eprintln!("[dispatch] {msg}");
+        snap_activity(snap, "error", msg);
+        return;
     };
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
@@ -2220,6 +2214,21 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
         },
     };
+    // Identity law (BR#2455): this app is a gateway. The pair flow vends a
+    // gateway-class token (gw-*); running on an agent-class token is an
+    // invalid pairing state — per-agent provisioning is impossible and every
+    // claim would carry the wrong identity class. Hard-fail with the fix:
+    // re-pair (a fresh token is vended at pair time).
+    if cfg.token.is_empty() || !cfg.token.starts_with("gw-") {
+        let msg = "gateway token invalid (missing or not gateway-class gw-*) — re-pair this device to vend a gateway token; dispatch refused (a gateway never runs on an agent token)";
+        eprintln!("[dispatch] {msg}");
+        snap_activity(&snap, "error", msg);
+        if let Ok(mut g) = last_error.lock() {
+            *g = Some(msg.to_string());
+        }
+        running.store(false, Ordering::Relaxed);
+        return;
+    }
     running.store(true, Ordering::Relaxed);
     // BR#2460: scratch session dirs are per-run — anything left under
     // <workdir>/sessions is an orphan from a previous run (crash/kill);
