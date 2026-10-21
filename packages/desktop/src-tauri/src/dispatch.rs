@@ -422,7 +422,7 @@ pub enum PairPoll {
 /// endpoints currently answer empty-token requests, so an unpaired desktop
 /// would keep rendering board data after logout — refuse client-side instead.
 fn paired_config() -> Result<DispatchConfig, String> {
-    let cfg = paired_config()?;
+    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
     if cfg.token.is_empty() {
         return Err("logged out — pair first".into());
     }
