@@ -141,6 +141,12 @@ export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; 
 export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
   taskId: string; openBlocked?: boolean; onClose: () => void; onOpen?: (id: string) => void;
 }) {
+  // 1s tick — "time spent" on spawned work counts up live while the panel is open
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
   const [task, setTask] = useState<(KbArtefact & { meta?: TaskMeta; status_ts?: number }) | null>(null);
   const [relations, setRelations] = useState<Array<{ relation: string; artefact_id: string; dir: string }>>([]);
   const [related, setRelated] = useState<KbArtefact[]>([]);
@@ -283,19 +289,15 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
         )}
 
         {relations.filter((r) => r.dir === "in").length > 0 && (
-          <div className="detail-block">
-            <label>Child tasks — verify / unblock / decomposition rounds (running or not)</label>
-            {relations.filter((r) => r.dir === "in").map((r) => {
-              const child = related.find((a) => a.id === r.artefact_id);
-              if (!child) return null;
-              return (
-                <div key={r.artefact_id} className="progress-line" onClick={() => nav(r.artefact_id)} style={{ cursor: "pointer" }}>
-                  <span className="chip chip-scope">{r.relation}</span>
-                  <span className={`chip ${child.status === "done" ? "st-ok" : child.status === "blocked" ? "st-err" : "st-amber"}`}>{child.status.replace("_", " ")}</span>
-                  <span className="progress-note"><RefText text={child.title} onOpen={nav} /></span>
-                </div>
-              );
-            })}
+          <div className="detail-block history-block">
+            <label>Work tree — spawned tasks, live</label>
+            <div className="worktree-list">
+              {relations.filter((r) => r.dir === "in").map((r) => {
+                const child = related.find((a) => a.id === r.artefact_id);
+                if (!child) return null;
+                return <WorkTreeRow key={r.artefact_id} child={child} relation={r.relation} nav={nav} now={Date.now()} />;
+              })}
+            </div>
           </div>
         )}
 
@@ -365,6 +367,43 @@ export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) =
         ),
       )}
     </>
+  );
+}
+
+/** One spawned task in the work tree: state, live time-in-state, last signal.
+ *  Live = the row re-renders every second (panel has a 1s clock), so "time
+ *  spent" counts up in real time for active work. Re-verified rounds show
+ *  attempt counts. Click navigates into the child. */
+function WorkTreeRow({ child, relation, nav, now }: {
+  child: any; relation: string; nav: (id: string) => void; now: number;
+}) {
+  const m = child.meta ?? {};
+  const p = m.last_progress ?? {};
+  const status = child.status;
+  const state = status === "done" ? "done" : status === "in_review" ? "review" : status === "blocked" ? "blocked" : status === "todo" ? "queued" : "active";
+  const stateClass = { done: "wt-done", review: "wt-review", blocked: "wt-error", queued: "wt-queued", active: "wt-active" }[state] ?? "wt-active";
+  const statusTs = (child as any).status_ts ?? child.updated_ts;
+  const spent = statusTs ? Math.max(0, now - statusTs) : 0;
+  const spentTxt = spent > 3600_000
+    ? `${Math.floor(spent / 3600_000)}h ${Math.floor((spent % 3600_000) / 60_000)}m`
+    : `${Math.floor(spent / 60_000)}m ${Math.floor((spent % 60_000) / 1000)}s`;
+  const sinceSignal = p.ts ? now - p.ts : Infinity;
+  const stale = state === "active" && sinceSignal > 10 * 60_000;
+  const attempts = m.attempt?.attempts ?? 0;
+  const kind = (child.tags ?? []).includes("role:review") ? "verify"
+    : (child.tags ?? []).includes("role:analysis") ? "analysis"
+    : (child.tags ?? []).includes("role:unblock") ? "unblock"
+    : (child.tags ?? []).includes("role:impl") ? "impl" : relation;
+  const lastNote = (p.note ?? "").slice(0, 90);
+  return (
+    <div className={`wt-row ${stateClass}`} onClick={() => nav(child.id)} title={lastNote ? `last: ${lastNote}` : child.title}>
+      <span className={`wt-dot ${stateClass}${stale ? " wt-stale" : ""}`} title={stale ? "active but no signal >10m" : state} />
+      <span className="wt-kind">{kind}</span>
+      <span className="wt-title" title={child.title}>{child.title.length > 64 ? child.title.slice(0, 64) + "…" : child.title}</span>
+      {attempts > 0 && <span className="chip chip-urgent wt-att" title={`attempted ${attempts}x`}>×{attempts}</span>}
+      <span className="wt-state">{state}</span>
+      <span className="wt-time top-num" title="time in current state (live)">{spentTxt}</span>
+    </div>
   );
 }
 

@@ -306,7 +306,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---------- ask detail inside the panel ---------- */
 
-.detail-panel { width: min(480px, 92vw); border-radius: 0; box-shadow: -18px 0 50px rgba(0,0,0,.45); }
+.detail-panel { width: min(640px, 94vw); border-radius: 0; box-shadow: -18px 0 50px rgba(0,0,0,.45); }
 .detail-question { font-size: 17px; }
 .task-panel-body { padding: 0 2px; }
 
@@ -770,3 +770,27 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* tree structure: children indented under parent with a connector rule */
 .top-row-child { border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--line)); margin-left: 14px; border-radius: 0 6px 6px 0; }
 .tree-branch { color: var(--text-faint); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+/* ---------- work tree (detail panel): spawned tasks, live ---------- */
+.worktree-list { display: flex; flex-direction: column; gap: 3px; }
+.wt-row {
+  display: grid; grid-template-columns: 10px 56px 1fr auto auto;
+  gap: 8px; align-items: center;
+  padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px;
+  cursor: pointer; font-size: 12px; background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+.wt-row:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.wt-dot { width: 8px; height: 8px; border-radius: 50%; }
+.wt-dot.wt-active { background: var(--green); animation: wt-pulse 1.6s ease-in-out infinite; }
+.wt-dot.wt-review { background: var(--accent); }
+.wt-dot.wt-done { background: var(--green); opacity: .45; }
+.wt-dot.wt-blocked { background: var(--red); }
+.wt-dot.wt-queued { background: #3a4356; }
+.wt-dot.wt-stale { background: var(--red); animation: wt-pulse 1.6s ease-in-out infinite; }
+@keyframes wt-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.wt-kind { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); }
+.wt-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.wt-att { font-size: 10px; padding: 0 6px; }
+.wt-state { font-size: 11px; color: var(--text-dim); }
+.wt-time { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
+.wt-active .wt-time, .wt-row.wt-active .wt-time { color: var(--text-dim); }
