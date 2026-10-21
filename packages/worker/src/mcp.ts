@@ -71,9 +71,19 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
 
   // tokens are opaque — the workspace comes from the routing order above,
   // never from the secret itself. The shared ingest token is default-workspace.
-  const ws = bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)
-    ? DEFAULT_WS_SLUG
-    : await resolveTokenWs(env, bearer);
+  let ws: string;
+  try {
+    ws = bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)
+      ? DEFAULT_WS_SLUG
+      : await resolveTokenWs(env, bearer);
+  } catch {
+    // unknown/revoked bearer: a clean JSON-RPC 401, not an unhandled throw
+    // (unhandled = CF HTML error page, which reads as "the service is down")
+    return json(
+      { jsonrpc: "2.0", id: null, error: { code: -32001, message: "unauthorized: unknown or revoked token" } },
+      401,
+    );
+  }
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
 
   // identity: registry auth token (bkw_…) or the legacy shared ingest token
