@@ -942,6 +942,45 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
     None
 }
 
+// Silent-dispatch churn guard (the BR#2298 class): a dispatched session that
+// produces zero output every cycle trips none of the deterministic guards
+// (config error, 3-fail, handoff rejection are all observable errors — silence
+// is not), so the watchdog stall → runner auto-resume → re-dispatch loop ran
+// forever, spawning an unblock child per cycle. Bound it: after
+// SILENT_DISPATCH_LIMIT consecutive stall-then-reclaim cycles with no agent
+// output, stop re-dispatching and hand off loudly.
+const SILENT_DISPATCH_LIMIT: u32 = 3;
+
+fn silent_churn_escalation_note(count: u32) -> String {
+    format!(
+        "runner: {count} consecutive silent dispatches — zero agent output each cycle; auto-resume disabled to stop the churn loop"
+    )
+}
+
+fn silent_churn_escalation_condition() -> &'static str {
+    "runner-escalated (silent-dispatch churn): a human or a fresh agent session must review get_history and either execute the duty directly or re-scope the task; to re-enable runner dispatch, transition to todo deliberately with a note explaining the fix"
+}
+
+fn is_silent_churn_escalation(text: &str) -> bool {
+    text.starts_with("runner-escalated (silent-dispatch churn)")
+}
+
+fn json_tags(v: &serde_json::Value) -> Vec<String> {
+    v.get("tags")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Verdict-role duties (unblock, review) are board-side judgment work: the
+/// agent renders a verdict from task history and live receipts, not from a
+/// checkout. A missing repo ref is bounce-with-findings material for them,
+/// never a deterministic runner block — blocking them parks a done-only task
+/// type in blocked and spawns the unblock-spawn loop.
+fn tags_exempt_from_repo_gate(tags: &[String]) -> bool {
+    tags.iter().any(|t| t == "role:unblock" || t == "role:review")
+}
+
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
 /// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
 fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
@@ -1604,6 +1643,7 @@ fn tick(
                     );
                     remove_task_state(&inf.task_id);
                     attempts.remove(&inf.task_id);
+                    silent_cycles.remove(&inf.task_id);
                     finished_no_pr.insert(inf.task_id.clone());
                     if transition_to == "done" && inf.worktree.is_some() {
                         // terminal: worktree + branch served their purpose
@@ -1643,6 +1683,7 @@ fn tick(
                         }
                     }
                     finished_no_pr.insert(inf.task_id.clone());
+                    silent_cycles.remove(&inf.task_id);
                     remove_task_state(&inf.task_id);
                 }
             }
@@ -1670,6 +1711,7 @@ fn tick(
                 gave_up.insert(inf.task_id.clone());
                 attempts.remove(&inf.task_id);
                 fail_counts.remove(&inf.task_id);
+                silent_cycles.remove(&inf.task_id);
                 remove_task_state(&inf.task_id);
                 msgs.push(format!("{} blocked (agent config error — no retries): {}", inf.task_title, truncate(&tail, 120)));
                 snap_activity(snap, "error", &format!("{} blocked — deterministic agent config error", inf.task_id));
@@ -1707,6 +1749,7 @@ fn tick(
                 gave_up.insert(inf.task_id.clone());
                 attempts.remove(&inf.task_id);
                 fail_counts.remove(&inf.task_id);
+                silent_cycles.remove(&inf.task_id);
                 remove_task_state(&inf.task_id);
                 msgs.push(format!("{} failed {}x — blocked for attention (no more runner retries)", inf.task_title, fails));
             } else {
@@ -1762,6 +1805,8 @@ fn tick(
             continue; // unchanged since last poll — nothing new to relay
         }
         let note = format!("runner: agent output — {live}");
+        // real agent output: the silent-dispatch churn streak is broken
+        silent_cycles.remove(&inf.task_id);
         if let Err(e) = mcp_call(
             cfg,
             id,
@@ -1854,6 +1899,35 @@ fn tick(
         {
             continue; // silent backoff: runner bookkeeping must not look like agent activity
         }
+        // silent-dispatch churn guard: this task came back around (stall →
+        // release → resume) without a single line of agent output. After
+        // SILENT_DISPATCH_LIMIT such cycles, stop feeding the loop — hand it
+        // off loudly instead of re-dispatching to the same fate.
+        let silent = {
+            let c = silent_cycles.entry(tid.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if silent >= SILENT_DISPATCH_LIMIT {
+            let note = silent_churn_escalation_note(silent);
+            let cond = silent_churn_escalation_condition();
+            if mcp_call_task(
+                cfg,
+                id,
+                "transition",
+                json!({ "id": tid, "to": "blocked", "note": note, "unblock_condition": cond }),
+                &tid,
+            )
+            .is_err()
+            {
+                let _ = mcp_call_task(cfg, id, "log_progress", json!({ "id": tid, "note": note }), &tid);
+            }
+            gave_up.insert(tid.to_string());
+            silent_cycles.remove(tid);
+            snap_activity(snap, "error", &format!("{tid} escalated — {silent} silent dispatches, auto-resume disabled"));
+            msgs.push(format!("{tid} → blocked (silent-dispatch escalation — human/fresh session required)"));
+            continue;
+        }
         let want_title = format!("bridge-{tid}");
         let sess = sessions.get(&want_title).cloned().or_else(|| {
             sessions.iter().find(|(title, _)| title.contains(&want_title)).map(|(_, id)| id.clone())
@@ -1925,6 +1999,47 @@ fn tick(
         {
             continue;
         }
+        if gave_up.contains(tid) {
+            continue; // escalated or handed off — the watchdog/humans own it now
+        }
+        // cross-host stop: a silent-churn escalation block is a deliberate
+        // handoff. Resuming it on sight is what turned one host's guard into
+        // every host's loop — leave it for a human or a directed session.
+        if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
+            let unblock = task.get("unblock_condition").and_then(|u| u.as_str()).unwrap_or("");
+            if is_silent_churn_escalation(unblock) {
+                gave_up.insert(tid.to_string());
+                continue;
+            }
+        }
+        // silent-dispatch churn guard — same contract as the resume path: a
+        // candidate that keeps coming back with zero agent output is a loop,
+        // not work. Bound the cycles, then escalate off the runner.
+        let silent = {
+            let c = silent_cycles.entry(tid.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if silent >= SILENT_DISPATCH_LIMIT {
+            let note = silent_churn_escalation_note(silent);
+            let cond = silent_churn_escalation_condition();
+            if mcp_call_task(
+                cfg,
+                id,
+                "transition",
+                json!({ "id": tid, "to": "blocked", "note": note, "unblock_condition": cond }),
+                &tid,
+            )
+            .is_err()
+            {
+                let _ = mcp_call_task(cfg, id, "log_progress", json!({ "id": tid, "note": note }), &tid);
+            }
+            gave_up.insert(tid.to_string());
+            silent_cycles.remove(tid);
+            snap_activity(snap, "error", &format!("{tid} escalated — {silent} silent dispatches, auto-resume disabled"));
+            msgs.push(format!("{tid} → blocked (silent-dispatch escalation — human/fresh session required)"));
+            continue;
+        }
         let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");
         let (body_md, task_meta) = if is_blocked {
             // resume the blocked task. Preferred context: the unblock condition
@@ -1963,10 +2078,13 @@ fn tick(
             // repo contract: the task must reference a git repository BEFORE we
             // claim it. Repo-less tasks are blocked deterministically — claiming
             // first would park them in_progress with nothing to work in.
+            // Verdict roles (unblock/review) are exempt: their work is
+            // board-side judgment, and deterministically blocking a done-only
+            // task type is how the unblock-spawn loop was fed.
             let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
             let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
             let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-            if source_repo(&body_md, &task_meta).is_none() {
+            if source_repo(&body_md, &task_meta).is_none() && !tags_exempt_from_repo_gate(&json_tags(&art)) {
                 let _ = mcp_call_task(
                     cfg,
                     id,
@@ -2056,6 +2174,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
+    let mut silent_cycles: HashMap<String, u32> = HashMap::new();
     let mut finished_no_pr: HashSet<String> = HashSet::new();
     let mut gave_up: HashSet<String> = HashSet::new();
     let mut avail: Vec<opencode::Backend> = Vec::new();
@@ -2084,6 +2203,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut in_flight,
             &mut attempts,
             &mut fail_counts,
+            &mut silent_cycles,
             &mut finished_no_pr,
             &mut gave_up,
             &snap,
@@ -2159,4 +2279,54 @@ pub fn stop(state: &DispatchState) {
     // persist the stop signal immediately so the flat file reflects it even
     // before the loop drains its current sleep slice
     write_runner_state(&state.snapshot);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_churn_signature_is_matched_exact() {
+        assert!(is_silent_churn_escalation(silent_churn_escalation_condition()));
+        // other unblock conditions must never read as escalations — that would
+        // make the runner refuse to resume legitimate blocked work
+        assert!(!is_silent_churn_escalation(
+            "add the git repository reference (meta.repo or a repo URL in the body), then re-claim"
+        ));
+        assert!(!is_silent_churn_escalation(
+            "satisfy the rejected gate, then re-claim: ERROR: moving to in_review requires the PR link"
+        ));
+        assert!(!is_silent_churn_escalation(""));
+        // prefix-spoof resistance: the signature must match from the start
+        assert!(!is_silent_churn_escalation(
+            "see: runner-escalated (silent-dispatch churn)"
+        ));
+    }
+
+    #[test]
+    fn escalation_note_carries_the_count() {
+        let note = silent_churn_escalation_note(3);
+        assert!(note.contains("3"), "note must name the cycle count: {note}");
+        assert!(note.contains("silent dispatches"));
+    }
+
+    #[test]
+    fn repo_gate_exempts_verdict_roles_only() {
+        assert!(tags_exempt_from_repo_gate(&["role:unblock".to_string()]));
+        assert!(tags_exempt_from_repo_gate(&["role:review".to_string()]));
+        assert!(tags_exempt_from_repo_gate(&["role:review".to_string(), "attempted".to_string()]));
+        assert!(!tags_exempt_from_repo_gate(&["role:impl".to_string()]));
+        assert!(!tags_exempt_from_repo_gate(&["role:analysis".to_string()]));
+        assert!(!tags_exempt_from_repo_gate(&[]));
+    }
+
+    #[test]
+    fn json_tags_reads_top_level_array_only() {
+        let v = serde_json::json!({ "tags": ["role:unblock", "attempted"], "meta": { "tags": ["role:impl"] } });
+        assert_eq!(json_tags(&v), vec!["role:unblock".to_string(), "attempted".to_string()]);
+        // meta.tags must not leak into the top-level read
+        let nested = serde_json::json!({ "meta": { "tags": ["role:review"] } });
+        assert!(json_tags(&nested).is_empty());
+        assert!(json_tags(&serde_json::json!({})).is_empty());
+    }
 }
