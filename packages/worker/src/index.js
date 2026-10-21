@@ -106,7 +106,10 @@ export default {
         body: JSON.stringify({ bearer }),
       }).then((r) => r.json()).catch(() => null);
       if (!ident?.label) return new Response("unauthorized", { status: 401 });
-      if (!/^gw-/.test(ident.label)) return json({ error: "only gateway-class tokens (gw-*) may provision agent tokens" }, 403);
+      // gateway is a token TRAIT (the gateway tag), not a naming convention —
+      // the label is free-form, so class is read from the tag
+      const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
+      if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
       return kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
