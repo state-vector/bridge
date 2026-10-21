@@ -93,6 +93,19 @@ pub fn run_task(
         .env_remove("XDG_STATE_HOME")
         .env_remove("OPENCODE_SERVER_USERNAME")
         .env_remove("OPENCODE_SERVER_PASSWORD");
+    // Lane selection (ADR BR#550 + BR#1265 thread): dispatched worker sessions
+    // speak to the GATEWAY, not to the hub. The bridge MCP is the leader plane
+    // (issue work, view the system, transition state) — a worker with it
+    // enabled can orient, claim other tasks, and transition state it does not
+    // own (observed: dispatched sessions closing their own verify rounds).
+    // Disable it for dispatched runs: the gateway relays progress from stdout
+    // and owns every transition. Interactive agents keep the full MCP.
+    if backend == Backend::OpenCode {
+        cmd.env(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"mcp": {"bridge": {"enabled": false}}}"#,
+        );
+    }
     match backend {
         Backend::OpenCode => {
             cmd.arg("run");
