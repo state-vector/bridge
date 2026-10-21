@@ -40,6 +40,7 @@ pub struct DispatchConfig {
     pub agent_name: Option<String>, // name dispatched tasks are attributed to (override for the <hostname>-<backend> autogen)
     #[serde(default)]
     pub ws: Option<String>, // workspace slug from pairing
+    pub gateway: Option<bool>, // Some(true): paired as gateway-class — set by pairing from the vended tags (the secret is opaque; class is a trait)
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize, // WIP limit for this node
     #[serde(default)]
@@ -219,6 +220,7 @@ impl DispatchConfig {
             label: None,
             agent_name: None,
             ws: None,
+            gateway: None,
         })
     }
 
@@ -412,6 +414,7 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
                 label: None,
                 agent_name: None,
                 ws: None,
+                gateway: None,
                 max_sessions: default_max_sessions(),
                 report_minutes: None,
                 isolate: default_isolate(),
@@ -423,6 +426,12 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
             cfg.token = token;
             cfg.ws = Some(ws);
             cfg.label = label;
+            cfg.gateway = Some(
+                resp.get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| s.eq_ignore_ascii_case("gateway")))
+                    .unwrap_or(false),
+            );
             cfg.normalize();
             cfg.save()?;
             eprintln!("[pair] authorized — token for workspace '{}' saved (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
@@ -741,7 +750,24 @@ fn write_runner_state(snap: &SharedSnapshot) {
 pub fn external_snapshot() -> Option<serde_json::Value> {
     let dir = dispatch_dir()?;
     let raw = std::fs::read_to_string(dir.join("runner.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // a stale file from a dead process must not claim the runner is alive —
+    // Settings reads this file; running:true with a dead pid is a lie
+    if v.get("running").and_then(|r| r.as_bool()).unwrap_or(false) {
+        let pid = v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+        let alive = pid != 0
+            && pid != std::process::id()
+            && Command::new("ps")
+                .args(["-o", "pid=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if !alive {
+            v["running"] = serde_json::Value::Bool(false);
+            v["in_flight"] = serde_json::Value::Array(vec![]);
+            let _ = std::fs::write(dir.join("runner.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+    }
     Some(v)
 }
 
@@ -2288,8 +2314,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // claim would carry the wrong identity class. Log out automatically:
     // erase the pairing and return to onboarding (a fresh token is vended at
     // the next pair).
-    if cfg.token.is_empty() || !cfg.token.starts_with("gw-") {
-        let msg = "logged out — hub token is missing or not gateway-class (gw-*); pair again to onboard";
+    if cfg.token.is_empty() || cfg.gateway != Some(true) {
+        let msg = "logged out — no gateway-class pairing on this device; pair again (the desktop declares gateway at pair time)";
         eprintln!("[dispatch] {msg}");
         logout_core(&stop, &running, &snap);
         if let Ok(mut g) = last_error.lock() {

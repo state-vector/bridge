@@ -182,19 +182,14 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
   const [comment, setComment] = useState("");
   const [actMsg, setActMsg] = useState("");
 
-  const act = async (id: string, to: "accepted" | "rejected") => {
+  const act = (id: string) => {
+    // decisions are human-authoritative — they are made in the webapp (the
+    // machine plane may only supersede). The buttons deep-link there.
     setActing(id);
-    try {
-      await invoke("decision_act", { id, act: to });
-      setActMsg(`${id} ${to}`);
-      setTimeout(() => setActMsg(""), 2500);
-      await pull();
-    } catch (e) {
-      setActMsg(`failed: ${String(e)}`);
-    } finally {
-      setActing(null);
-      void pull();
-    }
+    if (hubUrl) openExternal(`${hubUrl}/?task=${id}`);
+    setActMsg("opening the board — decide there");
+    setTimeout(() => setActMsg(""), 2500);
+    setActing(null);
   };
 
   const frameDecision = (d: ForYouArtefact): { q: string; verdict: string; target: string } => {
@@ -223,10 +218,9 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
         </span>
         <span className="gw-fq" title={d.title}>{f.q}</span>
         <div className="gw-row" style={{ marginLeft: "auto", gap: 6 }}>
-          <button className="gw-btn act-accept" disabled={busy} onClick={() => void act(d.id, "accepted")}>
-            {f.verdict === "BOUNCE" ? "Bounce it" : "Accept"}
+          <button className="gw-btn act-accept" disabled={busy} onClick={() => act(d.id)}>
+            {f.verdict === "BOUNCE" ? "Decide" : "Decide"} ↗
           </button>
-          <button className="gw-btn act-reject" disabled={busy} onClick={() => void act(d.id, "rejected")}>Reject</button>
           {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${hubUrl}/?task=${d.id}`); }}>comment ↗</a>}
         </div>
       </div>
@@ -503,6 +497,15 @@ export function App() {
 
 
 
+  // native menu (tray + app menu) actions arrive as events
+  useEffect(() => {
+    const offs: Array<() => void> = [];
+    void listen("goto-settings", () => setPage("settings")).then((f) => offs.push(f));
+    void listen("do-logout", () => void doLogoutRef.current?.()).then((f) => offs.push(f));
+    return () => offs.forEach((f) => f());
+  }, []);
+
+  const doLogoutRef = useRef<(() => void) | null>(null);
   const doLogout = async () => {
     if (!window.confirm("Log out? This stops the runner and clears the gateway token — your settings are kept; pair again to onboard.")) return;
     try {
@@ -514,6 +517,7 @@ export function App() {
       setLogoutMsg(`failed: ${String(e)}`);
     }
   };
+  doLogoutRef.current = doLogout;
 
   const pull = useCallback(async () => {
     try {
