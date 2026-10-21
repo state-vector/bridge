@@ -674,7 +674,7 @@ export class KnowledgeHub {
     // human-plane GET mirror
     if (request.method === "GET") {
       switch (url.pathname) {
-        case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
+        case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
         case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
         case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
         case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));

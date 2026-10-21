@@ -36,6 +36,30 @@ export default {
       try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
       return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/stats");
     }
+    // machine-plane list mirror (bearer): lets runners/scripts enumerate artefacts
+    // without a browser cookie — same DO list op the webapp uses, via the GET
+    // /artefacts route (filters read query params there; a POST /list with an
+    // empty body would silently drop the filters).
+    if (url.pathname === "/api/kb-machine/list") {
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" });
+    }
+
+    // machine-plane search mirror (bearer): desktop/console clients retrieve
+    // knowledge without a browser cookie — same DO search op the webapp uses
+    // (GET /search reads q/type/limit from query params there).
+    if (url.pathname === "/api/kb-machine/search") {
+      const { resolveTokenWs } = await import("./mcp.ts");
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+      if (!bearer) return new Response("unauthorized", { status: 401 });
+      let ws;
+      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" });
+    }
 
     if (url.pathname === "/mcp") {
       return handleMcp(request, env);

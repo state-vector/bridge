@@ -537,6 +537,7 @@ fn write_runner_state(snap: &SharedSnapshot) {
     if let Ok(s) = snap.lock() {
         let v = serde_json::json!({
             "updated_ts": now_ms(),
+            "pid": std::process::id(),
             "running": s.running,
             "url": s.url,
             "workspace": s.workspace,
@@ -549,6 +550,73 @@ fn write_runner_state(snap: &SharedSnapshot) {
         });
         let _ = std::fs::write(dir.join("runner.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
     }
+}
+
+/// Snapshot of a dispatch loop running in ANOTHER process (headless runner).
+/// runner.json is written every tick — in-flight list + recent activity.
+/// Null when no runner has ever written state here.
+pub fn external_snapshot() -> Option<serde_json::Value> {
+    let dir = dispatch_dir()?;
+    let raw = std::fs::read_to_string(dir.join("runner.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(v)
+}
+
+/// Pid of a dispatch loop alive in ANOTHER process, if any. Guards the
+/// dual-runner race: the desktop GUI used to auto-start its own loop while a
+/// headless runner polled the same hub — two claimers racing on one board.
+/// Stale files (crashed runner) are detected via pid liveness; our own pid
+/// never counts as external.
+pub fn external_runner_pid() -> Option<u32> {
+    let v = external_snapshot()?;
+    let pid = v.get("pid")?.as_u64()? as u32;
+    if pid == std::process::id() {
+        return None;
+    }
+    if !v.get("running").and_then(|r| r.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let alive = Command::new("ps")
+        .args(["-o", "pid=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if alive { Some(pid) } else { None }
+}
+
+/// "For you" payload for the desktop panel: the human's inbox, read-only.
+/// Machine-plane list queries (agent token) — decisions/blocked/questions.
+/// Human-authoritative actions (accept/reject) stay in the webapp; rows carry
+/// the hub URL so the panel can deep-link. Runs on a blocking thread.
+pub fn for_you_payload() -> Result<serde_json::Value, String> {
+    let cfg = DispatchConfig::resolve().ok_or("not configured — pair first")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let get = |q: &str| -> Result<serde_json::Value, String> {
+        Ok(client
+            .get(format!("{}/api/kb-machine/list{}", cfg.url.trim_end_matches('/'), q))
+            .header("Authorization", format!("Bearer {}", cfg.token))
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .map_err(|e| e.to_string())?
+            .get("artefacts")
+            .cloned()
+            .unwrap_or_else(|| json!([])))
+    };
+    let decisions = get("?type=decision&status=proposed&limit=50")?;
+    let blocked = get("?type=task&status=blocked&limit=50")?;
+    let questions = get("?type=task&tag=question&limit=50")?;
+    Ok(json!({
+        "url": cfg.url,
+        "decisions": decisions,
+        "blocked": blocked,
+        "questions": questions,
+    }))
 }
 
 // ---- dispatch state (shared with Tauri commands) ----
@@ -1678,6 +1746,11 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
     let mut handle = state.handle.lock().map_err(|_| "state poisoned")?;
     if state.running.load(Ordering::Relaxed) {
         return Err("dispatch loop already running".into());
+    }
+    if let Some(pid) = external_runner_pid() {
+        // single-claimant rule: two dispatch loops polling one hub race on
+        // claims and double-dispatch. Observe the external runner instead.
+        return Err(format!("runner already live in another process (pid {pid}) — stop it or kill {pid} first"));
     }
     // remember explicit settings (concurrency, backend, model, hub) across
     // restarts/app runs — the settings page applies by re-starting the loop

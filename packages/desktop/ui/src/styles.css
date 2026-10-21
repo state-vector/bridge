@@ -128,3 +128,37 @@ body {
   margin: 0; font-size: 13px; font-weight: 700; font-family: var(--mono);
   color: var(--accent);
 }
+
+/* For you (unblock inbox) */
+.fy-chips { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+.fy-item { align-items: baseline; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; background: var(--bg2, #1c1f26); border: 1px solid #2c313a; color: #c9d1d9; }
+.chip-urgent { border-color: #d29922; color: #e3b341; }
+
+/* Console chat */
+.gw-main.chat { padding-bottom: 0; }
+.chat-head { flex-shrink: 0; padding: 10px 14px 8px; }
+.chat-head h2 { margin: 0; }
+.chat-scroll {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  padding: 4px 2px 12px; user-select: text;
+}
+.chat-msg { display: flex; flex-direction: column; gap: 4px; max-width: 82%; }
+.chat-msg-user { align-self: flex-end; }
+.chat-msg-assistant { align-self: flex-start; }
+.chat-bubble {
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 9px 12px; white-space: pre-wrap; word-break: break-word; font-size: 13px;
+}
+.chat-msg-user .chat-bubble { background: rgba(91, 141, 239, 0.16); border-color: rgba(91, 141, 239, 0.4); }
+.chat-srcs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding-left: 4px; }
+.chat-src {
+  font-size: 10.5px; color: var(--text-dim); border: 1px solid var(--line);
+  border-radius: 999px; padding: 1px 7px;
+}
+.chat-busy { padding: 4px; }
+.chat-inputrow {
+  display: flex; gap: 8px; padding: 10px 0 14px; flex-shrink: 0;
+  border-top: 1px solid var(--line); background: var(--bg);
+}
+.chat-input { flex: 1; }

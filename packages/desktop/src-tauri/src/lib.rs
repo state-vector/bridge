@@ -1,3 +1,4 @@
+mod console;
 mod dispatch;
 mod mac_notify;
 mod menubar;
@@ -67,7 +68,32 @@ fn dispatch_config() -> serde_json::Value {
 
 #[tauri::command]
 fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_json::Value {
-    state.snapshot.lock().map(|s| serde_json::to_value(&*s).unwrap_or_default()).unwrap_or_default()
+    // in-process loop: the live snapshot is authoritative. Otherwise observe
+    // an external (headless) runner via its flat-file state — the panel used
+    // to go stale whenever the loop ran in a separate process.
+    if state.running.load(std::sync::atomic::Ordering::Relaxed) {
+        return state.snapshot.lock().map(|s| serde_json::to_value(&*s).unwrap_or_default()).unwrap_or_default();
+    }
+    dispatch::external_snapshot().unwrap_or(serde_json::Value::Null)
+}
+
+/// "For you" — the human's inbox (proposed decisions, blocked work, questions).
+/// Read-only; human-authoritative actions live in the webapp.
+#[tauri::command]
+async fn for_you() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(dispatch::for_you_payload)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One console turn: retrieve board artefacts for the question, then
+/// summarise/answer with the on-device Apple model (fallback: backend CLI).
+/// Read-only — the console never claims or writes work.
+#[tauri::command]
+async fn chat_send(question: String, history: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || console::chat_turn(&question, &history))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -104,6 +130,8 @@ pub fn run() {
             dispatch_status,
             dispatch_config,
             dispatch_snapshot,
+            for_you,
+            chat_send,
             dispatch_start,
             dispatch_stop,
             menubar::show_panel,
@@ -124,6 +152,9 @@ pub fn run() {
             let headless = std::env::args().any(|a| a == "--headless");
             if !headless {
                 menubar::setup(app)?;
+                // watch the inbox for new proposed decisions — OS notification
+                // per arrival, independent of whether the dispatch loop runs
+                console::start_decision_watch(handle.clone());
             }
 
             // auto-start dispatch: headless pairs (device flow) if unconfigured;
@@ -137,7 +168,13 @@ pub fn run() {
             }
             if headless || cfg.is_some() {
                 let state = app.state::<dispatch::DispatchState>();
-                dispatch::start(&state, cfg)?;
+                if let Some(pid) = dispatch::external_runner_pid() {
+                    // a headless runner already polls this hub from another
+                    // process — observe it, never race it for claims
+                    eprintln!("[dispatch] runner live in pid {pid} — observing, not starting a second loop");
+                } else {
+                    dispatch::start(&state, cfg)?;
+                }
             }
             Ok(())
         })

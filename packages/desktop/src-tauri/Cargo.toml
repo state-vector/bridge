@@ -34,3 +34,5 @@ block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSet", "NSDictionary", "NSError"] }
 objc2-user-notifications = { version = "0.3.2", features = ["block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationCategory", "UNNotificationAction", "UNNotificationResponse", "UNNotificationSound"] }
+# Apple's on-device LLM (FoundationModels, macOS 26+) — the console summariser
+foundation-models = { version = "0.12", features = ["macos_26_0"] }

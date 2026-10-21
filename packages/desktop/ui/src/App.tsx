@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
-/** Bridge gateway UI. Three pages:
+/** Bridge gateway UI. Four pages (For you first — the unblock inbox is the
+ *  most important thing a user sees):
+ *  For you — read-only inbox: proposed decisions, blocked work + unblock
+ *            conditions, open questions. Human-authoritative actions stay in
+ *            the webapp; rows deep-link there.
  *  Main — mini-Top: the local work in flight right now.
  *  Log — the full dispatch log stream.
  *  Settings — hub, agents (multi-select backends + profile + model), concurrency.
@@ -90,8 +95,182 @@ function age(ms: number): string {
   return `${h}h ${m % 60}m`;
 }
 
+interface ForYouArtefact {
+  id: string;
+  type: string;
+  title: string;
+  body_md?: string | null;
+  status: string;
+  owner?: string | null;
+  created_ts: number;
+  updated_ts: number;
+  meta?: Record<string, any> | null;
+  tags?: string[] | null;
+}
+
+/** For you — the human's unblock inbox (machine-plane, read-only). Verify
+ *  verdicts group per target task like the webapp's For Me (BR#1782). */
+function ForYou({ hubUrl }: { hubUrl: string | null }) {
+  const [data, setData] = useState<{ decisions: ForYouArtefact[]; blocked: ForYouArtefact[]; questions: ForYouArtefact[] } | null>(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let dead = false;
+    const pull = async () => {
+      try {
+        const d = await invoke<any>("for_you");
+        if (!dead) {
+          setData({ decisions: d.decisions ?? [], blocked: d.blocked ?? [], questions: d.questions ?? [] });
+          setErr("");
+        }
+      } catch (e) {
+        if (!dead) setErr(String(e));
+      }
+    };
+    void pull();
+    const t = setInterval(() => void pull(), 5000);
+    return () => { dead = true; clearInterval(t); };
+  }, []);
+
+  const verdicts = (data?.decisions ?? []).filter((d) => d.meta?.decision_class === "verify-verdict" && (d.meta?.task || d.meta?.verify_target));
+  const generic = (data?.decisions ?? []).filter((d) => !verdicts.includes(d));
+  const byTarget = new Map<string, ForYouArtefact[]>();
+  for (const d of verdicts) {
+    const m = (d.meta ?? {}) as Record<string, any>;
+    const key = String(m.task ?? m.verify_target);
+    (byTarget.get(key) ?? byTarget.set(key, []).get(key)!).push(d);
+  }
+  const verdictCards = [...byTarget.values()].map((arr) => arr.sort((a, b) => b.created_ts - a.created_ts)).map((arr) => ({ latest: arr[0], prior: arr.slice(1) }));
+  const openQuestions = (data?.questions ?? []).filter((t) => t.status !== "done" && t.status !== "superseded");
+  const total = verdictCards.length + generic.length + (data?.blocked ?? []).length + openQuestions.length;
+
+  const Row = ({ chips, title, sub, id }: { chips: string[]; title: string; sub?: string | null; id: string }) => (
+    <div className="gw-agent fy-item">
+      <span className="fy-chips">{chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}</span>
+      <span className="gw-fnote" title={title}>{title}</span>
+      {sub && <span className="gw-fmeta">{sub}</span>}
+      {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); window.open(hubUrl, "_blank"); }}>open ↗</a>}
+      <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{id}</span>
+    </div>
+  );
+
+  return (
+    <main className="gw-main">
+      {err && <div className="gw-card"><span className="gw-err">{err}</span></div>}
+      <div className="gw-card">
+        <h2>For you</h2>
+        <span className="gw-note">{total > 0 ? `${total} awaiting you` : "nothing needs you right now"}</span>
+      </div>
+      {(verdictCards.length > 0 || generic.length > 0) && (
+        <div className="gw-card">
+          <h2>Awaiting your decision</h2>
+          {verdictCards.map(({ latest, prior }) => {
+            const verdict = String(latest.meta?.verdict ?? "").toLowerCase() === "bounce" ? "BOUNCE" : "VERIFIED";
+            const target = String(latest.meta?.task ?? latest.meta?.verify_target ?? "");
+            return (
+              <div key={latest.id}>
+                <Row chips={["VERDICT", verdict, target]} title={latest.title} id={latest.id}
+                  sub={prior.length > 0 ? `+ ${prior.length} prior round${prior.length > 1 ? "s" : ""}` : null} />
+              </div>
+            );
+          })}
+          {generic.map((d) => <Row key={d.id} chips={["DECISION"]} title={d.title} id={d.id} />)}
+        </div>
+      )}
+      {(data?.blocked ?? []).length > 0 && (
+        <div className="gw-card">
+          <h2>Blocked — unblock work</h2>
+          {(data?.blocked ?? []).map((b) => (
+            <Row key={b.id} chips={["BLOCKED"]} title={b.title} sub={b.meta?.unblock_condition ?? b.meta?.blocked_reason ?? null} id={b.id} />
+          ))}
+        </div>
+      )}
+      {openQuestions.length > 0 && (
+        <div className="gw-card">
+          <h2>Open questions</h2>
+          {openQuestions.map((t) => <Row key={t.id} chips={["QUESTION"]} title={t.title} id={t.id} />)}
+        </div>
+      )}
+      <div className="gw-card">
+        <span className="gw-note">Accept / reject from the full board — human decisions live there.</span>
+      </div>
+    </main>
+  );
+}
+
+/** Console chat — read-only Q&A over the board. Retrieval + summarisation on
+ *  the Rust side (Apple's on-device model, fallback: the configured backend
+ *  CLI); the webview only carries the conversation. */
+interface ChatSource { id: string; title: string; status: string }
+interface ChatMsg { role: "user" | "assistant"; text: string; sources?: ChatSource[]; engine?: string }
+
+function Chat() {
+  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [msgs.length, busy]);
+
+  const send = async () => {
+    const question = input.trim();
+    if (!question || busy) return;
+    setInput("");
+    setErr("");
+    setMsgs((m) => [...m, { role: "user", text: question }]);
+    setBusy(true);
+    try {
+      const history = msgs.slice(-6).map((m) => ({ role: m.role, text: m.text }));
+      const r = await invoke<any>("chat_send", { question, history });
+      setMsgs((m) => [...m, { role: "assistant", text: r.answer ?? String(r), sources: r.sources ?? [], engine: r.engine }]);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="gw-main chat">
+      <div className="gw-card chat-head">
+        <h2>Console</h2>
+        <span className="gw-note">read-only Q&amp;A over the board — on-device model, no work dispatched</span>
+      </div>
+      <div className="chat-scroll" ref={scrollRef}>
+        {msgs.length === 0 && (
+          <span className="gw-log-empty">ask about the board — "what's blocked?", "recap BR#46", "what needs my decision?"</span>
+        )}
+        {msgs.map((m, i) => (
+          <div key={i} className={`chat-msg chat-msg-${m.role}`}>
+            <div className="chat-bubble">{m.text}</div>
+            {m.role === "assistant" && (m.sources?.length ?? 0) > 0 && (
+              <div className="chat-srcs">
+                {m.sources!.map((s) => <span key={s.id} className="chat-src gw-mono" title={s.title}>{s.id}</span>)}
+                {m.engine && <span className="gw-fmeta">{m.engine}</span>}
+              </div>
+            )}
+          </div>
+        ))}
+        {busy && <span className="gw-log-empty chat-busy">reading the board…</span>}
+      </div>
+      {err && <div className="gw-card"><span className="gw-err">{err}</span></div>}
+      <div className="chat-inputrow">
+        <input className="gw-input chat-input" value={input}
+          placeholder="ask the board…"
+          disabled={busy}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void send(); }} />
+        <button className="gw-btn gw-btn-run" disabled={busy || !input.trim()} onClick={() => void send()}>Send</button>
+      </div>
+    </main>
+  );
+}
+
 export function App() {
-  const [page, setPage] = useState<"main" | "log" | "settings">("main");
+  const [page, setPage] = useState<"forme" | "chat" | "main" | "log" | "settings">("forme");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -139,6 +318,13 @@ export function App() {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = 0;
   }, [snap?.activity.length]);
+
+  // native notification click → jump to the inbox (asks + decision watch)
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void listen("open-ask", () => setPage("forme")).then((f) => { un = f; });
+    return () => un?.();
+  }, []);
 
   const toggleRun = async () => {
     try {
@@ -213,12 +399,18 @@ export function App() {
       <header className="gw-head">
         <span className="gw-brand">bridge<span className="cursor" /></span>
         <nav className="gw-nav">
+          <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
+          <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
           <button className={page === "main" ? "active" : ""} onClick={() => setPage("main")}>Main</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
         </nav>
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
+
+      {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
+
+      {page === "chat" && <Chat />}
 
       {page === "main" && (
         <main className="gw-main">

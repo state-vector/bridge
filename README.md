@@ -80,6 +80,11 @@ Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
+Beyond dispatch it carries two human-facing surfaces:
+
+- **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
+- **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). No runner required.
+
 ### Runner config file
 
 All runner knobs live in `~/.bridge/config.json` (written by pairing; safe to
@@ -173,7 +178,7 @@ contract.
 | package | what |
 |---|---|
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
-| `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*`, serves the webapp |
+| `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
 | `packages/webapp` | the full web UI (browser-only — no shell forks) |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |

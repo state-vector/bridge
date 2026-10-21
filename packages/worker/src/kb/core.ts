@@ -40,7 +40,7 @@ export function isQuestionTask(meta: any): boolean {
 export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   steering: { draft: ["active"], active: ["superseded"] },
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
-  decision: { proposed: ["accepted"], accepted: ["superseded"] },
+  decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
   task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
   progress: {},
   agent: {},
