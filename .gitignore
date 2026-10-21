@@ -18,4 +18,6 @@ packages/desktop/src-tauri/gen/
 .DS_Store
 packages/cli/target/
 packages/mobile/ui/node_modules/
+# runner scratch (when workdir points at a checkout — BR#2460)
 repos/
+sessions/

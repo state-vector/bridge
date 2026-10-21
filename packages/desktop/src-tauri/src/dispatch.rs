@@ -1033,6 +1033,15 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         return Some(path);
     }
     std::fs::create_dir_all(path.parent()?).ok()?;
+    // Self-heal stale registrations: a worktree dir deleted without
+    // deregistration leaves a "prunable" ghost whose branch lock fails both
+    // worktree adds below, and the isolation guard then refuses dispatch —
+    // churning the task through the watchdog (BR#2421 class). Prune is
+    // idempotent and cheap.
+    let _ = Command::new("git")
+        .current_dir(repo_path)
+        .args(["worktree", "prune"])
+        .output();
         let branch = format!("bridge/{slug}");
         // Base = the clone's default branch. `origin/HEAD` is set by clone.
         let mut cmd = Command::new("git");
@@ -1059,8 +1068,22 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
     let slug = slugify(task_id);
     let Some(home) = std::env::var("HOME").ok() else { return };
     let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
+    // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
+    // Deregistering against cfg.workdir silently failed whenever the worktree
+    // was owned by a clone under <workdir>/repos — the dir was then deleted,
+    // leaving a prunable ghost whose branch lock made the next dispatch of the
+    // same task refuse isolation and churn through the watchdog (BR#2421).
+    let owner = std::fs::read_to_string(path.join(".git"))
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("gitdir: ")
+                .and_then(|g| g.split("/.git/worktrees/").next())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| workdir.to_string());
     let _ = Command::new("git")
-        .current_dir(workdir)
+        .current_dir(&owner)
         .args(["worktree", "remove", "--force"])
         .arg(&path)
         .output();
@@ -1069,7 +1092,7 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
         // no future. On todo releases the branch is KEPT: a re-claim attaches
         // to it, preserving any unpushed stall work.
         let _ = Command::new("git")
-            .current_dir(workdir)
+            .current_dir(&owner)
             .args(["branch", "-D"])
             .arg(&format!("bridge/{slug}"))
             .output();
