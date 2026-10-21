@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { kbApi } from "../lib/kb";
 import type { KbArtefact, KbVersion } from "../lib/kb";
 import { kindOf, rel, TASK_REF_RE } from "../lib/views";
@@ -164,6 +164,16 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
   const [versions, setVersions] = useState<KbVersion[]>([]);
 
   const transition = useKb((s) => s.transition);
+  const boardTasks = useKb((s) => s.tasks) as any[];
+  // children resolve from the LIVE board store first (complete + realtime via
+  // WS) — the semantic `related` call misses most children (embedding-ranked,
+  // limit ~6), which is why the work tree used to render empty
+  const childIndex = useMemo(() => {
+    const m = new Map<string, any>();
+    for (const t of boardTasks) m.set(t.id, t);
+    for (const r of related) if (!m.has(r.id)) m.set(r.id, r);
+    return m;
+  }, [boardTasks, related]);
 
   useEffect(() => {
     let on = true;
@@ -293,7 +303,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
             <label>Work tree — spawned tasks, live</label>
             <div className="worktree-list">
               {relations.filter((r) => r.dir === "in").map((r) => {
-                const child = related.find((a) => a.id === r.artefact_id);
+                const child = childIndex.get(r.artefact_id);
                 if (!child) return null;
                 return <WorkTreeRow key={r.artefact_id} child={child} relation={r.relation} nav={nav} now={Date.now()} />;
               })}
