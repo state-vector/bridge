@@ -1090,10 +1090,14 @@ fn extract_pr(stdout: &str) -> Option<String> {
 /// page cited as a PR — BR#860/863/866/844/855 class). Treated as failure:
 /// backoff, then blocked-for-attention, never done, never in_review.
 fn void_run(stdout: &str, stderr: &str) -> bool {
-    const SIGS: [&str; 3] = [
+    const SIGS: [&str; 5] = [
         "Model blocked by guardrail",
         "0 endpoints out of",
         "no endpoints are available matching your guardrail",
+        // opencode server-side crash — the session died before any work
+        // (auth expired, local server broken). Deterministic, no work done.
+        "Unexpected server error. Check server logs",
+        "\"name\": \"UnknownError\"",
     ];
     SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
 }
@@ -1284,6 +1288,43 @@ fn spawn_opencode(
     snap_in_flight_list(snap, in_flight);
 }
 
+/// Dispatch circuit breaker: N consecutive failed/void dispatches with the
+/// same error signature means the AGENT CLI is broken (auth, server down,
+/// guardrails) — not the tasks. Claiming more work just burns the queue:
+/// every session dies the same way, each attempt spins tasks through
+/// blocked/unblock cycles. Break the loop: stop claiming, surface the error
+/// prominently, resume on the first successful run (or manual restart).
+#[derive(Default)]
+struct CircuitBreaker {
+    consecutive_failures: u32,
+    last_signature: String,
+    tripped: bool,
+}
+impl CircuitBreaker {
+    const THRESHOLD: u32 = 3;
+    fn record_failure(&mut self, stdout: &str, stderr: &str) {
+        let sig = ["Unexpected server error", "Model blocked by guardrail", "0 endpoints out of", "no endpoints are available matching your guardrail", "UnknownError"]
+            .iter().find(|s| stdout.contains(*s) || stderr.contains(*s))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "other".into());
+        if sig == self.last_signature || self.consecutive_failures == 0 {
+            self.consecutive_failures += 1;
+        } else {
+            self.consecutive_failures = 1;
+        }
+        self.last_signature = sig;
+        if self.consecutive_failures >= Self::THRESHOLD && !self.tripped {
+            self.tripped = true;
+        }
+    }
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_signature.clear();
+        self.tripped = false;
+    }
+    fn tripped(&self) -> bool { self.tripped }
+}
+
 fn tick(
     cfg: &DispatchConfig,
     id: &mut i64,
@@ -1295,6 +1336,7 @@ fn tick(
     snap: &SharedSnapshot,
     avail: &mut Vec<opencode::Backend>,
     last_avail_ok: &mut bool,
+    breaker: &mut CircuitBreaker,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
 
@@ -1418,6 +1460,7 @@ fn tick(
         // timeout, or a guardrail-void dispatch — can NEVER hand off. Void
         // runs still exit 0, so the exit code alone is not enough.
         let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
+        if outcome_ok { breaker.record_success(); } else { breaker.record_failure(&outcome.stdout_tail, &outcome.stderr_tail); }
         // persist final state (incl. PR link and exit code) before handoff
         write_task_state(
             &inf.task_id,
@@ -1687,6 +1730,17 @@ fn tick(
         return Ok(msgs);
     }
 
+    // 3c. circuit breaker: agent CLI is failing deterministically — stop
+    // claiming. In-flight sessions keep finishing; the breaker clears on the
+    // first success or a runner restart after the environment is fixed.
+    if breaker.tripped() {
+        msgs.push(format!(
+            "CIRCUIT BREAKER — {} consecutive dispatch failures ({}). Not claiming new work: fix the agent CLI/auth, then restart the runner.",
+            breaker.consecutive_failures, breaker.last_signature
+        ));
+        return Ok(msgs);
+    }
+
     // 4. orient — once per tick when we have capacity
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
     let policy = orient
@@ -1943,6 +1997,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut gave_up: HashSet<String> = HashSet::new();
     let mut avail: Vec<opencode::Backend> = Vec::new();
     let mut last_avail_ok = true;
+    let mut breaker = CircuitBreaker::default();
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -1971,6 +2026,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &snap,
             &mut avail,
             &mut last_avail_ok,
+            &mut breaker,
         ) {
             Ok(msgs) => {
                 for msg in msgs {
