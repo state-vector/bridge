@@ -503,6 +503,24 @@ export function App() {
     };
   }, [pairCode, pairingUrl, loadCfg, pull]);
 
+  useEffect(() => {
+    void pull();
+    void loadCfg();
+    const t = setInterval(() => void pull(), 2000);
+    return () => clearInterval(t);
+  }, [pull, loadCfg]);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = 0;
+  }, [snap?.activity.length]);
+
+  // native notification click → jump to the inbox (asks + decision watch)
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void listen("open-ask", () => setPage("forme")).then((f) => { un = f; });
+    return () => un?.();
+  }, []);
+
   // logged out / first use = ONE screen: pair this desktop. No nav, no pages,
   // no board chrome — nothing else is reachable without an identity.
   if (!paired) {
@@ -540,24 +558,6 @@ export function App() {
       </div>
     );
   }
-
-  useEffect(() => {
-    void pull();
-    void loadCfg();
-    const t = setInterval(() => void pull(), 2000);
-    return () => clearInterval(t);
-  }, [pull, loadCfg]);
-
-  useEffect(() => {
-    if (logRef.current) logRef.current.scrollTop = 0;
-  }, [snap?.activity.length]);
-
-  // native notification click → jump to the inbox (asks + decision watch)
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    void listen("open-ask", () => setPage("forme")).then((f) => { un = f; });
-    return () => un?.();
-  }, []);
 
   const toggleRun = async () => {
     try {
