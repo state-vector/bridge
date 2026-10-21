@@ -946,14 +946,20 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
     while let Some(i) = rest.find("https://") {
         rest = &rest[i..];
         let end = rest
-            .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>')
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ')' | ']' | '>' | ',' | ';' | '!' | '?' | '"' | '\'')
+            })
             .unwrap_or(rest.len());
         let url = &rest[..end];
         let base = url
             .trim_end_matches('/')
             .trim_end_matches('.')
             .trim_end_matches(".git");
-        if base.contains("github.com/") || base.contains(".git") {
+        if base.contains("github.com/") {
+            if let Some(repo) = github_repo_base(base) {
+                return Some(repo);
+            }
+        } else if base.contains(".git") {
             return Some(base.trim_end_matches(".git").to_string());
         }
         rest = &rest[end..];
@@ -961,28 +967,33 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
     None
 }
 
-// Silent-dispatch churn guard (the BR#2298 class): a dispatched session that
-// produces zero output every cycle trips none of the deterministic guards
-// (config error, 3-fail, handoff rejection are all observable errors — silence
-// is not), so the watchdog stall → runner auto-resume → re-dispatch loop ran
-// forever, spawning an unblock child per cycle. Bound it: after
-// SILENT_DISPATCH_LIMIT consecutive stall-then-reclaim cycles with no agent
-// output, stop re-dispatching and hand off loudly.
-const SILENT_DISPATCH_LIMIT: u32 = 3;
-
-fn silent_churn_escalation_note(count: u32) -> String {
-    format!(
-        "runner: {count} consecutive silent dispatches — zero agent output each cycle; auto-resume disabled to stop the churn loop"
-    )
+/// Normalize a github.com URL to its owning repository: task bodies lead with
+/// receipts (pull/N, commit/<sha>, blob/tree paths, issues, actions runs), and
+/// the first such citation is not a clone target — its repo is. Returns
+/// `https://github.com/<owner>/<repo>` so a PR-receipt task dispatches into
+/// the right checkout (the agent can `gh pr checkout` from the citation).
+/// None = no owner/repo prefix (bare domain, gist, wrong host) — keep scanning.
+fn github_repo_base(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut segs = rest.split('/');
+    let owner = segs.next()?;
+    let repo = segs.next()?;
+    let clean = |s: &str, extra: bool| -> String {
+        s.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && !(extra && c == '.'))
+            .trim_end_matches(".git")
+            .to_string()
+    };
+    let (owner, repo) = (clean(owner, false), clean(repo, true));
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repo}"))
 }
 
-fn silent_churn_escalation_condition() -> &'static str {
-    "runner-escalated (silent-dispatch churn): a human or a fresh agent session must review get_history and either execute the duty directly or re-scope the task; to re-enable runner dispatch, transition to todo deliberately with a note explaining the fix"
-}
-
-fn is_silent_churn_escalation(text: &str) -> bool {
-    text.starts_with("runner-escalated (silent-dispatch churn)")
-}
+// BR#2419: state legality lives in the worker's machine (machine.ts). The
+// runner never transitions tasks to blocked, never resumes blocked tasks, and
+// never encodes gate verdicts as state — it releases claims and skips
+// candidates. The drift-alarm test at the bottom of this file enforces it.
 
 fn json_tags(v: &serde_json::Value) -> Vec<String> {
     v.get("tags")
@@ -1197,6 +1208,29 @@ fn is_config_error(text: &str) -> bool {
         "no such agent",
     ];
     MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// Silent-dispatch churn bound: candidate ticks with zero agent output
+/// (spawn refused, CLI missing, model error) before the task escalates off
+/// the loop. Same contract as the 3-strike failure cap — the loop may not
+/// churn indefinitely on a setup problem.
+const SILENT_DISPATCH_LIMIT: u32 = 3;
+
+fn silent_churn_escalation_note(silent: u32) -> String {
+    format!(
+        "runner: silent-dispatch escalation — {silent} dispatch cycles produced no agent output (CLI missing, model unconfigured, or spawn refused). Auto-resume disabled."
+    )
+}
+
+fn silent_churn_escalation_condition() -> String {
+    "fix the local agent setup (`bridge doctor` names it), then re-claim or re-issue the task — it will not auto-dispatch until then".to_string()
+}
+
+/// A blocked task whose unblock condition is a silent-churn escalation block
+/// must never be auto-resumed on sight: resuming is what turned one host's
+/// guard into every host's loop.
+fn is_silent_churn_escalation(unblock: &str) -> bool {
+    unblock.contains("silent-dispatch escalation") || unblock.contains("will not auto-dispatch until then")
 }
 
 fn extract_pr(stdout: &str) -> Option<String> {
@@ -1467,7 +1501,6 @@ fn tick(
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
     fail_counts: &mut HashMap<String, u32>,
-    silent_cycles: &mut HashMap<String, u32>,
     finished_no_pr: &mut HashSet<String>,
     gave_up: &mut HashSet<String>,
     snap: &SharedSnapshot,
@@ -1694,7 +1727,6 @@ fn tick(
                     );
                     remove_task_state(&inf.task_id);
                     attempts.remove(&inf.task_id);
-                    silent_cycles.remove(&inf.task_id);
                     finished_no_pr.insert(inf.task_id.clone());
                     if transition_to == "done" && inf.worktree.is_some() {
                         // terminal: worktree + branch served their purpose
@@ -1709,43 +1741,42 @@ fn tick(
                 }
                 Err(e) => {
                     // gate rejected the handoff (e.g. receipts rejected, no PR).
-                    // Do NOT release to todo: a release puts the task straight
-                    // back into the claim pool, and the next dispatch hits the
-                    // same gate — the 104-attempt churn loop. The gate's verdict
-                    // is information: block the task with the rejection as the
-                    // reason and the gate's own demand as the exit condition.
-                    let block_note = format!(
+                    // BR#2419: the runner owns no state semantics — release the
+                    // claim back to the pool with the rejection as the note.
+                    // The worker owns consequences: its gates emitted this
+                    // rejection, its churn guard redirects repeats (escalate
+                    // verdict duties at 3 releases, redirect impl at 5), its
+                    // audit records everything.
+                    let release_note = format!(
                         "runner: handoff to {transition_to} rejected — {e}. Run completed (~{mins}m, exit 0); session + worktree retained.",
                     );
-                    let unblock = format!("satisfy the rejected gate, then re-claim: {}", truncate(&e, 220));
                     match mcp_call_task(
                         cfg,
                         id,
                         "transition",
-                        json!({ "id": inf.task_id, "to": "blocked", "note": block_note, "unblock_condition": unblock }),
+                        json!({ "id": inf.task_id, "to": "todo", "note": release_note }),
                         &inf.task_id,
                     ) {
                         Ok(_) => {
-                            snap_activity(snap, "info", &format!("{} blocked after handoff rejection", inf.task_id));
-                            msgs.push(format!("{} → blocked (handoff rejected: {}) — gate demand on the card", inf.task_title, truncate(&e, 100)));
+                            snap_activity(snap, "info", &format!("{} released after handoff rejection", inf.task_id));
+                            msgs.push(format!("{} → todo (handoff rejected: {}) — worker churn guard owns repeats", inf.task_title, truncate(&e, 100)));
                         }
                         Err(e2) => {
-                            msgs.push(format!("{} handoff AND block failed: {e2} — manual attention needed", inf.task_title));
+                            msgs.push(format!("{} handoff AND release failed: {e2} — manual attention needed", inf.task_title));
                         }
                     }
                     finished_no_pr.insert(inf.task_id.clone());
-                    silent_cycles.remove(&inf.task_id);
                     remove_task_state(&inf.task_id);
                 }
             }
         } else {
             // deterministic config errors (bad agent profile, bad model id,
             // auth) replay identically on every retry — retrying is pure
-            // churn. Block immediately with the agent's own error text.
+            // churn. BR#2419: release the claim (state semantics live in the
+            // worker); stop retrying ON THIS HOST only.
             if is_config_error(&outcome.stdout_tail) || is_config_error(&outcome.stderr_tail) {
-                let block_note = "runner: agent CLI config error (deterministic — not retrying)";
-                let unblock = format!(
-                    "fix the agent config named in the error, then re-claim: {}",
+                let release_note = format!(
+                    "runner: agent CLI config error (deterministic — not retrying on this host): {}",
                     truncate(&tail, 220)
                 );
                 let _ = mcp_call(
@@ -1754,18 +1785,16 @@ fn tick(
                     "transition",
                     json!({
                         "id": inf.task_id,
-                        "to": "blocked",
-                        "note": block_note,
-                        "unblock_condition": unblock,
+                        "to": "todo",
+                        "note": release_note,
                     }),
                 );
                 gave_up.insert(inf.task_id.clone());
                 attempts.remove(&inf.task_id);
                 fail_counts.remove(&inf.task_id);
-                silent_cycles.remove(&inf.task_id);
                 remove_task_state(&inf.task_id);
-                msgs.push(format!("{} blocked (agent config error — no retries): {}", inf.task_title, truncate(&tail, 120)));
-                snap_activity(snap, "error", &format!("{} blocked — deterministic agent config error", inf.task_id));
+                msgs.push(format!("{} released (agent config error — no retries on this host): {}", inf.task_title, truncate(&tail, 120)));
+                snap_activity(snap, "error", &format!("{} released — deterministic agent config error", inf.task_id));
                 if inf.worktree.is_some() {
                     cleanup_worktree(&cfg.workdir, &inf.task_id, false);
                 }
@@ -1782,9 +1811,9 @@ fn tick(
             if fails >= 3 {
                 let void_cause = void_run(&outcome.stdout_tail, &outcome.stderr_tail);
                 let note = if void_cause {
-                    "runner: dispatch VOID — provider guardrails blocked the model (0 endpoints), no work performed, 3 attempts — handed off for attention (BR#877: void runs never hand off as complete)"
+                    "runner: dispatch VOID — provider guardrails blocked the model (0 endpoints), no work performed, 3 attempts — released for attention (BR#877: void runs never hand off as complete)"
                 } else {
-                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — handed off for attention"
+                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — released for attention"
                 };
                 let _ = mcp_call(
                     cfg,
@@ -1792,17 +1821,15 @@ fn tick(
                     "transition",
                     json!({
                         "id": inf.task_id,
-                        "to": "blocked",
+                        "to": "todo",
                         "note": note,
-                        "unblock_condition": "fix the failure, then log_progress to re-claim (the runner will re-dispatch)",
                     }),
                 );
                 gave_up.insert(inf.task_id.clone());
                 attempts.remove(&inf.task_id);
                 fail_counts.remove(&inf.task_id);
-                silent_cycles.remove(&inf.task_id);
                 remove_task_state(&inf.task_id);
-                msgs.push(format!("{} failed {}x — blocked for attention (no more runner retries)", inf.task_title, fails));
+                msgs.push(format!("{} failed {}x — released for attention (no more runner retries on this host)", inf.task_title, fails));
             } else {
                 attempts.insert(inf.task_id.clone(), Instant::now());
                 msgs.push(format!("{} failed/timed out — left in_progress (backoff, attempt {}/3)", inf.task_title, fails));
@@ -1856,8 +1883,6 @@ fn tick(
             continue; // unchanged since last poll — nothing new to relay
         }
         let note = format!("runner: agent output — {live}");
-        // real agent output: the silent-dispatch churn streak is broken
-        silent_cycles.remove(&inf.task_id);
         if let Err(e) = mcp_call(
             cfg,
             id,
@@ -1950,35 +1975,6 @@ fn tick(
         {
             continue; // silent backoff: runner bookkeeping must not look like agent activity
         }
-        // silent-dispatch churn guard: this task came back around (stall →
-        // release → resume) without a single line of agent output. After
-        // SILENT_DISPATCH_LIMIT such cycles, stop feeding the loop — hand it
-        // off loudly instead of re-dispatching to the same fate.
-        let silent = {
-            let c = silent_cycles.entry(tid.to_string()).or_insert(0);
-            *c += 1;
-            *c
-        };
-        if silent >= SILENT_DISPATCH_LIMIT {
-            let note = silent_churn_escalation_note(silent);
-            let cond = silent_churn_escalation_condition();
-            if mcp_call_task(
-                cfg,
-                id,
-                "transition",
-                json!({ "id": tid, "to": "blocked", "note": note, "unblock_condition": cond }),
-                &tid,
-            )
-            .is_err()
-            {
-                let _ = mcp_call_task(cfg, id, "log_progress", json!({ "id": tid, "note": note }), &tid);
-            }
-            gave_up.insert(tid.to_string());
-            silent_cycles.remove(tid);
-            snap_activity(snap, "error", &format!("{tid} escalated — {silent} silent dispatches, auto-resume disabled"));
-            msgs.push(format!("{tid} → blocked (silent-dispatch escalation — human/fresh session required)"));
-            continue;
-        }
         let want_title = format!("bridge-{tid}");
         let sess = sessions.get(&want_title).cloned().or_else(|| {
             sessions.iter().find(|(title, _)| title.contains(&want_title)).map(|(_, id)| id.clone())
@@ -1999,12 +1995,12 @@ fn tick(
     }
 
     // 6. claim new claimable tasks until the WIP limit is reached.
-    // BLOCKED tasks with an exit condition rank first: unblocking is priority.
-    // A blocked task is resumed by transitioning back to in_progress with the
-    // resolution — then dispatched like any other work.
-    // RESUME preference: a candidate we hold an opencode session AND worktree
-    // for sorts first — resuming that session restores full context cheaply,
-    // which is how a task that yielded earlier routes back to "the same agent".
+    // BR#2419: blocked tasks are NOT candidates — resuming them is an unblock
+    // duty's verdict, never a client transition. The runner only claims todo
+    // work. RESUME preference: a candidate we hold an opencode session AND
+    // worktree for sorts first — resuming that session restores full context
+    // cheaply, which is how a task that yielded earlier routes back to "the
+    // same agent".
     let candidates = orient
         .get("unclaimed_work")
         .and_then(|v| v.as_array())
@@ -2053,121 +2049,39 @@ fn tick(
         if gave_up.contains(tid) {
             continue; // escalated or handed off — the watchdog/humans own it now
         }
-        // cross-host stop: a silent-churn escalation block is a deliberate
-        // handoff. Resuming it on sight is what turned one host's guard into
-        // every host's loop — leave it for a human or a directed session.
+        // BR#2419: blocked work is not runner work. Leaving blocked is a
+        // verdict delivered by a role:unblock duty or a human — never a client
+        // transition. The unblock CHILD (a todo task) is what the runner
+        // dispatches; it shows up here as its own candidate.
         if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
-            let unblock = task.get("unblock_condition").and_then(|u| u.as_str()).unwrap_or("");
-            if is_silent_churn_escalation(unblock) {
-                gave_up.insert(tid.to_string());
-                continue;
-            }
-        }
-        // silent-dispatch churn guard — same contract as the resume path: a
-        // candidate that keeps coming back with zero agent output is a loop,
-        // not work. Bound the cycles, then escalate off the runner.
-        let silent = {
-            let c = silent_cycles.entry(tid.to_string()).or_insert(0);
-            *c += 1;
-            *c
-        };
-        if silent >= SILENT_DISPATCH_LIMIT {
-            let note = silent_churn_escalation_note(silent);
-            let cond = silent_churn_escalation_condition();
-            if mcp_call_task(
-                cfg,
-                id,
-                "transition",
-                json!({ "id": tid, "to": "blocked", "note": note, "unblock_condition": cond }),
-                &tid,
-            )
-            .is_err()
-            {
-                let _ = mcp_call_task(cfg, id, "log_progress", json!({ "id": tid, "note": note }), &tid);
-            }
-            gave_up.insert(tid.to_string());
-            silent_cycles.remove(tid);
-            snap_activity(snap, "error", &format!("{tid} escalated — {silent} silent dispatches, auto-resume disabled"));
-            msgs.push(format!("{tid} → blocked (silent-dispatch escalation — human/fresh session required)"));
             continue;
         }
-        let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");
-        let (body_md, task_meta) = if is_blocked {
-            // resume the blocked task. Preferred context: the unblock condition
-            // (the exit condition on record). No exit condition? The blocked
-            // REASON is still actionable context — an agent reading the card can
-            // decide: clear it, re-scope the task, or escalate to a human. A
-            // blocked task is never skipped for missing metadata.
-            let unblock = task.get("unblock_condition").and_then(|u| u.as_str()).unwrap_or("");
-            let reason = task.get("blocked_reason").and_then(|u| u.as_str()).unwrap_or("");
-            let context = if !unblock.is_empty() {
-                format!("exit condition: {unblock}")
-            } else if !reason.is_empty() {
-                format!("blocked with no recorded exit condition — reason: {reason}. Read the card and history, then: clear the block, re-scope the task, or file an ask to escalate")
-            } else {
-                "blocked with no reason recorded — read the card and history, then: unblock, re-scope, or escalate".to_string()
-            };
-            if let Err(e) = mcp_call_task(
-                cfg,
-                id,
-                "transition",
-                json!({ "id": tid, "to": "in_progress", "note": format!("runner resume — {context}"), "session": format!("dispatch-{}", slugify(tid)) }),
-                &tid,
-            ) {
-                attempts.insert(tid.to_string(), Instant::now());
-                snap_activity(snap, "error", &format!("unblock {tid} failed: {e}"));
-                continue;
-            }
-            let msg = format!("unblocked {tid} — {context}");
-            snap_activity(snap, "dispatch", &msg);
-            msgs.push(msg);
-            let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-            let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-            let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-            (body_md, task_meta)
-        } else {
-            // repo contract: the task must reference a git repository BEFORE we
-            // claim it. Repo-less tasks are blocked deterministically — claiming
-            // first would park them in_progress with nothing to work in.
-            // Verdict roles (unblock/review) are exempt: their work is
-            // board-side judgment, and deterministically blocking a done-only
-            // task type is how the unblock-spawn loop was fed.
-            let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-            let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-            let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-            if source_repo(&body_md, &task_meta).is_none() && !tags_exempt_from_repo_gate(&json_tags(&art)) {
-                let _ = mcp_call_task(
-                    cfg,
-                    id,
-                    "transition",
-                    json!({
-                        "id": tid,
-                        "to": "blocked",
-                        "note": "runner: task references no git repository — add meta.repo or a repo URL to the body, then re-claim",
-                        "unblock_condition": "add the git repository reference (meta.repo or a repo URL in the body), then re-claim",
-                    }),
-                    &tid,
-                );
-                attempts.insert(tid.to_string(), Instant::now());
-                snap_activity(snap, "error", &format!("{tid} blocked — references no git repository"));
-                msgs.push(format!("{tid} blocked — no repo reference (add meta.repo or a repo URL)"));
-                continue;
-            }
-            if let Err(e) = mcp_call_task(
-                cfg,
-                id,
-                "transition",
-                json!({ "id": tid, "to": "in_progress" }),
-                &tid,
-            ) {
-                // claim raced or failed — don't kill the tick or the whole claim loop
-                attempts.insert(tid.to_string(), Instant::now());
-                snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
-                continue;
-            }
-            (body_md, task_meta)
-        };
-        let (body_md, task_meta) = (body_md, task_meta);
+        // repo policy (host-side, not law): without a git repository reference
+        // there is nothing to clone, so decline the candidate. Verdict roles
+        // (unblock/review) are board-side judgment work — no checkout needed.
+        // A missing repo ref is the author's metadata gap; the runner never
+        // moves the card (the worker machine owns state), it just declines.
+        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+        let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
+        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        if source_repo(&body_md, &task_meta).is_none() && !tags_exempt_from_repo_gate(&json_tags(&art)) {
+            attempts.insert(tid.to_string(), Instant::now());
+            snap_activity(snap, "info", &format!("{tid} skipped — no repo reference (host policy)"));
+            msgs.push(format!("{tid} skipped — no repo reference (add meta.repo or a repo URL; runner declines, card untouched)"));
+            continue;
+        }
+        if let Err(e) = mcp_call_task(
+            cfg,
+            id,
+            "transition",
+            json!({ "id": tid, "to": "in_progress" }),
+            &tid,
+        ) {
+            // claim raced or failed — don't kill the tick or the whole claim loop
+            attempts.insert(tid.to_string(), Instant::now());
+            snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
+            continue;
+        }
         let _ = mcp_call_task(
             cfg,
             id,
@@ -2225,7 +2139,6 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
-    let mut silent_cycles: HashMap<String, u32> = HashMap::new();
     let mut finished_no_pr: HashSet<String> = HashSet::new();
     let mut gave_up: HashSet<String> = HashSet::new();
     let mut avail: Vec<opencode::Backend> = Vec::new();
@@ -2254,7 +2167,6 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut in_flight,
             &mut attempts,
             &mut fail_counts,
-            &mut silent_cycles,
             &mut finished_no_pr,
             &mut gave_up,
             &snap,
@@ -2337,28 +2249,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn silent_churn_signature_is_matched_exact() {
-        assert!(is_silent_churn_escalation(silent_churn_escalation_condition()));
-        // other unblock conditions must never read as escalations — that would
-        // make the runner refuse to resume legitimate blocked work
-        assert!(!is_silent_churn_escalation(
-            "add the git repository reference (meta.repo or a repo URL in the body), then re-claim"
-        ));
-        assert!(!is_silent_churn_escalation(
-            "satisfy the rejected gate, then re-claim: ERROR: moving to in_review requires the PR link"
-        ));
-        assert!(!is_silent_churn_escalation(""));
-        // prefix-spoof resistance: the signature must match from the start
-        assert!(!is_silent_churn_escalation(
-            "see: runner-escalated (silent-dispatch churn)"
-        ));
-    }
-
-    #[test]
-    fn escalation_note_carries_the_count() {
-        let note = silent_churn_escalation_note(3);
-        assert!(note.contains("3"), "note must name the cycle count: {note}");
-        assert!(note.contains("silent dispatches"));
+    fn runner_never_moves_cards_to_blocked_and_never_resumes_blocked_work() {
+        // BR#2419: state legality lives in the worker's machine. The runner is
+        // hands, not judgment: it may claim todo work and release its own
+        // claims — nothing else. This alarm fires if either client-side state
+        // decision ever reappears.
+        let src = include_str!("dispatch.rs");
+        // needles assembled from parts so this alarm cannot match itself
+        let blocked_edge = format!(r#""to": "{}""#, "blo".to_string() + "cked");
+        let resume_marker = format!("runner {}", "resume");
+        assert!(
+            !src.contains(&blocked_edge),
+            "runner must never transition a task to blocked — release claims instead; the worker machine owns blocked"
+        );
+        assert!(
+            !src.contains(&resume_marker),
+            "runner must never resume blocked tasks — that verdict belongs to a role:unblock duty or a human"
+        );
     }
 
     #[test]
