@@ -18,3 +18,4 @@ packages/desktop/src-tauri/gen/
 .DS_Store
 packages/cli/target/
 packages/mobile/ui/node_modules/
+repos/
