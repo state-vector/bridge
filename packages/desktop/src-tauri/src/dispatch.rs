@@ -61,9 +61,15 @@ fn default_isolate() -> bool {
 }
 
 fn default_workdir() -> String {
-    std::env::current_dir()
-        .map(|d| d.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    // scratch space for cloned task repos + worktrees — NOT a repo itself.
+    // Tasks reference their git repository; the runner clones on demand.
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    PathBuf::from(home).join("bridge-work").to_string_lossy().into_owned()
 }
 fn default_poll_secs() -> u64 {
     60
@@ -731,9 +737,82 @@ fn slugify(s: &str) -> String {
         .collect()
 }
 
+/// Extract the git repository a task references: meta.repo wins (bare
+/// `owner/repo` becomes a github URL), then the first github/https-git URL in
+/// the body. None = the task cannot be dispatched (nothing to clone).
+fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
+    if let Some(r) = meta.get("repo").and_then(|v| v.as_str()) {
+        let r = r.trim();
+        if !r.is_empty() {
+            return Some(if r.starts_with("http") || r.starts_with("git@") {
+                r.trim_end_matches('/').trim_end_matches(".git").to_string()
+            } else {
+                format!("https://github.com/{}", r.trim_end_matches(".git"))
+            });
+        }
+    }
+    let mut rest = body_md;
+    while let Some(i) = rest.find("https://") {
+        rest = &rest[i..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>')
+            .unwrap_or(rest.len());
+        let url = &rest[..end];
+        let base = url
+            .trim_end_matches('/')
+            .trim_end_matches('.')
+            .trim_end_matches(".git");
+        if base.contains("github.com/") || base.contains(".git") {
+            return Some(base.trim_end_matches(".git").to_string());
+        }
+        rest = &rest[end..];
+    }
+    None
+}
+
+/// Clone-on-demand cache: one bare-enough working clone per task repo under
+/// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
+fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
+    let tail: String = repo_url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit('/')
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = slugify(&tail);
+    let repos_dir = PathBuf::from(workdir).join("repos");
+    std::fs::create_dir_all(&repos_dir).ok()?;
+    let path = repos_dir.join(&slug);
+    if path.join(".git").exists() {
+        let ok = Command::new("git")
+            .current_dir(&path)
+            .args(["fetch", "--all", "--prune"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        return if ok { Some(path) } else { None };
+    }
+    let ok = Command::new("git")
+        .args(["clone", repo_url])
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok { Some(path) } else { None }
+}
+
 /// Provision (or reuse) an isolated worktree for a task: ~/.bridge/worktrees/<slug>
-/// on branch bridge/<slug>. On resume the branch already exists — attach to it.
-fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf> {
+/// on branch bridge/<slug>, branched from the task repo's default branch.
+/// On resume the branch already exists — attach to it.
+fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<PathBuf> {
     let slug = slugify(task_id);
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug);
@@ -742,23 +821,20 @@ fn ensure_worktree(workdir: &str, task_id: &str, resume: bool) -> Option<PathBuf
     }
     std::fs::create_dir_all(path.parent()?).ok()?;
         let branch = format!("bridge/{slug}");
-        // A fresh (non-resume) dispatch can still hit an existing branch: the
-        // worktree is cleaned up after every finalize, but `bridge/<slug>` stays
-        // behind. `worktree add -b` then fails and we'd silently fall back to
-        // running in the main workdir. Try creating; if the branch exists, attach.
+        // Base = the clone's default branch. `origin/HEAD` is set by clone.
         let mut cmd = Command::new("git");
-        cmd.current_dir(workdir);
+        cmd.current_dir(repo_path);
         if resume {
             cmd.args(["worktree", "add"]).arg(&path).arg(&branch);
         } else {
-            cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(&path);
+            cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(&path).arg("origin/HEAD");
         }
         let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
         if ok {
             return Some(path);
         }
         let mut cmd = Command::new("git");
-        cmd.current_dir(workdir)
+        cmd.current_dir(repo_path)
             .args(["worktree", "add"])
             .arg(&path)
             .arg(&branch);
@@ -938,6 +1014,7 @@ fn spawn_opencode(
     tid: &str,
     title: &str,
     body_md: &str,
+    task_meta: &serde_json::Value,
     policy: &str,
     resume_session: Option<String>,
     role_work: bool,
@@ -945,6 +1022,21 @@ fn spawn_opencode(
     in_flight: &mut Vec<InFlight>,
 ) {
     let backend = pick_backend(avail);
+
+    // the task names its git repository; the runner clones it on demand.
+    // No reference -> deterministic refusal (nothing to clone = nothing to do).
+    let Some(repo_url) = source_repo(body_md, task_meta) else {
+        // backstop: the caller (tick) blocks repo-less tasks BEFORE claiming;
+        // reaching here means the reference appeared without a URL.
+        eprintln!("[dispatch] {tid} has no repo reference — skipping spawn");
+        snap_activity(snap, "error", &format!("{tid} has no repo reference — not dispatched"));
+        return;
+    };
+    let Some(repo_path) = ensure_repo_clone(&cfg.workdir, &repo_url) else {
+        eprintln!("[dispatch] {tid}: clone failed for {repo_url} — skipping spawn");
+        snap_activity(snap, "error", &format!("{tid}: clone failed ({repo_url})"));
+        return;
+    };
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
@@ -982,7 +1074,7 @@ fn spawn_opencode(
     };
     let resume = resume_session.is_some();
     let worktree = if cfg.isolate {
-        ensure_worktree(&cfg.workdir, tid, resume)
+        ensure_worktree(&repo_path, tid, resume)
     } else {
         None
     };
@@ -1017,8 +1109,8 @@ fn spawn_opencode(
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- When finished, output a concise summary including the PR URL.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
     };
     let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
-        policy, tid, title, body_md, resume_note, run_dir, branch, heartbeat_line, delivery_line
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n# Delivery contract\n\n- You are working in {} on branch `{}` (an isolated git worktree of {}).\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+        policy, tid, title, body_md, resume_note, run_dir, branch, repo_url, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -1561,7 +1653,11 @@ fn tick(
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
         };
         let role_work = t.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, title, "", &policy, sess, role_work, avail, in_flight);
+        // re-dispatch after cleanup needs the task body + repo reference again
+        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+        let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
+        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -1620,7 +1716,7 @@ fn tick(
             continue;
         }
         let is_blocked = task.get("status").and_then(|s| s.as_str()) == Some("blocked");
-        if is_blocked {
+        let (body_md, task_meta) = if is_blocked {
             // resume the blocked task. Preferred context: the unblock condition
             // (the exit condition on record). No exit condition? The blocked
             // REASON is still actionable context — an agent reading the card can
@@ -1649,23 +1745,50 @@ fn tick(
             let msg = format!("unblocked {tid} — {context}");
             snap_activity(snap, "dispatch", &msg);
             msgs.push(msg);
-        } else if let Err(e) = mcp_call_task(
-            cfg,
-            id,
-            "transition",
-            json!({ "id": tid, "to": "in_progress" }),
-            &tid,
-        ) {
-            // claim raced or failed — don't kill the tick or the whole claim loop
-            attempts.insert(tid.to_string(), Instant::now());
-            snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
-            continue;
-        }
-        // fetch the body so the policy pre-prompt carries the actual task
-        let body_md = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))
-            .ok()
-            .and_then(|v| v.get("body_md").and_then(|b| b.as_str()).map(String::from))
-            .unwrap_or_default();
+            let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+            let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
+            let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+            (body_md, task_meta)
+        } else {
+            // repo contract: the task must reference a git repository BEFORE we
+            // claim it. Repo-less tasks are blocked deterministically — claiming
+            // first would park them in_progress with nothing to work in.
+            let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+            let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
+            let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+            if source_repo(&body_md, &task_meta).is_none() {
+                let _ = mcp_call_task(
+                    cfg,
+                    id,
+                    "transition",
+                    json!({
+                        "id": tid,
+                        "to": "blocked",
+                        "note": "runner: task references no git repository — add meta.repo or a repo URL to the body, then re-claim",
+                        "unblock_condition": "add the git repository reference (meta.repo or a repo URL in the body), then re-claim",
+                    }),
+                    &tid,
+                );
+                attempts.insert(tid.to_string(), Instant::now());
+                snap_activity(snap, "error", &format!("{tid} blocked — references no git repository"));
+                msgs.push(format!("{tid} blocked — no repo reference (add meta.repo or a repo URL)"));
+                continue;
+            }
+            if let Err(e) = mcp_call_task(
+                cfg,
+                id,
+                "transition",
+                json!({ "id": tid, "to": "in_progress" }),
+                &tid,
+            ) {
+                // claim raced or failed — don't kill the tick or the whole claim loop
+                attempts.insert(tid.to_string(), Instant::now());
+                snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
+                continue;
+            }
+            (body_md, task_meta)
+        };
+        let (body_md, task_meta) = (body_md, task_meta);
         let _ = mcp_call_task(
             cfg,
             id,
@@ -1678,7 +1801,7 @@ fn tick(
             None => format!("claimed {tid} — dispatched to opencode"),
         };
         let role_work = task.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &policy, resume_sess, role_work, avail, in_flight);
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);

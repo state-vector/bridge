@@ -2271,6 +2271,28 @@ export class KnowledgeHub {
       const tags: string[] = parseTags(t.tags);
       if (!tags.includes("attempted")) tags.push("attempted");
       const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
+      // REWORK-LOOP ESCALATION: past 5 attempts this is not bad luck — it's a
+      // loop (claim → stall → watchdog-bounce → blocked → release → claim…).
+      // Re-releasing just runs the same cycle again. Park it blocked-for-human:
+      // only a human (web/human actor) may release it from here on.
+      if (attempts >= 5) {
+        meta.blocked = {
+          reason: `rework loop detected — ${attempts} dispatch attempts without completion (last release reason: ${reason.slice(0, 160)}). Re-running again would repeat the cycle; escalated to a human.`,
+          unblock_condition: "human: review the attempt history (get_history) — either fix what keeps failing, re-scope the task, or transition it todo yourself to deliberately continue",
+          ts: now,
+        };
+        meta.attempt = { by: ownerLabel, at: now, attempts, last_reason: reason.slice(0, 200) };
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
+        );
+        this.audit("system:reaper", "loop_escalated", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
+        this.version(t.id, "system:reaper", "transition", `rework loop escalated to human — ${attempts} attempts without completion`, { prev_owner: ownerLabel });
+        out.push(
+          `${t.id} "${t.title}" REWORK LOOP (${attempts} attempts) — escalated to a human instead of re-releasing. Blocked-for-human until reviewed.`,
+        );
+        continue;
+      }
       meta.attempt = { by: ownerLabel, at: now, attempts };
       delete meta.blocked;
       this.state.storage.sql.exec(

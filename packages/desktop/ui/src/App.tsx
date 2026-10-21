@@ -270,7 +270,7 @@ function Chat() {
 }
 
 export function App() {
-  const [page, setPage] = useState<"forme" | "chat" | "main" | "log" | "settings">("forme");
+  const [page, setPage] = useState<"forme" | "chat" | "log" | "settings">("forme");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -401,7 +401,6 @@ export function App() {
         <nav className="gw-nav">
           <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
           <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
-          <button className={page === "main" ? "active" : ""} onClick={() => setPage("main")}>Main</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
         </nav>
@@ -412,9 +411,27 @@ export function App() {
 
       {page === "chat" && <Chat />}
 
-      {page === "main" && (
+      {page === "log" && (
         <main className="gw-main">
           <div className="gw-card">
+            <h2>Dispatch log</h2>
+            <div className="gw-log gw-log-tall" ref={logRef}>
+              {activity.length === 0 && <span className="gw-log-empty">no activity yet — start the runner</span>}
+              {activity.map((a, i) => (
+                <div key={`${a.ts}-${i}`} className="gw-line">
+                  <span className="gw-ts">{ts(a.ts)}</span>
+                  <span className={KIND_CLASS[a.kind] ?? "gw-kind-info"}>{a.msg}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </main>
+      )}
+
+      {page === "settings" && (
+        <main className="gw-main">
+          <div className="gw-card">
+            <h2>Runner</h2>
             <div className="gw-row">
               <span className={`gw-conn ${snap?.running ? "gw-conn-open" : "gw-conn-closed"}`}>
                 ● {snap?.running ? `running${snap.workspace ? ` · ${snap.workspace}` : ""}` : "stopped"}
@@ -430,11 +447,7 @@ export function App() {
                 open full board ↗
               </a>
             </div>
-          </div>
-
-          <div className="gw-card">
-            <h2>Local work</h2>
-            <div className="gw-inflight">
+            <div className="gw-inflight" style={{ marginTop: 8 }}>
               {inFlight.map((f) => (
                 <div key={f.task_id} className="gw-agent">
                   <span className={`conn conn-open`} title="in flight">●</span>
@@ -458,28 +471,7 @@ export function App() {
               </div>
             )}
           </div>
-        </main>
-      )}
 
-      {page === "log" && (
-        <main className="gw-main">
-          <div className="gw-card">
-            <h2>Dispatch log</h2>
-            <div className="gw-log gw-log-tall" ref={logRef}>
-              {activity.length === 0 && <span className="gw-log-empty">no activity yet — start the runner</span>}
-              {activity.map((a, i) => (
-                <div key={`${a.ts}-${i}`} className="gw-line">
-                  <span className="gw-ts">{ts(a.ts)}</span>
-                  <span className={KIND_CLASS[a.kind] ?? "gw-kind-info"}>{a.msg}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </main>
-      )}
-
-      {page === "settings" && (
-        <main className="gw-main">
           <div className="gw-card">
             <h2>Concurrency</h2>
             <div className="gw-row">
