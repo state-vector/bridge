@@ -49,7 +49,6 @@ pub struct RunRequest<'a> {
 /// The abstraction Ray asked for: backends hide their protocol specifics
 /// (stdio flags, ACP JSON-RPC, kiro stream-json) behind `dispatch`.
 pub trait AgentTransport: Send + Sync {
-    fn name(&self) -> &'static str;
     fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome;
 }
 
@@ -114,11 +113,7 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> (Option<std::process::E
 pub struct OpencodeRun;
 
 impl AgentTransport for OpencodeRun {
-    fn name(&self) -> &'static str {
-        "opencode-stdio"
-    }
-
-    fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+    fn dispatch(&self, req: &RunRequest, timeout: Duration, _live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
         cmd.arg("run")
             .current_dir(req.workdir)
@@ -231,11 +226,7 @@ pub struct OpencodeAcp;
 const ACP_UNAVAILABLE: &str = "ACP_UNAVAILABLE:";
 
 impl AgentTransport for OpencodeAcp {
-    fn name(&self) -> &'static str {
-        "opencode-acp"
-    }
-
-    fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+    fn dispatch(&self, req: &RunRequest, timeout: Duration, _live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
         cmd.arg("acp")
             .current_dir(req.workdir)
@@ -284,10 +275,10 @@ impl AgentTransport for OpencodeAcp {
         let mut next_id: i64 = 1;
         let deadline = Instant::now() + timeout;
 
-        /// Send a request, then read lines until its response arrives.
-        /// Non-matching lines (session/update notifications) go to `on_line`.
-        /// Returns Err on timeout/dead child.
-        let mut call = |stdin: &mut BufWriter<std::process::ChildStdin>,
+        // Send a request, then read lines until its response arrives.
+        // Non-matching lines (session/update notifications) go to `on_line`.
+        // Returns Err on timeout/dead child.
+        let call = |stdin: &mut BufWriter<std::process::ChildStdin>,
                         id: i64,
                         method: &str,
                         params: serde_json::Value,
@@ -323,7 +314,7 @@ impl AgentTransport for OpencodeAcp {
         };
 
         // 1. initialize
-        let mut session_line = String::new();
+        let session_line = String::new();
         let mut on_update = |line: &str| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
@@ -492,11 +483,7 @@ fn extract_update_text(v: &serde_json::Value) -> Option<String> {
 pub struct KiroChat;
 
 impl AgentTransport for KiroChat {
-    fn name(&self) -> &'static str {
-        "kiro-chat"
-    }
-
-    fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+    fn dispatch(&self, req: &RunRequest, timeout: Duration, _live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
         cmd.arg("chat")
             .arg("--no-interactive")

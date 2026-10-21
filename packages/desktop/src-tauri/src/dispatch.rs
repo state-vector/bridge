@@ -1287,29 +1287,6 @@ fn is_config_error(text: &str) -> bool {
     MARKERS.iter().any(|m| text.contains(m))
 }
 
-/// Silent-dispatch churn bound: candidate ticks with zero agent output
-/// (spawn refused, CLI missing, model error) before the task escalates off
-/// the loop. Same contract as the 3-strike failure cap — the loop may not
-/// churn indefinitely on a setup problem.
-const SILENT_DISPATCH_LIMIT: u32 = 3;
-
-fn silent_churn_escalation_note(silent: u32) -> String {
-    format!(
-        "runner: silent-dispatch escalation — {silent} dispatch cycles produced no agent output (CLI missing, model unconfigured, or spawn refused). Auto-resume disabled."
-    )
-}
-
-fn silent_churn_escalation_condition() -> String {
-    "fix the local agent setup (`bridge doctor` names it), then re-claim or re-issue the task — it will not auto-dispatch until then".to_string()
-}
-
-/// A blocked task whose unblock condition is a silent-churn escalation block
-/// must never be auto-resumed on sight: resuming is what turned one host's
-/// guard into every host's loop.
-fn is_silent_churn_escalation(unblock: &str) -> bool {
-    unblock.contains("silent-dispatch escalation") || unblock.contains("will not auto-dispatch until then")
-}
-
 fn extract_pr(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
         // URLs are often wrapped in markdown ("[View PR](https://…/pull/1)")
