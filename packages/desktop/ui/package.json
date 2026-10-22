@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "bridge desktop gateway UI — auth, dispatch log stream, agent config, open-in-web",
+  "description": "bridge desktop gateway UI \u2014 auth, dispatch log stream, agent config, open-in-web",
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
     "build": "tsc && vite build",
@@ -12,7 +12,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.12.2",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "@bridge/ui-kit": "*"
   },
   "devDependencies": {
     "@types/react": "^19.1.0",

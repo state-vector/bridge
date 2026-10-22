@@ -4,12 +4,13 @@
   "type": "module",
   "description": "bridge: work orchestration for agents + humans \u2014 web app first",
   "workspaces": [
-    "packages/specs",
-    "packages/worker",
-    "packages/webapp",
     "packages/desktop",
     "packages/desktop/ui",
-    "packages/mobile/ui"
+    "packages/mobile/ui",
+    "packages/specs",
+    "packages/ui-kit",
+    "packages/webapp",
+    "packages/worker"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",

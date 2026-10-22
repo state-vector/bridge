@@ -4,6 +4,7 @@ mod mac_notify;
 mod menubar;
 mod opencode;
 mod transport;
+mod ws_bridge;
 mod scm;
 
 use serde::Deserialize;
@@ -263,6 +264,15 @@ pub fn run() {
                 // watch the inbox for new proposed decisions — OS notification
                 // per arrival, independent of whether the dispatch loop runs
                 console::start_decision_watch(handle.clone());
+            }
+
+            // WS bridge: the desktop owns one bearer-authed socket to the hub's
+            // KB event stream — the webview subscribes via Tauri events.
+            let bridge_cfg = dispatch::DispatchConfig::resolve();
+            if let Some(c) = bridge_cfg {
+                if !c.url.is_empty() && !c.token.is_empty() {
+                    ws_bridge::start(handle.clone(), c.url.clone(), c.token.clone());
+                }
             }
 
             // auto-start dispatch: headless pairs (device flow) if unconfigured;

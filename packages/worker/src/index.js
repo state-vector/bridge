@@ -123,7 +123,23 @@ export default {
     // Knowledge realtime (human plane, cookie): KB event fanout.
     if (url.pathname === "/kb-ws") {
       const auth = await checkAuth(request, env);
-      if (auth instanceof Response) return auth;
+      if (auth instanceof Response) {
+        // cookie auth failed — accept a machine bearer (gateway-class token)
+        // so desktops get the KB event stream with header auth (webviews
+        // cannot set WS headers; the Rust bridge and JS clients pass the
+        // token via the bridge.<token> subprotocol).
+        const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+        const proto = (request.headers.get("Sec-WebSocket-Protocol") || "").split(/,\s*/);
+        const tokenFromProto = proto[1] && proto[0].toLowerCase() === "bridge" ? proto[1] : "";
+        const candidate = bearer || tokenFromProto;
+        if (!candidate) return auth;
+        const { resolveTokenWs } = await import("./mcp.ts");
+        let ws;
+        try { ws = await resolveTokenWs(env, candidate); } catch { return auth; }
+        const h = new Headers(request.headers);
+        h.delete("Sec-WebSocket-Protocol");
+        return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/ws", { headers: h });
+      }
       return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
 

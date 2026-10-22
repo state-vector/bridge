@@ -36,6 +36,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSe
 objc2-user-notifications = { version = "0.3.2", features = ["block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationCategory", "UNNotificationAction", "UNNotificationResponse", "UNNotificationSound"] }
 # Apple's on-device LLM (FoundationModels, macOS 26+) — the console summariser
 foundation-models = { version = "0.12", features = ["macos_26_0"] }
+tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
 
 # Binary named "Bridge": macOS derives the menu-bar app name from the process
 # name — "bridge-desktop" showed a blank menu bar title in dev.

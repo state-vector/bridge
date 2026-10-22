@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { TopList, BacklogList, ForYouList } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
 
@@ -317,52 +318,7 @@ function Top() {
     <main className="gw-main">
       <div className="gw-card"><h2>Top</h2><span className="gw-note">{rows?.length ?? 0} in flight — live</span>{err && <span className="gw-err">{err}</span>}</div>
       <div className="gw-card">
-        <div className="bt-head">
-          <span>task</span><span>state</span><span>gauge</span><span>last signal</span>
-        </div>
-        {(rows ?? []).map((t) => {
-          const kind = kindOf(t);
-          const p = t.meta?.last_progress;
-          const sig = signal(t);
-          const st = t.status;
-          const blocked = st === "blocked";
-          const exit = t.meta?.blocked?.unblock_condition ?? t.meta?.awaiting_ask?.ask_id;
-          const sentiment = p?.sentiment;
-          return (
-            <div key={t.id} className={`bt-row ${blocked ? "bt-blocked" : ""}`}>
-              <span className={`conn conn-${staleness(sig) === "dead" ? "closed" : "open"}`}>●</span>
-              <span className="gw-mono bt-id">{t.id}</span>
-              <div className="bt-main">
-                <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
-                <span className="bt-title" title={t.title}>{t.title}</span>
-                {p?.will && <span className="bt-will" title={p.will}>▸ {String(p.will).slice(0, 70)}</span>}
-                {blocked && exit && (
-                  <span className="bt-exit"><span className="chip chip-urgent">exit</span> {String(exit).slice(0, 90)}</span>
-                )}
-                {p?.note && !blocked && <span className="bt-note">{String(p.note).slice(0, 110)}</span>}
-              </div>
-              <div className="bt-state">
-                <span className={`st-chip ${st === "in_progress" ? "st-live" : blocked ? "st-err" : "st-amber"}`}>{st.replace("_", " ")}</span>
-                {sentiment && <span className="bt-sent">{String(sentiment).replace("_", " ")}</span>}
-              </div>
-              <span className="bt-gauge">
-                {p?.confidence_pct != null && <span className="bt-num">conf {p.confidence_pct}%</span>}
-                {p?.risk_pct != null && <span className="bt-num">risk {p.risk_pct}%</span>}
-                {!p && <span className="bt-num">—</span>}
-              </span>
-              <span className="bt-bar">
-                {blocked && exit ? null : (
-                  <>
-                    <span className="bt-barfill"><span className="bt-barin" style={{ width: `${Math.max(0, Math.min(100, p?.completion_pct ?? 0))}%` }} /></span>
-                    <span className="bt-num">{p?.completion_pct != null ? `${p.completion_pct}%` : "—"}</span>
-                  </>
-                )}
-              </span>
-              <span className="bt-age top-num" title={`last signal ${ageOf(sig, now)} ago`}>{ageOf(sig, now)}</span>
-            </div>
-          );
-        })}
-        {(rows ?? []).length === 0 && <span className="gw-log-empty">nothing in flight</span>}
+        <TopList tasks={rows ?? []} now={Date.now()} />
       </div>
     </main>
   );
@@ -397,43 +353,9 @@ function Backlog() {
 
   return (
     <main className="gw-main">
-      <div className="gw-card"><h2>Backlog</h2><span className="gw-note">{queue.length} queued · {data?.done?.length ?? 0} done</span>{err && <span className="gw-err">{err}</span>}</div>
+      <div className="gw-card"><h2>Backlog</h2><span className="gw-note">{data?.backlog?.length ?? 0} queued · {data?.done?.length ?? 0} done</span>{err && <span className="gw-err">{err}</span>}</div>
       <div className="gw-card">
-        <h2>Queue</h2>
-        {queue.map((t) => {
-          const kind = kindOf(t);
-          const att = t.meta?.attempt?.attempts ?? 0;
-          const boosted = !!t.meta?.boosted;
-          const exit = t.meta?.blocked?.unblock_condition ?? t.meta?.awaiting_ask?.ask_id;
-          return (
-            <div key={t.id} className={`bl-row ${boosted ? "bl-boosted" : ""}`}>
-              {boosted && <span className="bl-rank bl-rank-boost">▲</span>}
-              <span className="gw-mono bl-id">{t.id}</span>
-              <div className="bl-main">
-                <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
-                <span className="bl-title" title={t.title}>{t.title}</span>
-                {exit && <span className="bl-exit"><span className="chip chip-urgent">exit</span> {String(exit).slice(0, 90)}</span>}
-              </div>
-              <span className="bl-meta">
-                {att > 0 && <span className="chip chip-urgent" title={`attempted ${att}x`}>×{att}</span>}
-                <span className="gw-fmeta">{ageOf(t.updated_ts, now)}</span>
-              </span>
-            </div>
-          );
-        })}
-        {queue.length === 0 && <span className="gw-log-empty">queue empty</span>}
-      </div>
-      <div className="gw-card">
-        <h2>Done</h2>
-        {(data?.done ?? []).slice(0, 30).map((t) => (
-          <div key={t.id} className="bl-row bl-done">
-            <span className="gw-mono bl-id">{t.id}</span>
-            <div className="bl-main"><span className="bl-title">{t.title}</span></div>
-            <span className="gw-fmeta">{t.owner || t.meta?.session || "—"}</span>
-            <span className="gw-fmeta" style={{ marginLeft: "auto" }}>{ageOf(t.status_ts ?? t.updated_ts, now)} ago</span>
-          </div>
-        ))}
-        {(data?.done ?? []).length === 0 && <span className="gw-log-empty">nothing done yet</span>}
+        <BacklogList queue={data?.backlog ?? []} done={data?.done ?? []} now={Date.now()} />
       </div>
     </main>
   );
