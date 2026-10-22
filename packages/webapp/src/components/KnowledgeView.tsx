@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { kbApi } from "../lib/kb";
 import type { KbArtefact, KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
+import { Btn, Chip, FormRow, Select, TextArea, TextInput } from "@bridge/ui-kit";
 import { TaskStateCard } from "./TaskDetail";
 
 const GROUPS = ["steering", "goal", "decision", "task", "progress", "agent"];
@@ -10,15 +11,14 @@ const GROUP_LABEL: Record<string, string> = {
   task: "Tasks", progress: "Progress", agent: "Agents",
 };
 
-const STATUS_TONE: Record<string, string> = {
+const STATUS_TONE: Record<string, "ok" | "warn" | "err" | "muted"> = {
   active: "ok", accepted: "ok", done: "ok", implemented: "ok", published: "ok", achieved: "ok",
-  draft: "muted", proposed: "amber", open: "amber", todo: "muted", in_progress: "amber", logged: "muted",
+  draft: "muted", proposed: "warn", open: "warn", todo: "muted", in_progress: "warn", logged: "muted",
   blocked: "err", rejected: "err", dropped: "err", superseded: "err", concluded: "muted",
 };
 
 function StatusChip({ status }: { status: string }) {
-  const tone = STATUS_TONE[status] ?? "muted";
-  return <span className={`st-chip st-${tone}`}>{status.replace(/_/g, " ")}</span>;
+  return <Chip pill tone={STATUS_TONE[status] ?? "muted"}>{status.replace(/_/g, " ")}</Chip>;
 }
 
 export function KnowledgeView() {
@@ -70,8 +70,8 @@ export function KnowledgeView() {
           <aside className="detail-panel">
             <header className="detail-head">
               <div className="ask-chips">
-                <span className="chip chip-scope">{selected.type}</span>
-                <span className="chip">{selected.status}</span>
+                <Chip tone="scope">{selected.type}</Chip>
+                <Chip>{selected.status}</Chip>
               </div>
               <button className="icon-btn" onClick={() => { setSelected(null); setVersions([]); }}>✕</button>
             </header>
@@ -79,14 +79,14 @@ export function KnowledgeView() {
             <TaskStateCard task={selected as any} />
             <pre className="know-body">{selected.body_md || "—"}</pre>
             {(selected.tags ?? []).length > 0 && (
-              <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+              <div className="task-tags">{(selected.tags ?? []).map((t: string) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
             )}
             {related.length > 0 && (
               <div className="detail-block">
                 <label>Related</label>
                 {related.map((r) => (
                   <div key={r.id} className="progress-line">
-                    <span className="chip chip-scope">{r.type}</span> {r.title}
+                    <Chip tone="scope">{r.type}</Chip> {r.title}
                   </div>
                 ))}
               </div>
@@ -97,7 +97,7 @@ export function KnowledgeView() {
                 {versions.length === 0 && <span className="muted-note">no versions yet</span>}
                 {versions.map((v) => (
                   <div key={v.seq} className="progress-line">
-                    <span className={`chip chip-kind ${v.action === "create" ? "kind-agent" : "kind-system"}`}>{v.action}</span>
+                    <Chip tone={v.action === "create" ? "scope" : "muted"}>{v.action}</Chip>
                     <span className="progress-note">{v.summary}</span>
                     <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
                   </div>
@@ -113,8 +113,8 @@ export function KnowledgeView() {
       </div>
 
       <div className="know-search">
-        <input value={q} placeholder="Search — plain words work" onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void doSearch()} />
-        <button className="opt-btn" onClick={() => void doSearch()}>{searching ? "✕ clear" : "Search"}</button>
+        <TextInput value={q} placeholder="Search — plain words work" onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void doSearch()} />
+        <Btn onClick={() => void doSearch()}>{searching ? "✕ clear" : "Search"}</Btn>
       </div>
 
       {rows.length > 0 && (
@@ -143,7 +143,7 @@ export function KnowledgeView() {
         <div className="know-detail-card">
           <div className="detail-head">
             <div className="ask-chips">
-              <span className="chip chip-scope">{selected.type}</span>
+              <Chip tone="scope">{selected.type}</Chip>
               <StatusChip status={selected.status} />
               <span className="why-line">{selected.id} · updated {rel(selected.updated_ts)}</span>
             </div>
@@ -153,14 +153,14 @@ export function KnowledgeView() {
           <TaskStateCard task={selected as any} />
           <pre className="know-body">{selected.body_md || "—"}</pre>
           {(selected.tags ?? []).length > 0 && (
-            <div className="task-tags">{(selected.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+            <div className="task-tags">{(selected.tags ?? []).map((t: string) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
           )}
           {related.length > 0 && (
             <div className="know-related">
               <label>Related</label>
               {related.map((r: any) => (
                 <button key={r.id} className="know-row know-rel-row" onClick={() => void open(r.id)}>
-                  <span className="chip chip-scope">{r.type}</span>
+                  <Chip tone="scope">{r.type}</Chip>
                   <span className="know-row-title">{r.title}</span>
                 </button>
               ))}
@@ -171,14 +171,14 @@ export function KnowledgeView() {
 
       <div className="settings-card">
         <h2>New artefact</h2>
-        <div className="set-row">
-          <select value={createType} onChange={(e) => setCreateType(e.target.value)}>
+        <FormRow>
+          <Select value={createType} onChange={(e) => setCreateType(e.target.value)}>
             {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
-          <input value={title} placeholder="Title" onChange={(e) => setTitle(e.target.value)} />
-        </div>
-        <textarea rows={4} value={body} placeholder="Markdown body…" onChange={(e) => setBody(e.target.value)} />
-        <button className="opt-btn" disabled={!title.trim()} onClick={() => void create()}>Create</button>
+          </Select>
+          <TextInput value={title} placeholder="Title" onChange={(e) => setTitle(e.target.value)} />
+        </FormRow>
+        <TextArea rows={4} value={body} placeholder="Markdown body…" onChange={(e) => setBody(e.target.value)} />
+        <Btn disabled={!title.trim()} onClick={() => void create()}>Create</Btn>
         {msg && <span className={msg === "created" ? "ok" : "login-error"}> {msg}</span>}
       </div>
     </div>

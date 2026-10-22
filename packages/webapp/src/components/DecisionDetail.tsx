@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useBridge } from "../lib/store";
 import { rel } from "../lib/views";
+import { Btn, TextArea } from "@bridge/ui-kit";
 import { BoardChip, KindBadge, UrgencyBadge } from "./ui";
 import { WhyLine } from "./DecisionCard";
 
@@ -62,34 +63,34 @@ export function DecisionDetail() {
           <>
             <div className="detail-block">
               <label>Note (travels with your answer)</label>
-              <textarea
+              <TextArea
                 rows={2}
                 value={note}
                 placeholder="Context, constraint, nuance…"
                 onChange={(e) => setNote(e.target.value)}
               />
             </div>
-            <button className="primary-btn" onClick={() => act("unblocked")}>
+            <Btn variant="primary" onClick={() => act("unblocked")}>
               Answer: {d.options?.find((o) => o.id === choice)?.label}
-            </button>
+            </Btn>
           </>
         ) : (
           <>
             <div className="detail-block">
               <label>Note (travels with your answer)</label>
-              <textarea
+              <TextArea
                 rows={2}
                 value={note}
                 placeholder="Context, choice, constraint…"
                 onChange={(e) => setNote(e.target.value)}
               />
             </div>
-            <button className="primary-btn" onClick={() => act("unblocked")}>
+            <Btn variant="primary" onClick={() => act("unblocked")}>
               Unblock — work resumes
-            </button>
-            <button className="secondary-btn" onClick={() => act("completed")}>
+            </Btn>
+            <Btn onClick={() => act("completed")}>
               Mark done
-            </button>
+            </Btn>
           </>
         )}
 

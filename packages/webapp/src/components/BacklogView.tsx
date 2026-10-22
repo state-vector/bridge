@@ -3,6 +3,7 @@ import { useKb } from "../store/kb";
 import { kbApi } from "../lib/kb";
 import { TaskDetail } from "./TaskDetail";
 import { kindOf, rel } from "../lib/views";
+import { Btn, Chip } from "@bridge/ui-kit";
 
 /** Backlog + Completed: the queue and the ledger.
  *  Backlog = work to be done, ranked by what gets picked up next (the same
@@ -97,25 +98,27 @@ export function BacklogView() {
               <span className="backlog-rank" title={`pickup rank: ${why}`}>{boosted ? "▲" : rank + 1}</span>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
-                <span className={`chip chip-kind kind-pill kp-${kind}`}>{kind}</span>
+                <span className={`kind-pill kp-${kind}`}>{kind}</span>
                 <span className="backlog-title">{t.title}</span>
                 {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
                   <span className="backlog-why">
                     {t.meta?.awaiting_ask?.ask_id
-                      ? <><span className="chip chip-urgent">ask</span> {t.meta.awaiting_ask.ask_id}</>
-                      : <><span className="chip chip-scope">exit</span> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
+                      ? <><Chip tone="urgent">ask</Chip> {t.meta.awaiting_ask.ask_id}</>
+                      : <><Chip tone="scope">exit</Chip> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
                   </span>
                 )}
               </span>
               <span className="backlog-meta">
-                <button
-                  className={`opt-btn boost-btn ${boosted ? "boost-on" : ""}`}
+                <Btn
+                  size="sm"
+                  className="boost-btn"
+                  on={boosted}
                   title={boosted ? "remove boost (this task + its open children)" : "boost to priority 0 (this task + its open children)"}
                   onClick={(e) => void boost(t.id, !boosted, e)}
                 >
                   {boosted ? "▼ unboost" : "▲ boost"}
-                </button>
-                {attempts > 0 && <span className="chip chip-urgent" title={`attempted ${attempts}x`}>×{attempts}</span>}
+                </Btn>
+                {attempts > 0 && <Chip tone="urgent" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
                 {t.owner ? <span title={`claimed by ${t.owner}`}>{t.owner}</span> : <span className="backlog-pool">pool</span>}
               </span>
               <span className="backlog-age top-num" title="last updated">{rel(t.updated_ts)}</span>
@@ -139,12 +142,12 @@ export function BacklogView() {
                   <span className="backlog-rank backlog-rank-parked">▪</span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">
-                    <span className={`chip chip-kind kind-pill kp-${kind}`}>{kind}</span>
+                    <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
-                    <span className="backlog-why"><span className="chip chip-scope">why</span> {parkedReason(t)}</span>
+                    <span className="backlog-why"><Chip tone="scope">why</Chip> {parkedReason(t)}</span>
                   </span>
                   <span className="backlog-meta">
-                    {attempts > 0 && <span className="chip chip-urgent" title={`attempted ${attempts}x`}>×{attempts}</span>}
+                    {attempts > 0 && <Chip tone="urgent" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
                     {t.owner ? <span>{t.owner}</span> : <span className="backlog-pool">pool</span>}
                   </span>
                   <span className="backlog-age top-num" title="last updated">{rel(t.updated_ts)}</span>
@@ -182,7 +185,7 @@ export function CompletedView() {
             <div key={t.id} className="backlog-row backlog-done" onClick={() => setSelectedTaskId(t.id)}>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
-                <span className={`chip chip-kind kind-pill kp-${kind}`}>{kind}</span>
+                <span className={`kind-pill kp-${kind}`}>{kind}</span>
                 <span className="backlog-title">{t.title}</span>
               </span>
               <span className="backlog-meta">{t.owner || t.meta?.session || "—"}</span>

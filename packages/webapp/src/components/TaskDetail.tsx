@@ -1,23 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
+import { ActionRow, Btn, Chip, type ChipTone, Select, TextArea, TextInput } from "@bridge/ui-kit";
 import { kbApi } from "../lib/kb";
 import type { KbArtefact, KbVersion } from "../lib/kb";
 import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 
-export const SENTIMENT_CHIP: Record<string, string> = {
-  going_well: "chip-done",
-  neutral: "",
-  struggling: "chip-diag",
-  converging: "chip-kind kind-agent",
-  diverging: "chip-urgent",
+export const SENTIMENT_CHIP: Record<string, ChipTone> = {
+  going_well: "done",
+  neutral: "neutral",
+  struggling: "diag",
+  converging: "scope",
+  diverging: "urgent",
 };
 
 /** Unified history: one log holds progress notes AND state changes, typed. */
-export const HISTORY_CHIP: Record<string, string> = {
-  progress: "chip-kind kind-agent",
-  transition: "chip-kind kind-human",
-  create: "chip-done",
-  update: "chip-kind kind-system",
-  reassign: "chip-urgent",
+export const HISTORY_CHIP: Record<string, ChipTone> = {
+  progress: "scope",
+  transition: "warn",
+  create: "done",
+  update: "muted",
+  reassign: "urgent",
 };
 export const HISTORY_LABEL: Record<string, string> = {
   progress: "log",
@@ -104,7 +105,7 @@ export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; 
       {hasGauges && (
         <div className="gauge-row">
           {gauges.filter(([, v]) => v !== undefined).map(([k, v]) => (
-            <span key={k} className="chip chip-scope" title={`${k} gauge (last progress)`}>{k} {v}%</span>
+            <Chip key={k} tone="scope" title={`${k} gauge (last progress)`}>{k} {v}%</Chip>
           ))}
         </div>
       )}
@@ -132,7 +133,7 @@ export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; 
         ))}
       </dl>
       {(task.tags ?? []).length > 0 && (
-        <div className="task-tags">{(task.tags as string[]).map((t) => <span key={t} className="chip chip-scope">{t}</span>)}</div>
+        <div className="task-tags">{(task.tags as string[]).map((t) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
       )}
     </div>
   );
@@ -228,9 +229,9 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
       <aside className="detail-panel">
         <header className="detail-head">
           <div className="ask-chips">
-            <span className="chip chip-scope">{task?.type ?? "task"}</span>
-            <span className={`chip chip-kind kind-pill kp-${kindOf((task ?? {}) as any)}`}>{kindOf((task ?? {}) as any)}</span>
-            <span className="chip">{task?.status ?? "…"}</span>
+            <Chip tone="scope">{task?.type ?? "task"}</Chip>
+            <span className={`kind-pill kp-${kindOf((task ?? {}) as any)}`}>{kindOf((task ?? {}) as any)}</span>
+            <Chip>{task?.status ?? "…"}</Chip>
           </div>
           <button className="icon-btn" onClick={onClose}>✕</button>
         </header>
@@ -241,9 +242,9 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
 
         {task?.meta?.last_progress?.note && (
           <p className="task-progress-line">
-            <span className={`chip ${SENTIMENT_CHIP[task.meta.last_progress.sentiment ?? ""] ?? ""}`}>
+            <Chip tone={SENTIMENT_CHIP[task.meta.last_progress.sentiment ?? ""] ?? "neutral"}>
               {task.meta.last_progress.sentiment ?? "progress"}
-            </span>
+            </Chip>
             <span>{task.meta.last_progress.note}</span>
           </p>
         )}
@@ -257,13 +258,12 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
             </label>
             {showBody ? (
               <>
-                <textarea rows={6} value={body} onChange={(e) => setBody(e.target.value)} />
-                <button
-                  className="opt-btn"
+                <TextArea rows={6} value={body} onChange={(e) => setBody(e.target.value)} />
+                <Btn
                   onClick={async () => { await kbApi.update(taskId, { body_md: body }); setMsg("saved"); setTimeout(() => setMsg(""), 1500); }}
                 >
                   Save description
-                </button>
+                </Btn>
               </>
             ) : (
               <pre className="know-body">{body || "—"}</pre>
@@ -281,9 +281,9 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
               .filter((v) => !/^(runner:|opencode finished in ~|grace declared|watchdog\.)/i.test(v.summary ?? ""))
               .map((v) => (
                 <div key={v.seq} className="progress-line">
-                  <span className={`chip chip-kind ${HISTORY_CHIP[v.action] ?? "kind-system"}`} title={HISTORY_LABEL[v.action] ?? v.action}>
+                  <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={HISTORY_LABEL[v.action] ?? v.action}>
                     {HISTORY_LABEL[v.action] ?? v.action}
-                  </span>
+                  </Chip>
                   <span className="progress-note"><RefText text={v.summary} onOpen={nav} /></span>
                   <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
                 </div>
@@ -314,31 +314,30 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
         <div className="detail-block form-block">
           <label>Log progress</label>
           <div className="row">
-            <select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
+            <Select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
               <option value="going_well">going well</option>
               <option value="converging">converging</option>
               <option value="neutral">neutral</option>
               <option value="diverging">diverging</option>
               <option value="struggling">struggling</option>
-            </select>
+            </Select>
           </div>
-          <textarea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
+          <TextArea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
           <div className="pct-inputs">
-            <input type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
-            <input type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
-            <input type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
+            <TextInput type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
+            <TextInput type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
+            <TextInput type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
           </div>
-          <button className="opt-btn" disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</button>
+          <Btn disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</Btn>
         </div>
 
         <div className="detail-block form-block">
           <label>Change status</label>
           {blockedIntent ? (
             <>
-              <textarea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
-              <input placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
-              <button
-                className="opt-btn"
+              <TextArea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
+              <TextInput placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
+              <Btn
                 disabled={!blockedReason.trim() || !unblockCondition.trim()}
                 onClick={async () => {
                   await transition(taskId, "blocked", { note: blockedReason.trim(), unblock_condition: unblockCondition.trim() });
@@ -346,17 +345,17 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
                 }}
               >
                 Mark blocked
-              </button>
-              <button className="opt-btn opt-ghost" onClick={onClose}>Cancel</button>
+              </Btn>
+              <Btn quiet onClick={onClose}>Cancel</Btn>
             </>
           ) : (
-            <div className="ask-actions">
+            <ActionRow>
               {["todo", "in_progress", "blocked", "done"]
                 .filter((s) => s !== task?.status)
                 .map((s) => (
-                  <button key={s} className="opt-btn" onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</button>
+                  <Btn key={s} onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</Btn>
                 ))}
-            </div>
+            </ActionRow>
           )}
         </div>
       </aside>
@@ -410,7 +409,7 @@ function WorkTreeRow({ child, relation, nav, now }: {
       <span className={`wt-dot ${stateClass}${stale ? " wt-stale" : ""}`} title={stale ? "active but no signal >10m" : state} />
       <span className="wt-kind">{kind}</span>
       <span className="wt-title" title={child.title}>{child.title.length > 64 ? child.title.slice(0, 64) + "…" : child.title}</span>
-      {attempts > 0 && <span className="chip chip-urgent wt-att" title={`attempted ${attempts}x`}>×{attempts}</span>}
+      {attempts > 0 && <Chip tone="urgent" className="wt-att" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
       <span className="wt-state">{state}</span>
       <span className="wt-time top-num" title="time in current state (live)">{spentTxt}</span>
     </div>

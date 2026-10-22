@@ -4,6 +4,7 @@ import { useKb } from "../store/kb";
 import { useBridge } from "../lib/store";
 import { kbApi, type KbArtefact } from "../lib/kb";
 import { rel } from "../lib/views";
+import { ActionRow, Btn, Card, Chip, type ChipTone, TextInput } from "@bridge/ui-kit";
 
 /** For Me — the human's inbox. First tab. Surfaces everything awaiting a
  *  human decision or attention:
@@ -14,7 +15,7 @@ import { rel } from "../lib/views";
  *   - open question threads (link into Discussions)
  */
 
-const KIND_CHIP: Record<string, string> = { proposed: "chip-needs", accepted: "chip-done", rejected: "chip-done" };
+const KIND_CHIP: Record<string, ChipTone> = { proposed: "needs", accepted: "done", rejected: "done" };
 
 /** Verify-verdict decisions carry meta.decision_class + verdict + receipts —
  *  frame them as the choice they are: accept the verdict (closes the task) or
@@ -132,11 +133,11 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
           const f = decisionFrame(d);
           return (
             <div className="ask-chips">
-              <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
-              <span className={`chip ${KIND_CHIP[d.status] ?? "chip-needs"}`}>{d.status.toUpperCase()}</span>
-              {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
+              <Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>
+              <Chip tone={KIND_CHIP[d.status] ?? "needs"}>{d.status.toUpperCase()}</Chip>
+              {f.verdict && <Chip tone={f.verdict === "bounce" ? "needs" : "done"}>{f.verdict.toUpperCase()}</Chip>}
               <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {d.owner ?? "—"}</span>
-              <button className="opt-btn opt-ghost forme-close" onClick={onClose}>✕</button>
+              <Btn quiet className="forme-close" onClick={onClose}>✕</Btn>
             </div>
           );
         })()}
@@ -166,7 +167,7 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
               {f.receipts.length > 0 && (
                 <div className="ask-chips">
                   {f.receipts.map(([k, v]) => (
-                    <span key={k} className="chip chip-scope" title={v}>{k}: {v.length > 40 ? `${v.slice(0, 40)}…` : v}</span>
+                    <Chip key={k} tone="scope" title={v}>{k}: {v.length > 40 ? `${v.slice(0, 40)}…` : v}</Chip>
                   ))}
                 </div>
               )}
@@ -185,33 +186,33 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
           {comments === null && <p className="empty">loading…</p>}
         </div>
         <div className="steer-box">
-          <input
+          <TextInput
             value={comment}
             placeholder="Add a comment…"
             onChange={(e) => setComment(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) void addComment(); }}
           />
-          <button className="opt-btn" disabled={busy || !comment.trim()} onClick={() => void addComment()}>Comment</button>
+          <Btn disabled={busy || !comment.trim()} onClick={() => void addComment()}>Comment</Btn>
         </div>
 
         {rejectOpen && (
           <div className="steer-box forme-reject">
-            <input
+            <TextInput
               autoFocus
               value={rejectReason}
               placeholder="Why reject? (required)"
               onChange={(e) => setRejectReason(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") void act("rejected"); }}
             />
-            <button className="opt-btn act-reject" disabled={busy || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</button>
-            <button className="opt-btn opt-ghost" onClick={() => setRejectOpen(false)}>Cancel</button>
+            <Btn variant="reject" disabled={busy || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</Btn>
+            <Btn quiet onClick={() => setRejectOpen(false)}>Cancel</Btn>
           </div>
         )}
 
-        <div className="ask-actions">
-          <button className="opt-btn act-accept" disabled={busy || actBusy} onClick={() => void actWithNote("accepted")}>Accept</button>
-          <button className="opt-btn opt-ghost" disabled={busy || actBusy} onClick={() => setRejectOpen(true)}>Reject…</button>
-        </div>
+        <ActionRow>
+          <Btn variant="accept" disabled={busy || actBusy} onClick={() => void actWithNote("accepted")}>Accept</Btn>
+          <Btn quiet disabled={busy || actBusy} onClick={() => setRejectOpen(true)}>Reject…</Btn>
+        </ActionRow>
         {msg && <p className="ok">{msg}</p>}
       </div>
     </div>
@@ -242,14 +243,14 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone);
   return (
-    <div className="card ask-urgent forme-item">
+    <Card className="ask-urgent forme-item">
       {(() => {
         const f = decisionFrame(d);
         return (
           <div className="ask-chips">
-            <span className="chip chip-urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</span>
-            {f.verdict && <span className={`chip ${f.verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{f.verdict.toUpperCase()}</span>}
-            {f.target && <span className="chip chip-scope">{f.target}</span>}
+            <Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>
+            {f.verdict && <Chip tone={f.verdict === "bounce" ? "needs" : "done"}>{f.verdict.toUpperCase()}</Chip>}
+            {f.target && <Chip tone="scope">{f.target}</Chip>}
             <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
           </div>
         );
@@ -262,22 +263,22 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
             : d.title;
         })()}
       </h3>
-      <div className="ask-actions">
+      <ActionRow>
         {(() => {
           const f = decisionFrame(d);
           const acceptLabel = f.kind === "verify" && f.verdict === "bounce" ? "Bounce it" : "Accept";
           return (
             <>
-              <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{acceptLabel}</button>
-              <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
-              <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
+              <Btn variant="accept" disabled={busy} onClick={() => void act("accepted")}>{acceptLabel}</Btn>
+              <Btn variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
+              <Btn quiet onClick={() => setOpen(true)}>Details / comment…</Btn>
             </>
           );
         })()}
-        {err && <span className="gw-err">{err}</span>}
-      </div>
+        {err && <span className="k-err">{err}</span>}
+      </ActionRow>
       {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
-    </div>
+    </Card>
   );
 }
 
@@ -290,11 +291,11 @@ function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior:
   const target = String(m.task ?? m.verify_target ?? "");
   const verdict = String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : "verified";
   return (
-    <div className="card ask-urgent forme-item">
+    <Card className="ask-urgent forme-item">
       <div className="ask-chips">
-        <span className="chip chip-urgent">VERDICT</span>
-        <span className={`chip ${verdict === "bounce" ? "chip-needs" : "chip-done"}`}>{verdict.toUpperCase()}</span>
-        <span className="chip chip-scope">{target}</span>
+        <Chip tone="urgent">VERDICT</Chip>
+        <Chip tone={verdict === "bounce" ? "needs" : "done"}>{verdict.toUpperCase()}</Chip>
+        <Chip tone="scope">{target}</Chip>
         <span className="why-line">{latest.id} · proposed {rel(latest.created_ts)}</span>
       </div>
       <h3 className="ask-question" onClick={() => void 0}>
@@ -302,9 +303,9 @@ function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior:
       </h3>
       {prior.length > 0 && (
         <p className="why-line" style={{ margin: "2px 0" }}>
-          <button className="opt-btn" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
+          <Btn size="sm" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
             {showPrior ? "▾" : "▸"} {prior.length} identical prior round{prior.length > 1 ? "s" : ""} collapsed
-          </button>
+          </Btn>
         </p>
       )}
       {showPrior && prior.map((d) => (
@@ -313,7 +314,7 @@ function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior:
         </p>
       ))}
       <VerdictActions d={latest} onDone={onDone} />
-    </div>
+    </Card>
   );
 }
 
@@ -323,12 +324,12 @@ function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => 
   const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
   return (
     <>
-      <div className="ask-actions">
-        <button className="opt-btn act-accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</button>
-        <button className="opt-btn act-reject" disabled={busy} onClick={() => void act("rejected")}>Reject</button>
-        <button className="opt-btn opt-ghost" onClick={() => setOpen(true)}>Details / comment…</button>
-        {err && <span className="gw-err">{err}</span>}
-      </div>
+      <ActionRow>
+        <Btn variant="accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</Btn>
+        <Btn variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
+        <Btn quiet onClick={() => setOpen(true)}>Details / comment…</Btn>
+        {err && <span className="k-err">{err}</span>}
+      </ActionRow>
       {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
     </>
   );
@@ -349,20 +350,20 @@ function AskRow({ d, onDone }: { d: any; onDone: (id: string) => void }) {
   };
 
   return (
-    <div className="card forme-item">
+    <Card className="forme-item">
       <div className="ask-chips">
-        <span className="chip chip-needs">ASK</span>
-        {d.urgent && <span className="chip chip-urgent">URGENT</span>}
+        <Chip tone="needs">ASK</Chip>
+        {d.urgent && <Chip tone="urgent">URGENT</Chip>}
         <span className="why-line">{d.asker ?? d.from_label ?? "agent"} · {rel(d.opened_ts ?? d.created_ts ?? d.ts ?? Date.now())}</span>
       </div>
       <h3 className="ask-question">{d.title ?? d.question}</h3>
       {d.reason && <p className="ask-reason">{d.reason}</p>}
       {d.question && d.question !== d.title && <p className="ask-reason">{d.question}</p>}
-      <div className="ask-actions">
-        <button className="opt-btn" disabled={busy} onClick={() => void act("unblocked")}>Unblock</button>
-        <button className="opt-btn opt-ghost" disabled={busy} onClick={() => void act("completed")}>Done</button>
-      </div>
-    </div>
+      <ActionRow>
+        <Btn disabled={busy} onClick={() => void act("unblocked")}>Unblock</Btn>
+        <Btn quiet disabled={busy} onClick={() => void act("completed")}>Done</Btn>
+      </ActionRow>
+    </Card>
   );
 }
 
@@ -450,13 +451,13 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
           <h2>Open question threads · {questions.length}</h2>
           <div className="disc-list">
             {questions.map((t) => (
-              <div key={t.id} className="card forme-item forme-link" onClick={() => openThread?.(t.id)}>
+              <Card key={t.id} className="forme-item forme-link" onClick={() => openThread?.(t.id)}>
                 <div className="ask-chips">
-                  <span className="chip chip-scope">QUESTION</span>
+                  <Chip tone="scope">QUESTION</Chip>
                   <span className="why-line">{t.owner ?? "—"} · updated {rel(t.updated_ts)}</span>
                 </div>
                 <h3 className="ask-question">{t.title}</h3>
-              </div>
+              </Card>
             ))}
           </div>
         </section>

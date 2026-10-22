@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useKb } from "../store/kb";
+import { Btn, Field, FormRow, Select, TextArea, TextInput } from "@bridge/ui-kit";
 
 const BOARD_MODES = [
   { key: "none", label: "None" },
@@ -65,44 +66,40 @@ export function SettingsView() {
       </div>
 
       <div className="set-card">
-        <div className="set-field">
-          <label>Project name</label>
-          <input value={draft.project_name ?? ""} placeholder="Superpositional" onChange={(e) => set("project_name", e.target.value)} />
-        </div>
+        <Field label="Project name">
+          <TextInput value={draft.project_name ?? ""} placeholder="Superpositional" onChange={(e) => set("project_name", e.target.value)} />
+        </Field>
 
-        <div className="set-field">
-          <label>Board</label>
-          <select value={boardMode} onChange={(e) => set("board.mode", e.target.value)}>
+        <Field label="Board">
+          <Select value={boardMode} onChange={(e) => set("board.mode", e.target.value)}>
             {BOARD_MODES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
-          </select>
+          </Select>
           {boardMode === "external" && (
             <>
-              <input value={draft["board.kind"] ?? ""} placeholder="kind — github-projects" onChange={(e) => set("board.kind", e.target.value)} />
-              <input value={draft["board.url"] ?? ""} placeholder="Board URL" onChange={(e) => set("board.url", e.target.value)} />
-              <textarea rows={2} value={draft["board.prompt"] ?? ""} placeholder="Prompt for agents working with this board…" onChange={(e) => set("board.prompt", e.target.value)} />
+              <TextInput value={draft["board.kind"] ?? ""} placeholder="kind — github-projects" onChange={(e) => set("board.kind", e.target.value)} />
+              <TextInput value={draft["board.url"] ?? ""} placeholder="Board URL" onChange={(e) => set("board.url", e.target.value)} />
+              <TextArea rows={2} value={draft["board.prompt"] ?? ""} placeholder="Prompt for agents working with this board…" onChange={(e) => set("board.prompt", e.target.value)} />
             </>
           )}
-        </div>
+        </Field>
 
-        <div className="set-field">
-          <label>Bootstrap markdown</label>
-          <textarea rows={4} value={draft.bootstrap_md ?? ""} placeholder="Extra guidance appended to every agent briefing…" onChange={(e) => set("bootstrap_md", e.target.value)} />
-        </div>
+        <Field label="Bootstrap markdown">
+          <TextArea rows={4} value={draft.bootstrap_md ?? ""} placeholder="Extra guidance appended to every agent briefing…" onChange={(e) => set("bootstrap_md", e.target.value)} />
+        </Field>
 
         {extras.length > 0 && (
-          <div className="set-field">
-            <label>Custom settings</label>
+          <Field label="Custom settings">
             {extras.map(([k, v]) => (
-              <div key={k} className="set-row">
-                <input className="set-key" value={k} readOnly />
-                <input value={v} onChange={(e) => set(k, e.target.value)} />
-                <button className="opt-btn set-del" onClick={() => { const d = { ...draft }; delete d[k]; setDraft(d); }}>×</button>
-              </div>
+              <FormRow key={k}>
+                <TextInput className="set-key" value={k} readOnly />
+                <TextInput value={v} onChange={(e) => set(k, e.target.value)} />
+                <Btn className="set-del" onClick={() => { const d = { ...draft }; delete d[k]; setDraft(d); }}>×</Btn>
+              </FormRow>
             ))}
-          </div>
+          </Field>
         )}
 
-        <button className="opt-btn" onClick={() => void save()}>Save</button>
+        <Btn onClick={() => void save()}>Save</Btn>
         {msg && <span className="ok"> {msg}</span>}
       </div>
 

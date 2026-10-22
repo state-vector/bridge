@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@bridge/specs": "*",
+    "@bridge/ui-kit": "*",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "snarkdown": "^2.0.0",

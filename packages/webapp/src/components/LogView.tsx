@@ -1,5 +1,6 @@
 import { useKb } from "../store/kb";
 import { rel } from "../lib/views";
+import { Chip, ConnDot } from "@bridge/ui-kit";
 
 export function LogView() {
   const events = useKb((s) => s.events);
@@ -9,7 +10,7 @@ export function LogView() {
     <div className="log-wrap">
       <div className="view-head">
         <h2>Activity log</h2>
-        <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
+        <ConnDot state={conn === "open" ? "open" : "closed"} className="conn" />
         <span className="muted-note">{events.length} events · live</span>
       </div>
       <table className="log-table">
@@ -28,7 +29,7 @@ export function LogView() {
               <td className="log-ts">{rel(e.ts)}</td>
               <td>{e.actor}</td>
               <td>
-                <span className={`chip chip-kind op-${e.op}`}>{e.op}</span>
+                <Chip className={`op-${e.op}`}>{e.op}</Chip>
               </td>
               <td>{e.artefact_id ?? "—"}</td>
               <td className="log-detail">{JSON.stringify(e.detail)}</td>

@@ -1,33 +1,30 @@
 import type { Decision, Presence } from "@bridge/specs";
+import { Chip, relTime } from "@bridge/ui-kit";
 import { normTs, presenceLabel } from "../lib/views";
 
+/** Thin webapp wrappers over the shared kit vocabulary. */
+
 export function rel(ms: number): string {
-  const d = Date.now() - normTs(ms);
-  const a = Math.abs(d);
-  const unit =
-    a < 60_000 ? `${Math.max(1, Math.round(a / 1000))}s`
-    : a < 3_600_000 ? `${Math.round(a / 60_000)}m`
-    : `${Math.round(a / 3_600_000)}h`;
-  return d >= 0 ? `${unit} ago` : `in ${unit}`;
+  return relTime(normTs(ms));
 }
 
 export function BoardChip({ board }: { board?: string | null }) {
   if (!board) return null;
-  return <span className="chip chip-scope">{board.toUpperCase()}</span>;
+  return <Chip tone="scope">{board.toUpperCase()}</Chip>;
 }
 
 export function ActorChip({ kind }: { kind: Presence["kind"] }) {
-  return <span className={`chip chip-kind kind-${kind}`}>{kind.toUpperCase()}</span>;
+  return <Chip className={`chip-kind kind-${kind}`}>{kind.toUpperCase()}</Chip>;
 }
 
 export function KindBadge({ kind }: { kind?: Decision["kind"] }) {
   if (kind === "needs_input")
-    return <span className="chip chip-needs">NEEDS INPUT</span>;
-  return <span className="chip chip-diag">DIAGNOSTIC</span>;
+    return <Chip tone="needs">NEEDS INPUT</Chip>;
+  return <Chip tone="diag">DIAGNOSTIC</Chip>;
 }
 
 export function UrgencyBadge({ urgency }: { urgency?: Decision["urgency"] }) {
-  return urgency === "time-sensitive" ? <span className="chip chip-urgent">NOW</span> : null;
+  return urgency === "time-sensitive" ? <Chip tone="urgent">NOW</Chip> : null;
 }
 
 export function StatusDot({ active }: { active: boolean }) {

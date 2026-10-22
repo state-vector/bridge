@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../store/kb";
 import { getConfig } from "../lib/config";
 import { rel } from "../lib/views";
+import { Btn, Card, Chip, Select, TextInput } from "@bridge/ui-kit";
 
 function Copyable({ label, body }: { label: string; body: string }) {
   const [copied, setCopied] = useState(false);
@@ -9,9 +10,9 @@ function Copyable({ label, body }: { label: string; body: string }) {
     <div className="connect-block">
       <div className="connect-row">
         <span>{label}</span>
-        <button className="opt-btn" onClick={async () => { await navigator.clipboard.writeText(body); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
+        <Btn onClick={async () => { await navigator.clipboard.writeText(body); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
           {copied ? "copied ✓" : "copy"}
-        </button>
+        </Btn>
       </div>
       <pre className="connect-pre">{body}</pre>
     </div>
@@ -64,10 +65,10 @@ function AgentSetupModal({ label, secret, projectName, onClose }: { label: strin
         <p className="muted-note">Wire the agent's MCP config, then prepend the bootstrap prompt. {secret ? "The auth token is shown once — store it now." : "Mint a token to slot the real one in."}</p>
         <Copyable label="Bootstrap prompt" body={prompt} />
         <div className="connect-row">
-          <select value={client} onChange={(e) => setClient(e.target.value as "opencode" | "generic")}>
+          <Select value={client} onChange={(e) => setClient(e.target.value as "opencode" | "generic")}>
             <option value="opencode">opencode</option>
             <option value="generic">generic (mcpServers)</option>
-          </select>
+          </Select>
         </div>
         <Copyable label={mcpTarget} body={mcpJson} />
         {secret && (
@@ -144,8 +145,8 @@ export function ConnectView() {
     <>
       {!t.revoked_ts && (
         <>
-          <button className="opt-btn" onClick={() => setSetupFor({ label: t.label, secret: null })}>setup</button>{" "}
-          <button className="opt-btn danger" onClick={() => void revoke(t.id)}>revoke</button>
+          <Btn onClick={() => setSetupFor({ label: t.label, secret: null })}>setup</Btn>{" "}
+          <Btn variant="danger" onClick={() => void revoke(t.id)}>revoke</Btn>
         </>
       )}
     </>
@@ -160,17 +161,17 @@ export function ConnectView() {
 
       {setupFor && <AgentSetupModal label={setupFor.label} secret={setupFor.secret} projectName={projectName} onClose={() => setSetupFor(null)} />}
 
-      <div className="card">
+      <Card>
         <h2>Agents</h2>
         <p className="muted-note">independent peers — mint a token, wire its MCP config, onboard manually. Gateway-spawned workers are NOT minted here; they are provisioned by their gateway and nested under it below.</p>
         <div className="row">
-          <input
+          <TextInput
             value={label}
             placeholder="agent name (e.g. opencode-ray)"
             onChange={(e) => setLabel(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && label.trim()) void addAgent(); }}
           />
-          <button className="opt-btn auth-submit" disabled={!label.trim()} onClick={() => void addAgent()}>Add agent</button>
+          <Btn className="auth-submit" disabled={!label.trim()} onClick={() => void addAgent()}>Add agent</Btn>
         </div>
         {msg && <p className="login-error">{msg}</p>}
         <table className="log-table">
@@ -190,9 +191,9 @@ export function ConnectView() {
             ))}
           </tbody>
         </table>
-      </div>
+      </Card>
 
-      <div className="card">
+      <Card>
         <h2>Gateways</h2>
         <p className="muted-note">paired devices — infrastructure. Each owns the worker-agents it provisioned and the sessions it dispatched.</p>
         <table className="log-table">
@@ -207,7 +208,7 @@ export function ConnectView() {
               return (
                 <tr key={t.id}>
                   <td>
-                    <span className="chip chip-scope">gateway</span> {t.label}
+                    <Chip tone="scope">gateway</Chip> {t.label}
                   </td>
                   <td>
                     {workers.length === 0 && <span className="muted-note">none</span>}
@@ -228,7 +229,7 @@ export function ConnectView() {
                   <td><StateCell t={t} /></td>
                   <td>
                     {!t.revoked_ts && (
-                      <button className="opt-btn danger" onClick={() => void revoke(t.id)}>revoke</button>
+                      <Btn variant="danger" onClick={() => void revoke(t.id)}>revoke</Btn>
                     )}
                   </td>
                 </tr>
@@ -237,9 +238,9 @@ export function ConnectView() {
           </tbody>
         </table>
         <p className="muted-note">revoking a gateway does not revoke its worker-agents — revoke those individually if they are lost.</p>
-      </div>
+      </Card>
 
-      <div className="card">
+      <Card>
         <h2>Sessions</h2>
         <table className="log-table">
           <thead><tr><th>identity</th><th>session</th><th>first seen</th><th>last seen</th></tr></thead>
@@ -249,7 +250,7 @@ export function ConnectView() {
             ))}
           </tbody>
         </table>
-      </div>
+      </Card>
 
     </div>
   );

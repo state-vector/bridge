@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Btn, Select, TextInput } from "@bridge/ui-kit";
 
 /**
  * Device pairing approval (GitHub-like device flow, bridge-native).
@@ -71,7 +72,8 @@ export function PairView() {
           <p className="muted-note">
             Pairing approval is human-plane — sign in with GitHub first, then come back to this page.
           </p>
-          <a className="opt-btn auth-submit" href="/login" style={{ display: "block", textAlign: "center", textDecoration: "none" }}>
+          {/* kit button classes on an anchor — one declaration source for the look */}
+          <a className="k-btn auth-submit" href="/login" style={{ display: "block", textAlign: "center", textDecoration: "none" }}>
             Sign in with GitHub
           </a>
         </div>
@@ -144,7 +146,7 @@ export function PairView() {
             <p className="muted-note">
               Enter the code shown on the device (e.g. <code>K7M3-Q9XZ</code>).
             </p>
-            <input
+            <TextInput
               className="login-input"
               value={code}
               placeholder="XXXX-XXXX"
@@ -152,9 +154,9 @@ export function PairView() {
               onChange={(e) => setCode(e.target.value.toUpperCase())}
               onKeyDown={(e) => { if (e.key === "Enter" && code.trim().length >= 8) void lookup(); }}
             />
-            <button className="opt-btn auth-submit" disabled={code.trim().length < 8 || busy} onClick={() => void lookup()}>
+            <Btn className="auth-submit" disabled={code.trim().length < 8 || busy} onClick={() => void lookup()}>
               {busy ? "…" : "Look up device"}
-            </button>
+            </Btn>
           </>
         ) : (
           <>
@@ -162,17 +164,17 @@ export function PairView() {
               Pair <b>{info.device}</b>?
             </p>
             <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
-            <input className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <TextInput className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>
-            <select className="login-input" value={ws} onChange={(e) => setWs(e.target.value)}>
+            <Select className="login-input" value={ws} onChange={(e) => setWs(e.target.value)}>
               <option value="">choose…</option>
               {workspaces.map((w) => (
                 <option key={w.slug} value={w.slug}>{w.slug}</option>
               ))}
-            </select>
-            <button className="opt-btn auth-submit" disabled={!ws || !label.trim() || busy} onClick={() => void approve()}>
+            </Select>
+            <Btn className="auth-submit" disabled={!ws || !label.trim() || busy} onClick={() => void approve()}>
               {busy ? "…" : "Approve"}
-            </button>
+            </Btn>
           </>
         )}
         {msg && <span className="login-error">{msg}</span>}

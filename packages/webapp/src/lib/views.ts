@@ -1,19 +1,14 @@
 import type { Decision, EventView, Presence } from "@bridge/specs";
+import { relTime } from "@bridge/ui-kit";
 
 /** The API doc says EventView.ts is ms epoch; tolerate seconds-valued ts from early adapters. */
 export function normTs(ts: number): number {
   return ts > 0 && ts < 10_000_000_000 ? ts * 1000 : ts;
 }
 
+/** Relative time from possibly-seconds ts — the kit formatter + normTs. */
 export function rel(ms: number): string {
-  const d = Date.now() - normTs(ms);
-  const a = Math.abs(d);
-  const unit =
-    a < 60_000 ? `${Math.max(1, Math.round(a / 1000))}s`
-    : a < 3_600_000 ? `${Math.round(a / 60_000)}m`
-    : a < 86_400_000 ? `${Math.round(a / 3_600_000)}h`
-    : `${Math.round(a / 86_400_000)}d`;
-  return d >= 0 ? `${unit} ago` : `in ${unit}`;
+  return relTime(normTs(ms));
 }
 
 export function clock(ms: number): string {

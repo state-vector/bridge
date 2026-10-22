@@ -3,6 +3,7 @@ import { useKb } from "../store/kb";
 import type { BoardPrefs } from "../store/kb";
 import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
+import { Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
 
 /** Render text with task references (BR#12, TASK-007) as clickable links. */
 function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
@@ -142,14 +143,14 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
         <RefText text={task.title} onOpen={(id) => onOpen(id)} />
       </div>
       <div className="task-row task-status-row">
-        <span className={`chip chip-kind kind-pill kp-${kindOf(task)}`} title="task kind">{kindOf(task)}</span>
+        <span className={`kind-pill kp-${kindOf(task)}`} title="task kind">{kindOf(task)}</span>
         {prefs.status && task.status === "in_progress" && (
-          <span className="st-chip st-live" title={task.meta?.subprocess ? `in progress — declared subprocess silence (watchdog paused until the budget lapses)\n\n${task.meta.subprocess.reason ?? ""}` : "in progress — agent active"}>
+          <Chip tone="live" pill title={task.meta?.subprocess ? `in progress — declared subprocess silence (watchdog paused until the budget lapses)\n\n${task.meta.subprocess.reason ?? ""}` : "in progress — agent active"}>
             in progress{task.meta?.subprocess ? " · subprocess" : ""}
-          </span>
+          </Chip>
         )}
         {prefs.status && task.status !== "in_progress" && (
-          <span className={`st-chip st-${task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "amber"}`}>{task.status.replace("_", " ")}</span>
+          <Chip pill tone={task.status === "done" ? "ok" : task.status === "blocked" ? "err" : "warn"}>{task.status.replace("_", " ")}</Chip>
         )}
         {prefs.age && task.status === "in_progress" && task.meta?.grace_until && task.meta.grace_until > now && (
           <span className="age-chip age-fresh" title="declared grace window — the agent stated it will be silent until then">
@@ -187,13 +188,13 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
 
       {prefs.tags && (task.tags ?? []).length > 0 && (
         <div className="task-tags">
-          {(task.tags ?? []).map((t: string) => <span key={t} className="chip chip-scope">{t}</span>)}
+          {(task.tags ?? []).map((t: string) => <Chip key={t} tone="scope">{t}</Chip>)}
         </div>
       )}
 
       {prefs.sentiment && (p?.sentiment || mine.length > 0) && (
         <div className="task-sentiment-row">
-          {p?.sentiment && <span className={`chip ${SENTIMENT_CHIP[p.sentiment] ?? ""}`}>{p.sentiment.replace("_", " ")}</span>}
+          {p?.sentiment && <Chip tone={SENTIMENT_CHIP[p.sentiment] ?? "neutral"}>{p.sentiment.replace("_", " ")}</Chip>}
           <span className="sentiment-dots">
             {mine.slice(-8).map((s: any, i: number) => (
               <span key={i} className="s-dot" style={{ background: SENT_DOT[s.sentiment] ?? "#3a4356" }} title={`${s.sentiment} · ${rel(s.ts)}`} />
@@ -224,7 +225,7 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       {task.status === "blocked" && task.meta?.blocked && (
         <div className="task-blocked-info">
           {(task.meta.blocked.reason ?? "").startsWith("abandoned") && (
-            <span className="chip chip-urgent">abandoned</span>
+            <Chip tone="urgent">abandoned</Chip>
           )}
           <div className="task-progress-note"><b>why:</b> {task.meta.blocked.reason}</div>
           <div className="task-progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition}</div>
@@ -234,18 +235,18 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       <div className="task-actions" onClick={(e) => e.stopPropagation()}>
         {(next[task.status] ?? []).map((to) => (
           to === "todo" ? (
-            <button
+            <Btn
               key={to}
-              className="opt-btn task-btn"
+              className="task-btn"
               title="push back to todo — releases the claim, re-enters the unclaimed pool, tags the task 'attempted' so the next agent verifies state first"
               onClick={() => void retry()}
             >
               retry
-            </button>
+            </Btn>
           ) : (
-            <button key={to} className="opt-btn task-btn" onClick={() => onOpen(task.id, to === "blocked" ? "blocked" : undefined)}>
+            <Btn key={to} className="task-btn" onClick={() => onOpen(task.id, to === "blocked" ? "blocked" : undefined)}>
               {label[to] ?? to}
-            </button>
+            </Btn>
           )
         ))}
       </div>
@@ -273,8 +274,8 @@ function FieldsMenu({ onClose }: { onClose: () => void }) {
     <div className="fields-menu" onClick={(e) => e.stopPropagation()}>
       <div className="fields-menu-head">
         <span>Card fields</span>
-        <button className="opt-btn" onClick={() => setPrefs({ issue: true, status: true, age: true, owner: false, tags: false, sentiment: false, snippet: false, sparkline: false, pct: false })}>Compact</button>
-        <button className="opt-btn" onClick={() => setPrefs({ issue: true, status: true, age: true, owner: true, tags: true, sentiment: true, snippet: true, sparkline: true, pct: true })}>Full</button>
+        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: false, tags: false, sentiment: false, snippet: false, sparkline: false, pct: false })}>Compact</Btn>
+        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: true, tags: true, sentiment: true, snippet: true, sparkline: true, pct: true })}>Full</Btn>
       </div>
       {PREF_FIELDS.map((f) => (
         <label key={f.key} className="fields-check">
@@ -282,7 +283,7 @@ function FieldsMenu({ onClose }: { onClose: () => void }) {
           {f.label}
         </label>
       ))}
-      <button className="opt-btn fields-done" onClick={onClose}>Done</button>
+      <Btn className="fields-done" onClick={onClose}>Done</Btn>
     </div>
   );
 }
@@ -316,34 +317,34 @@ function NewTaskComposer({ onCreated }: { onCreated: (id: string) => void }) {
     }
   };
 
-  if (!open) return <button className="opt-btn" onClick={() => setOpen(true)}>+ new task</button>;
+  if (!open) return <Btn onClick={() => setOpen(true)}>+ new task</Btn>;
   return (
-    <div className="card new-task-card" onClick={(e) => e.stopPropagation()}>
-      <input
+    <Card className="new-task-card" onClick={(e) => e.stopPropagation()}>
+      <TextInput
         autoFocus
         value={title}
         placeholder="Task title — e.g. #1234 fix verdict drift on retry"
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => { if (e.key === "Enter" && title.trim()) void submit(); }}
       />
-      <textarea
+      <TextArea
         rows={3}
         value={body}
         placeholder="Context — the problem, acceptance, out-of-scope (optional)"
         onChange={(e) => setBody(e.target.value)}
       />
-      <input
+      <TextInput
         value={tags}
         placeholder="tags, comma-separated (optional — e.g. gtm, issue:quality)"
         onChange={(e) => setTags(e.target.value)}
       />
       <p>
-        <button className="opt-btn" disabled={!title.trim()} onClick={() => void submit()}>Create</button>{" "}
-        <button className="opt-btn opt-ghost" onClick={() => setOpen(false)}>Cancel</button>{" "}
+        <Btn disabled={!title.trim()} onClick={() => void submit()}>Create</Btn>{" "}
+        <Btn quiet onClick={() => setOpen(false)}>Cancel</Btn>{" "}
         {msg && <span className="ok">{msg}</span>}
       </p>
       <span className="muted-note">lands as an unclaimed pool task (attributed to you); agents pick it up like any other work. For an open-ended question use the Discussions tab.</span>
-    </div>
+    </Card>
   );
 }
 
@@ -422,7 +423,7 @@ export function BoardView() {
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={() => setSelectedTaskId(null)} onOpen={(id) => { setSelectedTaskId(id); setBlockedIntent(false); }} />}
       <div className="view-head">
         <h2>Board</h2>
-        <span className={`conn ${conn === "open" ? "conn-open" : "conn-closed"}`}>●</span>
+        <ConnDot state={conn === "open" ? "open" : "closed"} className="conn" />
         <NewTaskComposer onCreated={(id) => openTask(id)} />
         <div className="board-controls">
           <select value={groupBy} onChange={(e) => setGroupBy(e.target.value as GroupBy)}>
@@ -436,7 +437,7 @@ export function BoardView() {
               {allTags.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           )}
-          <button className="opt-btn" onClick={(e) => { e.stopPropagation(); setFieldsOpen(!fieldsOpen); }}>fields ▾</button>
+          <Btn onClick={(e) => { e.stopPropagation(); setFieldsOpen(!fieldsOpen); }}>fields ▾</Btn>
         </div>
         <span className="muted-note">{tasks.length} tasks</span>
       </div>

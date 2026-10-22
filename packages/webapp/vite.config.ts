@@ -5,9 +5,11 @@ import path from "node:path";
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: {
-      "@bridge/specs": path.resolve(import.meta.dirname, "../specs/src/index.ts"),
-    },
+    alias: [
+      { find: "@bridge/ui-kit/ui-kit.css", replacement: path.resolve(import.meta.dirname, "../ui-kit/src/ui-kit.css") },
+      { find: "@bridge/ui-kit", replacement: path.resolve(import.meta.dirname, "../ui-kit/src/index.ts") },
+      { find: "@bridge/specs", replacement: path.resolve(import.meta.dirname, "../specs/src/index.ts") },
+    ],
   },
   server: { port: 1420, strictPort: true },
   clearScreen: false,

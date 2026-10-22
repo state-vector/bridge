@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useBridge } from "../lib/store";
 import { myAnswers, rankDecisions } from "../lib/views";
+import { Chip } from "@bridge/ui-kit";
 import { DecisionCard } from "./DecisionCard";
 import { SessionList } from "./SessionList";
 
@@ -29,9 +30,9 @@ export function Panel() {
           <div className="answered-strip">
             <span className="answered-label">Answered today</span>
             {answered.slice(0, 4).map((e) => (
-              <span key={e.id} className="chip chip-done">
+              <Chip key={e.id} tone="done">
                 {e.kind} · {(e.title ?? e.task_id ?? "").slice(0, 22)}
-              </span>
+              </Chip>
             ))}
           </div>
         )}

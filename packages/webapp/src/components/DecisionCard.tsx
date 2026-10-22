@@ -1,6 +1,7 @@
 import type { Decision } from "@bridge/specs";
 import { useBridge } from "../lib/store";
 import { rel } from "../lib/views";
+import { ActionRow, Btn, Card } from "@bridge/ui-kit";
 import { BoardChip, KindBadge, UrgencyBadge } from "./ui";
 
 export function WhyLine({ deadline }: { deadline?: number | null }) {
@@ -19,7 +20,7 @@ export function DecisionCard({ d }: { d: Decision }) {
   const token = useBridge((s) => s.token);
 
   return (
-    <article className={`ask-card ${d.urgency === "time-sensitive" || d.kind === "needs_input" ? "ask-urgent" : "ask-diag"}`}>
+    <Card className={d.urgency === "time-sensitive" || d.kind === "needs_input" ? "ask-urgent" : "ask-diag"}>
       <div className="ask-chips">
         <KindBadge kind={d.kind} />
         <UrgencyBadge urgency={d.urgency} />
@@ -31,31 +32,31 @@ export function DecisionCard({ d }: { d: Decision }) {
         {d.title}
       </h3>
       {d.reason && <p className="ask-reason">{d.reason}</p>}
-      <div className="ask-actions">
+      <ActionRow>
         {token ? (
           d.options?.length ? (
             d.options.map((o) => (
-              <button key={o.id} className="opt-btn" title={o.hint ?? undefined} onClick={() => void resolve(d, "unblocked", undefined, o.id)}>
+              <Btn key={o.id} title={o.hint ?? undefined} onClick={() => void resolve(d, "unblocked", undefined, o.id)}>
                 {o.label}
-              </button>
+              </Btn>
             ))
           ) : (
             <>
-              <button className="opt-btn" onClick={() => void resolve(d, "unblocked")}>
+              <Btn onClick={() => void resolve(d, "unblocked")}>
                 Unblock
-              </button>
-              <button className="opt-btn" onClick={() => void resolve(d, "completed")}>
+              </Btn>
+              <Btn onClick={() => void resolve(d, "completed")}>
                 Done
-              </button>
+              </Btn>
             </>
           )
         ) : (
           <span className="why-line">set ingest token (⚙) to answer</span>
         )}
-        <button className="opt-btn opt-ghost" onClick={() => selectDecision(d.id)}>
+        <Btn quiet onClick={() => selectDecision(d.id)}>
           Open →
-        </button>
-      </div>
-    </article>
+        </Btn>
+      </ActionRow>
+    </Card>
   );
 }

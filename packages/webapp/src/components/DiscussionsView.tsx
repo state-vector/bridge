@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useKb } from "../store/kb";
 import { kbApi, type KbArtefact, type KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
+import { Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
 
 /** Discussion tab = threaded display of question tasks with responses.
  *  No separate discussion artefacts: a "thread" is a task with meta.kind
@@ -62,38 +63,38 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
   return (
     <div className="disc-wrap">
       <div className="view-head">
-        <button className="opt-btn opt-ghost" onClick={onBack}>← All threads</button>
+        <Btn quiet onClick={onBack}>← All threads</Btn>
         <h2>{task.title}</h2>
       </div>
-      <div className="card ask-thread">
+      <Card className="ask-thread">
         <div className="ask-chips">
-          <span className={`chip ${task.status === "done" ? "chip-done" : "chip-needs"}`}>{task.status.toUpperCase()}</span>
-          {task.board && <span className="chip chip-scope">{task.board.toUpperCase()}</span>}
+          <Chip tone={task.status === "done" ? "done" : "needs"}>{task.status.toUpperCase()}</Chip>
+          {task.board && <Chip tone="scope">{task.board.toUpperCase()}</Chip>}
           <span className="why-line">{task.owner ?? "—"} · opened {rel(task.created_ts)}</span>
         </div>
         <pre className="know-body">{task.body_md}</pre>
-      </div>
+      </Card>
       <div className="disc-list">
         {(versions === null) && <p className="empty">loading responses…</p>}
         {stream.map((v) => (
-          <div key={v.seq} className={`card resp ${v.action === "progress" ? "resp-note" : ""}`}>
+          <Card key={v.seq} className={`resp ${v.action === "progress" ? "resp-note" : ""}`}>
             <div className="ask-chips">
               {v.data?.sentiment ? <span className="sent-dot" style={{ background: SENT_DOT[String(v.data.sentiment)] ?? "#3a4356" }} /> : null}
               <span className="resp-actor">{v.actor}</span>
               <span className="why-line">{ACTION_LABEL[v.action] ?? v.action} · {rel(v.ts)}</span>
             </div>
             {versionText(v) && <p className="resp-body">{versionText(v)}</p>}
-          </div>
+          </Card>
         ))}
-        <div className="card">
-          <textarea
+        <Card>
+          <TextArea
             rows={2}
             value={reply}
             placeholder="Reply — answer, evidence, concern…"
             onChange={(e) => setReply(e.target.value)}
           />
-          <p><button className="opt-btn" disabled={!reply.trim()} onClick={() => void send()}>Reply</button> {msg && <span className="ok">{msg}</span>}</p>
-        </div>
+          <p><Btn disabled={!reply.trim()} onClick={() => void send()}>Reply</Btn> {msg && <span className="ok">{msg}</span>}</p>
+        </Card>
       </div>
     </div>
   );
@@ -139,27 +140,27 @@ export function DiscussionsView() {
       <div className="view-head">
         <h2>Discussions</h2>
         <span className="muted-note">question tasks + responses — agents and humans in one thread</span>
-        <span className={`conn conn-${conn === "open" ? "open" : "closed"}`} title={`kb realtime: ${conn}`}>●</span>
+        <ConnDot state={conn === "open" ? "open" : "closed"} className="conn" title={`kb realtime: ${conn}`} />
       </div>
 
-      <div className="card">
+      <Card>
         <h2>Ask a question</h2>
-        <input value={title} placeholder="What should the dispatch backoff strategy be?" onChange={(e) => setTitle(e.target.value)} />
-        <textarea rows={2} value={context} placeholder="Context — the problem, constraints, what you considered…" onChange={(e) => setContext(e.target.value)} />
-        <p><button className="opt-btn" disabled={!title.trim()} onClick={() => void ask()}>Ask</button> {msg && <span className="ok">{msg}</span>}</p>
-      </div>
+        <TextInput value={title} placeholder="What should the dispatch backoff strategy be?" onChange={(e) => setTitle(e.target.value)} />
+        <TextArea rows={2} value={context} placeholder="Context — the problem, constraints, what you considered…" onChange={(e) => setContext(e.target.value)} />
+        <p><Btn disabled={!title.trim()} onClick={() => void ask()}>Ask</Btn> {msg && <span className="ok">{msg}</span>}</p>
+      </Card>
 
       <div className="disc-list" key={refreshTick}>
         {threads.map((t) => (
-          <div key={t.id} className="card disc" onClick={() => setOpenId(t.id)}>
+          <Card key={t.id} className="disc" onClick={() => setOpenId(t.id)}>
             <div className="ask-chips">
-              <span className={`chip ${t.status === "done" ? "chip-done" : "chip-needs"}`}>{t.status.toUpperCase()}</span>
-              {t.board && <span className="chip chip-scope">{t.board.toUpperCase()}</span>}
+              <Chip tone={t.status === "done" ? "done" : "needs"}>{t.status.toUpperCase()}</Chip>
+              {t.board && <Chip tone="scope">{t.board.toUpperCase()}</Chip>}
               <span className="why-line">{t.owner ?? "—"} · opened {rel(t.created_ts)} · updated {rel(t.updated_ts)}</span>
             </div>
             <h3 className="ask-question">{t.title}</h3>
             <p className="ask-reason">{(t.body_md ?? "").trim().slice(0, 140) || "—"}{(t.body_md ?? "").length > 140 ? "…" : ""}</p>
-          </div>
+          </Card>
         ))}
         {threads.length === 0 && <p className="empty">No open question threads.</p>}
       </div>

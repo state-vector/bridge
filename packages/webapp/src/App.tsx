@@ -10,8 +10,11 @@ import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { TopView } from "./components/TopView";
 import type { WsFrame } from "@bridge/specs";
+import { Btn, Chip, ConnDot } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
+import "@bridge/ui-kit/tokens.css";
+import "@bridge/ui-kit/ui-kit.css";
 import "./App.css";
 
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
@@ -40,8 +43,8 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
     <header className="topbar">
       <div className="brand">
         Bridge
-        <span className={`conn conn-${conn}`} title={`hub: ${conn}`}>●</span>
-        <span className={`conn conn-${kbConn === "open" ? "open" : "closed"}`} title={`kb realtime: ${kbConn}`}>●</span>
+        <ConnDot state={conn === "open" ? "open" : conn === "connecting" ? "connecting" : "closed"} className="conn" title={`hub: ${conn}`} />
+        <ConnDot state={kbConn === "open" ? "open" : "closed"} className="conn" title={`kb realtime: ${kbConn}`} />
       </div>
       <nav className="tabs">
         {TABS.map((t) => (
@@ -55,7 +58,7 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
         <div className="user-widget" title={session.expires_ts ? `session expires ${new Date(session.expires_ts).toLocaleString()}` : session.mode}>
           <span className="user-mode">{session.mode === "access" ? "SSO" : "GitHub"}</span>
           <span className="user-name">{session.user ?? "admin"}</span>
-          <button className="opt-btn user-out" onClick={() => void signOut()}>Sign out</button>
+          <Btn size="sm" quiet className="user-out" onClick={() => void signOut()}>Sign out</Btn>
         </div>
       )}
     </header>
@@ -71,9 +74,9 @@ function SignIn() {
       <div className="auth-card">
         <div className="brand auth-brand">Bridge</div>
         <p className="auth-host">Sign in to {new URL(url).host}</p>
-        <button className="opt-btn auth-submit" onClick={() => signInWithGithub()}>
+        <Btn className="auth-submit" onClick={() => signInWithGithub()}>
           Sign in with GitHub
-        </button>
+        </Btn>
       </div>
     </div>
   );
@@ -120,9 +123,9 @@ export default function App() {
       {conn === "closed" && (
         <div className="conn-banner">
           Hub unreachable — is it deployed / mock hub running (npm run hub)?
-          <button className="opt-btn" onClick={() => useBridge.getState().retryConnection()}>
+          <Btn size="sm" onClick={() => useBridge.getState().retryConnection()}>
             Retry
-          </button>
+          </Btn>
         </div>
       )}
       <main className="main">
@@ -148,16 +151,16 @@ export default function App() {
         <div className="overlay-backdrop">
           <div className="overlay-card">
             <div className="ask-chips">
-              <span className="chip chip-urgent">DECISION</span>
-              {overlay.board && <span className="chip chip-scope">{overlay.board.toUpperCase()}</span>}
+              <Chip tone="urgent">DECISION</Chip>
+              {overlay.board && <Chip tone="scope">{overlay.board.toUpperCase()}</Chip>}
             </div>
             <h2>{overlay.title}</h2>
             {overlay.reason && <p className="ask-reason">{overlay.reason}</p>}
             <div className="overlay-actions">
-              <button className="opt-btn" onClick={() => void resolve(overlay, "unblocked")}>Unblock</button>
-              <button className="opt-btn" onClick={() => void resolve(overlay, "completed")}>Done</button>
-              <button className="opt-btn opt-ghost" onClick={() => { selectDecision(overlay.id); dismissOverlay(); }}>Open</button>
-              <button className="opt-btn opt-ghost" onClick={dismissOverlay}>Later</button>
+              <Btn onClick={() => void resolve(overlay, "unblocked")}>Unblock</Btn>
+              <Btn onClick={() => void resolve(overlay, "completed")}>Done</Btn>
+              <Btn quiet onClick={() => { selectDecision(overlay.id); dismissOverlay(); }}>Open</Btn>
+              <Btn quiet onClick={dismissOverlay}>Later</Btn>
             </div>
           </div>
         </div>

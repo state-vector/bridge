@@ -16,5 +16,5 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "../specs/src"]
+  "include": ["src", "../specs/src", "../ui-kit/src"]
 }

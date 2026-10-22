@@ -3,14 +3,15 @@ import { useKb } from "../store/kb";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { kindOf } from "../lib/views";
+import { Chip, ConnDot, type ChipTone } from "@bridge/ui-kit";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
   diverging: "var(--startup)", struggling: "var(--red)",
 };
 
-const GRADE_TONE: Record<string, string> = {
-  excellent: "ok", good: "ok", fair: "amber", poor: "err",
+const GRADE_TONE: Record<string, ChipTone> = {
+  excellent: "ok", good: "ok", fair: "warn", poor: "err",
 };
 
 /** Consistent pct colouring: higher-is-better gauges green/amber/red at 70/40;
@@ -208,7 +209,7 @@ export function TopView() {
           <span className="gateway-strip-label">gateways</span>
           {gateways.map((g) => (
             <span key={g.label} className={`gateway-chip ${g.online ? "gw-online" : "gw-offline"}`}>
-              <span className={`conn conn-${g.online ? "open" : "closed"}`}>●</span>
+              <ConnDot state={g.online ? "open" : "closed"} />
               {g.label}
               <span className="gateway-meta">
                 {g.online ? age(g.lastSeen, now) : `last seen ${age(g.lastSeen, now)}`}
@@ -245,34 +246,34 @@ export function TopView() {
           onClick={() => r.taskId && setSelectedTaskId(r.taskId)}
         >
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
-            <span className={`conn conn-${r.online ? "open" : "closed"}`} title={r.online ? "online" : "offline"}>●</span>
+            <ConnDot state={r.online ? "open" : "closed"} className="conn" title={r.online ? "online" : "offline"} />
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
             {r.agent}
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
             {depth > 0 && <span className="tree-branch" title={`child of ${r.partOf ?? "parent"}`}>└─ </span>}
-            <span className={`chip chip-kind kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
+            <span className={`kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.goal ?? "—"}
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
             {r.status === "in_progress" && (
-              <span className="st-chip st-live" title="in progress — the last log line says what it is running">
+              <Chip tone="live" pill title="in progress — the last log line says what it is running">
                 in progress
-              </span>
+              </Chip>
             )}
             {r.status && r.status !== "in_progress" && (
-              <span className={`st-chip st-${r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "amber"}`}>{r.status.replace("_", " ")}</span>
+              <Chip pill tone={r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "warn"}>{r.status.replace("_", " ")}</Chip>
             )}
             {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`agent mood: ${r.sentiment.replace("_", " ")}`} />}
-            {r.sentiment && <span className={`chip ${SENTIMENT_CHIP[r.sentiment] ?? ""} top-sent`}>{r.sentiment.replace("_", " ")}</span>}
+            {r.sentiment && <Chip tone={SENTIMENT_CHIP[r.sentiment] ?? "neutral"} className="top-sent">{r.sentiment.replace("_", " ")}</Chip>}
           </span>
           <span className="topc-score">
             {r.score != null && (
-              <span className={`st-chip st-${GRADE_TONE[r.grade ?? "fair"] ?? "muted"} st-score`} title="behaviour compliance score">
+              <Chip pill tone={GRADE_TONE[r.grade ?? "fair"] ?? "muted"} className="st-score" title="behaviour compliance score">
                 {r.score}
-              </span>
+              </Chip>
             )}
           </span>
           <span className={`topc-gauge top-num ${pctTone(r.confidence, true)}`}>{r.confidence != null ? `${r.confidence}%` : "—"}</span>
@@ -285,8 +286,8 @@ export function TopView() {
                 title={r.askPending ? `blocked on decision — awaiting answer to ask ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
               >
                 {r.askPending
-                  ? <><span className="chip chip-urgent">ask</span> awaiting answer to {r.askPending}</>
-                  : <><span className="chip chip-scope">exit</span> {r.unblock}</>}
+                  ? <><Chip tone="urgent">ask</Chip> awaiting answer to {r.askPending}</>
+                  : <><Chip tone="scope">exit</Chip> {r.unblock}</>}
               </span>
             ) : (
               <>
