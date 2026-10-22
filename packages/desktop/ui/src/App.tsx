@@ -50,7 +50,7 @@ interface Cfg {
   isolate: boolean;
   model: string | null;
   backend: string | null;
-  backends?: Record<string, { bin?: string | null; agent?: string | null; model?: string | null }> | string[] | null;
+  backends?: Record<string, { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null }> | string[] | null;
   models?: Record<string, string> | null;
   agents?: Record<string, string> | null;
   report_minutes?: number | null;
@@ -710,9 +710,14 @@ export function App() {
       setApplyMsg(`model required for: ${missing.join(", ")}`);
       return;
     }
-    // backends dict: each enabled provider carries its own section
+    // backends dict: each enabled provider carries its own section. Merge
+    // over the existing file config — Apply only owns what the form shows
+    // (model, agent); fields it does not know about (mode, bin) must
+    // survive, or saving settings silently switches the transport.
+    const prevBackends = (cfg?.backends && !Array.isArray(cfg.backends) ? cfg.backends : {}) as Record<string, { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null }>;
     const backendsOut = Object.fromEntries(
       ordered.map((b) => [b, {
+        ...(prevBackends[b] ?? {}),
         model: (backendModels[b] ?? "").trim() || null,
         agent: (backendAgents[b] ?? "").trim() || null,
       }]),
