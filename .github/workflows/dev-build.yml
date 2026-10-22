@@ -58,10 +58,12 @@ jobs:
           body: |
             Rolling dev build of `main` @ ${{ github.sha }}.
 
-            Pre-release — `install.sh` and `releases/latest` always resolve to the
-            newest *versioned* release, never this one. Fetch a dev binary:
+            Pre-release — `install.sh` with no arguments and `releases/latest`
+            always resolve to the newest *versioned* release, never this one.
 
-                gh release download dev --repo state-vector/bridge -p 'bridge-<target>.tar.gz'
+            Install the dev channel:
+
+                curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash -s -- dev
           files: |
             bridge-*.tar.gz
             bridge-*.tar.gz.sha256

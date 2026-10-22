@@ -17,7 +17,7 @@ bridge pair https://your-hub.workers.dev
 
 That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.
 
-Every push to `main` also publishes a rolling **dev** pre-release of the binaries — `install.sh` always resolves to the newest versioned release, never dev. Grab it with `gh release download dev --repo state-vector/bridge`.
+Every push to `main` also publishes a rolling **dev** pre-release of the binaries — `install.sh` with no arguments always resolves to the newest versioned release, never dev. Install the dev channel with `curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash -s -- dev`.
 
 ## Three surfaces, one hub
 

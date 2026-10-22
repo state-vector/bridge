@@ -63,10 +63,10 @@ cd packages/cli && cargo build --release
 ./target/release/bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Living on the edge? Every push to `main` rebuilds the binaries into a rolling **dev** pre-release (`releases/latest` and `install.sh` never see it):
+Living on the edge? Every push to `main` rebuilds the binaries into a rolling **dev** pre-release (`releases/latest` and plain `install.sh` never see it):
 
 ```bash
-gh release download dev --repo state-vector/bridge -p 'bridge-<target>.tar.gz'
+curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash -s -- dev
 ```
 
 ### Run on a server

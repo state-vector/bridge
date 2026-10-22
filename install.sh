@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # bridge installer — headless runner for linux + macOS
 #
-#   curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash            (stable)
+#   curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash -s -- dev  (rolling main build)
 #
 # Downloads the latest release binary for your platform, verifies its
 # checksum, and installs it to $BRIDGE_INSTALL_DIR (default ~/.local/bin).
 # Nothing else touches your system — no root, no shell rc edits.
+#
+# Channel: `dev` installs the rolling pre-release rebuilt on every push to
+# main. Default (no argument) is the newest versioned release.
 
 set -euo pipefail
 
@@ -44,22 +48,30 @@ else
 fi
 if command -v tar >/dev/null 2>&1; then tar="tar"; else fail "tar is required"; fi
 
-# ---- resolve latest release ----
-API="https://api.github.com/repos/$REPO/releases/latest"
-info "resolving latest release…"
-METADATA="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")" \
-  || fail "could not reach GitHub releases (rate-limited? retry in a minute)"
-
-TAG="$(printf '%s' "$METADATA" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-[ -n "$TAG" ] || fail "no release found — has a release been published yet?"
+# ---- resolve release by channel ----
+CHANNEL="${1:-stable}"
+case "$CHANNEL" in
+  stable)
+    API="https://api.github.com/repos/$REPO/releases/latest"
+    info "resolving latest release…"
+    METADATA="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")" \
+      || fail "could not reach GitHub releases (rate-limited? retry in a minute)"
+    TAG="$(printf '%s' "$METADATA" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+    [ -n "$TAG" ] || fail "no release found — has a release been published yet?"
+    ;;
+  dev)
+    TAG="dev" # rolling pre-release, rebuilt on every push to main
+    ;;
+  *) fail "unknown channel: '$CHANNEL' (stable | dev)" ;;
+esac
 ASSET="bridge-${TARGET}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
-info "latest: $TAG"
+info "channel: $CHANNEL ($TAG)"
 
 # ---- download + verify ----
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-info "downloading $ASSET…"
+info "downloading ${ASSET}…"
 curl -fsSL -o "$TMP/$ASSET" "$URL" || fail "download failed: $URL"
 curl -fsSL -o "$TMP/$ASSET.sha256" "$URL.sha256" || warn "no checksum published — skipping verification (unusual)"
 if [ -s "$TMP/$ASSET.sha256" ]; then
