@@ -1531,7 +1531,14 @@ fn spawn_opencode(
     // not per session) — board actions attribute to the agent, not the
     // gateway. Identity law (BR#2455): this app is a gateway; the pair flow
     // vends a gw-* token; run_loop refuses to start on anything else.
-    let agent_label = agent_identity(cfg);
+    // machine/agent naming: the worker identity lives UNDER its gateway
+    // (<gateway>.<agent>) — ownership filtering is then a prefix glob
+    // (machinename/*), and the namespace survives re-pairings because the
+    // gateway label is the stable root.
+    let agent_label = match &cfg.label {
+        Some(l) if !l.is_empty() => format!("{l}.{}", agent_identity(cfg)),
+        _ => agent_identity(cfg),
+    };
     // Provision the worker's per-agent token. There is NO second class check
     // here: the token secret is opaque (bkw_*), so a prefix test can never
     // work, and the class gate is run_loop's (config gateway flag). If

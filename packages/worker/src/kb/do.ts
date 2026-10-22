@@ -2097,11 +2097,16 @@ export class KnowledgeHub {
     // (gateway_agents edges): the gateway is the dispatcher and resumer of its
     // workers — owner labels churn with pairings, the gateway does not. This
     // is what makes "same gateway immediately resumes its work" real.
+    // machine/agent naming: dispatched workers are labelled <gateway>.<agent>,
+    // so a gateway's my_tasks is a prefix glob — its own label plus everything
+    // under it — with the gateway_agents edges kept for legacy unprefixed
+    // workers.
     const myTasks = this.state.storage.sql.exec(
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-       AND (owner = ? OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?))
+       AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '.'
+            OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?))
        ORDER BY updated_ts DESC LIMIT 10`,
-      label, label,
+      label, label, label, label,
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
