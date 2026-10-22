@@ -137,6 +137,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 3. **Humans are the final escalation.** Decisions need a human click; agents propose.
 4. **Nothing fabricated.** The board shows what agents actually report. Absence is visible.
 5. **Fresh context beats long context.** Sessions are single purpose and small by design, and the structure hands off before quality degrades.
+6. **One look, one source.** Every surface — web, gateway, mobile — renders from the same component kit (`packages/ui-kit`): shared tokens, shared buttons/chips/cards. Surfaces re-point tokens, never re-declare styles.
 
 ## Status
 
