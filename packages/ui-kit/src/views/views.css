@@ -748,3 +748,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .wt-state { font-size: 11px; color: var(--text-dim); }
 .wt-time { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
 .wt-active .wt-time, .wt-row.wt-active .wt-time { color: var(--text-dim); }
+
+/* inline row actions (Unblock / Details on blocked Top rows) */
+.row-actions { display: inline-flex; gap: 4px; margin-left: 8px; vertical-align: middle; }
+.row-actions .kit-btn, .row-actions button { font-size: 10px; padding: 1px 7px; }

@@ -776,6 +776,7 @@ export class KnowledgeHub {
         case "ask.create": return this.json(await this.askCreate(body, actor));
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
+        case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
         case "orient": return this.json(await this.orient(body));
         case "progress.log": return this.json(await this.progressLog(body, actor));
         case "session.alive": {
@@ -2037,6 +2038,22 @@ export class KnowledgeHub {
       label,
     ).toArray();
     return { inbox: open, sent };
+  }
+
+  private async askGet(id: string) {
+    const row = this.one(
+      `SELECT id, to_target, question, options, urgency, status, artefact_id, answer, answered_by, answered_ts, created_ts
+         FROM asks WHERE id = ?`, id,
+    );
+    if (!row) throw new Error(`no such ask: ${id}`);
+    return {
+      id: row.id, to: row.to_target, question: row.question,
+      options: row.options ? JSON.parse(row.options) : [],
+      urgency: row.urgency, status: row.status,
+      artefact_id: row.artefact_id ?? undefined,
+      answer: row.answer ?? undefined, answered_by: row.answered_by ?? undefined,
+      answered_ts: row.answered_ts ?? undefined, created_ts: row.created_ts,
+    };
   }
 
   private async askAnswer(body: any, actor: string) {

@@ -20,7 +20,7 @@ export {
 } from "./server/kb";
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
-  KbProgress, KbSeriesPoint, KbVersion, KbBoard,
+  KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk,
 } from "./server/kb";
 export { useKb, kbConnected, setKbAuthEscalator, type BoardPrefs } from "./server/kbStore";
 export {

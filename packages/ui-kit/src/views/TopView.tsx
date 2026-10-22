@@ -3,7 +3,8 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { kindOf } from "../server/views";
-import { Chip, ConnDot, type ChipTone } from "./index-kit";
+import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
+import { kbApi } from "../server/kb";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -88,12 +89,24 @@ const GATEWAY_FRESH_MS = 3 * 60_000; // poll_secs default 60 → 3 fresh = alive
 
 export function TopView() {
   useClock();
+  const refreshKb = useKb((s) => s.refresh);
   const tasks = useKb((s) => s.tasks);
   const sessions = useKb((s) => s.sessions);
   const agents = useKb((s) => s.agents);
   const events = useKb((s) => s.events);
   const now = Date.now();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+
+  /** One-click unblock straight from the row: answer the blocking ask (the DO
+   *  auto-resumes the task) or, for condition-blocks, transition it back. */
+  const unblockFromRow = async (r: TopRow, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      if (r.askPending) await kbApi.askAnswer(r.askPending, "unblocked by human (Top)");
+      else if (r.taskId) await kbApi.transition(r.taskId, "in_progress", { note: "unblocked by human — condition satisfied (Top)" });
+      await refreshKb();
+    } catch { /* the panel surfaces failures with full context */ }
+  };
 
   const gateways = useMemo(() => {
     const gw = sessions.filter((s) => (s.name ?? "").startsWith("dispatch-"));
@@ -288,6 +301,10 @@ export function TopView() {
                 {r.askPending
                   ? <><Chip tone="urgent">ask</Chip> awaiting answer to {r.askPending}</>
                   : <><Chip tone="scope">exit</Chip> {r.unblock}</>}
+                <span className="row-actions">
+                  <Btn size="sm" variant="accept" title="answer the ask / satisfy the exit condition — resumes the task now" onClick={(e) => void unblockFromRow(r, e)}>Unblock</Btn>
+                  <Btn size="sm" quiet title="open the task panel" onClick={(e) => { e.stopPropagation(); r.taskId && setSelectedTaskId(r.taskId); }}>Details</Btn>
+                </span>
               </span>
             ) : (
               <>

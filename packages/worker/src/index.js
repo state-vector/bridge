@@ -146,17 +146,19 @@ export default {
           : sub === "stats" ? "https://kb/stats"
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
+          : sub === "ask" ? "https://kb/ask.get"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
         return kbCors(env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
-        const op = ["create", "update", "transition", "link", "progress", "enrich", "boost"].includes(sub) ? sub : null;
+        const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : "web";
-        return kbCors(env.KB.get(kbId).fetch(`https://kb/${op}`, {
+        // do ops are dot-namespaced (ask.answer); the web plane uses snake_case
+        return kbCors(env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),

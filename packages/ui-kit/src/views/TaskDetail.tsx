@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { ActionRow, Btn, Chip, type ChipTone, Select, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
+import type { KbAsk } from "../server/kb";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
+import { useKb } from "../server/kbStore";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -77,9 +79,31 @@ interface TaskMeta {
 /** Full state of the item: identity, gauges, structured meta, facts. Read-only —
  *  the forms (progress / status) live further down; this is the display half.
  *  Shared with KnowledgeView (any artefact type gets the same treatment). */
-export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string } }) {
+export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string }; onChanged?: () => void }) {
   const m = (task.meta ?? {}) as TaskMeta;
   const lp = m.last_progress;
+  const [ask, setAsk] = useState<KbAsk | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const id = m.awaiting_ask?.ask_id;
+    if (!id) { setAsk(null); return; }
+    let on = true;
+    kbApi.ask(id).then((a) => { if (on) setAsk(a); }).catch(() => { if (on) setAsk(null); });
+    return () => { on = false; };
+  }, [m.awaiting_ask?.ask_id]);
+
+  const unblock = async () => {
+    setBusy(true);
+    try {
+      if (ask && m.awaiting_ask?.ask_id) await kbApi.askAnswer(m.awaiting_ask.ask_id, "unblocked by human (panel)");
+      else await kbApi.transition(task.id, "in_progress", { note: "unblocked by human — condition satisfied (panel)" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch { /* history shows the failure */ } finally {
+      setBusy(false);
+    }
+  };
   const gauges: Array<[string, number | undefined]> = [
     ["done", lp?.completion_pct],
     ["conf", lp?.confidence_pct],
@@ -113,6 +137,21 @@ export function TaskStateCard({ task }: { task: KbArtefact & { meta?: TaskMeta; 
         <div className="task-blocked-info">
           <div className="progress-note"><b>why blocked:</b> {m.blocked.reason ?? ""}</div>
           <div className="progress-note"><b>unblocks when:</b> {m.blocked.unblock_condition ?? ""}</div>
+          <div className="row" style={{ marginTop: 6 }}>
+            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void unblock()}>Unblock now</Btn>
+            <span className="muted-note">answers the ask / marks the exit condition satisfied and resumes the task</span>
+          </div>
+        </div>
+      )}
+      {ask && ask.status === "open" && (
+        <div className="task-blocked-info">
+          <div className="progress-note"><b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.id} · to {ask.to} · {rel(ask.created_ts)}</div>
+          <div className="progress-note">{ask.question}</div>
+          {ask.options.length > 0 && <div className="ask-chips">{ask.options.map((o) => <Chip key={o} tone="scope">{o}</Chip>)}</div>}
+          <div className="row" style={{ marginTop: 6 }}>
+            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void unblock()}>Unblock now</Btn>
+            <span className="muted-note">answers the ask — the task auto-resumes</span>
+          </div>
         </div>
       )}
       {m.subprocess && typeof m.subprocess.deadline_ts === "number" && (
@@ -163,6 +202,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
   const [confidence, setConfidence] = useState("");
   const [risk, setRisk] = useState("");
   const [versions, setVersions] = useState<KbVersion[]>([]);
+  const [reloadKey, setReloadKey] = useState(0);
 
   const transition = useKb((s) => s.transition);
   const boardTasks = useKb((s) => s.tasks) as any[];
@@ -197,7 +237,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
       } catch { /* offline */ }
     })();
     return () => { on = false; };
-  }, [taskId]);
+  }, [taskId, reloadKey]);
 
   const clampPct = (v: string) => (v === "" ? undefined : Math.max(0, Math.min(100, Math.round(Number(v)))));
   // navigate to another task inside the same panel (task refs / dep graph)
@@ -233,7 +273,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
 
         <h2 className="detail-question"><RefText text={task?.title ?? taskId} onOpen={nav} /></h2>
 
-        {task && <TaskStateCard task={task as any} />}
+        {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
 
         {task?.meta?.last_progress?.note && (
           <p className="task-progress-line">
@@ -467,4 +507,3 @@ function DepGraph({ selfId, selfTitle, relations, related, onOpen }: {
   );
 }
 
-import { useKb } from "../server/kbStore";

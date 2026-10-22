@@ -84,6 +84,21 @@ export interface KbVersion {
   data: Record<string, unknown>;
 }
 
+/** An open ask (agent → human decision request) that may be blocking a task. */
+export interface KbAsk {
+  id: string;
+  to: string;
+  question: string;
+  options: string[];
+  urgency: string;
+  status: string;
+  artefact_id?: string;
+  answer?: string;
+  answered_by?: string;
+  answered_ts?: number;
+  created_ts: number;
+}
+
 export interface KbBoard {
   tasks: KbArtefact[];
   sessions: KbSession[];
@@ -117,6 +132,9 @@ export const kbApi = {
     return j<{ artefacts: KbArtefact[] }>(`/api/kb/artefacts${p.size ? `?${p}` : ""}`);
   },
   artefact: (id: string) => j<KbArtefact & { relations: { relation: string; artefact_id: string; dir: string }[] }>(`/api/kb/artefact?id=${encodeURIComponent(id)}`),
+  ask: (id: string) => j<KbAsk>(`/api/kb/ask?id=${encodeURIComponent(id)}`),
+  askAnswer: (id: string, answer: string) =>
+    j<{ id: string; status: string; artefact_id?: string; task_status?: string }>("/api/kb/ask_answer", { method: "POST", body: JSON.stringify({ id, answer }) }),
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
