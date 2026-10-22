@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "bridge shared UI kit — tokens + primitives (Btn, Chip, Card, Field, ConnDot, RelTime); one look, every surface",
+  "description": "bridge shared UI kit \u2014 tokens + primitives (Btn, Chip, Card, Field, ConnDot, RelTime); one look, every surface",
   "exports": {
     ".": "./src/index.ts",
     "./ui-kit.css": "./src/ui-kit.css",
@@ -13,6 +13,7 @@
   "dependencies": {
     "react": "^19.1.0",
     "@bridge/specs": "*",
-    "zustand": "^5.0.8"
+    "zustand": "^5.0.8",
+    "snarkdown": "^2.0.0"
   }
 }

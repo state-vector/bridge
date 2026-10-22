@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TopView, BacklogView, CompletedView, useKb, setKbHubConfig } from "@bridge/ui-kit";
+import { TopView, BacklogView, CompletedView, ForMeView, useKb, setKbHubConfig, getKbHubConfig } from "@bridge/ui-kit";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
@@ -104,23 +104,7 @@ function age(ms: number): string {
   return `${h}h ${m % 60}m`;
 }
 
-interface ForYouArtefact {
-  id: string;
-  type: string;
-  title: string;
-  body_md?: string | null;
-  status: string;
-  owner?: string | null;
-  created_ts: number;
-  updated_ts: number;
-  meta?: Record<string, any> | null;
-  tags?: string[] | null;
-}
-
-/** For you — the human's unblock inbox (machine-plane, read-only). Verify
- *  verdicts group per target task like the webapp's For Me (BR#1782). */
-
-// ---- rich-row shared bits (parity with the webapp's Top/Backlog) ----
+// rich-row shared bits (parity with the webapp's Top/Backlog)
 const KIND_TONE: Record<string, string> = {
   verify: "k-verify", analysis: "k-analysis", unblock: "k-unblock", question: "k-question", impl: "k-impl",
 };
@@ -149,140 +133,6 @@ function ageOf(ts: number | undefined, now: number): string {
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;
 }
-
-function ForYou({ hubUrl }: { hubUrl: string | null }) {
-  const [data, setData] = useState<{ decisions: ForYouArtefact[]; blocked: ForYouArtefact[]; questions: ForYouArtefact[] } | null>(null);
-  const [err, setErr] = useState("");
-  const pull = useCallback(async () => {
-    try {
-      const d = await invoke<any>("for_you");
-      setData({ decisions: d.decisions ?? [], blocked: d.blocked ?? [], questions: d.questions ?? [] });
-      setErr("");
-    } catch (e) {
-      setErr(String(e));
-    }
-  }, []);
-  useEffect(() => { void pull(); }, [pull]);
-  useEffect(() => {
-    const t = setInterval(() => void pull(), 5000);
-    return () => clearInterval(t);
-  }, [pull]);
-
-  const verdicts = (data?.decisions ?? []).filter((d) => d.meta?.decision_class === "verify-verdict" && (d.meta?.task || d.meta?.verify_target));
-  const generic = (data?.decisions ?? []).filter((d) => !verdicts.includes(d));
-  const byTarget = new Map<string, ForYouArtefact[]>();
-  for (const d of verdicts) {
-    const m = (d.meta ?? {}) as Record<string, any>;
-    const key = String(m.task ?? m.verify_target);
-    (byTarget.get(key) ?? byTarget.set(key, []).get(key)!).push(d);
-  }
-  const verdictCards = [...byTarget.values()].map((arr) => arr.sort((a, b) => b.created_ts - a.created_ts)).map((arr) => ({ latest: arr[0], prior: arr.slice(1) }));
-  const openQuestions = (data?.questions ?? []).filter((t) => t.status !== "done" && t.status !== "superseded");
-  const total = verdictCards.length + generic.length + (data?.blocked ?? []).length + openQuestions.length;
-
-  const [acting, setActing] = useState<string | null>(null);
-  const [comment, setComment] = useState("");
-  const [actMsg, setActMsg] = useState("");
-
-  const act = (id: string) => {
-    // decisions are human-authoritative — they are made in the webapp (the
-    // machine plane may only supersede). The buttons deep-link there.
-    setActing(id);
-    if (hubUrl) openExternal(`${hubUrl}/?task=${id}`);
-    setActMsg("opening the board — decide there");
-    setTimeout(() => setActMsg(""), 2500);
-    setActing(null);
-  };
-
-  const frameDecision = (d: ForYouArtefact): { q: string; verdict: string; target: string } => {
-    const m = (d.meta ?? {}) as Record<string, unknown>;
-    const target = String(m.task ?? m.verify_target ?? d.id);
-    if (m.decision_class === "verify-verdict") {
-      const bounce = String(m.verdict ?? "").toLowerCase() === "bounce";
-      return {
-        q: bounce ? `Bounce ${target} back to work? (verifier: receipts void)` : `Accept verification of ${target}? (receipts confirmed)`,
-        verdict: bounce ? "BOUNCE" : "VERIFIED",
-        target,
-      };
-    }
-    return { q: d.title, verdict: "", target: "" };
-  };
-
-  const DecisionRow = ({ d, chips }: { d: ForYouArtefact; chips: string[] }) => {
-    const busy = acting === d.id;
-    const f = frameDecision(d);
-    return (
-      <div className="gw-agent fy-item fy-decision">
-        <span className="fy-chips">
-          {f.verdict && <Chip tone={f.verdict === "BOUNCE" ? "needs" : "done"}>{f.verdict}</Chip>}
-          {chips.map((c) => <Chip key={c} tone="urgent">{c}</Chip>)}
-          {f.target && <Chip tone="scope">{f.target}</Chip>}
-        </span>
-        <span className="gw-fq" title={d.title}>{f.q}</span>
-        <div className="gw-row" style={{ marginLeft: "auto", gap: 6 }}>
-          <Btn variant="accept" size="sm" disabled={busy} onClick={() => act(d.id)}>
-            {f.verdict === "BOUNCE" ? "Decide" : "Decide"} ↗
-          </Btn>
-          {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${hubUrl}/?task=${d.id}`); }}>comment ↗</a>}
-        </div>
-      </div>
-    );
-  };
-
-  return (
-    <main className="gw-main">
-      {err && <Card><span className="k-err">{err}</span></Card>}
-      <Card>
-        <h2>For you</h2>
-        <span className="gw-note">{total > 0 ? `${total} awaiting you` : "nothing needs you right now"}</span>
-      </Card>
-      {(verdictCards.length > 0 || generic.length > 0) && (
-        <Card>
-          <h2>Awaiting your decision</h2>
-          {verdictCards.map(({ latest, prior }) => {
-            const verdict = String(latest.meta?.verdict ?? "").toLowerCase() === "bounce" ? "BOUNCE" : "VERIFIED";
-            const target = String(latest.meta?.task ?? latest.meta?.verify_target ?? "");
-            return (
-              <div key={latest.id}>
-                <DecisionRow d={latest} chips={["VERDICT", verdict, target]} />
-                {prior.length > 0 && <div className="gw-note" style={{ marginLeft: 12 }}>+ {prior.length} prior round{prior.length > 1 ? "s" : ""} collapsed</div>}
-              </div>
-            );
-          })}
-          {generic.map((d) => <DecisionRow key={d.id} d={d} chips={["DECISION"]} />)}
-        </Card>
-      )}
-      {(data?.blocked ?? []).length > 0 && (
-        <Card>
-          <h2>Blocked — unblock work</h2>
-          {(data?.blocked ?? []).map((b) => (
-            <div key={b.id} className="gw-agent fy-item">
-              <span className="fy-chips"><Chip tone="urgent">BLOCKED</Chip></span>
-              <span className="gw-fnote" title={b.title}>{b.title}</span>
-              <span className="gw-fmeta">{b.meta?.unblock_condition ?? b.meta?.blocked_reason ?? null}</span>
-              <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{b.id}</span>
-            </div>
-          ))}
-        </Card>
-      )}
-      {openQuestions.length > 0 && (
-        <Card>
-          <h2>Open questions</h2>
-          {openQuestions.map((t) => (
-            <div key={t.id} className="gw-agent fy-item">
-              <span className="fy-chips"><Chip tone="urgent">QUESTION</Chip></span>
-              <span className="gw-fnote" title={t.title}>{t.title}</span>
-              <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{t.id}</span>
-            </div>
-          ))}
-        </Card>
-      )}
-      {actMsg && <Card><span className="k-ok">{actMsg}</span></Card>}
-    </main>
-  );
-}
-
-
 
 interface BoardTask { id: string; title: string; status: string; tags?: string[]; owner?: string; meta?: Record<string, any>; updated_ts?: number; status_ts?: number }
 
@@ -765,7 +615,14 @@ export function App() {
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
-      {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
+      {page === "forme" && (
+        <ForMeView
+          openThread={(id) => {
+            const u = getKbHubConfig().url;
+            if (u) openExternal(`${u}/?task=${id}`);
+          }}
+        />
+      )}
       {page === "top" && <TopView />}
       {page === "backlog" && <BacklogView />}
       {page === "chat" && <Chat />}

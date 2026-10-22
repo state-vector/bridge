@@ -107,7 +107,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: identity.label }),
+      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id, principal: identity.principal ?? null }),
     });
     const out = await r.json();
     if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);

@@ -1369,6 +1369,14 @@ export class KnowledgeHub {
     if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = attributedAgent ?? actor;
     }
+    // identity phase 2: ownership references the stable principal when the
+    // acting token carries one (labels are display; principals are the anchor)
+    const actingPrincipal = typeof body.token_id === "string" && body.token_id
+      ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, body.token_id)?.principal
+      : null;
+    if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && actingPrincipal) {
+      owner = actingPrincipal;
+    }
     // attribution bookkeeping (BR#2455): when a gateway-tagged token acts as
     // another agent, record the gateway→agent edge for Connect grouping. The
     // token row is the authority — a forged body.gateway without the tag no-ops.
@@ -1892,16 +1900,16 @@ export class KnowledgeHub {
   private async identify(bearer: string) {
     if (!bearer) throw new Error("missing bearer");
     const hash = await hashAuthToken(bearer);
-    let row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+    let row = this.one(`SELECT id, label, tags, principal, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
     if (!row) {
       // absorb dev-mode write-visibility hiccups right after mint
       await new Promise((r) => setTimeout(r, 250));
-      row = this.one(`SELECT id, label, tags, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
+      row = this.one(`SELECT id, label, tags, principal, revoked_ts FROM auth_tokens WHERE hash = ?`, hash);
     }
     if (!row) throw new Error("unknown auth token");
     if (row.revoked_ts) throw new Error("auth token revoked");
     this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
-    return { token_id: row.id, label: row.label, tags: parseTags(row.tags) };
+    return { token_id: row.id, label: row.label, tags: parseTags(row.tags), principal: row.principal ?? null };
   }
 
   /**
@@ -2108,9 +2116,10 @@ export class KnowledgeHub {
     const myTasks = this.state.storage.sql.exec(
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
        AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '/'
-            OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?))
+            OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
+            OR owner = ?)
        ORDER BY updated_ts DESC LIMIT 10`,
-      label, label, label, label,
+      label, label, label, label, body.principal ?? null,
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
