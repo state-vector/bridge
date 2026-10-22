@@ -17,6 +17,8 @@ import { useKb } from "./store/kb";
 import "@bridge/ui-kit/ui-kit.css";
 import "./App.css";
 
+// No changes to the imports.
+
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
