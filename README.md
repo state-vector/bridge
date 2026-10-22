@@ -219,6 +219,7 @@ not by client convention.
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
 - **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
+- **Blocker rollup**: when ≥3 blocked cards share one machine-detectable root cause, the watchdog sweep auto-creates ONE boosted `ROOT BLOCKER` task — *investigate → fix → one approval* — and every queued card points at it (`meta.root_blocker` + a `child_of` link, so the board shows the tree and the boost cascades to all of them). Today's machine-detectable roots: a `github.com/.../pull/N` URL in the card's unblock condition (the one unmerged PR everything queues behind) and red/broken/failing-`main` language (the never-merge-onto-red-main class). Idempotent: cards already pointing at an open root are left alone, re-runs create no duplicates. A root closes only by an agent or human with receipts that the root cause is gone — the sweep never auto-closes it, and a later cluster of the same root opens a NEW root rather than reusing a done one.
 - Anything needing a human lands in **For Me**
 
 ## Local development
