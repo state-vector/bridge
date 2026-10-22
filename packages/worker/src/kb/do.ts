@@ -2093,9 +2093,15 @@ export class KnowledgeHub {
     ).toArray();
     const settings = this.settingsMap();
     const projectName = settings.project_name || "Superpositional";
+    // my_tasks for a gateway includes the work of the agents it dispatched
+    // (gateway_agents edges): the gateway is the dispatcher and resumer of its
+    // workers — owner labels churn with pairings, the gateway does not. This
+    // is what makes "same gateway immediately resumes its work" real.
     const myTasks = this.state.storage.sql.exec(
-      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND owner = ? AND status IN ('todo','in_progress','in_review','blocked') ORDER BY updated_ts DESC LIMIT 10`,
-      label,
+      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+       AND (owner = ? OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?))
+       ORDER BY updated_ts DESC LIMIT 10`,
+      label, label,
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
