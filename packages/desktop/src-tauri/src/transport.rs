@@ -496,7 +496,7 @@ fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
 
 /// Pull the human-readable text out of a session/update notification.
 fn extract_update_text(v: &serde_json::Value) -> Option<String> {
-    let u = v.get("update")?;
+    let u = update_payload(v)?;
     let kind = u.get("sessionUpdate").and_then(|k| k.as_str())?;
     // content is a text block ({type:"text",text:...}) or an ARRAY of blocks
     // depending on the opencode version — accept both. A version whose frames
@@ -531,10 +531,19 @@ fn extract_update_text(v: &serde_json::Value) -> Option<String> {
 /// The ACP update kind, for when text extraction fails — any session/update
 /// frame still proves the session is alive and should surface as such.
 fn update_kind(v: &serde_json::Value) -> String {
-    v.pointer("/update/sessionUpdate")
-        .and_then(|k| k.as_str())
+    update_payload(v)
+        .and_then(|u| u.get("sessionUpdate").and_then(|k| k.as_str()))
         .unwrap_or("update")
         .to_string()
+}
+
+/// The update object of a session/update frame. JSON-RPC notifications carry
+/// it under `params` (ACP spec: params = { sessionId, update }); opencode 1.x
+/// flattened it to a top-level `update` — accept both. Reading only one shape
+/// is what blinded the runner on hermes (v2.1.2, spec shape) while the same
+/// parser worked on other hosts.
+fn update_payload(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    v.pointer("/params/update").or_else(|| v.get("update"))
 }
 
 // ---------------------------------------------------------------------------
@@ -694,5 +703,46 @@ mod tests {
         });
         assert_eq!(extract_update_text(&v), None);
         assert_eq!(update_kind(&v), "plan_update");
+    }
+}
+#[cfg(test)]
+mod spec_shape_tests {
+    use super::*;
+
+    // opencode 2.1.2 on hermes emits the ACP-spec shape: the update object
+    // rides under `params` — the parser read only a top-level `update`, so
+    // every frame parsed as None (bare "acp update" kind, empty reply tails)
+    // while the session worked. Both shapes must extract.
+
+    #[test]
+    fn spec_shape_params_nested() {
+        let v = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": "sess_1",
+                        "update": { "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": "spec text" } } }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("spec text"));
+        assert_eq!(update_kind(&v), "agent_message_chunk");
+    }
+
+    #[test]
+    fn spec_shape_params_nested_array_content() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "tool_call", "title": "edit" } }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("[tool] edit"));
+    }
+
+    #[test]
+    fn flattened_shape_still_works() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "flat" } }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("flat"));
     }
 }
