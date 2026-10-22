@@ -162,7 +162,24 @@ export class KnowledgeHub {
     for (const r of rows as any[]) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
-      if (meta.awaiting_ask) continue;
+      if (meta.awaiting_ask) {
+        // aging escalation: a task parked on a human answer must show its
+        // age, or the wait is invisible and unbounded. Annotate hourly;
+        // the release stays human-owned (an answered ask un-blocks it).
+        try {
+          const ask = this.one(`SELECT to_target, created_ts FROM asks WHERE id = ? AND status = 'open'`, meta.awaiting_ask.ask_id);
+          if (ask) {
+            const hours = Math.floor((now - ask.created_ts) / 3_600_000);
+            if (meta.awaiting_ask.annotated_h !== hours) {
+              meta.awaiting_ask.annotated_h = hours;
+              const base = String(meta.blocked?.reason ?? "").replace(/^⏳ blocked \d+h — .*? · /, "");
+              meta.blocked = { ...(meta.blocked ?? {}), reason: `⏳ blocked ${hours}h — awaiting ${ask.to_target ?? "human"} on ask ${meta.awaiting_ask.ask_id} · ${base}` };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            }
+          }
+        } catch { /* annotation is best-effort */ }
+        continue;
+      }
       // (A) declared grace: the agent stated a silence window — honor it until it lapses
       if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
       // (A2) declared subprocess window: the task is still in_progress, just
