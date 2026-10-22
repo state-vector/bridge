@@ -173,6 +173,7 @@ export class KnowledgeHub {
       }
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
+        meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
       );
       if (now - lastTs <= staleMs) continue;
       const openAsk = this.one(
@@ -756,6 +757,14 @@ export class KnowledgeHub {
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "orient": return this.json(await this.orient(body));
         case "progress.log": return this.json(await this.progressLog(body, actor));
+        case "session.alive": {
+          const row = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND type = 'task' AND status = 'in_progress'`, String(body.id ?? ""));
+          if (!row) return this.json({ ok: false, error: "task not in progress" });
+          const meta = JSON.parse(row.meta ?? "{}");
+          meta.session_alive_ts = Date.now();
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), row.id);
+          return this.json({ ok: true });
+        }
         case "settings.public": return this.json({ settings: this.publicSettings() });
         case "bootstrap": {
           const m = this.settingsMap();

@@ -1755,13 +1755,15 @@ fn tick(
     if !finished.is_empty() {
         snap_in_flight_list(snap, in_flight);
     }
-    // liveness heartbeat: a session whose stdout is moving is WORKING. Keep
-    // last_progress fresh (throttled to one note per ~4m per task, and only
-    // when the live line actually changed) so the watchdog's 10m stall
-    // release fires on genuinely dead sessions — not on long quiet stretches
-    // of real work. This is the churn epidemic's root fix: TASK-001 11x,
-    // BR#50 11x, BR#552 18x, BR#911 19x were all live sessions released as
-    // "stalled" because nothing mechanical kept their progress fresh.
+    // liveness vouch: a session whose stdout/ACP stream is moving is WORKING.
+    // Vouch via the session_alive op (watchdog signal only — no board event,
+    // no progress entry), throttled to one call per ~4m per task and only
+    // when the live line actually changed. The watchdog's 10m stall release
+    // then fires on genuinely dead sessions — not on long quiet stretches of
+    // real work (the churn epidemic: TASK-001 11x, BR#50 11x, BR#552 18x,
+    // BR#911 19x were all live sessions released as "stalled"). Agent
+    // narration keeps flowing over MCP log_progress as before; this is the
+    // runner vouching for the machinery underneath it.
     for inf in in_flight.iter() {
         let line = inf.live_line();
         let e = live_notes
@@ -1769,15 +1771,11 @@ fn tick(
             .or_insert_with(|| (line.clone(), Instant::now()));
         if e.0 != line {
             if e.1.elapsed() >= Duration::from_secs(240) {
-                let mins = inf.started.elapsed().as_secs() / 60;
                 let _ = mcp_call(
                     cfg,
                     id,
-                    "log_progress",
-                    json!({
-                        "id": inf.task_id,
-                        "did": format!("runner: session active ({mins}m) — {}", truncate(&line, 110)),
-                    }),
+                    "session_alive",
+                    json!({ "id": inf.task_id }),
                 );
                 e.1 = Instant::now();
             }

@@ -336,6 +336,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const h = await call("get_history", { id: args.id, limit: args.limit });
       return text(JSON.stringify(h, null, 1));
     }
+    case "session_alive": {
+      const a = await call("session.alive", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
+      return text(JSON.stringify(a));
+    }
     case "log_progress": {
       const a = await call("progress.log", { ...args, session: args.session ?? ctx.sessionName, token_id: identity.token_id });
       const hasGauges = args.completion_pct != null || args.confidence_pct != null || args.risk_pct != null || args.context_pct != null;
@@ -486,6 +490,15 @@ const TOOLS = [
       type: "object",
       required: ["id"],
       properties: { id: { type: "string" }, limit: { type: "integer", maximum: 50 } },
+    },
+  },
+  {
+    name: "session_alive",
+    description: "Runner-side liveness vouch: the session process is alive and producing output (stdout/ACP stream moved). Updates the watchdog liveness stamp only — no board event, no progress entry. Called by the runner, throttled; agents should use log_progress for narrative.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: { id: { type: "string", description: "task artefact id" } },
     },
   },
   {
