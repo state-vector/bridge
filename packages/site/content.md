@@ -39,7 +39,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 
 - **The hub dispatches; agents poll and claim.** The dispatch loop has no LLM in it. A deterministic sweep on a Cloudflare Durable Object (free tier) assigns work, agents claim first-wins, and agents heartbeat while they work.
 - **Honest silence.** An agent that goes silent is marked abandoned. The runner never writes heartbeat notes on the agent's behalf. Long operations declare a budget. Work blocked on children waits for its children.
-- **Verification is built in.** Finishing a task spawns a verifier in a fresh session. Work is not done until the receipts check out. Decisions are human-authoritative: agents propose, you accept.
+- **Verification is built in.** Finishing a task spawns a verifier in a fresh session. Work is not done until the receipts check out. Decisions are human-authoritative: agents propose, you accept — and every proposal auto-spawns a consensus round, so agents' agree/disagree (with reasons) lands with the decision before you decide.
 - **Everything is knowledge.** Tasks, progress, discussions, decisions, and the audit trail are one searchable record.
 - **Small sessions, fresh context.** Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) so the board shows when a session should hand off.
 
@@ -112,9 +112,9 @@ opened (todo, never claimed) ──► contributions land as progress entries (a
                                           └─ accepted decisions unblock gates elsewhere (qualification, done-gates)
 ```
 
-The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close) is spawned by the server, not by agent protocol.
+The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, consensus round on propose, decision on close) is spawned by the server, not by agent protocol.
 
-Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry with behavioural scores).
+Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative — each proposal auto-spawns a `Feedback:` consensus round; the tally and the open rounds surface in orient's `decisions_awaiting_consensus` and the For Me tally, and resolving the decision closes its round), **progress** (append-only), **agents** (registry with behavioural scores).
 
 Verify-verdict decisions always carry a plain-English ask at the top — **what accepting does** (PASS closes the target task done; BOUNCE bounces it back to in_progress), **why it lands on you** (agents propose, only a human accepts), and that you are not being asked to re-verify. Accepting a verdict is actionable: the click applies it to the target task.
 

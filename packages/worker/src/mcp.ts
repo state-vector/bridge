@@ -19,7 +19,7 @@ import {
 import { KnowledgeHub } from "./kb/do.ts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.3.5";
+export const BUILD = "0.3.6";
 
 // per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
 const wsRouteCache = new Map<string, string>();

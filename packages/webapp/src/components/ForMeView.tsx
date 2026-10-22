@@ -67,6 +67,68 @@ function Comment({ v }: { v: HistoryEntry }) {
   );
 }
 
+/** Verdict chip for a consensus contribution — mirrors the server's
+ *  tallyConsensus heuristic (dissent always surfaces). */
+function contributionVerdict(note: string): { label: string; cls: string } {
+  const negated = /\b(?:not|no|can't|cannot|won't|don't|doesn't|didn't|never)\b[\w\s,'’-]{0,40}?\bagree/i.test(note);
+  if (/\bdisagree/i.test(note) || negated) return { label: "disagree", cls: "chip-urgent" };
+  if (/\b(?:agree|concur|endorse|support)/i.test(note)) return { label: "agree", cls: "chip-done" };
+  return { label: "note", cls: "chip-scope" };
+}
+
+function ConsensusLine({ c }: { c: NonNullable<KbArtefact["consensus"]> }) {
+  return (
+    <p className="consensus-line">
+      <span className="chip chip-scope">CONSENSUS</span>
+      <span className="why-line">
+        {c.agree} agree · {c.disagree} disagree
+        {c.other > 0 ? ` · ${c.other} notes` : ""}
+        {" · "}{c.contributors.length} contributor{c.contributors.length === 1 ? "" : "s"}
+      </span>
+    </p>
+  );
+}
+
+/** Contributions on the decision's feedback round — the reasons behind the tally. */
+function ConsensusSection({ c }: { c: NonNullable<KbArtefact["consensus"]> }) {
+  const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  useEffect(() => {
+    let dead = false;
+    kbApi.history(c.round_id)
+      .then((r) => {
+        if (dead) return;
+        const contribs = (r.versions ?? []).filter((v) => v.action === "progress").reverse();
+        setEntries(contribs as HistoryEntry[]);
+      })
+      .catch(() => { if (!dead) setEntries([]); });
+    return () => { dead = true; };
+  }, [c.round_id, c.round_ts]);
+
+  return (
+    <>
+      <h3 className="forme-sub">Agent consensus · {c.agree} agree · {c.disagree} disagree</h3>
+      <div className="forme-comments">
+        {entries === null && <p className="empty">loading…</p>}
+        {entries !== null && entries.length === 0 && <p className="empty">no agent contributions yet — the round is open</p>}
+        {(entries ?? []).map((v) => {
+          const note = (v.data?.note as string | undefined) ?? v.summary;
+          const verdict = contributionVerdict(note ?? "");
+          return (
+            <div key={v.seq} className="resp">
+              <div className="ask-chips">
+                <span className={`chip ${verdict.cls}`}>{verdict.label.toUpperCase()}</span>
+                <span className="resp-actor">{v.actor}</span>
+                <span className="why-line">{rel(v.ts)}</span>
+              </div>
+              <div className="resp-body md-body" dangerouslySetInnerHTML={{ __html: md(note ?? "") }} />
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
   const tasks = useKb((s) => s.tasks) as any[];
   const { busy: actBusy, act } = useDecisionAct(d, onChanged);
@@ -179,6 +241,8 @@ function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: ()
           );
         })()}
 
+        {d.consensus && <ConsensusSection c={d.consensus} />}
+
         <h3 className="forme-sub">Comments</h3>
         <div className="forme-comments">
           {(comments ?? []).length === 0 && comments !== null && <p className="empty">no comments yet</p>}
@@ -263,6 +327,7 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
             : d.title;
         })()}
       </h3>
+      {d.consensus && <ConsensusLine c={d.consensus} />}
       <ActionRow>
         {(() => {
           const f = decisionFrame(d);
@@ -301,6 +366,7 @@ function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior:
       <h3 className="ask-question" onClick={() => void 0}>
         {(verdict === "bounce" ? `Bounce ${target}` : `Accept verification of ${target}`).slice(0, 110)}
       </h3>
+      {latest.consensus && <ConsensusLine c={latest.consensus} />}
       {prior.length > 0 && (
         <p className="why-line" style={{ margin: "2px 0" }}>
           <Btn size="sm" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
@@ -324,6 +390,7 @@ function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => 
   const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
   return (
     <>
+      {d.consensus && <ConsensusLine c={d.consensus} />}
       <ActionRow>
         <Btn variant="accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</Btn>
         <Btn variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>

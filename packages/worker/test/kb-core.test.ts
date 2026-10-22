@@ -134,6 +134,38 @@ describe("limits", () => {
   });
 });
 
+import { tallyConsensus } from "../src/kb/core.ts";
+
+describe("decision consensus tally (BR#903)", () => {
+  it("counts agree / disagree / neutral, contributors distinct", () => {
+    const t = tallyConsensus([
+      { actor: "a1", note: "agree — the round pattern mirrors Verify children" },
+      { actor: "a2", note: "disagree — asks already cover this; reasons: dup channel" },
+      { actor: "a1", note: "agree" },
+      { actor: "a3", note: "what happens to the round when the decision is superseded?" },
+    ]);
+    expect(t.agree).toBe(2);
+    expect(t.disagree).toBe(1);
+    expect(t.other).toBe(1);
+    expect(t.contributors).toEqual(["a1", "a2", "a3"]);
+  });
+
+  it("dissent always surfaces: disagree beats agree, negated agree counts as disagree", () => {
+    expect(tallyConsensus([{ note: "disagree with the gate" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "I don't agree with the marker approach" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "cannot agree with this as written" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "I don't agree, I disagree" }]).disagree).toBe(1);
+  });
+
+  it("affirmatives in the wild count as agree; empty/null entries are safe", () => {
+    expect(tallyConsensus([{ note: "I concur with the proposal" }]).agree).toBe(1);
+    expect(tallyConsensus([{ note: "endorse — ship it" }]).agree).toBe(1);
+    expect(tallyConsensus([])).toEqual({ agree: 0, disagree: 0, other: 0, contributors: [] });
+    expect(tallyConsensus(null)).toEqual({ agree: 0, disagree: 0, other: 0, contributors: [] });
+    expect(tallyConsensus([{ note: "" }, { note: "   " }]).other).toBe(0);
+  });
+});
+
 import { cosine, hybridMerge } from "../src/kb/core.ts";
 
 describe("semantic helpers", () => {
