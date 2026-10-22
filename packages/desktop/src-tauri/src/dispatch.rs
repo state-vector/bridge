@@ -1675,6 +1675,7 @@ fn tick(
     avail: &mut Vec<opencode::Backend>,
     last_avail_ok: &mut bool,
     breaker: &mut CircuitBreaker,
+    live_notes: &mut HashMap<String, (String, Instant)>,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
 
@@ -1754,11 +1755,42 @@ fn tick(
     if !finished.is_empty() {
         snap_in_flight_list(snap, in_flight);
     }
+    // liveness heartbeat: a session whose stdout is moving is WORKING. Keep
+    // last_progress fresh (throttled to one note per ~4m per task, and only
+    // when the live line actually changed) so the watchdog's 10m stall
+    // release fires on genuinely dead sessions — not on long quiet stretches
+    // of real work. This is the churn epidemic's root fix: TASK-001 11x,
+    // BR#50 11x, BR#552 18x, BR#911 19x were all live sessions released as
+    // "stalled" because nothing mechanical kept their progress fresh.
+    for inf in in_flight.iter() {
+        let line = inf.live_line();
+        let e = live_notes
+            .entry(inf.task_id.clone())
+            .or_insert_with(|| (line.clone(), Instant::now()));
+        if e.0 != line {
+            if e.1.elapsed() >= Duration::from_secs(240) {
+                let mins = inf.started.elapsed().as_secs() / 60;
+                let _ = mcp_call(
+                    cfg,
+                    id,
+                    "log_progress",
+                    json!({
+                        "id": inf.task_id,
+                        "did": format!("runner: session active ({mins}m) — {}", truncate(&line, 110)),
+                    }),
+                );
+                e.1 = Instant::now();
+            }
+            e.0 = line;
+        }
+    }
+
     for (mut inf, outcome) in finished {
         // BR#2460: scratch dirs are disposable on every exit path (yield
         // included) — the board is the only deliverable, and a resumed run
         // gets a fresh scratch dir. Unlike worktrees, they hold no resume
         // assets.
+        live_notes.remove(&inf.task_id);
         if let Some(s) = inf.scratch.take() {
             let _ = std::fs::remove_dir_all(s);
         }
@@ -2344,6 +2376,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut avail: Vec<opencode::Backend> = Vec::new();
     let mut last_avail_ok = true;
     let mut breaker = CircuitBreaker::default();
+    let mut live_notes: HashMap<String, (String, Instant)> = HashMap::new();
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -2374,6 +2407,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut avail,
             &mut last_avail_ok,
             &mut breaker,
+            &mut live_notes,
         ) {
             Ok(msgs) => {
                 for msg in msgs {
