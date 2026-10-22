@@ -1676,7 +1676,7 @@ fn tick(
     avail: &mut Vec<opencode::Backend>,
     last_avail_ok: &mut bool,
     breaker: &mut CircuitBreaker,
-    live_notes: &mut HashMap<String, (String, Instant)>,
+    live_notes: &mut HashMap<String, (String, Instant, Instant)>,
     gated_announced: &mut HashSet<String>,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
@@ -1770,8 +1770,22 @@ fn tick(
         let line = inf.live_line();
         let e = live_notes
             .entry(inf.task_id.clone())
-            .or_insert_with(|| (line.clone(), Instant::now()));
+            .or_insert_with(|| (line.clone(), Instant::now(), Instant::now()));
         if e.0 != line {
+            // operator-visible chatter: the agent's latest output line, head
+            // only, throttled to 1/60s per task. A quiet console here reads
+            // as "hung" to anyone watching (fleet incident 2026-10-22: three
+            // healthy sessions declared timed out looked dead because none
+            // of their output was visible until the verdict).
+            if e.2.elapsed() >= Duration::from_secs(60) && !line.is_empty() {
+                eprintln!(
+                    "[dispatch] {} · {}m in · {}",
+                    inf.task_id,
+                    inf.started.elapsed().as_secs() / 60,
+                    line
+                );
+                e.2 = Instant::now();
+            }
             if e.1.elapsed() >= Duration::from_secs(240) {
                 let _ = mcp_call(
                     cfg,
@@ -2393,7 +2407,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut avail: Vec<opencode::Backend> = Vec::new();
     let mut last_avail_ok = true;
     let mut breaker = CircuitBreaker::default();
-    let mut live_notes: HashMap<String, (String, Instant)> = HashMap::new();
+    let mut live_notes: HashMap<String, (String, Instant, Instant)> = HashMap::new();
     // gated tasks announce ONCE per app run — visibility without a flood
     let mut gated_announced: HashSet<String> = HashSet::new();
     eprintln!(

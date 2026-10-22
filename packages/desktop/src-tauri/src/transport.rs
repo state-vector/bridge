@@ -224,6 +224,15 @@ impl AgentTransport for OpencodeRun {
 pub struct OpencodeAcp;
 
 const ACP_UNAVAILABLE: &str = "ACP_UNAVAILABLE:";
+/// A session that produces no output for this long is hung — model thinking
+/// gaps run tens of seconds, never minutes. Applies BEFORE the task budget
+/// (a hung spawner fails in minutes, not 30) and as the grace AFTER it: a
+/// session still producing output past its budget gets one stall window to
+/// finish, then is cut. The old post-budget cliff (1s) killed healthy
+/// chattering sessions mid-work and read as "acp timed out" with the agent
+/// actually fine (fleet incident 2026-10-22: three green implementations
+/// declared timed out; circuit breaker tripped on false failures).
+const ACP_STALL: Duration = Duration::from_secs(300);
 
 impl AgentTransport for OpencodeAcp {
     fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
@@ -294,9 +303,26 @@ impl AgentTransport for OpencodeAcp {
                 .and_then(|_| stdin.write_all(b"\n"))
                 .and_then(|_| stdin.flush())
                 .map_err(|e| format!("acp stdin write failed: {e}"))?;
+            let mut last_line = Instant::now();
             loop {
-                let left = deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::from_secs(1));
-                let line = rx.recv_timeout(left).map_err(|_| "acp timed out".to_string())?;
+                // wait until whichever comes first: the stall window closing
+                // (no output for 5m — hung) or the hard ceiling (budget +
+                // one stall window of post-budget grace for live sessions)
+                let now = Instant::now();
+                let stall_end = last_line + ACP_STALL;
+                let hard_end = deadline + ACP_STALL;
+                let left = hard_end
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO)
+                    .min(stall_end.checked_duration_since(now).unwrap_or(Duration::ZERO));
+                let line = rx.recv_timeout(left).map_err(|_| {
+                    if now >= stall_end {
+                        "acp timed out — stalled: no output for 5m".to_string()
+                    } else {
+                        "acp timed out (budget + grace exhausted)".to_string()
+                    }
+                })?;
+                last_line = Instant::now();
                 on_line(&line);
                 let v: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
