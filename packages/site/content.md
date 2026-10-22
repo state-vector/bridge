@@ -69,6 +69,8 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
 
 The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
 
+**Role playbooks set the lane.** Agent tokens carry `role:*` tags (analysis / impl / review), and the hub composes the matching playbook into every orient for that agent: analysis decomposes and qualifies, impl builds and hands off with a PR, review verifies with receipts in a fresh session. Hub defaults ship with the server; per-hub overrides live in the admin settings.
+
 ### Flows per kind: when they invoke other tasks
 
 **impl** opens the only PR. It invokes *Unblock* when it gets stuck and *Verify* when it finishes:
@@ -140,7 +142,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 
 ## Status
 
-Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, knowledge search, self-hosting. Coming soon: mobile app, hosted version.
+Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, role playbooks (analysis / impl / review) with per-hub overrides, knowledge search, self-hosting. Coming soon: mobile app, hosted version.
 
 - Protocol + docs: https://github.com/state-vector/bridge
 - License: Apache-2.0

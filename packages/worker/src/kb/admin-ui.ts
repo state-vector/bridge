@@ -1,8 +1,16 @@
 /**
  * Admin page for the knowledge layer (human plane, password session):
- * mint/revoke agent auth tokens, see connected agents + sessions, project flags.
- * Server-rendered shell + fetch calls to /api/kb/admin/* — no build step.
+ * mint/revoke agent auth tokens, see connected agents + sessions, project flags,
+ * role playbooks. Server-rendered shell + fetch calls to /api/kb/admin/* — no build step.
  */
+import { DEFAULT_ROLE_PLAYBOOKS } from "./core.ts";
+
+/** Hub defaults inlined for display; escaped so they can sit inside the page's script. */
+const ROLE_DEFAULTS_JSON = JSON.stringify(DEFAULT_ROLE_PLAYBOOKS)
+  .replace(/\\/g, "\\\\")
+  .replace(/`/g, "\\`")
+  .replace(/\$\{/g, "\\${");
+
 export const ADMIN_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -66,7 +74,22 @@ export const ADMIN_HTML = `<!doctype html>
   <p class="muted">Agents receive this via the MCP <code class="inline">instructions</code> on connect and inside <code class="inline">orient</code> — the entry prompt only teaches discovery; docs stay in artefacts.</p>
 </div>
 
+<div class="card">
+  <h2>Roles &amp; playbooks</h2>
+  <p class="muted">Agent tokens carry <code class="inline">role:*</code> tags; the hub composes the matching playbook into every orient for that agent (under <code class="inline">YOUR ROLE</code>). Hub defaults live in <code class="inline">packages/worker/src/kb/core.ts</code> (<code class="inline">DEFAULT_ROLE_PLAYBOOKS</code>). Override a lane below; clear a playbook and save to reset it to the hub default.</p>
+  <label>role:analysis playbook (blank = hub default)</label><textarea id="s-role-analysis" rows="6" placeholder="blank = hub default"></textarea>
+  <label>role:impl playbook (blank = hub default)</label><textarea id="s-role-impl" rows="3" placeholder="blank = hub default"></textarea>
+  <label>role:review playbook (blank = hub default)</label><textarea id="s-role-review" rows="3" placeholder="blank = hub default"></textarea>
+  <details>
+    <summary class="muted" style="cursor:pointer; margin-top:8px;">Hub defaults</summary>
+    <pre id="s-role-defaults" class="muted" style="white-space:pre-wrap;"></pre>
+  </details>
+  <p><button onclick="saveRoles()">Save roles</button> <span id="s-roles-msg"></span></p>
+</div>
+
 <script>
+const ROLES = ["analysis", "impl", "review"];
+const ROLE_DEFAULTS = ${ROLE_DEFAULTS_JSON};
 const j = async (u, o) => { const r = await fetch(u, { credentials: "include", headers: { "content-type": "application/json" }, ...o }); const b = await r.json().catch(() => ({})); if (!r.ok) throw new Error(b.error || r.status); return b; };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ago = (ts) => ts ? Math.round((Date.now() - ts) / 60000) + "m ago" : "never";
@@ -100,6 +123,9 @@ async function loadSettings() {
   document.getElementById("s-board-url").value = board.url ?? "";
   document.getElementById("s-board-prompt").value = board.prompt ?? "";
   document.getElementById("s-bootstrap").value = s.bootstrap_md ?? "";
+  const roles = s.roles || {};
+  for (const r of ROLES) document.getElementById("s-role-" + r).value = typeof roles[r] === "string" ? roles[r] : "";
+  document.getElementById("s-role-defaults").textContent = ROLES.map(r => "role:" + r + "\n" + (ROLE_DEFAULTS[r] ?? "")).join("\n\n");
   boardExtra();
 }
 function boardExtra() { document.getElementById("s-board-extra").style.display = document.getElementById("s-board-mode").value === "external" ? "block" : "none"; }
@@ -112,6 +138,14 @@ async function saveSettings() {
     }})});
     document.getElementById("s-msg").innerHTML = '<span class="ok">saved</span>';
   } catch (e) { document.getElementById("s-msg").innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+async function saveRoles() {
+  try {
+    await j("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings: {
+      roles: Object.fromEntries(ROLES.map(r => [r, document.getElementById("s-role-" + r).value])),
+    }})});
+    document.getElementById("s-roles-msg").innerHTML = '<span class="ok">saved</span>';
+  } catch (e) { document.getElementById("s-roles-msg").innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
 }
 document.getElementById("s-board-mode").addEventListener("change", boardExtra);
 load(); loadSettings();

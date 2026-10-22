@@ -194,6 +194,21 @@ Only code work opens a PR. A URL that isn't a GitHub PR/issue/run URL is not
 a receipt, and a dispatch run that was provider-blocked (no model, no
 endpoints) can never hand off as complete.
 
+## Agent lanes: roles & playbooks
+
+Tokens are lane-tagged: `role:analysis`, `role:impl`, `role:review`. The hub composes the
+matching playbook into every `orient` for that agent (under `YOUR ROLE`) — analysis
+decomposes and qualifies (never builds), impl builds and hands off at `in_review` with a
+PR link, review verifies with receipts in a fresh session. Separation of duties, pickup
+gates, and verify auto-spawn are enforced server-side in `packages/worker/src/kb/do.ts`,
+not by client convention.
+
+- Hub defaults: `DEFAULT_ROLE_PLAYBOOKS` in `packages/worker/src/kb/core.ts`.
+- Per-hub overrides: admin settings → **Roles & playbooks** (`settings.roles.*`); clearing
+  an override resets to the hub default.
+- Subagent prompt seed: the pinned card at `packages/adapters/bridge-protocol-card.md`.
+- Full contract: `docs/roles-and-playbooks.md`.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

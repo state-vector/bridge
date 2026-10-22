@@ -306,6 +306,21 @@ export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
   review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.`,
 };
 
+/**
+ * Effective playbook for a role tag: a non-blank settings.roles.<role> override
+ * wins; a blank override (or unknown role) falls back to the hub default. Blank
+ * must mean "reset to default", not "remove the playbook" — a plain ?? lookup
+ * would let a cleared override silently drop the playbook from orient.
+ */
+export function resolveRolePlaybook(
+  rolesSettings: Record<string, unknown> | undefined,
+  role: string,
+): string {
+  const v = rolesSettings?.[role];
+  if (typeof v === "string" && v.trim()) return v.trim();
+  return DEFAULT_ROLE_PLAYBOOKS[role] ?? "";
+}
+
 // ---------- progress sentiment (board aliveness) ----------
 
 export const SENTIMENTS = ["going_well", "neutral", "struggling", "converging", "diverging"] as const;
