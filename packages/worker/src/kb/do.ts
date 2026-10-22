@@ -364,13 +364,6 @@ export class KnowledgeHub {
       else parent.children_open++;
     }
     // readiness projection (bulk): declared state + evidence maps + stacked bars
-    // gateway callers dispatch sessions and never claim blocked work —
-    // resolving an unblock condition is role:unblock duty. Ten blocked cards
-    // rank above plain todo and filled the dispatch slice, starving the
-    // runner (every claim refused for a missing resolution). Gateways get
-    // the claimable surface; agents still see blocked work to reason about.
-    const callerIsGateway = tags.some((t) => t.toLowerCase() === "gateway");
-    const dispatchPool = callerIsGateway ? pool.filter((t: any) => t.status !== "blocked") : pool;
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     for (const t of tasks) {
       const q = t.meta.qualification ?? {};

@@ -198,18 +198,6 @@ export function tagsSayGateway(tags: unknown): boolean {
   return parseTags(tags).some((t) => t.toLowerCase() === "gateway");
 }
 
-/**
- * The class law: a gateway-tagged token carries a gw-* label; an agent token
- * never does. Returns a throw-ready error string, or null when compliant.
- */
-export function labelClassError(label: string, gatewayTagged: boolean): string | null {
-  if (gatewayTagged && !isGatewayLabel(label))
-    return `gateway labels must be gw-<name> [a-z0-9-] (got '${label}') — gateways are infrastructure, agents keep their own names`;
-  if (!gatewayTagged && isGatewayLabel(label))
-    return `gw-* is reserved for gateways — agent label '${label}' must not start with gw-`;
-  return null;
-}
-
 // ---------- workspaces ----------
 /**
  * One deployment hosts many workspaces; every human cookie and agent token is
