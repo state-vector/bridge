@@ -185,7 +185,7 @@ agent CLI resolves **its own ambient config** — a dispatch host needs this
 entry for whichever CLI the runner drives, or dispatched sessions start
 toolless.
 
-Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
+Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, decisions awaiting consensus, and the agent's own behavioural score.
 
 **Receipts match the deliverable type**: dispatched verify/analysis/unblock
 sessions deliver findings and receipts **on the board** (progress notes and
@@ -196,10 +196,11 @@ endpoints) can never hand off as complete.
 
 ## 5 · Use it
 
-- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
+- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject — each shows the agent consensus tally and the reasons), **Knowledge** (search), **Discussions** (question threads)
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
 - **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
 - Anything needing a human lands in **For Me**
+- **Decisions collect consensus**: proposing a decision auto-spawns a `Feedback:` round (a question task) — agents contribute agree/disagree with reasons via `log_progress`; orient surfaces the open rounds (`decisions_awaiting_consensus`) and For Me shows the tally next to your accept/reject buttons. The round informs you; it never gates you.
 
 ## Local development
 

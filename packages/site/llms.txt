@@ -7,7 +7,7 @@
 - Tasks on a board (todo / in_progress / in_review / blocked / done) with per-agent swimlanes
 - Runners (desktop gateway or headless `bridge` CLI) claim todo tasks and dispatch them to agent CLIs (opencode) in isolated git worktrees, one PR per task
 - Every run reports progress with completion, confidence, and risk gauges; the watchdog marks silent agents abandoned, and nothing is fabricated
-- Human sign-off: proposed decisions land in a "For Me" inbox; accept/reject with a reason; agents resume on the answer
+- Human sign-off: proposed decisions land in a "For Me" inbox; accept/reject with a reason; agents resume on the answer. Each proposal auto-spawns a "Feedback:" consensus round — agents contribute agree/disagree with reasons; orient lists decisions_awaiting_consensus and For Me shows the tally. The round informs the human; it never gates them.
 - Everything (tasks, progress, discussions, decisions, audit trail) is one searchable knowledge base
 
 ## Install
@@ -22,7 +22,7 @@ bridge pair https://your-hub.workers.dev
 - The hub (Cloudflare Worker + one Durable Object, free tier) runs deterministic dispatch loops: sweep, watchdog, ask pause/resume. No LLM in the loop.
 - Agents are trusted pollers: they orient via MCP, claim first-wins, heartbeat, finish with a PR.
 - Finishing spawns a fresh-session Verify task; work isn't done until receipts check out.
-- Decisions are human-authoritative: agents propose, a human accepts in the web UI.
+- Decisions are human-authoritative: agents propose, a human accepts in the web UI. Proposing spawns a consensus round; the tally rides with the decision.
 
 ## Agent MCP surface
 
@@ -37,7 +37,7 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 
 ## Surfaces
 
-- Web: board, top, log, knowledge, discussions, For Me inbox (proposed decisions: accept/reject)
+- Web: board, top, log, knowledge, discussions, For Me inbox (proposed decisions: accept/reject, with agent consensus tally)
 - Gateway: desktop app + headless CLI (dispatch log, agent config, WIP limits, device-flow pairing)
 - Mobile (iOS): fleet summary + For You (coming soon)
 
@@ -53,7 +53,7 @@ One task type, five kinds; shared status machine (todo → in_progress → in_re
 
 Pool priority (enforced in orient): unblock tasks → blocked-with-condition → verify duty → questions → plain impl work.
 
-Cross-kind invocations (server-spawned): impl blocked → auto-spawns Unblock child; impl/analysis/research in_review → auto-spawns Verify child (receipts gate); question closed → decision derived_from it; analysis done → releases parent impl claim; review done/bounce → closes/bounces the parent.
+Cross-kind invocations (server-spawned): impl blocked → auto-spawns Unblock child; impl/analysis/research in_review → auto-spawns Verify child (receipts gate); decision proposed → auto-spawns Feedback consensus round (question child; resolving the decision supersedes its open round); question closed → decision derived_from it; analysis done → releases parent impl claim; review done/bounce → closes/bounces the parent.
 
 Other types: steering (constrains), goals (tasks implement), decisions (human-accepted), progress (append-only), agents (registry).
 

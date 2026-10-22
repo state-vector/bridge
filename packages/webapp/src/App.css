@@ -383,6 +383,9 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .forme-item { cursor: default; }
 .forme-link { cursor: pointer; }
 .forme-link:hover { border-color: var(--accent); }
+/* agent consensus on a proposed decision (BR#903): tally line on the row */
+.consensus-line { margin: 4px 0 0; display: flex; align-items: center; gap: 8px; }
+.consensus-line .why-line { color: var(--text-dim); font-size: 12px; }
 
 /* markdown rendering (decisions, comments) */
 .md-body { font-size: 12.5px; line-height: 1.5; color: var(--text); }
