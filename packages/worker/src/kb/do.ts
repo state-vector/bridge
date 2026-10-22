@@ -2602,6 +2602,18 @@ export class KnowledgeHub {
     const code = String(body.code ?? "").trim().toUpperCase();
     const ws = String(body.ws ?? "").trim();
     const label = String(body.label ?? "").trim();
+    const login = String(body.login ?? "").toLowerCase();
+    const row = this.one(`SELECT code, created_ts, status, device, type, device_id FROM pairings WHERE code = ?`, code);
+    if (!row || row.status !== "pending") throw new Error("pairing code not pending");
+    if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
+      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
+      throw new Error("pairing code expired");
+    }
+    // class was declared by the DEVICE at pair/start — the approver cannot
+    // change it, only name the identity and pick the workspace
+    const gateway = row.type === "gateway";
+    const tags = gateway ? ["gateway"] : Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
+    if (!isWsSlug(ws)) throw new Error("bad workspace slug");
     // reserved roots: _-prefixed labels are system namespaces (_direct for
     // directly connected agents) — a gateway may not take one, so
     // _direct/* ownership can never be impersonated by a paired device
