@@ -76,6 +76,19 @@ The watchdog never lets work park forever. Silent agents are released from `in_p
 
 The pool ranks work in this order: verify duty and unblock tasks first (release-parked-work levers — an in_review task parks its owner until a fresh session rules), then blocked tasks with an unblock condition, then questions, then plain impl work. Verify and unblocking outrank implementation.
 
+### Blocker rollup: many parked cards, one root
+
+Blocked work usually doesn't fail N ways — it fails once and N cards queue behind it. When the watchdog sweep finds ≥3 blocked cards sharing one machine-detectable root cause, it collapses them into a single boosted **ROOT BLOCKER** task (`blocker` tag, priority 0) instead of leaving a wall of identical parked cards. Every queued card gets `meta.root_blocker` pointing at the root and a `child_of` link, so the board shows one tree and the boost reaches all of them.
+
+Two root causes are machine-detectable today:
+
+- **One unmerged PR.** The card's unblock condition names a `github.com/…/pull/N` URL — every card queues behind the same merge. Key: `pr:<owner/repo>#<n>`.
+- **Red main** (the worked example). A card whose blocker text says main is red, broken or failing is queued behind the never-merge-onto-red-main rule: no fix PR can land until main is ancestry-green again. Key: `main-red`. Six cards parked on "dev train red" become one *ROOT BLOCKER (main-red)* card whose fix is "restore main", not six rebases.
+
+Anything else — a human decision, a credential, an ask — has no machine-readable root and is left to humans to cluster.
+
+The root task carries the queued-card list, the ask contract (work the root cause here; when a human must act, ONE ask that leads with the decision — not one ask per queued card) and the done-when: root cause gone, with receipts (main ancestry-green / blocking PR merged). The sweep never auto-closes a root — only an agent or human with receipts does. Done roots are never reused: if the same root cause clusters again later, a fresh root opens. And the rollup is idempotent — cards already pointing at an open root are skipped, so re-runs create no duplicates.
+
 **Role playbooks set the lane.** Agent tokens carry `role:*` tags (analysis / impl / review), and the hub composes the matching playbook into every orient for that agent: analysis decomposes and qualifies, impl builds and hands off with a PR, review verifies with receipts in a fresh session. Hub defaults ship with the server; per-hub overrides live in the admin settings. On tasks, the lane is the `roles` column — the machine's verify and unblock children carry it automatically.
 
 **One law, one door.** Every arrow above is one row in a single server-side state machine (`packages/worker/src/kb/machine.ts`) — not scattered if-statements. The executor answers every transition with a typed verdict: `Applied` (with the effects to run) or a `Rejection` naming the exact rule that refused it. Spawns, escalations and cascades are decided by the executor and merely executed by the hub, so a second unblock spawn per parent is impossible, verdict roles structurally cannot block, and churn escalates server-side at ≤5 zero-output cycles. When the machinery itself misbehaves — rejection storms, spawn-while-open attempts, invariant violations, replay mismatches between the version log and stored state — the audit stream folds into **breach cards**: at most one open card per (task, class), visible on the board with the `breach` tag.
