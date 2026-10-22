@@ -2680,6 +2680,12 @@ export class KnowledgeHub {
     if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
+    // a namespaced label (<gateway>/<agent>) may only live under the
+    // provisioning gateway's own prefix — otherwise an agent label could
+    // squat inside another gateway's ownership glob
+    if (label.includes("/") && !label.startsWith(`${caller}/`)) {
+      throw new Error(`namespaced label '${label}' must live under the provisioning gateway's own namespace ('${caller}/...')`);
+    }
     const rotate = body.rotate === true;
     const ts = Date.now();
     const existing = this.one(`SELECT id, revoked_ts FROM auth_tokens WHERE label = ?`, label);
@@ -2714,6 +2720,7 @@ export class KnowledgeHub {
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    if (label.includes("/")) throw new Error("labels cannot contain '/' — the separator is reserved for gateway-namespaced workers (minted by gateways, not here)");
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     // Replace semantics (pairing is an approval): the same machine re-pairing
     // rotates its token — renamed or not — and re-using a label REPLACES the

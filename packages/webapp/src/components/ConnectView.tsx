@@ -129,6 +129,10 @@ export function ConnectView() {
   };
 
   const addAgent = async () => {
+    if (label.includes("/")) {
+      setMsg("agent names cannot contain '/' — the separator is reserved for gateway-namespaced workers");
+      return;
+    }
     try {
       const t = await mint(label.trim(), [], "mcp");
       setSetupFor({ label: t.label, secret: t.secret });

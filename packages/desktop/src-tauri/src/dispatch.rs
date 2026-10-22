@@ -1691,20 +1691,26 @@ fn tick(
 
     // dispatchability gate: re-check every tick (cheap: one --version per
     // backend). No dispatchable agent -> never claim, never orient; drain
-    // finished sessions only. Edge-detected so the state change is loud once.
+    // in-flight sessions, then EXIT non-zero. This is fatal, not a wait
+    // state: the old behaviour edge-printed the error once and sat silent
+    // behind a "healthy" systemd unit for hours (hermes, 2026-10-23 — the
+    // single stderr line landed in an unreadable journal). Now: loud every
+    // tick while draining, then exit(1) — systemd reports the failure and
+    // Restart=on-failure retries every 10s, re-reporting until fixed.
     *avail = available_backends(cfg);
     let avail_ok = !avail.is_empty();
-    if avail_ok != *last_avail_ok {
-        if !avail_ok {
-            let msg = "no dispatchable agents (CLI missing/unrunnable or model unconfigured) — NOT claiming work until one is available; run `bridge doctor`";
-            eprintln!("[dispatch] {msg}");
-            snap_activity(snap, "error", msg);
-        } else {
-            eprintln!("[dispatch] agents available — resuming claims");
-            snap_activity(snap, "info", "agents available — resuming claims");
+    if !avail_ok {
+        let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
+        eprintln!("[dispatch] {msg}");
+        snap_activity(snap, "error", msg);
+        if in_flight.is_empty() {
+            std::process::exit(1);
         }
-        *last_avail_ok = avail_ok;
+    } else if !*last_avail_ok {
+        eprintln!("[dispatch] agents available — resuming claims");
+        snap_activity(snap, "info", "agents available — resuming claims");
     }
+    *last_avail_ok = avail_ok;
 
     // worktree hygiene: every 10 ticks reconcile disk worktrees with task
     // state — done/released tasks must not hold ~/.bridge/worktrees/<slug>

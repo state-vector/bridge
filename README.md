@@ -105,7 +105,10 @@ edit by hand — settings in the desktop app apply by updating the same file):
   "backends": {                        // provider sections — each carries its own config
     "opencode": {                      // model optional: unset = opencode's own default config
       "model": "openrouter/~anthropic/claude-haiku-latest",
-      "agent": "reviewer"              // optional agent profile
+      "agent": "reviewer",             // optional agent profile
+      "bin": "/home/me/.local/bin/opencode", // CLI binary override — ABSOLUTE path strongly
+                                             // recommended under systemd (minimal PATH)
+      "mode": "acp"                    // transport: "acp" (default, live session updates) | "stdio"
     },
     "kiro": {                          // profile-driven: the kiro profile pins provider+model
     }
@@ -117,6 +120,8 @@ edit by hand — settings in the desktop app apply by updating the same file):
   "isolate": true                      // per-task git worktrees + PR branch
 }
 ```
+
+If no agent CLI is dispatchable, the runner says so loudly every tick and **exits non-zero once in-flight sessions drain** — `systemctl status bridge` shows the failure and `Restart=on-failure` retries every 10s until you fix it (`bridge doctor` diagnoses). Under systemd, use absolute `bin` paths or a `PATH` override for the unit: the service does not inherit your shell's PATH.
 
 Notes:
 

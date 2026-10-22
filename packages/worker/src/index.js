@@ -120,17 +120,19 @@ export default {
       return handleMcp(request, env);
     }
 
-    // Knowledge realtime (human plane, cookie): KB event fanout.
+    // Knowledge realtime (human plane, cookie | gateway bearer): KB event fanout.
     if (url.pathname === "/kb-ws") {
-      const auth = await checkAuth(request, env);
-      if (auth instanceof Response) return auth;
-      return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
+      if (request.method === "OPTIONS") return kbPreflight();
+      const auth = await authKb(request, env);
+      if (auth instanceof Response) return kbCors(auth);
+      return kbCors(env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request));
     }
 
-    // Knowledge REST mirror (human plane, cookie).
+    // Knowledge REST mirror (human plane, cookie | gateway bearer).
     if (url.pathname.startsWith("/api/kb/") && !url.pathname.startsWith("/api/kb/admin/")) {
-      const auth = await checkAuth(request, env);
-      if (auth instanceof Response) return auth;
+      if (request.method === "OPTIONS") return kbPreflight();
+      const auth = await authKb(request, env);
+      if (auth instanceof Response) return kbCors(auth);
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
@@ -144,19 +146,19 @@ export default {
           : sub === "history" ? "https://kb/history"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
-        if (!kbUrl) return new Response("not found", { status: 404 });
-        return env.KB.get(kbId).fetch(kbUrl + url.search, request);
+        if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
+        return kbCors(env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost"].includes(sub) ? sub : null;
-        if (!op) return new Response("not found", { status: 404 });
+        if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = "web";
-        return env.KB.get(kbId).fetch(`https://kb/${op}`, {
+        body.actor = auth.bearer ? "gateway" : "web";
+        return kbCors(env.KB.get(kbId).fetch(`https://kb/${op}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        });
+        }));
       }
     }
 
@@ -369,6 +371,35 @@ const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
 
 function githubConfigured(env) {
   return !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
+}
+
+/** Cookie-first auth with gateway-token fallback for the knowledge web plane.
+ *  The desktop shell (and any native webview) holds a gateway token, not a hub
+ *  session cookie — this lets it read/write the same KB plane the webapp uses.
+ *  Admin routes intentionally stay on checkAuth (cookie-only). */
+async function authKb(request, env) {
+  const session = await checkAuth(request, env);
+  if (!(session instanceof Response)) return session;
+  const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "")
+    || new URL(request.url).searchParams.get("token") || "";
+  if (!bearer) return session;
+  const { resolveTokenWs } = await import("./mcp.ts");
+  let ws;
+  try { ws = await resolveTokenWs(env, bearer); } catch { return session; }
+  if (!ws) return session;
+  return { login: null, ws, bearer: true };
+}
+
+/** Native shells hit the hub cross-origin — bearer auth needs no credentials,
+ *  so a permissive CORS policy on the (non-admin) knowledge plane is safe. */
+function kbCors(r) {
+  r.headers.set("Access-Control-Allow-Origin", "*");
+  r.headers.set("Access-Control-Allow-Headers", "authorization, content-type");
+  r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  return r;
+}
+function kbPreflight() {
+  return kbCors(new Response(null, { status: 204 }));
 }
 
 async function checkAuth(request, env) {
