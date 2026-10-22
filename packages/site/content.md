@@ -69,6 +69,8 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
 
 The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.
 
+**One law, one door.** Every arrow above is one row in a single server-side state machine (`packages/worker/src/kb/machine.ts`) — not scattered if-statements. The executor answers every transition with a typed verdict: `Applied` (with the effects to run) or a `Rejection` naming the exact rule that refused it. Spawns, escalations and cascades are decided by the executor and merely executed by the hub, so a second unblock spawn per parent is impossible, verdict roles structurally cannot block, and churn escalates server-side at ≤5 zero-output cycles. When the machinery itself misbehaves — rejection storms, spawn-while-open attempts, invariant violations, replay mismatches between the version log and stored state — the audit stream folds into **breach cards**: at most one open card per (task, class), visible on the board with the `breach` tag.
+
 ### Flows per kind: when they invoke other tasks
 
 **impl** opens the only PR. It invokes *Unblock* when it gets stuck and *Verify* when it finishes:
