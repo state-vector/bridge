@@ -1,0 +1,14 @@
+{
+  "name": "@bridge/mobile-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "bridge mobile — native iOS shell wrapping @bridge/mobile-ui (Tauri 2)",
+  "scripts": {
+    "tauri": "tauri",
+    "ios:build:sim": "tauri ios build --target aarch64-sim"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

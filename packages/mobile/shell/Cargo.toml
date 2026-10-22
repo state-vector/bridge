@@ -1,0 +1,44 @@
+[package]
+name = "bridge-mobile"
+version = "0.1.0"
+description = "Bridge — native iOS shell wrapping @bridge/mobile-ui (hub-REST-only, fork-free per ADR BR#998)"
+authors = ["state-vector"]
+edition = "2021"
+
+[lib]
+name = "bridge_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# iOS notification core — the mac_notify.rs pattern carried over: UNUserNotificationCenter,
+# one category per ask (option ids as action ids), delegate converts taps into Tauri events.
+# Gated to iOS: the desktop crate owns its own macOS copy (packages/desktop/src-tauri).
+[target.'cfg(target_os = "ios")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSet", "NSError"] }
+objc2-user-notifications = { version = "0.3.2", features = [
+  "block2",
+  "UNUserNotificationCenter",
+  "UNNotificationRequest",
+  "UNNotificationContent",
+  "UNNotificationCategory",
+  "UNNotificationAction",
+  "UNNotificationResponse",
+  "UNNotificationSound",
+] }
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

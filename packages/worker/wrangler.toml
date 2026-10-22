@@ -50,3 +50,7 @@ run_worker_first = ["/ingest", "/api/state", "/api/session", "/api/workspaces", 
 #   BRIDGE_INGEST_TOKEN    shared bearer for POST /ingest (legacy FLOWS_INGEST_TOKEN still accepted during rotation)
 #   CF_ACCESS_TEAM        optional: https://<team>.cloudflareaccess.com (edge JWT mode)
 #   CF_ACCESS_AUD         optional: Access application AUD tag
+#   SHELL_ORIGINS         optional: comma allowlist of iOS-shell webview origins
+#                         (e.g. "tauri://localhost,http://localhost:1421") — turns on
+#                         credentialed CORS preflight + response stamping for those
+#                         origins only; unset = pre-BR#2514 behaviour exactly

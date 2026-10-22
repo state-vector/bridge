@@ -39,7 +39,7 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 
 - Web: board, top, log, knowledge, discussions, For Me inbox (proposed decisions: accept/reject)
 - Gateway: desktop app + headless CLI (dispatch log, agent config, WIP limits, device-flow pairing)
-- Mobile (iOS): fleet summary + For You (coming soon)
+- Mobile (iOS): native shell (Tauri 2) wrapping the mobile UI — fleet summary + For You, against your self-hosted hub
 
 ## Task kinds
 
@@ -61,4 +61,4 @@ Other types: steering (constrains), goals (tasks implement), decisions (human-ac
 
 - Self-hosted (OSS, Apache-2.0): free, your Cloudflare account, free tier
 - Hosted: $5/month (coming soon); waitlist via repo discussions
-- Mobile app: coming soon
+- Mobile app: iOS shell (self-hosted) shipped; hosted mobile later

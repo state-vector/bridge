@@ -41,3 +41,33 @@ jobs:
       - name: Compile check (locked)
         working-directory: packages/cli
         run: cargo check --locked --all-targets
+
+  ios-sim:
+    name: iOS simulator build (packages/mobile/shell)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/mobile/shell
+      - name: Build mobile-ui dist
+        run: npm run build -w @bridge/mobile-ui
+      # sim target needs no signing; the receipt proves the iOS-target build
+      # compiles on every PR (BR#2514 done-when)
+      - name: Tauri iOS build (aarch64-sim)
+        working-directory: packages/mobile/shell
+        run: npx tauri ios build --target aarch64-sim
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-ios-sim-app
+          path: packages/mobile/shell/gen/apple/build/arm64-sim/*.app
+          if-no-files-found: error

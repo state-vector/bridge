@@ -9,6 +9,15 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // iOS-shell CORS preflight (BR#2514, additive + opt-in): fetches from the
+    // Tauri WKWebView origin (tauri://localhost) are cross-origin, so writes
+    // need preflight approval and reads need credential-bearing ACAO. Gated by
+    // the SHELL_ORIGINS allowlist — unset means today's behaviour exactly.
+    if (request.method === "OPTIONS") {
+      const pre = preflightShell(request, env);
+      if (pre) return pre;
+    }
+
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);
     }
@@ -145,18 +154,18 @@ export default {
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return new Response("not found", { status: 404 });
-        return env.KB.get(kbId).fetch(kbUrl + url.search, request);
+        return withShellCors(request, env, await env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost"].includes(sub) ? sub : null;
         if (!op) return new Response("not found", { status: 404 });
         const body = await request.json().catch(() => ({}));
         body.actor = "web";
-        return env.KB.get(kbId).fetch(`https://kb/${op}`, {
+        return withShellCors(request, env, await env.KB.get(kbId).fetch(`https://kb/${op}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        });
+        }));
       }
     }
 
@@ -193,7 +202,7 @@ export default {
 
     // Human plane. Auth mode: GitHub OAuth (HMAC session cookie), or Cloudflare
     // Access JWT at the edge when CF_ACCESS_TEAM+AUD are set.
-    if (url.pathname === "/login") return handleGithubLogin(request, env);
+    if (url.pathname === "/login") return handleLogin(request, env);
     if (url.pathname === "/login/callback") return handleGithubCallback(request, env);
 
     // Device pairing (github-like device flow, bridge-native): start + poll are
@@ -254,7 +263,7 @@ export default {
     }
 
     // Human plane session probe: who is signed in (widget + tests).
-    if (url.pathname === "/api/session") return handleSession(request, env);
+    if (url.pathname === "/api/session") return withShellCors(request, env, await handleSession(request, env));
 
     // Workspaces (human plane): list / create / switch. The registry lives in
     // the default KB DO; create/switch are membership-checked server-side.
@@ -291,7 +300,7 @@ export default {
 
     const hub = env.HUB.get(env.HUB.idFromName(doWs(auth.ws)));
     if (url.pathname === "/ws") return hub.fetch("https://hub/ws", request);
-    if (url.pathname === "/api/state") return hub.fetch("https://hub/state", request);
+    if (url.pathname === "/api/state") return withShellCors(request, env, await hub.fetch("https://hub/state", request));
     if (url.pathname === "/") return hub.fetch("https://hub/ui", request);
     return new Response("not found", { status: 404 });
   },
@@ -300,7 +309,19 @@ export default {
 async function handleIngest(request, env) {
   if (request.method !== "POST") return json({ error: "POST only" }, 405);
   const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!token || token !== (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) return json({ error: "unauthorized" }, 401);
+  if (token) {
+    // machine plane: the shared ingest bearer — a wrong bearer is still 401
+    if (token !== (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) return json({ error: "unauthorized" }, 401);
+  } else {
+    // shell fallback (BR#2514): the mobile UI must not ship the shared bearer
+    // token inside the app, so an authenticated human session may ingest too.
+    // CSRF-guarded by the x-bridge-csrf custom header — CORS preflight makes
+    // that header impossible for a cross-site attacker without an allowlisted
+    // shell origin (SHELL_ORIGINS), and cross-site forms cannot send it.
+    if (request.headers.get("x-bridge-csrf") !== "1") return json({ error: "unauthorized" }, 401);
+    const auth = await checkAuth(request, env);
+    if (auth instanceof Response) return auth;
+  }
 
   let body;
   try { body = await request.json(); } catch { return json({ error: "bad json" }, 400); }
@@ -312,11 +333,11 @@ async function handleIngest(request, env) {
   const id = env.HUB.idFromName(doWs(DEFAULT_WS_SLUG));
   const hub = env.HUB.get(id);
   // forward a real request body — spreading a Request loses everything (prototype accessors)
-  return hub.fetch("https://hub/ingest", {
+  return withShellCors(request, env, await hub.fetch("https://hub/ingest", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ events }),
-  });
+  }));
 }
 
 // --- auth: GitHub OAuth session cookie, optional Access JWT at the edge ---
@@ -461,12 +482,96 @@ function startGithubLogin(env, state) {
   });
 }
 
-function handleGithubLogin(request, env) {
-  if (!githubConfigured(env)) {
-    return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET" }, 503);
+/// GET /login — GitHub OAuth when configured, else the legacy shared-password
+/// form. `?shell=1` marks an iOS-shell-initiated flow: the session cookie is
+/// then minted SameSite=None (Secure) so it travels on the shell's cross-origin
+/// fetches — a Lax cookie would never be sent from tauri://localhost.
+async function handleLogin(request, env) {
+  if (request.method === "POST") return handlePasswordLogin(request, env);
+  const shell = new URL(request.url).searchParams.get("shell") === "1";
+  if (githubConfigured(env)) return startGithubLogin(env, loginState(shell));
+  if (env.BRIDGE_UI_PASSWORD) return passwordForm(shell, new URL(request.url).searchParams.get("error") === "1");
+  return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET (or legacy BRIDGE_UI_PASSWORD)" }, 503);
+}
+
+// OAuth state carries the shell flag as a suffix (it round-trips via the
+// state cookie; GitHub echoes it back verbatim).
+function loginState(shell) {
+  const base = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+  return shell ? `${base}-shell` : base;
+}
+
+function passwordForm(shell, err = false) {
+  const action = shell ? "/login?shell=1" : "/login";
+  return new Response(
+    `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bridge — sign in</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; background: #0e1116; color: #e6e9ef;
+           display: flex; align-items: center; justify-content: center; min-height: 100dvh; margin: 0; }
+    form { background: #161b23; border: 1px solid #2a313d; border-radius: 12px; padding: 28px;
+           width: min(320px, 88vw); display: grid; gap: 12px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p.hint { font-size: 12px; color: #8b93a3; margin: 0; }
+    ${err ? ".err { color: #ff7b7b; font-size: 13px; margin: 0; }" : ""}
+    input[type=password] { background: #0e1116; color: #e6e9ef; border: 1px solid #2a313d;
+           border-radius: 8px; padding: 10px 12px; font-size: 15px; width: 100%; box-sizing: border-box; }
+    button { background: #4c8dff; color: #fff; border: 0; border-radius: 8px; padding: 10px 12px;
+           font-size: 15px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <form method="post" action="${action}">
+    <h1>Bridge hub</h1>
+    <p class="hint">Shared-password mode — enter the hub password to continue.</p>
+    ${err ? '<p class="err">Wrong password — try again.</p>' : ""}
+    ${shell ? '<input type="hidden" name="shell" value="1">' : ""}
+    <input type="password" name="password" placeholder="hub password" autocomplete="current-password" required autofocus>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>`,
+    { headers: { "content-type": "text/html; charset=utf-8", "Cache-Control": "no-store" } },
+  );
+}
+
+/** legacy password-mode POST: verify against BRIDGE_UI_PASSWORD, mint the 2-part cookie */
+async function handlePasswordLogin(request, env) {
+  if (!env.BRIDGE_UI_PASSWORD) return json({ error: "auth not configured: set BRIDGE_UI_PASSWORD" }, 503);
+  const shell = new URL(request.url).searchParams.get("shell") === "1";
+  const form = new URLSearchParams(await request.text().catch(() => ""));
+  const pass = form.get("password") ?? "";
+  if (!(await timingSafeEq(pass, env.BRIDGE_UI_PASSWORD))) {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: `/login?error=1${shell ? "&shell=1" : ""}`, "Cache-Control": "no-store" },
+    });
   }
-  const state = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
-  return startGithubLogin(env, state);
+  const exp = String(Date.now() + SESSION_TTL_MS);
+  const sig = await sign(exp, env.BRIDGE_UI_PASSWORD);
+  // shell-initiated logins mint SameSite=None (Secure) so the cookie travels on
+  // the shell's cross-origin fetches from tauri://localhost — Lax would drop it.
+  const cookieSameSite = shell || form.get("shell") === "1" ? "SameSite=None" : "SameSite=Lax";
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": `${SESSION_COOKIE}=${exp}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; ${cookieSameSite}`,
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+/** constant-shape string compare: HMAC both sides, then XOR the equal-length digests */
+async function timingSafeEq(a, b) {
+  const [ha, hb] = await Promise.all([sign("cmp", a), sign("cmp", b)]);
+  let diff = 0;
+  for (let i = 0; i < ha.length; i++) diff |= ha.charCodeAt(i) ^ hb.charCodeAt(i);
+  return diff === 0;
 }
 
 function oauthFailure(origin, reason = "unknown") {
@@ -534,13 +639,18 @@ async function handleGithubCallback(request, env) {
   }
   const exp = String(Date.now() + SESSION_TTL_MS);
   const sig = await sign(`${exp}.${u.login}.${ws}`, env.GITHUB_CLIENT_SECRET);
+  // shell-initiated logins mint SameSite=None (Secure) so the cookie travels on
+  // the shell's cross-origin fetches from tauri://localhost (state suffix
+  // `-shell`); plain browser logins keep SameSite=Lax.
+  const shellLogin = state.endsWith("-shell");
+  const cookieSameSite = shellLogin ? "SameSite=None" : "SameSite=Lax";
   const headers = new Headers({
     Location: "/",
     "Cache-Control": "no-store",
   });
   headers.append(
     "Set-Cookie",
-    `${SESSION_COOKIE}=${exp}.${u.login}.${ws}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+    `${SESSION_COOKIE}=${exp}.${u.login}.${ws}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; ${cookieSameSite}`,
   );
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
   return new Response(null, { status: 302, headers });
@@ -598,3 +708,54 @@ function json(obj, status = 200, extra = {}) {
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...extra },
   });
 }
+
+// --- iOS shell CORS (BR#2514, additive + opt-in) -----------------------------
+// SHELL_ORIGINS is a comma-separated allowlist of webview origins (e.g.
+// "tauri://localhost,http://localhost:1421"). Unset = every helper here is a
+// pass-through and routing behaviour is exactly pre-BR#2514.
+function shellOrigins(env) {
+  return (env.SHELL_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** the request's Origin if it is allowlisted for the shell, else null */
+function shellAllowed(request, env) {
+  const list = shellOrigins(env);
+  if (!list.length) return null;
+  const origin = request.headers.get("Origin");
+  return origin && list.includes(origin) ? origin : null;
+}
+
+// CORS preflight for allowlisted shell origins: credentialed requests need the
+// ACAO echo + ACAC, and the custom x-bridge-csrf header must be allowed or the
+// browser blocks the fetch before it fires. Returns a Response to short-circuit
+// with, or null to continue normal routing.
+function preflightShell(request, env) {
+  const origin = shellAllowed(request, env);
+  if (!origin) return null;
+  if (!request.headers.get("Access-Control-Request-Method")) return null;
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type, authorization, x-bridge-csrf",
+      "Access-Control-Max-Age": "600",
+      Vary: "Origin",
+    },
+  });
+}
+
+// Attach credentialed CORS headers to a response when the request comes from an
+// allowlisted shell origin; otherwise pass the response through untouched.
+async function withShellCors(request, env, res) {
+  const origin = shellAllowed(request, env);
+  if (!origin) return res;
+  const out = new Response(res.body, res);
+  out.headers.set("Access-Control-Allow-Origin", origin);
+  out.headers.set("Access-Control-Allow-Credentials", "true");
+  out.headers.append("Vary", "Origin");
+  return out;
+}
+
+export { shellOrigins, preflightShell, withShellCors };
