@@ -1336,7 +1336,7 @@ fn extract_pr(stdout: &str) -> Option<String> {
 /// page cited as a PR — BR#860/863/866/844/855 class). Treated as failure:
 /// backoff, then blocked-for-attention, never done, never in_review.
 fn void_run(stdout: &str, stderr: &str) -> bool {
-    const SIGS: [&str; 5] = [
+    const SIGS: [&str; 6] = [
         "Model blocked by guardrail",
         "0 endpoints out of",
         "no endpoints are available matching your guardrail",
