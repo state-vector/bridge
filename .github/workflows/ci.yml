@@ -58,6 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/mobile/shell
+      - run: npm ci
       - name: Build mobile-ui dist
         run: npm run build -w @bridge/mobile-ui
       # sim target needs no signing; the receipt proves the iOS-target build

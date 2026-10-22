@@ -13,7 +13,10 @@ compatibility_date = "2026-01-15"
 # Install what the build needs, then invoke vite by path. Typechecking stays
 # in CI's full-install job.
 [build]
-command = "cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
+# root-workspace install + build: CF Workers Builds starts bare (no root
+# node_modules), so the old `../../node_modules/.bin/vite` path 127'd there;
+# this shape works both locally and in CF (verified locally, BR#2514)
+command = "cd ../.. && npm install --no-save --silent && npm run build -w @bridge/webapp"
 
 # Your deployment lives at https://<your-subdomain>.workers.dev once deployed.
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
