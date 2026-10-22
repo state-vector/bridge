@@ -73,4 +73,20 @@ describe("withShellCors", () => {
     expect(denied.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(await denied.text()).toBe("plain");
   });
+
+  // Routing contract (BR#2514 E2E, run 7): the auth short-circuit fires BEFORE
+  // per-route withShellCors wrapping, so the 401 a shell webview sees must be
+  // stamped HERE — a bare 401 is unreadable cross-origin, the UI shows a
+  // network error ("hub unreachable") and the sign-in leg never arms.
+  it("stamps a 401 auth short-circuit too (status + ACAO together)", async () => {
+    const unauth = new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+    const out = await withShellCors(req({ origin: "tauri://localhost", method: "GET" }), env("tauri://localhost"), unauth);
+    expect(out.status).toBe(401);
+    expect(out.headers.get("Access-Control-Allow-Origin")).toBe("tauri://localhost");
+    expect(out.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+    expect(await out.text()).toContain("unauthorized");
+  });
 });

@@ -94,11 +94,20 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
-            WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::default())
+            // E2E hook (see shellui::e2e_boot_script): launch env pre-connects
+            // the shell and arms the login auto-submit. Unset in normal runs.
+            let e2e = std::env::var("E2E_HUB_URL").ok().map(|hub| {
+                let pass = std::env::var("E2E_HUB_PASSWORD").ok();
+                shellui::e2e_boot_script(&hub, pass.as_deref())
+            });
+            let mut builder = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::default())
                 .title("Bridge")
                 .initialization_script(shellui::INIT_SCRIPT)
-                .on_navigation(move |url| shellui::on_navigation(&handle, &url))
-                .build()?;
+                .on_navigation(move |url| shellui::on_navigation(&handle, &url));
+            if let Some(script) = e2e {
+                builder = builder.initialization_script(script);
+            }
+            builder.build()?;
             Ok(())
         })
         .run(tauri::generate_context!())

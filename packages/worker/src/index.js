@@ -246,7 +246,10 @@ export default {
     }
 
     const auth = await checkAuth(request, env);
-    if (auth instanceof Response) return auth; // login page / 401 / 403 / 503 Response
+    // shell (BR#2514): the 401 short-circuit must carry CORS too — a bare 401
+    // is unreadable from tauri://localhost, so the webview sees a network
+    // error ("hub unreachable") instead of the 401 that arms the sign-in leg.
+    if (auth instanceof Response) return withShellCors(request, env, auth); // login page / 401 / 403 / 503 Response
 
     if (url.pathname === "/logout") {
       // Access mode: send the browser to the IdP logout too, or Access re-mints on next nav.
@@ -308,16 +311,17 @@ export default {
 
 async function handleIngest(request, env) {
   if (request.method !== "POST") return json({ error: "POST only" }, 405);
-  const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (token) {
-    // machine plane: the shared ingest bearer — a wrong bearer is still 401
-    if (token !== (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) return json({ error: "unauthorized" }, 401);
-  } else {
+  const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  const machine = Boolean(bearer) && bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN);
+  if (!machine) {
     // shell fallback (BR#2514): the mobile UI must not ship the shared bearer
     // token inside the app, so an authenticated human session may ingest too.
     // CSRF-guarded by the x-bridge-csrf custom header — CORS preflight makes
     // that header impossible for a cross-site attacker without an allowlisted
     // shell origin (SHELL_ORIGINS), and cross-site forms cannot send it.
+    // A non-machine Bearer (the shell's session token) lands here too —
+    // checkAuth accepts it (E2E run 9: the Unblock ingest 401'd while the
+    // session-bearing reads all worked).
     if (request.headers.get("x-bridge-csrf") !== "1") return json({ error: "unauthorized" }, 401);
     const auth = await checkAuth(request, env);
     if (auth instanceof Response) return auth;
@@ -405,7 +409,7 @@ async function checkAuth(request, env) {
     if (!env.BRIDGE_UI_PASSWORD) {
       return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET (or legacy BRIDGE_UI_PASSWORD)" }, 503);
     }
-    const legacy = parseLegacyPasswordCookie(request, env);
+    const legacy = parseLegacyPasswordSession(request, env);
     return legacy ? { login: null, ws: DEFAULT_WS_SLUG, legacy: true } : loginResponse(request);
   }
   const cookie = request.headers.get("Cookie") || "";
@@ -415,16 +419,28 @@ async function checkAuth(request, env) {
   return session; // { login, ws }
 }
 
-/** legacy password-mode session cookie: `bridge_session=<exp>.<hmac>` signed with BRIDGE_UI_PASSWORD */
-function parseLegacyPasswordCookie(request, env) {
-  const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
-  if (!m) return false;
-  const dot = m[1].indexOf(".");
-  if (dot <= 0 || m[1].includes(".", dot + 1)) return false;
-  const exp = m[1].slice(0, dot);
+/** legacy password-mode session value: `bridge_session=<exp>.<hmac>` signed with BRIDGE_UI_PASSWORD */
+async function legacySessionOk(value, env) {
+  if (!value) return false;
+  const dot = value.indexOf(".");
+  if (dot <= 0 || value.includes(".", dot + 1)) return false;
+  const exp = value.slice(0, dot);
   if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
-  // verifySession's HMAC helper; the legacy secret is the password itself
-  return sign(exp, env.BRIDGE_UI_PASSWORD).then((expected) => expected === m[1].slice(dot + 1));
+  return (await sign(exp, env.BRIDGE_UI_PASSWORD)) === value.slice(dot + 1);
+}
+
+// Accepts the session cookie OR the same value as a Bearer header. The Bearer
+// path exists for the iOS shell (BR#2514, E2E run 8): WebKit drops Secure
+// cookies over plain http, so self-hosted http hubs hand the shell the session
+// value as a post-login fragment instead; the shell sends it as a Bearer header
+// on every hub fetch. Preflight-gated (authorization is not a CORS-safelisted
+// header), so a cross-site attacker cannot send it.
+function parseLegacyPasswordSession(request, env) {
+  const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+  if (m) return legacySessionOk(m[1], env);
+  const b = (request.headers.get("Authorization") || "").match(/^Bearer\s+(\S+)$/i);
+  if (b) return legacySessionOk(b[1], env);
+  return false;
 }
 
 async function handleSession(request, env) {
@@ -443,10 +459,13 @@ async function handleSession(request, env) {
     }
   }
   if (!githubConfigured(env)) {
-    const legacy = await parseLegacyPasswordCookie(request, env);
+    const legacy = await parseLegacyPasswordSession(request, env);
     if (!legacy) return json({ mode: "password", user: null, workspace: DEFAULT_WS_SLUG });
-    const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
-    return json({ mode: "password", user: null, workspace: DEFAULT_WS_SLUG, expires_ts: Number(m[1].slice(0, m[1].indexOf("."))) });
+    // mirror the accepted session value back: cookie or Bearer carry the same exp.sig
+    const cm = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
+    const bm = (request.headers.get("Authorization") || "").match(/^Bearer\s+(\S+)$/i);
+    const v = cm ? cm[1] : bm[1];
+    return json({ mode: "password", user: null, workspace: DEFAULT_WS_SLUG, expires_ts: Number(v.slice(0, v.indexOf("."))) });
   }
   const cookie = request.headers.get("Cookie") || "";
   const m = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
@@ -556,11 +575,31 @@ async function handlePasswordLogin(request, env) {
   // shell-initiated logins mint SameSite=None (Secure) so the cookie travels on
   // the shell's cross-origin fetches from tauri://localhost — Lax would drop it.
   const cookieSameSite = shell || form.get("shell") === "1" ? "SameSite=None" : "SameSite=Lax";
+  const token = `${exp}.${sig}`;
+  // shell (BR#2514, E2E run 8): WebKit drops Secure cookies over plain http, so
+  // on self-hosted http hubs the cookie can never carry the webview's
+  // cross-origin fetches. The shell instead banks the session value from the
+  // post-login redirect fragment (#bridge_token=…) and sends it as a Bearer
+  // header (checkAuth's legacy branch accepts both). The cookie is still set —
+  // on https hubs it just works.
+  if (shell || form.get("shell") === "1") {
+    return new Response(
+      `<!doctype html><title>signed in</title><script>location.replace("tauri://localhost/index.html#bridge_token=${token}")</script>`,
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Set-Cookie": `${SESSION_COOKIE}=${token}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; ${cookieSameSite}`,
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
   return new Response(null, {
     status: 302,
     headers: {
       Location: "/",
-      "Set-Cookie": `${SESSION_COOKIE}=${exp}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; ${cookieSameSite}`,
+      "Set-Cookie": `${SESSION_COOKIE}=${token}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; ${cookieSameSite}`,
       "Cache-Control": "no-store",
     },
   });
@@ -758,4 +797,4 @@ async function withShellCors(request, env, res) {
   return out;
 }
 
-export { shellOrigins, preflightShell, withShellCors };
+export { shellOrigins, preflightShell, withShellCors, legacySessionOk };
