@@ -171,7 +171,8 @@ async fn pair_start(url: String) -> Result<String, String> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "device".into());
-        dispatch::pair_start(&client, url.trim_end_matches('/'), &device)
+        let principal = dispatch::ensure_principal_from_file();
+        dispatch::pair_start(&client, url.trim_end_matches('/'), &device, &principal)
     })
     .await
     .map_err(|e| e.to_string())?

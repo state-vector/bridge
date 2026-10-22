@@ -263,6 +263,38 @@ impl DispatchConfig {
     }
 }
 
+/// The machine's stable principal: read from the config, generated once and
+/// written back when absent. Short by design — it is a handle, not a secret
+/// (the secret is the bkw_ token). Survives re-pairings, rotations, renames.
+pub fn ensure_principal_from_file() -> String {
+    let path = config_path();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(existing) = c.get("principal").and_then(|p| p.as_str()) {
+                if !existing.is_empty() {
+                    return existing.to_string();
+                }
+            }
+            let mut bytes = [0u8; 4];
+            let _ = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
+            let p = format!("p_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            if let Some(obj) = c.as_object_mut() {
+                obj.insert("principal".into(), serde_json::Value::String(p.clone()));
+            }
+            let body = serde_json::to_string_pretty(&c).unwrap_or_default();
+            let _ = std::fs::write(&path, body);
+            #[cfg(unix)]
+            let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            return p;
+        }
+    }
+    let mut bytes = [0u8; 4];
+    let _ = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
+    format!("p_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".bridge").join("config.json")
@@ -295,7 +327,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "device".into());
 
-    let code = pair_start(&client, url, &device)?;
+    let code = pair_start(&client, url, &device, ensure_principal_from_file().as_str())?;
     eprintln!("[pair] open {url}/pair and enter code {code}");
     println!("[pair] open {url}/pair and enter code {code}");
 
@@ -355,11 +387,11 @@ fn device_id() -> String {
 /// This app IS a gateway — the pairing declares that class; the hub vends a
 /// gateway-class token on approval. The approver never chooses. The stable
 /// device id lets the hub re-associate re-pairings (rotate, not collide).
-pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str) -> Result<String, String> {
+pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str, principal: &str) -> Result<String, String> {
     let start: serde_json::Value = client
         .post(format!("{url}/api/pair/start"))
         .header("content-type", "application/json")
-        .body(json!({ "device": device, "type": "gateway", "device_id": device_id() }).to_string())
+        .body(json!({ "device": device, "type": "gateway", "device_id": device_id(), "principal": principal }).to_string())
         .send()
         .map_err(|e| format!("bridge unreachable: {e}"))?
         .json()
