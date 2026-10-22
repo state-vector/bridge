@@ -341,14 +341,16 @@ impl AgentTransport for OpencodeAcp {
 
         // 1. initialize
         let session_line = String::new();
+        let frames = std::cell::Cell::new(0usize);
         let mut on_update = |line: &str| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
-                    if let Some(text) = extract_update_text(&v) {
-                        if let Some(cell) = &live {
-                            if let Ok(mut slot) = cell.lock() {
-                                *slot = head_line(&text, 200);
-                            }
+                    frames.set(frames.get() + 1);
+                    if let Some(cell) = &live {
+                        if let Ok(mut slot) = cell.lock() {
+                            let text = extract_update_text(&v)
+                                .unwrap_or_else(|| format!("[acp {}]", update_kind(&v)));
+                            *slot = format!("#{} {}", frames.get(), head_line(&text, 200));
                         }
                     }
                 }
@@ -398,13 +400,20 @@ impl AgentTransport for OpencodeAcp {
         let mut on_prompt = |line: &str| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
-                    if let Some(text) = extract_update_text(&v) {
-                        accumulated.push_str(&text);
+                    frames.set(frames.get() + 1);
+                    let shown = extract_update_text(&v);
+                    if let Some(text) = &shown {
+                        accumulated.push_str(text);
                         accumulated.push('\n');
-                        if let Some(cell) = &live {
-                            if let Ok(mut slot) = cell.lock() {
-                                *slot = head_line(&text, 200);
-                            }
+                    }
+                    // every frame moves the live cell — text or not. Liveness
+                    // vouches and the operator console must not depend on the
+                    // frame carrying extractable text (hermes incident: a
+                    // shape we didn't match read as a dead session).
+                    if let Some(cell) = &live {
+                        if let Ok(mut slot) = cell.lock() {
+                            let shown = shown.unwrap_or_else(|| format!("[acp {}]", update_kind(&v)));
+                            *slot = format!("#{} {}", frames.get(), head_line(&shown, 200));
                         }
                     }
                 }
@@ -489,17 +498,43 @@ fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
 fn extract_update_text(v: &serde_json::Value) -> Option<String> {
     let u = v.get("update")?;
     let kind = u.get("sessionUpdate").and_then(|k| k.as_str())?;
+    // content is a text block ({type:"text",text:...}) or an ARRAY of blocks
+    // depending on the opencode version — accept both. A version whose frames
+    // don't match here used to go completely dark to the runner: no live
+    // line, no session_alive vouches, watchdog releasing working sessions as
+    // "stalled" (fleet incident 2026-10-22, hermes).
+    let text_of = |c: &serde_json::Value| -> Option<String> {
+        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+            return Some(t.to_string());
+        }
+        if let Some(blocks) = c.as_array() {
+            for b in blocks {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        return Some(t.to_string());
+                    }
+                }
+            }
+        }
+        None
+    };
     match kind {
-        "agent_message_chunk" => u
-            .pointer("/content/text")
-            .and_then(|t| t.as_str())
-            .map(String::from),
-        "tool_call" => {
+        "agent_message_chunk" | "agent_thought_chunk" => u.get("content").and_then(text_of),
+        "tool_call" | "tool_call_update" => {
             let title = u.get("title").and_then(|t| t.as_str()).unwrap_or("tool");
             Some(format!("[tool] {title}"))
         }
         _ => None,
     }
+}
+
+/// The ACP update kind, for when text extraction fails — any session/update
+/// frame still proves the session is alive and should surface as such.
+fn update_kind(v: &serde_json::Value) -> String {
+    v.pointer("/update/sessionUpdate")
+        .and_then(|k| k.as_str())
+        .unwrap_or("update")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
