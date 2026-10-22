@@ -2266,6 +2266,13 @@ fn tick(
         // transition. The unblock CHILD (a todo task) is what the runner
         // dispatches; it shows up here as its own candidate.
         if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
+            // blocked is a verdict, and claiming it needs a resolution the
+            // runner cannot invent — that is role:unblock duty. Skipping
+            // silently here starved the runner in front of a full backlog:
+            // ten blocked tasks filled the orient slice, every claim was
+            // refused, and nothing announced why. Announce + pace.
+            attempts.insert(tid.to_string(), Instant::now());
+            msgs.push(format!("{tid} blocked — needs its unblock condition resolved (role:unblock duty or human), skipped"));
             continue;
         }
         // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
@@ -2282,7 +2289,9 @@ fn tick(
             json!({ "id": tid, "to": "in_progress" }),
             &tid,
         ) {
-            // claim raced or failed — don't kill the tick or the whole claim loop
+            // claim raced or failed — don't kill the tick or the whole claim loop;
+            // surface it on stderr too (snap-only failures read as silence)
+            eprintln!("[dispatch] claim {tid} failed: {e}");
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
             continue;

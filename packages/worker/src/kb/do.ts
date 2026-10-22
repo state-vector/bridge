@@ -364,6 +364,13 @@ export class KnowledgeHub {
       else parent.children_open++;
     }
     // readiness projection (bulk): declared state + evidence maps + stacked bars
+    // gateway callers dispatch sessions and never claim blocked work —
+    // resolving an unblock condition is role:unblock duty. Ten blocked cards
+    // rank above plain todo and filled the dispatch slice, starving the
+    // runner (every claim refused for a missing resolution). Gateways get
+    // the claimable surface; agents still see blocked work to reason about.
+    const callerIsGateway = tags.some((t) => t.toLowerCase() === "gateway");
+    const dispatchPool = callerIsGateway ? pool.filter((t: any) => t.status !== "blocked") : pool;
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     for (const t of tasks) {
       const q = t.meta.qualification ?? {};
@@ -2091,6 +2098,13 @@ export class KnowledgeHub {
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
        ORDER BY updated_ts DESC LIMIT 400`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
+    // gateway callers dispatch sessions and never claim blocked work —
+    // resolving an unblock condition is role:unblock duty. Ten blocked cards
+    // rank above plain todo and filled the dispatch slice, starving the
+    // runner (every claim refused for a missing resolution). Gateways get
+    // the claimable surface; agents still see blocked work to reason about.
+    const callerIsGateway = tags.some((t) => t.toLowerCase() === "gateway");
+    const dispatchPool = callerIsGateway ? pool.filter((t: any) => t.status !== "blocked") : pool;
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(
       (this.state.storage.sql.exec(
@@ -2108,7 +2122,7 @@ export class KnowledgeHub {
       if (qualIds.has(l.dst_id) || analysisEv.has(l.dst_id)) parentQualified.add(l.src_id);
       if (l.pstatus === "in_review") verifyParents.set(l.src_id, l);
     }
-    const unclaimedWork = pool.filter((t: any) => {
+    const unclaimedWork = dispatchPool.filter((t: any) => {
       const need = t.tags.filter((x: string) => x.startsWith("role:"));
       const m = JSON.parse(t.meta ?? "{}");
       const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
