@@ -87,10 +87,10 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
 
   // identity: registry auth token (bkw_…) or the legacy shared ingest token
-  let identity: { token_id: string; label: string; tags: string[] };
+  let identity: { token_id: string; label: string; tags: string[]; principal: string | null };
   try {
     if (bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) {
-      identity = { token_id: "shared", label: "shared", tags: [] };
+      identity = { token_id: "shared", label: "shared", tags: [], principal: null };
     } else {
       identity = await kb(hub, "auth.identify", { bearer });
     }
@@ -163,7 +163,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
 
 interface Ctx {
   call: (op: string, payload: object) => Promise<any>;
-  identity: { token_id: string; label: string; tags: string[] };
+  identity: { token_id: string; label: string; tags: string[]; principal: string | null };
   sessionName: string;
 }
 
