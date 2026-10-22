@@ -135,10 +135,8 @@ export default {
         if (!candidate) return auth;
         const { resolveTokenWs } = await import("./mcp.ts");
         let ws;
-        try { ws = await resolveTokenWs(env, candidate); } catch { return auth; }
-        const h = new Headers(request.headers);
-        h.delete("Sec-WebSocket-Protocol");
-        return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/ws", { headers: h });
+        try { ws = await resolveTokenWs(env, candidate); } catch { return new Response("unauthorized", { status: 401 }); }
+        return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/ws", request);
       }
       return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
