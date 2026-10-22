@@ -2042,14 +2042,13 @@ export class KnowledgeHub {
 
   private async askGet(id: string) {
     const row = this.one(
-      `SELECT id, to_target, question, options, urgency, status, artefact_id, answer, answered_by, answered_ts, created_ts
+      `SELECT id, from_label, to_target, question, status, artefact_id, answer, answered_by, answered_ts, created_ts
          FROM asks WHERE id = ?`, id,
     );
     if (!row) throw new Error(`no such ask: ${id}`);
     return {
-      id: row.id, to: row.to_target, question: row.question,
-      options: row.options ? JSON.parse(row.options) : [],
-      urgency: row.urgency, status: row.status,
+      id: row.id, from: row.from_label, to: row.to_target, question: row.question,
+      options: [] as string[], urgency: "normal", status: row.status,
       artefact_id: row.artefact_id ?? undefined,
       answer: row.answer ?? undefined, answered_by: row.answered_by ?? undefined,
       answered_ts: row.answered_ts ?? undefined, created_ts: row.created_ts,
