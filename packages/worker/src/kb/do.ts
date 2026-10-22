@@ -2602,19 +2602,11 @@ export class KnowledgeHub {
     const code = String(body.code ?? "").trim().toUpperCase();
     const ws = String(body.ws ?? "").trim();
     const label = String(body.label ?? "").trim();
-    const login = String(body.login ?? "").toLowerCase();
-    const row = this.one(`SELECT code, created_ts, status, device, type, device_id FROM pairings WHERE code = ?`, code);
-    if (!row || row.status !== "pending") throw new Error("pairing code not pending");
-    if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
-      this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
-      throw new Error("pairing code expired");
-    }
-    // class was declared by the DEVICE at pair/start — the approver cannot
-    // change it, only name the identity and pick the workspace
-    const gateway = row.type === "gateway";
-    const tags = gateway ? ["gateway"] : Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
-    if (!isWsSlug(ws)) throw new Error("bad workspace slug");
-    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    // reserved roots: _-prefixed labels are system namespaces (_direct for
+    // directly connected agents) — a gateway may not take one, so
+    // _direct/* ownership can never be impersonated by a paired device
+    if (/^_/.test(label)) throw new Error(`labels beginning with '_' are reserved system roots (got '${label}')`);
+    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._/-]");
     const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
     if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
     // mint in the target workspace's DO (registers hash → ws in the central
@@ -2720,7 +2712,11 @@ export class KnowledgeHub {
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
-    if (label.includes("/")) throw new Error("labels cannot contain '/' — the separator is reserved for gateway-namespaced workers (minted by gateways, not here)");
+    // the only '/' allowed in a human-minted label is the reserved
+    // _direct/ root — directly connected agents live there
+    if (label.includes("/") && !label.startsWith("_direct/")) {
+      throw new Error("labels cannot contain '/' — only the reserved _direct/ root (directly connected agents) may");
+    }
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     // Replace semantics (pairing is an approval): the same machine re-pairing
     // rotates its token — renamed or not — and re-using a label REPLACES the
