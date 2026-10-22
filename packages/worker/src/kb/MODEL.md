@@ -25,15 +25,31 @@ todo ──claim──▶ in_progress ──PR──▶ in_review ──verify d
   └──expiry/abandonment (watchdog)──▶ back to todo (attempt count++)
 ```
 
-Every arrow above is enforced, not convention:
+Every arrow above is enforced, not convention — and all of it is ONE
+executor: `machine.ts` holds a declarative rule table plus a total
+`decide()` that returns `Applied(effects) | Rejection{code, rule, message}`.
+`do.ts` persists the applied status, stamps `meta_patch`, and executes the
+returned effects (spawn verify/unblock children, supersede rounds, escalate
+to human, redirect releases). It never invents legality or a spawn decision.
 
-- **in_review** requires a PR link in the note. Auto-spawns a Verify child (`role:review`, `child_of`) into the unclaimed pool. No auto-spawn if the task itself is a review task — reviews never spawn verify-of-verify.
+- **in_review** requires a PR link in the note. The executor returns a `spawn_verify` effect (skipped when an ancestor is a review task or nesting would exceed the cap; reusing the open round instead of stacking when one exists). No spawn if the task itself is a review task — reviews never spawn verify-of-verify.
 - **done (review)** requires receipts (PR link / merged / passed) in the note, and separation of duties: the session that implemented the parent cannot complete its review.
 - **done (analysis)** releases the parent's claim if the same session holds it — impl needs a fresh session.
 - **done (any parent)** blocked while open children exist.
-- **todo (release)** only owner/human/system; agents can't dump each other's work. Stamps `attempted` + attempt count.
-- **blocked** requires reason + unblock_condition. `subprocess` class requires `budget_minutes` (1–1440) and auto-reclaims on expiry.
+- **todo (release)** only owner/human/system (`release-needs-ownership` table row); agents can't dump each other's work. Stamps `attempted` + attempt count. The executor decides churn: verdict duties escalate to a human at 3 releases (or 3 zero-output watchdog cycles folded from the version log); impl/analysis releases redirect to `blocked` at 5 (or 5 silent cycles). Completion resets the counter.
+- **blocked** requires reason + unblock_condition. `subprocess` class requires `budget_minutes` (1–1440) and auto-reclaims on expiry. Blocked spawns an unblock child — capped at ONE open per parent (reuse over respawn, plus a 60m same-exit flood guard), decided by the executor.
 - **claim** stamps session attribution (first-wins); system actors can't steal claims; review bounces return to the author, not the pool.
+
+## Breach door + replay
+
+Post-write invariants run on the single write path. Every
+`transition_rejected`, `invariant_violation`, `spawn_skipped` and
+`replay_mismatch` event folds through `foldBreaches()` — one OPEN breach
+card per `(task, class)` key (classes: same-gate rejection storms at 3
+events; spawn-while-open, invariant violation and replay mismatch on the
+first event). `replayStatus()` folds the version log's transition chain
+forward and compares with stored state; a disagreement (or a broken chain)
+is itself a breach. Breach cards are tasks tagged `breach:<class>`.
 
 ## Verification duty
 
