@@ -248,6 +248,13 @@ export interface BoardSettings {
 
 export const DEFAULT_BOARD: BoardSettings = { mode: "none" };
 
+/**
+ * Build marker — bump on every behavioural change. Agents verify what's live
+ * via orient.build; provenance receipts use it as the recency cue for
+ * server-default records (composed from this deploy, versioned with it).
+ */
+export const BUILD = "0.3.6";
+
 /** Compose the per-project bootstrap instructions (kept short — discovery only). */
 export const DEFAULT_PROJECT = "Superpositional";
 

@@ -6,4 +6,6 @@ export {
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
   KbProgress, KbSeriesPoint, KbVersion, KbBoard,
+  KbRecordType, KbProvenanceReceipt, KbSectionProvenance, KbBriefProvenance,
+  KbBriefEntry, KbWarning, KbBrief,
 } from "@bridge/ui-kit";

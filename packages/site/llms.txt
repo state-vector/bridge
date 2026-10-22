@@ -37,7 +37,7 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 
 ## Surfaces
 
-- Web: board, top, log, knowledge, discussions, For Me inbox (proposed decisions: accept/reject)
+- Web: board, top, log, knowledge, discussions, briefs (per-section provenance receipts), For Me inbox (proposed decisions: accept/reject)
 - Gateway: desktop app + headless CLI (dispatch log, agent config, WIP limits, device-flow pairing)
 - Mobile (iOS): fleet summary + For You (coming soon)
 

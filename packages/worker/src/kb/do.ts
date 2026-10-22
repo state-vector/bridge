@@ -52,7 +52,9 @@ import {
   resolveRolePlaybook,
   sanitizeTags,
   validateRelation,
+  BUILD,
 } from "./core.ts";
+import { buildSessionBriefProvenance, buildTaskBriefProvenance } from "./provenance.ts";
 import {
   check as checkRules,
   invariants as checkInvariants,
@@ -745,6 +747,7 @@ export class KnowledgeHub {
         case "/stats": return this.json(await this.stats());
         case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
         case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
+        case "/brief": return this.json(await this.briefView(url.searchParams));
       }
     }
 
@@ -2092,6 +2095,25 @@ export class KnowledgeHub {
   private async orient(body: any) {
     const label = String(body.label ?? "");
     const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
+    // reaper: sort out my abandoned work at check-in (see reapAbandoned) — the
+    // ONLY mutating part of orient; the brief assembly below stays read-only
+    // so the human-plane brief endpoint can reuse it without side effects.
+    const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    const staleMin = staleMinS ? Math.max(1, Math.min(120, parseInt(staleMinS.value, 10) || 10)) : 10;
+    const actionRequired = this.reapAbandoned(label, staleMin);
+    const { payload, provenance } = await this.orientBrief(label, tags, actionRequired, body.principal ?? null);
+    return { ...payload, provenance };
+  }
+
+  /**
+   * Orient-equivalent brief assembly, shared by orient() and the human-plane
+   * brief endpoint (GET /brief?label=). Read-only: no reaper, no mutations.
+   * Attaches the additive optional `provenance` field (BR#542): per-section
+   * receipt entries derived at read time from the same records the brief was
+   * composed from — settings, artefact rows, asks, events. No storage changes;
+   * clients without provenance support simply ignore the field.
+   */
+  private async orientBrief(label: string, tags: string[], actionRequired: string[], principal: string | null = null) {
     const counts = this.state.storage.sql.exec(
       `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
     ).toArray();
@@ -2136,7 +2158,7 @@ export class KnowledgeHub {
             OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
             OR owner = ?)
        ORDER BY updated_ts DESC LIMIT 10`,
-      label, label, label, label, body.principal ?? null,
+      label, label, label, label, principal ?? null,
     ).toArray();
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
@@ -2260,10 +2282,6 @@ export class KnowledgeHub {
       .filter((t) => t.startsWith("role:"))
       .map((t) => ({ role: t.slice(5), playbook: resolveRolePlaybook(rolesSettings, t.slice(5)) }))
       .filter((p) => typeof p.playbook === "string" && p.playbook.trim());
-    // reaper: sort out my abandoned work at check-in (see reapAbandoned)
-    const staleMinS = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
-    const staleMin = staleMinS ? Math.max(1, Math.min(120, parseInt(staleMinS.value, 10) || 10)) : 10;
-    const actionRequired = this.reapAbandoned(label, staleMin);
     // verification_stalled: an in_review parent's verify child is unclaimed — the
     // parent's owner is parked waiting on a verdict that only pickup can produce.
     // Tell the waiting owner (this is a pickup problem, not a review problem) and
@@ -2325,7 +2343,45 @@ export class KnowledgeHub {
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.
     const scoreDirective = `\n\nYOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it — it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") : "No deductions — keep heartbeats ≤10m, finish with receipts, answer asks fast."}`;
-    return {
+    // provenance receipts (BR#542): what each brief section was composed from.
+    // instructions: rules template (server-default + build cue) + every
+    // setting/default actually injected; playbook sources resolve per entry
+    // (blank-means-default: an empty setting value composes from the default,
+    // so its source is server-default, not setting).
+    const kindSource: "setting" | "server-default" | null =
+      isCron && typeof kindSettings.cron !== "string"
+        ? "server-default" // composed from DEFAULT_CRON_PLAYBOOK
+        : typeof (isCron ? kindSettings.cron : kindSettings.interactive) === "string"
+          ? "setting"
+          : null;
+    const actionEvents = actionRequired.length
+      ? (this.state.storage.sql.exec(
+          `SELECT seq, ts, actor, op, artefact_id FROM events WHERE op IN ('reassign','nudge') ORDER BY seq DESC LIMIT 10`,
+        ).toArray() as any[])
+      : [];
+    const provenance = buildSessionBriefProvenance({
+      settings,
+      buildVersion: BUILD,
+      hasBootstrapMd: !!settings.bootstrap_md,
+      kindPlaybook: kindPlaybook ? { source: kindSource ?? "server-default", isCron } : null,
+      rolePlaybooks: playbooks.map((p) => ({
+        role: p.role,
+        source:
+          typeof rolesSettings[p.role] === "string" && (rolesSettings[p.role] as string).trim()
+            ? ("setting" as const)
+            : ("server-default" as const),
+      })),
+      hasExternalBoard: settings.board?.mode === "external" && !!settings.board?.prompt,
+      openArtefacts: open as any[],
+      myTasks: myTasks as any[],
+      unclaimedWork,
+      pendingAsks: pendingAsks as any[],
+      actionEvents,
+      actionTaskIds: verificationNotices.map((v) => v.task_id).filter((x: any) => typeof x === "string"),
+      hasGaugeDebt: gaugeDebt.length > 0,
+      hasScore: true,
+    });
+    const payload = {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
         + (settings.bootstrap_md ? `\n${settings.bootstrap_md}` : "")
@@ -2345,6 +2401,119 @@ export class KnowledgeHub {
         : undefined,
       gauge_debt: gaugeDebt.length ? gaugeDebt : undefined,
       my_score,
+    };
+    return { payload, provenance };
+  }
+
+  /**
+   * Human-plane brief view (GET /brief) — read-only, derived at read time,
+   * no storage (BR#542). Two flavours:
+   *  - ?id=<artefact>  → task-scoped brief: assembled goal + constraining
+   *    steering + accepted decisions + supporting research + open discussions
+   *    + warnings, each section with provenance receipts.
+   *  - ?label=<agent>  → session brief: what that agent's orient would return
+   *    (read-only — no reaper side effects), with provenance.
+   */
+  private async briefView(params: URLSearchParams) {
+    const id = params.get("id");
+    if (id) return this.taskBrief(id);
+    const label = params.get("label");
+    if (label) {
+      const tok = this.one(`SELECT tags, principal FROM auth_tokens WHERE label = ?`, label) as any;
+      const { payload, provenance } = await this.orientBrief(label, parseTags(tok?.tags), [], tok?.principal ?? null);
+      return { kind: "session", label, ...payload, provenance };
+    }
+    throw new Error("brief needs ?id=<artefact> or ?label=<agent>");
+  }
+
+  /** Section membership rules for the task-scoped brief (BR#542). */
+  private taskBriefSections(rows: any[]) {
+    const isOpenQuestion = (r: any) =>
+      (r.type === "task" && isQuestionTask(r.meta ?? {}) && !["done", "superseded", "blocked"].includes(r.status))
+      || (r.type === "discussion" && r.status === "open");
+    return {
+      goal: rows.filter((r) => r.type === "goal" && r.status === "active"),
+      steering: rows.filter((r) => r.type === "steering" && r.status === "active"),
+      decisions: rows.filter((r) => r.type === "decision" && r.status === "accepted"),
+      research: rows.filter((r) => r.type === "research" && r.status === "published"),
+      discussions: rows.filter(isOpenQuestion),
+    };
+  }
+
+  /** Compact entry for a brief section — identity + recency + excerpt. */
+  private briefEntry(r: any) {
+    const excerpt = String(r.body_md ?? "").replace(/\s+/g, " ").trim().slice(0, 180);
+    return { id: r.id, type: r.type, title: r.title, status: r.status, updated_ts: r.updated_ts, ...(excerpt ? { excerpt } : {}) };
+  }
+
+  private async taskBrief(id: string) {
+    const row = this.one(`SELECT id, type, title, status, body_md, meta, tags, updated_ts FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    const task = this.shape(row);
+    const rels = this.state.storage.sql.exec(
+      `SELECT relation, dst_id AS artefact_id, 'out' AS dir FROM relations WHERE src_id = ?
+       UNION ALL
+       SELECT relation, src_id AS artefact_id, 'in' AS dir FROM relations WHERE dst_id = ?`,
+      id, id,
+    ).toArray() as any[];
+    const relatedIds = [...new Set(rels.map((r) => String(r.artefact_id)).filter((x) => x && x !== id))];
+    // Rule 8: superseding rows replace superseded ones — resolve supersedes
+    // edges for everything related, then fetch the union so a superseding row
+    // that inherited the relation renders even if it was never linked here.
+    const supersessions: Record<string, string> = {};
+    if (relatedIds.length) {
+      for (const s of this.state.storage.sql.exec(
+        `SELECT dst_id, src_id FROM relations WHERE relation = 'supersedes' AND dst_id IN (${relatedIds.map(() => "?").join(",")})`,
+        ...relatedIds,
+      ).toArray() as any[]) {
+        supersessions[String(s.dst_id)] = String(s.src_id);
+      }
+    }
+    const fetchIds = [...new Set([...relatedIds, ...Object.values(supersessions)])];
+    const rows = fetchIds.length
+      ? (this.state.storage.sql.exec(
+          `SELECT id, type, title, status, body_md, meta, tags, updated_ts FROM artefacts WHERE id IN (${fetchIds.map(() => "?").join(",")})`,
+          ...fetchIds,
+        ).toArray() as any[]).map((r) => this.shape(r))
+      : [];
+    const sections = this.taskBriefSections(rows);
+    // warnings: warning-class audit ops on the task (reaper reassignments, gate
+    // rejections, nudges, transitions into blocked)
+    const warnOps = new Set(["reassign", "transition_rejected", "nudge"]);
+    const warnings = (this.state.storage.sql.exec(
+      `SELECT seq, ts, actor, op, artefact_id, detail FROM events WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+      id,
+    ).toArray() as any[])
+      .filter((e) => {
+        if (warnOps.has(e.op)) return true;
+        if (e.op !== "transition") return false;
+        try { return JSON.parse(e.detail ?? "{}")?.to === "blocked"; } catch { return false; }
+      })
+      .slice(0, 10);
+    const provenance = buildTaskBriefProvenance({
+      task,
+      goal: sections.goal,
+      steering: sections.steering,
+      decisions: sections.decisions,
+      research: sections.research,
+      discussions: sections.discussions,
+      warnings,
+      supersessions,
+    });
+    const entry = (r: any) => this.briefEntry(r);
+    return {
+      kind: "task",
+      generated_ts: Date.now(),
+      brief: {
+        task: [task].map(entry),
+        goal: sections.goal.map(entry),
+        steering: sections.steering.map(entry),
+        decisions: sections.decisions.map(entry),
+        research: sections.research.map(entry),
+        discussions: sections.discussions.map(entry),
+        warnings: warnings.map((e) => ({ seq: e.seq, ts: e.ts, actor: e.actor, op: e.op })),
+      },
+      provenance,
     };
   }
 

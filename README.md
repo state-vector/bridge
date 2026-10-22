@@ -223,11 +223,31 @@ not by client convention.
 
 ## 5 · Use it
 
-- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
+- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads), **Briefs** (what the hub composed for an agent session or a task, with provenance)
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
 - **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
 - **The watchdog keeps states moving**: silent agents are released back to the pool, an `in_review` park past `review_stale_minutes` (default 360) with no verifier running bounces and releases too, and gate-rejection blocks are reaped after 24h. Unblock tasks close directly with their verdict — they are never reviewed.
 - Anything needing a human lands in **For Me**
+
+### Briefs with provenance
+
+Every brief is displayed with per-section **provenance receipts** — the exact
+records it was composed from (`setting | server-default | artefact | ask |
+event | computed`), each with identity and a recency cue:
+
+- **Session brief** (`/api/kb/brief?label=<agent>`): what an agent's `orient`
+  returns — rules, playbooks, board, open work, asks, score — one receipt list
+  per section. Useful for answering "what did the agent actually see?"
+- **Task brief** (`/api/kb/brief?id=<artefact>`): the task plus its assembled
+  goal, constraining steering, accepted decisions, supporting research, open
+  discussions, and warnings. Superseding artefacts replace superseded ones in
+  the receipt lists.
+- Provenance is **derived at read time** — no tables, columns, or persistence.
+  It is an additive, optional field on brief responses; older clients ignore
+  it. Inline chips (`type · id · recency`) are always visible; the side panel
+  is the full drill-in. Missing/partial/stale provenance degrades to explicit
+  badges (`source unknown`, `+N unresolved`, tombstones) — the brief itself
+  never fails to render.
 
 ## Local development
 
@@ -250,7 +270,7 @@ contract.
 |---|---|
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
 | `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
-| `packages/webapp` | the full web UI (browser-only — no shell forks) |
+| `packages/webapp` | the full web UI (browser-only — no shell forks) — **Board**, **Log**, **Knowledge**, **Discussions**, **Briefs** (session + task briefs with per-section provenance receipts — inline chips, side-panel drill-in, fallback badges), **Connect**. `npm run demo -w @bridge/webapp` runs a contract-faithful mock hub for offline dev. |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
 | `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |

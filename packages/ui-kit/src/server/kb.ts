@@ -111,6 +111,59 @@ export interface KbBoard {
   agents?: Array<{ label: string; score: number; grade: string; hints: string[] } & Record<string, number | string>>;
 }
 
+// ---------- briefs (BR#542: provenance receipts, additive + optional) ----------
+
+export type KbRecordType = "setting" | "server-default" | "artefact" | "ask" | "event" | "computed";
+
+/** One provenance receipt: the exact record a brief section was composed from. */
+export interface KbProvenanceReceipt {
+  record_type: KbRecordType;
+  record_id: string;
+  label: string;
+  /** recency cue: epoch ms for stored records, build version for server-defaults */
+  updated_ts?: number | string;
+  link?: string;
+  /** tombstone: the record no longer resolves */
+  unresolvable?: boolean;
+}
+
+export interface KbSectionProvenance {
+  state: "ok" | "partial" | "unknown";
+  receipts: KbProvenanceReceipt[];
+  /** resolvable receipts rendered but this many ids did not resolve */
+  unresolved?: number;
+}
+
+export type KbBriefProvenance = Record<string, KbSectionProvenance>;
+
+export interface KbBriefEntry {
+  id: string;
+  type?: string;
+  title: string;
+  status?: string;
+  updated_ts?: number;
+  excerpt?: string;
+}
+
+export interface KbWarning {
+  seq?: number;
+  ts: number;
+  actor?: string;
+  op?: string;
+}
+
+/** Brief response — task-scoped (?id=) or session (?label=). `provenance` is
+ *  additive: older servers omit it, this view degrades to source-unknown chips. */
+export interface KbBrief {
+  kind: "task" | "session";
+  generated_ts?: number;
+  /** task flavour: compact entries per section */
+  brief?: Record<string, KbBriefEntry[] | KbWarning[]>;
+  provenance?: KbBriefProvenance;
+  /** session flavour: the orient payload is spread at the top level */
+  [k: string]: unknown;
+}
+
 const base = () => getKbHubConfig().url;
 
 /** Thrown when auth fails (missing/expired cookie or bad token) — the shell funnels these into its sign-in gate. */
@@ -156,6 +209,10 @@ export const kbApi = {
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
+  brief: (q: { id?: string; label?: string }) => {
+    const p = new URLSearchParams(Object.entries(q).filter(([, v]) => v).map(([k, v]) => [k, v as string]));
+    return j<KbBrief>(`/api/kb/brief${p.size ? `?${p}` : ""}`);
+  },
   // human replies on a question thread — the same log_progress door agents use
   progress: (id: string, note: string, extra?: { will?: string; sentiment?: string }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),

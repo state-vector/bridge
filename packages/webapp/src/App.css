@@ -755,3 +755,56 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .ws-create input:focus { border-color: var(--accent); }
 .ws-new { padding: 2px 7px !important; }
+
+/* ---------- briefs + provenance (BR#542) ---------- */
+
+/* provenance chips: visually distinct from task tags — dashed border, muted,
+   never editable task metadata */
+.chip-prov {
+  border-style: dashed;
+  color: var(--text-dim);
+  background: transparent;
+  font-weight: 600;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-prov-unknown { border-color: var(--amber); color: var(--amber); }
+.chip-prov-gap { border-color: var(--amber); color: var(--amber); }
+.chip-prov-dead { color: var(--red); border-color: var(--red); text-decoration: line-through; }
+.chip-prov-more { font-style: italic; }
+
+.brief-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.brief-flavour { display: flex; gap: 6px; }
+.brief-controls select { min-width: 280px; }
+
+.brief-list { display: flex; flex-direction: column; gap: 10px; }
+.brief-section { padding: 10px 12px; }
+.brief-sec-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.brief-sec-head h3 { margin: 0; font-size: 13px; }
+.brief-sec-badges { display: flex; align-items: center; gap: 6px; }
+.prov-details { padding: 2px 8px; font-size: 10.5px; }
+
+.brief-entries { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.brief-entry-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.brief-entry-title { font-size: 12.5px; }
+.brief-excerpt { margin: 2px 0 0 0; font-size: 11.5px; color: var(--text-dim); }
+
+.prov-inline { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+
+/* side panel: full receipt drill-in */
+.prov-panel-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 60; }
+.prov-panel {
+  position: absolute; top: 0; right: 0; bottom: 0; width: min(420px, 92vw);
+  background: var(--bg); border-left: 1px solid var(--line);
+  padding: 14px; overflow-y: auto;
+}
+.prov-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.prov-panel-head h3 { margin: 0; font-size: 13px; }
+.prov-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.prov-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
+.prov-row-body { flex: 1; min-width: 0; }
+.prov-row-label { font-size: 12px; overflow-wrap: anywhere; }
+.prov-row-dead .prov-row-label { color: var(--red); }
+.prov-link { font-size: 11px; color: var(--accent); align-self: center; }

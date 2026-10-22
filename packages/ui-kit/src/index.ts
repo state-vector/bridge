@@ -21,6 +21,8 @@ export {
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
   KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk,
+  KbRecordType, KbProvenanceReceipt, KbSectionProvenance, KbBriefProvenance,
+  KbBriefEntry, KbWarning, KbBrief,
 } from "./server/kb";
 export { useKb, kbConnected, setKbAuthEscalator, type BoardPrefs } from "./server/kbStore";
 export {
