@@ -10,5 +10,5 @@ export { Field, type FieldProps } from "./Field";
 export { TextInput, TextArea, Select } from "./Inputs";
 export { ActionRow, FormRow } from "./Rows";
 export { ConnDot, type ConnState } from "./ConnDot";
-export { RelTime } from "./RelTime";
+export { RelTime } from "./RelTime.tsx";
 export { relTime } from "./relTime";
