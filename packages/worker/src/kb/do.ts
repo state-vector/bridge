@@ -59,6 +59,12 @@ import {
   churnRelease,
   RuleCtx,
 } from "./machine.ts";
+import {
+  ROOT_BLOCKER_TAG,
+  planRootBlockers,
+  rootBlockerBody,
+  rootBlockerTitle,
+} from "./rollup.ts";
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
@@ -308,6 +314,17 @@ export class KnowledgeHub {
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
       });
     }
+    // (D) blocker rollup: blocked cards sharing one machine-detectable root
+    // cause (one unmerged PR; red main — BR#551) collapse into ONE boosted
+    // ROOT BLOCKER task, and the queued cards point at it. The human sees a
+    // single approval surface instead of N identical parked cards (BR#2645).
+    let rollup: { created: string[]; stamped: number } | undefined;
+    try {
+      rollup = await this.rootBlockerRollup(now);
+    } catch (e) {
+      // the rollup must never take the watchdog down — log and keep going
+      this.audit("system:watchdog", "sweep_error", "root_blocker_rollup", { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
     // observability: the board can answer "is the watchdog alive?" via
     // /api/kb/stats — last tick, next alarm ts (poison detection: a
     // next_alarm_ts stuck in the past means the schedule is jammed), stale
@@ -336,8 +353,101 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(
       `INSERT INTO settings (key, value) VALUES ('watchdog.sweep', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks }),
+      JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks, root_blocker_rollup: rollup ?? null }),
     );
+  }
+
+  /** Blocker rollup (BR#2645): cluster the blocked cards by machine root key
+   *  (rollup.ts) and execute the plan — create ONE boosted ROOT BLOCKER task
+   *  per qualifying cluster (≥3 members, no open root for the key), stamp the
+   *  queued cards (meta.root_blocker + child_of → board tree + boost cascade).
+   *  Idempotent: the plan only stamps cards whose pointer changed, so a re-run
+   *  creates no duplicates. Roots close only by agent/human with receipts;
+   *  done roots are never reused — a later cluster opens a fresh root. */
+  private async rootBlockerRollup(now: number): Promise<{ created: string[]; stamped: number }> {
+    const blockedRows = this.state.storage.sql.exec(
+      `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    ).toArray() as any[];
+    const cards = blockedRows.map((r) => {
+      const meta = JSON.parse(r.meta ?? "{}");
+      return { id: r.id, title: r.title, blocked: meta.blocked ?? null, root_blocker: meta.root_blocker ?? null };
+    });
+    const rootRows = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND tags LIKE ?`,
+      `%"${ROOT_BLOCKER_TAG}"%`,
+    ).toArray() as any[];
+    const roots = rootRows.map((r) => ({ id: r.id, status: r.status, root_key: JSON.parse(r.meta ?? "{}").root_key ?? null }));
+    const plan = planRootBlockers(cards, roots);
+    const created: string[] = [];
+    if (plan.creates.length || plan.stamps.length) {
+      const keyToRoot = new Map<string, string>();
+      for (const c of plan.creates) {
+        try {
+          const members = cards.filter((x) => c.members.includes(x.id));
+          const res: any = await this.create(
+            {
+              type: "task",
+              title: rootBlockerTitle(c.key, c.members.length),
+              body_md: rootBlockerBody(c.key, members),
+              tags: [ROOT_BLOCKER_TAG],
+              // the sweep HAS analysed the cluster — the root is ready for pickup
+              qualified: true,
+              meta: { root_key: c.key },
+            },
+            "system:watchdog",
+          );
+          if (res?.id) { keyToRoot.set(c.key, res.id); created.push(res.id); }
+          this.audit("system:watchdog", "root_blocker_created", res?.id ?? null, { key: c.key, members: c.members });
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", `root_blocker:${c.key}`, { error: String((e as Error).message ?? e).slice(0, 300) });
+        }
+      }
+      let stamped = 0;
+      for (const s of plan.stamps) {
+        try {
+          const rootId = s.root ?? keyToRoot.get(s.root_key);
+          if (!rootId) continue;
+          const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, s.id);
+          if (!row) continue;
+          const meta = JSON.parse(row.meta ?? "{}");
+          if (meta.root_blocker === rootId) continue; // stamp only when changed
+          meta.root_blocker = rootId;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+            JSON.stringify(meta), now, s.id,
+          );
+          // child_of → board tree + boost cascade. Best-effort: the nesting
+          // cap and relation limits can reject; the stamp alone still counts.
+          const linked = this.one(
+            `SELECT 1 AS x FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`,
+            s.id, rootId,
+          );
+          if (!linked) {
+            try {
+              await this.link({ src: s.id, relation: "child_of", dst: rootId }, "system:watchdog");
+            } catch (e) {
+              this.audit("system:watchdog", "rollup_link_rejected", s.id, { root: rootId, error: String((e as Error).message ?? e).slice(0, 200) });
+            }
+          }
+          stamped++;
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", s.id, { error: String((e as Error).message ?? e).slice(0, 300) });
+        }
+      }
+      // boost the NEW roots — cascades to every linked open card (priority 0)
+      for (const rootId of keyToRoot.values()) {
+        try {
+          await this.boost({ id: rootId, boost: true }, "system:watchdog");
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", `boost:${rootId}`, { error: String((e as Error).message ?? e).slice(0, 300) });
+        }
+      }
+      if (created.length || stamped) {
+        this.audit("system:watchdog", "root_blocker_rollup", null, { created, stamped });
+      }
+      return { created, stamped };
+    }
+    return { created: [], stamped: 0 };
   }
 
   async eventsSince(since: number, limit: number) {
