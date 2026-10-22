@@ -21,8 +21,12 @@ async function api<T>(path: string, body: unknown): Promise<T> {
   return out;
 }
 
-function prefillLabel(device: string): string {
-  return device.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 40) || "device";
+function prefillLabel(device: string, gateway: boolean): string {
+  const slug = (device.replace(/[^a-zA-Z0-9._-]/g, "-").match(/[a-zA-Z0-9._-]+/g) ?? []).join("-").replace(/^-+|-+$/g, "").slice(0, 40) || "device";
+  // BR#2455: gateway pairings prefill the gw-* convention (auto gw-<hostname>).
+  // A suggestion, not a gate — the tag is the class authority (BR#2482); the
+  // approver can still rename, and nothing rejects a non-gw-* label.
+  return gateway ? `gw-${slug.toLowerCase()}`.slice(0, 40) : slug;
 }
 
 export function PairView() {
@@ -91,8 +95,9 @@ export function PairView() {
         setMsg(`code is ${d.status}`);
         return;
       }
+      const gateway = (d.type ?? "gateway") === "gateway";
       setInfo({ device: d.device, type: d.type ?? "gateway", created_ts: d.created_ts });
-      setLabel(prefillLabel(d.device));
+      setLabel(prefillLabel(d.device, gateway));
     } catch (e) {
       setMsg((e as Error).message);
     } finally {
@@ -161,7 +166,7 @@ export function PairView() {
             <p className="auth-host">
               Pair <b>{info.device}</b>?
             </p>
-            <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
+            <label>Token label ({gateway ? "gateway name — pre-filled gw-<hostname>, editable" : "agent name"})</label>
             <input className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>
             <select className="login-input" value={ws} onChange={(e) => setWs(e.target.value)}>

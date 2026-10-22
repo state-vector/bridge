@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the identity becomes `gw-<hostname>` (e.g. `gw-macbookpro`), which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
+Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. The device declares its class at pair time (the gateway app and CLI pair as gateways), so approval just names the identity — pre-filled `gw-<hostname>` (e.g. `gw-macbookpro`), which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
 
 Prefer building from source?
 
@@ -124,16 +124,19 @@ Notes:
   opencode needs an explicit model (the runner refuses to dispatch without
   one; the CLI's own default is how a stale pin silently downgrades a fleet).
   Kiro is profile-driven, so it needs no model entry.
-- **Identity**: gateways and agents share one label namespace with a class
-  boundary — gateway tokens are infrastructure named `gw-<hostname>` (e.g.
-  `gw-macbookpro`) and never task owners; agent labels (`opencode-ray`) never
-  take the `gw-` prefix. The boundary is enforced at mint, pairing, rename and
-  tag-edit time: a mis-named token is rejected, not rendered wrong. Connect
-  shows gateways with the agents they dispatched, attributed agents nested
-  under their gateway. Dispatched work is attributed to the agent the gateway
-  dispatched as, named `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or
-  overridden with `"agent_name"` in the config. Legacy tokens keep their
-  labels — pair a new device as a gateway (or mint `gw-*`) to get the law.
+- **Identity**: gateways and agents are separate identity classes. The class
+  lives in the token's `gateway` tag — that tag, not the name, is the
+  authority (a gateway never owns tasks; per-agent attribution only rides on
+  gateway-class tokens). The desktop app and headless CLI declare
+  `type: "gateway"` at pair time, the approval screen pre-fills the
+  `gw-<hostname>` convention (e.g. `gw-macbookpro`, still editable), and a
+  gateway refuses to run on a non-gateway pairing — log out and re-pair
+  instead of mis-attributing. Connect lists gateways with the agents they
+  dispatched, worker-agents nested under their gateway. Dispatched work is
+  attributed to the agent the gateway dispatched as, named
+  `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or overridden with
+  `"agent_name"` in the config. Legacy tokens keep their labels — pair a new
+  device as a gateway (or mint `gw-*`) to get the law.
 - **Model cost**: whatever you set here is what every dispatched session uses.
   Check the opencode CLI's own config (`~/.config/opencode/opencode.json`,
   `"model"` key) if spend looks high despite a pin here.
