@@ -744,6 +744,12 @@ pub struct DispatchSnapshot {
     pub max_sessions: usize,
     pub in_flight: Vec<InFlightView>,
     pub activity: Vec<DispatchActivity>, // newest first, capped
+    // BR#2532: set when the runner INVOLUNTARILY signs the desktop out
+    // (identity-law run gate, hub-rejected token). The pair screen renders it
+    // as a guided notice — what happened, that nothing was lost, one click to
+    // re-pair — instead of leaving a silent logout in the dispatch log.
+    pub logout_reason: Option<String>,
+    pub logout_ts: Option<u64>,
 }
 
 pub type SharedSnapshot = Arc<Mutex<DispatchSnapshot>>;
@@ -780,6 +786,46 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
             },
         );
         s.activity.truncate(30);
+    }
+}
+
+/// Record an involuntary sign-out (identity-law run gate, hub-rejected token)
+/// as a structured notice on the snapshot — BR#2532: the reason used to live
+/// only in stderr/last_error, which the UI never reads, so an upgrading
+/// desktop stared at onboarding with no explanation.
+fn snap_logout(snap: &SharedSnapshot, msg: &str) {
+    if let Ok(mut s) = snap.lock() {
+        s.logout_reason = Some(msg.to_string());
+        s.logout_ts = Some(now_ms());
+    }
+    snap_activity(snap, "error", msg);
+}
+
+/// Clear the logout notice: a user-initiated logout is not a forced sign-out
+/// (the Settings UI says so itself), and a fresh run starts clean.
+fn snap_logout_clear(snap: &SharedSnapshot) {
+    if let Ok(mut s) = snap.lock() {
+        s.logout_reason = None;
+        s.logout_ts = None;
+    }
+}
+
+/// BR#2532: after an auto-logout the loop is STOPPED, so `dispatch_snapshot`
+/// serves the external (headless flat-file) snapshot — which knows nothing of
+/// the in-memory notice. Overlay it so the pair screen can still guide the
+/// re-pair. `v` may be Null (no runner file at all — the gate tripped before
+/// the first tick ever wrote one).
+pub fn overlay_logout_notice(snap: &SharedSnapshot, v: &mut serde_json::Value) {
+    let (reason, ts) = match snap.lock().ok().map(|s| (s.logout_reason.clone(), s.logout_ts)) {
+        Some((Some(r), ts)) => (r, ts.unwrap_or(0)),
+        _ => return,
+    };
+    if !v.is_object() {
+        *v = serde_json::json!({ "running": false });
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("logout_reason".into(), serde_json::Value::String(reason));
+        obj.insert("logout_ts".into(), serde_json::json!(ts));
     }
 }
 
@@ -835,6 +881,11 @@ fn write_runner_state(snap: &SharedSnapshot) {
             "max_sessions": s.max_sessions,
             "in_flight": s.in_flight,
             "activity": s.activity.iter().take(10).collect::<Vec<_>>(),
+            // BR#2532: an auto-logout in a HEADLESS runner must reach the
+            // desktop UI too — it observes this file from another process and
+            // can't see our in-memory notice. Null after a user logout.
+            "logout_reason": s.logout_reason,
+            "logout_ts": s.logout_ts,
         });
         let _ = std::fs::write(dir.join("runner.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
     }
@@ -2390,12 +2441,17 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // impossible and every claim would carry the wrong identity class. Log
     // out automatically: clear the dead credential and await the next login
     // (self-provision re-vends, replace-by-device_id — no human click beyond
-    // the login).
+    // the login). BR#2532: a WRONG-CLASS token is a forced sign-out — the
+    // reason rides the snapshot as a structured notice (an upgrading desktop
+    // gets a guided sign-in, not a silent logout). An EMPTY token is plain
+    // first-run onboarding: no notice, nothing was taken away.
     if cfg.token.is_empty() || cfg.gateway != Some(true) {
         let msg = if cfg.token.is_empty() {
             "no gateway token — sign in to provision this desktop's gateway".to_string()
         } else {
-            "wrong credential class — token cleared; sign in to re-provision (gateway class is vended at login)".to_string()
+            let msg = "signed out automatically — the identity law reserves gateway dispatch for gateway-class tokens, and this device's saved token is not one (it predates gateway-class vending). Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
+            snap_logout(&snap, msg);
+            msg.to_string()
         };
         eprintln!("[dispatch] {msg}");
         logout_core(&stop, &running, &snap, true);
@@ -2499,14 +2555,14 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                             continue;
                         }
                     }
-                    let msg = format!(
-                        "logged out — hub rejected the token ({e}) and one-time repair failed; sign in to re-provision"
-                    );
-                    eprintln!("[dispatch] {msg}");
-                    snap_activity(&snap, "error", &msg);
+                    // BR#2532: same guided-surface treatment as the identity
+                    // gate — the reason rides the snapshot, not just the log.
+                    let msg = "signed out automatically — the hub rejected this device's token (revoked, expired, or rotated away) and the one-time repair failed. Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
+                    eprintln!("[dispatch] {msg} (hub said: {e})");
+                    snap_logout(&snap, msg);
                     logout_core(&stop, &running, &snap, true);
                     if let Ok(mut g) = last_error.lock() {
-                        *g = Some(msg);
+                        *g = Some(msg.to_string());
                     }
                     did_logout = true;
                     break;
@@ -2584,6 +2640,10 @@ pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(
         }
     }
     state.stop.store(false, Ordering::Relaxed);
+    // fresh run: any prior auto-logout notice is stale — either the pairing
+    // was fixed (re-pair) or the user restarted deliberately (BR#2532). If
+    // the pairing is still unqualified, run_loop re-records it immediately.
+    snap_logout_clear(&state.snapshot);
     let stop = state.stop.clone();
     let running = state.running.clone();
     let last_error = state.last_error.clone();
@@ -2636,6 +2696,9 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
         s.running = false;
         s.in_flight = Vec::new();
     }
+    // BR#2532: persist the post-logout state (incl. an auto-logout notice, if
+    // this was one) so an observing desktop UI sees it in the flat file
+    write_runner_state(snap);
     eprintln!(
         "[dispatch] logged out — {}",
         if clear_credential {
@@ -2651,6 +2714,10 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
 /// survives UI logout, dispatched agents keep running, admin revoke is the
 /// kill switch). The next login re-vends, replacing in place.
 pub fn logout(state: &DispatchState) {
+    // user-initiated: not a forced sign-out — clear any stale auto-logout
+    // notice BEFORE logout_core persists the runner state, so the flat file
+    // doesn't present it as one either (BR#2532).
+    snap_logout_clear(&state.snapshot);
     logout_core(&state.stop, &state.running, &state.snapshot, false);
     if let Ok(mut g) = state.last_error.lock() {
         *g = None;
@@ -2769,6 +2836,37 @@ mod tests {
         // the caller provisions a scratch dir and the board contract
         assert_eq!(source_repo("pure board-side judgment work, no links", &json!({})), None);
         assert_eq!(source_repo("", &json!({ "repo": 42 })), None);
+    }
+
+    #[test]
+    fn auto_logout_records_a_guided_notice_not_just_a_log_line() {
+        // BR#2532: the identity-law run gate (and the hub-401 logout) must
+        // record a structured notice the pair screen can render — naming the
+        // law and the one-click re-pair path — instead of leaving the reason
+        // in stderr/last_error, which the UI never reads.
+        let src = include_str!("dispatch.rs");
+        // needles assembled from parts so this alarm cannot match itself
+        let notice_call = format!("snap_{}(&snap", "logout");
+        assert!(
+            src.matches(&notice_call).count() >= 2,
+            "both auto-logout sites (identity-law gate + hub-401) must record the structured notice"
+        );
+        assert!(
+            src.contains(&format!("overlay_{}out_notice", "log")),
+            "stopped-loop snapshots serve the external flat file — the notice must be overlaid onto it or the UI never sees it"
+        );
+        let msg_kw = format!("let msg {} ", "=");
+        let law = format!("{} law", "identity");
+        let law_named = src.lines().filter(|l| l.contains(&msg_kw) && l.contains(&law)).count() >= 1;
+        assert!(law_named, "the identity-law logout reason must name the identity law");
+        let keeps = format!("{} was lost", "Nothing");
+        let kept = format!("settings {} kept", "are");
+        let keeps_named = src
+            .lines()
+            .filter(|l| l.contains(&msg_kw) && l.contains(&keeps) && l.contains(&kept))
+            .count()
+            >= 2;
+        assert!(keeps_named, "both auto-logout reasons must say what re-pairing keeps (hub URL + settings)");
     }
 }
 

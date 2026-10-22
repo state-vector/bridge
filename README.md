@@ -93,10 +93,11 @@ layer — the desktop opens a live WebSocket to the hub with its paired
 `gw-*` token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
 cookie-only), so both surfaces always look and update identically.
 
-Beyond dispatch it carries two human-facing surfaces:
+Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
 - **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). Verify-verdict notifications state the ask ("Accept verification of BR#X? — verdict PASS"), not the raw receipts title. No runner required.
+- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade, or a token the hub rejects), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates.
 
 ### Runner config file
 
