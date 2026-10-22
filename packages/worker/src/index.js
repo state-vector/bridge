@@ -121,11 +121,13 @@ export default {
     }
 
     // Knowledge realtime (human plane, cookie | gateway bearer): KB event fanout.
+    // (no CORS wrap — CORS does not gate WebSocket upgrades; auth rides the
+    // cookie or the ?token= param on the upgrade request itself)
     if (url.pathname === "/kb-ws") {
       if (request.method === "OPTIONS") return kbPreflight();
       const auth = await authKb(request, env);
       if (auth instanceof Response) return kbCors(auth);
-      return kbCors(env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request));
+      return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
 
     // Knowledge REST mirror (human plane, cookie | gateway bearer).
@@ -393,9 +395,11 @@ async function authKb(request, env) {
 /** Native shells hit the hub cross-origin — bearer auth needs no credentials,
  *  so a permissive CORS policy on the (non-admin) knowledge plane is safe. */
 function kbCors(r) {
-  r.headers.set("Access-Control-Allow-Origin", "*");
-  r.headers.set("Access-Control-Allow-Headers", "authorization, content-type");
-  r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (r && r.headers) {
+    r.headers.set("Access-Control-Allow-Origin", "*");
+    r.headers.set("Access-Control-Allow-Headers", "authorization, content-type");
+    r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  }
   return r;
 }
 function kbPreflight() {
