@@ -640,3 +640,59 @@ pub fn transport_for(backend: crate::opencode::Backend, mode: Option<&str>) -> B
         Box::new(OpencodeRun)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The hermes incident (2026-10-22): a frame shape the extractor didn't
+    // match read as a DEAD session — no live line, no session_alive vouches,
+    // watchdog released working tasks, reply tail was bare "acp timed out".
+    // Every ACP serialization we know of must yield text or a kind fallback,
+    // and liveness itself must never depend on this matching (b02c237b9).
+
+    #[test]
+    fn message_chunk_content_as_object() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "hello" } }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("hello"));
+        assert_eq!(update_kind(&v), "agent_message_chunk");
+    }
+
+    #[test]
+    fn message_chunk_content_as_array() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": [ { "type": "text", "text": "block text" } ] }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("block text"));
+    }
+
+    #[test]
+    fn tool_call_and_update_kinds() {
+        let call = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "tool_call", "title": "bash" }
+        });
+        assert_eq!(extract_update_text(&call).as_deref(), Some("[tool] bash"));
+        let upd = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "tool_call_update", "title": "bash" }
+        });
+        assert_eq!(extract_update_text(&upd).as_deref(), Some("[tool] bash"));
+    }
+
+    #[test]
+    fn unmatched_shape_still_names_the_kind() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "plan_update" }
+        });
+        assert_eq!(extract_update_text(&v), None);
+        assert_eq!(update_kind(&v), "plan_update");
+    }
+}
