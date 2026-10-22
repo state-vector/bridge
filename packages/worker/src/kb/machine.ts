@@ -79,6 +79,25 @@ function metaOf(m: unknown): any {
 export const CHURN_REDIRECT_ATTEMPTS = 5; // impl/analysis: release redirects to blocked
 export const CHURN_ESCALATE_ATTEMPTS = 3; // verdict roles: escalate to human (they may not block)
 
+/** What the release path does with a task re-entering the pool. */
+export type ChurnOutcome = "pass" | "escalate" | "redirect";
+
+/**
+ * The churn decision for one release, as a pure function so every host obeys
+ * the same counter (BR#2404/BR#2420 — the silent-dispatch loop class: claim →
+ * stall → watchdog release → re-claim, forever). Verdict duties
+ * (role:review/role:unblock) may not block, so at CHURN_ESCALATE_ATTEMPTS they
+ * escalate to a human instead of redirecting; everything else stops silently
+ * re-entering at CHURN_REDIRECT_ATTEMPTS — the release becomes an honest
+ * blocked record. Releasing an already-blocked task is a deliberate act and
+ * never re-redirects.
+ */
+export function churnRelease(nextAttempts: number, verdictDuty: boolean, fromStatus: string): ChurnOutcome {
+  if (verdictDuty && nextAttempts >= CHURN_ESCALATE_ATTEMPTS) return "escalate";
+  if (nextAttempts >= CHURN_REDIRECT_ATTEMPTS && fromStatus !== "blocked") return "redirect";
+  return "pass";
+}
+
 export const RULES: Rule[] = [
   {
     name: "verdict-no-in_review",

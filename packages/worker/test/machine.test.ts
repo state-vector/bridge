@@ -2,11 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   RULES,
   check,
+  churnRelease,
   effectiveRole,
   invariants,
   detectBreaches,
   breachClass,
   CHURN_ESCALATE_ATTEMPTS,
+  CHURN_REDIRECT_ATTEMPTS,
   type RuleCtx,
   type RuleInput,
 } from "../src/kb/machine.ts";
@@ -208,6 +210,32 @@ describe("loop regressions", () => {
       ].sort(),
     );
     expect(CHURN_ESCALATE_ATTEMPTS).toBeLessThan(5); // escalate before the old 5-redirect
+  });
+});
+
+// ---------- churn release policy (BR#2404 — the silent-dispatch loop bound) ----------
+
+describe("churnRelease", () => {
+  it("verdict duties escalate to a human at 3 releases — they may not block", () => {
+    expect(churnRelease(1, true, "in_progress")).toBe("pass");
+    expect(churnRelease(2, true, "in_progress")).toBe("pass");
+    expect(churnRelease(CHURN_ESCALATE_ATTEMPTS, true, "in_progress")).toBe("escalate");
+    expect(churnRelease(9, true, "in_progress")).toBe("escalate");
+  });
+
+  it("impl/analysis keep re-entering below 5 releases, then the release redirects to blocked", () => {
+    expect(churnRelease(CHURN_REDIRECT_ATTEMPTS - 1, false, "in_progress")).toBe("pass");
+    expect(churnRelease(CHURN_REDIRECT_ATTEMPTS, false, "in_progress")).toBe("redirect");
+    expect(churnRelease(CHURN_REDIRECT_ATTEMPTS + 3, false, "in_progress")).toBe("redirect");
+  });
+
+  it("at the overlap a verdict duty escalates — escalate wins over redirect", () => {
+    expect(churnRelease(CHURN_REDIRECT_ATTEMPTS, true, "in_progress")).toBe("escalate");
+  });
+
+  it("releasing an already-blocked task never re-redirects (deliberate unblock)", () => {
+    expect(churnRelease(CHURN_REDIRECT_ATTEMPTS + 1, false, "blocked")).toBe("pass");
+    expect(churnRelease(CHURN_ESCALATE_ATTEMPTS, true, "blocked")).toBe("escalate");
   });
 });
 
