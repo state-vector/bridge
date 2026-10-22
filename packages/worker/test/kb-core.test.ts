@@ -96,7 +96,7 @@ describe("relations", () => {
 
   it("supersedes requires same type", () => {
     expect(validateRelation("supersedes", "decision", "decision").ok).toBe(true);
-    expect(validateRelation("supersedes", "decision", "rfc").ok).toBe(false);
+    expect(validateRelation("supersedes", "decision", "rfc" as any).ok).toBe(false);
   });
 
   it("implements: task → goal only (rfc type is gone)", () => {
@@ -171,7 +171,8 @@ import { scoreAgent, AgentSignals } from "../src/kb/core.ts";
 
 const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0,
-  asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0,
+  reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
+  artefacts_created: 0, verify_duty_backlog: 0,
 };
 
 describe("agent behaviour score", () => {

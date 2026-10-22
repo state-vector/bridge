@@ -227,7 +227,7 @@ export const RULES: Rule[] = [
  *  failing rule wins. Returns the rejection message or null. Never throws. */
 export async function check(i: RuleInput, c: RuleCtx): Promise<string | null> {
   const base = validateTransition(i.type as any, i.status, i.to);
-  if (!base.ok) return base.reason;
+  if (base.ok === false) return base.reason;
   for (const r of RULES) {
     if (!r.when(i)) continue;
     const err = await r.guard(i, c);
