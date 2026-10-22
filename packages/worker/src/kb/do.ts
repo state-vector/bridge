@@ -2702,9 +2702,12 @@ export class KnowledgeHub {
     }
     const target = (own && !byLabel) ? own : (byLabel ?? own);
     if (target) {
+      // the vended class rides with the replacement: a gateway pairing must
+      // not leave the row carrying the replaced token's stale tags
+      const mintTags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
       this.state.storage.sql.exec(
-        `UPDATE auth_tokens SET hash = ?, label = ?, device_id = COALESCE(?, device_id), revoked_ts = NULL WHERE id = ?`,
-        hash, label, device_id, target.id,
+        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, device_id = COALESCE(?, device_id), revoked_ts = NULL WHERE id = ?`,
+        hash, label, JSON.stringify(mintTags), device_id, target.id,
       );
       const ws = this.wsSlug();
       if (ws) {
