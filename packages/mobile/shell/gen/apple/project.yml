@@ -1,0 +1,154 @@
+name: bridge-mobile
+options:
+  bundleIdPrefix: com.statevector.bridge.mobile
+  deploymentTarget:
+    iOS: 15.0
+# E2E scheme (BR#2514): release-only — mobile debug builds are dev-server
+# shells (no embedded assets), useless without `tauri ios dev`. The target-
+# level scheme's build/test actions stay Debug by default and xcodegen's
+# target-scheme keys can't override them, so the E2E lane uses this scheme.
+schemes:
+  e2e:
+    build:
+      targets:
+        bridge-mobile_iOS: [release]
+        bridge-mobile_UITests: [release]
+    test:
+      config: release
+      targets:
+        - bridge-mobile_UITests
+    run:
+      config: release
+fileGroups: [../../src]
+configs:
+  debug: debug
+  release: release
+settingGroups:
+  app:
+    base:
+      PRODUCT_NAME: Bridge
+      PRODUCT_BUNDLE_IDENTIFIER: com.statevector.bridge.mobile
+targetTemplates:
+  app:
+    type: application
+    sources:
+      - path: Sources
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      groups: [app]
+targets:
+  bridge-mobile_iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+      # Exclude built static libs: regenerating with xcodegen after a build
+      # otherwise turns the per-configuration libapp.a copies into colliding
+      # resources ("Multiple commands produce …/libapp.a"). They are linked
+      # via LIBRARY_SEARCH_PATHS, never bundled as resources.
+      - path: Externals
+        excludes: ["**/*.a"]
+      - path: bridge-mobile_iOS
+      - path: assets
+        buildPhase: resources
+        type: folder
+      - path: LaunchScreen.storyboard
+    info:
+      path: bridge-mobile_iOS/Info.plist
+      properties:
+        LSRequiresIPhoneOS: true
+        # E2E + self-hosted hubs are plain http:// on LAN/loopback (BR#2514) —
+        # ATS blocks http://127.0.0.1 fetches without this exception.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        UILaunchStoryboardName: LaunchScreen
+        UIRequiredDeviceCapabilities: [arm64, metal]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+    entitlements:
+      path: bridge-mobile_iOS/bridge-mobile_iOS.entitlements
+    scheme:
+      buildConfiguration: release
+      testConfiguration: release
+      launchConfiguration: release
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+      testTargets:
+        - bridge-mobile_UITests
+    settings:
+      base:
+        ENABLE_BITCODE: false
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64 
+        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+      groups: [app]
+    dependencies:
+      - framework: libapp.a
+        embed: false
+      - sdk: CoreGraphics.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: Security.framework
+      - sdk: UIKit.framework
+      - sdk: WebKit.framework
+    preBuildScripts:
+      # Standalone Rust build (BR#2514): the stock `tauri ios xcode-script`
+      # needs the tauri CLI's options-server (only alive while `tauri ios
+      # build/dev` runs), which blocks plain `xcodebuild` — and the E2E lane
+      # builds the test bundles directly. This reproduces what it does: cargo
+      # build the staticlib, copy it where LIBRARY_SEARCH_PATHS expects it as
+      # libapp.a.
+      - script: |
+          set -e
+          case "${PLATFORM_NAME:-}" in
+            iphonesimulator) RUST_TARGET=aarch64-apple-ios-sim ;;
+            *)               RUST_TARGET=aarch64-apple-ios ;;
+          esac
+          PROFILE_DIR=$(echo "${CONFIGURATION:-Debug}" | tr '[:upper:]' '[:lower:]')
+          cd "$SRCROOT/../.."
+          # release builds must match `tauri ios build`: the custom-protocol
+          # feature is what embeds the frontend dist into the binary
+          if [ "$PROFILE_DIR" = "release" ]; then
+            cargo build --lib --target "$RUST_TARGET" --release --features tauri/custom-protocol
+          else
+            cargo build --lib --target "$RUST_TARGET"
+          fi
+          OUT="$SRCROOT/Externals/arm64/${CONFIGURATION}"
+          mkdir -p "$OUT"
+          cp "target/$RUST_TARGET/$PROFILE_DIR/libbridge_mobile_lib.a" "$OUT/libapp.a"
+        name: Build Rust Code
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+  # E2E drive (BR#2514): no idb on this box and osascript keystrokes are
+  # permission-blocked, so the simulator run is driven by XCUITest — connect
+  # to the local hub, sign in through the shell bridge, verify Fleet + For You.
+  bridge-mobile_UITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: bridge-mobile_iOS
+    settings:
+      base:
+        PRODUCT_NAME: bridge-mobile_UITests
+        TEST_TARGET_NAME: bridge-mobile_iOS
+        GENERATE_INFOPLIST_FILE: YES

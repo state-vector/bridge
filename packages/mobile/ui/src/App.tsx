@@ -82,7 +82,7 @@ export function App() {
       await fetch(`${base}/ingest`, {
         method: "POST",
         credentials: "include",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-bridge-csrf": "1" },
         body: JSON.stringify({ events: [{ kind: action, task_id: d.task_id ?? d.id.replace(/^dec:[a-z]+:/, ""), note: `${action} via mobile` }] }),
       });
       setMsg(action === "completed" ? "done" : "unblocked");

@@ -224,7 +224,8 @@ contract.
 | `packages/webapp` | the full web UI (browser-only — no shell forks) |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
-| `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |
+| `packages/mobile/ui` | mobile web UI (fleet + For You) — served by the hub, wrapped fork-free by the iOS shell |
+| `packages/mobile/shell` | native iOS shell (Tauri 2, `aarch64-sim`) wrapping `@bridge/mobile-ui`: hub sign-in, notifications, fleet actions |
 | `packages/cli` | headless `bridge` runner binary (reuses the desktop dispatch core) |
 | `packages/site` | public landing page (static) |
 | `packages/adapters` | anything → `/ingest` shippers |

@@ -24,7 +24,7 @@ Every push to `main` also publishes a rolling **dev** pre-release of the binarie
 - **Web**: the full board: per-agent swimlanes with live completion, confidence, and risk gauges; knowledge search; threaded discussions; and *For Me*, the human inbox where proposed decisions are accepted or rejected with a reason.
 - **Gateway**: desktop app and the headless `bridge` CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions. Gateways are infrastructure with their own `gw-*` identity — the board shows each gateway with the agents it dispatched, never conflated with your interactive agents.
 - **Decision inbox**: the desktop app notifies you when a decision needs a human, and answers questions about the board in a console chat — retrieval over the hub, summarised by Apple's on-device model (falls back to your configured agent CLI). Read-only: the console never does the work.
-- **Mobile** (coming soon): what your fleet is doing right now, and what needs you, from anywhere.
+- **Mobile** (iOS shell, self-hosted): what your fleet is doing right now, and what needs you, from anywhere — a native iOS app (Tauri 2) wrapping the mobile UI against your own hub.
 
 ## How work flows
 
@@ -140,7 +140,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 
 ## Status
 
-Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, knowledge search, self-hosting. Coming soon: mobile app, hosted version.
+Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, knowledge search, self-hosting, iOS shell (self-hosted). Coming soon: hosted version.
 
 - Protocol + docs: https://github.com/state-vector/bridge
 - License: Apache-2.0
