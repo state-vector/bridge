@@ -154,6 +154,30 @@ fn main() {
 
 fn run(cfg: Option<DispatchConfig>) {
     let mut cfg = cfg;
+    // Self-heal the credential: a runner may not start on a missing or
+    // non-gateway token — and it does not have to fail there either. Pair
+    // automatically (device flow: prints a code, a human approves in the
+    // web) — pairing replaces the old credential and the loop continues.
+    if let Some(c) = cfg.as_mut() {
+        if c.token.is_empty() || c.gateway != Some(true) {
+            let url = c.url.clone();
+            if !url.is_empty() {
+                println!("\n== gateway pairing required — starting device flow (approve at {url}/pair) ==\n");
+                match dispatch::pair_device(&url) {
+                    Ok(fresh) => {
+                        *c = fresh;
+                        let _ = c.save();
+                        println!("\n== paired — starting the runner ==\n");
+                    }
+                    Err(e) => {
+                        eprintln!("[bridge] automatic pairing failed: {e}");
+                        eprintln!("[bridge] fix the credential and start again: bridge pair {url}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
     // CLI override: --max-sessions N (wins over env/file, same as the gateway)
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--max-sessions") {
@@ -238,7 +262,7 @@ fn bin_detected(bin: &str) -> bool {
 fn onboard(cfg: &mut DispatchConfig) {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if !tty {
-        eprintln!("[bridge] non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends + models are REQUIRED).");
+        eprintln!("[bridge] non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends are required; models are optional (CLI defaults apply)).");
         return;
     }
     println!("\n== onboard: which agents will drive tasks on this machine? ==\n");
@@ -289,25 +313,40 @@ fn onboard(cfg: &mut DispatchConfig) {
         .collect::<Vec<_>>();
     let backends = if backends.is_empty() { vec![default_backend.clone()] } else { backends };
 
-    // model per backend — REQUIRED (the runner refuses dispatch without one)
+    // transport for opencode: ACP is the default (bidirectional, live session
+    // updates); stdio is the fallback for hosts where the ACP path misbehaves.
+    let mut transport: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    if backends.iter().any(|b| b == "opencode") {
+        let existing_mode = cfg.backends.get("opencode").and_then(|s| s.mode.clone()).unwrap_or_else(|| "acp".into());
+        let t = prompt(
+            "opencode transport — acp (default, live updates) or stdio",
+            Some(&existing_mode),
+        );
+        let t = t.trim().to_lowercase();
+        transport.insert("opencode".to_string(), if t == "stdio" { Some("stdio".into()) } else { None });
+    }
+
+    // model per backend — optional: empty means the agent CLI's own default
+    // config decides (the runner injects an explicit model only when set)
     let mut models = std::collections::HashMap::new();
-    println!("\n== a model per agent (REQUIRED — the runner refuses dispatch without it) ==\n");
+    println!("\n== a model per agent (empty = use the agent CLI's own default) ==\n");
     for b in &backends {
-        let example = if b == "kiro" { "anthropic.claude-sonnet-4-5" } else { "openrouter/~z-ai/glm-flash-latest" };
-        let m = loop {
-            let v = prompt(&format!("  model for {b} (e.g. {example})"), None);
-            if !v.trim().is_empty() {
-                break v.trim().to_string();
-            }
-            println!("  a model is required — the runner will not dispatch without one.");
-        };
-        models.insert(b.clone(), m);
+        let existing = cfg.backends.get(b).and_then(|s| s.model.clone()).unwrap_or_default();
+        let v = prompt(&format!("  model for {b} (empty = keep `{}` / CLI default)", if existing.is_empty() { "unset" } else { &existing }), Some(&existing));
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            models.insert(b.clone(), v);
+        }
     }
 
     println!("\n== where the work happens ==\n");
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
-    let default_wd = if home.is_empty() { cwd.clone() } else { format!("{home}/bridge-work") };
+    let default_wd = if cfg.workdir.is_empty() {
+        if home.is_empty() { cwd.clone() } else { format!("{home}/bridge-work") }
+    } else {
+        cfg.workdir.clone()
+    };
     let workdir = prompt("scratch workdir (task repos are cloned here)", Some(&default_wd));
     let is_git = std::process::Command::new("git")
         .args(["-C", &workdir, "rev-parse", "--is-inside-work-tree"])
@@ -317,17 +356,18 @@ fn onboard(cfg: &mut DispatchConfig) {
         .map(|s| s.success())
         .unwrap_or(false);
     let _ = is_git;
-    let max_sessions = prompt("max concurrent agent sessions", Some("1"))
+    let max_sessions = prompt("max concurrent agent sessions", Some(&cfg.max_sessions.to_string()))
         .parse::<usize>()
         .ok()
         .filter(|&n| n >= 1)
-        .unwrap_or(1);
+        .unwrap_or(cfg.max_sessions.max(1));
 
     cfg.backends = backends
         .iter()
         .map(|b| {
             let section = dispatch::BackendConfig {
                 model: models.get(b).cloned(),
+                mode: transport.get(b).cloned().flatten(),
                 ..Default::default()
             };
             (b.clone(), section)
