@@ -351,7 +351,7 @@ export class KnowledgeHub {
           `SELECT seq, ts, actor, op, artefact_id, detail FROM events WHERE seq > 0 ORDER BY seq DESC LIMIT ?`,
           limit,
         ).toArray().reverse();
-    const events = rows.map((e) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
+    const events = rows.map((e: any) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
     return { events, last_seq: events.length ? events[events.length - 1].seq : since };
   }
 
@@ -359,7 +359,7 @@ export class KnowledgeHub {
     const tasks = this.state.storage.sql.exec(
       `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
        WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
-    ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags) }));
+    ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -416,7 +416,7 @@ export class KnowledgeHub {
     const progress = this.state.storage.sql.exec(
       `SELECT seq, ts, actor, artefact_id, detail FROM events
        WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
-    ).toArray().map((e) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
+    ).toArray().map((e: any) => ({ ...e, detail: JSON.parse(e.detail ?? "{}") }));
     const series = this.state.storage.sql.exec(
       `SELECT artefact_id, ts, actor, data FROM artefact_versions
        WHERE action = 'progress' ORDER BY seq DESC LIMIT 400`,
@@ -448,7 +448,7 @@ export class KnowledgeHub {
     const sig = (label: string): AgentSignals => {
       let s = signals.get(label);
       if (!s) {
-        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 };
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
         signals.set(label, s);
       }
       return s;
@@ -697,7 +697,7 @@ export class KnowledgeHub {
     // Same write-law as mint (BR#2455): charset, uniqueness, and the gw-*
     // class boundary — a token can never rename across the class line.
     if (url.pathname === "/token.self_revoke") {
-      const body = await request.json();
+      const body: any = await request.json();
       let identity;
       try {
         identity = await this.identify(String(body.bearer ?? ""));
@@ -710,7 +710,7 @@ export class KnowledgeHub {
       return this.json({ ok: true, revoked: identity.label });
     }
     if (url.pathname === "/token.rename") {
-      const body = await request.json();
+      const body: any = await request.json();
       const identity = await this.identify(String(body.bearer ?? ""));
       const newLabel = String(body.label ?? "").trim();
       if (!/^[a-zA-Z0-9._-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
@@ -1691,7 +1691,7 @@ export class KnowledgeHub {
     const dst = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, dstId);
     if (!src || !dst) throw new Error("both src and dst must exist");
     const verdict = validateRelation(rel, src.type as ArtefactType, dst.type as ArtefactType);
-    if (!verdict.ok) throw new Error(verdict.reason);
+    if (verdict.ok === false) throw new Error(verdict.reason);
     // verify-of-verify is structurally impossible: a verify task can never be
     // a child of a verify task (or of an unblock task — same ephemerality).
     // Enforced here at the relation level, not just the auto-spawn path.
@@ -2278,7 +2278,7 @@ export class KnowledgeHub {
       ? `\n\nGAUGE DEBT — these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) — the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.`
       : "";
     const my_score = this.agentScores().find((a) => a.label === label)
-      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0 }) };
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
     // score optimisation is an explicit standing directive: the agent sees its
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.
@@ -2402,7 +2402,7 @@ export class KnowledgeHub {
   private settingsMap(): Record<string, any> {
     const rows = this.state.storage.sql.exec(`SELECT key, value FROM settings`).toArray();
     const map: Record<string, any> = {};
-    for (const r of rows) map[r.key] = JSON.parse(r.value);
+    for (const r of rows as any[]) map[r.key] = JSON.parse(r.value);
     return map;
   }
 
@@ -2910,11 +2910,15 @@ export class KnowledgeHub {
     return max + 1;
   }
 
-  private one(query: string, ...params: any[]) {
+  // :any on purpose — rows come back as Record<string, SqlStorageValue> and every
+  // caller immediately narrows to the columns it selected; the per-site casts the
+  // strict ratchet will want are deferred until that pass (BR#2505 guard landed
+  // non-strict on purpose).
+  private one(query: string, ...params: any[]): any {
     return this.state.storage.sql.exec(query, ...params).toArray()[0] ?? null;
   }
 
-  private shape(row: any) {
+  private shape(row: any): any {
     return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags) };
   }
 

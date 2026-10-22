@@ -1,0 +1,15 @@
+{
+  "//": "Type gate for the worker's TypeScript (kb/*.ts + mcp.ts) — the 2026-10-22 board outage shipped because nothing type-analysed these files (tsc would have flagged the undefined name instantly). Deliberately NON-strict for now: TS2304 undefined-name checks (the incident bug class) fire at any strictness; the known noise classes (SqlStorageValue widening, spread-row access) are fixed first, then strict ratchets on. Runs via `tsc --noEmit` in the test script BEFORE the wrangler dry-run. Not part of the CF build hook — wrangler.toml's Workers Builds install deliberately skips tsc; typechecking lives in CI's full-install job.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

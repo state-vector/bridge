@@ -5,7 +5,8 @@
   "description": "bridge worker: ingest, knowledge layer, MCP \u2014 Cloudflare Worker + Durable Objects",
   "scripts": {
     "build": "echo 'bridge worker: no compile step \u2014 wrangler bundles src/ at deploy'",
-    "test": "node --check src/index.js && node --check src/do.js && node --check src/ui.js && npm run build -w @bridge/webapp && wrangler deploy --dry-run && vitest run",
+    "test": "node --check src/index.js && node --check src/do.js && node --check src/ui.js && npm run typecheck && npm run build -w @bridge/webapp && wrangler deploy --dry-run && vitest run",
+    "typecheck": "tsc --noEmit",
     "dev": "wrangler dev",
     "test:syntax": "node --check src/index.js && node --check src/do.js && node --check src/ui.js",
     "check": "npm run build -w @bridge/webapp && wrangler deploy --dry-run"
@@ -14,6 +15,7 @@
     "jose": "^5.9.6"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261019.1",
     "vitest": "^3.1.1",
     "wrangler": "^4.0.0"
   }
