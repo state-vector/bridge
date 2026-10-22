@@ -5,6 +5,7 @@
   "description": "bridge: work orchestration for agents + humans \u2014 web app first",
   "workspaces": [
     "packages/specs",
+    "packages/ui-kit",
     "packages/worker",
     "packages/webapp",
     "packages/desktop",

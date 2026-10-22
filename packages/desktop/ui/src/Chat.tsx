@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Btn, Card, TextArea, TextInput } from "@bridge/ui-kit";
 
 /** Console chat — board Q&A on the local model, write-capable with
  *  confirmation: an exchange that implies new work yields a task DRAFT,
@@ -107,42 +108,40 @@ export function Chat() {
           </div>
         )}
         {draft && (
-          <div className="gw-card chat-draft">
+          <Card className="chat-draft">
             <h2>draft task — confirm to create</h2>
-            <input
-              className="gw-input"
+            <TextInput
               value={draft.title}
               onChange={(e) => setDraft({ ...draft, title: e.target.value })}
             />
-            <textarea
-              className="gw-input"
+            <TextArea
               rows={4}
               value={draft.body}
               onChange={(e) => setDraft({ ...draft, body: e.target.value })}
             />
             <div className="gw-row">
-              <button
-                className="gw-btn gw-btn-run"
+              <Btn
+                variant="primary"
+                size="sm"
                 disabled={creating || !draft.title.trim()}
                 onClick={() => void createTask()}
               >
                 Create task
-              </button>
-              <button className="gw-btn" disabled={creating} onClick={() => setDraft(null)}>
+              </Btn>
+              <Btn size="sm" disabled={creating} onClick={() => setDraft(null)}>
                 Discard
-              </button>
+              </Btn>
             </div>
             <span className="gw-note">
               nothing is created until you confirm; created tasks land in todo — dispatch is a separate decision
             </span>
-          </div>
+          </Card>
         )}
-        {err && <span className="gw-err">{err}</span>}
+        {err && <span className="k-err">{err}</span>}
       </div>
-      <div className="gw-card">
+      <Card>
         <div className="gw-row">
-          <input
-            className="gw-input"
+          <TextInput
             style={{ flex: 1 }}
             value={input}
             placeholder="ask the board, or describe work…"
@@ -151,11 +150,11 @@ export function Chat() {
               if (e.key === "Enter" && !e.shiftKey) void send();
             }}
           />
-          <button className="gw-btn gw-btn-run" disabled={busy || !input.trim()} onClick={() => void send()}>
+          <Btn variant="primary" size="sm" disabled={busy || !input.trim()} onClick={() => void send()}>
             Send
-          </button>
+          </Btn>
         </div>
-      </div>
+      </Card>
     </main>
   );
 }

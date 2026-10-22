@@ -493,6 +493,18 @@ const TOOLS = [
     },
   },
   {
+    name: "ask_answer",
+    description: "Answer an ask addressed to you (or escalate it): closes the ask with your answer and un-blocks whatever was waiting on it. Required for ask hygiene — unanswered asks park tasks indefinitely.",
+    inputSchema: {
+      type: "object",
+      required: ["id", "answer"],
+      properties: {
+        id: { type: "string", description: "ask artefact id (ASK-…)" },
+        answer: { type: "string", description: "the answer / decision" },
+      },
+    },
+  },
+  {
     name: "session_alive",
     description: "Runner-side liveness vouch: the session process is alive and producing output (stdout/ACP stream moved). Updates the watchdog liveness stamp only — no board event, no progress entry. Called by the runner, throttled; agents should use log_progress for narrative.",
     inputSchema: {

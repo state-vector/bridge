@@ -1,0 +1,60 @@
+/* ============================================================
+   @bridge/ui-kit — tokens
+   The single style vocabulary. Surfaces may RE-POINT these
+   values (palette overrides, density knobs) but never re-declare
+   component styles. Defaults are the dark CLI palette shared by
+   the gateway + mobile shells; the webapp overrides the palette
+   in its own surface css.
+   ============================================================ */
+
+:root {
+  /* ---- palette ---- */
+  --bg: #0b0e14;
+  --bg-raised: #12161f;
+  --bg-hover: #1c2330;
+  --panel: #12161f;            /* base for translucent panel rows */
+  --line: #232a37;
+  --text: #dfe5ee;
+  --text-dim: #9aa4b5;
+  --text-faint: #5d6675;
+  --accent: #5b8def;
+  --green: #3fbf7f;
+  --red: #e5484d;
+  --amber: #f2a33c;
+  --work: #5b8def;             /* plane colors (webapp re-points) */
+  --startup: #b18cff;
+  --home: #3ecf8e;
+  --on-accent: #ffffff;        /* text on accent fills (webapp re-points darker) */
+
+  /* ---- geometry ---- */
+  --kit-radius: 10px;
+  --kit-radius-sm: 8px;
+  --kit-radius-xs: 5px;
+
+  /* ---- type scale ---- */
+  --kit-font-xs: 9.5px;
+  --kit-font-sm: 10.5px;
+  --kit-font-dim: 11.5px;
+  --kit-font-base: 12.5px;
+  --kit-font-md: 13px;
+  --kit-font-lg: 14.5px;
+
+  /* ---- spacing ---- */
+  --kit-sp-1: 4px;
+  --kit-sp-2: 6px;
+  --kit-sp-3: 8px;
+  --kit-sp-4: 10px;
+  --kit-sp-5: 12px;
+  --kit-sp-6: 14px;
+  --kit-sp-7: 16px;
+
+  /* ---- font stacks ---- */
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: -apple-system, "SF Pro Text", system-ui, sans-serif;
+
+  /* ---- control density knobs (surfaces re-point; mobile goes touch) ---- */
+  --kit-control-font: 13px;
+  --kit-control-pad: 8px 13px;
+  --kit-input-font: 13px;
+  --kit-input-pad: 7px 10px;
+}

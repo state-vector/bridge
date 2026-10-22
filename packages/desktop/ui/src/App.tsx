@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
 
@@ -212,15 +213,15 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
     return (
       <div className="gw-agent fy-item fy-decision">
         <span className="fy-chips">
-          {f.verdict && <span className={`chip ${f.verdict === "BOUNCE" ? "chip-needs" : "chip-done"}`}>{f.verdict}</span>}
-          {chips.map((c) => <span key={c} className="chip chip-urgent">{c}</span>)}
-          {f.target && <span className="chip chip-scope">{f.target}</span>}
+          {f.verdict && <Chip tone={f.verdict === "BOUNCE" ? "needs" : "done"}>{f.verdict}</Chip>}
+          {chips.map((c) => <Chip key={c} tone="urgent">{c}</Chip>)}
+          {f.target && <Chip tone="scope">{f.target}</Chip>}
         </span>
         <span className="gw-fq" title={d.title}>{f.q}</span>
         <div className="gw-row" style={{ marginLeft: "auto", gap: 6 }}>
-          <button className="gw-btn act-accept" disabled={busy} onClick={() => act(d.id)}>
+          <Btn variant="accept" size="sm" disabled={busy} onClick={() => act(d.id)}>
             {f.verdict === "BOUNCE" ? "Decide" : "Decide"} ↗
-          </button>
+          </Btn>
           {hubUrl && <a className="gw-link" href="#" onClick={(e) => { e.preventDefault(); openExternal(`${hubUrl}/?task=${d.id}`); }}>comment ↗</a>}
         </div>
       </div>
@@ -229,13 +230,13 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
 
   return (
     <main className="gw-main">
-      {err && <div className="gw-card"><span className="gw-err">{err}</span></div>}
-      <div className="gw-card">
+      {err && <Card><span className="k-err">{err}</span></Card>}
+      <Card>
         <h2>For you</h2>
         <span className="gw-note">{total > 0 ? `${total} awaiting you` : "nothing needs you right now"}</span>
-      </div>
+      </Card>
       {(verdictCards.length > 0 || generic.length > 0) && (
-        <div className="gw-card">
+        <Card>
           <h2>Awaiting your decision</h2>
           {verdictCards.map(({ latest, prior }) => {
             const verdict = String(latest.meta?.verdict ?? "").toLowerCase() === "bounce" ? "BOUNCE" : "VERIFIED";
@@ -248,34 +249,34 @@ function ForYou({ hubUrl }: { hubUrl: string | null }) {
             );
           })}
           {generic.map((d) => <DecisionRow key={d.id} d={d} chips={["DECISION"]} />)}
-        </div>
+        </Card>
       )}
       {(data?.blocked ?? []).length > 0 && (
-        <div className="gw-card">
+        <Card>
           <h2>Blocked — unblock work</h2>
           {(data?.blocked ?? []).map((b) => (
             <div key={b.id} className="gw-agent fy-item">
-              <span className="fy-chips"><span className="chip chip-urgent">BLOCKED</span></span>
+              <span className="fy-chips"><Chip tone="urgent">BLOCKED</Chip></span>
               <span className="gw-fnote" title={b.title}>{b.title}</span>
               <span className="gw-fmeta">{b.meta?.unblock_condition ?? b.meta?.blocked_reason ?? null}</span>
               <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{b.id}</span>
             </div>
           ))}
-        </div>
+        </Card>
       )}
       {openQuestions.length > 0 && (
-        <div className="gw-card">
+        <Card>
           <h2>Open questions</h2>
           {openQuestions.map((t) => (
             <div key={t.id} className="gw-agent fy-item">
-              <span className="fy-chips"><span className="chip chip-urgent">QUESTION</span></span>
+              <span className="fy-chips"><Chip tone="urgent">QUESTION</Chip></span>
               <span className="gw-fnote" title={t.title}>{t.title}</span>
               <span className="gw-fmeta gw-mono" style={{ marginLeft: "auto" }}>{t.id}</span>
             </div>
           ))}
-        </div>
+        </Card>
       )}
-      {actMsg && <div className="gw-card"><span className="gw-ok">{actMsg}</span></div>}
+      {actMsg && <Card><span className="k-ok">{actMsg}</span></Card>}
     </main>
   );
 }
@@ -315,8 +316,8 @@ function Top() {
 
   return (
     <main className="gw-main">
-      <div className="gw-card"><h2>Top</h2><span className="gw-note">{rows?.length ?? 0} in flight — live</span>{err && <span className="gw-err">{err}</span>}</div>
-      <div className="gw-card">
+      <Card><h2>Top</h2><span className="gw-note">{rows?.length ?? 0} in flight — live</span>{err && <span className="k-err">{err}</span>}</Card>
+      <Card>
         <div className="bt-head">
           <span>task</span><span>state</span><span>gauge</span><span>last signal</span>
         </div>
@@ -330,19 +331,19 @@ function Top() {
           const sentiment = p?.sentiment;
           return (
             <div key={t.id} className={`bt-row ${blocked ? "bt-blocked" : ""}`}>
-              <span className={`conn conn-${staleness(sig) === "dead" ? "closed" : "open"}`}>●</span>
+              <ConnDot state={staleness(sig) === "dead" ? "closed" : "open"} />
               <span className="gw-mono bt-id">{t.id}</span>
               <div className="bt-main">
                 <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
                 <span className="bt-title" title={t.title}>{t.title}</span>
                 {p?.will && <span className="bt-will" title={p.will}>▸ {String(p.will).slice(0, 70)}</span>}
                 {blocked && exit && (
-                  <span className="bt-exit"><span className="chip chip-urgent">exit</span> {String(exit).slice(0, 90)}</span>
+                  <span className="bt-exit"><Chip tone="urgent">exit</Chip> {String(exit).slice(0, 90)}</span>
                 )}
                 {p?.note && !blocked && <span className="bt-note">{String(p.note).slice(0, 110)}</span>}
               </div>
               <div className="bt-state">
-                <span className={`st-chip ${st === "in_progress" ? "st-live" : blocked ? "st-err" : "st-amber"}`}>{st.replace("_", " ")}</span>
+                <Chip pill tone={st === "in_progress" ? "live" : blocked ? "err" : "warn"}>{st.replace("_", " ")}</Chip>
                 {sentiment && <span className="bt-sent">{String(sentiment).replace("_", " ")}</span>}
               </div>
               <span className="bt-gauge">
@@ -363,7 +364,7 @@ function Top() {
           );
         })}
         {(rows ?? []).length === 0 && <span className="gw-log-empty">nothing in flight</span>}
-      </div>
+      </Card>
     </main>
   );
 }
@@ -397,8 +398,8 @@ function Backlog() {
 
   return (
     <main className="gw-main">
-      <div className="gw-card"><h2>Backlog</h2><span className="gw-note">{queue.length} queued · {data?.done?.length ?? 0} done</span>{err && <span className="gw-err">{err}</span>}</div>
-      <div className="gw-card">
+      <Card><h2>Backlog</h2><span className="gw-note">{queue.length} queued · {data?.done?.length ?? 0} done</span>{err && <span className="k-err">{err}</span>}</Card>
+      <Card>
         <h2>Queue</h2>
         {queue.map((t) => {
           const kind = kindOf(t);
@@ -412,18 +413,18 @@ function Backlog() {
               <div className="bl-main">
                 <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
                 <span className="bl-title" title={t.title}>{t.title}</span>
-                {exit && <span className="bl-exit"><span className="chip chip-urgent">exit</span> {String(exit).slice(0, 90)}</span>}
+                {exit && <span className="bl-exit"><Chip tone="urgent">exit</Chip> {String(exit).slice(0, 90)}</span>}
               </div>
               <span className="bl-meta">
-                {att > 0 && <span className="chip chip-urgent" title={`attempted ${att}x`}>×{att}</span>}
+                {att > 0 && <Chip tone="urgent" title={`attempted ${att}x`}>×{att}</Chip>}
                 <span className="gw-fmeta">{ageOf(t.updated_ts, now)}</span>
               </span>
             </div>
           );
         })}
         {queue.length === 0 && <span className="gw-log-empty">queue empty</span>}
-      </div>
-      <div className="gw-card">
+      </Card>
+      <Card>
         <h2>Done</h2>
         {(data?.done ?? []).slice(0, 30).map((t) => (
           <div key={t.id} className="bl-row bl-done">
@@ -434,7 +435,7 @@ function Backlog() {
           </div>
         ))}
         {(data?.done ?? []).length === 0 && <span className="gw-log-empty">nothing done yet</span>}
-      </div>
+      </Card>
     </main>
   );
 }
@@ -644,35 +645,35 @@ export function App() {
     return (
       <div className="gw">
         <main className="gw-main">
-          <div className="gw-card">
+          <Card>
             <h2>Pair this desktop</h2>
-            <div className="gw-row">
-              <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
-                onChange={(e) => setHubUrl(e.target.value)} />
-              <button className="gw-btn gw-btn-run" onClick={() => void startPair()}>Pair</button>
-            </div>
-            {pairCode && (
-              <>
-                <div className="gw-row" style={{ marginTop: 14 }}>
-                  <span className="gw-mono" style={{ fontSize: 30, letterSpacing: 6, fontWeight: 600 }}>{pairCode}</span>
-                  <button className="gw-btn" onClick={() => void copyCode()}>{copied ? "copied ✓" : "Copy"}</button>
-                  <button className="gw-btn" onClick={() => {
-                    localStorage.removeItem("bridge-pair-pending");
-                    setPairCode(null);
-                    setPairingUrl("");
-                  }}>Cancel</button>
-                </div>
-                <span className="gw-note">
-                  Enter this code at <span className="gw-mono">{pairingUrl}/pair</span> (just opened in your browser) — waiting for approval…
-                </span>
-              </>
-            )}
-            {pairErr && (
-              <div className="gw-row" style={{ marginTop: 8 }}>
-                <span className="gw-err">{pairErr}</span>
+              <div className="gw-row">
+                <TextInput style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
+                  onChange={(e) => setHubUrl(e.target.value)} />
+                <Btn variant="primary" size="sm" onClick={() => void startPair()}>Pair</Btn>
               </div>
-            )}
-          </div>
+              {pairCode && (
+                <>
+                  <div className="gw-row" style={{ marginTop: 14 }}>
+                    <span className="gw-mono" style={{ fontSize: 30, letterSpacing: 6, fontWeight: 600 }}>{pairCode}</span>
+                    <Btn size="sm" onClick={() => void copyCode()}>{copied ? "copied ✓" : "Copy"}</Btn>
+                    <Btn size="sm" onClick={() => {
+                      localStorage.removeItem("bridge-pair-pending");
+                      setPairCode(null);
+                      setPairingUrl("");
+                    }}>Cancel</Btn>
+                  </div>
+                  <span className="gw-note">
+                    Enter this code at <span className="gw-mono">{pairingUrl}/pair</span> (just opened in your browser) — waiting for approval…
+                  </span>
+                </>
+              )}
+              {pairErr && (
+                <div className="gw-row" style={{ marginTop: 8 }}>
+                  <span className="k-err">{pairErr}</span>
+                </div>
+              )}
+            </Card>
         </main>
       </div>
     );
@@ -771,7 +772,7 @@ export function App() {
 
       {page === "log" && (
         <main className="gw-main">
-          <div className="gw-card">
+          <Card>
             <h2>Dispatch log</h2>
             <div className="gw-log gw-log-tall" ref={logRef}>
               {activity.length === 0 && <span className="gw-log-empty">no activity yet — start the runner</span>}
@@ -782,25 +783,26 @@ export function App() {
                 </div>
               ))}
             </div>
-          </div>
+          </Card>
         </main>
       )}
 
       {page === "settings" && (
         <main className="gw-main">
-          <div className="gw-card">
+          <Card>
             <h2>Runner</h2>
             <div className="gw-row">
-              <span className={`gw-conn ${snap?.running ? "gw-conn-open" : "gw-conn-closed"}`}>
-                ● {snap?.running ? `running${snap.workspace ? ` · ${snap.workspace}` : ""}` : "stopped"}
-              </span>
+              <ConnDot
+                state={snap?.running ? "open" : "closed"}
+                label={snap?.running ? `running${snap.workspace ? ` · ${snap.workspace}` : ""}` : "stopped"}
+              />
               {snap?.running
-                ? <button className="gw-btn gw-btn-stop" onClick={() => void toggleRun()}>Stop</button>
-                : <button className="gw-btn gw-btn-run" onClick={() => void toggleRun()}>Start</button>}
+                ? <Btn variant="danger" size="sm" onClick={() => void toggleRun()}>Stop</Btn>
+                : <Btn variant="primary" size="sm" onClick={() => void toggleRun()}>Start</Btn>}
               <span className="gw-note">
                 {inFlight.length}/{snap?.max_sessions ?? 1} in flight
               </span>
-              {msg && <span className="gw-err">{msg}</span>}
+              {msg && <span className="k-err">{msg}</span>}
               <a className="gw-link" style={{ marginLeft: "auto" }} href="#" onClick={(e) => { e.preventDefault(); openWeb(); }}>
                 open full board ↗
               </a>
@@ -808,7 +810,7 @@ export function App() {
             <div className="gw-inflight" style={{ marginTop: 8 }}>
               {inFlight.map((f) => (
                 <div key={f.task_id} className="gw-agent">
-                  <span className={`conn conn-open`} title="in flight">●</span>
+                  <ConnDot state="open" title="in flight" />
                   <span className="gw-agent-name gw-mono">{f.task_id}</span>
                   <span className="gw-fnote" title={f.task_title}>{f.task_title}</span>
                   <span className="gw-fmeta">{age(now - f.started_ms)}</span>
@@ -828,26 +830,26 @@ export function App() {
                 ))}
               </div>
             )}
-          </div>
+          </Card>
 
-          <div className="gw-card">
+          <Card>
             <h2>Concurrency</h2>
             <div className="gw-row">
-              <button className="gw-btn" onClick={() => setMaxSessions((n) => Math.max(1, n - 1))}>−</button>
+              <Btn size="sm" onClick={() => setMaxSessions((n) => Math.max(1, n - 1))}>−</Btn>
               <span className="gw-conc">{maxSessions}</span>
-              <button className="gw-btn" onClick={() => setMaxSessions((n) => Math.min(8, n + 1))}>+</button>
+              <Btn size="sm" onClick={() => setMaxSessions((n) => Math.min(8, n + 1))}>+</Btn>
               <span className="gw-note">concurrent agent sessions (WIP limit)</span>
             </div>
             <span className="gw-note">all knobs live in ~/.bridge/config.json — editing it by hand is fine; Apply writes this form there too</span>
-          </div>
+          </Card>
 
-          <div className="gw-card">
+          <Card>
             <h2>Providers</h2>
             <div className="gw-row">
               {BACKENDS.map((b) => (
-                <button key={b} className={`gw-btn ${backends.includes(b) ? "gw-btn-on" : ""}`} onClick={() => toggleBackend(b)}>
+                <Btn key={b} size="sm" on={backends.includes(b)} onClick={() => toggleBackend(b)}>
                   {backends.includes(b) ? "✓ " : ""}{b}
-                </button>
+                </Btn>
               ))}
             </div>
             <span className="gw-note">tasks rotate across the enabled provider CLIs</span>
@@ -857,12 +859,12 @@ export function App() {
                 <div key={b} className="gw-provider">
                   <h3 className="gw-provider-head">{meta.label}</h3>
                   <div className="gw-row">
-                    <input className="gw-input" style={{ flex: 1 }} value={backendModels[b] ?? ""}
+                    <TextInput style={{ flex: 1 }} value={backendModels[b] ?? ""}
                       placeholder={meta.modelPlaceholder}
                       onChange={(e) => setBackendModels((m) => ({ ...m, [b]: e.target.value }))} />
                   </div>
                   <div className="gw-row">
-                    <input className="gw-input" style={{ flex: 1 }} value={backendAgents[b] ?? ""}
+                    <TextInput style={{ flex: 1 }} value={backendAgents[b] ?? ""}
                       placeholder="agent profile (optional — the CLI's own default profile if empty)"
                       onChange={(e) => setBackendAgents((m) => ({ ...m, [b]: e.target.value }))} />
                   </div>
@@ -870,29 +872,29 @@ export function App() {
                 </div>
               );
             })}
-          </div>
+          </Card>
 
-          <div className="gw-card">
+          <Card>
             <h2>Hub</h2>
             <div className="gw-row">
-              <input className="gw-input" style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
+              <TextInput style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
                 onChange={(e) => setHubUrl(e.target.value)} />
             </div>
             <span className="gw-note">identity comes from device pairing — a new hub needs `bridge pair &lt;url&gt;`</span>
-          </div>
+          </Card>
 
-          <div className="gw-card">
+          <Card>
             <div className="gw-row">
-              <button className="gw-btn gw-btn-run" onClick={() => void applySettings()}>Apply</button>
-              {applyMsg && <span className="gw-ok">{applyMsg}</span>}
+              <Btn variant="primary" size="sm" onClick={() => void applySettings()}>Apply</Btn>
+              {applyMsg && <span className="k-ok">{applyMsg}</span>}
               <span className="gw-note">applying restarts the runner when it is running</span>
             </div>
             <div className="gw-row" style={{ marginTop: 10 }}>
-              <button className="gw-btn gw-btn-stop" onClick={() => void doLogout()}>Log out</button>
+              <Btn variant="danger" size="sm" onClick={() => void doLogout()}>Log out</Btn>
               {logoutMsg && <span className="gw-note">{logoutMsg}</span>}
               <span className="gw-note">stops the runner and clears the token — settings kept, pair again to onboard</span>
             </div>
-          </div>
+          </Card>
         </main>
       )}
     </div>

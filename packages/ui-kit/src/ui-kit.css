@@ -1,0 +1,165 @@
+/* ============================================================
+   @bridge/ui-kit — component classes
+   One declaration per visual intent. Surfaces consume these via
+   the kit components (Btn, Chip, Card, Field, …); per-surface
+   css keeps LAYOUT only. Import order: tokens.css → ui-kit.css
+   → surface css.
+   ============================================================ */
+
+/* ---------- buttons ---------- */
+
+.k-btn {
+  background: var(--bg-hover);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: var(--kit-radius-sm);
+  padding: var(--kit-control-pad);
+  font: inherit;
+  font-size: var(--kit-control-font);
+  font-weight: 600;
+  cursor: pointer;
+}
+.k-btn:hover { border-color: var(--accent); }
+.k-btn:disabled { opacity: 0.4; cursor: default; }
+
+.k-btn--sm { --kit-control-font: var(--kit-font-base); --kit-control-pad: 6px 12px; }
+
+.k-btn--primary {
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+}
+.k-btn--primary:hover { border-color: var(--accent); filter: brightness(1.08); }
+
+.k-btn--accept {
+  background: color-mix(in srgb, var(--green) 18%, var(--bg-raised));
+  border-color: var(--green);
+  color: var(--green);
+  font-weight: 650;
+}
+.k-btn--accept:hover { background: color-mix(in srgb, var(--green) 28%, var(--bg-raised)); border-color: var(--green); }
+
+.k-btn--reject {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--red) 55%, var(--line));
+  color: var(--red);
+  font-weight: 650;
+}
+.k-btn--reject:hover { background: color-mix(in srgb, var(--red) 12%, var(--bg-raised)); border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }
+
+.k-btn--danger { background: var(--red); border-color: var(--red); color: #fff; }
+.k-btn--danger:hover { border-color: var(--red); filter: brightness(1.08); }
+
+/* de-emphasised ghost (cancel / tertiary) */
+.k-btn--quiet { color: var(--text-dim); font-weight: 500; }
+
+/* toggle-on state (enabled backend, boosted) — green outline */
+.k-btn--on { border-color: var(--green); color: var(--green); }
+
+/* ---------- chips ---------- */
+
+.k-chip {
+  display: inline-block;
+  font-size: var(--kit-font-xs);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: var(--kit-radius-xs);
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.k-chip--pill { border-radius: 999px; font-weight: 600; }
+
+.k-chip--urgent { background: var(--red); color: #1a0d0d; border: none; }
+.k-chip--needs { background: var(--amber); color: #221607; border: none; }
+.k-chip--diag { background: color-mix(in srgb, var(--red) 22%, var(--bg-hover)); color: var(--red); border: none; }
+.k-chip--done { color: var(--green); }
+.k-chip--scope { background: color-mix(in srgb, var(--accent) 25%, transparent); color: var(--accent); }
+.k-chip--scope.k-chip--on { color: var(--text); border-color: var(--accent); }
+
+/* status pills */
+.k-chip--ok { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); }
+.k-chip--live { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); animation: k-chip-pulse 2.2s ease-in-out infinite; }
+.k-chip--warn { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); }
+.k-chip--err { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.k-chip--muted { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text-dim); }
+
+@keyframes k-chip-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 35%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 0%, transparent); }
+}
+
+/* ---------- cards ---------- */
+
+.k-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--kit-radius);
+  padding: var(--kit-sp-5) var(--kit-sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--kit-sp-3);
+}
+
+/* ---------- fields ---------- */
+
+.k-field { display: flex; flex-direction: column; gap: var(--kit-sp-2); }
+.k-field-label {
+  font-size: var(--kit-font-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+}
+.k-field-hint { font-size: var(--kit-font-dim); color: var(--text-faint); line-height: 1.45; }
+
+.k-input {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--kit-radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--kit-input-font);
+  padding: var(--kit-input-pad);
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+.k-input:focus { border-color: var(--accent); }
+.k-input::placeholder { color: var(--text-faint); }
+.k-input--area { resize: vertical; line-height: 1.5; }
+.k-input--select { cursor: pointer; }
+
+/* ---------- form patterns ---------- */
+
+/* settings row: key + control + action on one line */
+.k-form-row { display: flex; gap: var(--kit-sp-2); align-items: center; }
+
+/* inline action row: buttons + inline status, wrapping */
+.k-action-row { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
+
+/* ---------- status text ---------- */
+
+.k-ok { color: var(--green); font-size: 12px; }
+.k-err { color: var(--red); font-size: 12px; }
+
+/* ---------- connection dot ---------- */
+
+.k-conn { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-faint); }
+.k-conn-dot { font-size: 9px; line-height: 1; }
+.k-conn--open .k-conn-dot, .k-conn--open.k-conn { color: var(--green); }
+.k-conn--connecting .k-conn-dot { color: var(--amber); }
+.k-conn--closed .k-conn-dot { color: var(--red); }
+.k-conn-label { color: var(--text-faint); }
+
+/* ---------- relative time ---------- */
+
+.k-reltime {
+  color: var(--text-faint);
+  font-size: var(--kit-font-sm);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .k-chip--live { animation: none; }
+}

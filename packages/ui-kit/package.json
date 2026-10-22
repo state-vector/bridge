@@ -1,0 +1,15 @@
+{
+  "name": "@bridge/ui-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "bridge shared UI kit — tokens + primitives (Btn, Chip, Card, Field, ConnDot, RelTime); one look, every surface",
+  "exports": {
+    ".": "./src/index.ts",
+    "./ui-kit.css": "./src/ui-kit.css",
+    "./tokens.css": "./src/tokens.css"
+  },
+  "dependencies": {
+    "react": "^19.1.0"
+  }
+}
