@@ -744,7 +744,7 @@ export class KnowledgeHub {
         case "/board": return this.json(await this.board());
         case "/stats": return this.json(await this.stats());
         case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
-        case "/ask": return this.json(await this.askGet(String(url.searchParams.get("id"))));
+        case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
       }
     }
 
@@ -2046,7 +2046,7 @@ export class KnowledgeHub {
       `SELECT id, from_label, to_target, question, status, artefact_id, answer, answered_by, answered_ts, created_ts
          FROM asks WHERE id = ?`, id,
     );
-    if (!row) throw new Error(`no such ask: ${id}`);
+    if (!row) return null;
     return {
       id: row.id, from: row.from_label, to: row.to_target, question: row.question,
       options: [] as string[], urgency: "normal", status: row.status,
