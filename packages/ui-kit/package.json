@@ -7,9 +7,12 @@
   "exports": {
     ".": "./src/index.ts",
     "./ui-kit.css": "./src/ui-kit.css",
-    "./tokens.css": "./src/tokens.css"
+    "./tokens.css": "./src/tokens.css",
+    "./views.css": "./src/views/views.css"
   },
   "dependencies": {
-    "react": "^19.1.0"
+    "react": "^19.1.0",
+    "@bridge/specs": "*",
+    "zustand": "^5.0.8"
   }
 }

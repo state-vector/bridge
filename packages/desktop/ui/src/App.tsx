@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { TopView, BacklogView, CompletedView, useKb, setKbHubConfig } from "@bridge/ui-kit";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
@@ -765,8 +766,8 @@ export function App() {
       </header>
 
       {page === "forme" && <ForYou hubUrl={snap?.url ?? null} />}
-      {page === "top" && <Top />}
-      {page === "backlog" && <Backlog />}
+      {page === "top" && <TopView />}
+      {page === "backlog" && <BacklogView />}
       {page === "chat" && <Chat />}
 
 

@@ -12,3 +12,25 @@ export { ActionRow, FormRow } from "./Rows";
 export { ConnDot, type ConnState } from "./ConnDot";
 export { RelTime } from "./RelTime.tsx";
 export { relTime } from "./relTime";
+
+// — knowledge plane: data layer + views (one rendering path, every surface) —
+export { getKbHubConfig, setKbHubConfig, clearKbHubConfig, type KbMode } from "./server/config";
+export {
+  kbApi, KbAuthError, connectKbWs,
+} from "./server/kb";
+export type {
+  KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
+  KbProgress, KbSeriesPoint, KbVersion, KbBoard,
+} from "./server/kb";
+export { useKb, kbConnected, setKbAuthEscalator, type BoardPrefs } from "./server/kbStore";
+export {
+  normTs, rel, clock, rankDecisions, actorEvents, latestTaskId,
+  boardsOf, myAnswers, presenceLabel, kindOf, TASK_REF_RE,
+} from "./server/views";
+export { DashboardSummary } from "./views/Dashboard";
+export {
+  TaskDetail, TaskStateCard, SentimentBar, RefText,
+  SENTIMENT_CHIP, HISTORY_CHIP, HISTORY_LABEL,
+} from "./views/TaskDetail";
+export { TopView } from "./views/TopView";
+export { BacklogView, CompletedView } from "./views/BacklogView";
