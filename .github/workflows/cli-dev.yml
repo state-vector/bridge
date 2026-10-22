@@ -1,0 +1,39 @@
+name: cli-dev
+# Moving `dev` release: the CLI rebuilt on every push to main. Install on a
+# runner box with: fetch the bridge-dev-*.tar.gz from the `dev` release.
+# Stable releases remain tag-gated (v*) via release.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/cli/**"
+      - ".github/workflows/cli-dev.yml"
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build bridge CLI (dev)
+        working-directory: packages/cli
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Package
+        shell: bash
+        run: |
+          BIN=packages/cli/target/x86_64-unknown-linux-gnu/release/bridge
+          tar -czf bridge-dev-x86_64-unknown-linux-gnu.tar.gz -C "$(dirname "$BIN")" bridge
+          sha256sum bridge-dev-x86_64-unknown-linux-gnu.tar.gz > bridge-dev-x86_64-unknown-linux-gnu.tar.gz.sha256
+      - name: Publish to the moving `dev` release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dev
+          tag_name: dev
+          prerelease: true
+          body: "Dev build of ${{ github.sha }} — rebuilt on every push to main. Not versioned; for runner boxes that track main."
+          files: |
+            bridge-dev-x86_64-unknown-linux-gnu.tar.gz
+            bridge-dev-x86_64-unknown-linux-gnu.tar.gz.sha256
