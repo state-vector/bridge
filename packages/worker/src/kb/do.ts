@@ -744,6 +744,7 @@ export class KnowledgeHub {
         case "/board": return this.json(await this.board());
         case "/stats": return this.json(await this.stats());
         case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
+        case "/ask": return this.json(await this.askGet(String(url.searchParams.get("id"))));
       }
     }
 
