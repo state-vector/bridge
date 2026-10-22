@@ -1557,6 +1557,7 @@ fn spawn_opencode(
         Some(
             json!({
                 "$schema": "https://opencode.ai/config.json",
+                "model": model_str, // ACP ignores --model; the injected config is how the session learns its model
                 "mcp": { "bridge": {
                     "type": "remote",
                     "url": format!("{}/mcp", cfg.url.trim_end_matches('/')),
