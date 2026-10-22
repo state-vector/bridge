@@ -1676,6 +1676,7 @@ fn tick(
     last_avail_ok: &mut bool,
     breaker: &mut CircuitBreaker,
     live_notes: &mut HashMap<String, (String, Instant)>,
+    gated_announced: &mut HashSet<String>,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
 
@@ -2252,10 +2253,11 @@ fn tick(
             || task.get("is_claimable").and_then(|q| q.as_bool()) == Some(false)
         {
             // silence here reads as a dead runner: the queue looks full and
-            // nothing moves, with no errors anywhere. Say why — once per
-            // backoff window (the attempts insert paces the note too).
-            attempts.insert(tid.to_string(), Instant::now());
-            msgs.push(format!("{tid} not claimable (qualification/attempted gate) — needs a role:analysis pass or a human re-issue"));
+            // nothing moves, with no errors anywhere. Say why — once per app
+            // run per task (an operator clearing the gate re-arms the note).
+            if gated_announced.insert(tid.to_string()) {
+                msgs.push(format!("{tid} not claimable (qualification/attempted gate) — needs a role:analysis pass or a human re-issue"));
+            }
             continue;
         }
         if gave_up.contains(tid) {
@@ -2384,6 +2386,8 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut last_avail_ok = true;
     let mut breaker = CircuitBreaker::default();
     let mut live_notes: HashMap<String, (String, Instant)> = HashMap::new();
+    // gated tasks announce ONCE per app run — visibility without a flood
+    let mut gated_announced: HashSet<String> = HashSet::new();
     eprintln!(
         "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
         cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
@@ -2415,6 +2419,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             &mut last_avail_ok,
             &mut breaker,
             &mut live_notes,
+            &mut gated_announced,
         ) {
             Ok(msgs) => {
                 for msg in msgs {
