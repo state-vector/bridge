@@ -165,7 +165,7 @@ export const kbApi = {
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
   progressGauges: (body: { id: string; note: string; sentiment?: string; completion_pct?: number; confidence_pct?: number; risk_pct?: number }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify(body) }),
-  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
+  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string; derived_from?: string | string[] }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),

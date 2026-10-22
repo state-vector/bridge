@@ -274,6 +274,9 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const traits = isTask
         ? {
             is_question: isQuestion,
+            // BR#909: an escalated question shows what it awaits — the proposed
+            // decision whose acceptance closes it / rejection reopens it
+            awaiting_decision: isQuestion && m.awaiting_decision ? String(m.awaiting_decision) : undefined,
             is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated,
             claim_reason: isQuestion
               ? "question — answered, not claimed (contribute via log_progress {id, did})"
@@ -423,6 +426,10 @@ const TOOLS = [
         qualified: { type: "boolean", description: "declare you already analysed this task — it goes ready for pickup (publishers are scored on the quality of their self-qualified tasks)" },
         await: { type: "array", items: { type: "string" }, description: "stacked qualification: further confirmation required before pickup, e.g. [\"role:review\"] — satisfied by a done child of that role or an accepted decision" },
         tags: { type: "array", items: { type: "string" }, description: "categories + role gating for tasks, e.g. [ingestion, role:impl]" },
+        derived_from: {
+          anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+          description: "decision escalations only: question task id(s) this proposal derives from — each question is stamped awaiting_decision, and its acceptance closes them / rejection reopens them (BR#909)",
+        },
         session: { type: "string", description: "your session name — attributes the card to your session" },
       },
     },

@@ -114,13 +114,17 @@ todo ──claim──► in_progress ──► done + knowledge artefact link �
 
 ```
 opened (todo, never claimed) ──► contributions land as progress entries (any agent, any human)
-      └── author judges sufficiency ──► decision written (derived_from the question) ──► question closed
-                                          └─ accepted decisions unblock gates elsewhere (qualification, done-gates)
+      └── convergence ──► escalate: a decision is filed (derived_from the question) ──► question stamped awaiting_decision
+                ├── human accepts ──► question auto-closed done (the accepted decision is the receipt)
+                └── human rejects / proposal superseded ──► question REOPENS (back to todo, reason in the note) ──► loop continues
+      └─ accepted decisions unblock gates elsewhere (qualification, done-gates)
 ```
 
-The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close) is spawned by the server, not by agent protocol.
+Escalation is one action: the Discussions thread has an **Escalate to decision** button (pre-fills the proposal and the contributor list from the thread), and agents file it the same way — `create` a decision with `derived_from` set to the question task id(s). The proposal IS the request for the human ruling: it lands proposed in *For Me* ("request from: <question>"), and the stamp clears only when the loop resolves. Superseding a decision closes its consensus rounds the way done closes Verify rounds.
 
-Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry with behavioural scores).
+The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close, close/reopen on ruling) is spawned by the server, not by agent protocol.
+
+Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted | superseded | rejected; acceptance is human-authoritative; a rejection or supersede reopens the decision's linked questions), **progress** (append-only), **agents** (registry with behavioural scores).
 
 Verify-verdict decisions always carry a plain-English ask at the top — **what accepting does** (PASS closes the target task done; BOUNCE bounces it back to in_progress), **why it lands on you** (agents propose, only a human accepts), and that you are not being asked to re-verify. Accepting a verdict is actionable: the click applies it to the target task.
 

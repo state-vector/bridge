@@ -1001,6 +1001,21 @@ export class KnowledgeHub {
     let bodyMd = String(body.body_md ?? "");
     const limitErr = checkLimits(title, bodyMd, body.meta);
     if (limitErr) throw new Error(limitErr);
+    // BR#909: create a decision with derived_from → question task(s) and the
+    // escalation IS the proposal — each question is stamped awaiting_decision
+    // (surfaced on the card + orient) and the lifecycle wiring finds it on
+    // accept/reject. Validated BEFORE the insert: a typo must not half-create.
+    const derivedRefs: string[] = (Array.isArray(body.derived_from) ? body.derived_from : body.derived_from ? [body.derived_from] : [])
+      .map((x: any) => String(x ?? "").trim())
+      .filter(Boolean)
+      .slice(0, 10);
+    if (type === "decision" && derivedRefs.length) {
+      for (const ref of derivedRefs) {
+        const dst = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, ref);
+        if (!dst) throw new Error(`derived_from: no such artefact: ${ref}`);
+        if (dst.type !== "task") throw new Error(`derived_from ${ref} is a ${dst.type} — escalation derives from question TASKS`);
+      }
+    }
 
     const seq = (await this.nextSeq(type));
     const id = formatId(seq);
@@ -1124,7 +1139,47 @@ export class KnowledgeHub {
       if (ref) { try { await this.enrichFromGitHub(id, ref); } catch { /* GH unavailable — stay bare */ } }
     }
     if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
-    return { id, type, status };
+    // BR#909: the validated derived_from refs link + stamp now that the
+    // decision row exists — question tasks get meta.awaiting_decision.
+    let awaiting: string[] | undefined;
+    if (type === "decision" && derivedRefs.length) {
+      awaiting = [];
+      for (const ref of derivedRefs) {
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'derived_from', ?, ?)`,
+          id, ref, ts,
+        );
+        awaiting.push(ref);
+      }
+      this.stampAwaitingDecision(id, awaiting, actor);
+    }
+    return { id, type, status, ...(awaiting?.length ? { awaiting_decision: awaiting } : {}) };
+  }
+
+  /** BR#909: a decision derived from question task(s) is their
+   *  request-for-human-ruling. Stamp each question meta.awaiting_decision so
+   *  the card, orient and For Me show what it awaits — and the transition
+   *  wiring can find the linked questions on accept (close) / reject (reopen).
+   *  Non-question tasks link but don't stamp. Idempotent: re-stamping the same
+   *  decision is a no-op; a NEW decision supersedes the old stamp (one live
+   *  proposal per question — the newest wins). */
+  private stampAwaitingDecision(decisionId: string, questionIds: string[], actor: string) {
+    const ts = Date.now();
+    for (const qid of questionIds) {
+      const q = this.one(`SELECT id, type, tags, meta FROM artefacts WHERE id = ?`, qid);
+      if (!q || q.type !== "task") continue;
+      const tags = parseTags(q.tags);
+      const qm = JSON.parse(q.meta ?? "{}");
+      if (!tags.includes("question") && !isQuestionTask(qm)) continue;
+      if (qm.awaiting_decision === decisionId) continue;
+      qm.awaiting_decision = decisionId;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(qm), ts, qid,
+      );
+      this.audit(actor, "awaiting_decision", qid, { decision: decisionId });
+      this.version(qid, actor, "update", `awaiting decision ${decisionId} — escalated to a decision (the proposal is the request for the ruling)`, { awaiting_decision: decisionId });
+    }
   }
 
   /** A progress artefact (meta.task → task id) doubles as a heartbeat on that task:
@@ -1213,7 +1268,20 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql
       .exec(`SELECT * FROM artefacts ${where} ORDER BY updated_ts DESC LIMIT ?`, ...params, Math.min(Number(body.limit ?? 50), 200))
       .toArray();
-    return { artefacts: rows.map((r) => this.shape(r)) };
+    const artefacts = rows.map((r) => this.shape(r));
+    // BR#909: a proposed decision derived from question task(s) IS their
+    // request-for-human-ruling — carry the source question's title so For Me
+    // renders "request from: <question>" without client-side relation lookups.
+    for (const a of artefacts) {
+      if (a.type !== "decision" || a.status !== "proposed") continue;
+      const src = this.one(
+        `SELECT q.title AS title FROM relations r JOIN artefacts q ON q.id = r.dst_id
+         WHERE r.src_id = ? AND r.relation = 'derived_from' AND q.type = 'task' ORDER BY r.created_ts LIMIT 1`,
+        a.id,
+      );
+      if (src) a.request_from = src.title;
+    }
+    return { artefacts };
   }
 
   /** Hybrid: FTS5 keyword + embedding cosine, merged. Falls back to FTS-only when AI is unavailable. */
@@ -1363,9 +1431,14 @@ export class KnowledgeHub {
       row.id,
     );
     if (child) return { ok: true, via: child.id };
+    // BR#909: an ACCEPTED decision satisfies the review evidence both ways it
+    // can be linked — supports (the verify-verdict pattern) and derived_from
+    // (the question→decision lifecycle: the ruling is the receipt that closed
+    // the question). The decision must already be accepted when this runs, so
+    // the accept→auto-close ordering inside one transition works.
     const dec = this.one(
       `SELECT d.id AS id FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted' LIMIT 1`,
+       WHERE r.relation IN ('supports', 'derived_from') AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted' LIMIT 1`,
       row.id,
     );
     if (dec) return { ok: true, via: dec.id };
@@ -1482,7 +1555,7 @@ export class KnowledgeHub {
       },
       unmetBars: () => this.unmetBars(row),
       session: () => this.resolveSession(body, String(body?.token_id ?? "")),
-      evidence: (eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid),
+      evidence: (eid) => this.one(`SELECT type, tags, meta, status FROM artefacts WHERE id = ?`, eid),
       parent: () =>
         this.one(
           `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -1578,8 +1651,10 @@ export class KnowledgeHub {
     // retry / release: pushing a card back to todo releases the claim — it
     // re-enters the unclaimed pool for any matching agent (or the cron sweep)
     // to pick up fresh. Only the current owner or a human may release a claim —
-    // agents can't dump each other's work.
-    if (row.type === "task" && to === "todo") {
+    // agents can't dump each other's work. A done → todo REOPEN (BR#909, gated
+    // by the reopen-needs-decision rule) is not a release: no churn bookkeeping,
+    // no attempt counting — the question did nothing wrong, its decision died.
+    if (row.type === "task" && to === "todo" && row.status !== "done") {
       const isHuman = actor === "web" || actor.startsWith("web:") || actor.startsWith("human:");
       const isSystem = /^system:/.test(actor);
       if (row.owner && row.owner !== actor && !isHuman && !isSystem)
@@ -1710,6 +1785,84 @@ export class KnowledgeHub {
             this.audit("decision:verdict", "apply_failed", target, { decision: id, error: msg });
             this.version(id, "decision:verdict", "note", `verdict apply failed on ${target}: ${msg}`, { target, error: msg });
           }
+        }
+      }
+    }
+    // question→decision lifecycle (BR#909): a decision derived_from question
+    // task(s) is their request-for-human-ruling. Acceptance IS the ruling and
+    // auto-closes the questions (the accepted decision is the receipt — it also
+    // satisfies the done-gate via the derived_from evidence link). A rejection
+    // or supersede (withdrawn / revised) REOPENS them: back to todo with the
+    // reason as the note, awaiting_decision cleared, so the loop continues
+    // (more contributions → a new/revised proposal). Superseded/accepted
+    // decisions also close linked consensus rounds exactly like Verify children
+    // close on done — same predicate as the BR#903 spawn, so either merge
+    // order composes. Per-question gate refusals surface on the decision,
+    // never swallowed: the human's click must not silently do nothing.
+    if (row.type === "decision" && ["accepted", "rejected", "superseded"].includes(to)) {
+      const linked = new Set<string>();
+      for (const r of this.state.storage.sql.exec(
+        `SELECT dst_id AS id FROM relations WHERE src_id = ? AND relation = 'derived_from'`, id,
+      ).toArray() as any[]) linked.add(String(r.id));
+      for (const q of this.state.storage.sql.exec(
+        `SELECT id FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.awaiting_decision') = ?`, id,
+      ).toArray() as any[]) linked.add(String(q.id));
+      for (const qid of linked) {
+        const q = this.one(`SELECT id, type, status, meta FROM artefacts WHERE id = ?`, qid);
+        if (!q || q.type !== "task") continue;
+        if (to === "accepted") {
+          if (["done", "superseded"].includes(q.status)) continue; // already closed — clean no-op
+          try {
+            await this.transition({ id: qid, to: "done", note: `closed by ${id} acceptance` }, actor);
+            this.audit(actor, "question_closed", qid, { decision: id, effect: "closed" });
+          } catch (e) {
+            const msg = String((e as Error).message ?? e).slice(0, 300);
+            this.audit("decision:lifecycle", "apply_failed", qid, { decision: id, error: msg });
+            this.version(id, "decision:lifecycle", "note", `question close failed on ${qid}: ${msg}`, { question: qid, error: msg });
+          }
+        } else {
+          // rejected / superseded: reopen. Superseded questions stay dead
+          // (merged away); anything still open just needs the stamp cleared —
+          // only a DONE question walks back out (gated by reopen_for).
+          if (q.status === "superseded") continue;
+          const qm = JSON.parse(q.meta ?? "{}");
+          delete qm.awaiting_decision;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ?, owner = '', updated_ts = ? WHERE id = ?`,
+            JSON.stringify(qm), ts, qid,
+          );
+          if (q.status !== "done") continue;
+          const reason = String(body.note ?? "").trim();
+          try {
+            await this.transition(
+              { id: qid, to: "todo", reopen_for: id, note: reason ? `reopened — ${id} ${to}: ${reason}` : `reopened — decision ${id} ${to}` },
+              actor,
+            );
+            this.audit(actor, "question_reopened", qid, { decision: id, effect: "reopened" });
+          } catch (e) {
+            const msg = String((e as Error).message ?? e).slice(0, 300);
+            this.audit("decision:lifecycle", "apply_failed", qid, { decision: id, error: msg });
+            this.version(id, "decision:lifecycle", "note", `question reopen failed on ${qid}: ${msg}`, { question: qid, error: msg });
+          }
+        }
+      }
+      // linked consensus rounds close when the decision resolves (the round
+      // informed the human; it never gated them). rejected keeps the round —
+      // the reasons there feed the revised proposal the reopen invites.
+      if (to !== "rejected") {
+        for (const c of this.state.storage.sql.exec(
+          `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task' AND c.status IN ('todo','in_progress','blocked')
+             AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')`, id,
+        ).toArray() as any[]) {
+          const cm = JSON.parse(c.meta ?? "{}");
+          cm.superseded_reason = `${id} ${to} — consensus round closed (the human decided; the round informed, it never gated)`;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+            JSON.stringify(cm), ts, ts, c.id,
+          );
+          this.audit("system:separation", "transition", c.id, { from: c.status, to: "superseded", note: cm.superseded_reason });
+          this.version(c.id, "system:separation", "transition", cm.superseded_reason, { from: c.status, to: "superseded" });
         }
       }
     }
@@ -1927,6 +2080,11 @@ export class KnowledgeHub {
       `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, ?, ?, ?)`,
       srcId, rel, dstId, Date.now(),
     );
+    // BR#909: linking a decision derived_from a question task is the escalation
+    // gesture on the decision-first path (create the proposal, then link the
+    // source question) — stamp the question so accept/reject can find it.
+    if (rel === "derived_from" && src.type === "decision" && dst.type === "task")
+      this.stampAwaitingDecision(srcId, [dstId], actor);
     this.audit(actor, "link", srcId, { relation: rel, dst: dstId });
     return { src: srcId, relation: rel, dst: dstId };
   }
@@ -2390,6 +2548,9 @@ export class KnowledgeHub {
         const m = JSON.parse(t.meta ?? "{}");
         if (m.blocked) { t.blocked_reason = (m.blocked.reason ?? "").slice(0, 200); t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 200); }
         if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
+        // BR#909: a question awaiting its human ruling says so — agents see the
+        // escalation is filed and contribute instead of re-asking
+        if (m.awaiting_decision) t.awaiting_decision = m.awaiting_decision;
         delete t.meta;
       }
       return t;
@@ -2512,6 +2673,9 @@ export class KnowledgeHub {
       // questions by kind (meta.kind = "question"), not by legacy tag — tags are
       // roles, kind is the pickup model. Legacy-tagged rows still register.
       t.is_question = isQuestionTask(m) || t.tags?.includes("question") || false;
+      // BR#909: the question is escalated — a decision is proposed and the
+      // human's ruling on it closes/reopens this card automatically
+      if (m.awaiting_decision) t.awaiting_decision = m.awaiting_decision;
       const gated = m.operator_gated;
       if (t.status !== "blocked") {
         t.is_claimable = !t.is_question && !gated;

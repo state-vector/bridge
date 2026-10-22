@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useKb } from "../store/kb";
 import { kbApi, type KbArtefact, type KbVersion } from "../lib/kb";
 import { rel } from "../lib/views";
-import { Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
+import { ActionRow, Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
 
 /** Discussion tab = threaded display of question tasks with responses.
  *  No separate discussion artefacts: a "thread" is a task with meta.kind
@@ -33,6 +33,13 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
   const [versions, setVersions] = useState<KbVersion[] | null>(null);
   const [reply, setReply] = useState("");
   const [msg, setMsg] = useState("");
+  // escalate-to-decision (BR#909): the proposal IS the request for the ruling —
+  // one action files it, pre-filled from this thread's history
+  const [escOpen, setEscOpen] = useState(false);
+  const [escTitle, setEscTitle] = useState("");
+  const [escBody, setEscBody] = useState("");
+  const [escMsg, setEscMsg] = useState("");
+  const [escBusy, setEscBusy] = useState(false);
 
   useEffect(() => {
     let dead = false;
@@ -60,6 +67,46 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
   // oldest last = a natural thread; skip pure heartbeat noise with empty notes
   const stream = (versions ?? []).slice().reverse().filter((v) => v.action !== "progress" || versionText(v));
 
+  // contributors = everyone who spoke on the thread (agents + humans), deduped
+  const contributors = [...new Set((versions ?? []).filter((v) => v.action === "progress").map((v) => v.actor))];
+  const awaiting = (task.meta as any)?.awaiting_decision as string | undefined;
+  const settled = ["done", "superseded"].includes(task.status);
+  const openEsc = () => {
+    setEscTitle(`Decision: ${task.title}`.slice(0, 290));
+    setEscBody(
+      [
+        `Escalated from question ${task.id} — "${task.title}".`,
+        "",
+        "The convergence from the question thread, for the ruling:",
+        task.body_md ?? "",
+        "",
+        contributors.length ? `Contributors: ${contributors.join(", ")}` : "Contributors: none logged yet",
+      ].join("\n"),
+    );
+    setEscOpen(true);
+  };
+  const fileEscalation = async () => {
+    if (!escTitle.trim()) return;
+    setEscBusy(true);
+    setEscMsg("");
+    try {
+      const r = await kbApi.create({
+        type: "decision",
+        title: escTitle.trim(),
+        body_md: escBody.trim(),
+        meta: { decision_class: "question-escalation", question: task.id, contributors },
+        derived_from: task.id,
+      });
+      setEscOpen(false);
+      setEscMsg(`filed ${r.id} — acceptance closes this question, rejection reopens it`);
+      setTimeout(() => setEscMsg(""), 6000);
+    } catch (e) {
+      setEscMsg(`failed: ${(e as Error).message}`);
+    } finally {
+      setEscBusy(false);
+    }
+  };
+
   return (
     <div className="disc-wrap">
       <div className="view-head">
@@ -70,9 +117,37 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
         <div className="ask-chips">
           <Chip tone={task.status === "done" ? "done" : "needs"}>{task.status.toUpperCase()}</Chip>
           {task.board && <Chip tone="scope">{task.board.toUpperCase()}</Chip>}
+          {awaiting && <Chip tone="urgent" title="a decision has been filed — accepting it closes this question, rejecting reopens it">AWAITING DECISION {awaiting}</Chip>}
           <span className="why-line">{task.owner ?? "—"} · opened {rel(task.created_ts)}</span>
         </div>
         <pre className="know-body">{task.body_md}</pre>
+        {!settled && !awaiting && (
+          <div className="steer-box">
+            {!escOpen && <Btn onClick={() => openEsc()}>Escalate to decision ↑</Btn>}
+            {escOpen && (
+              <div className="forme-reject">
+                <TextInput
+                  autoFocus
+                  value={escTitle}
+                  placeholder="Decision title"
+                  onChange={(e) => setEscTitle(e.target.value)}
+                />
+                <TextArea
+                  rows={6}
+                  value={escBody}
+                  placeholder="The proposed ruling — pre-filled from the thread; edit freely"
+                  onChange={(e) => setEscBody(e.target.value)}
+                />
+                <ActionRow>
+                  <Btn variant="accept" disabled={escBusy || !escTitle.trim()} onClick={() => void fileEscalation()}>File decision (proposed)</Btn>
+                  <Btn quiet onClick={() => setEscOpen(false)}>Cancel</Btn>
+                </ActionRow>
+                <p className="why-line">Filing proposes the decision and stamps this question as awaiting it — acceptance closes the question, rejection reopens it. The human rules in For Me.</p>
+              </div>
+            )}
+          </div>
+        )}
+        {escMsg && <p className="ok">{escMsg}</p>}
       </Card>
       <div className="disc-list">
         {(versions === null) && <p className="empty">loading responses…</p>}
@@ -156,6 +231,7 @@ export function DiscussionsView() {
             <div className="ask-chips">
               <Chip tone={t.status === "done" ? "done" : "needs"}>{t.status.toUpperCase()}</Chip>
               {t.board && <Chip tone="scope">{t.board.toUpperCase()}</Chip>}
+              {(t.meta as any)?.awaiting_decision && <Chip tone="urgent">AWAITING DECISION {(t.meta as any).awaiting_decision}</Chip>}
               <span className="why-line">{t.owner ?? "—"} · opened {rel(t.created_ts)} · updated {rel(t.updated_ts)}</span>
             </div>
             <h3 className="ask-question">{t.title}</h3>

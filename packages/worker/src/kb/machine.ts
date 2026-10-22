@@ -42,7 +42,7 @@ export interface RuleCtx {
   qualify(kind: "analysis" | "review"): { ok: boolean; via?: string } | Promise<{ ok: boolean; via?: string }>;
   unmetBars(): string[] | Promise<string[]>;
   session(): string | null | Promise<string | null>;
-  evidence(id: string): { type: string; tags: string[]; meta: any } | null | Promise<{ type: string; tags: string[]; meta: any } | null>;
+  evidence(id: string): { type: string; tags: string[]; meta: any; status?: string } | null | Promise<{ type: string; tags: string[]; meta: any; status?: string } | null>;
   parent(): { id: string; status?: string; meta: any } | null | Promise<{ id: string; status?: string; meta: any } | null>;
   openChildren(): number | Promise<number>;
 }
@@ -238,6 +238,23 @@ export const RULES: Rule[] = [
       return open > 0
         ? `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children)`
         : null;
+    },
+  },
+  {
+    // done → todo is the question reopen edge (BR#909): a rejected or superseded
+    // decision reopens its linked questions so the loop can continue. Only the
+    // lifecycle itself may walk a task back out of done — it must name the dead
+    // decision that justifies the reopen. Everything else stays terminal.
+    name: "reopen-needs-decision",
+    when: (i) => isTask(i) && i.status === "done" && i.to === "todo",
+    guard: async (i, c) => {
+      const rid = String(i.body?.reopen_for ?? "").trim();
+      if (!rid)
+        return `task ${i.id} is done — done is terminal. A question reopens only through its decision: rejecting or superseding the decision auto-reopens the linked questions.`;
+      const ev = await c.evidence(rid);
+      if (!ev || ev.type !== "decision" || !["rejected", "superseded"].includes(ev.status ?? ""))
+        return `reopen_for ${rid} is not a rejected/superseded decision — only a dead decision reopens its question (the decision is the receipt)`;
+      return null;
     },
   },
 ];

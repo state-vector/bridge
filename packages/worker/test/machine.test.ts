@@ -201,6 +201,7 @@ describe("loop regressions", () => {
         "human-signoff-done",
         "operator-gated",
         "question-not-claimable",
+        "reopen-needs-decision",
         "review-needs-pr",
         "review-separation-of-duties",
         "unblock-needs-resolution",
