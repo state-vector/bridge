@@ -1536,7 +1536,7 @@ fn spawn_opencode(
     // (machinename/*), and the namespace survives re-pairings because the
     // gateway label is the stable root.
     let agent_label = match &cfg.label {
-        Some(l) if !l.is_empty() => format!("{l}.{}", agent_identity(cfg)),
+        Some(l) if !l.is_empty() => format!("{l}/{}", agent_identity(cfg)),
         _ => agent_identity(cfg),
     };
     // Provision the worker's per-agent token. There is NO second class check

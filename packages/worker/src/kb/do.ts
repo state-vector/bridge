@@ -714,7 +714,7 @@ export class KnowledgeHub {
       const body: any = await request.json();
       const identity = await this.identify(String(body.bearer ?? ""));
       const newLabel = String(body.label ?? "").trim();
-      if (!/^[a-zA-Z0-9._-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+      if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
       const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
       if (!old) throw new Error("auth token not found");
       if (newLabel !== old.label) {
@@ -2103,7 +2103,7 @@ export class KnowledgeHub {
     // workers.
     const myTasks = this.state.storage.sql.exec(
       `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-       AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '.'
+       AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '/'
             OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?))
        ORDER BY updated_ts DESC LIMIT 10`,
       label, label, label, label,
@@ -2614,7 +2614,7 @@ export class KnowledgeHub {
     const gateway = row.type === "gateway";
     const tags = gateway ? ["gateway"] : Array.isArray(body.tags) ? body.tags.map((t: any) => String(t)).slice(0, 10) : [];
     if (!isWsSlug(ws)) throw new Error("bad workspace slug");
-    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
     if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
     // mint in the target workspace's DO (registers hash → ws in the central
@@ -2679,7 +2679,7 @@ export class KnowledgeHub {
     // gateway is a token trait: the caller's TAG provisions, its name is irrelevant
     if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
     const label = String(body.label ?? "").trim();
-    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
+    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
     const rotate = body.rotate === true;
     const ts = Date.now();
     const existing = this.one(`SELECT id, revoked_ts FROM auth_tokens WHERE label = ?`, label);
@@ -2713,7 +2713,7 @@ export class KnowledgeHub {
 
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
-    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     // Replace semantics (pairing is an approval): the same machine re-pairing
     // rotates its token — renamed or not — and re-using a label REPLACES the
