@@ -7,6 +7,7 @@ export default defineConfig({
   clearScreen: false,
   resolve: {
     alias: [
+      { find: "@bridge/ui-kit/tokens.css", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/tokens.css") },
       { find: "@bridge/ui-kit/ui-kit.css", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/ui-kit.css") },
       { find: "@bridge/ui-kit", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/index.ts") },
     ],
