@@ -86,6 +86,13 @@ Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
+**One rendering path.** The web UI and the desktop shell render the *same*
+view components (Top, Backlog, Completed, task detail with dep graph and
+live work tree) from the shared kit `@bridge/ui-kit`, over the same data
+layer — the desktop opens a live WebSocket to the hub with its paired
+`gw-*` token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
+cookie-only), so both surfaces always look and update identically.
+
 Beyond dispatch it carries two human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
