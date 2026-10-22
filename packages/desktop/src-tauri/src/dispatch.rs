@@ -272,7 +272,7 @@ fn load_config() -> Option<DispatchConfig> {
     let raw = std::fs::read_to_string(config_path()).ok()?;
     serde_json::from_str(&raw)
         .map_err(|e| {
-            eprintln!("[dispatch] bad config file: {e}");
+            eprintln!("[dispatch] ERROR: bad config file: {e}");
             e
         })
         .ok()
@@ -1416,7 +1416,7 @@ fn spawn_opencode(
     let resume = resume_session.is_some();
     let worktree = if let Some(url) = &repo_url {
         let Some(repo_path) = ensure_repo_clone(&cfg.workdir, url) else {
-            eprintln!("[dispatch] {tid}: clone failed for {url} — skipping spawn");
+            eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — skipping spawn");
             snap_activity(snap, "error", &format!("{tid}: clone failed ({url})"));
             note_task(
                 cfg,
@@ -1436,7 +1436,7 @@ fn spawn_opencode(
         // failed, refuse: never dispatch into cfg.workdir.
         if cfg.isolate && worktree.is_none() {
             let msg = format!(
-                "{tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
+                "ERROR: {tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
             );
             eprintln!("[dispatch] {msg}");
             snap_activity(snap, "error", &msg);
@@ -1541,7 +1541,7 @@ fn spawn_opencode(
     let agent_token = match provision_agent_token(cfg, &agent_label) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[dispatch] agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
+            eprintln!("[dispatch] ERROR: agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
             snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
             release_claim(
                 cfg,
@@ -1824,10 +1824,17 @@ fn tick(
             }
             s
         };
+        let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
         eprintln!(
             "[dispatch] {} {} in ~{}m — agent reply: {}",
             inf.task_id,
-            if outcome.timed_out { "TIMED OUT" } else { "finished" },
+            if outcome.timed_out {
+                "TIMED OUT"
+            } else if !outcome_ok {
+                "FAILED"
+            } else {
+                "finished"
+            },
             mins,
             reply_excerpt
         );
@@ -1837,7 +1844,6 @@ fn tick(
         // hard rule (BR#877): a run that performed no work — non-zero exit,
         // timeout, or a guardrail-void dispatch — can NEVER hand off. Void
         // runs still exit 0, so the exit code alone is not enough.
-        let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
         if outcome_ok { breaker.record_success(); } else { breaker.record_failure(&outcome.stdout_tail, &outcome.stderr_tail); }
         // persist final state (incl. PR link and exit code) before handoff
         write_task_state(
@@ -2082,7 +2088,7 @@ fn tick(
                         "sentiment": "neutral",
                     }),
                 ) {
-                    eprintln!("[dispatch] relay failed for {}: {e}", inf.task_id);
+                    eprintln!("[dispatch] ERROR: relay failed for {}: {e}", inf.task_id);
                 }
             }
             continue;
@@ -2101,7 +2107,7 @@ fn tick(
                 "sentiment": "neutral",
             }),
         ) {
-            eprintln!("[dispatch] relay failed for {}: {e}", inf.task_id);
+            eprintln!("[dispatch] ERROR: relay failed for {}: {e}", inf.task_id);
         } else if let Ok(mut s) = snap.lock() {
             if let Some(f) = s.in_flight.iter_mut().find(|f| f.task_id == inf.task_id) {
                 f.last_note = live.clone();
@@ -2256,7 +2262,7 @@ fn tick(
             // nothing moves, with no errors anywhere. Say why — once per app
             // run per task (an operator clearing the gate re-arms the note).
             if gated_announced.insert(tid.to_string()) {
-                msgs.push(format!("{tid} not claimable (qualification bars unmet) — meet the declared bars or re-issue"));
+                msgs.push(format!("SKIP: {tid} not claimable (qualification bars unmet) — meet the declared bars or re-issue"));
             }
             continue;
         }
@@ -2274,7 +2280,7 @@ fn tick(
             // ten blocked tasks filled the orient slice, every claim was
             // refused, and nothing announced why. Announce + pace.
             attempts.insert(tid.to_string(), Instant::now());
-            msgs.push(format!("{tid} blocked — needs its unblock condition resolved (role:unblock duty or human), skipped"));
+            msgs.push(format!("SKIP: {tid} blocked — needs its unblock condition resolved (unblock duty or human)"));
             continue;
         }
         // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
@@ -2293,7 +2299,7 @@ fn tick(
         ) {
             // claim raced or failed — don't kill the tick or the whole claim loop;
             // surface it on stderr too (snap-only failures read as silence)
-            eprintln!("[dispatch] claim {tid} failed: {e}");
+            eprintln!("[dispatch] ERROR: claim {tid} failed: {e}");
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
             continue;
@@ -2326,7 +2332,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             Ok(url) => match pair_device(url.trim_end_matches('/')) {
                 Ok(c) => {
                     if let Err(e) = c.save() {
-                        eprintln!("[dispatch] config save failed: {e}");
+                        eprintln!("[dispatch] ERROR: config save failed: {e}");
                     }
                     c
                 }
@@ -2334,7 +2340,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                     if let Ok(mut g) = last_error.lock() {
                         *g = Some(e.clone());
                     }
-                    eprintln!("[dispatch] pairing failed: {e}");
+                    eprintln!("[dispatch] ERROR: pairing failed: {e}");
                     running.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -2443,7 +2449,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                     did_logout = true;
                     break;
                 }
-                eprintln!("[dispatch] error: {e}");
+                eprintln!("[dispatch] ERROR: {e}");
                 snap_activity(&snap, "error", &e);
                 if let Ok(mut g) = last_error.lock() {
                     *g = Some(e);
@@ -2489,7 +2495,7 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
     // working too: resolve() order is env > file).
     if let Some(c) = &cfg {
         if let Err(e) = c.save() {
-            eprintln!("[dispatch] config save failed: {e}");
+            eprintln!("[dispatch] ERROR: config save failed: {e}");
         }
     }
     state.stop.store(false, Ordering::Relaxed);
