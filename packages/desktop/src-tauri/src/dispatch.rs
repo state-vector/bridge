@@ -2256,7 +2256,7 @@ fn tick(
             // nothing moves, with no errors anywhere. Say why — once per app
             // run per task (an operator clearing the gate re-arms the note).
             if gated_announced.insert(tid.to_string()) {
-                msgs.push(format!("{tid} not claimable (qualification/attempted gate) — needs a role:analysis pass or a human re-issue"));
+                msgs.push(format!("{tid} not claimable (qualification bars unmet) — meet the declared bars or re-issue"));
             }
             continue;
         }

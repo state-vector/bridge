@@ -1271,14 +1271,14 @@ export class KnowledgeHub {
   private ruleCtx(row: any, body: any, id: string, tTags: string[]): RuleCtx {
     return {
       qualify: (kind) => {
-        if (kind === "analysis") {
-          // gateway-attributed claims: the role lives in the TASK, not the
-          // token — a role-tagged task dispatched by its gateway IS that work.
-          const dispatchedRoleWork =
-            body?.gateway && ["role:analysis", "role:review", "role:impl", "role:unblock"].some((t) => tTags.includes(t));
-          return dispatchedRoleWork ? { ok: true, via: "dispatch" } : this.qualifyCheck(row, "analysis");
-        }
-        return this.qualifyCheck(row, "review");
+        // Bar-based claim gate: a claim is legal unless the task DECLARES
+        // enforceable bars that are unmet. Task tags declare the KIND of work
+        // (analysis/impl/review) for the dispatched session's delivery
+        // contract; there are no agent roles and no default qualification
+        // requirement — separation of duties lives in the session-history
+        // check, not here.
+        const unmet = this.unmetBars(row);
+        return unmet.length === 0 ? { ok: true, via: "no-bars" } : { ok: false };
       },
       unmetBars: () => this.unmetBars(row),
       session: () => this.resolveSession(body, String(body?.token_id ?? "")),
@@ -2129,13 +2129,15 @@ export class KnowledgeHub {
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
       const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
-      // role-tagged tasks are claimable by their gateway: the role lives in the
-      // task, and dispatch IS that work (the Oct-20 frozen-backlog lesson)
-      const dispatchedRoleWork = (t.tags ?? []).some((x: string) => ["role:analysis", "role:review", "role:impl", "role:unblock"].includes(x));
-      // roles are playbooks, not gates: every agent sees everything claimable.
-      // Flag instead of filter — agents stand down on work they can't do, and
-      // the server's separation-of-duties check is the actual integrity gate.
-      t.needs_qualification = !dispatchedRoleWork && (!qualified || unmet.length > 0);
+      // task tags declare the KIND of work (analysis/impl/review) — a
+      // playbook for the dispatched session, never a worker requirement.
+      // Qualification is bar-based only: a task is gated when it DECLARES
+      // enforceable bars and they are unmet. There are no agent roles — tags
+      // on tasks declare the KIND of work (analysis/impl/review), never a
+      // requirement about the worker. The old default-gate (untagged =
+      // needs_qualification) starved the queue: fresh, claimable tasks sat
+      // behind a concept nobody signed up for.
+      t.needs_qualification = unmet.length > 0;
       if (need.length) t.target_roles = need;
       // gateways dispatch sessions; qualification-gated work is role:analysis
       // duty (exactly what a qualify-or-close child task is). Leaving it in
