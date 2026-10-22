@@ -55,8 +55,7 @@ import {
 import {
   check as checkRules,
   invariants as checkInvariants,
-  CHURN_REDIRECT_ATTEMPTS,
-  CHURN_ESCALATE_ATTEMPTS,
+  churnRelease,
   RuleCtx,
 } from "./machine.ts";
 
@@ -1378,7 +1377,8 @@ export class KnowledgeHub {
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
       const verdictDuty = tTags.includes("role:review") || tTags.includes("role:unblock");
-      if (verdictDuty && nextAttempts >= CHURN_ESCALATE_ATTEMPTS) {
+      const churn = churnRelease(nextAttempts, verdictDuty, row.status);
+      if (churn === "escalate") {
         // verdict duties may not block (machine.ts) — repeated gate rejections
         // escalate to a human instead of redirecting into blocked + spawn.
         owner = "";
@@ -1390,7 +1390,7 @@ export class KnowledgeHub {
         meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
         this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tTags.find((t) => t.startsWith("role:")) ?? "unknown" });
         this.version(id, "system:churn-guard", "transition", `escalated to human — ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
-      } else if (nextAttempts >= CHURN_REDIRECT_ATTEMPTS && row.status !== "blocked") {
+      } else if (churn === "redirect") {
         // churn guard: the pool has re-run this task N times and a gate keeps
         // rejecting the completion. Re-releasing just loops claim → dispatch →
         // reject → release forever (104-attempt rows taught us this), and each

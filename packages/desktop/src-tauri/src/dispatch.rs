@@ -1038,7 +1038,8 @@ fn slugify(s: &str) -> String {
 
 /// Extract the git repository a task references: meta.repo wins (bare
 /// `owner/repo` becomes a github URL), then the first github/https-git URL in
-/// the body. None = the task cannot be dispatched (nothing to clone).
+/// the body. None = a repo-less dispatch (BR#2460): the host provisions a
+/// scratch dir and the board delivery contract — never a refusal.
 fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
     if let Some(r) = meta.get("repo").and_then(|v| v.as_str()) {
         let r = r.trim();
@@ -2617,6 +2618,60 @@ mod tests {
         let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
         assert_ne!(dir, other);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn source_repo_meta_repo_wins_and_normalizes() {
+        // structured meta.repo wins outright: bare owner/repo expands, and
+        // receipt-page URLs normalize to the owning clone URL
+        assert_eq!(
+            source_repo("body mentions https://github.com/other/repo", &json!({ "repo": "state-vector/bridge" })),
+            Some("https://github.com/state-vector/bridge".to_string())
+        );
+        assert_eq!(
+            source_repo("", &json!({ "repo": "https://github.com/o/r/pull/9" })),
+            Some("https://github.com/o/r".to_string())
+        );
+        assert_eq!(
+            source_repo("", &json!({ "repo": "git@gitlab.com:o/r.git" })),
+            Some("git@gitlab.com:o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn source_repo_unresolvable_meta_repo_is_a_hard_none() {
+        // an authoring defect in meta.repo refuses at the gate — never scrape
+        // past it to whatever URL the body happens to cite
+        assert_eq!(
+            source_repo("see https://github.com/other/repo", &json!({ "repo": "not a repo" })),
+            None
+        );
+    }
+
+    #[test]
+    fn source_repo_scrapes_first_resolvable_body_url() {
+        // no usable meta.repo: the first resolvable https URL in the body is
+        // the clone target; trailing prose punctuation must not poison it
+        assert_eq!(
+            source_repo(
+                "receipts: https://github.com/o/r/pull/3, merged. see also https://github.com/x/y",
+                &json!({}),
+            ),
+            Some("https://github.com/o/r".to_string())
+        );
+        // non-repo URLs don't hijack the scan; an empty meta.repo falls through
+        assert_eq!(
+            source_repo("docs at https://example.com then https://github.com/o/r", &json!({ "repo": "" })),
+            Some("https://github.com/o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn source_repo_none_means_repo_less_dispatch_not_refusal() {
+        // BR#2460: no resolvable repo reference anywhere = repo-less dispatch —
+        // the caller provisions a scratch dir and the board contract
+        assert_eq!(source_repo("pure board-side judgment work, no links", &json!({})), None);
+        assert_eq!(source_repo("", &json!({ "repo": 42 })), None);
     }
 }
 
