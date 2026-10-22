@@ -2280,8 +2280,9 @@ fn tick(
             // silently here starved the runner in front of a full backlog:
             // ten blocked tasks filled the orient slice, every claim was
             // refused, and nothing announced why. Announce + pace.
-            attempts.insert(tid.to_string(), Instant::now());
-            msgs.push(format!("SKIP: {tid} blocked — needs its unblock condition resolved (unblock duty or human)"));
+            if gated_announced.insert(format!("{tid}:blocked")) {
+                msgs.push(format!("SKIP: {tid} blocked — needs its unblock condition resolved (unblock duty or human)"));
+            }
             continue;
         }
         // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
