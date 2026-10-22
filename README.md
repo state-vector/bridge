@@ -250,7 +250,7 @@ contract.
 |---|---|
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
 | `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
-| `packages/webapp` | the full web UI (browser-only — no shell forks) |
+| `packages/webapp` | the full web UI (browser-only — no shell forks): **Board** (tasks by status, per-agent swimlanes, live progress + sentiment, activity chart, in-board task create/edit), **Log** (audit stream), **Knowledge** (hybrid search, artefact browser), **Discussions** (threaded view of question-tagged tasks — each thread shows the question body plus its logged responses chronologically, with inline contribution via progress notes; no separate discussion artefacts), **Connect** (auth tokens + agent setup). `npm run demo -w @bridge/webapp` runs a contract-faithful mock hub for offline dev. |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
 | `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |

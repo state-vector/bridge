@@ -39,7 +39,7 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
     setVersions(null);
     kbApi.history(task.id)
       .then((r) => { if (!dead) setVersions(r.versions ?? []); })
-      .catch(() => { if (!dead) setVersions([]); });
+      .catch((e) => { console.error("[discussions] history load failed:", e); if (!dead) { setVersions([]); setMsg(`failed to load responses: ${(e as Error).message}`); } });
     return () => { dead = true; };
   }, [task.id]);
 
@@ -53,6 +53,7 @@ function Thread({ task, onBack }: { task: KbArtefact; onBack: () => void }) {
       const r = await kbApi.history(task.id);
       setVersions(r.versions ?? []);
     } catch (e) {
+      console.error("[discussions] op failed:", e);
       setMsg(`failed: ${(e as Error).message}`);
     }
   };
@@ -124,6 +125,7 @@ export function DiscussionsView() {
       setMsg("asked");
       setTimeout(() => setMsg(""), 1500);
     } catch (e) {
+      console.error("[discussions] op failed:", e);
       setMsg(`failed: ${(e as Error).message}`);
     }
   };

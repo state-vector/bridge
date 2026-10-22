@@ -755,3 +755,14 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .ws-create input:focus { border-color: var(--accent); }
 .ws-new { padding: 2px 7px !important; }
+
+/* ---- in-board task form (TASK-016) ---- */
+.task-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.task-form input, .task-form textarea {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 15%, transparent);
+  border-radius: 6px; color: var(--text); padding: 6px 8px; font-size: 13px;
+  font-family: inherit;
+}
+.task-form textarea { resize: vertical; }
+.task-form input:focus, .task-form textarea:focus { outline: 1px solid var(--accent); }
