@@ -13,7 +13,7 @@ import type { WsFrame } from "@bridge/specs";
 import { Btn, Chip, ConnDot } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
-import "@bridge/ui-kit/tokens.css";
+import "@bridge/ui-kit/src/tokens.css";
 import "@bridge/ui-kit/ui-kit.css";
 import "./App.css";
 
