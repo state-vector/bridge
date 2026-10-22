@@ -2137,7 +2137,11 @@ export class KnowledgeHub {
       // the server's separation-of-duties check is the actual integrity gate.
       t.needs_qualification = !dispatchedRoleWork && (!qualified || unmet.length > 0);
       if (need.length) t.target_roles = need;
-      return true;
+      // gateways dispatch sessions; qualification-gated work is role:analysis
+      // duty (exactly what a qualify-or-close child task is). Leaving it in
+      // the gateway's slice let the oldest gated tasks occupy all 10 slots
+      // forever — the runner cycled them while claimable work sat behind.
+      return callerIsGateway ? !t.needs_qualification : true;
     }).sort((a: any, b: any) => {
       // ranking: unblock children first (cheapest unblocking lever — a check
       // that releases parked work), then blocked-with-condition, then verify
