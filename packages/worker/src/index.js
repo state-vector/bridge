@@ -177,6 +177,7 @@ export default {
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
+          : sub === "brief" ? "https://kb/brief"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));

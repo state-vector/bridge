@@ -8,6 +8,7 @@
  */
 import {
   ARTEFACT_TYPES,
+  BUILD,
   LIFECYCLES,
   RELATIONS,
   composeBootstrap,
@@ -18,8 +19,9 @@ import {
 } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 
-/** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.3.5";
+/** Build marker lives in kb/core.ts (the DO stamps it as the provenance
+ * recency cue without a circular import); re-exported here for the MCP plane. */
+export { BUILD };
 
 // per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
 const wsRouteCache = new Map<string, string>();
