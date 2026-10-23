@@ -2168,6 +2168,10 @@ export class KnowledgeHub {
     // clicking. Reports, receipts and narrative belong in details (body_md).
     if (question.length > 240) throw new Error("question must be the ask itself, one sentence ≤240 chars (e.g. 'Merge PR #84?') — put reports/receipts in details");
     const details = String(body.details ?? "").trim();
+    // WHY IT'S ESCALATED is not optional for human-directed asks: "merge PR
+    // #84?" is unanswerable without "review is red but rebuttable per guidance".
+    const reason = String(body.reason ?? "").trim().slice(0, 400);
+    if (!reason && (to === "human" || to === "ray")) throw new Error("asks to a human must state why they are escalated instead of automatic (reason: '…')");
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
@@ -2186,7 +2190,7 @@ export class KnowledgeHub {
         body_md: details || question,
         tags: ["question"],
         owner: "",
-        meta: { ask: { to, urgency, options, from: actor, artefact_id: artefactId || undefined } },
+        meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined } },
       },
       actor,
     );

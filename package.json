@@ -2,7 +2,7 @@
   "name": "bridge-monorepo",
   "private": true,
   "type": "module",
-  "description": "bridge: work orchestration for agents + humans \u2014 web app first",
+  "description": "bridge: work orchestration for agents + humans — web app first",
   "workspaces": [
     "packages/specs",
     "packages/ui-kit",
@@ -18,6 +18,7 @@
     "lint": "npm run lint --workspaces --if-present"
   },
   "devDependencies": {
+    "@types/node": "^26.6.5",
     "typescript": "^5.6.0"
   }
 }

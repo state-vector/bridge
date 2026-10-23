@@ -340,6 +340,9 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
         {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
+      {ask.reason && (
+        <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
+      )}
       <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={() => onChanged?.()} /></div>
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />

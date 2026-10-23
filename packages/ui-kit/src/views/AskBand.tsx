@@ -173,6 +173,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
       <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
       <span className="ab-main">
         <span className="ab-title" title={nodeAsk.title}>{askKernel(nodeAsk.title)}</span>
+        {m.ask?.reason && <span className="ab-reason" title={m.ask.reason}>why escalated: {m.ask.reason.length > 120 ? `${m.ask.reason.slice(0, 120)}…` : m.ask.reason}</span>}
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
           {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}

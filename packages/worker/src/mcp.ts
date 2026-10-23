@@ -354,7 +354,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       }));
     }
     case "ask_agent": {
-      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, details: args.details, options: args.options, artefact_id: args.artefact_id });
+      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id });
       return text(JSON.stringify({
         ...a,
         note: a.task_status === "blocked"
@@ -534,10 +534,11 @@ const TOOLS = [
     description: "Ask another agent or the human for insight/help/decisions. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), 'human', or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. OPTIONS ARE REQUIRED: give the human 2-8 one-click answers (e.g. [\"GO — merge now\", \"NO-GO — hold\"]) — they answer by clicking, and the ask is rejected without them.",
     inputSchema: {
       type: "object",
-      required: ["question", "options"],
+      required: ["question", "options", "reason"],
       properties: {
         to: { type: "string", description: "default: any" },
         question: { type: "string", description: "THE ASK ITSELF — one imperative sentence ≤240 chars (e.g. \"Merge PR #84?\"). Reports/receipts go in details, not here" },
+        reason: { type: "string", description: "REQUIRED: WHY this needs a decision instead of proceeding automatically — one sentence (e.g. \"PR is failing SP Review but the failure is rebuttable per guidance; rebuttal drafted\")" },
         details: { type: "string", description: "context, receipts, narrative — rendered as markdown below the question" },
         options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8, description: "REQUIRED: 2-8 one-click answer options for the human" },
         artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },

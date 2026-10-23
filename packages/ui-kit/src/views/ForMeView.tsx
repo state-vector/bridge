@@ -138,6 +138,7 @@ function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => 
         <span className="why-line">{ask.from ?? "agent"} · {rel(node.created_ts)}</span>
       </div>
       <h3 className="ask-question">{node.title}</h3>
+      {ask.reason && <p className="ask-reason"><b>why escalated:</b> {ask.reason}</p>}
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}

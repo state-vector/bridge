@@ -19,23 +19,16 @@ let mf: Miniflare;
 let kb: (path: string, init?: RequestInit) => Promise<Response>;
 
 beforeAll(async () => {
+  // miniflare 3 programmatic API — the v4 API bundled with wrangler changed
+  // its schema and rejected every shape tried; v3 is a direct devDep.
   mf = new Miniflare({
-    workers: [
-      {
-        config: {
-          name: "kb-test",
-          modules: true,
-          script: readFileSync(new URL("../src/index.js", import.meta.url), "utf8"),
-          compatibilityDate: "2025-09-06",
-          durableObjects: {
-            bindings: { HUB: "FlowsHub", KB: "KnowledgeHub" },
-          },
-        },
-      },
-    ],
+    scriptPath: new URL("../../src/index.js", import.meta.url).pathname,
+    modules: true,
+    compatibilityDate: "2025-09-06",
+    durableObjects: { HUB: "FlowsHub", KB: "KnowledgeHub" },
   });
   const ns = await mf.getDurableObjectNamespace("KB");
-  const stub = await ns.get(ns.idFromName("global"));
+  const stub = await ns.get(ns.newUniqueId());
   kb = (path, init) => stub.fetch(`https://kb${path}`, init);
   // warm + cold ensureSchema paths both exercised
   await kb("/orient", { actor: "test" });
@@ -55,7 +48,7 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
 
-describe.skip("auth token SQL paths (real storage)", () => {
+describe("auth token SQL paths (real storage)", () => {
   it("mints a token on a cold database (ensureSchema + INSERT)", async () => {
     const { status, body } = await kbJson("/admin.mint", {
       label: "test-mint-basic",
@@ -91,7 +84,7 @@ describe.skip("auth token SQL paths (real storage)", () => {
   });
 });
 
-describe.skip("agent provisioning SQL paths", () => {
+describe("agent provisioning SQL paths", () => {
   it("provisions a worker token (binding-count regression: 8 columns, 8 bindings)", async () => {
     const { status, body } = await kbJson("/agent.provision", {
       label: "test-provisioned",
@@ -114,7 +107,7 @@ describe.skip("agent provisioning SQL paths", () => {
   });
 });
 
-describe.skip("session registration (the migration that never ran in prod)", () => {
+describe("session registration (the migration that never ran in prod)", () => {
   it("session touch writes the kind column", async () => {
     const { status, body } = await kbJson("/session.touch", {
       token_id: "at_test",
