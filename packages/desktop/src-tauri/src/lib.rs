@@ -4,9 +4,9 @@ mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
-mod scm;
 mod session;
 mod transport;
+mod scm;
 
 use serde::Deserialize;
 use tauri::Manager;
