@@ -68,8 +68,11 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
     }
     for (const d of generic) put(null, { kind: "decision", d });
     // question-node asks: BR#-numbered, child_of their subject (part_of on the
-    // board payload) — surfaced by the same exactly-once rule
+    // board payload) — surfaced by the same exactly-once rule. Self-asks
+    // (agent → itself) are coordination, not a human decision: excluded.
     for (const nodeAsk of nodeAsks) {
+      const am = (nodeAsk.meta ?? {}).ask ?? {};
+      if (am.to && am.from && am.to === am.from) continue;
       put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
     }
 

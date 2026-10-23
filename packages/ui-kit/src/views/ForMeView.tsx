@@ -184,7 +184,12 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
 
   // open question nodes = the ask feed (one plane)
   const asked = useMemo(
-    () => (tasks as any[]).filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)),
+    () => (tasks as any[]).filter((t) => {
+      if (!(t.tags ?? []).includes("question") || !t.meta?.ask) return false;
+      if (!["todo", "in_progress", "blocked"].includes(t.status)) return false;
+      const am = t.meta.ask ?? {};
+      return !(am.to && am.from && am.to === am.from); // self-asks: coordination, not a human decision
+    }),
     [tasks],
   );
 

@@ -859,4 +859,4 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-band-row:has(.ask-opt-list) .ab-main { grid-column: 1 / -1; }
 
 /* the why-escalated line: muted, italic, always second */
-.ab-reason { font-size: 10.5px; color: var(--text-faint, #8b94a7); font-style: italic; }
+.ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }
