@@ -1,9 +1,11 @@
 //! Native menu bar + tray — Docker-style. The desktop is its own resizable
 //! window; clicking the tray icon opens the menu.
 //!
-//! Menus follow the auth state: logged out, the only options are Pair (shows
-//! the pairing view) and Quit. Paired, the full menu appears: live Status,
-//! Open Bridge, Settings, Logout, Quit.
+//! Menus follow the auth state: logged out, the only options are
+//! "Sign in with GitHub" (the human-session onboarding) and Quit. Signed in,
+//! the full menu appears: live Status, Open Bridge, Settings, Sign out, Quit.
+//! (Credential-class ADR BR#2673: the UI follows the HUMAN session; the
+//! gateway token is invisible infrastructure and never gates the menu.)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,12 +14,8 @@ use std::time::Duration;
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::dispatch::DispatchConfig;
-
 fn paired() -> bool {
-    DispatchConfig::resolve()
-        .map(|c| !c.token.is_empty())
-        .unwrap_or(false)
+    crate::session::load().is_some()
 }
 
 pub fn setup(app: &tauri::App) -> tauri::Result<()> {
@@ -25,9 +23,9 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     let status_item = tauri::menu::MenuItem::with_id(app, "status", "Status — starting…", false, None::<&str>)?;
     let open_item = tauri::menu::MenuItem::with_id(app, "open", "Open Bridge", true, None::<&str>)?;
     let settings_item = tauri::menu::MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-    let logout_item = tauri::menu::MenuItem::with_id(app, "logout", "Logout", true, None::<&str>)?;
+    let logout_item = tauri::menu::MenuItem::with_id(app, "logout", "Sign out", true, None::<&str>)?;
     let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "Quit Bridge", true, None::<&str>)?;
-    let pair_item = tauri::menu::MenuItem::with_id(app, "pair", "Pair this desktop…", true, None::<&str>)?;
+    let signin_item = tauri::menu::MenuItem::with_id(app, "signin", "Sign in with GitHub…", true, None::<&str>)?;
 
     // ---- paired menu: live status + full actions ----
     let menu_full = tauri::menu::MenuBuilder::new(app)
@@ -40,9 +38,9 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         .item(&quit_item)
         .build()?;
 
-    // ---- logged-out menu: Pair and Quit — nothing else is usable ----
+    // ---- logged-out menu: Sign in and Quit — nothing else is usable ----
     let menu_pair = tauri::menu::MenuBuilder::new(app)
-        .item(&pair_item)
+        .item(&signin_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -57,7 +55,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         .item(&quit_item)
         .build()?;
     let app_menu_pair = tauri::menu::MenuBuilder::new(app)
-        .item(&pair_item)
+        .item(&signin_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -114,7 +112,10 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
 
 fn handle_menu(app: &AppHandle, id: &str) {
     match id {
-        "pair" => show_main(app), // the app shows the pairing view when not paired
+        "signin" => {
+            show_main(app);
+            let _ = app.emit("do-signin", ());
+        }
         "open" => show_main(app),
         "settings" => {
             show_main(app);
