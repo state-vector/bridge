@@ -2871,7 +2871,7 @@ export class KnowledgeHub {
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
     this.state.storage.sql.exec(
       `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-      id, label, hash, tags, body.principal ?? null, ts,
+      id, label, hash, tags, body.device_id ?? null, body.principal ?? null, ts,
     );
     const ws = this.wsSlug();
     if (ws) {
