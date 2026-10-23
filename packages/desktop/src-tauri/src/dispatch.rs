@@ -297,30 +297,30 @@ impl DispatchConfig {
 pub fn ensure_principal_from_file() -> String {
     let path = config_path();
     if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Ok(c) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(existing) = c.get("principal").and_then(|p| p.as_str()) {
                 if !existing.is_empty() {
                     return existing.to_string();
                 }
             }
-            let mut bytes = [0u8; 4];
-            let _ = std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
-            let p = format!("p_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-            if let Some(obj) = c.as_object_mut() {
-                obj.insert("principal".into(), serde_json::Value::String(p.clone()));
-            }
+        }
+    }
+    String::new() // empty = not yet vended — the hub mints the device credential on first provision
+}
+
+/// Persist the hub-vended device credential (adopted on first provision;
+/// never regenerated client-side — ONE random generation approach).
+fn store_principal(p: &str) {
+    let path = config_path();
+    if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap_or_default()) {
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("principal".into(), serde_json::Value::String(p.to_string()));
             let body = serde_json::to_string_pretty(&c).unwrap_or_default();
             let _ = std::fs::write(&path, body);
             #[cfg(unix)]
             let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
-            return p;
         }
     }
-    let mut bytes = [0u8; 4];
-    let _ = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
-    format!("p_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 fn config_path() -> PathBuf {
@@ -398,32 +398,6 @@ fn host_slug() -> String {
         .unwrap_or_else(|| "device".into())
 }
 
-fn device_id() -> String {
-    if let Ok(out) = Command::new("ioreg")
-        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-        .output()
-    {
-        let s = String::from_utf8_lossy(&out.stdout);
-        for line in s.lines() {
-            if line.contains("\"IOPlatformUUID\"") {
-                if let Some(v) = line.split('=').nth(1) {
-                    let v = v.trim().trim_matches('"').trim_end_matches(';').trim();
-                    if !v.is_empty() {
-                        return format!("uuid-{v}");
-                    }
-                }
-            }
-        }
-    }
-    let host = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-device".into());
-    format!("host-{host}")
-}
-
 /// First half of the device flow: register this device, get the enter-code.
 /// This app IS a gateway — the pairing declares that class; the hub vends a
 /// gateway-class token on approval. The approver never chooses. The stable
@@ -432,7 +406,7 @@ pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str, p
     let start: serde_json::Value = client
         .post(format!("{url}/api/pair/start"))
         .header("content-type", "application/json")
-        .body(json!({ "device": device, "type": "gateway", "device_id": device_id(), "principal": principal }).to_string())
+        .body(json!({ "device": device, "type": "gateway", "principal": principal }).to_string())
         .send()
         .map_err(|e| format!("bridge unreachable: {e}"))?
         .json()
@@ -575,11 +549,11 @@ pub fn self_provision(
         .header("cookie", format!("bridge_session={cookie}"))
         .body(
             json!({
-                "device_id": device_id(),
-                // hostname — the label source (BR#899 identity convention);
-                // device_id stays the internal rotation anchor
-                "host": host_slug(),
+                // principal = the device credential (hub-vended, generate-once-
+                // never-change; empty on first provision — the hub mints it);
+                // host = display label source (BR#899 identity convention)
                 "principal": ensure_principal_from_file(),
+                "host": host_slug(),
             })
             .to_string(),
         )
@@ -596,6 +570,15 @@ pub fn self_provision(
     let secret = resp.get("secret").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).ok_or_else(err)?;
     let ws = resp.get("ws").and_then(|w| w.as_str()).filter(|w| !w.is_empty()).unwrap_or("state-vector");
     let label = resp.get("label").and_then(|l| l.as_str()).map(|s| s.to_string());
+    // adopt the hub-vended device credential on first provision — stored
+    // once, presented on every later provision, never regenerated (ONE
+    // random generation approach)
+    if let Some(p) = resp.get("principal").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
+        if p != ensure_principal_from_file() {
+            store_principal(p);
+            eprintln!("[dispatch] device credential vended by the hub and stored");
+        }
+    }
     let mut cfg = load_config().unwrap_or_else(default_config);
     apply_vended_credentials(&mut cfg, url, secret, ws, label, true)?;
     eprintln!(
@@ -1427,6 +1410,7 @@ fn spawn_opencode(
     policy: &str,
     resume_session: Option<String>,
     role_work: bool,
+    role_type: &str,
     avail: &[opencode::Backend],
     in_flight: &mut Vec<InFlight>,
 ) {
@@ -1537,7 +1521,8 @@ fn spawn_opencode(
             "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
         )
     };
-    let bridge_session = format!("dispatch-{}", slugify(tid));
+    let digits = tid.rsplit('-').next().unwrap_or(tid);
+    let bridge_session = format!("bridge-{role_type}-{}", slugify(digits));
     let env_block = format!(
         "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
     );
@@ -2274,12 +2259,15 @@ fn tick(
             Some(s) => format!("resumed {tid} — continuing opencode session {s}"),
             None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
         };
-        let role_work = t.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
+        let (role_work, role_type) = t.get("tags").and_then(|v| v.as_array()).map(|a| {
+            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
+            (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
+        }).unwrap_or((false, "task".to_string()));
         // re-dispatch after cleanup needs the task body + repo reference again
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess, role_work, avail, in_flight);
+        spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess, role_work, &role_type, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
@@ -2393,8 +2381,11 @@ fn tick(
             Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
             None => format!("claimed {tid} — dispatched to opencode"),
         };
-        let role_work = task.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| ["role:analysis","role:review","role:impl","role:unblock"].contains(&s))).unwrap_or(false);
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, avail, in_flight);
+        let (role_work, role_type) = task.get("tags").and_then(|v| v.as_array()).map(|a| {
+            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
+            (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
+        }).unwrap_or((false, "task".to_string()));
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight);
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);

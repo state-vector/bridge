@@ -91,7 +91,7 @@ type TokenRow = {
  *  agent (independently onboarded). */
 function classOf(t: TokenRow): "gateway" | "worker" | "agent" {
   const tags = (t.tags ?? []).map((x) => String(x).toLowerCase());
-  if (tags.includes("gateway") || t.label.startsWith("gw-")) return "gateway";
+  if (tags.includes("gateway")) return "gateway";
   if (tags.includes("provisioned")) return "worker";
   return "agent";
 }

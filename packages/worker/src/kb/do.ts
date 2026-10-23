@@ -2885,32 +2885,57 @@ export class KnowledgeHub {
     return { id, label, secret, provisioned_by: caller };
   }
 
-  /** Gateway self-provision (credential-class ADR BR#2673 leg 4): the human
-   *  session mints THIS device's gateway-class token — the login IS the human
-   *  approval. Identity is worker-derived (login/ws arrive from the
-   *  authenticated session forward in index.js, never client-claimable);
-   *  the label is deterministic gw-* from the device_id, so re-vend at every
-   *  login rotates the token in place and `gateway_agents` edges keyed by
-   *  that label stay stable. Audit op `self_provision` with the web actor —
-   *  distinguishable from admin mints (op "pair") and from any agent mint. */
+  /** Gateway self-provision (credential-class ADR, desktop gateway leg):
+   *  the human session mints THIS device's gateway-class token — the login
+   *  IS the human approval. ONE device credential: hub-vended on first
+   *  provision (returned to the desktop, stored, never regenerated),
+   *  presented on every later provision — replace-by-PRINCIPAL rotates the
+   *  gateway token in place (Ray 2026-10-23: one random generation approach;
+   *  no IOPlatformUUID, no client-side p_*). Label = bare hostname slug
+   *  (display only, BR#899); class = tags ["gateway"]. Audit op
+   *  `self_provision` stamped with the web actor. */
   private async selfProvision(body: any, actor: string) {
     const login = String(body.login ?? "").trim();
-    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : "";
     if (!login) throw new Error("self-provision requires the session login (worker-derived)");
-    if (!device_id) throw new Error("self-provision requires device_id");
-    const label = selfProvisionLabel(body.host ?? body.device_id);
-    const out = await this.tokenMint({
-      label,
-      device_id,
-      principal: typeof body.principal === "string" ? body.principal : null,
-      tags: ["gateway"],
-      transport: "mcp", // the desktop gateway is an MCP client of the hub
-    });
-    this.audit(actor, "self_provision", null, { label, device_id, login, ws: body.ws ?? "", token_id: out.id });
-    return { secret: out.secret, label: out.label ?? label, ws: this.wsSlug() || String(body.ws ?? ""), id: out.id };
+    const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : "";
+    const label = selfProvisionLabel(body.host);
+    const ws = this.wsSlug() || String(body.ws ?? "");
+    const secret = generateAuthToken();
+    const hash = await hashAuthToken(secret);
+    const mintTags = JSON.stringify(["gateway"]);
+    const register = (h: string) =>
+      (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/ws.token_register", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hash: h, ws }),
+      });
+    let id: string;
+    let vended: string | undefined;
+    const own = principal ? this.one(`SELECT id FROM auth_tokens WHERE principal = ?`, principal) as any : null;
+    if (own) {
+      // replace-by-principal: same machine, token rotation in place
+      this.state.storage.sql.exec(
+        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+        hash, label, mintTags, own.id,
+      );
+      id = own.id as string;
+      await register(hash);
+    } else {
+      // first provision: the hub VENDS the device credential (one random
+      // generation approach — generateAuthToken is the only generator)
+      vended = principal || generateAuthToken();
+      id = `at_${crypto.randomUUID().slice(0, 8)}`;
+      this.state.storage.sql.exec(
+        `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+        id, label, hash, mintTags, vended, Date.now(),
+      );
+      await register(hash); // registry failure fails the mint — never misroute
+    }
+    this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own });
+    return { secret, label, ws, id, principal: vended ?? principal };
   }
 
-  private async tokenMint(body: any) {    const label = String(body.label ?? "").trim();
+  private async tokenMint(body: any) {
+    const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     // the only '/' allowed in a human-minted label is the reserved
     // _direct/ root — directly connected agents live there
