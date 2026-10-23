@@ -8,6 +8,9 @@ mod scm;
 mod session;
 mod transport;
 
+pub use self::keychain::{save_token, load_token, delete_token};
+pub use self::session::{load, kb_request, probe, clear, login};
+
 use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
