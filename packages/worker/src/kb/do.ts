@@ -3155,12 +3155,18 @@ export class KnowledgeHub {
       });
     let id: string;
     let vended: string | undefined;
-    const own = principal ? this.one(`SELECT id FROM auth_tokens WHERE principal = ?`, principal) as any : null;
+    // same machine, token rotation in place: match by principal first; the
+    // deterministic label (same host -> same label) is the fallback when the
+    // principal reset (config wipes regenerate it) — the machine re-claims
+    // its identity by name, and the rotation stamps the fresh principal.
+    let own = principal ? this.one(`SELECT id, label FROM auth_tokens WHERE principal = ?`, principal) as any : null;
+    if (!own) {
+      own = this.one(`SELECT id, label FROM auth_tokens WHERE label = ?`, label) as any;
+    }
     if (own) {
-      // replace-by-principal: same machine, token rotation in place
       this.state.storage.sql.exec(
-        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
-        hash, label, mintTags, own.id,
+        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = ?, revoked_ts = NULL WHERE id = ?`,
+        hash, label, mintTags, principal, own.id,
       );
       id = own.id as string;
       await register(hash);
