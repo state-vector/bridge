@@ -8,8 +8,8 @@ mod scm;
 mod session;
 mod transport;
 
-pub use keychain;
-pub use session;
+//pub use keychain;
+//pub use session;
 
 use serde::Deserialize;
 use tauri::Manager;
@@ -24,6 +24,8 @@ struct NotifyAskArgs {
     urgent: bool,
 }
 
+pub use keychain::Keychain;
+pub use session::Session;
 /// Dispatch a decision to the OS notification surface.
 /// Native buttons when bundled (.app); plain notification otherwise.
 #[tauri::command]
