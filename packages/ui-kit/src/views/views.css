@@ -851,3 +851,9 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-opt-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .ask-opt-row.disabled { opacity: 0.5; cursor: default; }
 .ask-opt-text { font-size: 11.5px; line-height: 1.4; min-width: 0; }
+
+/* band rows hosting a vertical option list: let the row grow naturally */
+.ask-band-row:has(.ask-opt-list) { grid-template-columns: 120px minmax(0, 1fr); }
+.ask-band-row:has(.ask-opt-list) .ab-meta,
+.ask-band-row:has(.ask-opt-list) .ab-actions { display: none; }
+.ask-band-row:has(.ask-opt-list) .ab-main { grid-column: 1 / -1; }

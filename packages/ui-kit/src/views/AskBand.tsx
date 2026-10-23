@@ -173,7 +173,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
         <span className="ab-title" title={nodeAsk.title}>{nodeAsk.title}</span>
         {nodeAsk.part_of && <span className="ab-prior-line">on {nodeAsk.part_of}</span>}
         {(ask.options ?? []).length > 0 && (
-          <AskOptions options={ask.options as string[]} busy={busy} compact onPick={(o) => void answer(o)} />
+          <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
         )}
       </span>
       <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>

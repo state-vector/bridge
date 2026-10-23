@@ -47,23 +47,16 @@ export interface HistoryEntry {
 }
 
 
-/** Ask options, three shapes (Ray, 2026-10-23):
- *  - binary + short → one line: "DO YOU WANT TO X" [ APPROVE ] [ DENY ]
- *  - multi / long → vertical list: [ A ] - Provision x  (text outside the button)
- *  - compact surfaces (rows) with complex options → key buttons + tooltip */
-export function AskOptions({ options, onPick, busy, compact }: {
+/** Ask options, two shapes (Ray, 2026-10-23):
+ *  - binary + short → one line: [ APPROVE ] [ DENY ]
+ *  - everything else → vertical list, text VISIBLE next to the key:
+ *      [ A ] - Provision x
+ *      [ B ] - Reword y
+ *  Never letter-keys alone — an option without its text is not an option. */
+export function AskOptions({ options, onPick, busy }: {
   options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean;
 }) {
   const short = options.every((o) => o.length <= 34);
-  if (compact && (!(options.length === 2) || !short)) {
-    return (
-      <span className="ab-options">
-        {options.map((o, i) => (
-          <Btn key={o} size="sm" disabled={busy} title={o} onClick={() => onPick(o)}>{String.fromCharCode(65 + i)}</Btn>
-        ))}
-      </span>
-    );
-  }
   if (options.length === 2 && short) {
     return (
       <ActionRow>
