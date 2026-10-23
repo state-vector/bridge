@@ -150,7 +150,7 @@ export default {
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
-        return kbCors(env.KB.get(kbId).fetch(kbUrl + url.search, request));
+        return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
@@ -158,7 +158,7 @@ export default {
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : "web";
         // do ops are dot-namespaced (ask.answer); the web plane uses snake_case
-        return kbCors(env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
+        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
@@ -395,14 +395,16 @@ async function authKb(request, env) {
 }
 
 /** Native shells hit the hub cross-origin — bearer auth needs no credentials,
- *  so a permissive CORS policy on the (non-admin) knowledge plane is safe. */
+ *  so a permissive CORS policy on the (non-admin) knowledge plane is safe.
+ *  DO-fetched responses drop silently-mutated headers in some runtime
+ *  versions — rebuild the Response instead of trusting .set() to stick. */
 function kbCors(r) {
-  if (r && r.headers) {
-    r.headers.set("Access-Control-Allow-Origin", "*");
-    r.headers.set("Access-Control-Allow-Headers", "authorization, content-type");
-    r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  }
-  return r;
+  if (!r || !r.headers) return r;
+  const h = new Headers(r.headers);
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Access-Control-Allow-Headers", "authorization, content-type");
+  h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h, webSocket: r.webSocket });
 }
 function kbPreflight() {
   return kbCors(new Response(null, { status: 204 }));
