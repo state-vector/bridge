@@ -11,6 +11,9 @@ mod transport;
 pub mod keychain;
 pub mod session;
 
+pub use keychain::Keychain;
+pub use session::Session;
+
 use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
