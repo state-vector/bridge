@@ -11,8 +11,8 @@ mod transport;
 pub use keychain::*;
 pub use session::*;
 
-use keychain;
-use session;
+pub use keychain;
+pub use session;
 
 use serde::Deserialize;
 use tauri::Manager;
