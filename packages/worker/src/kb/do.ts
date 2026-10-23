@@ -2153,9 +2153,15 @@ export class KnowledgeHub {
       const m = JSON.parse(node.meta ?? "{}");
       if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), id);
+      // questions complete directly (todo → done) — the claimant status machine
+      // is for work items, not for Q&A nodes
+      const now = Date.now();
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(m), now, now, id,
+      );
+      this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { status: "done", answer: answer.slice(0, 200) });
       let taskStatus: string | undefined;
-      await this.transition({ id, to: "done", note: `answered by ${actor}: ${answer.slice(0, 200)}` }, actor);
       const subject = this.one(
         `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? ORDER BY r.created_ts DESC LIMIT 1`, id,
