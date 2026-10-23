@@ -185,7 +185,7 @@ export const kbApi = {
 /** Realtime KB events over WS. Reconnects with backoff; feeds a callback.
  *  Token auth rides the query string (browsers cannot set WS headers). */
 export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" | "closed") => void) {
-  const token = bearer();
+  const token = bearerToken();
   const url = base().replace(/^http/, "ws") + "/kb-ws?since=0" + (token ? `&token=${encodeURIComponent(token)}` : "");
   let ws: WebSocket | null = null;
   let stopped = false;
