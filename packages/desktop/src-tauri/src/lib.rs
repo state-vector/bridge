@@ -9,7 +9,9 @@ mod session;
 mod transport;
 
 pub mod keychain;
+use keychain::Keychain;
 pub mod session;
+use session::Session;
 pub mod dispatch;
 pub mod console;
 pub mod mac_notify;
