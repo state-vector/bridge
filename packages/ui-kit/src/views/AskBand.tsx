@@ -72,10 +72,16 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
     // question-node asks: BR#-numbered, child_of their subject (part_of on the
     // board payload) — surfaced by the same exactly-once rule. Self-asks
     // (agent → itself) are coordination, not a human decision: excluded.
+    // the human band: asks ADDRESSED to the human. Dispatch sessions ask
+    // under the coordinator's label (to === from is normal for Ray-gates) —
+    // what's NOT human mail: asks addressed to another agent or session.
+    const HUMAN_TARGET = /^(human|ray|rayh)$/i;
     const seenAsk = new Set<string>();
     for (const nodeAsk of nodeAsks) {
       const am = (nodeAsk.meta ?? {}).ask ?? {};
-      if (am.to && am.from && am.to === am.from) continue;
+      if (am.to && !HUMAN_TARGET.test(am.to) && !String(am.to).includes("@") === false) {
+        if (!HUMAN_TARGET.test(am.to)) continue; // addressed to an agent/session
+      }
       // identical re-asked asks collapse to the newest
       const key = `${nodeAsk.part_of ?? ""}:${nodeAsk.title}`;
       if (seenAsk.has(key)) continue;

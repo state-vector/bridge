@@ -195,7 +195,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
       if (!(t.tags ?? []).includes("question") || !t.meta?.ask) return false;
       if (!["todo", "in_progress", "blocked"].includes(t.status)) return false;
       const am = t.meta.ask ?? {};
-      return !(am.to && am.from && am.to === am.from); // self-asks: coordination, not a human decision
+      return !am.to || /^(human|ray|rayh)$/i.test(String(am.to)); // human-addressed only
     }),
     [tasks],
   );

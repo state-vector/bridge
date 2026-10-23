@@ -782,6 +782,9 @@ export class KnowledgeHub {
         let n = 0;
         for (const node of nodes) {
           const m = JSON.parse(node.meta ?? "{}");
+          // legacy-migrated asks: their content is prose — do NOT fabricate
+          // options for them (the human answers free-text or reframes)
+          if (m.ask?.legacy_id) continue;
           if (!m.ask || (Array.isArray(m.ask.options) && m.ask.options.length >= 2)) continue;
           const text = `${node.title ?? ""} ${node.body_md ?? ""}`;
           let opts: string[] = [];
