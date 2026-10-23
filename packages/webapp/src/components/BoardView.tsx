@@ -4,6 +4,7 @@ import type { BoardPrefs } from "../store/kb";
 import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
+import { TaskForm } from "./TaskForm";
 
 /** Render text with task references (BR#12, TASK-007) as clickable links. */
 function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
@@ -101,7 +102,7 @@ function Sparkline({ series }: { series: any[] }) {
 
 function TaskCard({ task, prefs, now, series, onOpen }: {
   task: any; prefs: BoardPrefs; now: number; series: any[];
-  onOpen: (id: string, intent?: "blocked") => void;
+  onOpen: (id: string, intent?: "blocked", mode?: "edit") => void;
 }) {
   const p = task.meta?.last_progress;
   const lastSignal = p?.ts ?? task.updated_ts;
@@ -249,6 +250,11 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
             </Btn>
           )
         ))}
+        {prefs.edit && (
+          <button key="edit" className="opt-btn task-btn" title="edit title/description/tags in-board" onClick={() => onOpen(task.id, undefined, "edit")}>
+            edit
+          </button>
+        )}
       </div>
     </div>
   );
@@ -264,6 +270,7 @@ const PREF_FIELDS: Array<{ key: keyof BoardPrefs; label: string }> = [
   { key: "snippet", label: "Snippet" },
   { key: "sparkline", label: "Sparkline" },
   { key: "pct", label: "Completion/Confidence/Risk %" },
+  { key: "edit", label: "Edit button" },
 ];
 
 function FieldsMenu({ onClose }: { onClose: () => void }) {
@@ -274,8 +281,8 @@ function FieldsMenu({ onClose }: { onClose: () => void }) {
     <div className="fields-menu" onClick={(e) => e.stopPropagation()}>
       <div className="fields-menu-head">
         <span>Card fields</span>
-        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: false, tags: false, sentiment: false, snippet: false, sparkline: false, pct: false })}>Compact</Btn>
-        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: true, tags: true, sentiment: true, snippet: true, sparkline: true, pct: true })}>Full</Btn>
+        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: false, tags: false, sentiment: false, snippet: false, sparkline: false, pct: false, edit: false })}>Compact</Btn>
+        <Btn onClick={() => setPrefs({ issue: true, status: true, age: true, owner: true, tags: true, sentiment: true, snippet: true, sparkline: true, pct: true, edit: true })}>Full</Btn>
       </div>
       {PREF_FIELDS.map((f) => (
         <label key={f.key} className="fields-check">
@@ -354,13 +361,20 @@ export function BoardView() {
   const events = useKb((s) => s.events);
   const series = useKb((s) => s.series);
   const prefs = useKb((s) => s.prefs);
+  const refresh = useKb((s) => s.refresh);
   const conn = useKb((s) => s.conn);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [blockedIntent, setBlockedIntent] = useState(false);
+  const [editIntent, setEditIntent] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupBy>("agent");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [fieldsOpen, setFieldsOpen] = useState(false);
-  const openTask = (id: string, intent?: "blocked") => { setSelectedTaskId(id); setBlockedIntent(intent === "blocked"); };
+  const openTask = (id: string, intent?: "blocked", mode?: "edit") => {
+    setSelectedTaskId(id);
+    setBlockedIntent(intent === "blocked");
+    setEditIntent(mode === "edit");
+  };
+  const closePanel = () => { setSelectedTaskId(null); setBlockedIntent(false); setEditIntent(false); void refresh(); };
 
   useClock(); // 1s tick — ages count up live
 
@@ -420,7 +434,13 @@ export function BoardView() {
 
   return (
     <div className="board-wrap">
-      {selectedTaskId && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={() => setSelectedTaskId(null)} onOpen={(id) => { setSelectedTaskId(id); setBlockedIntent(false); }} />}
+      {selectedTaskId && editIntent && <div className="panel-backdrop" onClick={closePanel} />}
+      {selectedTaskId && editIntent && (
+        <aside className="detail-panel">
+          <TaskForm taskId={selectedTaskId} onClose={closePanel} />
+        </aside>
+      )}
+      {selectedTaskId && !editIntent && <TaskDetail taskId={selectedTaskId} openBlocked={blockedIntent} onClose={closePanel} onOpen={(id) => { setSelectedTaskId(id); setBlockedIntent(false); setEditIntent(false); }} />}
       <div className="view-head">
         <h2>Board</h2>
         <ConnDot state={conn === "open" ? "open" : "closed"} className="conn" />

@@ -15,13 +15,13 @@ function escalateAuth(e: unknown) {
 
 export interface BoardPrefs {
   issue: boolean; status: boolean; age: boolean; owner: boolean;
-  tags: boolean; sentiment: boolean; snippet: boolean; sparkline: boolean; pct: boolean;
+  tags: boolean; sentiment: boolean; snippet: boolean; sparkline: boolean; pct: boolean; edit: boolean;
 }
 
 const PREFS_KEY = "bridge.board.prefs";
 const DEFAULT_PREFS: BoardPrefs = {
   issue: true, status: true, age: true, owner: true,
-  tags: true, sentiment: true, snippet: true, sparkline: true, pct: true,
+  tags: true, sentiment: true, snippet: true, sparkline: true, pct: true, edit: true,
 };
 function loadPrefs(): BoardPrefs {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") }; }
