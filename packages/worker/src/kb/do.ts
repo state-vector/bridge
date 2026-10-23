@@ -2455,6 +2455,19 @@ export class KnowledgeHub {
       }
       return t;
     });
+    // per-role steering: active steering artefacts — universal (no role:* tag)
+    // plus any whose role:* tags match the caller's — delivered at orient and
+    // at dispatch. The mechanism the merge ladder rides (BR#2799).
+    const steeringRows = this.state.storage.sql.exec(
+      `SELECT id, title, body_md, tags FROM artefacts
+       WHERE type = 'steering' AND status = 'active' ORDER BY updated_ts DESC LIMIT 20`,
+    ).toArray();
+    const steering = (steeringRows as any[])
+      .map((s: any) => ({ id: s.id, title: s.title, body_md: String(s.body_md ?? "").slice(0, 1500), tags: parseTags(s.tags) }))
+      .filter((s: any) => {
+        const roles = s.tags.filter((t: string) => t.startsWith("role:"));
+        return roles.length === 0 || roles.some((r: string) => tags.includes(r));
+      });
     const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
     const askMarks = askPlaceholders.map(() => "?").join(",");
     const pendingAsks = this.state.storage.sql.exec(
@@ -2681,6 +2694,8 @@ export class KnowledgeHub {
       open_artefacts: open,
       my_tasks: myTasks,
       unclaimed_work: unclaimedWork,
+      steering,
+      steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
       action_required: actionRequired.length || verificationNotices.length

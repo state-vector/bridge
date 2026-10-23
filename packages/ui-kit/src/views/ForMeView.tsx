@@ -160,6 +160,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
   const tasks = useKb((s) => s.tasks);
   const refresh = useKb((s) => s.refresh);
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
+  const [steering, setSteering] = useState<KbArtefact[] | null>(null);
   const [tick, setTick] = useState(0);
 
   const load = async () => {
@@ -168,6 +169,12 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
       setProposed(r.artefacts ?? []);
     } catch {
       setProposed([]);
+    }
+    try {
+      const s = await kbApi.artefacts({ type: "steering", status: "active" });
+      setSteering(s.artefacts ?? []);
+    } catch {
+      setSteering([]);
     }
   };
 
@@ -210,6 +217,24 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
         <h2>For Me</h2>
         <span className="muted-note">{total > 0 ? `${total} awaiting you` : "nothing needs you right now"}</span>
       </div>
+      {(steering ?? []).length > 0 && (
+        <Card>
+          <h2>Steering ({steering!.length})</h2>
+          {steering!.map((s) => {
+            const roles = (s.tags ?? []).filter((t) => t.startsWith("role:"));
+            const root = roles.length ? roles.join(", ") : "all roles";
+            return (
+              <div key={s.id} className="forme-item">
+                <span className="gw-mono">{s.id}</span>
+                <span title={s.title}>{s.title}</span>
+                <span className="muted-note">{root}</span>
+                <span className="muted-note" title={s.body_md}>{String(s.body_md ?? "").slice(0, 140)}…</span>
+              </div>
+            );
+          })}
+          <p className="muted-note">Per-role guidance delivered to sessions at orient — the merge ladder, verification standard, and deployment rules live here.</p>
+        </Card>
+      )}
       {blockedOnAsk.length > 0 && (
         <Card>
           <h2>Blocked — awaiting your GO ({blockedOnAsk.length})</h2>
