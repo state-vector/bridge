@@ -11,6 +11,8 @@ mod transport;
 pub use keychain::*;
 pub use session::*;
 
+// Explicitly re-export keychain and session modules to resolve E0433 errors.
+
 use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
