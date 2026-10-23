@@ -4,7 +4,6 @@ import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
-import type { AskFeed } from "./ForMeView";
 import { Btn, Chip, TextInput } from "./index-kit";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
@@ -15,7 +14,7 @@ import { Btn, Chip, TextInput } from "./index-kit";
  *  Flood collapse (identical prior rounds) applies in both contexts. */
 
 export interface AskEntry {
-  kind: "verdict" | "decision" | "ask" | "nodeAsk";
+  kind: "verdict" | "decision" | "nodeAsk";
   latest?: KbArtefact;
   prior?: KbArtefact[];
   d?: any;
@@ -31,7 +30,7 @@ export interface HumanAsks {
   total: number;
 }
 
-export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): HumanAsks {
+export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
   const tasks = useKb((s) => s.tasks);
   const nodeAsks = useMemo(
@@ -69,20 +68,16 @@ export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): Hu
     for (const nodeAsk of nodeAsks) {
       put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
     }
-    for (const d of askFeed?.decisions ?? []) {
-      if (d.resolved) continue;
-      if (!(d.target === "human" || d.asker === "human" || !d.target)) continue;
-      put(d.task_id ?? null, { kind: "ask", d });
-    }
+
     // within a target: verdict → decision → ask; newest first within a rank
     for (const list of byTask.values()) {
       list.sort((a, b) => rankOf(a) - rankOf(b) || ts(b) - ts(a));
     }
     return { ready: true, byTask, residual, total: byTask.size ? [...byTask.values()].reduce((n, l) => n + l.length, 0) + residual.length : residual.length };
-  }, [proposed, askFeed?.decisions, visibleTaskIds]);
+  }, [proposed, nodeAsks, visibleTaskIds]);
 }
 
-const rankOf = (e: AskEntry) => (e.kind === "ask" || e.kind === "nodeAsk" ? 2 : e.kind === "decision" ? 1 : 0);
+const rankOf = (e: AskEntry) => (e.kind === "nodeAsk" ? 2 : e.kind === "decision" ? 1 : 0);
 const ts = (e: AskEntry) => (e.latest ?? e.d ?? e.nodeAsk)?.created_ts ?? 0;
 
 function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
@@ -191,52 +186,24 @@ function BandNodeAskRow({ nodeAsk, onDone, nested }: {
   );
 }
 
-function BandAskRow({ d, resolve, onDone, nested }: {
-  d: any; resolve: NonNullable<AskFeed["resolve"]>; onDone: () => void; nested?: boolean;
-}) {
-  const [busy, setBusy] = useState(false);
-  const act = async (action: "unblocked" | "completed") => {
-    setBusy(true);
-    try {
-      await resolve(d, action, undefined, undefined);
-      onDone();
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
-      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{d.urgent && <Chip tone="urgent">URGENT</Chip>}</span>
-      <span className="ab-main"><span className="ab-title" title={d.title ?? d.question}>{d.title ?? d.question}</span></span>
-      <span className="ab-meta">{rel(d.opened_ts ?? d.created_ts ?? d.ts ?? Date.now())}</span>
-      <span className="ab-actions">
-        <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("unblocked")}>Unblock</Btn>
-        <Btn size="sm" quiet disabled={busy} onClick={() => void act("completed")}>Done</Btn>
-      </span>
-    </div>
-  );
-}
-
-export function AskEntries({ entries, askFeed, onDone, openDecision, nested }: {
-  entries: AskEntry[]; askFeed?: AskFeed; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+export function AskEntries({ entries, onDone, openDecision, nested }: {
+  entries: AskEntry[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
 }) {
   return (
     <>
-      {entries.map((e, i) => e.kind === "verdict"
+      {entries.map((e) => e.kind === "verdict"
         ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} />
         : e.kind === "decision"
         ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} />
-        : e.kind === "nodeAsk"
-        ? <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} nested={nested} />
-        : <BandAskRow key={e.d?.id ?? i} d={e.d} resolve={askFeed!.resolve} onDone={onDone} nested={nested} />)}
+        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} nested={nested} />)}
     </>
   );
 }
 
 /** Residual band: asks whose subject is not on the board. Header only when
  *  non-empty; nothing here means every ask already nests under its task. */
-export function AskBand({ asks, askFeed, onChanged, openDecision }: {
-  asks: HumanAsks; askFeed?: AskFeed; onChanged?: () => void; openDecision?: (id: string) => void;
+export function AskBand({ asks, onChanged, openDecision }: {
+  asks: HumanAsks; onChanged?: () => void; openDecision?: (id: string) => void;
 }) {
   const refresh = useKb((s) => s.refresh);
   if (!asks.ready || asks.residual.length === 0) return null;
@@ -246,7 +213,7 @@ export function AskBand({ asks, askFeed, onChanged, openDecision }: {
       {asks.residual.length > 0 && (
         <div className="ab-head muted-note">awaiting you — subjects not in flight</div>
       )}
-      <AskEntries entries={asks.residual} askFeed={askFeed} onDone={bump} openDecision={openDecision} />
+      <AskEntries entries={asks.residual} onDone={bump} openDecision={openDecision} />
     </div>
   );
 }

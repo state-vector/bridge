@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi, type KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
-import { ActionRow, Btn, Card, Chip } from "./index-kit";
+import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
 
 /** For Me — the human's inbox. First tab. Surfaces everything awaiting a
  *  human decision or attention:
@@ -111,46 +111,51 @@ function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => 
   );
 }
 
-function AskRow({ d, resolve, onDone }: { d: any; resolve: AskFeed["resolve"]; onDone: (id: string) => void }) {
+function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => void }) {
   const [busy, setBusy] = useState(false);
-
-  const act = async (action: "unblocked" | "completed") => {
+  const [text, setText] = useState("");
+  const ask = node.meta?.ask ?? {};
+  const answer = async (a: string) => {
+    if (!a.trim()) return;
     setBusy(true);
     try {
-      await resolve(d, action, undefined, undefined);
-      onDone(d.id);
+      await kbApi.askAnswer(node.id, a.trim());
+      await useKb.getState().refresh();
+      onDone(node.id);
     } finally {
       setBusy(false);
     }
   };
-
   return (
     <Card className="forme-item">
       <div className="ask-chips">
         <Chip tone="needs">ASK</Chip>
-        {d.urgent && <Chip tone="urgent">URGENT</Chip>}
-        <span className="why-line">{d.asker ?? d.from_label ?? "agent"} · {rel(d.opened_ts ?? d.created_ts ?? d.ts ?? Date.now())}</span>
+        {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        <span className="why-line">{ask.from ?? "agent"} · {rel(node.created_ts)}</span>
       </div>
-      <h3 className="ask-question">{d.title ?? d.question}</h3>
-      {d.reason && <p className="ask-reason">{d.reason}</p>}
-      {d.question && d.question !== d.title && <p className="ask-reason">{d.question}</p>}
-      <ActionRow>
-        <Btn disabled={busy} onClick={() => void act("unblocked")}>Unblock</Btn>
-        <Btn quiet disabled={busy} onClick={() => void act("completed")}>Done</Btn>
-      </ActionRow>
+      <h3 className="ask-question">{node.title}</h3>
+      {(ask.options ?? []).length > 0 && (
+        <ActionRow>
+          {(ask.options as string[]).map((o) => (
+            <Btn key={o} variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
+          ))}
+        </ActionRow>
+      )}
+      <div className="steer-box">
+        <TextInput
+          value={text}
+          placeholder="Answer in your own words…"
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) void answer(text); }}
+        />
+        <Btn disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+      </div>
     </Card>
   );
 }
 
-export interface AskFeed {
-  /** hub-plane ask decisions awaiting the human (shell feed) */
-  decisions: any[];
-  resolve: (d: any, action: "unblocked" | "completed", note?: string, choice?: string) => Promise<void>;
-}
-
-export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: string) => void; askFeed?: AskFeed }) {
+export function ForMeView({ openThread }: { openThread?: (taskId: string) => void }) {
   const tasks = useKb((s) => s.tasks);
-  const decisions = askFeed?.decisions ?? [];
   const refresh = useKb((s) => s.refresh);
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
   const [tick, setTick] = useState(0);
@@ -175,9 +180,10 @@ export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: strin
   };
   useEffect(() => { void load(); }, [tick]);
 
+  // open question nodes = the ask feed (one plane)
   const asked = useMemo(
-    () => decisions.filter((d: any) => !d.resolved && (d.target === "human" || d.asker === "human" || !d.target)),
-    [decisions],
+    () => (tasks as any[]).filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)),
+    [tasks],
   );
 
   const questions = useMemo(
@@ -222,7 +228,7 @@ export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: strin
       )}
 
       {asked.map((d: any) => (
-        <AskRow key={d.id} d={d} resolve={askFeed!.resolve} onDone={bump} />
+        <QuestionNodeRow key={d.id} node={d} onDone={bump} />
       ))}
 
       {grouped.verdictCards.map(({ latest, prior }) => (

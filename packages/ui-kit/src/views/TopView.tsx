@@ -3,7 +3,6 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
-import type { AskFeed } from "./ForMeView";
 import { kindOf } from "../server/views";
 import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
 import { kbApi } from "../server/kb";
@@ -87,7 +86,7 @@ interface TopRow {
 /** Compact gateway strip: ONLY gateway identity sessions (dispatch-<gw>),
  *  never dispatched agent sessions — those are rows in the table, not
  *  infrastructure. Per-task dispatch sessions only feed the in-flight count. */
-export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (id: string) => void }) {
+export function TopView({ openTask }: { openTask?: (id: string) => void }) {
   const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   useClock();
   const conn = useKb((s) => s.conn);
@@ -204,7 +203,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
   // human-ask plane: exactly-once placement — nested under a visible subject,
   // else the residual band (2026-10-23 design)
   const visibleTaskIds = useMemo(() => new Set(rows.map((r) => r.taskId ?? r.key)), [rows]);
-  const humanAsks = useHumanAsks(visibleTaskIds, askFeed);
+  const humanAsks = useHumanAsks(visibleTaskIds);
   const bumpAsks = () => { void refreshKb(); };
   useEffect(() => {
     if (useKb.getState().awaitingHuman !== humanAsks.total) useKb.setState({ awaitingHuman: humanAsks.total });
@@ -229,7 +228,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
-      <AskBand asks={humanAsks} askFeed={askFeed} onChanged={bumpAsks} openDecision={openTask} />
+      <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openTask} />
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
@@ -324,7 +323,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
         </div>,
         asks.length > 0 && (
           <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group" style={{ marginLeft: `${depth * 22 + 22}px` }}>
-            <AskEntries entries={asks} askFeed={askFeed} onDone={bumpAsks} openDecision={openTask} nested />
+            <AskEntries entries={asks} onDone={bumpAsks} openDecision={openTask} nested />
           </div>
         ),
         ];
