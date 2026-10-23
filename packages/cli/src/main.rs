@@ -15,15 +15,21 @@
 
 // The dispatch core is shared verbatim with the desktop gateway (single source
 // of truth — no drift between GUI and CLI).
+// vendored from the desktop crate — the CLI compiles a subset (pairing,
+// doctor, the loop); desktop-context functions (start/stop/logout/UI state)
+// are alive in their home crate, dead only in this partial compilation
 #[path = "../../desktop/src-tauri/src/dispatch.rs"]
+#[allow(dead_code)]
 mod dispatch;
 #[path = "../../desktop/src-tauri/src/keychain.rs"]
+#[allow(dead_code)]
 mod keychain;
 #[path = "../../desktop/src-tauri/src/opencode.rs"]
 mod opencode;
 #[path = "../../desktop/src-tauri/src/scm.rs"]
 mod scm;
 #[path = "../../desktop/src-tauri/src/session.rs"]
+#[allow(dead_code)]
 mod session;
 #[path = "../../desktop/src-tauri/src/transport.rs"]
 mod transport;
@@ -69,80 +75,6 @@ fn main() {
             }
             eprintln!("[bridge] onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
             run(Some(cfg));
-        }
-        "doctor" => {
-            // one command: is the system healthy? hub reachability, deploy
-            // drift (live __version vs HEAD when run in a checkout), and
-            // token validity (one MCP orient). Named failures, non-zero exit.
-            let mut bad = 0;
-            let cfg = dispatch::DispatchConfig::resolve();
-            let url = cfg
-                .as_ref()
-                .map(|c| c.url.clone())
-                    .or_else(|| std::env::var("BRIDGE_URL").ok())
-                .unwrap_or_default();
-            if url.is_empty() {
-                println!("✗ hub: no configured hub URL (pair first)");
-                bad += 1;
-            } else {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build();
-                // 1. reachability
-                match client.as_ref().map(|c| c.get(format!("{url}/__version")).send()) {
-                    Ok(Ok(resp)) if resp.status().is_success() => {
-                        let v: serde_json::Value = resp.json().unwrap_or_default();
-                        let live = v.get("commit").and_then(|c| c.as_str()).unwrap_or("?");
-                        println!("✓ hub: {url} reachable (built {})", v.get("built_at").and_then(|b| b.as_str()).unwrap_or("?"));
-                        // 2. deploy drift vs HEAD when run inside a checkout
-                        if let Ok(head) = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output() {
-                            if head.status.success() {
-                                let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-                                if live == head {
-                                    println!("✓ deploy: live hub matches HEAD ({live})");
-                                } else {
-                                    println!("✗ deploy: DRIFT — live is {live}, HEAD is {head} (CF Builds stalled or bypassed?)");
-                                    bad += 1;
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        println!("✗ hub: {url}/__version unreachable — hub down or route broken");
-                        bad += 1;
-                    }
-                }
-                // 3. token validity
-                let token = cfg.as_ref().map(|c| c.token.clone()).unwrap_or_default();
-                if token.is_empty() {
-                    println!("✗ token: none stored (logged out) — run `bridge` to pair");
-                    bad += 1;
-                } else if let Ok(client) = client {
-                    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"orient","arguments":{"session":"doctor"}}}"#;
-                    match client
-                        .post(format!("{url}/mcp"))
-                        .header("content-type", "application/json")
-                        .header("Authorization", format!("Bearer {token}"))
-                        .body(body)
-                        .send()
-                    {
-                        Ok(r) if r.status().is_success() => println!("✓ token: valid (orient 200)"),
-                        Ok(r) => {
-                            println!("✗ token: hub rejected it ({} {}) — re-pair to repair", r.status(), url);
-                            bad += 1;
-                        }
-                        Err(e) => {
-                            println!("✗ token: probe failed ({e})");
-                            bad += 1;
-                        }
-                    }
-                }
-            }
-            if bad > 0 {
-                println!("{} problem(s) found", bad);
-                std::process::exit(1);
-            }
-            println!("healthy ✓");
         }
         "status" => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -551,6 +483,48 @@ fn doctor() -> bool {
     }
     let cfg = cfg.unwrap();
 
+    // live probes: hub reachability, deploy drift (__version vs HEAD when in
+    // a checkout), token validity (one MCP orient). The deploy-stall incident
+    // was invisible for hours — these make it a named FAIL.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok();
+    if let Some(client) = &client {
+        match client.get(format!("{}/__version", cfg.url.trim_end_matches('/'))).send() {
+            Ok(resp) if resp.status().is_success() => {
+                let v: serde_json::Value = resp.json().unwrap_or_default();
+                let live = v.get("commit").and_then(|c| c.as_str()).unwrap_or("?").to_string();
+                ok("hub reachable", "", &mut bad, false);
+                if let Ok(head) = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output() {
+                    if head.status.success() {
+                        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+                        if live == head {
+                            ok("deploy matches HEAD", "", &mut bad, false);
+                        } else {
+                            ok("deploy drift", &format!("live {live} != HEAD {head} — CF Builds stalled or bypassed?"), &mut bad, true);
+                        }
+                    }
+                }
+            }
+            _ => ok("hub reachable", "hub unreachable or /__version broken", &mut bad, true),
+        }
+        if !cfg.token.is_empty() {
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"orient","arguments":{"session":"doctor"}}}"#;
+            match client
+                .post(format!("{}/mcp", cfg.url.trim_end_matches('/')))
+                .header("content-type", "application/json")
+                .header("Authorization", format!("Bearer {}", cfg.token))
+                .body(body)
+                .send()
+            {
+                Ok(r) if r.status().is_success() => ok("token valid (orient 200)", "", &mut bad, false),
+                Ok(r) => ok("token valid", &format!("hub rejected it ({}) — re-pair to repair", r.status()), &mut bad, true),
+                Err(e) => ok("token valid", &format!("probe failed: {e}"), &mut bad, false),
+            }
+        }
+    }
+
     // per-provider sections: model optional (unset = the CLI's own default
     // config decides for opencode; kiro profiles pin provider+model)
     let backends = &cfg.backends;
@@ -604,7 +578,6 @@ fn doctor() -> bool {
                     }
                 }
             } else {
-                bad = true;
                 if profile == BRIDGE_AGENT_NAME {
                     bad = true;
                     println!("  \x1b[31mFAIL\x1b[0m  agent profile [{backend}] = {profile} — not in the CLI's agent list. Run `bridge agent install`, then verify with `opencode agent list`");
