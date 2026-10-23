@@ -46,6 +46,45 @@ export interface HistoryEntry {
   data: Record<string, unknown>;
 }
 
+
+/** Ask options, three shapes (Ray, 2026-10-23):
+ *  - binary + short → one line: "DO YOU WANT TO X" [ APPROVE ] [ DENY ]
+ *  - multi / long → vertical list: [ A ] - Provision x  (text outside the button)
+ *  - compact surfaces (rows) with complex options → key buttons + tooltip */
+export function AskOptions({ options, onPick, busy, compact }: {
+  options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean;
+}) {
+  const short = options.every((o) => o.length <= 34);
+  if (compact && (!(options.length === 2) || !short)) {
+    return (
+      <span className="ab-options">
+        {options.map((o, i) => (
+          <Btn key={o} size="sm" disabled={busy} title={o} onClick={() => onPick(o)}>{String.fromCharCode(65 + i)}</Btn>
+        ))}
+      </span>
+    );
+  }
+  if (options.length === 2 && short) {
+    return (
+      <ActionRow>
+        {options.map((o) => (
+          <Btn key={o} variant="accept" disabled={busy} onClick={() => onPick(o)}>{o.toUpperCase()}</Btn>
+        ))}
+      </ActionRow>
+    );
+  }
+  return (
+    <div className="ask-opt-list">
+      {options.map((o, i) => (
+        <div key={o} className={`ask-opt-row ${busy ? "disabled" : ""}`} onClick={() => !busy && onPick(o)}>
+          <Btn size="sm" disabled={busy}>{String.fromCharCode(65 + i)}</Btn>
+          <span className="ask-opt-text">{o}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Comment({ v }: { v: HistoryEntry }) {
   const note = (v.data?.note as string | undefined) ?? v.summary;
   if (!note?.trim()) return null;

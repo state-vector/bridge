@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md } from "./decide";
+import { md, AskOptions } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
 import { useKb } from "../server/kbStore";
@@ -342,11 +342,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
       </div>
       <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={() => onChanged?.()} /></div>
       {(ask.options ?? []).length > 0 && (
-        <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
-          {(ask.options as string[]).map((o: string) => (
-            <Btn key={o} variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
-          ))}
-        </div>
+        <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />

@@ -3,7 +3,7 @@ import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
+import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
 import { Btn, Chip } from "./index-kit";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
@@ -173,11 +173,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
         <span className="ab-title" title={nodeAsk.title}>{nodeAsk.title}</span>
         {nodeAsk.part_of && <span className="ab-prior-line">on {nodeAsk.part_of}</span>}
         {(ask.options ?? []).length > 0 && (
-          <span className="ab-options">
-            {(ask.options as string[]).map((o) => (
-              <Btn key={o} size="sm" variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
-            ))}
-          </span>
+          <AskOptions options={ask.options as string[]} busy={busy} compact onPick={(o) => void answer(o)} />
         )}
       </span>
       <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>

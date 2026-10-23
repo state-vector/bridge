@@ -13,7 +13,7 @@ import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
  *   - open question threads (link into Discussions)
  */
 
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
+import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
 
 function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -139,11 +139,7 @@ function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => 
       </div>
       <h3 className="ask-question">{node.title}</h3>
       {(ask.options ?? []).length > 0 && (
-        <ActionRow>
-          {(ask.options as string[]).map((o) => (
-            <Btn key={o} variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
-          ))}
-        </ActionRow>
+        <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box">
         <TextInput

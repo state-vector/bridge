@@ -844,3 +844,10 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* never-silent-failure: the last failed call is visible in the lights */
 .lights-error { color: var(--red, #e5534b); font-size: 11px; margin-left: 4px; }
 .st-err { color: var(--red, #e5534b); }
+
+/* vertical ask options: [ A ] - text — descriptions outside the button */
+.ask-opt-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.ask-opt-row { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 4px; cursor: pointer; }
+.ask-opt-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.ask-opt-row.disabled { opacity: 0.5; cursor: default; }
+.ask-opt-text { font-size: 11.5px; line-height: 1.4; min-width: 0; }
