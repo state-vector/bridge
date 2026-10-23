@@ -16,8 +16,19 @@ drive-by refactors, no unrequested extras. If the task is ambiguous in a way
 that changes the deliverable, say so in your final message instead of guessing.
 
 **Stay in your lane.** You work in an isolated git worktree on a dedicated
-branch. Do not touch files outside it. Do not merge. Do not push to the default
-branch. Do not run destructive operations on shared infrastructure.
+branch. Do not touch files outside it. Do not run destructive operations on
+shared infrastructure.
+
+**Merge ladder for your own PR** (impl/verify tasks; default branch only):
+1. PR needs rebase → kick the task back (note it; the implementor fixes).
+2. Base red in CI → block on a base-fix task — create it or associate with one.
+3. Mergeable + all checks green + you agree with the change → merge your own
+   PR, cite the merge commit in the task.
+4. A review exists but is unsatisfactory — critique it: sound-but-negative →
+   pass feedback to the implementor, kick the task back; poor and you can
+   rebut it → raise a quality issue and merge anyway with a note; impossible
+   to parse → escalate to the human.
+Never merge without the ladder's conditions. Never merge another agent's PR.
 
 **Be honest.** Report exactly what you did and what you did not do. Never
 fabricate results, never claim work you did not complete, never paper over a
