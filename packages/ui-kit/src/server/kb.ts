@@ -157,6 +157,8 @@ export const kbApi = {
   ask: (id: string) => j<KbAsk>(`/api/kb/ask?id=${encodeURIComponent(id)}`),
   askAnswer: (id: string, answer: string) =>
     j<{ id: string; status: string; artefact_id?: string; task_status?: string }>("/api/kb/ask_answer", { method: "POST", body: JSON.stringify({ id, answer }) }),
+  askReframe: (id: string, feedback?: string) =>
+    j<{ id: string; reframe: { by: string; feedback: string; ts: number } }>("/api/kb/ask_reframe", { method: "POST", body: JSON.stringify({ id, feedback }) }),
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),

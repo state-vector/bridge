@@ -155,6 +155,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
   const [busy, setBusy] = useState(false);
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
+
   // the subject BY NAME — an id alone doesn't say what the ask is about
   const subject = useKb((s) => s.tasks.find((t) => t.id === nodeAsk.part_of));
   // rows point, the detail view acts: option buttons answer inline (one click,
@@ -187,6 +188,10 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
       </span>
       <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>
       <span className="ab-actions">
+        {ask.reframe
+          ? <span className="muted-note">reframed — awaiting re-ask</span>
+          : <Btn size="sm" variant="reject" disabled={busy} title="kick back to the asker: restructure per the ask contract (add feedback in the detail view)"
+              onClick={() => { setBusy(true); kbApi.askReframe(nodeAsk.id).catch((e) => useKb.getState().reportError("reframe ask", e)).finally(() => { setBusy(false); void useKb.getState().refresh(); }); }}>Reframe</Btn>}
         <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
           onClick={() => openDecision?.(nodeAsk.id)}>Details</Btn>
       </span>

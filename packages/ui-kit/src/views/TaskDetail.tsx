@@ -318,6 +318,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [text, setText] = useState("");
+  const [reframeText, setReframeText] = useState("");
   const answer = async (a: string) => {
     if (!a.trim()) return;
     setBusy(true);
@@ -350,6 +351,22 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />
         <Btn disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+      </div>
+      <div className="steer-box">
+        {ask.reframe ? (
+          <span className="muted-note">reframed by {ask.reframe.by} — awaiting structured re-ask: {ask.reframe.feedback}</span>
+        ) : (
+          <>
+            <TextArea rows={1} value={reframeText} placeholder="Reframe: kick back to the asker to restructure (optional feedback)…" onChange={(e) => setReframeText(e.target.value)} />
+            <Btn size="sm" quiet disabled={busy} onClick={() => {
+              setBusy(true);
+              kbApi.askReframe(task.id, reframeText.trim() || undefined)
+                .then(() => { setReframeText(""); useKb.getState().refresh(); onChanged?.(); })
+                .catch((e) => { setErr((e as Error).message); useKb.getState().reportError("reframe ask", e); })
+                .finally(() => setBusy(false));
+            }}>Reframe this</Btn>
+          </>
+        )}
       </div>
       {err && <p className="k-err">{err}</p>}
     </div>

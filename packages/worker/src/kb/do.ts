@@ -2226,7 +2226,9 @@ export class KnowledgeHub {
       .map((n) => {
         const m = JSON.parse(n.meta ?? "{}");
         if (!m.ask) return null;
-        return { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
+        const out: any = { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
+        if (m.ask.reframe) out.reframe = m.ask.reframe;
+        return out;
       })
       .filter((x): x is any => !!x && (x.to_target === "any" || x.to_target === label || true));
     const open = this.state.storage.sql.exec(
