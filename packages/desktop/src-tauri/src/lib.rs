@@ -2,6 +2,7 @@ mod console;
 mod dispatch;
 pub mod keychain;
 pub mod session;
+pub mod session;
 mod mac_notify;
 mod menubar;
 mod opencode;
