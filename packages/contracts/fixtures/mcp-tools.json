@@ -1,0 +1,102 @@
+{
+  "recorded": "2026-10-23",
+  "note": "the MCP tool registry contract \u2014 name + required args per tool. The dispatch must implement every name here and vice versa (the ask_answer/answer_ask incident). CI compares a generated table against this.",
+  "tools": [
+    {
+      "name": "answer_ask",
+      "required": [
+        "id",
+        "answer"
+      ]
+    },
+    {
+      "name": "ask_agent",
+      "required": [
+        "question",
+        "options",
+        "reason"
+      ]
+    },
+    {
+      "name": "asks",
+      "required": []
+    },
+    {
+      "name": "create_artefact",
+      "required": [
+        "type",
+        "title"
+      ]
+    },
+    {
+      "name": "get_artefact",
+      "required": [
+        "id"
+      ]
+    },
+    {
+      "name": "get_history",
+      "required": [
+        "id"
+      ]
+    },
+    {
+      "name": "link_artefacts",
+      "required": [
+        "src",
+        "relation",
+        "dst"
+      ]
+    },
+    {
+      "name": "list_agents",
+      "required": []
+    },
+    {
+      "name": "log_progress",
+      "required": [
+        "id",
+        "note"
+      ]
+    },
+    {
+      "name": "orient",
+      "required": []
+    },
+    {
+      "name": "related_artefacts",
+      "required": [
+        "id"
+      ]
+    },
+    {
+      "name": "search_knowledge",
+      "required": [
+        "q"
+      ]
+    },
+    {
+      "name": "session_alive",
+      "required": [
+        "id"
+      ]
+    },
+    {
+      "name": "stats",
+      "required": []
+    },
+    {
+      "name": "transition",
+      "required": [
+        "id",
+        "to"
+      ]
+    },
+    {
+      "name": "update_artefact",
+      "required": [
+        "id"
+      ]
+    }
+  ]
+}

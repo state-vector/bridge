@@ -1,0 +1,142 @@
+{
+  "recorded": "2026-10-23",
+  "note": "orient response shape \u2014 the contract between the hub and every runner/session. Drift here breaks runners silently (the candidates-key incident). Validate against this in CI; change via PR with both sides updated.",
+  "shape": {
+    "project": {
+      "type": "str",
+      "value": "Superpositional"
+    },
+    "instructions": {
+      "type": "str",
+      "value": "BRIDGE OPERATING RULES \u2014 Superpositional. Follow all of them.\n1. BRIDGE RESPONSE"
+    },
+    "board": {
+      "type": "object",
+      "keys": [
+        "mode"
+      ]
+    },
+    "counts": {
+      "type": "array",
+      "length": 16,
+      "item_keys": [
+        "n",
+        "status",
+        "type"
+      ]
+    },
+    "open_artefacts": {
+      "type": "array",
+      "length": 30,
+      "item_keys": [
+        "id",
+        "owner",
+        "status",
+        "title",
+        "type",
+        "updated_ts"
+      ]
+    },
+    "my_tasks": {
+      "type": "array",
+      "length": 9,
+      "item_keys": [
+        "id",
+        "status",
+        "title"
+      ]
+    },
+    "unclaimed_work": {
+      "type": "array",
+      "length": 10,
+      "item_keys": [
+        "id",
+        "is_claimable",
+        "is_question",
+        "meta",
+        "needs_qualification",
+        "previously_attempted",
+        "project",
+        "status",
+        "tags",
+        "target_roles",
+        "title",
+        "updated_ts"
+      ]
+    },
+    "steering": {
+      "type": "array",
+      "length": 6,
+      "item_keys": [
+        "body_md",
+        "id",
+        "tags",
+        "title"
+      ]
+    },
+    "my_roles": {
+      "type": "array",
+      "length": 0,
+      "item_keys": "empty"
+    },
+    "pending_asks": {
+      "type": "array",
+      "length": 0,
+      "item_keys": "empty"
+    },
+    "gauge_debt": {
+      "type": "array",
+      "length": 1,
+      "item_keys": [
+        "id",
+        "title"
+      ]
+    },
+    "my_score": {
+      "type": "object",
+      "keys": [
+        "abandoned",
+        "artefacts_created",
+        "asks_answered_on_time",
+        "asks_received",
+        "gauge_count",
+        "grade",
+        "hints",
+        "label",
+        "progress_count",
+        "reassigned",
+        "score",
+        "thin_notes",
+        "verify_duty_backlog"
+      ]
+    },
+    "build": {
+      "type": "str",
+      "value": "0.3.5"
+    },
+    "you": {
+      "type": "object",
+      "keys": [
+        "agent",
+        "session",
+        "tags"
+      ]
+    }
+  },
+  "keys_required": [
+    "board",
+    "build",
+    "counts",
+    "gauge_debt",
+    "instructions",
+    "my_roles",
+    "my_score",
+    "my_tasks",
+    "open_artefacts",
+    "pending_asks",
+    "project",
+    "steering",
+    "unclaimed_work",
+    "you"
+  ]
+}
