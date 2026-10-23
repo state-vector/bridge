@@ -21,9 +21,15 @@ export function isArtefactType(t: unknown): t is ArtefactType {
   return typeof t === "string" && (ARTEFACT_TYPES as readonly string[]).includes(t);
 }
 
-/** Task kinds — one task type, distinguished by meta.kind. */
+/** Task kinds — one task type, distinguished by TAGS (phase-2 classification:
+ *  type is structural, tags are labels). meta.kind is legacy read-only. */
 export const TASK_KINDS = ["impl", "analysis", "review", "research", "question"] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
+
+/** The tag that carries a task kind, for normalization at create time. */
+export const KIND_TAG: Record<TaskKind, string | null> = {
+  impl: null, analysis: "role:analysis", review: "role:review", research: "research", question: "question",
+};
 
 /** A task's kind, defaulting to impl. Questions are the open, non-exclusive kind. */
 export function taskKind(meta: any): TaskKind {
