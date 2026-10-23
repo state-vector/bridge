@@ -10,6 +10,7 @@ mod transport;
 
 pub use keychain::*;
 pub use session::*;
+pub use console::*;
 
 use serde::Deserialize;
 use tauri::Manager;
