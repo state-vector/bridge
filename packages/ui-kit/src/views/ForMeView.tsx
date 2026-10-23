@@ -189,7 +189,7 @@ export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: strin
 
   const grouped = useMemo(() => groupDecisions(proposed ?? []), [proposed]);
 
-  const total = grouped.verdictCards.length + grouped.generic.length + asked.length;
+  const total = grouped.verdictCards.length + grouped.generic.length + asked.length + blockedOnAsk.length;
 
   return (
     <div className="disc-wrap">
@@ -197,6 +197,24 @@ export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: strin
         <h2>For Me</h2>
         <span className="muted-note">{total > 0 ? `${total} awaiting you` : "nothing needs you right now"}</span>
       </div>
+      {blockedOnAsk.length > 0 && (
+        <Card>
+          <h2>Blocked — awaiting your GO ({blockedOnAsk.length})</h2>
+          {blockedOnAsk.map((t: any) => {
+            const hours = t.meta?.awaiting_ask?.annotated_h ?? 0;
+            const reason = String(t.meta?.blocked?.reason ?? "").replace(/^⏳ blocked \d+h — .*? · /, "");
+            return (
+              <div key={t.id} className="forme-item">
+                <span>{t.id}</span>
+                <span title={t.title}>{t.title}</span>
+                <span className="muted-note">blocked {hours}h · {reason.slice(0, 120)}</span>
+                <Btn onClick={() => void answerGo(t)}>GO — approve & resume</Btn>
+              </div>
+            );
+          })}
+          <p className="muted-note">GO answers the ask and auto-resumes the task server-side.</p>
+        </Card>
+      )}
 
       {proposed === null && <p className="empty">loading…</p>}
       {proposed !== null && proposed.length === 0 && asked.length === 0 && questions.length === 0 && (
