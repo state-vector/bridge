@@ -10,6 +10,7 @@ mod transport;
 
 pub use keychain::*;
 pub use session::*;
+pub use session::*;
 pub use mac_notify::*;
 pub use menubar::*;
 pub use scm::*;
