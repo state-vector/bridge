@@ -24,8 +24,8 @@ struct NotifyAskArgs {
     urgent: bool,
 }
 
-pub use keychain::Keychain;
-pub use session::Session;
+//pub use keychain::Keychain;
+//pub use session::Session;
 /// Dispatch a decision to the OS notification surface.
 /// Native buttons when bundled (.app); plain notification otherwise.
 #[tauri::command]
