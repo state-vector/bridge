@@ -230,12 +230,35 @@ export function AskBand({ asks, onChanged, openDecision }: {
   asks: HumanAsks; onChanged?: () => void; openDecision?: (id: string) => void;
 }) {
   const refresh = useKb((s) => s.refresh);
+  const [batchBusy, setBatchBusy] = useState(false);
   if (!asks.ready || asks.residual.length === 0) return null;
   const bump = () => { void refresh(); onChanged?.(); };
+  // identical-decision collapse: N open asks whose options are exactly
+  // GO / NO-GO are ONE decision ("trust the verified work") — batch-answer them
+  const optionsOf = (e: AskEntry): string[] => {
+    const src: any = e.kind === "nodeAsk" ? e.nodeAsk : (e.latest ?? e.d);
+    return ((src?.meta ?? {}).ask?.options ?? src?.meta?.options ?? []).map(String);
+  };
+  const gonogo = asks.residual.filter((e) =>
+    JSON.stringify(optionsOf(e)) === JSON.stringify(["GO", "NO-GO/redirect"]));
   return (
     <div className="ask-band">
       {asks.residual.length > 0 && (
-        <div className="ab-head muted-note">awaiting you — subjects not in flight</div>
+        <div className="ab-head muted-note" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span>awaiting you — subjects not in flight</span>
+          {gonogo.length >= 3 && (
+            <Btn size="sm" variant="accept" disabled={batchBusy}
+              title="answer GO on every open GO/NO-GO ask — each asker resumes and executes (merges verified PRs, runs the flagged action)"
+              onClick={() => {
+                setBatchBusy(true);
+                Promise.all(gonogo.map((e) => {
+                  const id = e.nodeAsk?.id ?? e.latest?.id ?? e.d?.id;
+                  return id ? kbApi.askAnswer(id, "GO").catch((err) => useKb.getState().reportError(`batch GO ${id}`, err)) : null;
+                })).then(() => { setBatchBusy(false); bump(); });
+              }}
+            >GO — all {gonogo.length} gates</Btn>
+          )}
+        </div>
       )}
       <AskEntries entries={asks.residual} onDone={bump} openDecision={openDecision} />
     </div>
