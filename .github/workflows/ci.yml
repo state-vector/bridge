@@ -41,6 +41,12 @@ jobs:
       - name: Compile check (locked)
         working-directory: packages/cli
         run: cargo check --locked --all-targets
+      # the credential/config store regression suite (BR#2840): atomic
+      # writes, rotate-in-one-call, write-once principal, legacy migration
+      # — these gate the merge, not just the release build
+      - name: CLI tests (locked)
+        working-directory: packages/cli
+        run: cargo test --locked
 
   deploy-check:
     name: Deploy drift alarm

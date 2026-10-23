@@ -100,13 +100,19 @@ Beyond dispatch it carries two human-facing surfaces:
 
 ### Runner config file
 
-All runner knobs live in `~/.bridge/config.json` (written by pairing; safe to
-edit by hand — settings in the desktop app apply by updating the same file):
+All runner *knobs* live in `~/.bridge/config.json` (written through a single
+atomic save; safe to edit by hand — settings in the desktop app apply by
+updating the same file). **Credentials never live there**: the gateway token
+is stored in the OS keychain (data-protection keychain on signed macOS
+builds; `~/.bridge/gateway-token`, mode 0600, on unsigned dev builds and
+Linux), and the device principal is write-once at `~/.bridge/principal`
+(0600) — `bridge reset-principal` is the only local clear:
 
 ```jsonc
 {
+  "schema_version": 2,                 // written by the runner; future versions warn
   "url": "https://bridge.<your-subdomain>.workers.dev",
-  "token": "<from pairing>",
+                                       // no "token" — the keychain owns it
   "workdir": "/path/to/repo",          // repo the runner works in
   "max_sessions": 1,                   // concurrency: concurrent agent sessions (WIP limit)
   "backends": {                        // provider sections — each carries its own config
@@ -127,6 +133,10 @@ edit by hand — settings in the desktop app apply by updating the same file):
   "isolate": true                      // per-task git worktrees + PR branch
 }
 ```
+
+If the hub rejects the token (401), the runner attempts **one** automatic
+repair (re-vend via the live login session) and, failing that, logs out
+loudly with a human-readable reason — the token never silently vanishes.
 
 If no agent CLI is dispatchable, the runner says so loudly every tick and **exits non-zero once in-flight sessions drain** — `systemctl status bridge` shows the failure and `Restart=on-failure` retries every 10s until you fix it (`bridge doctor` diagnoses). Under systemd, use absolute `bin` paths or a `PATH` override for the unit: the service does not inherit your shell's PATH.
 

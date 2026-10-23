@@ -311,6 +311,7 @@ pub fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod live_probe {
     #[test]
+    #[ignore = "live hub + stored session — diagnostics only; run explicitly with --ignored when debugging connectivity"]
     fn events_and_board_via_session() {
         // live probe (uses the real stored session) — diagnostics for the
         // "hub unreachable" report; not part of the suite's assertions
