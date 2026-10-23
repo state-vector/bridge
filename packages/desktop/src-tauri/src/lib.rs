@@ -10,6 +10,9 @@ mod transport;
 
 pub use self::keychain::{save_token, load_token, delete_token};
 pub use self::session::{load, kb_request, probe, clear, login};
+pub use self::session::{Session, SessionState};
+pub use self::keychain::{Keychain, Token};
+
 
 use serde::Deserialize;
 use tauri::Manager;
