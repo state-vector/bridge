@@ -305,7 +305,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
                   <Btn
                     size="sm" variant="accept"
                     title={r.askPending
-                      ? `Answers ${r.askPending}${askTexts[r.askPending]?.question ? ` — "${askTexts[r.askPending]!.question.slice(0, 100)}${askTexts[r.askPending]!.question.length > 100 ? "…" : ""}"` : ""} → task resumes in_progress`
+                      ? `Answers ${askTexts[r.askPending]?.display ?? r.askPending}${askTexts[r.askPending]?.question ? ` — "${askTexts[r.askPending]!.question.slice(0, 100)}${askTexts[r.askPending]!.question.length > 100 ? "…" : ""}"` : ""} → task resumes in_progress`
                       : `Marks satisfied: "${(r.unblock ?? "").slice(0, 100)}${(r.unblock ?? "").length > 100 ? "…" : ""}" → task resumes in_progress`}
                     onClick={(e) => void unblockFromRow(r, e)}
                   >Unblock</Btn>

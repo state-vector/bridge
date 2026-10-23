@@ -91,6 +91,8 @@ export interface KbVersion {
 /** An open ask (agent → human decision request) that may be blocking a task. */
 export interface KbAsk {
   id: string;
+  /** human handle: ASK-<subject>-<ordinal> ("ASK-BR-2466-2") */
+  display?: string;
   to: string;
   question: string;
   options: string[];

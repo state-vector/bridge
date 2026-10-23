@@ -2043,6 +2043,17 @@ export class KnowledgeHub {
     return { inbox: open, sent };
   }
 
+  /** Human handle for an ask: ASK-<subject>-<ordinal> ("ASK-BR-2466-2" = the
+   *  2nd ask on that task). The opaque row key stays internal plumbing. */
+  private askDisplay(row: { id: string; artefact_id: string | null; created_ts: number }) {
+    if (!row.artefact_id) return row.id;
+    const ord = this.one(
+      `SELECT COUNT(*) AS n FROM asks WHERE artefact_id = ? AND created_ts <= ?`,
+      row.artefact_id, row.created_ts,
+    ) as any;
+    return `ASK-${String(row.artefact_id).replace(/#/g, "-")}-${Number(ord?.n ?? 1)}`;
+  }
+
   private async askGet(id: string) {
     const row = this.one(
       `SELECT id, from_label, to_target, question, status, artefact_id, answer, answered_by, answered_ts, created_ts
@@ -2050,7 +2061,7 @@ export class KnowledgeHub {
     );
     if (!row) return null;
     return {
-      id: row.id, from: row.from_label, to: row.to_target, question: row.question,
+      id: row.id, display: this.askDisplay(row), from: row.from_label, to: row.to_target, question: row.question,
       options: [] as string[], urgency: "normal", status: row.status,
       artefact_id: row.artefact_id ?? undefined,
       answer: row.answer ?? undefined, answered_by: row.answered_by ?? undefined,

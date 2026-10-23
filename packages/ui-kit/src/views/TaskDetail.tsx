@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { ActionRow, Btn, Chip, type ChipTone, Select, TextArea, TextInput } from "./index-kit";
+import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
+import { md } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
 import { useKb } from "../server/kbStore";
@@ -93,6 +94,25 @@ function trunc(s: string | undefined, n: number): string {
   return t.length > n ? `${t.slice(0, n).trimEnd()}…` : t;
 }
 
+
+/** Markdown rendered for reading, with task refs (BR#12, TASK-007) as links. */
+export function MdRef({ text, onOpen }: { text: string | undefined; onOpen?: (id: string) => void }) {
+  const html = md(text ?? "");
+  if (!html.trim()) return null;
+  const parts = html.split(TASK_REF_RE);
+  return (
+    <>
+      {parts.map((p, i) =>
+        /^(BR#\d+|TASK-\d+)$/.test(p) ? (
+          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen?.(p); }}>{p}</span>
+        ) : (
+          <span key={i} dangerouslySetInnerHTML={{ __html: p }} />
+        ),
+      )}
+    </>
+  );
+}
+
 interface TaskMeta {
   session?: string;
   blocked?: { reason?: string; unblock_condition?: string; ts?: number };
@@ -113,6 +133,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
   const m = (task.meta ?? {}) as TaskMeta;
   const lp = m.last_progress;
   const [ask, setAsk] = useState<KbAsk | null>(null);
+  const [answerText, setAnswerText] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -123,11 +144,22 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
     return () => { on = false; };
   }, [m.awaiting_ask?.ask_id]);
 
+  const answerAsk = async (answer: string) => {
+    if (!ask || !m.awaiting_ask?.ask_id) return;
+    setBusy(true);
+    try {
+      await kbApi.askAnswer(m.awaiting_ask.ask_id, answer);
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch { /* history shows the failure */ } finally {
+      setBusy(false);
+    }
+  };
   const unblock = async () => {
     setBusy(true);
     try {
-      if (ask && m.awaiting_ask?.ask_id) await kbApi.askAnswer(m.awaiting_ask.ask_id, "unblocked by human (panel)");
-      else await kbApi.transition(task.id, "in_progress", { note: "unblocked by human — condition satisfied (panel)" });
+      if (ask && m.awaiting_ask?.ask_id) await answerAsk("unblocked by human");
+      else await kbApi.transition(task.id, "in_progress", { note: "unblocked by human — condition satisfied" });
       await useKb.getState().refresh();
       onChanged?.();
     } catch { /* history shows the failure */ } finally {
@@ -191,17 +223,24 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       {ask && ask.status === "open" && (
         <div className="task-blocked-info">
           <div className="progress-note">
-            <b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.id} · to {ask.to} · asked {rel(ask.created_ts)}
+            <b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.display ?? ask.id} · to {ask.to} · asked {rel(ask.created_ts)}
           </div>
           <div className="progress-note"><LongText text={ask.question} limit={260} /></div>
-          {ask.options.length > 0 && <div className="ask-chips">{ask.options.map((o) => <Chip key={o} tone="scope">{o}</Chip>)}</div>}
+          {ask.options.length > 0 && (
+            <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
+              {ask.options.map((o) => (
+                <Btn key={o} size="sm" variant="accept" disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
+              ))}
+            </div>
+          )}
           <div className="row" style={{ marginTop: 6 }}>
-            <Btn
-              size="sm" variant="accept" disabled={busy}
-              title={`Answer ${ask.id} — "${trunc(ask.question, 110)}" — the task auto-resumes in_progress`}
-              onClick={() => void unblock()}
-            >Unblock now</Btn>
-            <span className="muted-note">answers {ask.id}: "{trunc(ask.question, 90)}"</span>
+            <TextInput
+              value={answerText} placeholder="or answer in your own words…"
+              onChange={(e) => setAnswerText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && answerText.trim()) void answerAsk(answerText.trim()); }}
+            />
+            <Btn size="sm" disabled={busy || !answerText.trim()} onClick={() => void answerAsk(answerText.trim())}>Answer</Btn>
+            <Btn size="sm" quiet disabled={busy} title="answer 'unblocked' — resumes the task" onClick={() => void unblock()}>Unblock</Btn>
           </div>
         </div>
       )}
@@ -229,7 +268,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
   );
 }
 
-export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
+export function TaskDetail({ taskId, onClose, onOpen }: {
   taskId: string; openBlocked?: boolean; onClose: () => void; onOpen?: (id: string) => void;
 }) {
   // 1s tick — "time spent" on spawned work counts up live while the panel is open
@@ -242,20 +281,13 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
   const [relations, setRelations] = useState<Array<{ relation: string; artefact_id: string; dir: string }>>([]);
   const [related, setRelated] = useState<KbArtefact[]>([]);
   const [note, setNote] = useState("");
-  const [sentiment, setSentiment] = useState("neutral");
   const [body, setBody] = useState<string | null>(null);
   const [showBody, setShowBody] = useState(false);
   const [msg, setMsg] = useState("");
-  const [blockedIntent, setBlockedIntent] = useState(!!openBlocked);
-  const [blockedReason, setBlockedReason] = useState("");
-  const [unblockCondition, setUnblockCondition] = useState("");
-  const [completion, setCompletion] = useState("");
-  const [confidence, setConfidence] = useState("");
-  const [risk, setRisk] = useState("");
+  const [busy, setBusy] = useState(false);
   const [versions, setVersions] = useState<KbVersion[]>([]);
   const [reloadKey, setReloadKey] = useState(0);
 
-  const transition = useKb((s) => s.transition);
   const boardTasks = useKb((s) => s.tasks) as any[];
   // children resolve from the LIVE board store first (complete + realtime via
   // WS) — the semantic `related` call misses most children (embedding-ranked,
@@ -290,23 +322,23 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
     return () => { on = false; };
   }, [taskId, reloadKey]);
 
-  const clampPct = (v: string) => (v === "" ? undefined : Math.max(0, Math.min(100, Math.round(Number(v)))));
-  // navigate to another task inside the same panel (task refs / dep graph)
+    // navigate to another task inside the same panel (task refs / dep graph)
   const nav = (id: string) => {
     if (!onOpen) return;
     onOpen(id);
   };
-  const logProgress = async () => {
+  const comment = async () => {
     if (!note.trim()) return;
+    setBusy(true);
     try {
-      await kbApi.progressGauges({
-        id: taskId, note: note.trim(), sentiment,
-        completion_pct: clampPct(completion), confidence_pct: clampPct(confidence), risk_pct: clampPct(risk),
-      });
-      setNote("");
+      await kbApi.progress(taskId, note.trim());
+      setNote(""); setMsg("comment posted");
+      setTimeout(() => setMsg(""), 2000);
       const h = await kbApi.history(taskId);
       setVersions(h.versions ?? []);
-    } catch { /* offline */ }
+    } catch { /* offline */ } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -352,7 +384,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
                 </Btn>
               </>
             ) : (
-              <pre className="know-body">{body || "—"}</pre>
+              <div className="md-body know-body"><MdRef text={body || "—"} onOpen={nav} /></div>
             )}
           </div>
         )}
@@ -370,7 +402,7 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
                   <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={HISTORY_LABEL[v.action] ?? v.action}>
                     {HISTORY_LABEL[v.action] ?? v.action}
                   </Chip>
-                  <span className="progress-note"><RefText text={v.summary} onOpen={nav} /></span>
+                  <span className="progress-note md-body"><MdRef text={v.summary} onOpen={nav} /></span>
                   <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
                 </div>
               ))}
@@ -398,51 +430,10 @@ export function TaskDetail({ taskId, openBlocked, onClose, onOpen }: {
         )}
 
         <div className="detail-block form-block">
-          <label>Log progress</label>
-          <div className="row">
-            <Select value={sentiment} onChange={(e) => setSentiment(e.target.value)}>
-              <option value="going_well">going well</option>
-              <option value="converging">converging</option>
-              <option value="neutral">neutral</option>
-              <option value="diverging">diverging</option>
-              <option value="struggling">struggling</option>
-            </Select>
-          </div>
-          <TextArea rows={2} value={note} placeholder="One line — what just happened?" onChange={(e) => setNote(e.target.value)} />
-          <div className="pct-inputs">
-            <TextInput type="number" min={0} max={100} value={completion} placeholder="% done" onChange={(e) => setCompletion(e.target.value)} />
-            <TextInput type="number" min={0} max={100} value={confidence} placeholder="% conf" onChange={(e) => setConfidence(e.target.value)} />
-            <TextInput type="number" min={0} max={100} value={risk} placeholder="% risk" onChange={(e) => setRisk(e.target.value)} />
-          </div>
-          <Btn disabled={!note.trim()} onClick={() => void logProgress()}>Log progress</Btn>
-        </div>
-
-        <div className="detail-block form-block">
-          <label>Change status</label>
-          {blockedIntent ? (
-            <>
-              <TextArea rows={2} placeholder="Why is it blocked? (required)" value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
-              <TextInput placeholder="What unblocks it? (required)" value={unblockCondition} onChange={(e) => setUnblockCondition(e.target.value)} />
-              <Btn
-                disabled={!blockedReason.trim() || !unblockCondition.trim()}
-                onClick={async () => {
-                  await transition(taskId, "blocked", { note: blockedReason.trim(), unblock_condition: unblockCondition.trim() });
-                  setBlockedReason(""); setUnblockCondition(""); onClose();
-                }}
-              >
-                Mark blocked
-              </Btn>
-              <Btn quiet onClick={onClose}>Cancel</Btn>
-            </>
-          ) : (
-            <ActionRow>
-              {["todo", "in_progress", "blocked", "done"]
-                .filter((s) => s !== task?.status)
-                .map((s) => (
-                  <Btn key={s} onClick={() => s === "blocked" ? setBlockedIntent(true) : void transition(taskId, s)}>{s}</Btn>
-                ))}
-            </ActionRow>
-          )}
+          <label>Comment / steer</label>
+          <TextArea rows={2} value={note} placeholder="Add context for the agent — lands on the task's history" onChange={(e) => setNote(e.target.value)} />
+          <Btn disabled={!note.trim() || busy} onClick={() => void comment()}>Comment</Btn>
+          {msg && <span className="ok" style={{ marginLeft: 8 }}>{msg}</span>}
         </div>
       </aside>
     </>

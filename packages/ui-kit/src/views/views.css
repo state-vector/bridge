@@ -835,3 +835,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .ab-head { margin-bottom: 4px; }
 .lights-awaiting { color: var(--accent, #5b9dff); font-size: 10px; margin-left: 4px; font-weight: 700; }
+
+/* content titles render as written — the uppercase h2 rule is for section headers */
+.detail-question, .forme-pop h2 { text-transform: none; letter-spacing: normal; font-size: 14px; font-weight: 700; }
+.md-body p { margin: 0 0 6px; }
+.md-body pre { white-space: pre-wrap; }
