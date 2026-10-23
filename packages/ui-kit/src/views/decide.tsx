@@ -200,7 +200,15 @@ export function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onCl
         })()}
         {(() => {
           const f = decisionFrame(d);
-          if (f.kind !== "verify") return <h2>{d.title}</h2>;
+          if (f.kind !== "verify") {
+            const from = (d as any).request_from as string | undefined;
+            return (
+              <>
+                <h2>{d.title}</h2>
+                {from && <p className="ask-reason">request from: {from}</p>}
+              </>
+            );
+          }
           const st = tasks.find((t) => t.id === f.target)?.status;
           const applied = f.verdict === "bounce" ? st === "in_progress" : st === "done";
           const frame = applied

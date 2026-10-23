@@ -39,6 +39,11 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
             : d.title;
         })()}
       </h3>
+      {(() => {
+        const f = decisionFrame(d);
+        const from = (d as any).request_from as string | undefined;
+        return f.kind === "generic" && from ? <p className="ask-reason">request from: {from}</p> : null;
+      })()}
       <ActionRow>
         {(() => {
           const f = decisionFrame(d);
@@ -254,6 +259,11 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
               <Card key={t.id} className="forme-item forme-link" onClick={() => openThread?.(t.id)}>
                 <div className="ask-chips">
                   <Chip tone="scope">QUESTION</Chip>
+                  {(t.meta as any)?.awaiting_decision && (
+                    <Chip tone="urgent" title="a decision has been filed — accepting it closes this question, rejecting reopens it">
+                      AWAITING DECISION {(t.meta as any).awaiting_decision}
+                    </Chip>
+                  )}
                   <span className="why-line">{t.owner ?? "—"} · updated {rel(t.updated_ts)}</span>
                 </div>
                 <h3 className="ask-question">{t.title}</h3>

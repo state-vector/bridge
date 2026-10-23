@@ -46,8 +46,18 @@ export function isQuestionTask(meta: any): boolean {
 export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   steering: { draft: ["active"], active: ["superseded"] },
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
-  decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+  // rejected is a real ruling (BR#909): For Me's Reject button posts it, and a
+  // rejection reopens the decision's linked questions. Terminal — a rejection is
+  // recorded, not revised; the loop continues via a NEW/revised proposal.
+  decision: { proposed: ["accepted", "superseded", "rejected"], accepted: ["superseded"], rejected: [] },
+  // done → todo exists ONLY for the question reopen (BR#909): a rejected or
+  // superseded decision reopens its linked questions. machine.ts RULES gate it
+  // (reopen-needs-decision) — a plain task cannot walk back out of done.
+  // todo → done exists for the same lifecycle: an accepted decision closes its
+  // question directly (the ruling IS the review evidence — done-unreviewed
+  // passes via the derived_from/supports link). Unclaimed work still can't
+  // jump to done without that evidence: the gates stay in charge.
+  task: { todo: ["in_progress", "blocked", "done"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"], done: ["todo"] },
   progress: {},
   agent: {},
 };
