@@ -1,6 +1,6 @@
 mod console;
 mod dispatch;
-mod keychain;
+pub mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
