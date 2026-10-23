@@ -182,11 +182,44 @@ export const kbApi = {
     j<{ settings: Record<string, any> }>("/api/kb/admin/settings", { method: "POST", body: JSON.stringify({ settings }) }),
 };
 
-/** Realtime KB events over WS. Reconnects with backoff; feeds a callback.
- *  Token auth rides the query string (browsers cannot set WS headers). */
+/** Realtime KB events. Browser (webapp): WS authenticated by the human
+ *  session cookie — ZERO tokens on this plane (credential-class ADR BR#2673;
+ *  the ?token= leg is gateway-class only, agents poll REST instead). Native
+ *  shells (desktop; transport set): cross-origin WS can neither carry the
+ *  HttpOnly cookie nor pass CORS, so poll the events mirror through the
+ *  shell transport instead. Reconnects/polls with backoff; feeds onEvent. */
 export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" | "closed") => void) {
-  const token = bearer();
-  const url = base().replace(/^http/, "ws") + "/kb-ws?since=0" + (token ? `&token=${encodeURIComponent(token)}` : "");
+  if (transport) {
+    const viaTransport = transport;
+    let since = 0;
+    let open = false;
+    let stopped = false;
+    let backoff = 2000;
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        const r = (await viaTransport(`/api/kb/events?since=${since}&limit=200`)) as { events?: KbEvent[]; last_seq?: number };
+        for (const e of r.events ?? []) onEvent(e);
+        if (typeof r.last_seq === "number") since = r.last_seq;
+        if (!open) {
+          open = true;
+          onStatus("open");
+        }
+        backoff = 2000;
+      } catch {
+        if (open) {
+          open = false;
+          onStatus("closed");
+        }
+      }
+      if (!stopped) setTimeout(poll, backoff);
+    };
+    poll();
+    return () => {
+      stopped = true;
+    };
+  }
+  const url = base().replace(/^http/, "ws") + "/kb-ws?since=0";
   let ws: WebSocket | null = null;
   let stopped = false;
   let backoff = 2000;
