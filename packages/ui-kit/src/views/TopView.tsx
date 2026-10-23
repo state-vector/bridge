@@ -264,16 +264,12 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.context, false)}`} title="context % — how full the agent's window is; high values mean it should hand off soon">{r.context != null ? `${r.context}%` : "—"}</span>
           <span className="topc-bar">
-            {r.status === "blocked" && (r.unblock || r.askPending) ? (
-              <span
-                className="top-unblock"
-                title={r.askPending ? `blocked on ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
-              >
-                {r.askPending
-                  ? <><Chip tone="urgent">ask</Chip> {r.askPending}</>
-                  : <><Chip tone="scope">exit</Chip> {r.unblock}</>}
-                <span className="muted-note" style={{ marginLeft: 6 }}>open the task to answer / unblock</span>
+            {r.status === "blocked" && r.unblock ? (
+              <span className="top-unblock" title={`blocked — unblocks when: ${r.unblock}`}>
+                <Chip tone="scope">exit</Chip> {r.unblock}
               </span>
+            ) : r.status === "blocked" && r.askPending ? (
+              <span className="muted-note">blocked on a question — answered below</span>
             ) : (
               <>
                 <span className="top-bar"><span className="top-bar-fill" style={{ width: `${Math.max(0, Math.min(100, r.completion ?? 0))}%` }} /></span>

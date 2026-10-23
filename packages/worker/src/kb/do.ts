@@ -771,6 +771,46 @@ export class KnowledgeHub {
       console.log("asks_v2 migration:", String(e).slice(0, 200));
     }
 
+
+    // ---------- asks options backfill: no ask ships button-less ----------
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'asks_options_v1'`)) {
+        const nodes = this.state.storage.sql.exec(
+          `SELECT id, title, body_md, meta FROM artefacts
+           WHERE type = 'task' AND tags LIKE '%"question"%' AND status NOT IN ('done','superseded')`,
+        ).toArray() as any[];
+        let n = 0;
+        for (const node of nodes) {
+          const m = JSON.parse(node.meta ?? "{}");
+          if (!m.ask || (Array.isArray(m.ask.options) && m.ask.options.length >= 2)) continue;
+          const text = `${node.title ?? ""} ${node.body_md ?? ""}`;
+          let opts: string[] = [];
+          // enumerated questions carry their own answers: "(a) … (b) …"
+          const parts = text.split(/\([A-Da-d1-4]\)\s+/).map((x: string) => x.trim());
+          if (parts.length >= 3) {
+            opts = parts.slice(1, 5).map((x: string) => {
+              const cut = x.split(/\s+(?:vs\.?|or|—|--)\s+/i)[0];
+              return cut.replace(/\s*\n\s*/g, " ").slice(0, 140).trim();
+            }).filter((x: string) => x.length >= 2);
+          }
+          if (opts.length < 2) {
+            opts = /GO\/NO-GO|GO or NO-GO|merge GO/i.test(text)
+              ? ["GO — proceed as stated", "NO-GO — hold, reason in comment"]
+              : ["Approved — proceed as stated", "Hold — reason in comment"];
+          }
+          m.ask = { ...(m.ask ?? {}), options: opts.slice(0, 4) };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), node.id);
+          this.version(node.id, "system:migration", "update", `ask options backfilled (${m.ask.options.length})`, { options: m.ask.options });
+          n++;
+        }
+        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_options_v1', String(Date.now()))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        if (n) this.audit("system:migration", "ask_options_backfilled", null, { nodes: n });
+      }
+    } catch (e) {
+      console.log("asks options backfill:", String(e).slice(0, 200));
+    }
+
     // additive columns for DBs created before these existed
     for (const ddl of [
       `ALTER TABLE decisions ADD COLUMN options TEXT`,
