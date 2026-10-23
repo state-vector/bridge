@@ -90,6 +90,7 @@ const GATEWAY_FRESH_MS = 3 * 60_000; // poll_secs default 60 → 3 fresh = alive
 
 export function TopView() {
   useClock();
+  const conn = useKb((s) => s.conn);
   const refreshKb = useKb((s) => s.refresh);
   const tasks = useKb((s) => s.tasks);
   const sessions = useKb((s) => s.sessions);
@@ -342,7 +343,7 @@ export function TopView() {
       ))}
 
       {treeRows.length === 0 && (
-        <p className="empty">No fleet activity — agents appear here when they claim work.</p>
+        <p className="empty">{conn === "closed" ? "Hub unreachable — check the gateway pairing / hub url." : "No fleet activity — agents appear here when they claim work."}</p>
       )}
 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}

@@ -28,6 +28,7 @@ function rankOf(t: any, parentIdOf: Map<string, string>): { rank: number; why: s
 }
 
 export function BacklogView() {
+  const conn = useKb((s) => s.conn);
   const tasks = useKb((s) => s.tasks);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
@@ -125,7 +126,7 @@ export function BacklogView() {
             </div>
           );
         })}
-        {queue.length === 0 && <p className="empty">Queue empty — everything in flight, parked, or done.</p>}
+        {queue.length === 0 && <p className="empty">{conn === "closed" ? "Hub unreachable — check the gateway pairing / hub url." : "Queue empty — everything in flight, parked, or done."}</p>}
       </div>
 
       {parked.length > 0 && (

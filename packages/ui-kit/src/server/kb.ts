@@ -118,7 +118,10 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body) headers.set("content-type", "application/json");
   if (token) headers.set("authorization", `Bearer ${token}`);
-  const r = await fetch(`${base()}${path}`, { credentials: "include", ...init, headers });
+  // Bearer mode must OMIT credentials: with credentials:"include" the fetch
+  // spec rejects wildcard Access-Control-Allow-Origin — native shells would
+  // have every response blocked no matter what the hub sends.
+  const r = await fetch(`${base()}${path}`, { ...(init ?? {}), credentials: token ? "omit" : "include", headers });
   if (r.status === 401) throw new KbAuthError("unauthorized");
   if (!r.ok) throw new Error(`${r.status} ${await r.text().then((t) => t.slice(0, 200))}`);
   return (await r.json()) as T;
