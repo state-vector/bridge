@@ -339,6 +339,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
       <div className="ask-chips">
         <Chip tone="needs">ASK</Chip>
         {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        <span className="gw-mono ab-id">{task.id}</span>
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
       {ask.reason && (

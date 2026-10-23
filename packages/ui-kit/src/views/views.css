@@ -858,3 +858,5 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* the why-escalated line: muted, italic, always second */
 .ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }
+
+.ab-id { font-family: var(--mono, ui-monospace, monospace); font-size: 10px; color: var(--text-faint, #8b94a7); }

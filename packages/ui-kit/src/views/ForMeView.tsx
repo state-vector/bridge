@@ -135,6 +135,7 @@ function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => 
       <div className="ask-chips">
         <Chip tone="needs">ASK</Chip>
         {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        <span className="gw-mono ab-id">{node.id}</span>
         <span className="why-line">{ask.from ?? "agent"} · {rel(node.created_ts)}</span>
       </div>
       <h3 className="ask-question">{node.title}</h3>
