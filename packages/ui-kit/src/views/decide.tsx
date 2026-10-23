@@ -104,7 +104,7 @@ export function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onCl
     try {
       const r = await kbApi.history(d.id);
       setComments((r.versions ?? []) as HistoryEntry[]);
-    } catch { /* keep stale */ }
+    } catch (e) { console.warn("[bridge] comment reload:", (e as Error).message); }
   };
 
   const addComment = async () => {

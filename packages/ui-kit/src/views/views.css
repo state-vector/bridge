@@ -840,3 +840,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .detail-question, .forme-pop h2 { text-transform: none; letter-spacing: normal; font-size: 14px; font-weight: 700; }
 .md-body p { margin: 0 0 6px; }
 .md-body pre { white-space: pre-wrap; }
+
+/* never-silent-failure: the last failed call is visible in the lights */
+.lights-error { color: var(--red, #e5534b); font-size: 11px; margin-left: 4px; }
+.st-err { color: var(--red, #e5534b); }

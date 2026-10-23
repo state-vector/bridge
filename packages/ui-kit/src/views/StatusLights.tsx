@@ -10,6 +10,7 @@ export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open"
   const kbConn = useKb((s) => s.conn);
   const sessions = useKb((s) => s.sessions);
   const awaitingHuman = useKb((s) => s.awaitingHuman);
+  const lastError = useKb((s) => s.lastError);
   const [open, setOpen] = useState(false);
 
   const derived = useMemo(() => {
@@ -44,10 +45,16 @@ export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open"
         <ConnDot state={gwOnline > 0 ? "open" : "closed"} className="conn" title={`gateways: ${gwOnline}/${gateways.length} online`} />
         {gateways.length > 0 && <span className="lights-count">{gwOnline}/{gateways.length}</span>}
         {awaitingHuman > 0 && <span className="lights-awaiting" title={`${awaitingHuman} decision(s)/ask(s) awaiting you — see Top`}>{awaitingHuman}⚑</span>}
+        {lastError && <span className="lights-error" title={`last error (${lastError.context}): ${lastError.message}`}>⚠</span>}
       </button>
       {open && (
         <div className="lights-pop" onClick={() => setOpen(false)}>
           <div className="ask-chips"><b>status</b></div>
+          {lastError && (
+            <div className="light-row st-err" title={new Date(lastError.ts).toLocaleTimeString()}>
+              ⚠ {lastError.context}: {lastError.message}
+            </div>
+          )}
           <div className="light-row"><ConnDot state={bridgeConn ?? kbState} className="conn" /> hub {bridgeConn ? `(${bridgeConn})` : ""}</div>
           <div className="light-row"><ConnDot state={kbState} className="conn" /> knowledge realtime — {kbState}</div>
           {gateways.length === 0 && <div className="light-row muted">no gateways seen</div>}

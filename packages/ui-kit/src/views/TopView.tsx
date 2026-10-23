@@ -108,7 +108,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       if (r.askPending) await kbApi.askAnswer(r.askPending, "unblocked by human (Top)");
       else if (r.taskId) await kbApi.transition(r.taskId, "in_progress", { note: "unblocked by human — condition satisfied (Top)" });
       await refreshKb();
-    } catch { /* the panel surfaces failures with full context */ }
+    } catch (e) { useKb.getState().reportError("unblock from row", e); }
   };
 
   const rows = useMemo<TopRow[]>(() => {

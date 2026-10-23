@@ -135,6 +135,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
   const [ask, setAsk] = useState<KbAsk | null>(null);
   const [answerText, setAnswerText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cardErr, setCardErr] = useState("");
 
   useEffect(() => {
     const id = m.awaiting_ask?.ask_id;
@@ -151,7 +152,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       await kbApi.askAnswer(m.awaiting_ask.ask_id, answer);
       await useKb.getState().refresh();
       onChanged?.();
-    } catch { /* history shows the failure */ } finally {
+    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
       setBusy(false);
     }
   };
@@ -162,7 +163,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       else await kbApi.transition(task.id, "in_progress", { note: "unblocked by human — condition satisfied" });
       await useKb.getState().refresh();
       onChanged?.();
-    } catch { /* history shows the failure */ } finally {
+    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
       setBusy(false);
     }
   };
@@ -241,6 +242,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
             />
             <Btn size="sm" disabled={busy || !answerText.trim()} onClick={() => void answerAsk(answerText.trim())}>Answer</Btn>
             <Btn size="sm" quiet disabled={busy} title="answer 'unblocked' — resumes the task" onClick={() => void unblock()}>Unblock</Btn>
+            {cardErr && <span className="k-err">{cardErr}</span>}
           </div>
         </div>
       )}
@@ -309,15 +311,15 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           setBody(a.body_md ?? "");
           setRelations(((a as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
         }
-      } catch { /* stale */ }
+      } catch (e) { useKb.getState().reportError("load task", e); }
       try {
         const r = await kbApi.related(taskId);
         if (on) setRelated(r.artefacts ?? []);
-      } catch { /* offline */ }
+      } catch (e) { useKb.getState().reportError("load task relations", e); }
       try {
         const h = await kbApi.history(taskId);
         if (on) setVersions(h.versions ?? []);
-      } catch { /* offline */ }
+      } catch (e) { useKb.getState().reportError("load task relations", e); }
     })();
     return () => { on = false; };
   }, [taskId, reloadKey]);
@@ -336,7 +338,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
       setTimeout(() => setMsg(""), 2000);
       const h = await kbApi.history(taskId);
       setVersions(h.versions ?? []);
-    } catch { /* offline */ } finally {
+    } catch (e) { useKb.getState().reportError("post comment", e); setMsg("comment failed"); } finally {
       setBusy(false);
     }
   };

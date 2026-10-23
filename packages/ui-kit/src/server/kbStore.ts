@@ -45,6 +45,10 @@ interface KbState {
   initialThread: string | null;
   /** human-ask plane: decisions + asks awaiting the human (ask band + nested) */
   awaitingHuman: number;
+  /** NEVER SILENT FAILURE (error-handling steering): the last failed call,
+   *  surfaced by StatusLights — nothing in the kit may swallow an error. */
+  lastError: { message: string; context: string; ts: number } | null;
+  reportError: (context: string, e: unknown) => void;
 
   start: () => void;
   stop: () => void;
@@ -78,6 +82,13 @@ export const useKb = create<KbState>((set, get) => ({
   settings: {},
   initialThread: null,
   awaitingHuman: 0,
+  lastError: null,
+
+  reportError: (context, e) => {
+    const message = e instanceof Error ? e.message : String(e);
+    console.warn(`[bridge] ${context}:`, message);
+    set({ lastError: { message, context, ts: Date.now() } });
+  },
 
   start: () => {
     stopWs?.();
@@ -121,7 +132,8 @@ export const useKb = create<KbState>((set, get) => ({
         set({ events: merged.slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.last_seq) });
       }
     } catch (e) {
-      escalateAuth(e); /* hub unreachable or mock mode — views show empty states */
+      escalateAuth(e);
+      if (!(e instanceof KbAuthError)) get().reportError("board refresh", e);
     }
   },
 
@@ -131,7 +143,8 @@ export const useKb = create<KbState>((set, get) => ({
       const s = await kbApi.settings();
       set({ tokens: t.tokens, sessions: t.sessions, gatewayAgents: t.gateway_agents ?? [], settings: s.settings ?? {} });
     } catch (e) {
-      escalateAuth(e); /* not signed in yet */
+      escalateAuth(e);
+      if (!(e instanceof KbAuthError)) get().reportError("admin refresh", e);
     }
   },
 

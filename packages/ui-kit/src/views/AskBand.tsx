@@ -43,7 +43,7 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
     let on = true;
     kbApi.artefacts({ type: "decision", status: "proposed" })
       .then((r) => { if (on) setProposed(r.artefacts ?? []); })
-      .catch(() => { if (on) setProposed([]); });
+      .catch((e) => { if (on) { setProposed([]); useKb.getState().reportError("load proposed decisions", e); } });
     return () => { on = false; };
   }, [evSeq]);
 
