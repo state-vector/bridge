@@ -227,7 +227,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <div
           key={r.key}
           className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "top-row-child" : ""}`}
-          style={depth > 0 ? { marginLeft: `${(depth - 1) * 22}px` } : undefined}
+          style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-task" title={r.taskId ?? ""}>
@@ -284,7 +284,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
           <span className={`topc-age top-num age-${r.lastSignal ? staleness(r.lastSignal, now) : "dead"}`}>{age(r.lastSignal ?? r.lastSeen, now)}</span>
         </div>,
         asks.length > 0 && (
-          <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group" style={{ marginLeft: `${depth * 22 + 22}px` }}>
+          <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group">
             <AskEntries entries={asks} onDone={bumpAsks} openDecision={openAskDetails} nested />
           </div>
         ),

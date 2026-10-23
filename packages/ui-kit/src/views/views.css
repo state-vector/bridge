@@ -676,8 +676,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-bar-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent); transition: width .4s ease; }
 .top-bar-label { flex: none; width: 34px; text-align: right; }
 .topc-age { white-space: nowrap; }
-@media (max-width: 900px) {
-  .top-head, .top-row { grid-template-columns: minmax(100px, 120px) minmax(130px, 1.3fr) 110px 44px minmax(90px, 1fr) 60px 60px; }
+@media (max-width: 1280px) {
+  .top-head, .top-row { grid-template-columns: 96px minmax(100px, 120px) minmax(130px, 1.3fr) 110px 44px minmax(90px, 1fr) 60px 60px; }
   .topc-gauge, .top-sent, .topc-session { display: none; }
 }
 
