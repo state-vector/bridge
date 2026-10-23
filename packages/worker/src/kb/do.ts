@@ -721,6 +721,53 @@ export class KnowledgeHub {
           (SELECT id FROM auth_tokens WHERE tags LIKE '%"gateway"%')`,
       );
     } catch { /* fresh db */ }
+
+    // ---------- asks v2: open legacy asks become question nodes ----------
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'asks_v2'`)) {
+        const legacy = this.state.storage.sql.exec(
+          `SELECT id, from_label, to_target, question, created_ts, artefact_id FROM asks WHERE status = 'open'`,
+        ).toArray() as any[];
+        let n = 0;
+        for (const a of legacy) {
+          const created = await this.create(
+            {
+              type: "task",
+              title: String(a.question ?? "").slice(0, 200),
+              body_md: String(a.question ?? ""),
+              tags: ["question"],
+              owner: "",
+              meta: { ask: { to: a.to_target ?? "any", from: a.from_label ?? "agent", urgency: "normal", options: [], artefact_id: a.artefact_id || undefined, legacy_id: a.id } },
+            },
+            "system:migration",
+          );
+          if (a.artefact_id) {
+            const subj = this.one(`SELECT id, meta FROM artefacts WHERE id = ?`, a.artefact_id);
+            if (subj) {
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+                created.id, a.artefact_id, Date.now(),
+              );
+              const sm = JSON.parse(subj.meta ?? "{}");
+              if (sm.awaiting_ask?.ask_id === a.id) sm.awaiting_ask = { ...sm.awaiting_ask, ask_id: created.id };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), a.artefact_id);
+            }
+          }
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET created_ts = ? WHERE id = ?`, Number(a.created_ts ?? Date.now()), created.id,
+          );
+          this.state.storage.sql.exec(`UPDATE asks SET status = 'migrated' WHERE id = ?`, a.id);
+          this.audit("system:migration", "ask_migrated", a.artefact_id || null, { legacy: a.id, node: created.id });
+          n++;
+        }
+        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_v2', String(Date.now()))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        if (n) this.audit("system:migration", "asks_v2", null, { migrated: n });
+      }
+    } catch (e) {
+      console.log("asks_v2 migration:", String(e).slice(0, 200));
+    }
+
     // additive columns for DBs created before these existed
     for (const ddl of [
       `ALTER TABLE decisions ADD COLUMN options TEXT`,
@@ -739,6 +786,7 @@ export class KnowledgeHub {
       `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
       `ALTER TABLE pairings ADD COLUMN principal TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
+      `ALTER TABLE sessions ADD COLUMN kind TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -2070,7 +2118,11 @@ export class KnowledgeHub {
     if (question.length > 2000) throw new Error("question exceeds 2000 chars");
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
+    // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
+    // (free-text refinement lives in the detail view). No options = rejected
+    // at the contract, not a button-less ask the UI can't surface.
     const options = Array.isArray(body.options) ? body.options.map((o: any) => String(o).slice(0, 200)).filter(Boolean).slice(0, 8) : [];
+    if (options.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (options: [...])");
     const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
 
     // the ask IS a question node: BR#-numbered, child_of its subject, answered
@@ -2107,23 +2159,32 @@ export class KnowledgeHub {
   }
   private async askInbox(body: any) {
     const label = String(body.label ?? "");
-    const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
-    const placeholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
-    const marks = placeholders.map(() => "?").join(",");
+    // nodes are the inbox; open legacy rows are shown until the v2 migration
+    // converts them (they then read status 'migrated' and vanish naturally)
+    const nodes = this.state.storage.sql.exec(
+      `SELECT id, meta, created_ts FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND tags LIKE '%"question"'
+       ORDER BY created_ts DESC LIMIT 50`,
+    ).toArray() as any[];
+    const inbox = nodes
+      .map((n) => {
+        const m = JSON.parse(n.meta ?? "{}");
+        if (!m.ask) return null;
+        return { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
+      })
+      .filter((x): x is any => !!x && (x.to_target === "any" || x.to_target === label || true));
     const open = this.state.storage.sql.exec(
       `SELECT id, from_label, to_target, question, created_ts FROM asks
-       WHERE status = 'open' AND from_label != ? AND to_target IN (${marks})
-       ORDER BY created_ts DESC LIMIT 50`,
-      label, ...placeholders,
+       WHERE status = 'open' AND from_label != ? ORDER BY created_ts DESC LIMIT 50`,
+      label,
     ).toArray();
     const sent = this.state.storage.sql.exec(
       `SELECT id, to_target, question, status, answer, answered_by, created_ts FROM asks
        WHERE from_label = ? ORDER BY created_ts DESC LIMIT 50`,
       label,
     ).toArray();
-    return { inbox: open, sent };
+    return { inbox: [...inbox, ...open], sent };
   }
-
 
   /** Admin cleanup: supersede smoke/test rows created in the last 48h. Audited per row. */
   private async purgeSmoke(body: any) {
