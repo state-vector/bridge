@@ -354,7 +354,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       }));
     }
     case "ask_agent": {
-      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, options: args.options, artefact_id: args.artefact_id });
+      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, details: args.details, options: args.options, artefact_id: args.artefact_id });
       return text(JSON.stringify({
         ...a,
         note: a.task_status === "blocked"
@@ -537,7 +537,8 @@ const TOOLS = [
       required: ["question", "options"],
       properties: {
         to: { type: "string", description: "default: any" },
-        question: { type: "string" },
+        question: { type: "string", description: "THE ASK ITSELF — one imperative sentence ≤240 chars (e.g. \"Merge PR #84?\"). Reports/receipts go in details, not here" },
+        details: { type: "string", description: "context, receipts, narrative — rendered as markdown below the question" },
         options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8, description: "REQUIRED: 2-8 one-click answer options for the human" },
         artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },
       },

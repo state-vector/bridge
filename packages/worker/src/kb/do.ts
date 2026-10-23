@@ -2164,7 +2164,10 @@ export class KnowledgeHub {
     const to = String(body.to ?? "any");
     const question = String(body.question ?? "").trim();
     if (!question) throw new Error("question is required");
-    if (question.length > 2000) throw new Error("question exceeds 2000 chars");
+    // the question IS the ask — one imperative sentence a human can answer by
+    // clicking. Reports, receipts and narrative belong in details (body_md).
+    if (question.length > 240) throw new Error("question must be the ask itself, one sentence ≤240 chars (e.g. 'Merge PR #84?') — put reports/receipts in details");
+    const details = String(body.details ?? "").trim();
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
@@ -2180,7 +2183,7 @@ export class KnowledgeHub {
       {
         type: "task",
         title: question.slice(0, 200),
-        body_md: question,
+        body_md: details || question,
         tags: ["question"],
         owner: "",
         meta: { ask: { to, urgency, options, from: actor, artefact_id: artefactId || undefined } },
