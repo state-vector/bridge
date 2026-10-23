@@ -26,6 +26,10 @@ struct NotifyAskArgs {
     urgent: bool,
 }
 
+// Add missing imports
+use serde_json::Value;
+use std::sync::atomic::Ordering;
+
 /// Dispatch a decision to the OS notification surface.
 /// Native buttons when bundled (.app); plain notification otherwise.
 #[tauri::command]
