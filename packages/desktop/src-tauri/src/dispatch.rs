@@ -526,7 +526,11 @@ fn apply_vended_credentials(
 ) -> Result<(), String> {
     crate::keychain::save_token(token)?;
     cfg.url = url.trim_end_matches('/').to_string();
-    cfg.token.clear(); // keychain holds it; the file stays secret-free
+    // The secret stays IN MEMORY for this process — the loop thread receives
+    // it via cfg (the BR#2455 identity check refuses an empty token). The
+    // field is skip_serializing, so config.json stays secret-free; later
+    // resolves reload from the keychain (refresh_token_from_keychain).
+    cfg.token = token.to_string();
     cfg.ws = Some(ws.to_string());
     cfg.label = label;
     cfg.gateway = Some(gateway_class);

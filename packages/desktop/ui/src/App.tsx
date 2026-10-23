@@ -333,7 +333,7 @@ export function App() {
 
   const applySettings = async () => {
     if (!cfg) {
-      setApplyMsg("no config yet — start once (pairs via BRIDGE_URL), then edit");
+      setApplyMsg("no config yet — Start once (sign in vends the gateway token), then edit");
       return;
     }
     const ordered = BACKENDS.filter((b) => backends.includes(b));
@@ -428,7 +428,7 @@ export function App() {
       {page === "settings" && (
         <main className="gw-main">
           <Card>
-            <h2>Runner</h2>
+            <h2>Gateway</h2>
             <div className="gw-row">
               <ConnDot
                 state={snap?.running ? "open" : "closed"}
@@ -437,6 +437,10 @@ export function App() {
               {snap?.running
                 ? <Btn variant="danger" size="sm" onClick={() => void toggleRun()}>Stop</Btn>
                 : <Btn variant="primary" size="sm" onClick={() => void toggleRun()}>Start</Btn>}
+              <Btn size="sm" disabled={reconnecting} onClick={() => void reconnectGateway()}>
+                {reconnecting ? "Reconnecting…" : "Reconnect"}
+              </Btn>
+              {reconnectMsg && <span className="gw-note">{reconnectMsg}</span>}
               <span className="gw-note">
                 {inFlight.length}/{snap?.max_sessions ?? 1} in flight
               </span>
@@ -445,6 +449,9 @@ export function App() {
                 open full board ↗
               </a>
             </div>
+            <span className="gw-note">
+              Start and Reconnect both self-heal the token: with your GitHub session live, a tokenless gateway re-vends automatically — no pairing ceremony
+            </span>
             <div className="gw-inflight" style={{ marginTop: 8 }}>
               {inFlight.map((f) => (
                 <div key={f.task_id} className="gw-agent">
@@ -519,19 +526,6 @@ export function App() {
                 onChange={(e) => setHubUrl(e.target.value)} />
             </div>
             <span className="gw-note">identity comes from your GitHub sign-in — the gateway provisions itself against this hub</span>
-          </Card>
-
-          <Card>
-            <h2>Gateway</h2>
-            <div className="gw-row">
-              <Btn size="sm" disabled={reconnecting} onClick={() => void reconnectGateway()}>
-                {reconnecting ? "Reconnecting…" : "Reconnect"}
-              </Btn>
-              {reconnectMsg && <span className="gw-note">{reconnectMsg}</span>}
-            </div>
-            <span className="gw-note">
-              re-vends this desktop's gateway token via your human session (the sign-in is the approval) and restarts the gateway
-            </span>
           </Card>
 
           <Card>

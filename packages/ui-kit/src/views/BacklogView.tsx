@@ -127,7 +127,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
             </div>
           );
         })}
-        {queue.length === 0 && <p className="empty">{conn === "closed" ? "Hub unreachable — check the gateway pairing / hub url." : "Queue empty — everything in flight, parked, or done."}</p>}
+        {queue.length === 0 && <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "Queue empty — everything in flight, parked, or done."}</p>}
       </div>
 
       {parked.length > 0 && (

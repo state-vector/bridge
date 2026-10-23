@@ -331,7 +331,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
       })}
 
       {treeRows.length === 0 && (
-        <p className="empty">{conn === "closed" ? "Hub unreachable — check the gateway pairing / hub url." : "No fleet activity — agents appear here when they claim work."}</p>
+        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work."}</p>
       )}
 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
