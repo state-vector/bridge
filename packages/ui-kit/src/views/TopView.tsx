@@ -87,7 +87,8 @@ interface TopRow {
 /** Compact gateway strip: ONLY gateway identity sessions (dispatch-<gw>),
  *  never dispatched agent sessions — those are rows in the table, not
  *  infrastructure. Per-task dispatch sessions only feed the in-flight count. */
-export function TopView({ askFeed }: { askFeed?: AskFeed }) {
+export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (id: string) => void }) {
+  const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   useClock();
   const conn = useKb((s) => s.conn);
   const refreshKb = useKb((s) => s.refresh);
@@ -217,7 +218,7 @@ export function TopView({ askFeed }: { askFeed?: AskFeed }) {
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
-      <AskBand askFeed={askFeed} />
+      <AskBand askFeed={askFeed} openDecision={openTask} />
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
@@ -242,7 +243,7 @@ export function TopView({ askFeed }: { askFeed?: AskFeed }) {
           key={r.key}
           className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "top-row-child" : ""}`}
           style={depth > 0 ? { marginLeft: `${(depth - 1) * 22}px` } : undefined}
-          onClick={() => r.taskId && setSelectedTaskId(r.taskId)}
+          onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
             <ConnDot state={r.online ? "open" : "closed"} className="conn" title={r.online ? "online" : "offline"} />
@@ -295,7 +296,7 @@ export function TopView({ askFeed }: { askFeed?: AskFeed }) {
                       : `Marks satisfied: "${(r.unblock ?? "").slice(0, 100)}${(r.unblock ?? "").length > 100 ? "…" : ""}" → task resumes in_progress`}
                     onClick={(e) => void unblockFromRow(r, e)}
                   >Unblock</Btn>
-                  <Btn size="sm" quiet title="open the task panel" onClick={(e) => { e.stopPropagation(); r.taskId && setSelectedTaskId(r.taskId); }}>Details</Btn>
+                  <Btn size="sm" quiet title="open the task panel" onClick={(e) => { e.stopPropagation(); r.taskId && openDetails(r.taskId); }}>Details</Btn>
                 </span>
               </span>
             ) : (

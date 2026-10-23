@@ -130,6 +130,36 @@ export default {
       return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
 
+    // Gateway self-provision (human plane, session cookie ONLY): the desktop's
+    // post-login leg of the credential-class ADR — the login IS the human
+    // approval, so the web session mints its own desktop's gateway-class
+    // token (deterministic label, workspace-scoped). A gateway bearer must
+    // NEVER mint tokens, not even its own — reject it loudly; class
+    // separation is the point (fail-closed misconfig announces itself).
+    // No CORS wrap: cookie-authed plane, same enforcement as the admin
+    // routes — the desktop shell calls this from Rust, not the webview.
+    if (url.pathname === "/api/kb/self-provision" && request.method === "POST") {
+      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "")
+        || new URL(request.url).searchParams.get("token") || "";
+      if (bearer) return json({ error: "self-provision is human-plane only — a gateway bearer cannot mint tokens; sign in as the human" }, 403);
+      const auth = await checkAuth(request, env);
+      if (auth instanceof Response) return auth;
+      const body = await request.json().catch(() => ({}));
+      const kbId = env.KB.idFromName(doWs(auth.ws));
+      return env.KB.get(kbId).fetch("https://kb/self.provision", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          device_id: String(body.device_id ?? ""),
+          principal: typeof body.principal === "string" ? body.principal : null,
+          // worker-derived identity: the session's login + workspace — the
+          // client cannot claim an actor or scope (same law as body.actor)
+          login: auth.login ?? "",
+          ws: auth.ws,
+        }),
+      });
+    }
+
     // Knowledge REST mirror (human plane, cookie | gateway bearer).
     if (url.pathname.startsWith("/api/kb/") && !url.pathname.startsWith("/api/kb/admin/")) {
       if (request.method === "OPTIONS") return kbPreflight();
@@ -199,6 +229,9 @@ export default {
 
     // Human plane. Auth mode: GitHub OAuth (HMAC session cookie), or Cloudflare
     // Access JWT at the edge when CF_ACCESS_TEAM+AUD are set.
+    // Desktop: ?client=desktop&port=N hands the freshly minted session to the
+    // app process via a one-shot loopback redirect (ADR BR#2673 leg 3 — the
+    // desktop UI holds a human session, never a borrowed gateway bearer).
     if (url.pathname === "/login") return handleGithubLogin(request, env);
     if (url.pathname === "/login/callback") return handleGithubCallback(request, env);
 
@@ -505,7 +538,30 @@ function handleGithubLogin(request, env) {
     return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET" }, 503);
   }
   const state = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+  // Desktop login: the app binds an ephemeral loopback listener and passes its
+  // port; the state carries it through GitHub verbatim, and the callback hands
+  // the session value to the app process. Port is validated here — the
+  // redirect target is ALWAYS 127.0.0.1, never an attacker-chosen host.
+  const url = new URL(request.url);
+  if (url.searchParams.get("client") === "desktop") {
+    const port = Number(url.searchParams.get("port"));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return json({ error: "desktop login requires ?port=<1-65535> (the app's loopback listener)" }, 400);
+    }
+    return startGithubLogin(env, `desktop-${port}-${state}`);
+  }
   return startGithubLogin(env, state);
+}
+
+/** State sentinels for the desktop handshake (see handleGithubLogin):
+ *  `desktop-<port>-<64 hex>` → callback redirects the session value to the
+ *  app's 127.0.0.1:<port> listener. Anything else is a browser login. */
+function parseDesktopState(state) {
+  const m = /^desktop-(\d{1,5})-[0-9a-f]{64}$/.exec(String(state ?? ""));
+  if (!m) return null;
+  const port = Number(m[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { port };
 }
 
 function oauthFailure(origin, reason = "unknown") {
@@ -573,13 +629,21 @@ async function handleGithubCallback(request, env) {
   }
   const exp = String(Date.now() + SESSION_TTL_MS);
   const sig = await sign(`${exp}.${u.login}.${ws}`, env.GITHUB_CLIENT_SECRET);
+  const sessionValue = `${exp}.${u.login}.${ws}.${sig}`;
+  // Desktop handshake: hand the session to the app process via its loopback
+  // listener. The query param is the credential — this is the same trade gh
+  // CLI / VS Code make; the listener is single-shot, 127.0.0.1-bound, and the
+  // port was validated at /login. The browser still gets its Set-Cookie.
+  const desktop = parseDesktopState(state);
   const headers = new Headers({
-    Location: "/",
+    Location: desktop
+      ? `http://127.0.0.1:${desktop.port}/callback?bridge_session=${encodeURIComponent(sessionValue)}`
+      : "/",
     "Cache-Control": "no-store",
   });
   headers.append(
     "Set-Cookie",
-    `${SESSION_COOKIE}=${exp}.${u.login}.${ws}.${sig}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+    `${SESSION_COOKIE}=${sessionValue}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
   );
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
   return new Response(null, { status: 302, headers });

@@ -27,10 +27,11 @@ function rankOf(t: any, parentIdOf: Map<string, string>): { rank: number; why: s
   return { rank: 4, why: "todo" };
 }
 
-export function BacklogView() {
+export function BacklogView({ openTask }: { openTask?: (id: string) => void } = {}) {
   const conn = useKb((s) => s.conn);
   const tasks = useKb((s) => s.tasks);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const [msg, setMsg] = useState("");
 
   const { queue, parked } = useMemo(() => {
@@ -95,7 +96,7 @@ export function BacklogView() {
         {queue.map(({ t, rank, why, boosted, attempts }) => {
           const kind = kindOf(t);
           return (
-            <div key={t.id} className={`backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => setSelectedTaskId(t.id)}>
+            <div key={t.id} className={`backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => openDetails(t.id)}>
               <span className="backlog-rank" title={`pickup rank: ${why}`}>{boosted ? "▲" : rank + 1}</span>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
@@ -139,7 +140,7 @@ export function BacklogView() {
             {parked.map(({ t, attempts }) => {
               const kind = kindOf(t);
               return (
-                <div key={t.id} className="backlog-row backlog-parked" onClick={() => setSelectedTaskId(t.id)}>
+                <div key={t.id} className="backlog-row backlog-parked" onClick={() => openDetails(t.id)}>
                   <span className="backlog-rank backlog-rank-parked">▪</span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">
@@ -162,9 +163,10 @@ export function BacklogView() {
   );
 }
 
-export function CompletedView() {
+export function CompletedView({ openTask }: { openTask?: (id: string) => void } = {}) {
   const tasks = useKb((s) => s.tasks);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
 
   const rows = useMemo(
     () => (tasks as any[]).filter((t) => t.status === "done").sort((a, b) => (b.status_ts ?? b.updated_ts) - (a.status_ts ?? a.updated_ts)),
@@ -183,7 +185,7 @@ export function CompletedView() {
           const kind = kindOf(t);
           const lifetime = t.created_ts && t.status_ts ? Math.round((t.status_ts - t.created_ts) / 60000) : null;
           return (
-            <div key={t.id} className="backlog-row backlog-done" onClick={() => setSelectedTaskId(t.id)}>
+            <div key={t.id} className="backlog-row backlog-done" onClick={() => openDetails(t.id)}>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
                 <span className={`kind-pill kp-${kind}`}>{kind}</span>

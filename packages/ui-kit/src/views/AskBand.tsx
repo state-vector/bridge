@@ -11,7 +11,8 @@ import { Btn, Chip } from "./index-kit";
  *  rows (process-row height) between the dashboard stats and the fleet table.
  *  Kernel + options inline; click for the full decision popover. */
 
-function BandVerdictRow({ latest, prior, onDone }: { latest: KbArtefact; prior: KbArtefact[]; onDone: () => void }) {
+function BandVerdictRow({ latest, prior, onDone, openDecision }: { latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void }) {
+  const openDetails = (id: string) => (openDecision ? openDecision(id) : setOpen(true));
   const [showPrior, setShowPrior] = useState(false);
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(latest, onDone);
@@ -38,7 +39,7 @@ function BandVerdictRow({ latest, prior, onDone }: { latest: KbArtefact; prior: 
         <span className="ab-actions">
           <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
           <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-          <Btn size="sm" quiet onClick={() => setOpen(true)}>Details</Btn>
+          <Btn size="sm" quiet onClick={() => openDetails(latest.id)}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
       </div>
@@ -47,7 +48,8 @@ function BandVerdictRow({ latest, prior, onDone }: { latest: KbArtefact; prior: 
   );
 }
 
-function BandDecisionRow({ d, onDone }: { d: KbArtefact; onDone: () => void }) {
+function BandDecisionRow({ d, onDone, openDecision }: { d: KbArtefact; onDone: () => void; openDecision?: (id: string) => void }) {
+  const openDetails = (id: string) => (openDecision ? openDecision(id) : setOpen(true));
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone);
   const f = decisionFrame(d);
@@ -62,7 +64,7 @@ function BandDecisionRow({ d, onDone }: { d: KbArtefact; onDone: () => void }) {
         <span className="ab-actions">
           <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>Accept</Btn>
           <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-          <Btn size="sm" quiet onClick={() => setOpen(true)}>Details</Btn>
+          <Btn size="sm" quiet onClick={() => openDetails(d.id)}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
       </div>
@@ -95,7 +97,7 @@ function BandAskRow({ d, resolve, onDone }: { d: any; resolve: NonNullable<AskFe
   );
 }
 
-export function AskBand({ askFeed, onChanged }: { askFeed?: AskFeed; onChanged?: () => void }) {
+export function AskBand({ askFeed, onChanged, openDecision }: { askFeed?: AskFeed; onChanged?: () => void; openDecision?: (id: string) => void }) {
   const events = useKb((st) => st.events);
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
 
@@ -126,10 +128,10 @@ export function AskBand({ askFeed, onChanged }: { askFeed?: AskFeed; onChanged?:
         <BandAskRow key={d.id} d={d} resolve={askFeed!.resolve} onDone={bump} />
       ))}
       {grouped.verdictCards.map(({ latest, prior }) => (
-        <BandVerdictRow key={latest.id} latest={latest} prior={prior} onDone={bump} />
+        <BandVerdictRow key={latest.id} latest={latest} prior={prior} onDone={bump} openDecision={openDecision} />
       ))}
       {grouped.generic.map((d) => (
-        <BandDecisionRow key={d.id} d={d} onDone={bump} />
+        <BandDecisionRow key={d.id} d={d} onDone={bump} openDecision={openDecision} />
       ))}
     </div>
   );

@@ -198,6 +198,26 @@ export function tagsSayGateway(tags: unknown): boolean {
   return parseTags(tags).some((t) => t.toLowerCase() === "gateway");
 }
 
+/**
+ * Deterministic gateway label for a self-provisioned desktop (credential-class
+ * ADR, desktop gateway leg): gw-<device-slug>, derived ONLY from the stable
+ * device id — the same machine always lands on the same label, so re-vending
+ * at each login rotates the token in place and the `gateway_agents` edges
+ * keyed by that label stay stable. Mirrors the gw-* convention Connect uses
+ * to group gateways (BR#2455). Non-alphanumerics collapse to single dashes;
+ * an empty/undashable id falls back to "device" so the label is always valid
+ * under the mint label rules (2-40 chars, [a-zA-Z0-9._/-]).
+ */
+export function selfProvisionLabel(device_id: unknown): string {
+  const raw = typeof device_id === "string" ? device_id : "";
+  const slug = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  return `gw-${slug || "device"}`;
+}
+
 // ---------- workspaces ----------
 /**
  * One deployment hosts many workspaces; every human cookie and agent token is

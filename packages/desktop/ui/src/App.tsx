@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TopView, BacklogView, CompletedView, useKb, setKbHubConfig } from "@bridge/ui-kit";
+import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig } from "@bridge/ui-kit";
+import { openDetailWindow } from "./detailWindow";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
@@ -102,193 +103,6 @@ function age(ms: number): string {
   if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;
-}
-
-// rich-row shared bits (parity with the webapp's Top/Backlog)
-const KIND_TONE: Record<string, string> = {
-  verify: "k-verify", analysis: "k-analysis", unblock: "k-unblock", question: "k-question", impl: "k-impl",
-};
-function kindOf(t: BoardTask): string {
-  const tags: string[] = t.tags ?? [];
-  if (tags.includes("role:unblock")) return "unblock";
-  if (tags.includes("role:review")) return "verify";
-  if (tags.includes("role:analysis")) return "analysis";
-  if (t.meta?.kind === "question" || tags.includes("question")) return "question";
-  return "impl";
-}
-function useTick(): number {
-  const [t, setT] = useState(0);
-  useEffect(() => {
-    const iv = setInterval(() => setT((x) => x + 1), 1000);
-    return () => clearInterval(iv);
-  }, []);
-  return t;
-}
-function ageOf(ts: number | undefined, now: number): string {
-  if (!ts) return "—";
-  const sec = Math.max(0, Math.floor((now - ts) / 1000));
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-interface BoardTask { id: string; title: string; status: string; tags?: string[]; owner?: string; meta?: Record<string, any>; updated_ts?: number; status_ts?: number }
-
-
-function Top() {
-  const [rows, setRows] = useState<BoardTask[] | null>(null);
-  const [err, setErr] = useState("");
-  const now = useTick();
-  useEffect(() => {
-    let dead = false;
-    const pull = async () => {
-      try {
-        const d = await invoke<any>("board_lists");
-        if (!dead) { setRows(d.top ?? []); setErr(""); }
-      } catch (e) { if (!dead) setErr(String(e)); }
-    };
-    void pull();
-    const t = setInterval(() => void pull(), 5000);
-    return () => { dead = true; clearInterval(t); };
-  }, []);
-
-  const signal = (t: BoardTask) => {
-    const p = t.meta?.last_progress;
-    return Math.max(p?.ts ?? 0, t.status_ts ?? 0, t.updated_ts ?? 0);
-  };
-  const staleness = (ts: number) => {
-    const m = (now - ts) / 60000;
-    if (m > 60) return "dead";
-    if (m > 30) return "warn";
-    return "fresh";
-  };
-
-  return (
-    <main className="gw-main">
-      <Card><h2>Top</h2><span className="gw-note">{rows?.length ?? 0} in flight — live</span>{err && <span className="k-err">{err}</span>}</Card>
-      <Card>
-        <div className="bt-head">
-          <span>task</span><span>state</span><span>gauge</span><span>last signal</span>
-        </div>
-        {(rows ?? []).map((t) => {
-          const kind = kindOf(t);
-          const p = t.meta?.last_progress;
-          const sig = signal(t);
-          const st = t.status;
-          const blocked = st === "blocked";
-          const exit = t.meta?.blocked?.unblock_condition ?? t.meta?.awaiting_ask?.ask_id;
-          const sentiment = p?.sentiment;
-          return (
-            <div key={t.id} className={`bt-row ${blocked ? "bt-blocked" : ""}`}>
-              <ConnDot state={staleness(sig) === "dead" ? "closed" : "open"} />
-              <span className="gw-mono bt-id">{t.id}</span>
-              <div className="bt-main">
-                <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
-                <span className="bt-title" title={t.title}>{t.title}</span>
-                {p?.will && <span className="bt-will" title={p.will}>▸ {String(p.will).slice(0, 70)}</span>}
-                {blocked && exit && (
-                  <span className="bt-exit"><Chip tone="urgent">exit</Chip> {String(exit).slice(0, 90)}</span>
-                )}
-                {p?.note && !blocked && <span className="bt-note">{String(p.note).slice(0, 110)}</span>}
-              </div>
-              <div className="bt-state">
-                <Chip pill tone={st === "in_progress" ? "live" : blocked ? "err" : "warn"}>{st.replace("_", " ")}</Chip>
-                {sentiment && <span className="bt-sent">{String(sentiment).replace("_", " ")}</span>}
-              </div>
-              <span className="bt-gauge">
-                {p?.confidence_pct != null && <span className="bt-num">conf {p.confidence_pct}%</span>}
-                {p?.risk_pct != null && <span className="bt-num">risk {p.risk_pct}%</span>}
-                {!p && <span className="bt-num">—</span>}
-              </span>
-              <span className="bt-bar">
-                {blocked && exit ? null : (
-                  <>
-                    <span className="bt-barfill"><span className="bt-barin" style={{ width: `${Math.max(0, Math.min(100, p?.completion_pct ?? 0))}%` }} /></span>
-                    <span className="bt-num">{p?.completion_pct != null ? `${p.completion_pct}%` : "—"}</span>
-                  </>
-                )}
-              </span>
-              <span className="bt-age top-num" title={`last signal ${ageOf(sig, now)} ago`}>{ageOf(sig, now)}</span>
-            </div>
-          );
-        })}
-        {(rows ?? []).length === 0 && <span className="gw-log-empty">nothing in flight</span>}
-      </Card>
-    </main>
-  );
-}
-
-/** Backlog — the queue (todo: boosted first, oldest first) + done ledger. */
-function Backlog() {
-  const [data, setData] = useState<{ backlog: BoardTask[]; done: BoardTask[] } | null>(null);
-  const [err, setErr] = useState("");
-  const now = useTick();
-  useEffect(() => {
-    let dead = false;
-    const pull = async () => {
-      try {
-        const d = await invoke<any>("board_lists");
-        if (!dead) { setData({ backlog: d.backlog ?? [], done: d.done ?? [] }); setErr(""); }
-      } catch (e) { if (!dead) setErr(String(e)); }
-    };
-    void pull();
-    const t = setInterval(() => void pull(), 5000);
-    return () => { dead = true; clearInterval(t); };
-  }, []);
-
-  const queue = useMemo(() => {
-    const rows = [...(data?.backlog ?? [])];
-    rows.sort((a, b) => {
-      const ab = a.meta?.boosted ? 0 : 1, bb = b.meta?.boosted ? 0 : 1;
-      return ab - bb || (a.updated_ts ?? 0) - (b.updated_ts ?? 0);
-    });
-    return rows;
-  }, [data]);
-
-  return (
-    <main className="gw-main">
-      <Card><h2>Backlog</h2><span className="gw-note">{queue.length} queued · {data?.done?.length ?? 0} done</span>{err && <span className="k-err">{err}</span>}</Card>
-      <Card>
-        <h2>Queue</h2>
-        {queue.map((t) => {
-          const kind = kindOf(t);
-          const att = t.meta?.attempt?.attempts ?? 0;
-          const boosted = !!t.meta?.boosted;
-          const exit = t.meta?.blocked?.unblock_condition ?? t.meta?.awaiting_ask?.ask_id;
-          return (
-            <div key={t.id} className={`bl-row ${boosted ? "bl-boosted" : ""}`}>
-              {boosted && <span className="bl-rank bl-rank-boost">▲</span>}
-              <span className="gw-mono bl-id">{t.id}</span>
-              <div className="bl-main">
-                <span className={`k-pill ${KIND_TONE[kind] ?? "k-impl"}`}>{kind}</span>
-                <span className="bl-title" title={t.title}>{t.title}</span>
-                {exit && <span className="bl-exit"><Chip tone="urgent">exit</Chip> {String(exit).slice(0, 90)}</span>}
-              </div>
-              <span className="bl-meta">
-                {att > 0 && <Chip tone="urgent" title={`attempted ${att}x`}>×{att}</Chip>}
-                <span className="gw-fmeta">{ageOf(t.updated_ts, now)}</span>
-              </span>
-            </div>
-          );
-        })}
-        {queue.length === 0 && <span className="gw-log-empty">queue empty</span>}
-      </Card>
-      <Card>
-        <h2>Done</h2>
-        {(data?.done ?? []).slice(0, 30).map((t) => (
-          <div key={t.id} className="bl-row bl-done">
-            <span className="gw-mono bl-id">{t.id}</span>
-            <div className="bl-main"><span className="bl-title">{t.title}</span></div>
-            <span className="gw-fmeta">{t.owner || t.meta?.session || "—"}</span>
-            <span className="gw-fmeta" style={{ marginLeft: "auto" }}>{ageOf(t.status_ts ?? t.updated_ts, now)} ago</span>
-          </div>
-        ))}
-        {(data?.done ?? []).length === 0 && <span className="gw-log-empty">nothing done yet</span>}
-      </Card>
-    </main>
-  );
 }
 
 export function App() {
@@ -610,12 +424,21 @@ export function App() {
           <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
           <button className={page === "log" ? "active" : ""} onClick={() => setPage("log")}>Log</button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
+          <StatusLights />
         </nav>
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
-            {page === "top" && <TopView />}
-      {page === "backlog" && <BacklogView />}
+            {page === "top" && (
+        <TopView
+          openTask={(id) => openDetailWindow(/^ASK-|^DECISION-/.test(id) ? "decision" : "task", id)}
+        />
+      )}
+      {page === "backlog" && (
+        <BacklogView
+          openTask={(id) => openDetailWindow("task", id)}
+        />
+      )}
       {page === "chat" && <Chat />}
 
 
