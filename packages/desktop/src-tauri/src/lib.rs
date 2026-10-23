@@ -10,6 +10,13 @@ mod transport;
 
 pub mod keychain;
 pub mod session;
+pub mod dispatch;
+pub mod console;
+pub mod mac_notify;
+pub mod menubar;
+pub mod opencode;
+pub mod scm;
+pub mod transport;
 
 use serde::Deserialize;
 use tauri::Manager;
