@@ -447,7 +447,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
 
-        {task && (task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
+        {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
           <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
         )}
 
