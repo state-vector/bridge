@@ -1,6 +1,9 @@
+/// <reference types="node" />
 import { Miniflare } from "miniflare";
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+declare const fetch: typeof globalThis.fetch;
 
 /**
  * DO integration tests — the tier that would have caught today's production
