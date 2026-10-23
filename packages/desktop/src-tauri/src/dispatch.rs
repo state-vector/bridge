@@ -2543,7 +2543,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     eprintln!("[dispatch] loop stopped");
 }
 
-pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), String> {
+pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(), String> {
     let mut handle = state.handle.lock().map_err(|_| "state poisoned")?;
     if state.running.load(Ordering::Relaxed) {
         return Err("dispatch loop already running".into());
@@ -2552,6 +2552,29 @@ pub fn start(state: &DispatchState, cfg: Option<DispatchConfig>) -> Result<(), S
         // single-claimant rule: two dispatch loops polling one hub race on
         // claims and double-dispatch. Observe the external runner instead.
         return Err(format!("runner already live in another process (pid {pid}) — stop it or kill {pid} first"));
+    }
+    // Self-heal (credential-class ADR BR#2673 leg 4): no gateway token but the
+    // human session is live → the login IS the approval; vend this device's
+    // gateway token now so the loop can start. Every start lands here: the
+    // post-login kick, app boot, and the Settings Reconnect button.
+    if cfg.as_ref().map(|c| c.token.is_empty()).unwrap_or(true) {
+        if let Some(s) = crate::session::load() {
+            let hub = cfg
+                .as_ref()
+                .map(|c| c.url.clone())
+                .unwrap_or_else(|| s.url.clone());
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let vendored = self_provision(&client, &hub, &s.value)
+                .map_err(|e| format!("gateway has no token and self-provision failed: {e}"))?;
+            eprintln!(
+                "[dispatch] self-provisioned gateway token at start (workspace '{}')",
+                vendored.ws.as_deref().unwrap_or("?")
+            );
+            cfg = Some(vendored);
+        }
     }
     // remember explicit settings (concurrency, backend, model, hub) across
     // restarts/app runs — the settings page applies by re-starting the loop
@@ -2578,6 +2601,15 @@ pub fn stop(state: &DispatchState) {
     // persist the stop signal immediately so the flat file reflects it even
     // before the loop drains its current sleep slice
     write_runner_state(&state.snapshot);
+}
+
+/// Settings "Reconnect gateway" (Ray, 2026-10-23): stop the loop, re-vend the
+/// gateway token via the human session (start()'s self-heal — the login is
+/// the standing approval, no re-pairing ceremony), start fresh.
+pub fn reconnect(state: &DispatchState) -> Result<serde_json::Value, String> {
+    stop(state);
+    start(state, None)?;
+    Ok(state.status())
 }
 
 /// Log out core: reset the session-facing state. Shared by manual logout

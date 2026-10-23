@@ -164,6 +164,25 @@ export function App() {
   };
   doLogoutRef.current = doLogout;
 
+  // Settings "Reconnect gateway": re-vend the token via the human session and
+  // restart the loop (dispatch::reconnect — start() self-heals the vend)
+  const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectMsg, setReconnectMsg] = useState("");
+  const reconnectGateway = async () => {
+    setReconnecting(true);
+    setReconnectMsg("");
+    try {
+      const s = await invoke<any>("gateway_reconnect");
+      setReconnectMsg(s?.running ? "gateway running — token re-vended" : `gateway stopped: ${s?.last_error ?? "unknown"}`);
+      await loadCfg();
+      await pull();
+    } catch (e) {
+      setReconnectMsg(`failed: ${String(e)}`);
+    } finally {
+      setReconnecting(false);
+    }
+  };
+
   const pull = useCallback(async () => {
     try {
       const s = await invoke<Snapshot>("dispatch_snapshot");
@@ -499,7 +518,20 @@ export function App() {
               <TextInput style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
                 onChange={(e) => setHubUrl(e.target.value)} />
             </div>
-            <span className="gw-note">identity comes from device pairing — a new hub needs `bridge pair &lt;url&gt;`</span>
+            <span className="gw-note">identity comes from your GitHub sign-in — the gateway provisions itself against this hub</span>
+          </Card>
+
+          <Card>
+            <h2>Gateway</h2>
+            <div className="gw-row">
+              <Btn size="sm" disabled={reconnecting} onClick={() => void reconnectGateway()}>
+                {reconnecting ? "Reconnecting…" : "Reconnect"}
+              </Btn>
+              {reconnectMsg && <span className="gw-note">{reconnectMsg}</span>}
+            </div>
+            <span className="gw-note">
+              re-vends this desktop's gateway token via your human session (the sign-in is the approval) and restarts the gateway
+            </span>
           </Card>
 
           <Card>
@@ -509,9 +541,9 @@ export function App() {
               <span className="gw-note">applying restarts the runner when it is running</span>
             </div>
             <div className="gw-row" style={{ marginTop: 10 }}>
-              <Btn variant="danger" size="sm" onClick={() => void doLogout()}>Log out</Btn>
+              <Btn variant="danger" size="sm" onClick={() => void doLogout()}>Sign out</Btn>
               {logoutMsg && <span className="gw-note">{logoutMsg}</span>}
-              <span className="gw-note">stops the runner and clears the token — settings kept, pair again to onboard</span>
+              <span className="gw-note">clears your GitHub session only — the gateway keeps running</span>
             </div>
           </Card>
         </main>

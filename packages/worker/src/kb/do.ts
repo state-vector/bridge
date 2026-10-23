@@ -50,6 +50,7 @@ import {
   tagsSayGateway,
   parseTags,
   resolveRolePlaybook,
+  selfProvisionLabel,
   sanitizeTags,
   validateRelation,
 } from "./core.ts";
@@ -772,6 +773,7 @@ export class KnowledgeHub {
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
+        case "self.provision": return this.json(await this.selfProvision(body, actor));
         case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
@@ -2752,8 +2754,32 @@ export class KnowledgeHub {
     return { id, label, secret, provisioned_by: caller };
   }
 
-  private async tokenMint(body: any) {
-    const label = String(body.label ?? "").trim();
+  /** Gateway self-provision (credential-class ADR BR#2673 leg 4): the human
+   *  session mints THIS device's gateway-class token — the login IS the human
+   *  approval. Identity is worker-derived (login/ws arrive from the
+   *  authenticated session forward in index.js, never client-claimable);
+   *  the label is deterministic gw-* from the device_id, so re-vend at every
+   *  login rotates the token in place and `gateway_agents` edges keyed by
+   *  that label stay stable. Audit op `self_provision` with the web actor —
+   *  distinguishable from admin mints (op "pair") and from any agent mint. */
+  private async selfProvision(body: any, actor: string) {
+    const login = String(body.login ?? "").trim();
+    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : "";
+    if (!login) throw new Error("self-provision requires the session login (worker-derived)");
+    if (!device_id) throw new Error("self-provision requires device_id");
+    const label = selfProvisionLabel(device_id);
+    const out = await this.tokenMint({
+      label,
+      device_id,
+      principal: typeof body.principal === "string" ? body.principal : null,
+      tags: ["gateway"],
+      transport: "mcp", // the desktop gateway is an MCP client of the hub
+    });
+    this.audit(actor, "self_provision", null, { label, device_id, login, ws: body.ws ?? "", token_id: out.id });
+    return { secret: out.secret, label: out.label ?? label, ws: this.wsSlug() || String(body.ws ?? ""), id: out.id };
+  }
+
+  private async tokenMint(body: any) {    const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
     // the only '/' allowed in a human-minted label is the reserved
     // _direct/ root — directly connected agents live there

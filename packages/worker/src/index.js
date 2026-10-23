@@ -145,6 +145,9 @@ export default {
       const auth = await checkAuth(request, env);
       if (auth instanceof Response) return auth;
       const body = await request.json().catch(() => ({}));
+      // the actor is the human session (this op only exists on the human
+      // plane); the DO stamps the audit with it
+      body.actor = "web";
       const kbId = env.KB.idFromName(doWs(auth.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",

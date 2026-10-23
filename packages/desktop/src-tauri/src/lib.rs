@@ -192,6 +192,13 @@ fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
     dispatch::stop(&state);
 }
 
+/// Settings "Reconnect gateway": re-vend the gateway token via the human
+/// session (the login is the standing approval) and restart the loop.
+#[tauri::command]
+fn gateway_reconnect(state: tauri::State<'_, dispatch::DispatchState>) -> Result<serde_json::Value, String> {
+    dispatch::reconnect(&state)
+}
+
 /// Log out: stop the runner and clear the gateway token (settings are kept),
 /// returning the app to its onboarding state (pair again to vend a fresh
 /// gateway token).
@@ -286,6 +293,7 @@ pub fn run() {
             dispatch_create_task,
             dispatch_start,
             dispatch_stop,
+            gateway_reconnect,
             logout,
             pair_start,
             pair_poll,

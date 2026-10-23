@@ -307,3 +307,23 @@ pub fn urlencode(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod live_probe {
+    #[test]
+    fn events_and_board_via_session() {
+        // live probe (uses the real stored session) — diagnostics for the
+        // "hub unreachable" report; not part of the suite's assertions
+        let r = super::kb_request("GET", "/api/kb/events?since=0&limit=5", None);
+        match &r {
+            Ok(v) => println!("events OK: {}", serde_json::to_string(v).unwrap_or_default().chars().take(120).collect::<String>()),
+            Err(e) => println!("events ERR: {e}"),
+        }
+        let b = super::kb_request("GET", "/api/kb/board", None);
+        match &b {
+            Ok(v) => println!("board OK: tasks={:?}", v.get("tasks").and_then(|t| t.as_array()).map(|a| a.len())),
+            Err(e) => println!("board ERR: {e}"),
+        }
+        assert!(r.is_ok() && b.is_ok());
+    }
+}
