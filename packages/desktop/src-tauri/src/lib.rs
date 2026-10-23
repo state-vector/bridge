@@ -8,8 +8,8 @@ mod scm;
 mod session;
 mod transport;
 
-pub use self::keychain;
-pub use self::session;
+pub use keychain::*;
+pub use session::*;
 
 use serde::Deserialize;
 use tauri::Manager;
