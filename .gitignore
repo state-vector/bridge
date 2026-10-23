@@ -24,3 +24,4 @@ sessions/
 
 # webapp build artifact — built at deploy time ([build] hook in worker/wrangler.toml)
 packages/webapp/dist/
+packages/worker/src/__version.json

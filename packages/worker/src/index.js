@@ -51,6 +51,16 @@ export default {
     // without a browser cookie — same DO list op the webapp uses, via the GET
     // /artefacts route (filters read query params there; a POST /list with an
     // empty body would silently drop the filters).
+    if (url.pathname === "/__version") {
+      // deploy provenance: the [build] hook writes src/__version.json with the
+      // commit SHA — the drift probe and `bridge doctor` compare it to HEAD
+      try {
+        const v = await import("./__version.json");
+        return json(v);
+      } catch {
+        return json({ commit: "unknown", built_at: null });
+      }
+    }
     if (url.pathname === "/api/kb-machine/list") {
       const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");

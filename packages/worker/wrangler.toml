@@ -13,7 +13,7 @@ compatibility_date = "2026-01-15"
 # Install what the build needs, then invoke vite by path. Typechecking stays
 # in CI's full-install job.
 [build]
-command = "cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
+command = "printf '{\"commit\":\"%s\",\"built_at\":\"%s\"}' \"$(git rev-parse HEAD 2>/dev/null || echo unknown)\" \"$(date -u +%FT%TZ)\" > src/__version.json && cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
 
 # Your deployment lives at https://<your-subdomain>.workers.dev once deployed.
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
