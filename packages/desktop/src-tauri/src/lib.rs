@@ -1,5 +1,6 @@
 mod console;
 mod dispatch;
+mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
@@ -123,7 +124,7 @@ async fn session_login(app: tauri::AppHandle, url: Option<String>) -> Result<ser
             .ok_or("hub url required for first sign-in")?,
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let opener = app.opener().clone();
+        let opener = app.opener();
         session::login(&hub, &move |u: String| {
             let _ = opener.open_url(&u, None::<&str>);
         })
