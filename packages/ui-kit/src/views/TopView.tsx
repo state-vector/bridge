@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
+import { AskBand } from "./AskBand";
+import type { AskFeed } from "./ForMeView";
 import { kindOf } from "../server/views";
 import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
 import { kbApi } from "../server/kb";
@@ -88,7 +90,10 @@ interface TopRow {
  *  "dispatch-<task>" (one per dispatched task) — group by token label. */
 const GATEWAY_FRESH_MS = 3 * 60_000; // poll_secs default 60 → 3 fresh = alive
 
-export function TopView() {
+/** Compact gateway strip: ONLY gateway identity sessions (dispatch-<gw>),
+ *  never dispatched agent sessions — those are rows in the table, not
+ *  infrastructure. Per-task dispatch sessions only feed the in-flight count. */
+export function TopView({ askFeed }: { askFeed?: AskFeed }) {
   useClock();
   const conn = useKb((s) => s.conn);
   const refreshKb = useKb((s) => s.refresh);
@@ -113,15 +118,18 @@ export function TopView() {
   };
 
   const gateways = useMemo(() => {
-    const gw = sessions.filter((s) => (s.name ?? "").startsWith("dispatch-"));
+    // gateway identity sessions: dispatch-<gateway> — per-task dispatch
+    // sessions (dispatch-BR#… / dispatch-TASK-…) carry an AGENT label and
+    // must never appear as gateways
+    const isPerTask = (name: string) => /^dispatch-(BR#|TASK-|ASK-|DECISION-)/.test(name);
+    const gw = sessions.filter((s) => (s.name ?? "").startsWith("dispatch-") && !isPerTask(s.name ?? ""));
+    const inFlight = sessions.filter((s) => isPerTask(s.name ?? "") && now - (s.last_seen_ts ?? 0) < GATEWAY_FRESH_MS * 2).length;
     const byLabel = new Map<string, { label: string; lastSeen: number; tasksInFlight: number }>();
     for (const s of gw) {
-      const label = s.label ?? "unknown gateway";
-      const isPerTask = /^dispatch-(BR#|TASK-)/.test(s.name ?? "");
+      const label = s.label ?? s.name ?? "unknown gateway";
       const cur = byLabel.get(label) ?? { label, lastSeen: 0, tasksInFlight: 0 };
       cur.lastSeen = Math.max(cur.lastSeen, s.last_seen_ts ?? 0);
-      // a per-task dispatch session fresh within the poll window = a task in flight
-      if (isPerTask && now - (s.last_seen_ts ?? 0) < GATEWAY_FRESH_MS * 2) cur.tasksInFlight++;
+      cur.tasksInFlight = inFlight;
       byLabel.set(label, cur);
     }
     return [...byLabel.values()]
@@ -235,6 +243,7 @@ export function TopView() {
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
+      <AskBand askFeed={askFeed} />
       {gateways.length > 0 && (
         <div className="gateway-strip" title="dispatch gateways — poll the hub every minute, so they show online even with no traffic">
           <span className="gateway-strip-label">gateways</span>

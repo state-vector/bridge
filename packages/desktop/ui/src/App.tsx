@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TopView, BacklogView, CompletedView, ForMeView, useKb, setKbHubConfig, getKbHubConfig } from "@bridge/ui-kit";
+import { TopView, BacklogView, CompletedView, useKb, setKbHubConfig } from "@bridge/ui-kit";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
@@ -292,7 +292,7 @@ function Backlog() {
 }
 
 export function App() {
-  const [page, setPage] = useState<"forme" | "top" | "backlog" | "chat" | "log" | "settings">("forme");
+  const [page, setPage] = useState<"top" | "backlog" | "chat" | "log" | "settings">("top");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [msg, setMsg] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
@@ -486,7 +486,7 @@ export function App() {
   // native notification click → jump to the inbox (asks + decision watch)
   useEffect(() => {
     let un: (() => void) | undefined;
-    void listen("open-ask", () => setPage("forme")).then((f) => { un = f; });
+    void listen("open-ask", () => setPage("top")).then((f) => { un = f; });
     return () => un?.();
   }, []);
 
@@ -605,7 +605,6 @@ export function App() {
     <div className="gw">
       <header className="gw-head">
         <nav className="gw-nav">
-          <button className={page === "forme" ? "active" : ""} onClick={() => setPage("forme")}>For you</button>
           <button className={page === "top" ? "active" : ""} onClick={() => setPage("top")}>Top</button>
           <button className={page === "backlog" ? "active" : ""} onClick={() => setPage("backlog")}>Backlog</button>
           <button className={page === "chat" ? "active" : ""} onClick={() => setPage("chat")}>Chat</button>
@@ -615,15 +614,7 @@ export function App() {
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
-      {page === "forme" && (
-        <ForMeView
-          openThread={(id) => {
-            const u = getKbHubConfig().url;
-            if (u) openExternal(`${u}/?task=${id}`);
-          }}
-        />
-      )}
-      {page === "top" && <TopView />}
+            {page === "top" && <TopView />}
       {page === "backlog" && <BacklogView />}
       {page === "chat" && <Chat />}
 

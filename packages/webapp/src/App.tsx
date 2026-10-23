@@ -1,10 +1,8 @@
 import { useEffect, useState } from "react";
 import { BacklogView, CompletedView } from "./components/BacklogView";
-import { BoardView } from "./components/BoardView";
 import { ConnectView } from "./components/ConnectView";
 import { DecisionDetail } from "./components/DecisionDetail";
 import { DiscussionsView } from "./components/DiscussionsView";
-import { ForMeView } from "./components/ForMeView";
 import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
@@ -20,10 +18,8 @@ import "./App.css";
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
-type Tab = "forme" | "board" | "top" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
+type Tab = "top" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
 const TABS: Array<{ key: Tab; label: string }> = [
-  { key: "forme", label: "For Me" },
-  { key: "board", label: "Board" },
   { key: "top", label: "Top" },
   { key: "backlog", label: "Backlog" },
   { key: "completed", label: "Completed" },
@@ -90,7 +86,7 @@ export default function App() {
   const resolve = useBridge((s) => s.resolve);
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
-  const [tab, setTab] = useState<Tab>("forme");
+  const [tab, setTab] = useState<Tab>("top");
 
   useEffect(() => {
     connectHub({
@@ -129,15 +125,6 @@ export default function App() {
         </div>
       )}
       <main className="main">
-        {tab === "forme" && (
-          <ForMeView
-            openThread={(taskId) => {
-              useKb.setState({ initialThread: taskId } as any);
-              setTab("discussions");
-            }}
-          />
-        )}
-        {tab === "board" && <BoardView />}
         {tab === "top" && <TopView />}
         {tab === "backlog" && <BacklogView />}
         {tab === "completed" && <CompletedView />}
