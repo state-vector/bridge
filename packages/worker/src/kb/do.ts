@@ -173,7 +173,7 @@ export class KnowledgeHub {
             `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
              JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-               AND c.tags LIKE '%"question"%' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
+               AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
           );
           if (derived) {
             const nm = JSON.parse(derived.cmeta ?? "{}");
@@ -440,7 +440,7 @@ export class KnowledgeHub {
       `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
        FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%"question"%'
+         AND c.tags LIKE '%question%'
        ORDER BY c.created_ts DESC`,
     ).toArray();
     const askChildOf = new Map<string, any>();
@@ -721,7 +721,7 @@ export class KnowledgeHub {
     try {
       this.state.storage.sql.exec(
         `UPDATE sessions SET kind = 'gateway' WHERE kind IS NULL AND token_id IN
-          (SELECT id FROM auth_tokens WHERE tags LIKE '%"gateway"%')`,
+          (SELECT id FROM auth_tokens WHERE tags LIKE '%gateway%')`,
       );
     } catch { /* fresh db */ }
 
@@ -777,7 +777,7 @@ export class KnowledgeHub {
       if (!this.one(`SELECT value FROM settings WHERE key = 'asks_options_v1'`)) {
         const nodes = this.state.storage.sql.exec(
           `SELECT id, title, body_md, meta FROM artefacts
-           WHERE type = 'task' AND tags LIKE '%"question"%' AND status NOT IN ('done','superseded')`,
+           WHERE type = 'task' AND tags LIKE '%question%' AND status NOT IN ('done','superseded')`,
         ).toArray() as any[];
         let n = 0;
         for (const node of nodes) {
@@ -809,6 +809,45 @@ export class KnowledgeHub {
       }
     } catch (e) {
       console.log("asks options backfill:", String(e).slice(0, 200));
+    }
+
+
+    // ---------- tags v1: canonical encoding (defence in depth, SOLID) ----------
+    // The tags column historically holds JSON arrays, bare strings and comma
+    // lists — parseTags() reads them all, but every SQL tag filter guessed one
+    // encoding and silently missed the others. Re-encode EVERYTHING through
+    // parseTags (artefacts + auth_tokens); canonical rows write canonical
+    // JSON. Reads stay parseTags(); tag SQL filters are now correct forever.
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'tags_v1'`)) {
+        let fixed = 0;
+        for (const r of this.state.storage.sql.exec(`SELECT id, tags FROM artefacts`).toArray() as any[]) {
+          const canonical = JSON.stringify(parseTags(r.tags));
+          if (canonical !== String(r.tags ?? "")) {
+            this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, canonical, r.id);
+            fixed++;
+          }
+        }
+        for (const r of this.state.storage.sql.exec(`SELECT id, tags FROM auth_tokens`).toArray() as any[]) {
+          const canonical = JSON.stringify(parseTags(r.tags));
+          if (canonical !== String(r.tags ?? "")) {
+            this.state.storage.sql.exec(`UPDATE auth_tokens SET tags = ? WHERE id = ?`, canonical, r.id);
+            fixed++;
+          }
+        }
+        for (const r of this.state.storage.sql.exec(`SELECT token_id, name, kind FROM sessions WHERE kind IS NULL OR kind = ''`).toArray() as any[]) {
+          const tok = this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, r.token_id);
+          if (tok && parseTags(tok.tags).includes("gateway")) {
+            this.state.storage.sql.exec(`UPDATE sessions SET kind = 'gateway' WHERE token_id = ? AND name = ?`, r.token_id, r.name);
+            fixed++;
+          }
+        }
+        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('tags_v1', String(Date.now()))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.audit("system:migration", "tags_v1", null, { canonicalized: fixed });
+      }
+    } catch (e) {
+      console.log("tags_v1 migration:", String(e).slice(0, 200));
     }
 
     // additive columns for DBs created before these existed
@@ -941,6 +980,7 @@ export class KnowledgeHub {
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
         case "purge_smoke": return this.json(await this.purgeSmoke(body));
+        case "ask.reframe": return this.json(await this.askReframe(body, actor));
         case "orient": return this.json(await this.orient(body));
         case "progress.log": return this.json(await this.progressLog(body, actor));
         case "session.alive": {
@@ -2153,7 +2193,7 @@ export class KnowledgeHub {
     const ts = Date.now();
     this.state.storage.sql.exec(
       `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
-       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%"gateway"%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
        ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
       token_id, name, token_id, ts, ts,
     );
@@ -2242,6 +2282,25 @@ export class KnowledgeHub {
       label,
     ).toArray();
     return { inbox: [...inbox, ...open], sent };
+  }
+
+
+  /** Reframe: the human kicks an ask back to the asker to restructure.
+   *  Feedback is recorded on the node and surfaces in the asker's inbox.
+   *  Deliberately does NOT answer/resume — the parent stays parked until
+   *  a structured re-ask or an explicit answer. */
+  private async askReframe(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const feedback = String(body.feedback ?? "").trim().slice(0, 1000) ||
+      "REFRAME — restructure per the ask contract: one imperative question ≤240 chars, 2-8 one-click options, and why this is escalated instead of automatic.";
+    const node = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND tags LIKE '%question%'`, id);
+    if (!node) throw new Error(`no such ask: ${id}`);
+    const m = JSON.parse(node.meta ?? "{}");
+    m.ask = { ...(m.ask ?? {}), reframe: { by: actor, feedback, ts: Date.now() } };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), id);
+    this.version(id, actor, "update", `ask reframed by human — ${feedback.slice(0, 160)}`, { reframe: m.ask.reframe });
+    this.audit(actor, "ask_reframe", id, { feedback: feedback.slice(0, 200) });
+    return { id, reframe: m.ask.reframe };
   }
 
   /** Admin cleanup: supersede smoke/test rows created in the last 48h. Audited per row. */
@@ -2370,7 +2429,7 @@ export class KnowledgeHub {
     for (const c of this.state.storage.sql.exec(
       `SELECT r.dst_id AS parent, c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%"question"%' ORDER BY c.created_ts DESC`,
+         AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC`,
     ).toArray() as any[]) {
       if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
     }
