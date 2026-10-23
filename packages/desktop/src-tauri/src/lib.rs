@@ -8,8 +8,8 @@ mod scm;
 mod session;
 mod transport;
 
-pub use crate::keychain;
-pub use crate::session;
+pub use crate::keychain::*;
+pub use crate::session::*;
 
 use serde::Deserialize;
 use tauri::Manager;
