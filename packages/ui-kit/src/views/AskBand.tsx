@@ -4,7 +4,7 @@ import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
-import { Btn, Chip, TextInput } from "./index-kit";
+import { Btn, Chip } from "./index-kit";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -150,20 +150,18 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
   nodeAsk: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const [text, setText] = useState("");
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
+  // rows point, the detail view acts: option buttons answer inline (one click,
+  // no typing); free-text answering lives in the node's detail view
   const answer = async (a: string) => {
-    if (!a.trim()) return;
     setBusy(true);
-    setErr("");
     try {
       await kbApi.askAnswer(nodeAsk.id, a.trim());
       await useKb.getState().refresh();
       onDone();
     } catch (e) {
-      setErr((e as Error).message || "answer failed");
+      useKb.getState().reportError("answer ask", e);
     } finally {
       setBusy(false);
     }
@@ -181,18 +179,11 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
             ))}
           </span>
         )}
-        {err && <span className="k-err">{err}</span>}
       </span>
       <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>
       <span className="ab-actions">
-        <TextInput
-          value={text} placeholder="answer…"
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) void answer(text); }}
-        />
-        <Btn size="sm" disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
-        <Btn size="sm" quiet title="open the full ask — question, comments, context"
-          onClick={() => (openDecision ? openDecision(nodeAsk.id) : onDone())}>Details</Btn>
+        <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
+          onClick={() => openDecision?.(nodeAsk.id)}>Details</Btn>
       </span>
     </div>
   );

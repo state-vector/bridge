@@ -4,9 +4,7 @@ import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { kindOf } from "../server/views";
-import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
-import { kbApi } from "../server/kb";
-import type { KbAsk } from "../server/kb";
+import { Chip, ConnDot, type ChipTone } from "./index-kit";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -97,19 +95,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
   const events = useKb((s) => s.events);
   const now = Date.now();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [askTexts, setAskTexts] = useState<Record<string, KbAsk | null>>({});
 
 
-  /** One-click unblock straight from the row: answer the blocking ask (the DO
-   *  auto-resumes the task) or, for condition-blocks, transition it back. */
-  const unblockFromRow = async (r: TopRow, e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      if (r.askPending) await kbApi.askAnswer(r.askPending, "unblocked by human (Top)");
-      else if (r.taskId) await kbApi.transition(r.taskId, "in_progress", { note: "unblocked by human — condition satisfied (Top)" });
-      await refreshKb();
-    } catch (e) { useKb.getState().reportError("unblock from row", e); }
-  };
 
   const rows = useMemo<TopRow[]>(() => {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
@@ -204,31 +191,16 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
   // else the residual band (2026-10-23 design)
   const visibleTaskIds = useMemo(() => new Set(rows.map((r) => r.taskId ?? r.key)), [rows]);
   const humanAsks = useHumanAsks(visibleTaskIds);
+  const openAskDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const bumpAsks = () => { void refreshKb(); };
   useEffect(() => {
     if (useKb.getState().awaitingHuman !== humanAsks.total) useKb.setState({ awaitingHuman: humanAsks.total });
   }, [humanAsks.total]);
-  // a blocked row's inline unblock dedupes away when its ask nests below it
-  const nestedAskTargets = useMemo(() => new Set(humanAsks.byTask.keys()), [humanAsks.byTask]);
-
-  // pending asks on visible blocked rows — fetched once so the Unblock
-  // tooltip can state WHAT the task is waiting for, not just "an ask"
-  const pendingAskIds = useMemo(
-    () => [...new Set(rows.flatMap((r) => (r.askPending && !(r.askPending in askTexts) ? [r.askPending] : [])))].sort().join(","),
-    [rows, askTexts],
-  );
-  useEffect(() => {
-    if (!pendingAskIds) return;
-    for (const id of pendingAskIds.split(",")) {
-      kbApi.ask(id).then((a) => setAskTexts((m) => ({ ...m, [id]: a })))
-        .catch(() => setAskTexts((m) => ({ ...m, [id]: null })));
-    }
-  }, [pendingAskIds]);
 
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
-      <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openTask} />
+      <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
@@ -292,24 +264,15 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.context, false)}`} title="context % — how full the agent's window is; high values mean it should hand off soon">{r.context != null ? `${r.context}%` : "—"}</span>
           <span className="topc-bar">
-            {r.status === "blocked" && (r.unblock || r.askPending) && !(r.askPending && nestedAskTargets.has(r.taskId ?? r.key)) ? (
+            {r.status === "blocked" && (r.unblock || r.askPending) ? (
               <span
                 className="top-unblock"
-                title={r.askPending ? `blocked on decision — awaiting answer to ask ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
+                title={r.askPending ? `blocked on ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
               >
                 {r.askPending
-                  ? <><Chip tone="urgent">ask</Chip> awaiting answer to {r.askPending}</>
+                  ? <><Chip tone="urgent">ask</Chip> {r.askPending}</>
                   : <><Chip tone="scope">exit</Chip> {r.unblock}</>}
-                <span className="row-actions">
-                  <Btn
-                    size="sm" variant="accept"
-                    title={r.askPending
-                      ? `Answers ${askTexts[r.askPending]?.display ?? r.askPending}${askTexts[r.askPending]?.question ? ` — "${askTexts[r.askPending]!.question.slice(0, 100)}${askTexts[r.askPending]!.question.length > 100 ? "…" : ""}"` : ""} → task resumes in_progress`
-                      : `Marks satisfied: "${(r.unblock ?? "").slice(0, 100)}${(r.unblock ?? "").length > 100 ? "…" : ""}" → task resumes in_progress`}
-                    onClick={(e) => void unblockFromRow(r, e)}
-                  >Unblock</Btn>
-                  <Btn size="sm" quiet title="open the task panel" onClick={(e) => { e.stopPropagation(); r.taskId && openDetails(r.taskId); }}>Details</Btn>
-                </span>
+                <span className="muted-note" style={{ marginLeft: 6 }}>open the task to answer / unblock</span>
               </span>
             ) : (
               <>
@@ -323,7 +286,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         </div>,
         asks.length > 0 && (
           <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group" style={{ marginLeft: `${depth * 22 + 22}px` }}>
-            <AskEntries entries={asks} onDone={bumpAsks} openDecision={openTask} nested />
+            <AskEntries entries={asks} onDone={bumpAsks} openDecision={openAskDetails} nested />
           </div>
         ),
         ];
