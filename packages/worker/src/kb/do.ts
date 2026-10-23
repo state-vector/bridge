@@ -2827,7 +2827,7 @@ export class KnowledgeHub {
     const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : "";
     if (!login) throw new Error("self-provision requires the session login (worker-derived)");
     if (!device_id) throw new Error("self-provision requires device_id");
-    const label = selfProvisionLabel(device_id);
+    const label = selfProvisionLabel(body.host ?? body.device_id);
     const out = await this.tokenMint({
       label,
       device_id,

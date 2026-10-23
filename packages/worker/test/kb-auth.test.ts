@@ -81,25 +81,26 @@ describe("identity namespace law (BR#2455, revised: class is a trait)", () => {
 });
 
 describe("self-provision label law (desktop gateway leg, credential-class ADR)", () => {
-  it("deterministic per device: same device id, same gw-* label forever", () => {
+  it("deterministic per device: same host, same label forever", () => {
     const a = selfProvisionLabel("uuid-1234ABCD-5678");
     const b = selfProvisionLabel("uuid-1234ABCD-5678");
     expect(a).toBe(b);
-    expect(a).toMatch(/^gw-[a-z0-9-]+$/);
+    expect(a).toMatch(/^[a-z0-9-]+$/);
+    expect(a).not.toMatch(/^gw-/); // NO class prefix — gateway is a tag (Ray, 2026-10-23)
     expect(selfProvisionLabel("uuid-1234ABCD-5678".toUpperCase())).toBe(a); // case-stable
   });
 
   it("slug-safe under the mint label rules; never empty, never reserved", () => {
     // non-alphanumerics collapse to single dashes; result always valid
-    expect(selfProvisionLabel("MacBook Pro (local)")).toMatch(/^gw-[a-z0-9-]{2,40}$/);
-    expect(selfProvisionLabel("MacBook Pro (local)")).toBe("gw-macbook-pro-local");
-    expect(selfProvisionLabel("!!!")).toBe("gw-device"); // undashable → fallback
-    expect(selfProvisionLabel("")).toBe("gw-device");
-    expect(selfProvisionLabel(null)).toBe("gw-device");
-    expect(selfProvisionLabel(42)).toBe("gw-device");
+    expect(selfProvisionLabel("MacBook Pro (local)")).toMatch(/^[a-z0-9-]{2,40}$/);
+    expect(selfProvisionLabel("MacBook Pro (local)")).toBe("macbook-pro-local");
+    expect(selfProvisionLabel("!!!")).toBe("device"); // undashable → fallback
+    expect(selfProvisionLabel("")).toBe("device");
+    expect(selfProvisionLabel(null)).toBe("device");
+    expect(selfProvisionLabel(42)).toBe("device");
     // never a reserved _ root, always mint-legal shape
     const long = selfProvisionLabel("x".repeat(100));
-    expect(long.length).toBeLessThanOrEqual(33); // gw- + 30-slug cap
+    expect(long.length).toBeLessThanOrEqual(30); // 30-slug cap
     expect(/^[a-zA-Z0-9._/-]{2,40}$/.test(long)).toBe(true);
     expect(long.startsWith("_")).toBe(false);
   });
@@ -107,7 +108,7 @@ describe("self-provision label law (desktop gateway leg, credential-class ADR)",
   it("self-provisioned tokens are gateway-class by TAG (the trait, not the name)", () => {
     // the op mints tags ["gateway"] — exactly what the class gate reads
     expect(tagsSayGateway(["gateway"])).toBe(true);
-    expect(selfProvisionLabel("host-mybox")).toBe("gw-host-mybox"); // gw-* convention Connect groups on
+    expect(selfProvisionLabel("host-mybox")).toBe("host-mybox"); // bare hostname slug (BR#899 identity convention)
   });
 });
 

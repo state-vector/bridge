@@ -154,6 +154,8 @@ export default {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           device_id: String(body.device_id ?? ""),
+          // hostname — the label source (BR#899 identity convention)
+          host: String(body.host ?? ""),
           principal: typeof body.principal === "string" ? body.principal : null,
           // worker-derived identity: the session's login + workspace — the
           // client cannot claim an actor or scope (same law as body.actor)

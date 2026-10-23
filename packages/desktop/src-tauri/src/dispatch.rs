@@ -385,6 +385,19 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
 /// renames; unlike a MAC address it can't drift with hardware). The hub
 /// re-associates a re-pairing device with its existing token by this id —
 /// rotation, not a label collision. Fallback: hostname.
+/// Hostname slug — the LABEL source for the gateway token (BR#899 identity
+/// convention; Ray: gateway-ness is a tag, not a name prefix). The stable
+/// IOPlatformUUID (device_id) remains the internal rotation anchor and is
+/// never displayed.
+fn host_slug() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "device".into())
+}
+
 fn device_id() -> String {
     if let Ok(out) = Command::new("ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
@@ -563,6 +576,9 @@ pub fn self_provision(
         .body(
             json!({
                 "device_id": device_id(),
+                // hostname — the label source (BR#899 identity convention);
+                // device_id stays the internal rotation anchor
+                "host": host_slug(),
                 "principal": ensure_principal_from_file(),
             })
             .to_string(),
