@@ -1,8 +1,12 @@
 import { getKbHubConfig } from "./config";
 
 /** Knowledge-layer REST + realtime client.
- *  Auth: cookie session when present (webapp), Bearer token otherwise
- *  (native shells) — the hub accepts either on the knowledge web plane. */
+ *  Auth: the human session cookie — browser (webapp) sends it same-origin via
+ *  credentials:"include"; native shells route through the host process
+ *  (setKbTransport → Tauri invoke → reqwest with the Cookie header).
+ *  ZERO bearer on this plane: a gateway-class token stamps actor `gateway`,
+ *  and human-authoritative acts (decision acceptance, role:human sign-off)
+ *  are rejected by design — misconfigured UI paths fail loudly (ADR BR#2673). */
 
 export interface KbArtefact {
   id: string;
@@ -108,20 +112,31 @@ export interface KbBoard {
 }
 
 const base = () => getKbHubConfig().url;
-const bearer = () => getKbHubConfig().token;
 
 /** Thrown when auth fails (missing/expired cookie or bad token) — the shell funnels these into its sign-in gate. */
 export class KbAuthError extends Error {}
 
+/** Shell transport hook: native shells replace the webview fetch entirely —
+ *  cross-origin fetches can neither carry the HttpOnly session cookie
+ *  (SameSite=Lax) nor pass CORS reliably, so the desktop routes KB calls
+ *  through its Rust host which attaches the Cookie header itself. Browser
+ *  callers (webapp) keep plain same-origin fetch. */
+export type KbTransport = (path: string, init?: { method?: string; body?: string }) => Promise<unknown>;
+let transport: KbTransport | null = null;
+export function setKbTransport(t: KbTransport | null) {
+  transport = t;
+}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = bearer();
+  if (transport) {
+    return (await transport(path, {
+      method: init?.method,
+      body: typeof init?.body === "string" ? init.body : undefined,
+    })) as T;
+  }
   const headers = new Headers(init?.headers);
   if (init?.body) headers.set("content-type", "application/json");
-  if (token) headers.set("authorization", `Bearer ${token}`);
-  // Bearer mode must OMIT credentials: with credentials:"include" the fetch
-  // spec rejects wildcard Access-Control-Allow-Origin — native shells would
-  // have every response blocked no matter what the hub sends.
-  const r = await fetch(`${base()}${path}`, { ...(init ?? {}), credentials: token ? "omit" : "include", headers });
+  const r = await fetch(`${base()}${path}`, { ...(init ?? {}), credentials: "include", headers });
   if (r.status === 401) throw new KbAuthError("unauthorized");
   if (!r.ok) throw new Error(`${r.status} ${await r.text().then((t) => t.slice(0, 200))}`);
   return (await r.json()) as T;

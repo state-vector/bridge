@@ -780,3 +780,18 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ab-prior-line { font-size: 10px; color: var(--text-faint); margin-left: 2px; }
 .ab-meta { font-size: 10.5px; color: var(--text-faint); text-align: right; }
 .ab-actions { display: flex; gap: 4px; align-items: center; }
+
+/* title-bar status lights: hub / kb / gateways, click for details */
+.status-lights { position: relative; margin-right: 8px; }
+.lights-btn { display: inline-flex; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+.lights-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.lights-count { font-size: 10px; color: var(--text-faint); margin-left: 3px; }
+.lights-pop {
+  position: absolute; top: 100%; right: 0; z-index: 60; min-width: 260px;
+  background: var(--bg-raised, #151b28); border: 1px solid var(--border, #232b3b);
+  border-radius: 6px; padding: 10px 12px; margin-top: 4px;
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
+  box-shadow: 0 8px 28px rgba(0,0,0,.45); font-size: 11px;
+}
+.light-row { display: flex; align-items: center; gap: 6px; }
+.light-meta { color: var(--text-faint); margin-left: auto; font-size: 10px; }

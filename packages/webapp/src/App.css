@@ -744,3 +744,14 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .wt-state { font-size: 11px; color: var(--text-dim); }
 .wt-time { font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
 .wt-active .wt-time, .wt-row.wt-active .wt-time { color: var(--text-dim); }
+/* workspace picker (topbar) */
+.ws-picker { display: flex; align-items: center; gap: 6px; margin-right: 10px; }
+.ws-picker select { font-size: 11px; padding: 3px 6px; max-width: 180px; }
+.ws-create { display: flex; align-items: center; gap: 4px; }
+.ws-create input {
+  font-size: 11px; padding: 3px 6px; width: 130px;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; outline: none;
+}
+.ws-create input:focus { border-color: var(--accent); }
+.ws-new { padding: 2px 7px !important; }

@@ -7,8 +7,9 @@ import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { TopView } from "./components/TopView";
+import { WorkspacePicker } from "./components/WorkspacePicker";
 import type { WsFrame } from "@bridge/specs";
-import { Btn, Chip, ConnDot } from "@bridge/ui-kit";
+import { Btn, Chip, StatusLights } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "@bridge/ui-kit/tokens.css";
@@ -31,17 +32,12 @@ const TABS: Array<{ key: Tab; label: string }> = [
 
 function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   const conn = useBridge((s) => s.conn);
-  const kbConn = useKb((s) => s.conn);
   const session = useBridge((s) => s.session);
   const signOut = useBridge((s) => s.signOut);
 
   return (
     <header className="topbar">
-      <div className="brand">
-        Bridge
-        <ConnDot state={conn === "open" ? "open" : conn === "connecting" ? "connecting" : "closed"} className="conn" title={`hub: ${conn}`} />
-        <ConnDot state={kbConn === "open" ? "open" : "closed"} className="conn" title={`kb realtime: ${kbConn}`} />
-      </div>
+      <div className="brand">Bridge</div>
       <nav className="tabs">
         {TABS.map((t) => (
           <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => setTab(t.key)}>
@@ -50,6 +46,8 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
         ))}
       </nav>
       <div className="topbar-spacer" />
+      <StatusLights bridgeConn={conn === "open" ? "open" : conn === "connecting" ? "connecting" : "closed"} />
+      <WorkspacePicker />
       {session && (
         <div className="user-widget" title={session.expires_ts ? `session expires ${new Date(session.expires_ts).toLocaleString()}` : session.mode}>
           <span className="user-mode">{session.mode === "access" ? "SSO" : "GitHub"}</span>

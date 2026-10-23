@@ -34,4 +34,5 @@ export {
 } from "./views/TaskDetail";
 export { TopView } from "./views/TopView";
 export { BacklogView, CompletedView } from "./views/BacklogView";
+export { StatusLights } from "./views/StatusLights";
 export { ForMeView, type AskFeed } from "./views/ForMeView";
