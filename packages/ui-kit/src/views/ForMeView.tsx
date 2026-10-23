@@ -195,7 +195,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
       if (!(t.tags ?? []).includes("question") || !t.meta?.ask) return false;
       if (!["todo", "in_progress", "blocked"].includes(t.status)) return false;
       const am = t.meta.ask ?? {};
-      return !am.to || /^(human|ray|rayh)$/i.test(String(am.to)); // human-addressed only
+      return !(String(am.to ?? "").includes("@")); // session-scoped asks are agent-to-agent
     }),
     [tasks],
   );
