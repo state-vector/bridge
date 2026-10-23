@@ -3,11 +3,18 @@ import { useKb } from "../store/kb";
 import type { BoardPrefs } from "../store/kb";
 import { kindOf, rel, TASK_REF_RE } from "../lib/views";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
+import { kbApi } from "../lib/kb";
 import { Btn, Card, Chip, ConnDot, TextArea, TextInput } from "@bridge/ui-kit";
 
-/** Render text with task references (BR#12, TASK-007) as clickable links. */
-function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
+/** Render text with task references (BR#12, TASK-007) as clickable links.
+ *  ASK-… refs route to the ask popover (asks live in a separate registry). */
+function RefText({ text, onOpen, onOpenAsk }: { text: string; onOpen: (id: string) => void; onOpenAsk?: (id: string) => void }) {
   const parts = text.split(TASK_REF_RE);
+  const askRef = (p: string, i: number) => (
+    onOpenAsk
+      ? <span key={i} className="task-ref" title={`ask ${p} — open`} onClick={(e) => { e.stopPropagation(); onOpenAsk(p); }}>{p}</span>
+      : <span key={i} className="task-ref" title={`ask ${p}`}>{p}</span>
+  );
   return (
     <>
       {parts.map((p, i) =>
@@ -20,11 +27,63 @@ function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void 
           >
             {p}
           </span>
+        ) : /^ASK-[a-zA-Z0-9]+-[a-zA-Z0-9]+$/.test(p) ? (
+          askRef(p, i)
         ) : (
           <span key={i}>{p}</span>
         ),
       )}
     </>
+  );
+}
+
+/** Ask detail popover — resolves an ASK-… ref: the decision brief (summary /
+ *  why escalated / decision), status, answer, and the task it parks. */
+function AskPopover({ askId, onClose, onOpenTask }: { askId: string; onClose: () => void; onOpenTask: (id: string) => void }) {
+  const [ask, setAsk] = useState<any>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let dead = false;
+    setAsk(null); setErr("");
+    kbApi.ask(askId)
+      .then((a) => { if (!dead) (a as any).error ? setErr(String((a as any).error)) : setAsk(a); })
+      .catch((e) => { if (!dead) setErr(String((e as Error).message ?? e)); });
+    return () => { dead = true; };
+  }, [askId]);
+  const statusTone = ask?.status === "open" ? "needs" : ask?.status === "answered" ? "done" : "neutral";
+  return (
+    <div className="overlay-backdrop" onClick={onClose}>
+      <div className="forme-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="ask-chips">
+          <Chip tone="urgent">{(ask?.kind ?? "ask").toUpperCase()}</Chip>
+          <Chip tone={statusTone as any}>{(ask?.status ?? "…").toUpperCase()}</Chip>
+          <span className="why-line">{askId}{ask?.from_label ? ` · ${ask.from_label}` : ""}{ask?.to_target ? ` → ${ask.to_target}` : ""}{ask?.created_ts ? ` · ${rel(ask.created_ts)}` : ""}</span>
+          <Btn quiet className="forme-close" onClick={onClose}>✕</Btn>
+        </div>
+        {err && <p className="empty">{err}</p>}
+        {ask && (
+          <>
+            {ask.summary && <div className="task-progress-note"><b>what happened:</b> {ask.summary}</div>}
+            {ask.why_escalated && <div className="task-progress-note"><b>why not automatic:</b> {ask.why_escalated}</div>}
+            {ask.decision && <div className="task-progress-note"><b>decision needed:</b> {ask.decision}</div>}
+            {ask.done_when && <div className="task-progress-note"><b>done when:</b> {ask.done_when}</div>}
+            <div className="resp-body md-body md-pre">{ask.question}</div>
+            {!!ask.options?.length && (
+              <div className="ask-chips">
+                {ask.options.map((o: string) => (
+                  <Chip key={o} tone={ask.answer_choice === o ? "done" : "scope"}>{o}</Chip>
+                ))}
+              </div>
+            )}
+            {ask.answer && <div className="task-progress-note"><b>answer{ask.answered_by ? ` (${ask.answered_by})` : ""}:</b> {ask.answer}</div>}
+            {ask.answer_receipt && <div className="task-progress-note"><b>receipt:</b> {ask.answer_receipt}</div>}
+            {ask.artefact_id && (
+              <Btn onClick={() => { onClose(); onOpenTask(ask.artefact_id); }}>open {ask.artefact_id}</Btn>
+            )}
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -128,6 +187,8 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
   };
   const label: Record<string, string> = { done: "done" };
   const transition = useKb((s) => s.transition);
+  const [askId, setAskId] = useState<string | null>(null);
+  const openRef = (id: string) => (/^ASK-/.test(id) ? setAskId(id) : onOpen(id));
   const retry = async () => {
     try { await transition(task.id, "todo"); } catch { /* card stays blocked — e.g. open ask still pending */ }
   };
@@ -140,7 +201,7 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
       <div className="task-title" title={task.title}>
         {active && <span className="pulse" title="updated recently" />}
         {prefs.issue && <span className="task-id">{task.id}</span>}
-        <RefText text={task.title} onOpen={(id) => onOpen(id)} />
+        <RefText text={task.title} onOpen={openRef} onOpenAsk={setAskId} />
       </div>
       <div className="task-row task-status-row">
         <span className={`kind-pill kp-${kindOf(task)}`} title="task kind">{kindOf(task)}</span>
@@ -182,7 +243,7 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
 
       {p?.will && (
         <div className="task-snippet task-will" title="the agent's declared next action — what it was about to do when it last checked in">
-          ▸ <RefText text={p.will.slice(0, 140) + (p.will.length > 140 ? "…" : "")} onOpen={(id) => onOpen(id)} />
+          ▸ <RefText text={p.will.slice(0, 140) + (p.will.length > 140 ? "…" : "")} onOpen={openRef} onOpenAsk={setAskId} />
         </div>
       )}
 
@@ -227,8 +288,8 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
           {(task.meta.blocked.reason ?? "").startsWith("abandoned") && (
             <Chip tone="urgent">abandoned</Chip>
           )}
-          <div className="task-progress-note"><b>why:</b> {task.meta.blocked.reason}</div>
-          <div className="task-progress-note"><b>unblocks when:</b> {task.meta.blocked.unblock_condition}</div>
+          <div className="task-progress-note"><b>why:</b> <RefText text={task.meta.blocked.reason} onOpen={openRef} onOpenAsk={setAskId} /></div>
+          <div className="task-progress-note"><b>unblocks when:</b> <RefText text={task.meta.blocked.unblock_condition} onOpen={openRef} onOpenAsk={setAskId} /></div>
         </div>
       )}
 
@@ -250,6 +311,8 @@ function TaskCard({ task, prefs, now, series, onOpen }: {
           )
         ))}
       </div>
+
+      {askId && <AskPopover askId={askId} onClose={() => setAskId(null)} onOpenTask={(id) => onOpen(id)} />}
     </div>
   );
 }

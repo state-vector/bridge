@@ -88,21 +88,33 @@ export interface KbVersion {
   data: Record<string, unknown>;
 }
 
-/** An open ask (agent → human decision request) that may be blocking a task. */
+/** A decision ask (separate registry, not an artefact) — fetchable so ASK-…
+ *  refs on cards resolve instead of dead-ending. Kind discriminates what the
+ *  receiver holds (ADR BR#2672): ask = information, decision = a ruling with
+ *  renderable options, action = a capability with a done_when receipt bar. */
 export interface KbAsk {
   id: string;
   /** human handle: ASK-<subject>-<ordinal> ("ASK-BR-2466-2") */
   display?: string;
-  to: string;
+  from_label: string;
+  to_target: string;
+  to?: string;
+  urgency?: string;
   question: string;
-  options: string[];
-  urgency: string;
-  status: string;
-  artefact_id?: string;
-  answer?: string;
-  answered_by?: string;
-  answered_ts?: number;
+  summary?: string | null;
+  why_escalated?: string | null;
+  decision?: string | null;
+  kind?: "ask" | "decision" | "action" | null;
+  options?: string[] | null;
+  done_when?: string | null;
+  status: "open" | "answered" | "expired";
+  answer?: string | null;
+  answered_by?: string | null;
+  answer_choice?: string | null;
+  answer_receipt?: string | null;
   created_ts: number;
+  answered_ts?: number | null;
+  artefact_id?: string | null;
 }
 
 export interface KbBoard {
@@ -152,9 +164,12 @@ export const kbApi = {
     return j<{ artefacts: KbArtefact[] }>(`/api/kb/artefacts${p.size ? `?${p}` : ""}`);
   },
   artefact: (id: string) => j<KbArtefact & { relations: { relation: string; artefact_id: string; dir: string }[] }>(`/api/kb/artefact?id=${encodeURIComponent(id)}`),
-  ask: (id: string) => j<KbAsk>(`/api/kb/ask?id=${encodeURIComponent(id)}`),
-  askAnswer: (id: string, answer: string) =>
-    j<{ id: string; status: string; artefact_id?: string; task_status?: string }>("/api/kb/ask_answer", { method: "POST", body: JSON.stringify({ id, answer }) }),
+  ask: (id: string) => j<KbAsk & { error?: string }>(`/api/kb/ask?id=${encodeURIComponent(id)}`),
+  askAnswer: (id: string, answerOrBody: string | { answer?: string; choice?: string; receipt?: string }) =>
+    j<{ id: string; status: string; artefact_id?: string; task_status?: string }>("/api/kb/ask_answer", {
+      method: "POST",
+      body: JSON.stringify({ id, ...(typeof answerOrBody === "string" ? { answer: answerOrBody } : answerOrBody) }),
+    }),
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),

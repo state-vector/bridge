@@ -169,7 +169,7 @@ export function ForMeView({ openThread, askFeed }: { openThread?: (taskId: strin
   const blockedOnAsk = tasks.filter((t: any) => t.meta?.awaiting_ask?.ask_id && t.status === "blocked");
   const answerGo = async (t: any) => {
     try {
-      await kbApi.askAnswer(t.meta.awaiting_ask.ask_id, "GO — approved per the receipts on this ask");
+      await kbApi.askAnswer(t.meta.awaiting_ask.ask_id, { answer: "GO — approved per the receipts on this ask" });
       setTick((x) => x + 1);
     } catch { /* surfaced via refresh */ }
   };

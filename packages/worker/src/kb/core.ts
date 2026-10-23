@@ -251,6 +251,66 @@ export function isValidAskTarget(to: string): boolean {
 export const ASK_OPEN = "open";
 export const ASK_ANSWERED = "answered";
 
+/**
+ * Ask contract (steering BR#2643): a decision ask is a BRIEF, not a data dump.
+ * `summary` = what happened (with receipt links); `why_escalated` = why this is
+ * not automatic (the gate / credential / authority that forces a human);
+ * `decision` = the actual choice, (a)/(b), each with its receipt condition.
+ * `question` remains the full detail. The blocked card renders summary-first —
+ * the board must show substance, never the ask's preamble.
+ */
+export function composeBlockedAskNote(a: {
+  id: string;
+  to: string;
+  question: string;
+  summary?: string;
+  why_escalated?: string;
+  decision?: string;
+}): string {
+  const summary = (a.summary ?? "").trim() || a.question.replace(/\s+/g, " ").trim();
+  const parts = [`blocked on decision (ask ${a.id} → ${a.to}) — ${summary}`];
+  if ((a.decision ?? "").trim()) parts.push(`DECISION: ${(a.decision ?? "").trim()}`);
+  if ((a.why_escalated ?? "").trim()) parts.push(`WHY HUMAN: ${(a.why_escalated ?? "").trim()}`);
+  return parts.join(" · ");
+}
+
+/** Machine-checkable-ish unblock condition: carries the decision gist, never a
+ *  bare "answer to ask X" when the asker stated what the decision IS. */
+export function composeAskUnblock(a: { id: string; decision?: string }): string {
+  const d = (a.decision ?? "").trim();
+  return d ? `decision on ask ${a.id}: ${d.replace(/\s+/g, " ").slice(0, 160)}` : `answer to ask ${a.id}`;
+}
+
+/**
+ * Ask kinds (ADR BR#2672): one ask entity, three kinds — the kind encodes what
+ * the human/peer HOLDS at the gate:
+ *  - `ask`      — information: closure is an answer.
+ *  - `decision` — authority: closure is a choice; declare `options[]` and they
+ *                 render as buttons.
+ *  - `action`   — capability: closure is a receipt; carries `done_when`
+ *                 (machine-checkable where possible).
+ * Lifecycle mechanics (bind → pause watchdog → answer resumes) are shared.
+ */
+export const ASK_KINDS = ["ask", "decision", "action"] as const;
+export type AskKind = (typeof ASK_KINDS)[number];
+
+export function isValidAskKind(kind: string): kind is AskKind {
+  return (ASK_KINDS as readonly string[]).includes(kind);
+}
+
+/** Compose the persisted `answer` text from a structured answer payload
+ *  ({choice?, note?, receipt?}) — the stored blob stays human-readable and
+ *  backward-compatible while answer_choice/answer_receipt carry the machine
+ *  fields. Order: CHOICE · note · RECEIPT. */
+export function composeStructuredAnswer(a: { choice?: string; answer?: string; receipt?: string }): string {
+  const parts = [
+    (a.choice ?? "").trim() ? `CHOICE: ${(a.choice ?? "").trim()}` : "",
+    (a.answer ?? "").trim(),
+    (a.receipt ?? "").trim() ? `RECEIPT: ${(a.receipt ?? "").trim()}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
 // ---------- settings ----------
 
 export const SETTINGS_KEYS = ["project_name", "board", "bootstrap_md"] as const;
@@ -282,7 +342,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `5. Status is your responsibility: claim → in_progress immediately; finish → in_review with the PR link in the note; stuck → blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict — bounce = action the findings; done = released. Gates are enforced — unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `5c. VERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident). Verification agents: BEFORE any substance check, confirm the PR is mechanically mergeable — gh pr view --json mergeable,mergeStateStatus,reviewDecision AND every commit signature isValid=true. mergeable=false / CONFLICTING / any unsigned or NO_USER commit → STOP: zero substance checks, and bounce the parent to in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push"). Never file a human ask for a mechanical defect, never report "verified, awaiting merge" for an unmergeable PR (false report — it has zero verified legs), and never treat "accept the unsigned commit" as an option (the ruleset forbids it by construction). The ONLY escalation to a human: a broken signing environment (key unavailable / NO_USER) — one ask describing the environment covers the whole class, never one per PR.`,
-    `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
+    `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you. ASK CONTRACT — a decision ask is a brief, not a data dump: summary (what happened, one paragraph, receipt links), why_escalated (why this is not automatic — name the gate, credential, or authority that forces a human), decision (the actual choice: (a)/(b), each with what it does and its receipt condition). question carries the full detail. The blocked card renders summary-first; an ask that cannot fill the three fields means the analysis is not done. KINDS — declare what the receiver holds: kind=ask (you need information), kind=decision (you need a ruling — declare options[] and they render as buttons), kind=action (you need a capability exercised — say what done looks like in done_when, machine-checkable where possible). Answers are structured: choice (an option-ref) + note + receipt; a bare blob forces the asker's machine to re-parse prose.`,
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch — the docs are the interface, stale docs are a defect.`,

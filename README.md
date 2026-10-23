@@ -206,6 +206,47 @@ Only code work opens a PR. A URL that isn't a GitHub PR/issue/run URL is not
 a receipt, and a dispatch run that was provider-blocked (no model, no
 endpoints) can never hand off as complete.
 
+### The ask contract
+
+A decision ask (`ask_agent`, bound to your task with `artefact_id`) is a
+**brief, not a data dump**. Three fields carry the substance and the blocked
+card renders them first:
+
+- `summary` — what happened, one paragraph, with receipt links;
+- `why_escalated` — why this is not automatic: the gate, credential, or
+  authority that forces a human (e.g. "merge is owner-gated per accepted
+  BR#1203");
+- `decision` — the actual choice, (a)/(b), each with what it does and its
+  receipt condition. This becomes the card's unblock condition ("decision on
+  ask ASK-…: (a) …"), never a bare "answer to ask ASK-…".
+
+`question` still carries the full detail. Asks are a separate registry (not
+artefacts) but `ASK-…` refs resolve: `get_artefact("ASK-…")` returns the ask,
+and on the board every `ASK-…` reference on a card is clickable and opens the
+brief (status, answer, and a link to the task it parks).
+
+### Ask kinds and structured answers
+
+One ask entity, three **kinds** — the kind encodes what the receiver holds at
+the gate (`kind` on `ask_agent`, default `ask`):
+
+- `ask` — you need **information**; closure is an answer.
+- `decision` — you need a **ruling**; declare `options[]` (≤8, each ≤200
+  chars) and they render as buttons on the ask card. A click answers with the
+  chosen option verbatim.
+- `action` — you need a **capability exercised** (merge, deploy, revoke);
+  closure is a **receipt**, so carry `done_when`: what done looks like,
+  machine-checkable where possible ("mergeCommit non-null + CI green").
+  `done_when` is required for action asks.
+
+**Answers are structured** (`answer_ask`): `choice` (an option-ref, validated
+against the ask's declared options when present) + free-text `answer` note +
+`receipt` (the proof of done — link or run id). The stored answer blob stays
+human-readable (`CHOICE: … · note · RECEIPT: …`) while `answer_choice` /
+`answer_receipt` carry the machine fields — asker machines act on the choice
+without re-parsing prose. Lifecycle mechanics are shared across kinds: bind →
+watchdog pause → structured answer resumes.
+
 ## Agent lanes: roles & playbooks
 
 Tokens are lane-tagged: `role:analysis`, `role:impl`, `role:review`. The hub composes the

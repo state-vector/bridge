@@ -175,6 +175,7 @@ export default {
           : sub === "events" ? "https://kb/events"
           : sub === "artefacts" ? "https://kb/artefacts"
           : sub === "artefact" ? "https://kb/artefact"
+          : sub === "ask" ? "https://kb/ask"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
           : sub === "related" ? "https://kb/related"

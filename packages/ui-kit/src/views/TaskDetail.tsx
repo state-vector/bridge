@@ -223,10 +223,14 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       {ask && ask.status === "open" && (
         <div className="task-blocked-info">
           <div className="progress-note">
-            <b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.display ?? ask.id} · to {ask.to} · asked {rel(ask.created_ts)}
+            <b>{ask.urgency === "urgent" ? "URGENT ask" : (ask.kind ?? "ask").toUpperCase()}</b> {ask.display ?? ask.id} · to {ask.to ?? ask.to_target} · asked {rel(ask.created_ts)}
           </div>
           <div className="progress-note"><LongText text={ask.question} limit={260} /></div>
-          {ask.options.length > 0 && (
+          {ask.summary && <div className="progress-note"><b>what happened:</b> <LongText text={ask.summary} limit={220} /></div>}
+          {ask.why_escalated && <div className="progress-note"><b>why not automatic:</b> <LongText text={ask.why_escalated} limit={220} /></div>}
+          {ask.decision && <div className="progress-note"><b>decision needed:</b> <LongText text={ask.decision} limit={220} /></div>}
+          {ask.done_when && <div className="progress-note"><b>done when:</b> <LongText text={ask.done_when} limit={220} /></div>}
+          {!!ask.options?.length && (
             <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
               {ask.options.map((o) => (
                 <Btn key={o} size="sm" variant="accept" disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
@@ -440,7 +444,9 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
   );
 }
 
-/** Render text with task references (BR#12, TASK-007) as clickable links. */
+/** Render text with task references (BR#12, TASK-007) as clickable links.
+ *  ASK-… refs highlight but don't navigate (asks are a separate registry —
+ *  the webapp opens them via its ask popover). */
 export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
   const parts = text.split(TASK_REF_RE);
   return (
@@ -448,6 +454,8 @@ export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) =
       {parts.map((p, i) =>
         /^(BR#\d+|TASK-\d+)$/.test(p) ? (
           <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen(p); }}>{p}</span>
+        ) : /^ASK-[a-zA-Z0-9]+-[a-zA-Z0-9]+$/.test(p) ? (
+          <span key={i} className="task-ref" title={`ask ${p} — openable in the Bridge webapp`}>{p}</span>
         ) : (
           <span key={i}>{p}</span>
         ),

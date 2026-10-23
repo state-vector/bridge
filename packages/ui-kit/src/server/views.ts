@@ -62,4 +62,4 @@ export function kindOf(task: { tags?: string[] | null; meta?: any }): string {
 }
 
 /** Task references (BR#12, TASK-007) inside arbitrary text — for hyperlinking. */
-export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+)\b/g;
+export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+|ASK-[a-zA-Z0-9]+-[a-zA-Z0-9]+)\b/g;

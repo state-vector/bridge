@@ -47,6 +47,10 @@ import {
   isQuestionTask,
   isWsSlug,
   isValidAskTarget,
+  isValidAskKind,
+  composeBlockedAskNote,
+  composeAskUnblock,
+  composeStructuredAnswer,
   tagsSayGateway,
   parseTags,
   resolveRolePlaybook,
@@ -663,6 +667,14 @@ export class KnowledgeHub {
       `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
       `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
       `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
+      `ALTER TABLE asks ADD COLUMN summary TEXT`,
+      `ALTER TABLE asks ADD COLUMN why_escalated TEXT`,
+      `ALTER TABLE asks ADD COLUMN decision TEXT`,
+      `ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'ask'`,
+      `ALTER TABLE asks ADD COLUMN options TEXT`,
+      `ALTER TABLE asks ADD COLUMN done_when TEXT`,
+      `ALTER TABLE asks ADD COLUMN answer_choice TEXT`,
+      `ALTER TABLE asks ADD COLUMN answer_receipt TEXT`,
       `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE pairings ADD COLUMN type TEXT`,
@@ -740,12 +752,12 @@ export class KnowledgeHub {
       switch (url.pathname) {
         case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
         case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+        case "/ask": return this.json((() => { try { return this.askGet({ id: url.searchParams.get("id") ?? "" }); } catch (e) { return { error: String((e as Error).message ?? e) }; } })());
         case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
         case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
         case "/board": return this.json(await this.board());
         case "/stats": return this.json(await this.stats());
         case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
-        case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
       }
     }
 
@@ -777,9 +789,9 @@ export class KnowledgeHub {
         case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
+        case "ask.get": return this.json(this.askGet(body));
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
-        case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
         case "orient": return this.json(await this.orient(body));
         case "progress.log": return this.json(await this.progressLog(body, actor));
         case "session.alive": {
@@ -1991,8 +2003,21 @@ export class KnowledgeHub {
     if (!question) throw new Error("question is required");
     if (question.length > 2000) throw new Error("question exceeds 2000 chars");
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
-    const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
+    // Ask contract (BR#2643): summary / why_escalated / decision — the blocked
+    // card renders these first so a human sees WHAT HAPPENED · DECISION · WHY
+    // HUMAN, not the ask's preamble.
+    const summary = String(body.summary ?? "").trim().slice(0, 400);
+    const whyEscalated = String(body.why_escalated ?? "").trim().slice(0, 300);
+    const decision = String(body.decision ?? "").trim().slice(0, 400);
+    // Ask kinds (ADR BR#2672): ask = information, decision = a ruling (options
+    // render as buttons), action = a capability exercised (carries done_when).
+    const kind = body.kind === undefined || body.kind === "" ? "ask" : String(body.kind);
+    if (!isValidAskKind(kind)) throw new Error(`invalid ask kind '${kind}' (ask|decision|action)`);
+    const doneWhen = String(body.done_when ?? "").trim().slice(0, 400);
+    if (kind === "action" && !doneWhen)
+      throw new Error(`ask kind 'action' requires done_when — what done looks like, machine-checkable where possible`);
     const options = Array.isArray(body.options) ? body.options.map((o: any) => String(o).slice(0, 200)).filter(Boolean).slice(0, 8) : [];
+    const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
     const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
     const id = `ASK-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     let taskStatus: string | undefined;
@@ -2006,8 +2031,8 @@ export class KnowledgeHub {
         if (row.status === "in_progress") {
           await this.transition({
             id: artefactId, to: "blocked",
-            note: `blocked on decision — ${id}: ${question.slice(0, 120)}`,
-            unblock_condition: `answer to ask ${id}`,
+            note: composeBlockedAskNote({ id, to, question, summary, why_escalated: whyEscalated, decision }),
+            unblock_condition: composeAskUnblock({ id, decision }),
             awaiting_ask_id: id, // machine.ts: the only legal blocked for verdict duties
           }, actor);
           taskStatus = "blocked";
@@ -2017,11 +2042,21 @@ export class KnowledgeHub {
       }
     }
     this.state.storage.sql.exec(
-      `INSERT INTO asks (id, from_label, to_target, question, status, created_ts, artefact_id) VALUES (?, ?, ?, ?, 'open', ?, ?)`,
-      id, actor, to, question, Date.now(), artefactId || null,
+      `INSERT INTO asks (id, from_label, to_target, question, summary, why_escalated, decision, kind, options, done_when, status, created_ts, artefact_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+      id, actor, to, question, summary || null, whyEscalated || null, decision || null, kind, options.length ? JSON.stringify(options) : null, doneWhen || null, Date.now(), artefactId || null,
     );
-    this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
-    return { id, to, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
+    this.audit(actor, "ask", artefactId || null, { to, question, summary, why_escalated: whyEscalated, decision, kind, options, done_when: doneWhen || undefined, urgency, ask_id: id });
+    return { id, to, question, summary: summary || undefined, why_escalated: whyEscalated || undefined, decision: decision || undefined, kind, options, done_when: doneWhen || undefined, artefact_id: artefactId || undefined, urgency, task_status: taskStatus };
+  }
+
+  /** Parse the persisted options JSON — [] on absent/malformed (never null). */
+  private parseAskOptions(row: any): string[] {
+    try {
+      const v = JSON.parse(row.options ?? "[]");
+      return Array.isArray(v) ? v.map(String) : [];
+    } catch {
+      return [];
+    }
   }
 
   private async askInbox(body: any) {
@@ -2030,11 +2065,11 @@ export class KnowledgeHub {
     const placeholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
     const marks = placeholders.map(() => "?").join(",");
     const open = this.state.storage.sql.exec(
-      `SELECT id, from_label, to_target, question, created_ts FROM asks
+      `SELECT id, from_label, to_target, question, summary, why_escalated, decision, kind, options, done_when, artefact_id, created_ts FROM asks
        WHERE status = 'open' AND from_label != ? AND to_target IN (${marks})
        ORDER BY created_ts DESC LIMIT 50`,
       label, ...placeholders,
-    ).toArray();
+    ).toArray().map((r: any) => ({ ...r, kind: r.kind ?? "ask", options: this.parseAskOptions(r) }));
     const sent = this.state.storage.sql.exec(
       `SELECT id, to_target, question, status, answer, answered_by, created_ts FROM asks
        WHERE from_label = ? ORDER BY created_ts DESC LIMIT 50`,
@@ -2054,31 +2089,42 @@ export class KnowledgeHub {
     return `ASK-${String(row.artefact_id).replace(/#/g, "-")}-${Number(ord?.n ?? 1)}`;
   }
 
-  private async askGet(id: string) {
-    const row = this.one(
-      `SELECT id, from_label, to_target, question, status, artefact_id, answer, answered_by, answered_ts, created_ts
-         FROM asks WHERE id = ?`, id,
-    );
-    if (!row) return null;
+  /** Fetch one ask by id — makes ASK-… refs resolvable from cards/MCP.
+   *  Accepts a bare id or {id}; returns the full contract row (kind, parsed
+   *  options, done_when) plus the human-plane aliases (display/from/to). */
+  private askGet(body: any) {
+    const id = String(typeof body === "string" ? body : body?.id ?? "").trim();
+    const row = this.one(`SELECT * FROM asks WHERE id = ?`, id) as any;
+    if (!row) throw new Error(`no such ask: ${id}`);
     return {
-      id: row.id, display: this.askDisplay(row), from: row.from_label, to: row.to_target, question: row.question,
-      options: [] as string[], urgency: "normal", status: row.status,
-      artefact_id: row.artefact_id ?? undefined,
-      answer: row.answer ?? undefined, answered_by: row.answered_by ?? undefined,
-      answered_ts: row.answered_ts ?? undefined, created_ts: row.created_ts,
+      type: "ask", ...row,
+      kind: row.kind ?? "ask",
+      options: this.parseAskOptions(row),
+      display: this.askDisplay(row),
+      from: row.from_label, to: row.to_target, urgency: "normal",
     };
   }
 
   private async askAnswer(body: any, actor: string) {
     const id = String(body.id ?? "");
-    const answer = String(body.answer ?? "").trim();
-    if (!answer) throw new Error("answer is required");
-    const row = this.one(`SELECT status, artefact_id FROM asks WHERE id = ?`, id);
+    // Structured answers (ADR BR#2672): {choice?, note?, receipt?} — buttons
+    // write choice (an option-ref) + receipt; the free-text note stays the
+    // constant escape hatch. The stored `answer` blob remains human-readable
+    // (composed), answer_choice/answer_receipt carry the machine fields.
+    const choice = String(body.choice ?? "").trim().slice(0, 200);
+    const note = String(body.answer ?? "").trim();
+    const receipt = String(body.receipt ?? "").trim().slice(0, 600);
+    if (!choice && !note && !receipt) throw new Error("answer is required (note and/or choice and/or receipt)");
+    const row = this.one(`SELECT status, artefact_id, options FROM asks WHERE id = ?`, id);
     if (!row) throw new Error(`no such ask: ${id}`);
     if (row.status !== ASK_OPEN) throw new Error(`ask ${id} already ${row.status}`);
+    const declared = this.parseAskOptions(row);
+    if (choice && declared.length && !declared.includes(choice))
+      throw new Error(`choice '${choice}' is not one of this ask's options (${declared.join(" | ")})`);
+    const answer = composeStructuredAnswer({ choice, answer: note, receipt }).slice(0, 4000);
     this.state.storage.sql.exec(
-      `UPDATE asks SET status = 'answered', answer = ?, answered_by = ?, answered_ts = ? WHERE id = ?`,
-      answer.slice(0, 4000), actor, Date.now(), id,
+      `UPDATE asks SET status = 'answered', answer = ?, answered_by = ?, answered_ts = ?, answer_choice = ?, answer_receipt = ? WHERE id = ?`,
+      answer, actor, Date.now(), choice || null, receipt || null, id,
     );
     let taskStatus: string | undefined;
     if (row.artefact_id) {
@@ -2098,8 +2144,8 @@ export class KnowledgeHub {
         }
       }
     }
-    this.audit(actor, "answer", row.artefact_id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
-    return { id, status: ASK_ANSWERED, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
+    this.audit(actor, "answer", row.artefact_id ?? null, { ask_id: id, answer: answer.slice(0, 200), choice: choice || undefined, receipt: receipt || undefined });
+    return { id, status: ASK_ANSWERED, answer, choice: choice || undefined, receipt: receipt || undefined, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
   }
 
   private async orient(body: any) {
@@ -2119,7 +2165,7 @@ export class KnowledgeHub {
       // is the actionable part of a blocked card
       if (t.type === "task") {
         const m = JSON.parse(t.meta ?? "{}");
-        if (m.blocked) { t.blocked_reason = (m.blocked.reason ?? "").slice(0, 200); t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 200); }
+        if (m.blocked) { t.blocked_reason = (m.blocked.reason ?? "").slice(0, 300); t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 300); }
         if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
         delete t.meta;
       }
@@ -2128,11 +2174,11 @@ export class KnowledgeHub {
     const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
     const askMarks = askPlaceholders.map(() => "?").join(",");
     const pendingAsks = this.state.storage.sql.exec(
-      `SELECT id, from_label, to_target, question, created_ts FROM asks
+      `SELECT id, from_label, to_target, question, summary, why_escalated, decision, kind, options, done_when, artefact_id, created_ts FROM asks
        WHERE status = 'open' AND from_label != ? AND to_target IN (${askMarks})
        ORDER BY created_ts DESC LIMIT 10`,
       label, ...askPlaceholders,
-    ).toArray();
+    ).toArray().map((r: any) => ({ ...r, kind: r.kind ?? "ask", options: this.parseAskOptions(r) }));
     const settings = this.settingsMap();
     const projectName = settings.project_name || "Superpositional";
     // my_tasks for a gateway includes the work of the agents it dispatched

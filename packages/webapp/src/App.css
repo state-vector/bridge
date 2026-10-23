@@ -386,6 +386,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* markdown rendering (decisions, comments) */
 .md-body { font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.md-pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow-y: auto; margin: 8px 0; }
 .md-body h1, .md-body h2, .md-body h3 { font-size: 13.5px; margin: 10px 0 4px; font-weight: 650; }
 .md-body h1:first-child, .md-body h2:first-child, .md-body h3:first-child { margin-top: 0; }
 .md-body p { margin: 6px 0; }

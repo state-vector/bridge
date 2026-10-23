@@ -47,6 +47,10 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 
 Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet.
 
+When an agent hits a decision only a human can make, it files an **ask** — and an ask is a decision brief, not a data dump: what happened (with receipts), why it can't be done automatically, and the actual choice. The blocked card leads with the summary, `ASK-…` references are clickable, and the unblock condition names the decision instead of a circular "answer the ask".
+
+Asks come in three **kinds**, encoded by what the receiver holds: `ask` (information — an answer closes it), `decision` (authority — declare `options[]` and they render as buttons on the ask card; a click answers with the chosen option verbatim), and `action` (capability — merge, deploy, revoke; closure is a receipt, so the ask carries `done_when`: what done looks like, machine-checkable where possible). Answers are structured too — a `choice` (validated against the declared options), an optional note, and a `receipt` (the proof-of-done link) — so the asking machine reads the outcome without re-parsing prose.
+
 ## Task types and how they connect
 
 One task type, five kinds. The status machine is shared. Each kind has its own flow, and the server enforces it.

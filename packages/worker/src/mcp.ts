@@ -258,6 +258,12 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     case "search_knowledge":
       return text(JSON.stringify(await call("search", { q: args.q, type: args.type, limit: args.limit })));
     case "get_artefact": {
+      // asks are not artefacts (separate registry) but ASK-… refs must resolve:
+      // return the ask brief so a card reference is never a dead end.
+      if (/^ASK-/i.test(String(args.id ?? ""))) {
+        const ask = await call("ask.get", { id: args.id });
+        return text(JSON.stringify(ask, null, 1));
+      }
       const a = await call("get", { id: args.id });
       const rel = await call("relations", { id: args.id });
       // proactive surfacing: related work + docs, so agents discover overlap
@@ -354,7 +360,17 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       }));
     }
     case "ask_agent": {
-      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, artefact_id: args.artefact_id });
+      const a = await call("ask.create", {
+        to: args.to ?? "any",
+        question: args.question,
+        summary: args.summary,
+        why_escalated: args.why_escalated,
+        decision: args.decision,
+        kind: args.kind,
+        options: args.options,
+        done_when: args.done_when,
+        artefact_id: args.artefact_id,
+      });
       return text(JSON.stringify({
         ...a,
         note: a.task_status === "blocked"
@@ -366,8 +382,9 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       const inbox = await call("ask.inbox", { label: identity.label, tags: identity.tags });
       return text(JSON.stringify(inbox, null, 1));
     }
-    case "answer_ask": {
-      const a = await call("ask.answer", { id: args.id, answer: args.answer });
+    case "answer_ask":
+    case "ask_answer": { // alias — ask_answer is a published name with no handler before this
+      const a = await call("ask.answer", { id: args.id, answer: args.answer, choice: args.choice, receipt: args.receipt });
       return text(JSON.stringify(a));
     }
     default:
@@ -494,13 +511,15 @@ const TOOLS = [
   },
   {
     name: "ask_answer",
-    description: "Answer an ask addressed to you (or escalate it): closes the ask with your answer and un-blocks whatever was waiting on it. Required for ask hygiene — unanswered asks park tasks indefinitely.",
+    description: "Answer an ask addressed to you (or escalate it): closes the ask with your answer and un-blocks whatever was waiting on it. Required for ask hygiene — unanswered asks park tasks indefinitely. Structured: choice (option-ref) + note + receipt — the asker's machine reads choice/receipt without re-parsing prose.",
     inputSchema: {
       type: "object",
-      required: ["id", "answer"],
+      required: ["id"],
       properties: {
-        id: { type: "string", description: "ask artefact id (ASK-…)" },
-        answer: { type: "string", description: "the answer / decision" },
+        id: { type: "string", description: "ask id (ASK-…)" },
+        choice: { type: "string", description: "the chosen option, verbatim from the ask's options[] (validated against them when declared)" },
+        answer: { type: "string", description: "free-text note — the escape hatch on every ask; optional when choice/receipt carry it" },
+        receipt: { type: "string", description: "proof of done for action asks — link or run id (e.g. the PR URL or Actions run URL)" },
       },
     },
   },
@@ -543,13 +562,19 @@ const TOOLS = [
   },
   {
     name: "ask_agent",
-    description: "Ask another agent for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered.",
+    description: "Ask another agent (or the human via the Bridge app) for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. KINDS — declare what the receiver holds: kind=ask (you need information; closure is an answer), kind=decision (you need a ruling; declare options[] — they render as buttons and a click writes a structured choice), kind=action (you need a capability exercised — merge, deploy, revoke; closure is a receipt, so carry done_when: what done looks like, machine-checkable where possible, e.g. 'mergeCommit non-null + CI green'). EVERY ask is a BRIEF, not a data dump — fill the contract: summary (what happened, one paragraph, receipt links), why_escalated (why this is not automatic — name the gate/credential/authority that forces a human), decision (the actual choice, (a)/(b), each with what it does and its receipt condition). question carries the full detail. The blocked card renders summary-first; an ask missing the contract reads as burden-shifting and gets bounced.",
     inputSchema: {
       type: "object",
       required: ["question"],
       properties: {
         to: { type: "string", description: "default: any" },
-        question: { type: "string" },
+        question: { type: "string", description: "full detail + receipts" },
+        kind: { type: "string", enum: ["ask", "decision", "action"], description: "what the receiver holds: ask = information (an answer closes it), decision = authority (a choice closes it — declare options), action = capability (a receipt closes it — carry done_when). default: ask" },
+        options: { type: "array", items: { type: "string" }, maxItems: 8, description: "for kind=decision/action — the renderable buttons, e.g. [\"(a) GO — merge PR #102\", \"(b) NO-GO — re-scope\"]; a click answers with the chosen option verbatim" },
+        done_when: { type: "string", description: "for kind=action — the observable done condition, machine-checkable where possible (e.g. 'deployment status success on sha >= X'); required for action asks" },
+        summary: { type: "string", description: "WHAT HAPPENED — one paragraph with receipt links; the board shows this first" },
+        why_escalated: { type: "string", description: "WHY THIS IS NOT AUTOMATIC — the gate, credential, or authority that forces the human/other agent" },
+        decision: { type: "string", description: "THE CHOICE — (a)/(b), each with what it does and its receipt condition; becomes the unblock condition" },
         artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },
       },
     },
@@ -561,11 +586,16 @@ const TOOLS = [
   },
   {
     name: "answer_ask",
-    description: "Answer an ask from your inbox.",
+    description: "Answer an ask from your inbox (or act it: for kind=action asks the answer IS the receipt). Answers are structured: choice (option-ref) + note + receipt — the asker's machine reads choice/receipt without re-parsing prose.",
     inputSchema: {
       type: "object",
-      required: ["id", "answer"],
-      properties: { id: { type: "string" }, answer: { type: "string" } },
+      required: ["id"],
+      properties: {
+        id: { type: "string", description: "ask id (ASK-…)" },
+        choice: { type: "string", description: "the chosen option, verbatim from the ask's options[] (validated against them when declared)" },
+        answer: { type: "string", description: "free-text note — the escape hatch on every ask; optional when choice/receipt carry it" },
+        receipt: { type: "string", description: "proof of done for action asks — link or run id (e.g. the PR URL or Actions run URL)" },
+      },
     },
   },
 ];

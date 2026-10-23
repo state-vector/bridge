@@ -106,7 +106,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
   const unblockFromRow = async (r: TopRow, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      if (r.askPending) await kbApi.askAnswer(r.askPending, "unblocked by human (Top)");
+      if (r.askPending) await kbApi.askAnswer(r.askPending, { answer: "unblocked by human (Top)" });
       else if (r.taskId) await kbApi.transition(r.taskId, "in_progress", { note: "unblocked by human — condition satisfied (Top)" });
       await refreshKb();
     } catch { /* the panel surfaces failures with full context */ }
