@@ -170,7 +170,16 @@ export class KnowledgeHub {
         // the release stays human-owned (an answered ask un-blocks it).
         try {
           let ask: { to_target?: string; created_ts: number } | undefined;
-          if (/^BR#\d+$/.test(String(meta.awaiting_ask.ask_id))) {
+          const derived = this.one(
+            `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
+             JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.tags LIKE '%"question"%' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
+          );
+          if (derived) {
+            const nm = JSON.parse(derived.cmeta ?? "{}");
+            ask = { to_target: nm.ask?.to, created_ts: derived.created_ts };
+          } else if (/^BR#\d+$/.test(String(meta.awaiting_ask.ask_id))) {
             const node = this.one(`SELECT meta, created_ts, status FROM artefacts WHERE id = ? AND status IN ('todo','in_progress','blocked')`, meta.awaiting_ask.ask_id);
             if (node) {
               const nm = JSON.parse(node.meta ?? "{}");
@@ -426,6 +435,19 @@ export class KnowledgeHub {
       `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
     ).toArray();
+    // open question children: the DERIVED source for awaiting_ask (phase 4 —
+    // the marker was a second source of truth that could drift)
+    const openAskChildren = this.state.storage.sql.exec(
+      `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
+       FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
+         AND c.tags LIKE '%"question"%'
+       ORDER BY c.created_ts DESC`,
+    ).toArray();
+    const askChildOf = new Map<string, any>();
+    for (const c of openAskChildren as any[]) {
+      if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
+    }
     const progress = this.state.storage.sql.exec(
       `SELECT seq, ts, actor, artefact_id, detail FROM events
        WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
@@ -889,7 +911,13 @@ export class KnowledgeHub {
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
     // project: explicit override or the deployment's project; tasks enter UNCLAIMED (owner = pool)
     const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
-    const owner = type === "task" ? String(body.owner ?? "").trim() : String(body.owner ?? actor);
+    // owner = claimant, on tasks only (phase 4). Other types record their human
+    // actor in meta (proposed_by / ask.from) — one field, one meaning.
+    let owner = type === "task" ? String(body.owner ?? "").trim() : "";
+    if (type !== "task") {
+      const pm = (body.meta ?? {}) as any;
+      if (type === "decision" && !pm.proposed_by) pm.proposed_by = actor;
+    }
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["role:review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
@@ -2059,9 +2087,6 @@ export class KnowledgeHub {
         id, artefactId, Date.now(),
       );
       if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
-        const m = JSON.parse(row.meta ?? "{}");
-        m.awaiting_ask = { ask_id: id, ts: Date.now() };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), artefactId);
         if (row.status === "in_progress") {
           await this.transition({ id: artefactId, to: "blocked", note: `blocked on ${to}: ${question.slice(0, 100)}` }, actor);
           taskStatus = "blocked";
@@ -2183,6 +2208,15 @@ export class KnowledgeHub {
     return { id, status: ASK_ANSWERED, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
   }
   private async orient(body: any) {
+    // open question children: DERIVED awaiting_ask (phase 4 — no marker cache)
+    const askChildOf = new Map<string, any>();
+    for (const c of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS parent, c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
+         AND c.tags LIKE '%"question"%' ORDER BY c.created_ts DESC`,
+    ).toArray() as any[]) {
+      if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
+    }
     const label = String(body.label ?? "");
     const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
     const counts = this.state.storage.sql.exec(
@@ -2316,7 +2350,7 @@ export class KnowledgeHub {
       if (t.status === "blocked") {
         t.blocked_reason = (m.blocked?.reason ?? "").slice(0, 300);
         t.unblock_condition = (m.blocked?.unblock_condition ?? "").slice(0, 300);
-        t.awaiting_ask = m.awaiting_ask?.ask_id;
+        t.awaiting_ask = askChildOf.get(t.id)?.id ?? m.awaiting_ask?.ask_id;
         t.is_claimable = !!t.unblock_condition; // resume via transition in_progress with resolution
         if (!t.unblock_condition) t.claim_reason = "blocked without an unblock condition — open the card, resolve or re-scope it";
       }

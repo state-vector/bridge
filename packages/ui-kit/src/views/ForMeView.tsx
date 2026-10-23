@@ -27,7 +27,7 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
             <Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>
             {f.verdict && <Chip tone={f.verdict === "bounce" ? "needs" : "done"}>{f.verdict.toUpperCase()}</Chip>}
             {f.target && <Chip tone="scope">{f.target}</Chip>}
-            <span className="why-line">{d.id} · proposed {rel(d.created_ts)}</span>
+            <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {(d.meta as any)?.proposed_by ?? d.owner ?? "—"}</span>
           </div>
         );
       })()}
