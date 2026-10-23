@@ -1,11 +1,11 @@
 mod console;
 mod dispatch;
-mod keychain;
+pub mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
 mod scm;
-mod session;
+pub mod session;
 mod transport;
 
 
