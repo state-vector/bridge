@@ -549,14 +549,7 @@ export class KnowledgeHub {
         created_ts INTEGER NOT NULL,
         PRIMARY KEY (src_id, relation, dst_id)
       );
-      CREATE TABLE IF NOT EXISTS events (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        actor TEXT NOT NULL,
-        op TEXT NOT NULL,
-        artefact_id TEXT,
-        detail TEXT NOT NULL DEFAULT '{}'
-      );
+      -- events: now a VIEW over ledger (migration below)
       CREATE VIRTUAL TABLE IF NOT EXISTS artefacts_fts USING fts5(
         title, body_md, content='artefacts', content_rowid='rowid'
       );
@@ -641,15 +634,7 @@ export class KnowledgeHub {
         vec BLOB NOT NULL,
         dim INTEGER NOT NULL DEFAULT 0
       );
-      CREATE TABLE IF NOT EXISTS artefact_versions (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        artefact_id TEXT NOT NULL,
-        ts INTEGER NOT NULL,
-        actor TEXT NOT NULL,
-        action TEXT NOT NULL,
-        summary TEXT,
-        data TEXT NOT NULL DEFAULT '{}'
-      );
+      -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
         from_label TEXT NOT NULL,
@@ -662,6 +647,50 @@ export class KnowledgeHub {
         answered_ts INTEGER
       );
     `);
+
+    // ---------- ledger v1: one append-only record (events + versions merged) ----------
+    this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      actor TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'signal',
+      action TEXT NOT NULL,
+      artefact_id TEXT,
+      summary TEXT NOT NULL DEFAULT '',
+      data TEXT NOT NULL DEFAULT '{}'
+    )`);
+    try {
+      const migrated = this.one(`SELECT value FROM settings WHERE key = 'ledger_v1'`);
+      if (!migrated) {
+        const hasEvents = this.one(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'events'`);
+        if (hasEvents) {
+          this.state.storage.sql.exec(`ALTER TABLE events RENAME TO events_legacy`);
+          this.state.storage.sql.exec(`INSERT INTO ledger (ts, actor, kind, action, artefact_id, summary, data)
+            SELECT ts, actor, 'signal', op, artefact_id, '', detail FROM events_legacy`);
+        }
+        const hasVersions = this.one(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'artefact_versions'`);
+        if (hasVersions) {
+          this.state.storage.sql.exec(`ALTER TABLE artefact_versions RENAME TO versions_legacy`);
+          this.state.storage.sql.exec(`INSERT INTO ledger (ts, actor, kind, action, artefact_id, summary, data)
+            SELECT ts, actor, 'mutation', action, artefact_id, summary, data FROM versions_legacy`);
+        }
+        this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS events AS
+          SELECT seq, ts, actor, action AS op, artefact_id, data AS detail FROM ledger WHERE kind = 'signal'`);
+        this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS artefact_versions AS
+          SELECT seq, ts, actor, action, artefact_id, summary, data FROM ledger WHERE kind = 'mutation'`);
+        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('ledger_v1', String(Date.now()))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.audit("system:migration", "ledger_v1", null, { backfilled: !!(hasEvents || hasVersions) });
+      } else {
+        this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS events AS
+          SELECT seq, ts, actor, action AS op, artefact_id, data AS detail FROM ledger WHERE kind = 'signal'`);
+        this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS artefact_versions AS
+          SELECT seq, ts, actor, action, artefact_id, summary, data FROM ledger WHERE kind = 'mutation'`);
+      }
+    } catch (e) {
+      console.log("ledger migration:", String(e).slice(0, 200));
+    }
+
     // additive columns for DBs created before these existed
     for (const ddl of [
       `ALTER TABLE decisions ADD COLUMN options TEXT`,
@@ -1890,14 +1919,6 @@ export class KnowledgeHub {
     };
   }
 
-  /** Append-only history: every mutation of every artefact gets a version row. */
-  private version(artefactId: string, actor: string, action: string, summary: string, data: object = {}) {
-    const ts = Date.now();
-    this.state.storage.sql.exec(
-      `INSERT INTO artefact_versions (artefact_id, ts, actor, action, summary, data) VALUES (?, ?, ?, ?, ?, ?)`,
-      artefactId, ts, actor, action, summary.slice(0, 500), JSON.stringify(data),
-    );
-  }
 
   private async getHistory(artefactId: string, limit = 100) {
     const rows = this.state.storage.sql.exec(
@@ -3032,17 +3053,46 @@ export class KnowledgeHub {
 
   // ---------- helpers ----------
 
-  private audit(actor: string, op: string, artefactId: string | null, detail: object) {
+  /** THE append-only ledger — every mutation (kind 'mutation') and every
+   *  signal (kind 'signal') is one row in one sequence. events/artefact_versions
+   *  are views over this. */
+  private ledgerWrite(kind: 'signal' | 'mutation', actor: string, action: string, artefactId: string | null, summary: string, data: object): { seq: number; ts: number } {
     const ts = Date.now();
     const r = this.state.storage.sql.exec(
-      `INSERT INTO events (ts, actor, op, artefact_id, detail) VALUES (?, ?, ?, ?, ?) RETURNING seq`,
-      ts, actor, op, artefactId, JSON.stringify(detail),
+      `INSERT INTO ledger (ts, actor, kind, action, artefact_id, summary, data) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+      ts, actor, kind, action, artefactId, summary.slice(0, 500), JSON.stringify(data),
     ).toArray()[0] as any;
-    this.broadcastEvent({ seq: Number(r?.seq ?? 0), ts, actor, op, artefact_id: artefactId, detail });
+    return { seq: Number(r?.seq ?? 0), ts };
+  }
+
+  /** Append-only per-artefact history: every mutation gets one mutation row. */
+  private version(artefactId: string, actor: string, action: string, summary: string, data: object = {}) {
+    const { seq, ts } = this.ledgerWrite('mutation', actor, action, artefactId, summary, data);
+    // remember it so the paired audit() broadcast reuses this row instead of
+    // writing a second signal row for the same fact
+    this._lastMutation = { key: `${artefactId}:${action}`, seq, ts, actor, action, artefactId, data };
+  }
+
+  private audit(actor: string, op: string, artefactId: string | null, detail: object) {
+    const key = `${artefactId}:${op}`;
+    let seq: number; let ts: number;
+    const last = this._lastMutation;
+    if (last && last.key === key && Date.now() - last.ts < 5_000) {
+      // same fact already recorded as a mutation — broadcast THAT row, no second write
+      ({ seq, ts } = last);
+      this.broadcastEvent({ seq, ts, actor: last.actor, op: last.action, artefact_id: last.artefactId, detail: last.data });
+      this._lastMutation = null;
+      this.scoreCache = null;
+      return;
+    }
+    ({ seq, ts } = this.ledgerWrite('signal', actor, op, artefactId, "", detail));
+    this.broadcastEvent({ seq, ts, actor, op, artefact_id: artefactId, detail });
     // every mutation can move behaviour signals — drop the 30s score cache so
     // board reads after writes are fresh (the cache exists for DO row-read quota)
     this.scoreCache = null;
   }
+
+  private _lastMutation: { key: string; seq: number; ts: number; actor: string; action: string; artefactId: string | null; data: object } | null = null;
 
   private async nextSeq(_type: ArtefactType): Promise<number> {
     const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts`).toArray();
