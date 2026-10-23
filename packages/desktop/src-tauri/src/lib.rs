@@ -1,11 +1,12 @@
+pub mod keychain;
+pub mod session;
+
 mod console;
 mod dispatch;
-mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
 mod scm;
-mod session;
 mod transport;
 
 use serde::Deserialize;
