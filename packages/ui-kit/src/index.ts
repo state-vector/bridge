@@ -16,7 +16,7 @@ export { relTime } from "./relTime";
 // — knowledge plane: data layer + views (one rendering path, every surface) —
 export { getKbHubConfig, setKbHubConfig, clearKbHubConfig, type KbMode } from "./server/config";
 export {
-  kbApi, KbAuthError, connectKbWs,
+  kbApi, KbAuthError, connectKbWs, setKbTransport, type KbTransport,
 } from "./server/kb";
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
