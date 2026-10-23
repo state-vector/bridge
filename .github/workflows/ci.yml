@@ -53,6 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: test
+    # main pushes only: the alarm compares the LIVE hub (which deploys
+    # main via CF Workers Builds) against the pushed SHA — on a PR event
+    # github.sha is the PR head, which the live hub can never match
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Probe live hub __version vs pushed SHA
         env:
