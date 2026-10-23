@@ -70,6 +70,80 @@ fn main() {
             eprintln!("[bridge] onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
             run(Some(cfg));
         }
+        "doctor" => {
+            // one command: is the system healthy? hub reachability, deploy
+            // drift (live __version vs HEAD when run in a checkout), and
+            // token validity (one MCP orient). Named failures, non-zero exit.
+            let mut bad = 0;
+            let cfg = dispatch::DispatchConfig::resolve();
+            let url = cfg
+                .as_ref()
+                .map(|c| c.url.clone())
+                    .or_else(|| std::env::var("BRIDGE_URL").ok())
+                .unwrap_or_default();
+            if url.is_empty() {
+                println!("✗ hub: no configured hub URL (pair first)");
+                bad += 1;
+            } else {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build();
+                // 1. reachability
+                match client.as_ref().map(|c| c.get(format!("{url}/__version")).send()) {
+                    Ok(Ok(resp)) if resp.status().is_success() => {
+                        let v: serde_json::Value = resp.json().unwrap_or_default();
+                        let live = v.get("commit").and_then(|c| c.as_str()).unwrap_or("?");
+                        println!("✓ hub: {url} reachable (built {})", v.get("built_at").and_then(|b| b.as_str()).unwrap_or("?"));
+                        // 2. deploy drift vs HEAD when run inside a checkout
+                        if let Ok(head) = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output() {
+                            if head.status.success() {
+                                let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+                                if live == head {
+                                    println!("✓ deploy: live hub matches HEAD ({live})");
+                                } else {
+                                    println!("✗ deploy: DRIFT — live is {live}, HEAD is {head} (CF Builds stalled or bypassed?)");
+                                    bad += 1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        println!("✗ hub: {url}/__version unreachable — hub down or route broken");
+                        bad += 1;
+                    }
+                }
+                // 3. token validity
+                let token = cfg.as_ref().map(|c| c.token.clone()).unwrap_or_default();
+                if token.is_empty() {
+                    println!("✗ token: none stored (logged out) — run `bridge` to pair");
+                    bad += 1;
+                } else if let Ok(client) = client {
+                    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"orient","arguments":{"session":"doctor"}}}"#;
+                    match client
+                        .post(format!("{url}/mcp"))
+                        .header("content-type", "application/json")
+                        .header("Authorization", format!("Bearer {token}"))
+                        .body(body)
+                        .send()
+                    {
+                        Ok(r) if r.status().is_success() => println!("✓ token: valid (orient 200)"),
+                        Ok(r) => {
+                            println!("✗ token: hub rejected it ({} {}) — re-pair to repair", r.status(), url);
+                            bad += 1;
+                        }
+                        Err(e) => {
+                            println!("✗ token: probe failed ({e})");
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+            if bad > 0 {
+                println!("{} problem(s) found", bad);
+                std::process::exit(1);
+            }
+            println!("healthy ✓");
+        }
         "status" => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             let path = std::path::Path::new(&home).join(".bridge/dispatch/runner.json");
