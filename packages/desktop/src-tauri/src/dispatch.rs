@@ -19,6 +19,13 @@ use crate::scm;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatchConfig {
     pub url: String,
+    /// The gateway secret lives in the OS keychain (crate::keychain) — this
+    /// field is runtime-only and never serialized: config.json stays
+    /// secret-free, and the UI's config round-trip can never carry the token
+    /// (the UI's Apply path re-reads the keychain instead). Deserializing a
+    /// legacy config that still has a "token" is the one-time migration
+    /// trigger (resolve() moves it to the keychain and clears it).
+    #[serde(default, skip_serializing)]
     pub token: String,
     #[serde(default = "default_workdir")]
     pub workdir: String,
@@ -171,10 +178,14 @@ fn default_opencode_bin() -> String {
 
 impl DispatchConfig {
     /// Env fallbacks so headless mode needs no config file:
-    /// BRIDGE_URL, BRIDGE_TOKEN, BRIDGE_WORKDIR, BRIDGE_AGENT, BRIDGE_POLL_SECS.
+    /// BRIDGE_URL, BRIDGE_WORKDIR, BRIDGE_AGENT, BRIDGE_POLL_SECS.
+    /// (BRIDGE_TOKEN is gone — a pasted token was the manually-paired
+    /// fallback the credential-class ADR retires; headless onboards via
+    /// `bridge pair` or, on the desktop, via login-time self-provision.
+    /// The token always comes from the keychain.)
     pub fn from_env() -> Option<Self> {
         let url = std::env::var("BRIDGE_URL").ok()?;
-        let token = std::env::var("BRIDGE_TOKEN").ok()?;
+        let token = String::new();
         Some(Self {
             url: url.trim_end_matches('/').into(),
             token,
@@ -235,10 +246,27 @@ impl DispatchConfig {
     }
 
     /// Resolution order: env vars > ~/.bridge/config.json > None (→ device pairing).
+    /// The token is NEVER taken from either — keychain only.
     pub fn resolve() -> Option<Self> {
         let mut c = Self::from_env().or_else(load_config)?;
         c.normalize();
+        c.refresh_token_from_keychain();
         Some(c)
+    }
+
+    /// One-time migration + keychain attach: a legacy config carries the
+    /// token on disk — move it to the OS keychain, then always load from
+    /// there so the keychain is the single source of truth (admin revoke +
+    /// re-vend state included).
+    pub fn refresh_token_from_keychain(&mut self) {
+        if !self.token.is_empty() {
+            match crate::keychain::save_token(&self.token) {
+                Ok(()) => eprintln!("[dispatch] migrated gateway token from config.json to the OS keychain"),
+                Err(e) => eprintln!("[dispatch] WARNING: keychain migration failed ({e}) — token cleared from config anyway; sign in to re-provision"),
+            }
+            self.token.clear();
+        }
+        self.token = crate::keychain::load_token().unwrap_or_default();
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -434,40 +462,14 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
                 .map(|s| s.to_string());
             // merge into the existing config so user settings survive;
             // fresh defaults only when there is nothing to merge with
-            let mut cfg = load_config().unwrap_or_else(|| DispatchConfig {
-                url: url.to_string(),
-                token: String::new(),
-                workdir: default_workdir(),
-                agent: std::env::var("BRIDGE_AGENT").ok(),
-                model: std::env::var("BRIDGE_MODEL").ok(),
-                backend: std::env::var("BRIDGE_BACKEND").ok(),
-                poll_secs: default_poll_secs(),
-                timeout_mins: default_timeout_mins(),
-                opencode_bin: default_opencode_bin(),
-                label: None,
-                agent_name: None,
-                ws: None,
-                gateway: None,
-                max_sessions: default_max_sessions(),
-                report_minutes: None,
-                isolate: default_isolate(),
-                backends: Default::default(),
-                models: None,
-                agents: None,
-            });
-            cfg.url = url.trim_end_matches('/').to_string();
-            cfg.token = token;
-            cfg.ws = Some(ws);
-            cfg.label = label;
-            cfg.gateway = Some(
-                resp.get("tags")
-                    .and_then(|t| t.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| s.eq_ignore_ascii_case("gateway")))
-                    .unwrap_or(false),
-            );
-            cfg.normalize();
-            cfg.save()?;
-            eprintln!("[pair] authorized — token for workspace '{}' saved (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
+            let mut cfg = load_config().unwrap_or_else(default_config);
+            let gateway_class = resp
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| s.eq_ignore_ascii_case("gateway")))
+                .unwrap_or(false);
+            apply_vended_credentials(&mut cfg, url, &token, &ws, label, gateway_class)?;
+            eprintln!("[pair] authorized — token for workspace '{}' saved to the keychain (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
             Ok(PairPoll::Authorized(cfg))
         }
         Some("expired") => Ok(PairPoll::Expired),
@@ -482,6 +484,105 @@ pub enum PairPoll {
     Authorized(DispatchConfig),
     Expired,
     Failed(String),
+}
+
+/// Fresh defaults for a device with no config yet (paired fresh / first
+/// self-provision). User settings always merge over this.
+fn default_config() -> DispatchConfig {
+    DispatchConfig {
+        url: String::new(),
+        token: String::new(),
+        workdir: default_workdir(),
+        agent: std::env::var("BRIDGE_AGENT").ok(),
+        model: std::env::var("BRIDGE_MODEL").ok(),
+        backend: std::env::var("BRIDGE_BACKEND").ok(),
+        poll_secs: default_poll_secs(),
+        timeout_mins: default_timeout_mins(),
+        opencode_bin: default_opencode_bin(),
+        label: None,
+        agent_name: None,
+        ws: None,
+        gateway: None,
+        max_sessions: default_max_sessions(),
+        report_minutes: None,
+        isolate: default_isolate(),
+        backends: Default::default(),
+        models: None,
+        agents: None,
+    }
+}
+
+/// Merge vended gateway credentials (pairing approval or login-time
+/// self-provision — the only two human-approved paths to a token). The
+/// secret goes to the OS keychain ONLY; the config keeps identity +
+/// settings and stays secret-free.
+fn apply_vended_credentials(
+    cfg: &mut DispatchConfig,
+    url: &str,
+    token: &str,
+    ws: &str,
+    label: Option<String>,
+    gateway_class: bool,
+) -> Result<(), String> {
+    crate::keychain::save_token(token)?;
+    cfg.url = url.trim_end_matches('/').to_string();
+    cfg.token.clear(); // keychain holds it; the file stays secret-free
+    cfg.ws = Some(ws.to_string());
+    cfg.label = label;
+    cfg.gateway = Some(gateway_class);
+    cfg.normalize();
+    cfg.save()
+}
+
+/// Gateway self-provision (credential-class ADR, desktop gateway leg): the
+/// desktop's post-login leg. The human-auth leg hands over the hub session
+/// cookie after GitHub login; this exchanges it for THIS device's
+/// gateway-class token via POST /api/kb/self-provision. The login IS the
+/// human approval — hub-side the audit stamps op `self_provision` with the
+/// web-session actor. The secret goes straight to the OS keychain: it never
+/// touches the webview, the UI, or any log (only the workspace lands in the
+/// log line). Deterministic label + replace-by-device_id mean re-vending at
+/// every login rotates in place — same label, stable gateway_agents edges.
+pub fn self_provision(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    session_cookie: &str,
+) -> Result<DispatchConfig, String> {
+    let cookie = session_cookie.trim();
+    if cookie.is_empty() {
+        return Err("no web session — sign in first (the login is what authorizes the gateway)".into());
+    }
+    let resp: serde_json::Value = client
+        .post(format!("{url}/api/kb/self-provision"))
+        .header("content-type", "application/json")
+        .header("cookie", format!("bridge_session={cookie}"))
+        .body(
+            json!({
+                "device_id": device_id(),
+                "principal": ensure_principal_from_file(),
+            })
+            .to_string(),
+        )
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let err = || {
+        format!(
+            "self-provision failed: {}",
+            resp.get("error").and_then(|e| e.as_str()).unwrap_or("no secret in response")
+        )
+    };
+    let secret = resp.get("secret").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).ok_or_else(err)?;
+    let ws = resp.get("ws").and_then(|w| w.as_str()).filter(|w| !w.is_empty()).unwrap_or("state-vector");
+    let label = resp.get("label").and_then(|l| l.as_str()).map(|s| s.to_string());
+    let mut cfg = load_config().unwrap_or_else(default_config);
+    apply_vended_credentials(&mut cfg, url, secret, ws, label, true)?;
+    eprintln!(
+        "[dispatch] gateway self-provisioned for workspace '{}' — token in the OS keychain",
+        cfg.ws.as_deref().unwrap_or("?")
+    );
+    Ok(cfg)
 }
 
 /// Resolve the config and require a vendored token. The machine-plane board
@@ -827,12 +928,10 @@ pub fn external_runner_pid() -> Option<u32> {
 }
 
 /// "For you" payload for the desktop panel: the human's inbox, read-only.
-/// Machine-plane list queries (agent token) — decisions/blocked/questions.
-/// Human-authoritative actions (accept/reject) stay in the webapp; rows carry
-/// the hub URL so the panel can deep-link. Runs on a blocking thread.
 /// Console chat task creation: the human confirmed a draft, so create the
 /// task on the hub through MCP (the paired token's one legitimate write for
-/// the console — creation only, never claims/transitions).
+/// the console — creation only, never claims/transitions; the gateway is
+/// dispatch infrastructure per ADR BR#2673).
 pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String> {
     let cfg = paired_config()?;
     let mut id = 0i64;
@@ -849,22 +948,12 @@ pub fn create_task(title: &str, body: &str) -> Result<serde_json::Value, String>
     )
 }
 
+/// "For you" inbox for the decision watch (console.rs): proposed decisions,
+/// blocked work, open questions. This is a UI-plane read — it rides the
+/// human session cookie (actor `web`), never the gateway bearer.
 pub fn for_you_payload() -> Result<serde_json::Value, String> {
-    let cfg = paired_config()?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
     let get = |q: &str| -> Result<serde_json::Value, String> {
-        Ok(client
-            .get(format!("{}/api/kb-machine/list{}", cfg.url.trim_end_matches('/'), q))
-            .header("Authorization", format!("Bearer {}", cfg.token))
-            .send()
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json::<serde_json::Value>()
-            .map_err(|e| e.to_string())?
+        Ok(crate::session::kb_request("GET", &format!("/api/kb/artefacts{q}"), None)?
             .get("artefacts")
             .cloned()
             .unwrap_or_else(|| json!([])))
@@ -872,106 +961,13 @@ pub fn for_you_payload() -> Result<serde_json::Value, String> {
     let decisions = get("?type=decision&status=proposed&limit=50")?;
     let blocked = get("?type=task&status=blocked&limit=50")?;
     let questions = get("?type=task&tag=question&limit=50")?;
+    let url = crate::session::load().map(|s| s.url).unwrap_or_default();
     Ok(json!({
-        "url": cfg.url,
+        "url": url,
         "decisions": decisions,
         "blocked": blocked,
         "questions": questions,
     }))
-}
-
-/// Board lists for the desktop Top/Backlog views: live in-progress work
-/// (Top) and the ranked-ish dispatch queue + completed ledger (Backlog).
-pub fn board_lists_payload() -> Result<serde_json::Value, String> {
-    let cfg = paired_config()?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let get = |q: &str| -> Result<Vec<serde_json::Value>, String> {
-        Ok(client
-            .get(format!("{}/api/kb-machine/list{}", cfg.url.trim_end_matches('/'), q))
-            .header("Authorization", format!("Bearer {}", cfg.token))
-            .send()
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json::<serde_json::Value>()
-            .map_err(|e| e.to_string())?
-            .get("artefacts")
-            .cloned()
-            .unwrap_or_else(|| json!([]))
-            .as_array()
-            .cloned()
-            .unwrap_or_default())
-    };
-    let in_progress = get("?type=task&status=in_progress&limit=100")?;
-    let in_review = get("?type=task&status=in_review&limit=100")?;
-    let blocked = get("?type=task&status=blocked&limit=100")?;
-    let mut top = in_progress;
-    top.extend(in_review);
-    top.extend(blocked);
-    top.sort_by_key(|a| {
-        let m = a.get("meta").cloned().unwrap_or(json!({}));
-        -(m.get("last_progress").and_then(|p| p.get("ts")).and_then(|t| t.as_i64()).unwrap_or(0))
-    });
-    let mut backlog = get("?type=task&status=todo&limit=100")?;
-    backlog.sort_by_key(|a| {
-        let m = a.get("meta").cloned().unwrap_or(json!({}));
-        let boosted = m.get("boosted").is_some();
-        // boosted first, then oldest-first (proxy for the orient ranking)
-        (if boosted { 0 } else { 1 }, a.get("updated_ts").and_then(|t| t.as_i64()).unwrap_or(0))
-    });
-    let mut done = get("?type=task&status=done&limit=100")?;
-    done.sort_by_key(|a| -(a.get("status_ts").and_then(|t| t.as_i64()).unwrap_or(0)));
-    Ok(json!({
-        "url": cfg.url,
-        "top": top,
-        "backlog": backlog,
-        "done": done,
-    }))
-}
-
-/// Human decision action from the desktop: accept or reject a proposed
-/// decision. The webapp's human plane does this as actor "web"; the desktop
-/// carries the paired gateway token, so the hub treats the accept/reject as
-/// machine-plane — allowed for decisions? No: decision acceptance is
-/// human-authoritative, so this proxies through the human plane ONLY when a
-/// session cookie exists. In practice the desktop pairs with a machine token,
-/// so accept/reject opens the board in the browser. This command exists to
-/// REJECT (withdraw) a stale verdict — machine-plane supersede is allowed.
-pub fn decision_act_payload(id: &str, act: &str) -> Result<serde_json::Value, String> {
-    let cfg = paired_config()?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let to = match act {
-        "accepted" => "accepted",
-        "rejected" => "rejected",
-        "superseded" => "superseded",
-        other => return Err(format!("unknown action '{other}' (accepted | rejected | superseded)")),
-    };
-    let note = match to {
-        "accepted" => "accepted by human (desktop For you)",
-        "rejected" => "rejected by human (desktop For you)",
-        _ => "superseded — stale verdict withdrawn (desktop)",
-    };
-    let url = format!("{}/api/kb-machine/list", cfg.url.trim_end_matches('/'));
-    let _ = url;
-    let resp = client
-        .post(format!("{}/api/kb-machine/act", cfg.url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&json!({ "op": "transition", "id": id, "to": to, "note": note })).unwrap_or_default())
-        .send()
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().unwrap_or(json!({}));
-    if !status.is_success() {
-        return Err(format!("hub {status}: {}", body.get("error").and_then(|e| e.as_str()).unwrap_or("?")));
-    }
-    Ok(body)
 }
 
 // ---- dispatch state (shared with Tauri commands) ----
@@ -2418,16 +2414,21 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
         },
     };
-    // Identity law (BR#2455): this app is a gateway. The pair flow vends a
-    // gateway-class token (gw-*); running on an agent-class token is an
-    // invalid pairing state — per-agent provisioning is impossible and every
-    // claim would carry the wrong identity class. Log out automatically:
-    // erase the pairing and return to onboarding (a fresh token is vended at
-    // the next pair).
+    // Identity law (BR#2455): this app is a gateway. Self-provision and
+    // pairing vend a gateway-class token (gw-*); running on an agent-class
+    // token is an invalid credential state — per-agent provisioning is
+    // impossible and every claim would carry the wrong identity class. Log
+    // out automatically: clear the dead credential and await the next login
+    // (self-provision re-vends, replace-by-device_id — no human click beyond
+    // the login).
     if cfg.token.is_empty() || cfg.gateway != Some(true) {
-        let msg = "logged out — no gateway-class pairing on this device; pair again (the desktop declares gateway at pair time)";
+        let msg = if cfg.token.is_empty() {
+            "no gateway token — sign in to provision this desktop's gateway".to_string()
+        } else {
+            "wrong credential class — token cleared; sign in to re-provision (gateway class is vended at login)".to_string()
+        };
         eprintln!("[dispatch] {msg}");
-        logout_core(&stop, &running, &snap);
+        logout_core(&stop, &running, &snap, true);
         if let Ok(mut g) = last_error.lock() {
             *g = Some(msg.to_string());
         }
@@ -2496,15 +2497,16 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
             Err(e) => {
                 // A hub-rejected token (401: revoked/expired/rotated away) is
-                // not retryable — every call will fail the same way. Log out
-                // automatically: erase the pairing and return to onboarding.
-                // (Tick errors reaching here are orient's — "bridge {status}
-                // on /mcp" — so the prefix match cannot hit task IDs.)
+                // not retryable — every call will fail the same way. Clear the
+                // dead credential and await the next login: self-provision
+                // re-vends at no cost beyond the login itself. (Tick errors
+                // reaching here are orient's — "bridge {status} on /mcp" — so
+                // the prefix match cannot hit task IDs.)
                 if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
-                    let msg = format!("logged out — hub rejected the token ({e}); pair again to onboard");
+                    let msg = format!("logged out — hub rejected the token ({e}); sign in to re-provision");
                     eprintln!("[dispatch] {msg}");
                     snap_activity(&snap, "error", &msg);
-                    logout_core(&stop, &running, &snap);
+                    logout_core(&stop, &running, &snap, true);
                     if let Ok(mut g) = last_error.lock() {
                         *g = Some(msg);
                     }
@@ -2578,62 +2580,48 @@ pub fn stop(state: &DispatchState) {
     write_runner_state(&state.snapshot);
 }
 
-/// Log out core: trash the KEY, not the config. Clears the token in place
-/// (every other setting — hub URL, workdir, providers, model — survives, so
-/// onboarding is a re-pair, not a from-scratch setup), removes vendored
-/// per-agent credentials, and resets the snapshot. Shared by manual logout
-/// (Settings) and automatic logout on an invalid token (wrong class at
-/// startup, hub-rejected at runtime). Stops the loop; the caller
-/// returns/breaks afterwards.
-fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot) {
+/// Log out core: reset the session-facing state. Shared by manual logout
+/// (Settings) and automatic logout on an invalid token. `clear_credential`
+/// decides the credential's fate — the distinction IS the lifecycle law
+/// (credential-class ADR, desktop gateway leg):
+///  - UI logout (false): the gateway token STAYS in the keychain — the
+///    gateway survives logout, dispatched agents keep running, and the next
+///    login re-vends (rotates) in place. Only the human session ends.
+///  - dead credential (true): hub 401 (revoked/rotated away) or a wrong-class
+///    token at startup — the local copy is provably useless; delete it and
+///    await the next login to re-vend.
+fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot, clear_credential: bool) {
     stop.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
-    let path = config_path();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&raw) {
-            // invalidate the credential hub-side FIRST — a logged-out token
-            // must not stay valid. Best-effort: offline leaves it valid, and
-            // the next pairing replaces it anyway.
-            let token = c.get("token").and_then(|t| t.as_str()).unwrap_or("").to_string();
-            let url = c.get("url").and_then(|u| u.as_str()).unwrap_or("").trim_end_matches('/').to_string();
-            if !token.is_empty() && !url.is_empty() {
-                if let Ok(client) = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                {
-                    let _ = client
-                        .post(format!("{url}/api/kb-machine/revoke"))
-                        .header("Authorization", format!("Bearer {token}"))
-                        .header("content-type", "application/json")
-                        .body("{}")
-                        .send();
-                }
-            }
-            if let Some(obj) = c.as_object_mut() {
-                obj.insert("token".into(), serde_json::Value::String(String::new()));
-            }
-            let body = serde_json::to_string_pretty(&c).unwrap_or_default();
-            let _ = std::fs::write(&path, body);
-            #[cfg(unix)]
-            let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+    if clear_credential {
+        if let Err(e) = crate::keychain::delete_token() {
+            eprintln!("[dispatch] WARNING: keychain clear failed: {e}");
         }
-    }
-    if let Some(dir) = dispatch_dir() {
-        // vendored per-agent credentials — re-provisioned after the next pair
-        let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+        if let Some(dir) = dispatch_dir() {
+            // vendored per-agent credentials — re-provisioned after the next login
+            let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+        }
     }
     if let Ok(mut s) = snap.lock() {
         s.running = false;
         s.in_flight = Vec::new();
     }
-    eprintln!("[dispatch] logged out — token cleared (settings kept); pair again to onboard");
+    eprintln!(
+        "[dispatch] logged out — {}",
+        if clear_credential {
+            "credential cleared; sign in to re-provision"
+        } else {
+            "session ended; the gateway keeps running (token stays in the keychain)"
+        }
+    );
 }
 
-/// Log out (Settings): stop the runner and erase pairing + derived state,
-/// returning the app to its unconfigured onboarding state. A fresh gateway
-/// token is vended at the next pairing.
+/// Log out (Settings): stop the runner and end the human session — but the
+/// gateway token STAYS in the keychain (credential-class ADR: the gateway
+/// survives UI logout, dispatched agents keep running, admin revoke is the
+/// kill switch). The next login re-vends, replacing in place.
 pub fn logout(state: &DispatchState) {
-    logout_core(&state.stop, &state.running, &state.snapshot);
+    logout_core(&state.stop, &state.running, &state.snapshot, false);
     if let Ok(mut g) = state.last_error.lock() {
         *g = None;
     }

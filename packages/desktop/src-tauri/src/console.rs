@@ -1,10 +1,10 @@
 //! Desktop console — two human-facing services that are NOT dispatch:
 //!
 //! 1. `chat_turn` — one conversational turn over the hub's knowledge. Retrieve
-//!    (machine-plane search) then summarise with Apple's on-device model
-//!    (FoundationModels, macOS 26+); the configured backend CLI is the
-//!    fallback engine. The console never claims work or writes to the board —
-//!    it reads and summarises only.
+//!    (knowledge web plane, human session cookie) then summarise with Apple's
+//!    on-device model (FoundationModels, macOS 26+); the configured backend CLI
+//!    is the fallback engine. The console never claims work or writes to the
+//!    board — it reads and summarises only.
 //! 2. `start_decision_watch` — polls the For You inbox and raises an OS
 //!    notification when a proposed decision appears. Clicking it emits the
 //!    same "open-ask" event the ask notifications use, so the panel can jump
@@ -24,34 +24,19 @@ const SNIPPET_CHARS: usize = 700;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 const WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())
-}
-
-/// Retrieve artefacts relevant to the question from the paired hub.
-/// Empty (not error) when unconfigured — the chat still runs, it just answers
-/// from the conversation alone.
+/// Retrieve artefacts relevant to the question from the signed-in hub.
+/// Knowledge web plane, human session cookie (no bearer on UI paths).
+/// Empty (not error) when unsigned/unconfigured — the chat still runs, it
+/// just answers from the conversation alone.
 fn retrieve(question: &str) -> Result<Vec<Value>, String> {
-    let Some(cfg) = DispatchConfig::resolve() else {
-        return Ok(vec![]);
+    let resp = match crate::session::kb_request(
+        "GET",
+        &format!("/api/kb/search?q={}&limit={}", crate::session::urlencode(question), SEARCH_LIMIT),
+        None,
+    ) {
+        Ok(v) => v,
+        Err(_) => return Ok(vec![]),
     };
-    let client = http_client()?;
-    let resp = client
-        .get(format!(
-            "{}/api/kb-machine/search",
-            cfg.url.trim_end_matches('/')
-        ))
-        .query(&[("q", question), ("limit", &SEARCH_LIMIT.to_string())])
-        .header("Authorization", format!("Bearer {}", cfg.token))
-        .send()
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json::<Value>()
-        .map_err(|e| e.to_string())?;
     Ok(resp
         .get("artefacts")
         .and_then(|a| a.as_array().cloned())

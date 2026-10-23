@@ -1,10 +1,12 @@
 mod console;
 mod dispatch;
+mod keychain;
 mod mac_notify;
 mod menubar;
 mod opencode;
-mod transport;
 mod scm;
+mod session;
+mod transport;
 
 use serde::Deserialize;
 use tauri::Manager;
@@ -80,26 +82,68 @@ fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_
 }
 
 /// "For you" — the human's inbox (proposed decisions, blocked work, questions).
-/// Read-only; human-authoritative actions live in the webapp.
+/// Read-only; human-authoritative actions ride the kb_* commands as the human
+/// session (actor `web`).
 #[tauri::command]
-async fn for_you() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(dispatch::for_you_payload)
+async fn kb_board() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| session::kb_request("GET", "/api/kb/board", None))
         .await
         .map_err(|e| e.to_string())?
 }
 
+/// Generic knowledge-plane door for the shell UI: path must be under
+/// /api/kb/. Auth is the human session cookie ONLY (set in session.rs by
+/// construction) — the gateway bearer cannot appear here even by accident.
 #[tauri::command]
-async fn board_lists() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(dispatch::board_lists_payload)
+async fn kb_fetch(path: String, method: Option<String>, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let method = method.unwrap_or_else(|| "GET".into());
+    tauri::async_runtime::spawn_blocking(move || session::kb_request(&method, &path, body))
         .await
         .map_err(|e| e.to_string())?
 }
 
+/// Who is signed in (live probe of the hub's /api/session).
 #[tauri::command]
-async fn decision_act(id: String, act: String) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || dispatch::decision_act_payload(&id, &act))
+async fn session_get() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(session::probe)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// GitHub OAuth login for the desktop: opens the hub's /login with the
+/// desktop handshake (loopback listener) in the OS browser, awaits the
+/// callback, stores the session. Blocking up to 10 min on the callback.
+#[tauri::command]
+async fn session_login(app: tauri::AppHandle, url: Option<String>) -> Result<serde_json::Value, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let hub = match url.filter(|u| !u.trim().is_empty()) {
+        Some(u) => u.trim().to_string(),
+        None => session::load()
+            .map(|s| s.url)
+            .or_else(|| dispatch::DispatchConfig::resolve().map(|c| c.url))
+            .ok_or("hub url required for first sign-in")?,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let opener = app.opener();
+        session::login(&hub, &move |u: String| {
+            let _ = opener.open_url(&u, None::<&str>);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|s| {
+        serde_json::json!({
+            "signed_in": true, "user": s.user, "ws": s.ws,
+            "expires_ts": s.expires_ts, "url": s.url,
+        })
+    })
+}
+
+/// Sign out of the human session (the gateway token is separate — see logout).
+#[tauri::command]
+fn session_logout() -> Result<(), String> {
+    session::clear();
+    Ok(())
 }
 
 /// One console turn: retrieve board artefacts for the question, then
@@ -232,9 +276,11 @@ pub fn run() {
             dispatch_status,
             dispatch_config,
             dispatch_snapshot,
-            for_you,
-            board_lists,
-            decision_act,
+            kb_board,
+            kb_fetch,
+            session_get,
+            session_login,
+            session_logout,
             chat_send,
             chat_propose_task,
             dispatch_create_task,

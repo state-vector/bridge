@@ -198,6 +198,26 @@ export function tagsSayGateway(tags: unknown): boolean {
   return parseTags(tags).some((t) => t.toLowerCase() === "gateway");
 }
 
+/**
+ * Deterministic gateway label for a self-provisioned desktop (credential-class
+ * ADR, desktop gateway leg): gw-<device-slug>, derived ONLY from the stable
+ * device id — the same machine always lands on the same label, so re-vending
+ * at each login rotates the token in place and the `gateway_agents` edges
+ * keyed by that label stay stable. Mirrors the gw-* convention Connect uses
+ * to group gateways (BR#2455). Non-alphanumerics collapse to single dashes;
+ * an empty/undashable id falls back to "device" so the label is always valid
+ * under the mint label rules (2-40 chars, [a-zA-Z0-9._/-]).
+ */
+export function selfProvisionLabel(device_id: unknown): string {
+  const raw = typeof device_id === "string" ? device_id : "";
+  const slug = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  return `gw-${slug || "device"}`;
+}
+
 // ---------- workspaces ----------
 /**
  * One deployment hosts many workspaces; every human cookie and agent token is
@@ -260,7 +280,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — did (what just happened) + will (what you do next) + sentiment + gauges (completion_pct, confidence_pct, risk_pct, context_pct — 0-100; context_pct = how full your context window is, report it so the board can spot sessions that should hand off before quality degrades). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
     `4b. DECLARE SILENCE before any quiet stretch >10m: short op still yours (build, CI wait) → log_progress {will, grace_minutes ≤ 60}. Long or handed-off op (re-index, deploy, background batch) → transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes ≤ 1440}. Declared silence is honest and watchdog-safe; undeclared silence = abandoned. Overrun your declared window and it trips as abandoned anyway.`,
     `5. Status is your responsibility: claim → in_progress immediately; finish → in_review with the PR link in the note; stuck → blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict — bounce = action the findings; done = released. Gates are enforced — unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
-    `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (GH merge status, PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
+    `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: MERGEABILITY FIRST — before any substance check, confirm the PR is mergeable (gh pr view --json mergeable,mergeStateStatus,reviewDecision) and every commit signature is valid; an unmergeable/unsigned PR bounces to impl with the mechanical defect and files NO human ask (2026-10-23 unsigned-PR incident). Then check the actual state (PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
@@ -268,7 +288,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule).`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {

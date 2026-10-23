@@ -786,12 +786,41 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .lights-btn { display: inline-flex; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 3px 5px; border-radius: 4px; }
 .lights-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .lights-count { font-size: 10px; color: var(--text-faint); margin-left: 3px; }
-.lights-pop {
-  position: absolute; top: 100%; right: 0; z-index: 60; min-width: 260px;
-  background: var(--bg-raised, #151b28); border: 1px solid var(--border, #232b3b);
-  border-radius: 6px; padding: 10px 12px; margin-top: 4px;
-  display: flex; flex-direction: column; gap: 6px; text-align: left;
-  box-shadow: 0 8px 28px rgba(0,0,0,.45); font-size: 11px;
-}
+/* (superseded by the fixed-position .lights-pop block at the end) */
 .light-row { display: flex; align-items: center; gap: 6px; }
 .light-meta { color: var(--text-faint); margin-left: auto; font-size: 10px; }
+
+/* lights popover: fixed overlay — never grows the title bar, never themed light */
+.lights-pop {
+  position: fixed;
+  top: 34px;
+  right: 12px;
+  z-index: 1000;
+  min-width: 280px; max-width: 380px;
+  background: #10151f;
+  color: var(--text, #dbe2ee);
+  border: 1px solid #232b3b;
+  border-radius: 8px;
+  padding: 10px 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: 11px;
+  max-height: 60vh; overflow-y: auto;
+}
+.lights-pop .light-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+/* detail OS windows: the overlay components render full-bleed */
+.task-window { height: 100vh; background: var(--bg, #0d1117); }
+.task-window .panel-backdrop { display: none; }
+.task-window .detail-panel {
+  position: static; inset: auto; transform: none;
+  width: 100%; max-width: none; height: 100vh;
+  border: none; border-radius: 0; box-shadow: none;
+}
+.task-window .overlay-backdrop { position: static; background: none; padding: 0; }
+.task-window .forme-pop {
+  position: static; width: 100%; max-width: none; margin: 0;
+  border: none; border-radius: 0; min-height: 100vh;
+  box-shadow: none;
+}
+.task-window-empty { padding: 24px; color: var(--text-faint, #8b94a7); font-size: 12px; }
