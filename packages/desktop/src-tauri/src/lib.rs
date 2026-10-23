@@ -10,6 +10,11 @@ mod transport;
 
 pub use keychain::*;
 pub use session::*;
+pub use mac_notify::*;
+pub use menubar::*;
+pub use scm::*;
+pub use transport::*;
+
 
 use serde::Deserialize;
 use tauri::Manager;
