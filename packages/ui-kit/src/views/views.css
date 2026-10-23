@@ -863,3 +863,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }
 
 .ab-id { font-family: var(--mono, ui-monospace, monospace); font-size: 10px; color: var(--text-faint, #8b94a7); }
+
+/* wide-viewport cell hygiene: long tokens wrap, cells never blow out */
+.top-wrap, .ask-band, .backlog-wrap { min-width: 0; }
+.top-row, .top-head { min-width: 0; }
+.top-row > *, .ask-band-row > *, .ab-head > *, .ask-opt-row > * { min-width: 0; }
+.ab-title, .ab-reason, .ab-prior-line, .why-line, .ask-opt-text,
+.top-will, .top-unblock, .topc-goal, .backlog-title, .backlog-why {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ab-head .why-line { flex: 0 1 auto; }
+.topc-goal { overflow: hidden; }
+.topc-goal .top-will, .topc-goal .kind-pill { white-space: normal; }
