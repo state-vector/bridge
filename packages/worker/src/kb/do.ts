@@ -714,6 +714,13 @@ export class KnowledgeHub {
       console.log("ledger migration:", String(e).slice(0, 200));
     }
 
+    // sessions.kind backfill: gateway identity via the local token registry
+    try {
+      this.state.storage.sql.exec(
+        `UPDATE sessions SET kind = 'gateway' WHERE kind IS NULL AND token_id IN
+          (SELECT id FROM auth_tokens WHERE tags LIKE '%"gateway"%')`,
+      );
+    } catch { /* fresh db */ }
     // additive columns for DBs created before these existed
     for (const ddl of [
       `ALTER TABLE decisions ADD COLUMN options TEXT`,
@@ -842,6 +849,7 @@ export class KnowledgeHub {
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
+        case "purge_smoke": return this.json(await this.purgeSmoke(body));
         case "orient": return this.json(await this.orient(body));
         case "progress.log": return this.json(await this.progressLog(body, actor));
         case "session.alive": {
@@ -2047,9 +2055,10 @@ export class KnowledgeHub {
     const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `INSERT INTO sessions (token_id, name, first_seen_ts, last_seen_ts) VALUES (?, ?, ?, ?)
-       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts`,
-      token_id, name, ts, ts,
+      `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%"gateway"%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
+      token_id, name, token_id, ts, ts,
     );
     return { session: name };
   }
@@ -2113,6 +2122,29 @@ export class KnowledgeHub {
       label,
     ).toArray();
     return { inbox: open, sent };
+  }
+
+
+  /** Admin cleanup: supersede smoke/test rows created in the last 48h. Audited per row. */
+  private async purgeSmoke(body: any) {
+    const cutoff = Date.now() - 48 * 60 * 60_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status FROM artefacts WHERE type = 'task'
+         AND status NOT IN ('done','superseded')
+         AND created_ts > ?
+         AND (title LIKE 'smoke%' OR title LIKE 'phase-2 smoke%' OR title LIKE 'smoke %')`,
+      cutoff,
+    ).toArray() as any[];
+    const now = Date.now();
+    for (const r of rows) {
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET status = 'superseded', status_ts = ?, updated_ts = ? WHERE id = ?`,
+        now, now, r.id,
+      );
+      this.version(r.id, "system:cleanup", "transition", `purged smoke-test row (was ${r.status})`, { from: r.status, to: "superseded" });
+      this.audit("system:cleanup", "transition", r.id, { from: r.status, to: "superseded", reason: "smoke purge" });
+    }
+    return { purged: rows.map((r: any) => r.id) };
   }
 
   /** Human handle for an ask: ASK-<subject>-<ordinal> ("ASK-BR-2466-2" = the

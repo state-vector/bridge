@@ -188,6 +188,13 @@ export default {
         return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
+      if (sub === "purge_smoke" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        body.actor = auth.bearer ? "gateway" : "web";
+        return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        }));
+      }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));

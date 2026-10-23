@@ -14,6 +14,7 @@ import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "@bridge/ui-kit/tokens.css";
 import "@bridge/ui-kit/ui-kit.css";
+import "@bridge/ui-kit/views.css";
 import "./App.css";
 
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives

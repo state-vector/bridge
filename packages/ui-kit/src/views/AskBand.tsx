@@ -42,7 +42,11 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   useEffect(() => {
     let on = true;
     kbApi.artefacts({ type: "decision", status: "proposed" })
-      .then((r) => { if (on) setProposed(r.artefacts ?? []); })
+      .then((r) => {
+        if (!on) return;
+        const seen = new Set<string>();
+        setProposed((r.artefacts ?? []).filter((d) => (seen.has(d.id) ? false : (seen.add(d.id), true))));
+      })
       .catch((e) => { if (on) { setProposed([]); useKb.getState().reportError("load proposed decisions", e); } });
     return () => { on = false; };
   }, [evSeq]);
