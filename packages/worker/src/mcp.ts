@@ -354,7 +354,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
       }));
     }
     case "ask_agent": {
-      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, artefact_id: args.artefact_id });
+      const a = await call("ask.create", { to: args.to ?? "any", question: args.question, options: args.options, artefact_id: args.artefact_id });
       return text(JSON.stringify({
         ...a,
         note: a.task_status === "blocked"
@@ -531,13 +531,14 @@ const TOOLS = [
   },
   {
     name: "ask_agent",
-    description: "Ask another agent for insight/help. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered.",
+    description: "Ask another agent or the human for insight/help/decisions. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), 'human', or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. OPTIONS ARE REQUIRED: give the human 2-8 one-click answers (e.g. [\"GO — merge now\", \"NO-GO — hold\"]) — they answer by clicking, and the ask is rejected without them.",
     inputSchema: {
       type: "object",
-      required: ["question"],
+      required: ["question", "options"],
       properties: {
         to: { type: "string", description: "default: any" },
         question: { type: "string" },
+        options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8, description: "REQUIRED: 2-8 one-click answer options for the human" },
         artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },
       },
     },

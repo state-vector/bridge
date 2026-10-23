@@ -141,6 +141,31 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
     const id = m.awaiting_ask?.ask_id;
     if (!id) { setAsk(null); return; }
     let on = true;
+    if (/^BR#\d+$/.test(id)) {
+      // question NODE: it is a task — read it from the live board, artefact as fallback
+      const fromBoard = useKb.getState().tasks.find((t) => t.id === id);
+      if (fromBoard) {
+        const am = (fromBoard.meta ?? {}) as any;
+        setAsk({
+          id, display: id, to: am.ask?.to ?? "any", question: fromBoard.title,
+          options: am.ask?.options ?? [], urgency: am.ask?.urgency ?? "normal",
+          status: ["done", "superseded"].includes(fromBoard.status) ? "answered" : "open",
+          artefact_id: am.ask?.artefact_id, created_ts: fromBoard.created_ts,
+        });
+        return;
+      }
+      kbApi.artefact(id).then((a) => {
+        if (!on) return;
+        const am = (a.meta ?? {}) as any;
+        setAsk({
+          id, display: id, to: am.ask?.to ?? "any", question: a.title,
+          options: am.ask?.options ?? [], urgency: am.ask?.urgency ?? "normal",
+          status: ["done", "superseded"].includes(a.status) ? "answered" : "open",
+          artefact_id: am.ask?.artefact_id, created_ts: a.created_ts,
+        });
+      }).catch(() => { if (on) setAsk(null); });
+      return;
+    }
     kbApi.ask(id).then((a) => { if (on) setAsk(a); }).catch(() => { if (on) setAsk(null); });
     return () => { on = false; };
   }, [m.awaiting_ask?.ask_id]);

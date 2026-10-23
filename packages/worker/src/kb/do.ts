@@ -68,7 +68,6 @@ export class KnowledgeHub {
   /** ensureSchema runs once per isolate, not per request — its migration
    *  queries are full-table scans, and the free-tier DO row-read quota
    *  dies under per-request schema checks (2026-10-18 outage). */
-  private schemaReady = false;
 
   // ---------- realtime (hibernating websockets) ----------
 
@@ -551,8 +550,12 @@ export class KnowledgeHub {
   }
 
   async ensureSchema() {
-    if (this.schemaReady) return;
-    this.schemaReady = true;
+    // NO early-return flag: this DO's isolate is long-lived, and a flag set
+    // on first boot meant every migration added later NEVER ran on the warm
+    // singleton — today's schema additions silently broke against production
+    // while working on fresh local DBs. Everything here is idempotent by
+    // construction (IF NOT EXISTS + guarded ALTERs); the per-fetch cost is a
+    // few cheap statements.
     this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS artefacts (
         id TEXT PRIMARY KEY,
@@ -977,6 +980,12 @@ export class KnowledgeHub {
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["role:review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
+    // an ask node REQUIRES options (the human answers by clicking) — enforced
+    // here, not just in ask.create, so every door is covered
+    if (createMeta.ask && type === "task") {
+      const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
+      if (opts.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (meta.ask.options)");
+    }
     // classification lives in TAGS (phase 2): an incoming meta.kind is mapped
     // to its tag and stripped — stored meta never carries kind again
     if (createMeta.kind !== undefined) {
