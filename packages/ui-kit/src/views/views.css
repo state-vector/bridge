@@ -765,12 +765,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* ask band — decisions/asks awaiting the human, process-row height */
 .ask-band { display: flex; flex-direction: column; margin-bottom: 10px; }
 .ask-band-row {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 1fr) 84px auto;
-  gap: 10px; align-items: center;
-  min-height: 26px; padding: 2px 6px;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 6px;
   border-bottom: 1px solid color-mix(in srgb, var(--border, #232b3b) 60%, transparent);
 }
+.ab-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ab-head .why-line { font-size: 10.5px; color: var(--text-faint, #8b94a7); }
+.ab-actions { display: flex; gap: 6px; align-items: center; margin-left: auto; }
 .ask-band-row:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 .ab-kind { display: flex; gap: 4px; align-items: center; }
 .ab-main { display: flex; flex-direction: column; min-width: 0; }
@@ -853,10 +854,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-opt-text { font-size: 11.5px; line-height: 1.4; min-width: 0; }
 
 /* band rows hosting a vertical option list: let the row grow naturally */
-.ask-band-row:has(.ask-opt-list) { grid-template-columns: 120px minmax(0, 1fr); }
-.ask-band-row:has(.ask-opt-list) .ab-meta,
-.ask-band-row:has(.ask-opt-list) .ab-actions { display: none; }
-.ask-band-row:has(.ask-opt-list) .ab-main { grid-column: 1 / -1; }
+/* (column-fold hack removed — rows are column-flex, any content fits) */
 
 /* the why-escalated line: muted, italic, always second */
 .ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }

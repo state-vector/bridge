@@ -2711,7 +2711,6 @@ export class KnowledgeHub {
       my_tasks: myTasks,
       unclaimed_work: unclaimedWork,
       steering,
-      steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
       action_required: actionRequired.length || verificationNotices.length

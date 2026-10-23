@@ -53,9 +53,13 @@ export interface HistoryEntry {
  *      [ A ] - Provision x
  *      [ B ] - Reword y
  *  Never letter-keys alone — an option without its text is not an option. */
-export function AskOptions({ options, onPick, busy }: {
+export function AskOptions({ options: raw, onPick, busy }: {
   options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean;
 }) {
+  const options = raw
+    .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))
+    .filter((o) => o && !/\[object\s*object\]/i.test(o));
+  if (options.length === 0) return null;
   const short = options.every((o) => o.length <= 34);
   if (options.length === 2 && short) {
     return (

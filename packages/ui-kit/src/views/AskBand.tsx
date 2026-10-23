@@ -34,7 +34,9 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
   const tasks = useKb((s) => s.tasks);
   const nodeAsks = useMemo(
-    () => (tasks as any[]).filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)),
+    () => (tasks as any[])
+      .filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status))
+      .sort((x, y) => y.created_ts - x.created_ts),
     [tasks],
   );
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
@@ -70,9 +72,14 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
     // question-node asks: BR#-numbered, child_of their subject (part_of on the
     // board payload) — surfaced by the same exactly-once rule. Self-asks
     // (agent → itself) are coordination, not a human decision: excluded.
+    const seenAsk = new Set<string>();
     for (const nodeAsk of nodeAsks) {
       const am = (nodeAsk.meta ?? {}).ask ?? {};
       if (am.to && am.from && am.to === am.from) continue;
+      // identical re-asked asks collapse to the newest
+      const key = `${nodeAsk.part_of ?? ""}:${nodeAsk.title}`;
+      if (seenAsk.has(key)) continue;
+      seenAsk.add(key);
       put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
     }
 
@@ -98,27 +105,27 @@ function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
   return (
     <>
       <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
-        <span className="ab-kind"><Chip tone="urgent">VERDICT</Chip></span>
-        <span className="ab-main">
-          <span className="ab-title" title={latest.title}>
-            {isBounce ? "Bounce" : "Accept verification of"} {f.target ?? "task"}
-            {prior.length > 0 && (
-              <button className="ab-prior" onClick={() => setShowPrior(!showPrior)}>
-                {showPrior ? "▾" : "▸"} {prior.length} identical prior
-              </button>
-            )}
+        <div className="ab-head">
+          <Chip tone="urgent">VERDICT</Chip>
+          <span className="why-line">{f.target ?? "task"} · {rel(latest.created_ts)}</span>
+          <span className="ab-actions">
+            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
+            <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
+            <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(latest.id) : setOpen(true))}>Details</Btn>
+            {err && <span className="k-err">{err}</span>}
           </span>
-          {showPrior && prior.map((d) => (
-            <span key={d.id} className="ab-prior-line">{d.id} · {rel(d.created_ts)} · {String((d.meta as any)?.verdict ?? "").toUpperCase()}</span>
-          ))}
+        </div>
+        <span className="ab-title" title={latest.title}>
+          {isBounce ? "Bounce" : "Accept verification of"} {f.target ?? "task"}
+          {prior.length > 0 && (
+            <button className="ab-prior" onClick={() => setShowPrior(!showPrior)}>
+              {showPrior ? "▾" : "▸"} {prior.length} identical prior
+            </button>
+          )}
         </span>
-        <span className="ab-meta">{rel(latest.created_ts)}</span>
-        <span className="ab-actions">
-          <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
-          <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-          <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(latest.id) : setOpen(true))}>Details</Btn>
-          {err && <span className="k-err">{err}</span>}
-        </span>
+        {showPrior && prior.map((d) => (
+          <span key={d.id} className="ab-prior-line">{d.id} · {rel(d.created_ts)} · {String((d.meta as any)?.verdict ?? "").toUpperCase()}</span>
+        ))}
       </div>
       {open && <DecisionPopover d={latest} onClose={() => setOpen(false)} onChanged={onDone} />}
     </>
