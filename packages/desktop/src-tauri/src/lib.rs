@@ -8,6 +8,9 @@ mod scm;
 mod session;
 mod transport;
 
+pub use self::keychain;
+pub use self::session;
+
 use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
