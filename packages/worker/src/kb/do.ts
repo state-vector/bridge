@@ -1065,6 +1065,7 @@ export class KnowledgeHub {
     if (createMeta.ask && type === "task") {
       const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
       if (opts.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (meta.ask.options)");
+      if (!String(body.title ?? "").trimEnd().endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?'");
     }
     // classification lives in TAGS (phase 2): an incoming meta.kind is mapped
     // to its tag and stripped — stored meta never carries kind again
@@ -2204,9 +2205,10 @@ export class KnowledgeHub {
     const to = String(body.to ?? "any");
     const question = String(body.question ?? "").trim();
     if (!question) throw new Error("question is required");
-    // the question IS the ask — one imperative sentence a human can answer by
-    // clicking. Reports, receipts and narrative belong in details (body_md).
-    if (question.length > 240) throw new Error("question must be the ask itself, one sentence ≤240 chars (e.g. 'Merge PR #84?') — put reports/receipts in details");
+    // the question IS the ask — one answerable sentence ending in '?'.
+    // Reports, receipts and narrative belong in details (body_md).
+    if (question.length > 240) throw new Error("question must be the ask itself, one sentence ≤240 chars — put reports/receipts in details");
+    if (!question.endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?' (you sent a status report, not a question)");
     const details = String(body.details ?? "").trim();
     // WHY IT'S ESCALATED is not optional for human-directed asks: "merge PR
     // #84?" is unanswerable without "review is red but rebuttable per guidance".

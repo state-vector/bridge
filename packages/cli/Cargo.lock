@@ -31,6 +31,7 @@ name = "bridge-cli"
 version = "0.1.8"
 dependencies = [
  "reqwest",
+ "security-framework",
  "serde",
  "serde_json",
 ]

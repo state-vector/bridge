@@ -17,10 +17,14 @@
 // of truth — no drift between GUI and CLI).
 #[path = "../../desktop/src-tauri/src/dispatch.rs"]
 mod dispatch;
+#[path = "../../desktop/src-tauri/src/keychain.rs"]
+mod keychain;
 #[path = "../../desktop/src-tauri/src/opencode.rs"]
 mod opencode;
 #[path = "../../desktop/src-tauri/src/scm.rs"]
 mod scm;
+#[path = "../../desktop/src-tauri/src/session.rs"]
+mod session;
 #[path = "../../desktop/src-tauri/src/transport.rs"]
 mod transport;
 

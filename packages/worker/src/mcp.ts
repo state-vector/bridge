@@ -537,8 +537,8 @@ const TOOLS = [
       required: ["question", "options", "reason"],
       properties: {
         to: { type: "string", description: "default: any" },
-        question: { type: "string", description: "THE ASK ITSELF — one imperative sentence ≤240 chars (e.g. \"Merge PR #84?\"). Reports/receipts go in details, not here" },
-        reason: { type: "string", description: "REQUIRED: WHY this needs a decision instead of proceeding automatically — one sentence (e.g. \"PR is failing SP Review but the failure is rebuttable per guidance; rebuttal drafted\")" },
+        question: { type: "string", description: "THE ASK ITSELF — an answerable question ending in ?, <=240 chars. Canonical: Do you want to merge PR #123 into main? NOT a status report — reports go in details" },
+        reason: { type: "string", description: "REQUIRED: WHY this is escalated instead of automatic — one sentence. Canonical: PR is failing SP Review, but your guidance says this is tolerable if I rebut. Rebuttal in body." },
         details: { type: "string", description: "context, receipts, narrative — rendered as markdown below the question" },
         options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8, description: "REQUIRED: 2-8 one-click answer options for the human" },
         artefact_id: { type: "string", description: "your blocked task — links the decision, pauses the watchdog, auto-resumes on answer" },
