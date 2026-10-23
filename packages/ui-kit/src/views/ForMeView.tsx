@@ -113,15 +113,19 @@ function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => 
 
 function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => void }) {
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
   const [text, setText] = useState("");
   const ask = node.meta?.ask ?? {};
   const answer = async (a: string) => {
     if (!a.trim()) return;
     setBusy(true);
+    setErr("");
     try {
       await kbApi.askAnswer(node.id, a.trim());
       await useKb.getState().refresh();
       onDone(node.id);
+    } catch (e) {
+      setErr((e as Error).message || "answer failed");
     } finally {
       setBusy(false);
     }
@@ -149,6 +153,7 @@ function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => 
           onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) void answer(text); }}
         />
         <Btn disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+        {err && <span className="k-err">{err}</span>}
       </div>
     </Card>
   );

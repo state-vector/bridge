@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig } from "@bridge/ui-kit";
+import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig, setKbAuthEscalator } from "@bridge/ui-kit";
 import { openDetailWindow } from "./detailWindow";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
@@ -136,6 +136,15 @@ export function App() {
       setSession({ signed_in: false });
     }
   }, []);
+
+  // any 401 anywhere in the knowledge plane → back to the sign-in gate.
+  // Silent failure is how "answering does nothing" happens; fail closed loud.
+  useEffect(() => {
+    setKbAuthEscalator(() => {
+      setSession({ signed_in: false });
+      void refreshSession();
+    });
+  }, [refreshSession]);
 
 
 

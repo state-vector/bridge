@@ -21,6 +21,8 @@ export interface KbArtefact {
   created_ts: number;
   updated_ts: number;
   status_ts?: number;
+  /** parent task id, projected by board() from child_of relations */
+  part_of?: string;
 }
 
 export interface KbEvent {

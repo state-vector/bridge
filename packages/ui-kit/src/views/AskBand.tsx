@@ -142,20 +142,24 @@ function BandDecisionRow({ d, onDone, openDecision, nested }: {
   );
 }
 
-function BandNodeAskRow({ nodeAsk, onDone, nested }: {
-  nodeAsk: KbArtefact; onDone: () => void; nested?: boolean;
+function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
+  nodeAsk: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
   const [text, setText] = useState("");
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
   const answer = async (a: string) => {
     if (!a.trim()) return;
     setBusy(true);
+    setErr("");
     try {
       await kbApi.askAnswer(nodeAsk.id, a.trim());
       await useKb.getState().refresh();
       onDone();
+    } catch (e) {
+      setErr((e as Error).message || "answer failed");
     } finally {
       setBusy(false);
     }
@@ -165,6 +169,7 @@ function BandNodeAskRow({ nodeAsk, onDone, nested }: {
       <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
       <span className="ab-main">
         <span className="ab-title" title={nodeAsk.title}>{nodeAsk.title}</span>
+        {nodeAsk.part_of && <span className="ab-prior-line">on {nodeAsk.part_of}</span>}
         {(ask.options ?? []).length > 0 && (
           <span className="ab-options">
             {(ask.options as string[]).map((o) => (
@@ -172,6 +177,7 @@ function BandNodeAskRow({ nodeAsk, onDone, nested }: {
             ))}
           </span>
         )}
+        {err && <span className="k-err">{err}</span>}
       </span>
       <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>
       <span className="ab-actions">
@@ -181,6 +187,8 @@ function BandNodeAskRow({ nodeAsk, onDone, nested }: {
           onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) void answer(text); }}
         />
         <Btn size="sm" disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+        <Btn size="sm" quiet title="open the full ask — question, comments, context"
+          onClick={() => (openDecision ? openDecision(nodeAsk.id) : onDone())}>Details</Btn>
       </span>
     </div>
   );
@@ -195,7 +203,7 @@ export function AskEntries({ entries, onDone, openDecision, nested }: {
         ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} />
         : e.kind === "decision"
         ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} />
-        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} nested={nested} />)}
+        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} openDecision={openDecision} nested={nested} />)}
     </>
   );
 }
