@@ -5,7 +5,7 @@ import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
 import type { AskFeed } from "./ForMeView";
-import { Btn, Chip } from "./index-kit";
+import { Btn, Chip, TextInput } from "./index-kit";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -15,10 +15,11 @@ import { Btn, Chip } from "./index-kit";
  *  Flood collapse (identical prior rounds) applies in both contexts. */
 
 export interface AskEntry {
-  kind: "verdict" | "decision" | "ask";
+  kind: "verdict" | "decision" | "ask" | "nodeAsk";
   latest?: KbArtefact;
   prior?: KbArtefact[];
   d?: any;
+  nodeAsk?: KbArtefact;
 }
 
 export interface HumanAsks {
@@ -32,6 +33,11 @@ export interface HumanAsks {
 
 export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): HumanAsks {
   const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
+  const tasks = useKb((s) => s.tasks);
+  const nodeAsks = useMemo(
+    () => (tasks as any[]).filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)),
+    [tasks],
+  );
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
 
   useEffect(() => {
@@ -58,6 +64,11 @@ export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): Hu
       put(String((latest.meta as any)?.task ?? (latest.meta as any)?.verify_target ?? ""), { kind: "verdict", latest, prior });
     }
     for (const d of generic) put(null, { kind: "decision", d });
+    // question-node asks: BR#-numbered, child_of their subject (part_of on the
+    // board payload) — surfaced by the same exactly-once rule
+    for (const nodeAsk of nodeAsks) {
+      put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
+    }
     for (const d of askFeed?.decisions ?? []) {
       if (d.resolved) continue;
       if (!(d.target === "human" || d.asker === "human" || !d.target)) continue;
@@ -71,8 +82,8 @@ export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): Hu
   }, [proposed, askFeed?.decisions, visibleTaskIds]);
 }
 
-const rankOf = (e: AskEntry) => (e.kind === "ask" ? 2 : e.kind === "decision" ? 1 : 0);
-const ts = (e: AskEntry) => (e.latest ?? e.d)?.created_ts ?? 0;
+const rankOf = (e: AskEntry) => (e.kind === "ask" || e.kind === "nodeAsk" ? 2 : e.kind === "decision" ? 1 : 0);
+const ts = (e: AskEntry) => (e.latest ?? e.d ?? e.nodeAsk)?.created_ts ?? 0;
 
 function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
   latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
@@ -136,6 +147,50 @@ function BandDecisionRow({ d, onDone, openDecision, nested }: {
   );
 }
 
+function BandNodeAskRow({ nodeAsk, onDone, nested }: {
+  nodeAsk: KbArtefact; onDone: () => void; nested?: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [text, setText] = useState("");
+  const m = (nodeAsk.meta ?? {}) as any;
+  const ask = m.ask ?? {};
+  const answer = async (a: string) => {
+    if (!a.trim()) return;
+    setBusy(true);
+    try {
+      await kbApi.askAnswer(nodeAsk.id, a.trim());
+      await useKb.getState().refresh();
+      onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""}`}>
+      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
+      <span className="ab-main">
+        <span className="ab-title" title={nodeAsk.title}>{nodeAsk.title}</span>
+        {(ask.options ?? []).length > 0 && (
+          <span className="ab-options">
+            {(ask.options as string[]).map((o) => (
+              <Btn key={o} size="sm" variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
+            ))}
+          </span>
+        )}
+      </span>
+      <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>
+      <span className="ab-actions">
+        <TextInput
+          value={text} placeholder="answer…"
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) void answer(text); }}
+        />
+        <Btn size="sm" disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+      </span>
+    </div>
+  );
+}
+
 function BandAskRow({ d, resolve, onDone, nested }: {
   d: any; resolve: NonNullable<AskFeed["resolve"]>; onDone: () => void; nested?: boolean;
 }) {
@@ -171,6 +226,8 @@ export function AskEntries({ entries, askFeed, onDone, openDecision, nested }: {
         ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} />
         : e.kind === "decision"
         ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} />
+        : e.kind === "nodeAsk"
+        ? <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} nested={nested} />
         : <BandAskRow key={e.d?.id ?? i} d={e.d} resolve={askFeed!.resolve} onDone={onDone} nested={nested} />)}
     </>
   );

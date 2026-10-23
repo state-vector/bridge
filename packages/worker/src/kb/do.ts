@@ -168,7 +168,17 @@ export class KnowledgeHub {
         // age, or the wait is invisible and unbounded. Annotate hourly;
         // the release stays human-owned (an answered ask un-blocks it).
         try {
-          const ask = this.one(`SELECT to_target, created_ts FROM asks WHERE id = ? AND status = 'open'`, meta.awaiting_ask.ask_id);
+          let ask: { to_target?: string; created_ts: number } | undefined;
+          if (/^BR#\d+$/.test(String(meta.awaiting_ask.ask_id))) {
+            const node = this.one(`SELECT meta, created_ts, status FROM artefacts WHERE id = ? AND status IN ('todo','in_progress','blocked')`, meta.awaiting_ask.ask_id);
+            if (node) {
+              const nm = JSON.parse(node.meta ?? "{}");
+              ask = { to_target: nm.ask?.to, created_ts: node.created_ts };
+            }
+          } else {
+            const row = this.one(`SELECT to_target, created_ts FROM asks WHERE id = ? AND status = 'open'`, meta.awaiting_ask.ask_id);
+            if (row) ask = { to_target: row.to_target, created_ts: row.created_ts };
+          }
           if (ask) {
             const hours = Math.floor((now - ask.created_ts) / 3_600_000);
             if (meta.awaiting_ask.annotated_h !== hours) {
@@ -1994,36 +2004,42 @@ export class KnowledgeHub {
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
     const options = Array.isArray(body.options) ? body.options.map((o: any) => String(o).slice(0, 200)).filter(Boolean).slice(0, 8) : [];
     const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
-    const id = `ASK-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+    // the ask IS a question node: BR#-numbered, child_of its subject, answered
+    // by transition. The legacy asks row is no longer written.
+    const created = await this.create(
+      {
+        type: "task",
+        title: question.slice(0, 200),
+        body_md: question,
+        tags: ["question"],
+        owner: "",
+        meta: { ask: { to, urgency, options, from: actor, artefact_id: artefactId || undefined } },
+      },
+      actor,
+    );
+    const id = created.id;
     let taskStatus: string | undefined;
     if (artefactId) {
       const row = this.one(`SELECT type, status, meta FROM artefacts WHERE id = ?`, artefactId);
       if (!row) throw new Error(`no such artefact: ${artefactId}`);
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+        id, artefactId, Date.now(),
+      );
       if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
-        const meta = JSON.parse(row.meta ?? "{}");
-        meta.awaiting_ask = { ask_id: id, ts: Date.now() };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), artefactId);
+        const m = JSON.parse(row.meta ?? "{}");
+        m.awaiting_ask = { ask_id: id, ts: Date.now() };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), artefactId);
         if (row.status === "in_progress") {
-          await this.transition({
-            id: artefactId, to: "blocked",
-            note: `blocked on decision — ${id}: ${question.slice(0, 120)}`,
-            unblock_condition: `answer to ask ${id}`,
-            awaiting_ask_id: id, // machine.ts: the only legal blocked for verdict duties
-          }, actor);
-          taskStatus = "blocked";
-        } else {
+          await this.transition({ id: artefactId, to: "blocked", note: `blocked on ${to}: ${question.slice(0, 100)}` }, actor);
           taskStatus = "blocked";
         }
       }
     }
-    this.state.storage.sql.exec(
-      `INSERT INTO asks (id, from_label, to_target, question, status, created_ts, artefact_id) VALUES (?, ?, ?, ?, 'open', ?, ?)`,
-      id, actor, to, question, Date.now(), artefactId || null,
-    );
     this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
-    return { id, to, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
+    return { id, ask: id, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
   }
-
   private async askInbox(body: any) {
     const label = String(body.label ?? "");
     const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
@@ -2073,6 +2089,40 @@ export class KnowledgeHub {
     const id = String(body.id ?? "");
     const answer = String(body.answer ?? "").trim();
     if (!answer) throw new Error("answer is required");
+
+    // question-node asks (BR#): answer on the node, resume the subject
+    if (/^BR#\d+$/.test(id)) {
+      const node = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, id);
+      if (!node) throw new Error(`no such ask: ${id}`);
+      const m = JSON.parse(node.meta ?? "{}");
+      if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
+      m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), id);
+      let taskStatus: string | undefined;
+      await this.transition({ id, to: "done", note: `answered by ${actor}: ${answer.slice(0, 200)}` }, actor);
+      const subject = this.one(
+        `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+         WHERE r.relation = 'child_of' AND r.src_id = ? ORDER BY r.created_ts DESC LIMIT 1`, id,
+      );
+      if (subject) {
+        const sm = JSON.parse(subject.meta ?? "{}");
+        if (sm.awaiting_ask?.ask_id === id) {
+          delete sm.awaiting_ask;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
+        }
+        if (subject.status === "blocked") {
+          await this.transition({
+            id: subject.id, to: "in_progress",
+            note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
+          }, `system:question(${actor})`);
+          taskStatus = "in_progress";
+        }
+      }
+      this.audit(actor, "answer", subject?.id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
+      return { id, status: "answered", artefact_id: subject?.id, task_status: taskStatus };
+    }
+
+    // legacy asks-row asks (ASK-…) — kept until in-flight rows drain
     const row = this.one(`SELECT status, artefact_id FROM asks WHERE id = ?`, id);
     if (!row) throw new Error(`no such ask: ${id}`);
     if (row.status !== ASK_OPEN) throw new Error(`ask ${id} already ${row.status}`);
@@ -2101,7 +2151,6 @@ export class KnowledgeHub {
     this.audit(actor, "answer", row.artefact_id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
     return { id, status: ASK_ANSWERED, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
   }
-
   private async orient(body: any) {
     const label = String(body.label ?? "");
     const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
