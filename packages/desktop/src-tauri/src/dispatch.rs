@@ -2675,6 +2675,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provisioning_without_a_vended_secret_demands_a_rotate_retry() {
+        // BR#2878, the churn engine: empty local cache + existing hub token.
+        // The hub cannot re-show a secret (vended once) — {exists:true} and
+        // every error (incl. the revoked error) are ONLY recoverable by a
+        // rotate re-vend. Before this fix the runner dead-ended here and
+        // every dispatch died (38 fake in-flight cards, 38–58 releases).
+        let exists = serde_json::json!({ "exists": true, "id": "at_x", "label": "mac-modem-opencode" });
+        assert!(provision_response_needs_rotate(true, &exists), "exists without secret must retry with rotate");
+        let revoked = serde_json::json!({ "error": "token 'x' was revoked — provision with rotate to re-mint" });
+        assert!(provision_response_needs_rotate(false, &revoked), "revoked error must retry with rotate");
+        let server_error = serde_json::json!({ "error": "internal" });
+        assert!(provision_response_needs_rotate(false, &server_error), "any error retries once (rotate is the only lever)");
+        let vended = serde_json::json!({ "id": "at_x", "label": "a", "secret": "bkw_new" });
+        assert!(!provision_response_needs_rotate(true, &vended), "a vended secret never retries");
+        let empty_secret = serde_json::json!({ "id": "at_x", "secret": "" });
+        assert!(provision_response_needs_rotate(true, &empty_secret), "empty secret is not a credential");
+    }
+
+    #[test]
     fn runner_never_moves_cards_to_blocked_and_never_resumes_blocked_work() {
         // BR#2419: state legality lives in the worker's machine. The runner is
         // hands, not judgment: it may claim todo work and release its own
@@ -2768,8 +2787,12 @@ mod tests {
 
 /// Provision (or reuse) the per-agent hub token for `agent_label` via the
 /// gateway's own credentials. Secret cached in ~/.bridge/agent-tokens.json
-/// (0600 dir); hub dedupes by label — re-provision without a cached secret
-/// rotates (old token revoked, new secret issued).
+/// (0600 dir); hub dedupes by label. When our local cache is empty but the
+/// hub token already exists, the hub cannot re-show the secret (vended
+/// once) — the only recovery is a rotate re-vend, so we retry exactly once
+/// with rotate (old token revoked, fresh secret issued, cached). Without
+/// this the runner dead-ends forever — the 2026-10-24 churn engine (38
+/// fake in-flight cards, 38–58 watchdog releases each).
 fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<String, String> {
     if !cfg.token.is_empty() && agent_label == "gateway" {
         return Ok(cfg.token.clone());
@@ -2789,24 +2812,55 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(format!("{}/api/kb-machine/provision", cfg.url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&json!({ "label": agent_label })).unwrap_or_default())
-        .send()
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("hub {status}: {}", body.get("error").and_then(|e| e.as_str()).unwrap_or("?")));
+    let hub = cfg.url.trim_end_matches('/').to_string();
+    // attempt 1: plain provision; attempt 2 (only when the hub has no secret
+    // to re-show): rotate re-vend. Revoking-then-minting is safe here — the
+    // old secret is provably not in our cache, and by label-namespace rules
+    // it belongs to THIS gateway's worker.
+    let mut last_err = String::new();
+    for rotate in [false, true] {
+        let resp = client
+            .post(format!("{hub}/api/kb-machine/provision"))
+            .header("Authorization", format!("Bearer {}", cfg.token))
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&json!({ "label": agent_label, "rotate": rotate })).unwrap_or_default())
+            .send()
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().unwrap_or_default();
+        if provision_response_needs_rotate(status.is_success(), &body) {
+            last_err = format!(
+                "hub {status}: {}",
+                body.get("error").and_then(|e| e.as_str()).unwrap_or("no secret vended")
+            );
+            continue; // exactly one more attempt, with rotate
+        }
+        let secret = body
+            .get("secret")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("hub vended an empty secret")?;
+        cache.insert(agent_label.to_string(), secret.to_string());
+        let _ = std::fs::write(&cache_path, serde_json::to_string_pretty(&cache).unwrap_or_default());
+        if rotate {
+            eprintln!("[dispatch] agent token for '{agent_label}' re-vended by rotate (cache was empty)");
+        }
+        return Ok(secret.to_string());
     }
-    let secret = body
+    Err(format!(
+        "agent token provisioning for '{agent_label}' failed after rotate retry — {last_err}"
+    ))
+}
+
+/// The provisioning retry decision, extracted for the regression test: a
+/// response that carries no USABLE vended secret (exists:true, an empty
+/// secret, or any error — including the revoked-token error that also
+/// demands rotate) is only recoverable by a rotate re-vend.
+fn provision_response_needs_rotate(status_ok: bool, body: &serde_json::Value) -> bool {
+    let usable_secret = body
         .get("secret")
         .and_then(|s| s.as_str())
-        .map(String::from)
-        .ok_or_else(|| "hub returned no secret — token exists but no cached copy; provision with rotate".to_string())?;
-    cache.insert(agent_label.to_string(), secret.clone());
-    let _ = std::fs::write(&cache_path, serde_json::to_string_pretty(&cache).unwrap_or_default());
-    Ok(secret)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    !(status_ok && usable_secret)
 }
