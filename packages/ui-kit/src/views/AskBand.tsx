@@ -3,7 +3,7 @@ import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
+import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, askKernel } from "./decide";
 import { Btn, Chip } from "./index-kit";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
@@ -152,6 +152,8 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
   const [busy, setBusy] = useState(false);
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
+  // the subject BY NAME — an id alone doesn't say what the ask is about
+  const subject = useKb((s) => s.tasks.find((t) => t.id === nodeAsk.part_of));
   // rows point, the detail view acts: option buttons answer inline (one click,
   // no typing); free-text answering lives in the node's detail view
   const answer = async (a: string) => {
@@ -170,8 +172,11 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
     <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""}`}>
       <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
       <span className="ab-main">
-        <span className="ab-title" title={nodeAsk.title}>{nodeAsk.title}</span>
-        {nodeAsk.part_of && <span className="ab-prior-line">on {nodeAsk.part_of}</span>}
+        <span className="ab-title" title={nodeAsk.title}>{askKernel(nodeAsk.title)}</span>
+        <span className="ab-prior-line">
+          {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
+          {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}
+        </span>
         {(ask.options ?? []).length > 0 && (
           <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
         )}

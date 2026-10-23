@@ -78,6 +78,17 @@ export function AskOptions({ options, onPick, busy }: {
   );
 }
 
+
+/** The readable kernel of an ask: first sentence, cut on a word boundary. */
+export function askKernel(text: string | undefined, limit = 160): string {
+  const t = (text ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  const cut = t.slice(0, limit);
+  const sentence = cut.match(/^[^.?!]*[.?!]/)?.[0];
+  if (sentence && sentence.length > 24) return sentence.trim();
+  return (cut.length < t.length ? cut.slice(0, cut.lastIndexOf(" ")).trimEnd() + "…" : cut);
+}
+
 export function Comment({ v }: { v: HistoryEntry }) {
   const note = (v.data?.note as string | undefined) ?? v.summary;
   if (!note?.trim()) return null;

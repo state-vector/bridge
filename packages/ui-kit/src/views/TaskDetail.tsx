@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md, AskOptions } from "./decide";
+import { md, AskOptions, askKernel } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
 import { useKb } from "../server/kbStore";
@@ -439,7 +439,11 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           <button className="icon-btn" onClick={onClose}>✕</button>
         </header>
 
-        <h2 className="detail-question"><RefText text={task?.title ?? taskId} onOpen={nav} /></h2>
+        <h2 className="detail-question">
+          {task && (task.meta as any)?.ask
+            ? <RefText text={askKernel(task.title)} onOpen={nav} />
+            : <RefText text={task?.title ?? taskId} onOpen={nav} />}
+        </h2>
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
 
