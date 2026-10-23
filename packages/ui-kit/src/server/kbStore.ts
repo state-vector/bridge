@@ -43,6 +43,8 @@ interface KbState {
   settings: Record<string, any>;
   /** cross-tab handoff: thread id For Me wants Discussions to open */
   initialThread: string | null;
+  /** human-ask plane: decisions + asks awaiting the human (ask band + nested) */
+  awaitingHuman: number;
 
   start: () => void;
   stop: () => void;
@@ -75,6 +77,7 @@ export const useKb = create<KbState>((set, get) => ({
   gatewayAgents: [],
   settings: {},
   initialThread: null,
+  awaitingHuman: 0,
 
   start: () => {
     stopWs?.();

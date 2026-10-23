@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
-import { AskBand } from "./AskBand";
+import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import type { AskFeed } from "./ForMeView";
 import { kindOf } from "../server/views";
 import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
@@ -201,6 +201,17 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
     return out;
   }, [rows]);
 
+  // human-ask plane: exactly-once placement — nested under a visible subject,
+  // else the residual band (2026-10-23 design)
+  const visibleTaskIds = useMemo(() => new Set(rows.map((r) => r.taskId ?? r.key)), [rows]);
+  const humanAsks = useHumanAsks(visibleTaskIds, askFeed);
+  const bumpAsks = () => { void refreshKb(); };
+  useEffect(() => {
+    if (useKb.getState().awaitingHuman !== humanAsks.total) useKb.setState({ awaitingHuman: humanAsks.total });
+  }, [humanAsks.total]);
+  // a blocked row's inline unblock dedupes away when its ask nests below it
+  const nestedAskTargets = useMemo(() => new Set(humanAsks.byTask.keys()), [humanAsks.byTask]);
+
   // pending asks on visible blocked rows — fetched once so the Unblock
   // tooltip can state WHAT the task is waiting for, not just "an ask"
   const pendingAskIds = useMemo(
@@ -218,7 +229,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
-      <AskBand askFeed={askFeed} openDecision={openTask} />
+      <AskBand asks={humanAsks} askFeed={askFeed} onChanged={bumpAsks} openDecision={openTask} />
       <div className="view-head">
         <h2>Top</h2>
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
@@ -238,7 +249,9 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
         <span className="topc-age" title="time since the agent's last signal on this task">last signal</span>
       </div>
 
-      {treeRows.map(({ row: r, depth }) => (
+      {treeRows.flatMap(({ row: r, depth }) => {
+        const asks: AskEntry[] = humanAsks.byTask.get(r.taskId ?? r.key) ?? [];
+        return [
         <div
           key={r.key}
           className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "top-row-child" : ""}`}
@@ -280,7 +293,7 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
           <span className={`topc-gauge top-num ${pctTone(r.risk, false)}`}>{r.risk != null ? `${r.risk}%` : "—"}</span>
           <span className={`topc-gauge top-num ${pctTone(r.context, false)}`} title="context % — how full the agent's window is; high values mean it should hand off soon">{r.context != null ? `${r.context}%` : "—"}</span>
           <span className="topc-bar">
-            {r.status === "blocked" && (r.unblock || r.askPending) ? (
+            {r.status === "blocked" && (r.unblock || r.askPending) && !(r.askPending && nestedAskTargets.has(r.taskId ?? r.key)) ? (
               <span
                 className="top-unblock"
                 title={r.askPending ? `blocked on decision — awaiting answer to ask ${r.askPending}` : `blocked — unblocks when: ${r.unblock ?? ""}`}
@@ -308,8 +321,14 @@ export function TopView({ askFeed, openTask }: { askFeed?: AskFeed; openTask?: (
           </span>
           <span className="topc-age top-num">{r.statusTs ? age(r.statusTs, now) : "—"}</span>
           <span className={`topc-age top-num age-${r.lastSignal ? staleness(r.lastSignal, now) : "dead"}`}>{age(r.lastSignal ?? r.lastSeen, now)}</span>
-        </div>
-      ))}
+        </div>,
+        asks.length > 0 && (
+          <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group" style={{ marginLeft: `${depth * 22 + 22}px` }}>
+            <AskEntries entries={asks} askFeed={askFeed} onDone={bumpAsks} openDecision={openTask} nested />
+          </div>
+        ),
+        ];
+      })}
 
       {treeRows.length === 0 && (
         <p className="empty">{conn === "closed" ? "Hub unreachable — check the gateway pairing / hub url." : "No fleet activity — agents appear here when they claim work."}</p>

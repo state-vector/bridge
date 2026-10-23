@@ -2,17 +2,81 @@ import { useEffect, useMemo, useState } from "react";
 import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
+import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct } from "./decide";
 import type { AskFeed } from "./ForMeView";
-import { useKb } from "../server/kbStore";
 import { Btn, Chip } from "./index-kit";
 
-/** The ask band — decisions + asks awaiting the human, rendered as compact
- *  rows (process-row height) between the dashboard stats and the fleet table.
- *  Kernel + options inline; click for the full decision popover. */
+/** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
+ *  as close to their subject as possible (2026-10-23 design, Ray):
+ *   - subject is a visible Top row → nested under it, first among children
+ *   - subject not in flight (in_review/backlog/done, generic, unfiled) → the
+ *     residual band between stats and the fleet table
+ *  Flood collapse (identical prior rounds) applies in both contexts. */
 
-function BandVerdictRow({ latest, prior, onDone, openDecision }: { latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void }) {
-  const openDetails = (id: string) => (openDecision ? openDecision(id) : setOpen(true));
+export interface AskEntry {
+  kind: "verdict" | "decision" | "ask";
+  latest?: KbArtefact;
+  prior?: KbArtefact[];
+  d?: any;
+}
+
+export interface HumanAsks {
+  ready: boolean;
+  /** entries nested under a visible Top row, by target task id */
+  byTask: Map<string, AskEntry[]>;
+  /** everything whose subject is not on the board — the residual inbox */
+  residual: AskEntry[];
+  total: number;
+}
+
+export function useHumanAsks(visibleTaskIds: Set<string>, askFeed?: AskFeed): HumanAsks {
+  const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
+  const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
+
+  useEffect(() => {
+    let on = true;
+    kbApi.artefacts({ type: "decision", status: "proposed" })
+      .then((r) => { if (on) setProposed(r.artefacts ?? []); })
+      .catch(() => { if (on) setProposed([]); });
+    return () => { on = false; };
+  }, [evSeq]);
+
+  return useMemo(() => {
+    if (proposed === null) return { ready: false, byTask: new Map(), residual: [], total: 0 };
+    const { verdictCards, generic } = groupDecisions(proposed);
+    const byTask = new Map<string, AskEntry[]>();
+    const residual: AskEntry[] = [];
+    const put = (target: string | null, e: AskEntry) => {
+      if (target && visibleTaskIds.has(target)) {
+        const list = byTask.get(target) ?? [];
+        list.push(e);
+        byTask.set(target, list);
+      } else residual.push(e);
+    };
+    for (const { latest, prior } of verdictCards) {
+      put(String((latest.meta as any)?.task ?? (latest.meta as any)?.verify_target ?? ""), { kind: "verdict", latest, prior });
+    }
+    for (const d of generic) put(null, { kind: "decision", d });
+    for (const d of askFeed?.decisions ?? []) {
+      if (d.resolved) continue;
+      if (!(d.target === "human" || d.asker === "human" || !d.target)) continue;
+      put(d.task_id ?? null, { kind: "ask", d });
+    }
+    // within a target: verdict → decision → ask; newest first within a rank
+    for (const list of byTask.values()) {
+      list.sort((a, b) => rankOf(a) - rankOf(b) || ts(b) - ts(a));
+    }
+    return { ready: true, byTask, residual, total: byTask.size ? [...byTask.values()].reduce((n, l) => n + l.length, 0) + residual.length : residual.length };
+  }, [proposed, askFeed?.decisions, visibleTaskIds]);
+}
+
+const rankOf = (e: AskEntry) => (e.kind === "ask" ? 2 : e.kind === "decision" ? 1 : 0);
+const ts = (e: AskEntry) => (e.latest ?? e.d)?.created_ts ?? 0;
+
+function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
+  latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+}) {
   const [showPrior, setShowPrior] = useState(false);
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(latest, onDone);
@@ -20,7 +84,7 @@ function BandVerdictRow({ latest, prior, onDone, openDecision }: { latest: KbArt
   const isBounce = f.verdict === "bounce";
   return (
     <>
-      <div className="ask-band-row">
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
         <span className="ab-kind"><Chip tone="urgent">VERDICT</Chip></span>
         <span className="ab-main">
           <span className="ab-title" title={latest.title}>
@@ -39,7 +103,7 @@ function BandVerdictRow({ latest, prior, onDone, openDecision }: { latest: KbArt
         <span className="ab-actions">
           <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
           <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-          <Btn size="sm" quiet onClick={() => openDetails(latest.id)}>Details</Btn>
+          <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(latest.id) : setOpen(true))}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
       </div>
@@ -48,23 +112,22 @@ function BandVerdictRow({ latest, prior, onDone, openDecision }: { latest: KbArt
   );
 }
 
-function BandDecisionRow({ d, onDone, openDecision }: { d: KbArtefact; onDone: () => void; openDecision?: (id: string) => void }) {
-  const openDetails = (id: string) => (openDecision ? openDecision(id) : setOpen(true));
+function BandDecisionRow({ d, onDone, openDecision, nested }: {
+  d: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone);
   const f = decisionFrame(d);
   return (
     <>
-      <div className="ask-band-row">
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
         <span className="ab-kind"><Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip></span>
-        <span className="ab-main">
-          <span className="ab-title" title={d.title}>{f.kind === "verify" ? d.title : d.title}</span>
-        </span>
+        <span className="ab-main"><span className="ab-title" title={d.title}>{d.title}</span></span>
         <span className="ab-meta">{rel(d.created_ts)}</span>
         <span className="ab-actions">
           <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>Accept</Btn>
           <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-          <Btn size="sm" quiet onClick={() => openDetails(d.id)}>Details</Btn>
+          <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(d.id) : setOpen(true))}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
       </div>
@@ -73,7 +136,9 @@ function BandDecisionRow({ d, onDone, openDecision }: { d: KbArtefact; onDone: (
   );
 }
 
-function BandAskRow({ d, resolve, onDone }: { d: any; resolve: NonNullable<AskFeed["resolve"]>; onDone: () => void }) {
+function BandAskRow({ d, resolve, onDone, nested }: {
+  d: any; resolve: NonNullable<AskFeed["resolve"]>; onDone: () => void; nested?: boolean;
+}) {
   const [busy, setBusy] = useState(false);
   const act = async (action: "unblocked" | "completed") => {
     setBusy(true);
@@ -85,7 +150,7 @@ function BandAskRow({ d, resolve, onDone }: { d: any; resolve: NonNullable<AskFe
     }
   };
   return (
-    <div className="ask-band-row">
+    <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
       <span className="ab-kind"><Chip tone="needs">ASK</Chip>{d.urgent && <Chip tone="urgent">URGENT</Chip>}</span>
       <span className="ab-main"><span className="ab-title" title={d.title ?? d.question}>{d.title ?? d.question}</span></span>
       <span className="ab-meta">{rel(d.opened_ts ?? d.created_ts ?? d.ts ?? Date.now())}</span>
@@ -97,43 +162,34 @@ function BandAskRow({ d, resolve, onDone }: { d: any; resolve: NonNullable<AskFe
   );
 }
 
-export function AskBand({ askFeed, onChanged, openDecision }: { askFeed?: AskFeed; onChanged?: () => void; openDecision?: (id: string) => void }) {
-  const events = useKb((st) => st.events);
-  const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
-
-  const load = async () => {
-    try {
-      const r = await kbApi.artefacts({ type: "decision", status: "proposed" });
-      setProposed(r.artefacts ?? []);
-    } catch { setProposed([]); }
-  };
-  // refetch when the live event feed moves (new decision = new event)
-  const evSeq = events[0]?.seq ?? 0;
-  useEffect(() => { void load(); }, [evSeq, onChanged]);
-
-  const grouped = useMemo(() => groupDecisions(proposed ?? []), [proposed]);
-  const asked = useMemo(
-    () => (askFeed?.decisions ?? []).filter((d: any) => !d.resolved && (d.target === "human" || d.asker === "human" || !d.target)),
-    [askFeed?.decisions],
-  );
-
-  if (proposed === null) return null;
-  if (grouped.verdictCards.length === 0 && grouped.generic.length === 0 && asked.length === 0) return null;
-
-  const bump = () => { onChanged?.(); void load(); };
-
+export function AskEntries({ entries, askFeed, onDone, openDecision, nested }: {
+  entries: AskEntry[]; askFeed?: AskFeed; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+}) {
   return (
-    <div className="ask-band">
-      {asked.map((d: any) => (
-        <BandAskRow key={d.id} d={d} resolve={askFeed!.resolve} onDone={bump} />
-      ))}
-      {grouped.verdictCards.map(({ latest, prior }) => (
-        <BandVerdictRow key={latest.id} latest={latest} prior={prior} onDone={bump} openDecision={openDecision} />
-      ))}
-      {grouped.generic.map((d) => (
-        <BandDecisionRow key={d.id} d={d} onDone={bump} openDecision={openDecision} />
-      ))}
-    </div>
+    <>
+      {entries.map((e, i) => e.kind === "verdict"
+        ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} />
+        : e.kind === "decision"
+        ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} />
+        : <BandAskRow key={e.d?.id ?? i} d={e.d} resolve={askFeed!.resolve} onDone={onDone} nested={nested} />)}
+    </>
   );
 }
 
+/** Residual band: asks whose subject is not on the board. Header only when
+ *  non-empty; nothing here means every ask already nests under its task. */
+export function AskBand({ asks, askFeed, onChanged, openDecision }: {
+  asks: HumanAsks; askFeed?: AskFeed; onChanged?: () => void; openDecision?: (id: string) => void;
+}) {
+  const refresh = useKb((s) => s.refresh);
+  if (!asks.ready || asks.residual.length === 0) return null;
+  const bump = () => { void refresh(); onChanged?.(); };
+  return (
+    <div className="ask-band">
+      {asks.residual.length > 0 && (
+        <div className="ab-head muted-note">awaiting you — subjects not in flight</div>
+      )}
+      <AskEntries entries={asks.residual} askFeed={askFeed} onDone={bump} openDecision={openDecision} />
+    </div>
+  );
+}

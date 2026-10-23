@@ -9,6 +9,7 @@ import { ConnDot } from "../ConnDot";
 export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open" | "connecting" | "closed"; gatewaysFrom?: Array<{ label: string; online: boolean; lastSeen: number; tasksInFlight: number }> }) {
   const kbConn = useKb((s) => s.conn);
   const sessions = useKb((s) => s.sessions);
+  const awaitingHuman = useKb((s) => s.awaitingHuman);
   const [open, setOpen] = useState(false);
 
   const derived = useMemo(() => {
@@ -42,6 +43,7 @@ export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open"
         <ConnDot state={kbState} className="conn" title={`kb realtime: ${kbState}`} />
         <ConnDot state={gwOnline > 0 ? "open" : "closed"} className="conn" title={`gateways: ${gwOnline}/${gateways.length} online`} />
         {gateways.length > 0 && <span className="lights-count">{gwOnline}/{gateways.length}</span>}
+        {awaitingHuman > 0 && <span className="lights-awaiting" title={`${awaitingHuman} decision(s)/ask(s) awaiting you — see Top`}>{awaitingHuman}⚑</span>}
       </button>
       {open && (
         <div className="lights-pop" onClick={() => setOpen(false)}>

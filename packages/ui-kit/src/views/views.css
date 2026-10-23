@@ -824,3 +824,14 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   box-shadow: none;
 }
 .task-window-empty { padding: 24px; color: var(--text-faint, #8b94a7); font-size: 12px; }
+
+/* nested ask rows under their subject process */
+.ask-band-nested-group { margin: -2px 0 2px; }
+.ask-band-nested {
+  grid-template-columns: 110px minmax(0, 1fr) 84px auto;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 3px;
+}
+.ab-head { margin-bottom: 4px; }
+.lights-awaiting { color: var(--accent, #5b9dff); font-size: 10px; margin-left: 4px; font-weight: 700; }
