@@ -113,6 +113,20 @@ export function MdRef({ text, onOpen }: { text: string | undefined; onOpen?: (id
   );
 }
 
+
+/** Long-form markdown that starts collapsed at its kernel. */
+function MdLong({ text, limit = 260 }: { text: string | undefined; limit?: number }) {
+  const s = (text ?? "").trim();
+  if (!s) return null;
+  if (s.length <= limit) return <div className="md-body"><MdRef text={s} /></div>;
+  return (
+    <details className="longtext">
+      <summary>{s.slice(0, limit).trimEnd()}… <span className="lt-toggle">more</span></summary>
+      <div className="md-body lt-full"><MdRef text={s} /></div>
+    </details>
+  );
+}
+
 interface TaskMeta {
   session?: string;
   blocked?: { reason?: string; unblock_condition?: string; ts?: number };
@@ -251,7 +265,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
           <div className="progress-note">
             <b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.display ?? ask.id} · to {ask.to} · asked {rel(ask.created_ts)}
           </div>
-          <div className="progress-note"><LongText text={ask.question} limit={260} /></div>
+          <div className="progress-note"><MdLong text={ask.question} limit={260} /></div>
           {ask.options.length > 0 && (
             <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
               {ask.options.map((o) => (
@@ -291,6 +305,54 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       {(task.tags ?? []).length > 0 && (
         <div className="task-tags">{(task.tags as string[]).map((t) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
       )}
+    </div>
+  );
+}
+
+
+/** The answering surface when the viewed task IS a question node:
+ *  question rendered for reading, options as one-click buttons, free-text
+ *  refinement, subject context. Common to any task — this is the detail view. */
+function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void }) {
+  const ask = task.meta?.ask ?? {};
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [text, setText] = useState("");
+  const answer = async (a: string) => {
+    if (!a.trim()) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await kbApi.askAnswer(task.id, a.trim());
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) {
+      setErr((e as Error).message || "answer failed");
+      useKb.getState().reportError("answer ask", e);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="task-blocked-info" style={{ marginBottom: 10 }}>
+      <div className="ask-chips">
+        <Chip tone="needs">ASK</Chip>
+        {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
+      </div>
+      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={() => onChanged?.()} /></div>
+      {(ask.options ?? []).length > 0 && (
+        <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
+          {(ask.options as string[]).map((o: string) => (
+            <Btn key={o} variant="accept" disabled={busy} onClick={() => void answer(o)}>{o}</Btn>
+          ))}
+        </div>
+      )}
+      <div className="steer-box" style={{ marginTop: 8 }}>
+        <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />
+        <Btn disabled={busy || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
+      </div>
+      {err && <p className="k-err">{err}</p>}
     </div>
   );
 }
@@ -384,6 +446,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         <h2 className="detail-question"><RefText text={task?.title ?? taskId} onOpen={nav} /></h2>
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
+
+        {task && (task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
+          <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
+        )}
 
         {task?.meta?.last_progress?.note && (
           <p className="task-progress-line">
