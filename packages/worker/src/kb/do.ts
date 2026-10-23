@@ -2217,12 +2217,28 @@ export class KnowledgeHub {
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
     // (free-text refinement lives in the detail view). No options = rejected
     // at the contract, not a button-less ask the UI can't surface.
-    const options = Array.isArray(body.options) ? body.options.map((o: any) => String(o).slice(0, 200)).filter(Boolean).slice(0, 8) : [];
-    if (options.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (options: [...])");
+    // options are strings the human clicks — objects are flattened to their
+    // label-ish field and [object Object] garbage never stores
+    const options = [...new Set((Array.isArray(body.options) ? body.options : [])
+      .map((o: any) => typeof o === "string" ? o
+        : String(o?.label ?? o?.text ?? o?.value ?? o?.title ?? ""))
+      .map((x: string) => x.trim())
+      .filter((x: string) => x && !/\[object\s*object\]/i.test(x))
+      .map((x: string) => x.slice(0, 200)))].slice(0, 8);
+    if (options.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (options: ['GO', 'NO-GO'])");
     const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
 
     // the ask IS a question node: BR#-numbered, child_of its subject, answered
     // by transition. The legacy asks row is no longer written.
+    if (artefactId) {
+      const dup = this.one(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+           AND c.tags LIKE '%question%' AND c.title = ? LIMIT 1`,
+        artefactId, question.slice(0, 200),
+      );
+      if (dup) throw new Error(`an identical ask is already open: ${dup.id} — answer or reframe it instead of re-asking`);
+    }
     const created = await this.create(
       {
         type: "task",

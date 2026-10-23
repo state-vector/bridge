@@ -32,6 +32,8 @@ export function KnowledgeView() {
   const [createType, setCreateType] = useState("steering");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
+  const [tagsInput, setTagsInput] = useState("");
+  const [editBody, setEditBody] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
 
   const loadAll = async () => {
@@ -53,9 +55,20 @@ export function KnowledgeView() {
   };
 
   const create = async () => {
+    const tags = tagsInput.split(",").map((x) => x.trim()).filter(Boolean).map((t) => t.startsWith("role:") ? t : `role:${t}`);
     try {
-      await kbApi.create({ type: createType, title: title.trim(), body_md: body });
-      setTitle(""); setBody(""); setMsg("created"); setTimeout(() => setMsg(""), 1500);
+      await kbApi.create({ type: createType, title: title.trim(), body_md: body, tags } as any);
+      setTitle(""); setBody(""); setTagsInput(""); setMsg("created"); setTimeout(() => setMsg(""), 1500);
+      await loadAll();
+    } catch (e) { setMsg((e as Error).message); }
+  };
+
+  const saveEdit = async () => {
+    if (!selected || editBody === null) return;
+    try {
+      await kbApi.update(selected.id, { body_md: editBody });
+      setSelected({ ...selected, body_md: editBody });
+      setEditBody(null);
       await loadAll();
     } catch (e) { setMsg((e as Error).message); }
   };
@@ -77,7 +90,20 @@ export function KnowledgeView() {
             </header>
             <h2 className="detail-question">{selected.title}</h2>
             <TaskStateCard task={selected as any} />
-            <pre className="know-body">{selected.body_md || "—"}</pre>
+            {editBody === null ? (
+              <>
+                <pre className="know-body">{selected.body_md || "—"}</pre>
+                {selected.type === "steering" && (
+                  <Btn onClick={() => setEditBody(selected.body_md || "")}>Edit</Btn>
+                )}
+              </>
+            ) : (
+              <div className="detail-block">
+                <TextArea rows={8} value={editBody} onChange={(e) => setEditBody(e.target.value)} />
+                <Btn onClick={() => void saveEdit()}>Save</Btn>{" "}
+                <button className="icon-btn" onClick={() => setEditBody(null)}>✕</button>
+              </div>
+            )}
             {(selected.tags ?? []).length > 0 && (
               <div className="task-tags">{(selected.tags ?? []).map((t: string) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
             )}
@@ -129,6 +155,9 @@ export function KnowledgeView() {
                   <button key={a.id} className="know-row" onClick={() => void open(a.id)}>
                     <StatusChip status={a.status} />
                     <span className="know-row-title">{a.title}</span>
+                    {g === "steering" && (a.tags ?? []).filter((t: string) => t.startsWith("role:")).length > 0 && (
+                      <span className="know-row-meta">{(a.tags ?? []).filter((t: string) => t.startsWith("role:")).map((t: string) => t.slice(5)).join(", ")}</span>
+                    )}
                     <span className="know-row-meta">{a.id} · {rel(a.updated_ts)}</span>
                   </button>
                 ))}
@@ -151,7 +180,19 @@ export function KnowledgeView() {
           </div>
           <h3 className="detail-question">{selected.title}</h3>
           <TaskStateCard task={selected as any} />
-          <pre className="know-body">{selected.body_md || "—"}</pre>
+          {editBody === null ? (
+            <>
+              <pre className="know-body">{selected.body_md || "—"}</pre>
+              {selected.type === "steering" && (
+                <Btn onClick={() => setEditBody(selected.body_md || "")}>Edit</Btn>
+              )}
+            </>
+          ) : (
+            <div className="detail-block">
+              <TextArea rows={8} value={editBody} onChange={(e) => setEditBody(e.target.value)} />
+              <Btn onClick={() => void saveEdit()}>Save</Btn>
+            </div>
+          )}
           {(selected.tags ?? []).length > 0 && (
             <div className="task-tags">{(selected.tags ?? []).map((t: string) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
           )}
@@ -178,6 +219,11 @@ export function KnowledgeView() {
           <TextInput value={title} placeholder="Title" onChange={(e) => setTitle(e.target.value)} />
         </FormRow>
         <TextArea rows={4} value={body} placeholder="Markdown body…" onChange={(e) => setBody(e.target.value)} />
+        {createType === "steering" && (
+          <FormRow>
+            <TextInput value={tagsInput} placeholder="roles (comma-separated: review, impl — empty = all roles)" onChange={(e) => setTagsInput(e.target.value)} />
+          </FormRow>
+        )}
         <Btn disabled={!title.trim()} onClick={() => void create()}>Create</Btn>
         {msg && <span className={msg === "created" ? "ok" : "login-error"}> {msg}</span>}
       </div>
