@@ -895,11 +895,11 @@ export class KnowledgeHub {
     const createMeta: any = { ...(body.meta ?? {}) };
     // classification lives in TAGS (phase 2): an incoming meta.kind is mapped
     // to its tag and stripped — stored meta never carries kind again
-    if (createMeta0.kind !== undefined) {
-      const k = String(createMeta0.kind);
+    if (createMeta.kind !== undefined) {
+      const k = String(createMeta.kind);
       const tag = (KIND_TAG as Record<string, string | null>)[k];
       if (tag && !tags.includes(tag)) tags.push(tag);
-      delete createMeta0.kind;
+      delete createMeta.kind;
     }
 
     if (type === "task" && (body.qualified === true || (Array.isArray(body.await) && body.await.length))) {
