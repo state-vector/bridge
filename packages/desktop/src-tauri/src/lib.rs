@@ -7,6 +7,8 @@ mod opencode;
 mod scm;
 mod session;
 mod transport;
+use crate::keychain;
+use crate::session;
 
 use serde::Deserialize;
 use tauri::Manager;
