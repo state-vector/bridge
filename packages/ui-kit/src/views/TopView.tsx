@@ -5,6 +5,7 @@ import { DashboardSummary } from "./Dashboard";
 import { kindOf } from "../server/views";
 import { Btn, Chip, ConnDot, type ChipTone } from "./index-kit";
 import { kbApi } from "../server/kb";
+import type { KbAsk } from "../server/kb";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -96,6 +97,8 @@ export function TopView() {
   const events = useKb((s) => s.events);
   const now = Date.now();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [askTexts, setAskTexts] = useState<Record<string, KbAsk | null>>({});
+
 
   /** One-click unblock straight from the row: answer the blocking ask (the DO
    *  auto-resumes the task) or, for condition-blocks, transition it back. */
@@ -214,6 +217,20 @@ export function TopView() {
     return out;
   }, [rows]);
 
+  // pending asks on visible blocked rows — fetched once so the Unblock
+  // tooltip can state WHAT the task is waiting for, not just "an ask"
+  const pendingAskIds = useMemo(
+    () => [...new Set(rows.flatMap((r) => (r.askPending && !(r.askPending in askTexts) ? [r.askPending] : [])))].sort().join(","),
+    [rows, askTexts],
+  );
+  useEffect(() => {
+    if (!pendingAskIds) return;
+    for (const id of pendingAskIds.split(",")) {
+      kbApi.ask(id).then((a) => setAskTexts((m) => ({ ...m, [id]: a })))
+        .catch(() => setAskTexts((m) => ({ ...m, [id]: null })));
+    }
+  }, [pendingAskIds]);
+
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
@@ -302,7 +319,13 @@ export function TopView() {
                   ? <><Chip tone="urgent">ask</Chip> awaiting answer to {r.askPending}</>
                   : <><Chip tone="scope">exit</Chip> {r.unblock}</>}
                 <span className="row-actions">
-                  <Btn size="sm" variant="accept" title="answer the ask / satisfy the exit condition — resumes the task now" onClick={(e) => void unblockFromRow(r, e)}>Unblock</Btn>
+                  <Btn
+                    size="sm" variant="accept"
+                    title={r.askPending
+                      ? `Answers ${r.askPending}${askTexts[r.askPending]?.question ? ` — "${askTexts[r.askPending]!.question.slice(0, 100)}${askTexts[r.askPending]!.question.length > 100 ? "…" : ""}"` : ""} → task resumes in_progress`
+                      : `Marks satisfied: "${(r.unblock ?? "").slice(0, 100)}${(r.unblock ?? "").length > 100 ? "…" : ""}" → task resumes in_progress`}
+                    onClick={(e) => void unblockFromRow(r, e)}
+                  >Unblock</Btn>
                   <Btn size="sm" quiet title="open the task panel" onClick={(e) => { e.stopPropagation(); r.taskId && setSelectedTaskId(r.taskId); }}>Details</Btn>
                 </span>
               </span>

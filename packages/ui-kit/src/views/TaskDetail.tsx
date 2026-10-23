@@ -63,6 +63,36 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
   );
 }
 
+
+/** Show the kernel of a long text; full text behind a "more" toggle. */
+export function LongText({ text, limit }: { text: string | undefined; limit: number }) {
+  const t = (text ?? "").trim();
+  if (!t) return null;
+  if (t.length <= limit) return <span>{t}</span>;
+  return (
+    <details className="longtext">
+      <summary>{t.slice(0, limit).trimEnd()}… <span className="lt-toggle">more</span></summary>
+      <span className="lt-full">{t}</span>
+    </details>
+  );
+}
+
+/** Resume contracts enumerate their conditions "(1) … (2) …" — split them into
+ *  discrete items so the panel shows a checklist, not a wall. */
+export function splitConditions(s: string | undefined): string[] {
+  const t = (s ?? "").trim();
+  if (!t) return [];
+  const marks = t.match(/\(\d\)/g);
+  if (!marks || marks.length < 2) return [t];
+  const parts = t.split(/\(\d\)\s*/).map((x) => x.trim()).filter(Boolean);
+  return parts.length > 1 ? parts : [t];
+}
+
+function trunc(s: string | undefined, n: number): string {
+  const t = (s ?? "").trim();
+  return t.length > n ? `${t.slice(0, n).trimEnd()}…` : t;
+}
+
 interface TaskMeta {
   session?: string;
   blocked?: { reason?: string; unblock_condition?: string; ts?: number };
@@ -135,22 +165,43 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       )}
       {m.blocked && (
         <div className="task-blocked-info">
-          <div className="progress-note"><b>why blocked:</b> {m.blocked.reason ?? ""}</div>
-          <div className="progress-note"><b>unblocks when:</b> {m.blocked.unblock_condition ?? ""}</div>
+          <div className="progress-note"><b>why blocked:</b> <LongText text={m.blocked.reason} limit={220} /></div>
+          {(splitConditions(m.blocked.unblock_condition).length > 0) && (
+            <div className="progress-note">
+              <b>resumes when:</b>
+              <ol className="cond-list">
+                {splitConditions(m.blocked.unblock_condition).map((c, i) => (
+                  <li key={i}><LongText text={c} limit={160} /></li>
+                ))}
+              </ol>
+            </div>
+          )}
           <div className="row" style={{ marginTop: 6 }}>
-            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void unblock()}>Unblock now</Btn>
-            <span className="muted-note">answers the ask / marks the exit condition satisfied and resumes the task</span>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title={m.blocked.unblock_condition ? `Mark satisfied and resume now: "${trunc(m.blocked.unblock_condition, 110)}"` : "Resume the task now"}
+              onClick={() => void unblock()}
+            >Unblock now</Btn>
+            <span className="muted-note">
+              {m.blocked.unblock_condition ? `resume before the gate: "${trunc(m.blocked.unblock_condition, 90)}"` : "resume the task now"}
+            </span>
           </div>
         </div>
       )}
       {ask && ask.status === "open" && (
         <div className="task-blocked-info">
-          <div className="progress-note"><b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.id} · to {ask.to} · {rel(ask.created_ts)}</div>
-          <div className="progress-note">{ask.question}</div>
+          <div className="progress-note">
+            <b>{ask.urgency === "urgent" ? "URGENT ask" : "Ask"}</b> {ask.id} · to {ask.to} · asked {rel(ask.created_ts)}
+          </div>
+          <div className="progress-note"><LongText text={ask.question} limit={260} /></div>
           {ask.options.length > 0 && <div className="ask-chips">{ask.options.map((o) => <Chip key={o} tone="scope">{o}</Chip>)}</div>}
           <div className="row" style={{ marginTop: 6 }}>
-            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void unblock()}>Unblock now</Btn>
-            <span className="muted-note">answers the ask — the task auto-resumes</span>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title={`Answer ${ask.id} — "${trunc(ask.question, 110)}" — the task auto-resumes in_progress`}
+              onClick={() => void unblock()}
+            >Unblock now</Btn>
+            <span className="muted-note">answers {ask.id}: "{trunc(ask.question, 90)}"</span>
           </div>
         </div>
       )}
