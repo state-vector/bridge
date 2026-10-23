@@ -207,7 +207,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       </div>
 
       <div className="top-head">
-        <span className="topc-agent">agent</span>
+        <span className="topc-task" title="task id">task id</span>
+        <span className="topc-agent">machine / agent</span>
         <span className="topc-session">session</span>
         <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
@@ -229,9 +230,11 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
           style={depth > 0 ? { marginLeft: `${(depth - 1) * 22}px` } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
-          <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
+          <span className="topc-task" title={r.taskId ?? ""}>
             <ConnDot state={r.online ? "open" : "closed"} className="conn" title={r.online ? "online" : "offline"} />
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
+          </span>
+          <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
             {r.agent}
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
