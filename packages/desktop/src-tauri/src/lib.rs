@@ -8,6 +8,7 @@ mod opencode;
 mod scm;
 mod transport;
 
+
 use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
