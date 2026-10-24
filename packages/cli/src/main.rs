@@ -279,6 +279,7 @@ fn run(cfg: Option<DispatchConfig>) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
+                    identity: None, // built-in worker class applies (BR#3185)
                 },
             });
         }
