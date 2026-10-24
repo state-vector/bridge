@@ -654,91 +654,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   gap: 8px; align-items: center;
   font-size: 12px; padding: 6px 10px; border-radius: 8px;
 }
-.topc-task { display: flex; align-items: center; gap: 5px; font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; white-space: nowrap; overflow: hidden; }
-.top-head { color: var(--text-faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; padding-bottom: 2px; }
-.top-row { background: color-mix(in srgb, var(--panel) 60%, transparent); border: 1px solid var(--line); }
-.topc-status { flex-wrap: nowrap; }
-.top-row.top-click { cursor: pointer; }
-.top-row.top-click:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); background: color-mix(in srgb, var(--accent) 4%, transparent); }
-.top-row.top-idle { opacity: .55; }
-.top-row.top-blocked { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); }
-.topc-agent { display: flex; align-items: center; gap: 5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.topc-session { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
-.topc-goal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.top-will { color: var(--accent); opacity: .8; }
-.topc-status { display: flex; align-items: center; gap: 5px; overflow: hidden; }
-.top-sent { display: none; }
-.topc-score .st-score { min-width: 26px; text-align: center; }
-.topc-gauge { text-align: right; }
-.top-num { font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; color: var(--text-dim); }
-.top-risk { color: var(--red); }
-.topc-bar { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.top-bar { flex: 1; display: block; height: 6px; border-radius: 4px; background: color-mix(in srgb, var(--text) 8%, transparent); overflow: hidden; }
-.top-bar-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent); transition: width .4s ease; }
-.top-bar-label { flex: none; width: 34px; text-align: right; }
-.topc-age { white-space: nowrap; }
-@media (max-width: 1280px) {
-  .topc-gauge, .top-sent, .topc-session { display: none; }
-  /* compact template MATCHES the visible columns (agent, goal, status,
-     score, bar, ages) — hiding cells without re-templating misaligns
-     every remaining cell into the wrong track */
-  .top-head, .top-row {
-    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) 84px 84px;
-  }
-}
-
-/* ---- role picker (Connect mint) ---- */
-.role-picker { display: flex; gap: 14px; margin: 4px 0 10px; }
-.role-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
-.role-opt input { accent-color: var(--accent); }
-
-/* consistent numeric tone: pos/warn/bad shared by top + future views */
-.top-num.pos { color: var(--green); }
-.top-num.warn { color: var(--amber); }
-.top-num.bad { color: var(--red); }
-.top-num.num-comp { color: var(--accent); }
-
-/* ---------- board v5: kind pills, live pulse, subprocess, dep graph ---------- */
-
-/* task kind pill: what the task IS (question / impl / verify / analysis / research).
-   Bare span (no .chip base since the kit owns chips) — carries its own display + weight. */
-.kind-pill { display: inline-block; font-weight: 700; border: none; font-size: 9px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; letter-spacing: .05em; }
-.kind-pill.kp-impl { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
-.kind-pill.kp-verify { color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); }
-.kind-pill.kp-analysis { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); }
-.kind-pill.kp-question { color: var(--startup); background: color-mix(in srgb, var(--startup) 14%, transparent); }
-.kind-pill.kp-research { color: var(--text-dim); background: color-mix(in srgb, var(--text) 10%, transparent); }
-
-/* hyperlinked task refs inside titles / snippets */
-.task-ref { color: var(--accent); cursor: pointer; font-weight: 600; }
-.task-ref:hover { text-decoration: underline; }
-
-/* dependency graph (TaskDetail) */
-.dep-graph { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px; overflow-x: auto; }
-.dep-node { cursor: pointer; }
-.dep-node rect { fill: var(--bg-raised); stroke: var(--line); }
-.dep-node:hover rect { stroke: var(--accent); }
-.dep-node.dep-parent rect { stroke: var(--amber); }
-.dep-node.dep-child rect { stroke: var(--accent); }
-.dep-edge { stroke: var(--text-faint); stroke-width: 1; fill: none; }
-.dep-label { font-size: 9px; fill: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
-.dep-title { font-size: 10px; fill: var(--text); }
-
-/* ---------- top v2: task ids + unblock exit conditions ---------- */
-.top-task-id { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px; margin-right: 5px; opacity: .9; }
-
-/* tree structure: children indented under parent with a connector rule */
-.top-row-child { border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--line)); margin-left: 14px; border-radius: 0 6px 6px 0; }
-.tree-branch { color: var(--text-faint); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-
-/* ---------- work tree (detail panel): spawned tasks, live ---------- */
-.worktree-list { display: flex; flex-direction: column; gap: 3px; }
-.wt-row {
-  display: grid; grid-template-columns: 10px 56px 1fr auto auto;
-  gap: 8px; align-items: center;
-  padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px;
-  cursor: pointer; font-size: 12px; background: color-mix(in srgb, var(--bg) 55%, transparent);
-}
 .wt-row:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .wt-dot { width: 8px; height: 8px; border-radius: 50%; }
 .wt-dot.wt-active { background: var(--green); animation: wt-pulse 1.6s ease-in-out infinite; }
@@ -896,11 +811,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* compact template LAST so it actually overrides (cascade order): the visible
    columns at ≤1280 are agent, goal, status, score, bar, ages */
-@media (max-width: 1280px) {
-  .top-head, .top-row {
-    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) 84px 84px;
-  }
-}
 
 /* rows are ONE line, dense — wrap fixes overcorrected into tall rows.
    Overflow ellipsizes (full text on hover); tracks + min-width keep cells
@@ -914,3 +824,38 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* THE unblock/exit cell rule: one line, ellipsis — the wrap variant made
    every blocked row 3 lines tall (vertically fat rows) */
 .top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
+
+/* ============================================================
+   TOP TABLE — the whole table layout in two rules (+1 compact).
+   Rows are one line; EVERY cell clips (ellipsis); columns align
+   because tracks are fixed. Full text on hover via title attr.
+   ============================================================ */
+.top-head, .top-row {
+  display: grid;
+  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 48px 48px 48px 48px minmax(120px, 1fr) 84px 84px;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  padding: 5px 10px;
+}
+.top-head > span, .top-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-row-child { margin-left: 22px; }
+
+/* compact: hide session + gauges; template matches the visible cells */
+@media (max-width: 1280px) {
+  .topc-session, .topc-gauge, .top-sent { display: none; }
+  .top-head, .top-row {
+    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 48px minmax(120px, 1fr) 84px 84px;
+  }
+}
+
+/* goal cell: a flex row — single line BY CONSTRUCTION (flex never wraps
+   without flex-wrap), immune to any surviving line-box rule */
+.topc-goal { display: flex; align-items: center; gap: 6px; }
+.topc-goal .top-will { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topc-goal .kind-pill { flex: 0 0 auto; }
