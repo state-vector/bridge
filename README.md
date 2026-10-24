@@ -149,8 +149,47 @@ gateway token in place against it — the hostname is a display label only:
   "worktree_exempt_repos": []          // repos where per-task worktrees are skipped
                                        // (webapp-only checkout class); env override:
                                        // BRIDGE_WORKTREE_EXEMPT_REPOS (comma-separated)
+  "identity": {                        // git commit/signing identity for dispatched
+                                       // sessions (BR#3185). Omitted = the built-in
+                                       // worker class (detached-cody per BR#3181).
+    "name": "detached-cody",
+    "email": "297316395+detached-cody@users.noreply.github.com",
+    "signingKeyPath": "~/.ssh/sv-agents-signing.pub",
+    "signingProgram": "/usr/bin/ssh-keygen"
+  }
 }
 ```
+
+### Identity profiles (git signing, BR#3185)
+
+Dispatched sessions commit under a **first-class identity profile** — not
+ad-hoc `-c` overrides. At worktree provisioning the runner writes the
+profile into **repo-local** git config on the runner's own clone (the
+config that clone's worktrees share — never `--global`: `user.name`,
+`user.email`, `user.signingkey`, `gpg.format=ssh`, `gpg.ssh.program`,
+`commit.gpgsign=true`); your global git config is never touched, so the
+shared checkout keeps its own identity.
+
+- **Built-in class `worker`**: every dispatched session defaults to
+  `detached-cody` / `297316395+detached-cody@users.noreply.github.com`,
+  signing with `~/.ssh/sv-agents-signing.pub` via plain `/usr/bin/ssh-keygen`
+  (the BR#3181 ruling — no 1Password in the agent path). The values are the
+  recorded contract `packages/contracts/fixtures/identity-profiles.json`;
+  the runner fails its own test suite when the built-in drifts from it.
+- **Precedence**: an explicit `identity` block in the config beats the
+  built-in class; the built-in class beats whatever is in the host's global
+  git config for sessions dispatched into worktrees. An agent overriding
+  `user.*` ad-hoc (`-c`) drifts the committer identity away from the class
+  — the verify gate bounces that.
+- **Validation leg**: provisioning ends with a scratch sign check through
+  the profile's own program and key (`ssh-keygen -Y sign -n git`). A
+  missing key, wrong program, or hung signing program refuses the dispatch
+  loudly (like the smoke gate) — the task is noted on the board and the
+  runner retries next cycle; unsigned commits are never shipped.
+- **Board surfacing**: Connect nests each gateway's provisioned worker
+  agents under it with their identity class, and the pairing screen states
+  the class the device declared plus what its runner's dispatches commit
+  as (BR#2455 grouping, reused).
 
 If the hub rejects the token (401), the runner attempts **one** automatic
 repair (re-vend via the live login session) and, failing that, logs out

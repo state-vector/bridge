@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Btn, Select, TextInput } from "@bridge/ui-kit";
+import { Btn, Chip, Select, TextInput } from "@bridge/ui-kit";
 
 /**
  * Device pairing approval (GitHub-like device flow, bridge-native).
@@ -161,8 +161,19 @@ export function PairView() {
         ) : (
           <>
             <p className="auth-host">
-              Pair <b>{info.device}</b>?
+              Pair <b>{info.device}</b>{" "}
+              <Chip tone="scope" title="class declared by the device at pair/start — the approver cannot change it">
+                {gateway ? "gateway" : "agent"}
+              </Chip>
+              ?
             </p>
+            {gateway && (
+              <p className="muted-note">
+                This gateway&apos;s runner dispatches worker sessions whose commits are signed with its configured
+                identity class (built-in: <b>detached-cody</b>), applied repo-locally per worktree — your global git
+                config is never touched.
+              </p>
+            )}
             <label>Token label ({gateway ? "gateway name" : "agent name"})</label>
             <TextInput className="login-input" value={label} onChange={(e) => setLabel(e.target.value)} />
             <label>Workspace</label>

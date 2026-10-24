@@ -4,6 +4,7 @@ The shapes every runtime trusts and nothing verifies — recorded, versioned, CI
 
 - `fixtures/orient.json` — the orient response contract (hub → every runner/session). The candidates-key incident: a key rename silently zeroed the runner's work list.
 - `fixtures/mcp-tools.json` — the MCP tool registry contract (name + required args). The ask_answer/answer_ask incident: the registry declared a tool the dispatch never handled, while the implemented tool lived under a different name.
+- `fixtures/identity-profiles.json` — the git identity profile contract (BR#3185). The runner's built-in `worker` class (detached-cody per BR#3181) must match this fixture exactly — the `builtin_worker_identity_matches_contract` test fails when they drift. Applying a profile writes repo-local git config only; global config is never touched.
 
 ## Rules
 
