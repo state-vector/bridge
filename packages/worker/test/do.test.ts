@@ -78,24 +78,43 @@ describe("auth token SQL paths (real storage)", () => {
     expect(body.secret).toBeTruthy();
   });
 
-  it("mints with device_id + principal (8 columns, 8 bindings)", async () => {
+  it("mints with principal (7 columns, 7 bindings — device_id withdrawn)", async () => {
     const { status, body } = await kbJson("/admin.mint", {
       label: "test-principal",
       tags: [],
-      device_id: "dev-test",
       principal: "p_abcdef0123456789",
     });
     expect(status).toBeLessThan(500);
     expect(body.error).toBeUndefined();
     expect(body.secret).toBeTruthy();
   });
+
+  it("re-pairing the same principal rotates the SAME token in place (replace-by-principal)", async () => {
+    // BR#2700 DC: the device credential anchors rotation — a re-pair under
+    // the same principal must re-associate the existing row (rotate), not
+    // mint a second token (the old code keyed this by device_id, withdrawn)
+    const first = await kbJson("/admin.mint", {
+      label: "test-pr-rotate-a",
+      tags: [],
+      principal: "p_rotatetest00000000000000000",
+    });
+    expect(first.status).toBeLessThan(500);
+    expect(first.body.secret).toBeTruthy();
+    const second = await kbJson("/admin.mint", {
+      label: "test-pr-rotate-b",
+      tags: [],
+      principal: "p_rotatetest00000000000000000",
+    });
+    expect(second.status).toBeLessThan(500);
+    expect(second.body.secret).toBeTruthy();
+    expect(second.body.id).toBe(first.body.id);
+  });
 });
 
 describe("agent provisioning SQL paths", () => {
-  it("provisions a worker token (binding-count regression: 8 columns, 8 bindings)", async () => {
+  it("provisions a worker token (binding-count regression: 7 columns, 7 bindings)", async () => {
     const { status, body } = await kbJson("/agent.provision", {
       label: "test-provisioned",
-      device_id: "dev-test",
       principal: "p_abcdef0123456789",
     });
     expect(status).toBeLessThan(500);
