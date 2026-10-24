@@ -1,5 +1,5 @@
 import { Miniflare } from "miniflare";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
@@ -25,15 +25,26 @@ beforeAll(async () => {
   // wrangler bundles TS via esbuild (miniflare cannot parse mcp.ts) — the
   // pretest step produces ../../.kb-bundle/index.js via `wrangler deploy
   // --dry-run --outdir`; the bundle is a single ESM file
-  const bundle = new URL("../../../.kb-bundle/index.js", import.meta.url).pathname;
+  // rig recipe (proven by test/kb-throughput.test.ts): realpath + modulesRoot
+  // (workerd's virtual FS rejects ".." path segments) + useSQLite (wrangler.toml
+  // declares both classes new_sqlite_classes; without the flag the DO throws
+  // "SQL is not enabled for this Durable Object class")
+  const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
   if (!existsSync(bundle)) {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (the npm test script does this before vitest)");
   }
   mf = new Miniflare({
-    scriptPath: bundle,
-    modules: true,
-    compatibilityDate: "2025-09-06",
-    durableObjects: { HUB: "FlowsHub", KB: "KnowledgeHub" },
+    workers: [{
+      name: "main",
+      scriptPath: bundle,
+      modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")),
+      modules: true,
+      compatibilityDate: "2025-09-06",
+      durableObjects: {
+        HUB: { className: "FlowsHub", useSQLite: true },
+        KB: { className: "KnowledgeHub", useSQLite: true },
+      },
+    }],
   });  const ns = await mf.getDurableObjectNamespace("KB");
   const stub = await ns.get(ns.idFromName("global"));
   kb = (path, init) => stub.fetch(`https://kb${path}`, init);
@@ -92,8 +103,16 @@ describe("auth token SQL paths (real storage)", () => {
 });
 
 describe("agent provisioning SQL paths", () => {
+  // provisioning is gateway-class gated (the caller's token TAG provisions,
+  // its name is irrelevant): mint a gw-tagged caller first, then provision as it
+  beforeAll(async () => {
+    const { status } = await kbJson("/admin.mint", { label: "gw-test", tags: ["gateway"] });
+    expect(status).toBeLessThan(500);
+  });
+
   it("provisions a worker token (binding-count regression: 8 columns, 8 bindings)", async () => {
     const { status, body } = await kbJson("/agent.provision", {
+      provisioned_by: "gw-test",
       label: "test-provisioned",
       device_id: "dev-test",
       principal: "p_abcdef0123456789",
@@ -105,6 +124,7 @@ describe("agent provisioning SQL paths", () => {
 
   it("provisions with rotate (revoke + re-mint path)", async () => {
     const { status, body } = await kbJson("/agent.provision", {
+      provisioned_by: "gw-test",
       label: "test-rotator",
       rotate: true,
     });
