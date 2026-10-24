@@ -2574,17 +2574,22 @@ export class KnowledgeHub {
       // forever — the runner cycled them while claimable work sat behind.
       return callerIsGateway ? !t.needs_qualification : true;
     }).sort((a: any, b: any) => {
-      // ranking: unblock children first (cheapest unblocking lever — a check
-      // that releases parked work), then blocked-with-condition, then verify
-      // duty, questions, plain todo.
+      // ranking: release-parked-work levers first (verify duty + unblock
+      // duty), then blocked-with-condition, questions, plain todo.
       const rank = (t: any) => {
         const m = JSON.parse(t.meta ?? "{}");
         // human boost: priority 0, above unblock duty — the human's explicit
         // "process this (and its dependencies) first" (BR#911)
         if (m.boosted) return -1;
+        // release-parked-work levers FIRST, above everything claimable:
+        // verify duty (an in_review task parks its owner until a fresh
+        // session rules) and unblock duty. Verify starved below
+        // blocked-with-condition (2026-10-24, Ray): ranks 0-1 filled the
+        // 10-slot slice, verify children never surfaced, impls piled up
+        // in_review while new impl todo kept getting claimed.
+        if (verifyParents.has(t.id)) return 0;
         if (t.tags?.includes("role:unblock")) return 0;
         if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
-        if (verifyParents.has(t.id)) return 2;
         if (t.tags?.includes("question")) return 3;
         return 4;
       };

@@ -12,16 +12,21 @@ import { Btn, Chip } from "./index-kit";
  *  (deliberately not dispatchable). Completed = done work, newest first.
  *  Same ktable primitive as Top; only --cols differ. */
 
-function rankOf(t: any, parentIdOf: Map<string, string>): { rank: number; why: string } {
+function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<string>): { rank: number; why: string } {
   const tags: string[] = t.tags ?? [];
   const m = t.meta ?? {};
+  // release-parked-work levers first (verify + unblock — mirrors the orient
+  // pool ranking in worker do.ts, 2026-10-24): in_review work parks its
+  // owner until a fresh session rules; nothing outranks clearing that.
+  const parentId = parentIdOf.get(t.id);
+  if (parentId && tags.includes("role:review") && (!inReviewIds || inReviewIds.has(parentId))) {
+    return { rank: 0, why: `verify duty — parks ${parentId}'s owner` };
+  }
   if (tags.includes("role:unblock")) return { rank: 0, why: "unblock duty — cheapest lever on parked work" };
   if (t.status === "blocked") {
     if (m.blocked?.unblock_condition) return { rank: 1, why: "blocked with an exit condition — resumable now" };
     return { rank: 5, why: "blocked without an exit condition — needs re-scope" };
   }
-  const parentId = parentIdOf.get(t.id);
-  if (parentId && tags.includes("role:review")) return { rank: 2, why: `verify duty — parks ${parentId}'s owner` };
   if (tags.includes("question")) return { rank: 3, why: "question — open for contributions" };
   if (tags.includes("role:analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
   return { rank: 4, why: "todo" };
@@ -47,17 +52,15 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     const ts = tasks as any[];
     const parentOf = new Map<string, string>();
     for (const t of ts) if (t.part_of) parentOf.set(t.id, t.part_of);
+    const inReviewIds = new Set(ts.filter((t) => t.status === "in_review").map((t) => t.id));
     const twinIdx = unblockTwinIndex(ts);
     const decorate = (t: any) => {
-      const tags: string[] = t.tags ?? [];
-      const inReviewParent = t.status === "todo" && tags.includes("role:review") && parentOf.get(t.id)
-        && ts.some((p) => p.id === parentOf.get(t.id) && p.status === "in_review");
-      const { rank, why } = rankOf(t, parentOf);
+      const { rank, why } = rankOf(t, parentOf, inReviewIds);
       const boosted = !!(t.meta?.boosted);
       return {
         t,
-        rank: boosted ? -1 : (inReviewParent ? 2 : rank),
-        why: boosted ? "boosted — priority 0 (human)" : (inReviewParent ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why),
+        rank: boosted ? -1 : rank,
+        why: boosted ? "boosted — priority 0 (human)" : why,
         boosted,
         attempts: t.meta?.attempt?.attempts ?? 0,
       };
@@ -74,7 +77,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false).sort(byUpdated);
 
     return [
-      { key: "ready", title: "Next — ready to go", note: "claim-ranked: unblock duties → verify duties → questions → todo. ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
+      { key: "ready", title: "Next — ready to go", note: "claim-ranked: verify duties → unblock duties → questions → todo (verify first — in_review work parks its owner). ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
       { key: "human", title: "Blocked — awaiting you", note: "pending human ask — answer it and the asker resumes.", rows: blockedHuman, showRank: false, showBoost: false },
       { key: "verify", title: "Blocked — awaiting verify", note: "in review; the owner stays parked until a fresh verify session rules.", rows: verify, showRank: false, showBoost: false },
       { key: "unblocking", title: "Blocked — unblock duty live", note: "an agent is actively working the unblock; nothing for you to do.", rows: unblocking, showRank: false, showBoost: false },
