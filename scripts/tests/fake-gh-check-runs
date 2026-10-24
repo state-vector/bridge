@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# scripts/tests/fake-gh-check-runs — stub `gh` for main-green-gate.test.sh.
+#
+# Serves canned `gh api` responses per DHG_SCENARIO, split by URL side:
+#   - a URL containing $MAIN_GREEN_PR_SHA serves the PR-head payload (carve-out leg)
+#   - any other commits/<sha>/check-runs URL serves the main payload
+#   - anything else resolves as main's HEAD sha
+# No network, no token — the gate's decision rule is pinned offline.
+set -uo pipefail
+SCENARIO="${DHG_SCENARIO:-green}"
+url="${*}"
+
+emit() { cat <<'EOF'
+{"total_count":4,"check_runs":[
+ {"id":101,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/1/Test"},
+ {"id":102,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/run/1/CLI"},
+ {"id":103,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/run/1/Drift"},
+ {"id":104,"name":"Workers Builds: bridge","status":"completed","conclusion":"success","html_url":"https://example/run/1/CF"}
+]}
+EOF
+}
+
+case "${SCENARIO}" in
+  green)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      # newest Test run (id 900) SUCCESS supersedes an older FAILURE (id 100):
+      # the newest run judges — an old red must not block a green main.
+      cat <<'EOF'
+{"total_count":4,"check_runs":[
+ {"id":100,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/run/old/Test"},
+ {"id":900,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/new/Test"},
+ {"id":901,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/run/new/CLI"},
+ {"id":902,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/run/new/Drift"}
+]}
+EOF
+    else
+      echo "abc123def"
+    fi
+    ;;
+  red)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/run/red/Test"},
+ {"id":901,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","https":"x","html_url":"https://example/run/red/CLI"},
+ {"id":902,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/run/red/Drift"}
+]}
+EOF
+    else
+      echo "red456sha"
+    fi
+    ;;
+  cancelled-supersede)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      # newest run cancelled, older run failure: the cancelled run says
+      # nothing — the judge falls back to the newest NON-cancelled run.
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":800,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/run/old/Test"},
+ {"id":900,"name":"Test","status":"completed","conclusion":"cancelled","html_url":"https://example/run/new/Test"}
+]}
+EOF
+    else
+      echo "canc3lled"
+    fi
+    ;;
+  unsettled)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/mix/Test"},
+ {"id":901,"name":"CLI build (packages/cli)","status":"in_progress","conclusion":null,"html_url":"https://example/run/mix/CLI"},
+ {"id":902,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/run/mix/Drift"}
+]}
+EOF
+    else
+      echo "unset7led"
+    fi
+    ;;
+  all-cancelled)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":1,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"cancelled","html_url":"https://example/run/c/Test"}
+]}
+EOF
+    else
+      echo "all1canc"
+    fi
+    ;;
+  empty)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      echo '{"total_count":0,"check_runs":[]}'
+    else
+      echo "empt0sha"
+    fi
+    ;;
+  carve-out-pass)
+    if [[ "${url}" == *"/check-runs"* && -n "${MAIN_GREEN_PR_SHA:-}" && "${url}" == *"${MAIN_GREEN_PR_SHA}"* ]]; then
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":910,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/pr/Test"},
+ {"id":911,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/pr/CLI"}
+]}
+EOF
+    elif [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/red/Test"},
+ {"id":901,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/red/CLI"},
+ {"id":902,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/red/Drift"}
+]}
+EOF
+    else
+      echo "fixme9sha"
+    fi
+    ;;
+  carve-out-miss)
+    # main red on Test; PR head has NO green Test run (conclusion failure):
+    # the carve-out must NOT apply.
+    if [[ "${url}" == *"/check-runs"* && -n "${MAIN_GREEN_PR_SHA:-}" && "${url}" == *"${MAIN_GREEN_PR_SHA}"* ]]; then
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":910,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/pr/Test"},
+ {"id":911,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/pr/CLI"}
+]}
+EOF
+    elif [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"failure","html_url":"https://example/red/Test"},
+ {"id":901,"name":"Deploy drift alarm","status":"completed","conclusion":"success","html_url":"https://example/red/Drift"}
+]}
+EOF
+    else
+      echo "missd0sha"
+    fi
+    ;;
+  api-error)
+    echo "gh: (API) 502 Bad Request" >&2
+    exit 1
+    ;;
+  *)
+    echo "fake-gh: unknown scenario ${SCENARIO}" >&2
+    exit 2
+    ;;
+esac

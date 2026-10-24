@@ -263,7 +263,30 @@ Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, ta
 `TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
-open ask with its options as one-click buttons.
+open ask with its options as one-click buttons. `urgency` is an ask vocabulary, not a
+sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
+normal — agents can no longer file an "urgent" ask that renders as a quiet one.
+
+## Destination-green: the stop-the-line gate
+
+Merges must not land while the destination branch is red — accepted decision BR#3009 makes
+that law, and BR#3008 makes it mechanical instead of discipline. Two halves, same rule:
+
+- **The block**: every PR runs the required `main-green gate` check
+  (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
+  check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
+  (or a check still running, or no check runs at all) fails the gate and GitHub refuses
+  the merge via the `main: main-green gate required` ruleset. The newest run per check
+  judges; a cancelled run says nothing. The one exception is written into the gate: a PR
+  green on the *exact* checks main fails passes with a printed **REMEDIATION CARVE-OUT**
+  receipt — BR#3009's remediation-merge path, expressible and receipted, not a loophole.
+- **The alert**: the hub watchdog sweep (`stopTheLineSweep` in
+  `packages/worker/src/kb/do.ts`, paced by the `stop_line_sweep_minutes` setting, default
+  5 min, `0` = off) reads the same public API and, when main is RED, files ONE
+  time-sensitive ask to you per red episode — deduped per main-HEAD sha under the
+  `ALARM SINK` board card, so ten PRs seeing one red main produce one ask, not ten. A red
+  main pages the board even when nobody opens a PR. `admin.stop_line_sweep` drills it on
+  demand.
 
 ## 5 · Use it
 
