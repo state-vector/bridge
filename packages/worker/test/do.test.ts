@@ -35,7 +35,9 @@ beforeAll(async () => {
     compatibilityDate: "2025-09-06",
     durableObjects: { HUB: "FlowsHub", KB: "KnowledgeHub" },
     durableObjectsBindings: { HUB: "FlowsHub", KB: "KnowledgeHub" },
-  });  const ns = await mf.getDurableObjectNamespace("KB");
+  },
+  compatibilityDate: "2025-09-06"
+});  const ns = await mf.getDurableObjectNamespace("KB");
   const stub = await ns.get(ns.idFromName("global"));
   kb = (path, init) => stub.fetch(`https://kb${path}`, init);
   // warm + cold ensureSchema paths both exercised
