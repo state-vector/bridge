@@ -156,8 +156,9 @@ export default {
       if (auth instanceof Response) return auth;
       const body = await request.json().catch(() => ({}));
       // the actor is the human session (this op only exists on the human
-      // plane); the DO stamps the audit with it
-      body.actor = "web";
+      // plane) — the LOGIN rides along (web:<login>) so the audit names WHO
+      // approved, never the identity-less fallback "web"
+      body.actor = `web:${auth.login ?? "anon"}`;
       const kbId = env.KB.idFromName(doWs(auth.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",
@@ -201,14 +202,14 @@ export default {
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : "web";
+        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
         return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
       if (sub === "purge_smoke" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : "web";
+        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
         return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
@@ -216,7 +217,7 @@ export default {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : "web";
+        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
         // do ops are dot-namespaced (ask.answer); the web plane uses snake_case
         return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",

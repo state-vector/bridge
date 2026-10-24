@@ -98,23 +98,29 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
 const rankOf = (e: AskEntry) => (e.kind === "nodeAsk" ? 2 : e.kind === "decision" ? 1 : 0);
 const ts = (e: AskEntry) => (e.latest ?? e.d ?? e.nodeAsk)?.created_ts ?? 0;
 
-function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
+function BandVerdictRow({ latest, prior, onDone, openDecision, nested, pending, onPending }: {
   latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+  pending?: boolean; onPending?: (on: boolean) => void;
 }) {
   const [showPrior, setShowPrior] = useState(false);
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(latest, onDone);
   const f = decisionFrame(latest);
   const isBounce = f.verdict === "bounce";
+  const go = (v: "accepted" | "rejected") => {
+    onPending?.(true);
+    act(v).catch(() => {}).finally(() => onPending?.(false));
+  };
   return (
     <>
-      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
         <div className="ab-head">
           <Chip tone="urgent">VERDICT</Chip>
           <span className="why-line">{f.target ?? "task"} · {rel(latest.created_ts)}</span>
           <span className="ab-actions">
-            <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
-            <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
+            {pending && <span className="ask-spinner" title="sending…" />}
+            <Btn size="sm" variant="accept" disabled={busy} onClick={() => go("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
+            <Btn size="sm" variant="reject" disabled={busy} onClick={() => go("rejected")}>Reject</Btn>
             <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(latest.id) : setOpen(true))}>Details</Btn>
             {err && <span className="k-err">{err}</span>}
           </span>
@@ -136,21 +142,27 @@ function BandVerdictRow({ latest, prior, onDone, openDecision, nested }: {
   );
 }
 
-function BandDecisionRow({ d, onDone, openDecision, nested }: {
+function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending }: {
   d: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+  pending?: boolean; onPending?: (on: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone);
   const f = decisionFrame(d);
+  const go = (v: "accepted" | "rejected") => {
+    onPending?.(true);
+    act(v).catch(() => {}).finally(() => onPending?.(false));
+  };
   return (
     <>
-      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""}`}>
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
         <span className="ab-kind"><Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip></span>
         <span className="ab-main"><span className="ab-title" title={d.title}>{d.title}</span></span>
         <span className="ab-meta">{rel(d.created_ts)}</span>
         <span className="ab-actions">
-          <Btn size="sm" variant="accept" disabled={busy} onClick={() => void act("accepted")}>Accept</Btn>
-          <Btn size="sm" variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
+          {pending && <span className="ask-spinner" title="sending…" />}
+          <Btn size="sm" variant="accept" disabled={busy} onClick={() => go("accepted")}>Accept</Btn>
+          <Btn size="sm" variant="reject" disabled={busy} onClick={() => go("rejected")}>Reject</Btn>
           <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(d.id) : setOpen(true))}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
@@ -160,8 +172,9 @@ function BandDecisionRow({ d, onDone, openDecision, nested }: {
   );
 }
 
-function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
+function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPending }: {
   nodeAsk: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
+  pending?: boolean; onPending?: (on: boolean) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const m = (nodeAsk.meta ?? {}) as any;
@@ -172,6 +185,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
   // rows point, the detail view acts: option buttons answer inline (one click,
   // no typing); free-text answering lives in the node's detail view
   const answer = async (a: string) => {
+    onPending?.(true);
     setBusy(true);
     try {
       await kbApi.askAnswer(nodeAsk.id, a.trim());
@@ -179,12 +193,13 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
       onDone();
     } catch (e) {
       useKb.getState().reportError("answer ask", e);
+      onPending?.(false);
     } finally {
       setBusy(false);
     }
   };
   return (
-    <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""}`}>
+    <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
       <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
       <span className="ab-main">
         <span className="ab-title" title={nodeAsk.title}>{askKernel(nodeAsk.title)}</span>
@@ -197,7 +212,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
           <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
         )}
       </span>
-      <span className="ab-meta">{rel(nodeAsk.created_ts)}</span>
+      <span className="ab-meta">{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
       <span className="ab-actions">
         {ask.reframe
           ? <span className="muted-note">reframed — awaiting re-ask</span>
@@ -210,16 +225,39 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested }: {
   );
 }
 
+const entryId = (e: AskEntry): string =>
+  e.kind === "verdict" ? e.latest!.id : e.kind === "decision" ? e.d!.id : e.nodeAsk!.id;
+
 export function AskEntries({ entries, onDone, openDecision, nested }: {
   entries: AskEntry[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
 }) {
+  // Optimistic answering (Ray, 2026-10-24): the click INSTANTLY moves the row
+  // to the bottom of the list, grays it out with a spinner, and it stays that
+  // way until the server confirms (refresh drops it) or the call fails (the
+  // row returns to place with the error shown). Never a silent no-op.
+  const [pending, setPending] = useState<Set<string>>(new Set());
+  const markPending = (id: string, on: boolean) =>
+    setPending((prev) => {
+      if (on === prev.has(id)) return prev;
+      const next = new Set(prev);
+      if (on) next.add(id); else next.delete(id);
+      return next;
+    });
+  const ordered = useMemo(
+    () => [...entries].sort((a, b) => Number(pending.has(entryId(a))) - Number(pending.has(entryId(b)))),
+    [entries, pending],
+  );
+  const rowProps = (e: AskEntry) => ({
+    pending: pending.has(entryId(e)),
+    onPending: (on: boolean) => markPending(entryId(e), on),
+  });
   return (
     <>
-      {entries.map((e) => e.kind === "verdict"
-        ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} />
+      {ordered.map((e) => e.kind === "verdict"
+        ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />
         : e.kind === "decision"
-        ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} />
-        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} openDecision={openDecision} nested={nested} />)}
+        ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />
+        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />)}
     </>
   );
 }

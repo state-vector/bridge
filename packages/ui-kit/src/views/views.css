@@ -1011,3 +1011,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tag-chips { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; flex-wrap: wrap; }
 .tag-chip { font-size: 10px; }
 .tag-chip-more { font-size: 10px; }
+
+/* optimistic answering (2026-10-24, Ray): a clicked accept/reject/option
+   INSTANTLY sinks the row to the bottom of its list, grays it out, and spins
+   until the server confirms (refresh drops it) or the call fails (the row
+   returns to place with the error). Never a silent no-op. */
+.ask-band-row.ask-pending { opacity: .45; }
+.ask-band-row.ask-pending .ab-actions { pointer-events: none; }
+.ask-spinner {
+  display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: ask-spin .7s linear infinite; flex: none;
+}
+@keyframes ask-spin { to { transform: rotate(360deg); } }
