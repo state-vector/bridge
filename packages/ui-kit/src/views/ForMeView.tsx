@@ -186,7 +186,11 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
     try {
       await kbApi.askAnswer(t.meta.awaiting_ask.ask_id, "GO — approved per the receipts on this ask");
       setTick((x) => x + 1);
-    } catch { /* surfaced via refresh */ }
+    } catch (err) {
+      console.error("Failed to answer ask:", err);
+      // Error will also be handled by the refresh in bump()
+      setTick((x) => x + 1);
+    }
   };
   useEffect(() => { void load(); }, [tick]);
 
