@@ -1008,9 +1008,14 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   background: none; border: none; color: var(--text-faint); font-size: 10px;
   cursor: pointer; text-decoration: underline; padding: 0 2px;
 }
-.tag-chips { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; flex-wrap: wrap; }
-.tag-chip { font-size: 10px; }
-.tag-chip-more { font-size: 10px; }
+.tag-chips { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
+/* rows are ONE line (top/backlog doctrine): chip containers never wrap —
+   when goal text + pill + chips exceed the cell, extra width clips in-cell
+   (full tag list stays on the +N title). The wrap variant made every
+   tagged row multi-line tall again (BR#3205). */
+.tag-chips { flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+.tag-chip { font-size: 10px; flex: none; }
+.tag-chip-more { font-size: 10px; flex: none; }
 
 /* optimistic answering (2026-10-24, Ray): a clicked accept/reject/option
    INSTANTLY sinks the row to the bottom of its list, grays it out, and spins
