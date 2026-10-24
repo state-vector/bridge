@@ -2,18 +2,10 @@
  *  large touch targets, scroll-first layout. */
 
 :root {
-  --bg: #0b0e14;
-  --bg-raised: #12161f;
-  --line: #232a37;
-  --text: #dfe5ee;
-  --text-dim: #9aa4b5;
-  --text-faint: #5d6675;
-  --accent: #5b8def;
-  --green: #3fbf7f;
-  --red: #e5484d;
-  --amber: #f2a33c;
-  --radius: 12px;
-  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  /* palette comes from @bridge/ui-kit tokens (same dark values);
+     mobile only re-points the density knob for touch scale */
+  --kit-radius: 12px;
+  --radius: var(--kit-radius);
 }
 
 * { box-sizing: border-box; }

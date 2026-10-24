@@ -260,6 +260,19 @@ npm run test -w packages/worker  # worker tests (syntax → tsc --noEmit typeche
 npm run typecheck -w packages/worker  # worker type gate only — TS2304-class undefined names (the Oct 2026 board-500 bug class) fail here at any strictness
 ```
 
+### Shared UI kit
+
+Every surface (web, gateway UI, mobile) renders from one component kit,
+`packages/ui-kit` (`@bridge/ui-kit`): design tokens (`tokens.css`) plus
+`Btn` / `Chip` / `Card` / `Field` / `TextInput` / `TextArea` / `Select` /
+`ActionRow` / `FormRow` / `ConnDot` / `RelTime`. Import the css once per
+shell (`@bridge/ui-kit/ui-kit.css`, tokens included) and use the
+components — surfaces keep layout css only and may re-point tokens (the
+webapp overrides the palette in its `:root`; mobile sets
+`--kit-radius: 12px` for touch scale). No surface re-declares button,
+chip, card or field styles: the drift those per-surface copies caused is
+the bug this kit removes.
+
 **Docs are part of the change.** README.md and `packages/site/content.md`
 describe shipped behaviour — a change that alters user-visible behaviour
 (UI, config, protocol, gates) updates both in the same commit. Agents get
@@ -273,6 +286,7 @@ contract.
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
 | `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
 | `packages/webapp` | the full web UI (browser-only — no shell forks) |
+| `packages/ui-kit` | `@bridge/ui-kit` — shared design tokens + Btn/Chip/Card/Field/ConnDot/RelTime; one look for webapp, gateway UI and mobile |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
 | `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |
