@@ -372,11 +372,12 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
  * Cadence is selected by the token's `cadence:cron` tag; roles by `role:*` tags.
  */
 export const DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule — each run is one pass, not a conversation.
-1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
-2. If you own in_progress tasks: log_progress on each (one line + sentiment — the heartbeat), then resume the oldest one.
-3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims — an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
-5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
+1. MERGE SWEEP (standing order BR#3033): drain open PRs BEFORE claiming work. For each open PR in the deployment's repos, oldest first (dependency order): require (a) base main green, (b) PR checks green — external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four → merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress. Any failed leg → DO NOT merge: conflicts → mechanical rebase + re-push (it re-enters the order next tick); red substance checks → bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551). The pile of unmerged PRs is the fleet's debt — sweep it every tick.
+2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
+3. If you own in_progress tasks: log_progress on each (one line + sentiment — the heartbeat), then resume the oldest one.
+4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims — an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
 
 export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
   analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
