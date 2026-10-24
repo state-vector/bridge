@@ -684,7 +684,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
      score, bar, ages) — hiding cells without re-templating misaligns
      every remaining cell into the wrong track */
   .top-head, .top-row {
-    grid-template-columns: minmax(118px, max-content) minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) 84px 84px;
   }
 }
 
@@ -894,14 +894,14 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* age/agent tracks size to content at wide widths (no clipped "4h 12m") */
 .top-head, .top-row {
-  grid-template-columns: minmax(118px, max-content) 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(120px, 1fr) 84px 84px;
 }
 
 /* compact template LAST so it actually overrides (cascade order): the visible
    columns at ≤1280 are agent, goal, status, score, bar, ages */
 @media (max-width: 1280px) {
   .top-head, .top-row {
-    grid-template-columns: minmax(118px, max-content) minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) 84px 84px;
   }
 }
 
