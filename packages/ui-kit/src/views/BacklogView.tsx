@@ -4,6 +4,7 @@ import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
 import { kindOf, rel, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
+import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
 /** Backlog + Completed: the whole queue, categorised (2026-10-24 spec, Ray):
  *  NEXT (todo, claim-ranked — boost/park from the card), BLOCKED grouped by
@@ -13,22 +14,22 @@ import { Btn, Chip } from "./index-kit";
  *  Same ktable primitive as Top; only --cols differ. */
 
 function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<string>): { rank: number; why: string } {
-  const tags: string[] = t.tags ?? [];
+  const roles: string[] = t.roles ?? [];
   const m = t.meta ?? {};
   // release-parked-work levers first (verify + unblock — mirrors the orient
   // pool ranking in worker do.ts, 2026-10-24): in_review work parks its
   // owner until a fresh session rules; nothing outranks clearing that.
   const parentId = parentIdOf.get(t.id);
-  if (parentId && tags.includes("role:review") && (!inReviewIds || inReviewIds.has(parentId))) {
+  if (parentId && roles.includes("review") && (!inReviewIds || inReviewIds.has(parentId))) {
     return { rank: 0, why: `verify duty — parks ${parentId}'s owner` };
   }
-  if (tags.includes("role:unblock")) return { rank: 0, why: "unblock duty — cheapest lever on parked work" };
+  if (roles.includes("unblock")) return { rank: 0, why: "unblock duty — cheapest lever on parked work" };
   if (t.status === "blocked") {
     if (m.blocked?.unblock_condition) return { rank: 1, why: "blocked with an exit condition — resumable now" };
     return { rank: 5, why: "blocked without an exit condition — needs re-scope" };
   }
-  if (tags.includes("question")) return { rank: 3, why: "question — open for contributions" };
-  if (tags.includes("role:analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
+  if (t.type === "question") return { rank: 3, why: "question — open for contributions" };
+  if (roles.includes("analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
   return { rank: 4, why: "todo" };
 }
 
@@ -47,6 +48,8 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const [msg, setMsg] = useState("");
+  // tag themes: counts over the open pool, the filter applies to every group
+  const tagTheme = useTagTheme(tasks.filter((t) => !["done", "superseded"].includes((t as any).status)));
 
   const groups = useMemo<BlGroup[]>(() => {
     const ts = tasks as any[];
@@ -84,13 +87,14 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       { key: "other", title: "Blocked — other", note: "machine exit conditions — they move when the condition fires.", rows: blockedOther, showRank: false, showBoost: false },
       { key: "timeout", title: "Timeout — churn/rework parks", note: "cannot be actioned by anyone; the owning agent resumes or the park lapses.", rows: timeout, showRank: false, showBoost: false },
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
-    ].filter((g) => g.rows.length > 0);
-  }, [tasks]);
+    ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))
+      .map((g) => ({ ...g, rows: g.rows.filter((r: any) => tagTheme.passes(r.t ?? r)) }));
+  }, [tasks, tagTheme]);
 
   const parkedReason = (t: any): string => {
     if (isTimeoutBlock(t)) return "churn/rework park — agent resumes or it lapses";
     if (t.status === "blocked") return (t.meta?.blocked?.unblock_condition ?? "blocked — open the card, resolve or re-scope").slice(0, 90);
-    if ((t.tags ?? []).includes("question") || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
+    if (t.type === "question" || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
     if (t.meta?.operator_gated) return `operator gate: ${t.meta.operator_gated} — a human clears it`;
     return (t as any).claim_reason || "not dispatchable — see card";
   };
@@ -117,6 +121,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
         <span className="muted-note">{total} items — next · blocked by reason · timeout · parked</span>
         {msg && <span className="ok">{msg}</span>}
       </div>
+      <TagThemeBar theme={tagTheme} />
       {groups.map((g) => (
         <div key={g.key} className="backlog-group">
           <div className="view-head backlog-group-head">
@@ -143,6 +148,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                   <span className="backlog-main">
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
+                    <TagChips tags={t.tags} />
                     {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
                       <span className="backlog-why">
                         {t.meta?.awaiting_ask?.ask_id
@@ -206,6 +212,7 @@ export function CompletedView({ openTask }: { openTask?: (id: string) => void } 
               <span className="backlog-main">
                 <span className={`kind-pill kp-${kind}`}>{kind}</span>
                 <span className="backlog-title">{t.title}</span>
+                <TagChips tags={t.tags} />
               </span>
               <span className="backlog-meta">{t.owner || t.meta?.session || "—"}</span>
               <span className="backlog-age top-num" title={lifetime ? `lifetime ${lifetime}m` : undefined}>

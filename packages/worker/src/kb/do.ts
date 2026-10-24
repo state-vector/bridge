@@ -45,7 +45,11 @@ import {
   isRelation,
   isSentiment,
   isQuestionTask,
+  KIND_TYPE,
+  KIND_ROLE,
   KIND_TAG,
+  parseRolesInput,
+  splitSystemTags,
   isWsSlug,
   isValidAskTarget,
   tagsSayGateway,
@@ -173,8 +177,8 @@ export class KnowledgeHub {
           const derived = this.one(
             `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
              JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-               AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
+              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+                AND c.type = 'question' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
           );
           if (derived) {
             const nm = JSON.parse(derived.cmeta ?? "{}");
@@ -255,11 +259,11 @@ export class KnowledgeHub {
         if (age <= reviewStaleMin * 60_000) continue;
         const openAsk = this.one(`SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id);
         if (openAsk) continue;
-        const activeVerify = this.one(
-          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'in_progress'
-             AND c.tags LIKE '%"role:review"%' LIMIT 1`, r.id,
-        );
+         const activeVerify = this.one(
+           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'in_progress'
+              AND c.roles LIKE '%"review"%' LIMIT 1`, r.id,
+         );
         if (activeVerify) continue; // a verifier is on it — give them time
         const hours = Math.round(age / 3_600_000);
         const findings = `watchdog: review stalled ${hours}h — no verifier picked up the verification round. No adverse findings; resolve whatever the last gate/review named and hand off again, or let the work re-enter the pool.`;
@@ -311,10 +315,10 @@ export class KnowledgeHub {
        FROM relations r
        JOIN artefacts c ON c.id = r.src_id
        JOIN artefacts p ON p.id = r.dst_id
-       WHERE r.relation = 'child_of'
-         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-         AND c.tags LIKE '%"role:review"%'
-         AND p.type = 'task' AND p.status = 'in_review'`,
+        WHERE r.relation = 'child_of'
+          AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+          AND c.roles LIKE '%"review"%'
+          AND p.type = 'task' AND p.status = 'in_review'`,
     ).toArray() as any[];
     for (const v of nudgeRows) {
       const age = now - (v.age_ts ?? now);
@@ -335,13 +339,11 @@ export class KnowledgeHub {
     // in-flight count, open asks.
     const nextAlarm = await this.state.storage.getAlarm();
     this.state.storage.sql.exec(
-      `INSERT INTO settings (key, value) VALUES ('watchdog.last_tick', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.last_tick', ?)`,
       String(now),
     );
     this.state.storage.sql.exec(
-      `INSERT INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)`,
       String(nextAlarm ?? 0),
     );
     const staleNow = this.one(
@@ -355,8 +357,7 @@ export class KnowledgeHub {
     )?.n ?? 0;
     const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
     this.state.storage.sql.exec(
-      `INSERT INTO settings (key, value) VALUES ('watchdog.sweep', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
       JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks }),
     );
   }
@@ -379,9 +380,9 @@ export class KnowledgeHub {
 
   async board() {
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
-       WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`,
-    ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags) }));
+      `SELECT id, type, title, status, owner, tags, roles, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
+       WHERE type IN ('task','question') ORDER BY updated_ts DESC LIMIT 200`,
+    ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -418,8 +419,8 @@ export class KnowledgeHub {
       // tasks and operator gates are never dispatchable; role-tagged tasks
       // dispatch via their gateway; the rest needs qualification evidence.
       const tagsArr: string[] = t.tags ?? [];
-      const roleTagged = tagsArr.some((x) => ["role:analysis", "role:review", "role:impl", "role:unblock"].includes(x));
-      const isQ = tagsArr.includes("question") || (t.meta.kind === "question");
+      const roleTagged = (t.roles ?? []).some((x: string) => ["analysis", "review", "impl", "unblock"].includes(x));
+      const isQ = t.type === "question";
       const gated = t.meta.operator_gated;
       const roleWorkReady = roleTagged && t.qualification.ready !== false ? true : roleTagged;
       t.is_claimable = t.status === "todo" && !isQ && !gated && (roleWorkReady || t.qualification.ready !== false);
@@ -441,7 +442,7 @@ export class KnowledgeHub {
       `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
        FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%question%'
+         AND c.type = 'question'
        ORDER BY c.created_ts DESC`,
     ).toArray();
     const askChildOf = new Map<string, any>();
@@ -534,7 +535,7 @@ export class KnowledgeHub {
         s.verify_duty_backlog = this.one(
           `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-           AND c.tags LIKE '%"role:review"%' AND p.status = 'in_review'`,
+           AND c.roles LIKE '%"review"%' AND p.status = 'in_review'`,
         )?.n ?? 0;
       }
     }
@@ -675,6 +676,30 @@ export class KnowledgeHub {
       );
     `);
 
+    // additive columns for DBs created before these existed
+    for (const ddl of [
+      `ALTER TABLE decisions ADD COLUMN options TEXT`,
+      `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
+      `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
+      `ALTER TABLE decisions ADD COLUMN asker TEXT`,
+      `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
+      `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN roles TEXT`,
+      `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
+      `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
+      `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE pairings ADD COLUMN type TEXT`,
+      `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
+      `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
+      `ALTER TABLE pairings ADD COLUMN principal TEXT`,
+      `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
+      `ALTER TABLE sessions ADD COLUMN kind TEXT`,
+    ]) {
+      try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    }
+
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
     this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -705,8 +730,7 @@ export class KnowledgeHub {
           SELECT seq, ts, actor, action AS op, artefact_id, data AS detail FROM ledger WHERE kind = 'signal'`);
         this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS artefact_versions AS
           SELECT seq, ts, actor, action, artefact_id, summary, data FROM ledger WHERE kind = 'mutation'`);
-        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('ledger_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('ledger_v1', ?)`, String(Date.now()));
         this.audit("system:migration", "ledger_v1", null, { backfilled: !!(hasEvents || hasVersions) });
       } else {
         this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS events AS
@@ -736,10 +760,9 @@ export class KnowledgeHub {
         for (const a of legacy) {
           const created = await this.create(
             {
-              type: "task",
+              type: "question",
               title: String(a.question ?? "").slice(0, 200),
               body_md: String(a.question ?? ""),
-              tags: ["question"],
               owner: "",
               meta: { ask: { to: a.to_target ?? "any", from: a.from_label ?? "agent", urgency: "normal", options: [], artefact_id: a.artefact_id || undefined, legacy_id: a.id } },
             },
@@ -764,8 +787,7 @@ export class KnowledgeHub {
           this.audit("system:migration", "ask_migrated", a.artefact_id || null, { legacy: a.id, node: created.id });
           n++;
         }
-        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_v2', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('asks_v2', ?)`, String(Date.now()));
         if (n) this.audit("system:migration", "asks_v2", null, { migrated: n });
       }
     } catch (e) {
@@ -778,7 +800,7 @@ export class KnowledgeHub {
       if (!this.one(`SELECT value FROM settings WHERE key = 'asks_options_v1'`)) {
         const nodes = this.state.storage.sql.exec(
           `SELECT id, title, body_md, meta FROM artefacts
-           WHERE type = 'task' AND tags LIKE '%question%' AND status NOT IN ('done','superseded')`,
+           WHERE status NOT IN ('done','superseded') AND (type = 'question' OR (type = 'task' AND tags LIKE '%question%'))`,
         ).toArray() as any[];
         let n = 0;
         for (const node of nodes) {
@@ -807,8 +829,7 @@ export class KnowledgeHub {
           this.version(node.id, "system:migration", "update", `ask options backfilled (${m.ask.options.length})`, { options: m.ask.options });
           n++;
         }
-        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_options_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('asks_options_v1', ?)`, String(Date.now()));
         if (n) this.audit("system:migration", "ask_options_backfilled", null, { nodes: n });
       }
     } catch (e) {
@@ -846,36 +867,46 @@ export class KnowledgeHub {
             fixed++;
           }
         }
-        this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('tags_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('tags_v1', ?)`, String(Date.now()));
         this.audit("system:migration", "tags_v1", null, { canonicalized: fixed });
       }
     } catch (e) {
       console.log("tags_v1 migration:", String(e).slice(0, 200));
     }
 
-    // additive columns for DBs created before these existed
-    for (const ddl of [
-      `ALTER TABLE decisions ADD COLUMN options TEXT`,
-      `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
-      `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
-      `ALTER TABLE decisions ADD COLUMN asker TEXT`,
-      `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
-      `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
-      `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
-      `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
-      `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
-      `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
-      `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
-      `ALTER TABLE pairings ADD COLUMN type TEXT`,
-      `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
-      `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
-      `ALTER TABLE pairings ADD COLUMN principal TEXT`,
-      `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
-      `ALTER TABLE sessions ADD COLUMN kind TEXT`,
-    ]) {
-      try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    // ---------- roles_v1: system semantics leave the tag namespace (BR#2983) ----------
+    // Tags become 100% inert user labels. Three system meanings move out:
+    //   role:* tags      → the roles column (bare names: ["review"])
+    //   "question" tag   → type = 'question' (asks v2 nodes)
+    //   "attempted" tag  → meta.attempt only (backfilled where missing)
+    // The per-row transform is splitSystemTags() in core.ts — unit-tested
+    // against every legacy encoding. Idempotent (settings key).
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'roles_v1'`)) {
+        let roleRows = 0, questionRows = 0, attemptRows = 0;
+        for (const r of this.state.storage.sql.exec(`SELECT id, type, tags, meta, updated_ts FROM artefacts`).toArray() as any[]) {
+          const tags: string[] = parseTags(r.tags);
+          if (!tags.length) continue;
+          const meta = JSON.parse(r.meta ?? "{}");
+          const out = splitSystemTags(String(r.type ?? ""), tags, meta, Number(r.updated_ts ?? Date.now()));
+          if (!out.changed) continue;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET type = ?, tags = ?, roles = ?, meta = ? WHERE id = ?`,
+            out.type, out.tags.length ? JSON.stringify(out.tags) : null,
+            out.roles.length ? JSON.stringify(out.roles) : null,
+            JSON.stringify(out.meta), r.id,
+          );
+          if (out.roles.length) roleRows++;
+          if (out.type !== r.type) questionRows++;
+          if (tags.includes("attempted")) attemptRows++;
+        }
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('roles_v1', ?)`, String(Date.now()));
+        this.audit("system:migration", "roles_v1", null, { role_rows: roleRows, question_rows: questionRows, attempt_rows: attemptRows });
+      }
+    } catch (e) {
+      console.log("roles_v1 migration:", String(e).slice(0, 200));
     }
+
     // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
     const projectName = this.settingsMap().project_name || "superpositional";
     this.state.storage.sql.exec(
@@ -1047,7 +1078,7 @@ export class KnowledgeHub {
   // ---------- ops ----------
 
   private async create(body: any, actor: string) {
-    const type = body.type as ArtefactType;
+    let type = body.type as ArtefactType;
     if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
     const title = String(body.title ?? "");
     let bodyMd = String(body.body_md ?? "");
@@ -1059,6 +1090,11 @@ export class KnowledgeHub {
     const ts = Date.now();
     const status = INITIAL_STATUS[type];
     const tags = sanitizeTags(body.tags);
+    // roles: the machine's dispatch/gating lanes — structural, NEVER tags
+    // (tags are inert user labels; a tag can't change system behaviour)
+    const rolesIn = parseRolesInput(body.roles);
+    if (rolesIn.ok === false) throw new Error(rolesIn.error);
+    const roles = rolesIn.roles;
     const session = await this.resolveSession(body, String(body.token_id ?? ""));
     // project: explicit override or the deployment's project; tasks enter UNCLAIMED (owner = pool)
     const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
@@ -1070,21 +1106,26 @@ export class KnowledgeHub {
       if (type === "decision" && !pm.proposed_by) pm.proposed_by = actor;
     }
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
-    // further confirmation bars (await: ["role:review"]) before the task goes ready
+    // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
     // an ask node REQUIRES options (the human answers by clicking) — enforced
     // here, not just in ask.create, so every door is covered
-    if (createMeta.ask && type === "task") {
+    if (createMeta.ask && (type === "task" || type === "question")) {
       const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
       if (opts.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (meta.ask.options)");
       if (!String(body.title ?? "").trimEnd().endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?'");
     }
-    // classification lives in TAGS (phase 2): an incoming meta.kind is mapped
-    // to its tag and stripped — stored meta never carries kind again
+    // classification is structural (phase 3): legacy meta.kind maps to
+    // type ("question"), roles (analysis/review) or a plain tag (research) —
+    // stored meta never carries kind again
     if (createMeta.kind !== undefined) {
       const k = String(createMeta.kind);
-      const tag = (KIND_TAG as Record<string, string | null>)[k];
-      if (tag && !tags.includes(tag)) tags.push(tag);
+      const kindType = (KIND_TYPE as Record<string, string | undefined>)[k];
+      if (kindType && type === "task") type = kindType as ArtefactType;
+      const kindRole = (KIND_ROLE as Record<string, string | undefined>)[k];
+      if (kindRole && !roles.includes(kindRole as any)) roles.push(kindRole as any);
+      const kindTag = (KIND_TAG as Record<string, string | undefined>)[k];
+      if (kindTag && !tags.includes(kindTag)) tags.push(kindTag);
       delete createMeta.kind;
     }
 
@@ -1160,16 +1201,16 @@ export class KnowledgeHub {
       bodyMd = `${verifyVerdictStatement(createMeta)}\n\n${bodyMd.trim()}`.trim();
     }
     this.state.storage.sql.exec(
-      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, roles, status_ts, project, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, type, title, status, bodyMd, JSON.stringify({ ...createMeta, session }), owner, ts, ts,
-      tags ? JSON.stringify(tags) : null, ts, project, actor,
+      tags ? JSON.stringify(tags) : null, roles.length ? JSON.stringify(roles) : null, ts, project, actor,
     );
     if (!bodyMd.trim() && (type === "task" || type === "goal")) {
       bodyMd = scaffoldBody(title, owner || actor);
     }
     this.audit(actor, "create", id, { type, title });
-    this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [] });
+    this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [], roles });
     await this.embedArtefact(id, title, bodyMd);
     // GitHub auto-enrichment: "#1886" in the title pulls issue body/labels
     if (this.env.GH_TOKEN) {
@@ -1189,20 +1230,21 @@ export class KnowledgeHub {
     if (!raw) return;
     const candidates = [raw, raw.replace(/^#/, "BR#"), `BR#${raw.replace(/^#/, "")}`];
     const t = candidates
-      .map((c) => this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ? AND type = 'task'`, c))
+      .map((c) => this.one(`SELECT id, type, status, meta, tags, roles FROM artefacts WHERE id = ? AND type IN ('task','question')`, c))
       .find(Boolean);
     if (!t) return;
     const tmeta = JSON.parse(t.meta ?? "{}");
     const tTags: string[] = parseTags(t.tags);
-    const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
+    const tRoles: string[] = parseTags(t.roles);
+    const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
     if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
       await this.transition({ id: t.id, to: "in_progress", note: "re-claimed — progress artefact logged" }, actor);
       delete tmeta.blocked;
     } else if (t.status === "todo") {
       // pickup gate applies: only qualified work (or qualifier roles) auto-starts.
-      // Question tasks are never auto-started — contributions don't claim.
+      // Questions are never auto-started — contributions don't claim.
       const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
-      if (q.ok && !tTags.includes("question")) await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
+      if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
     tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
     delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
@@ -1387,17 +1429,25 @@ export class KnowledgeHub {
     const meta = JSON.stringify(metaObj);
     if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
     const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
+    // roles replacement semantics, same as tags (explicit array = replace)
+    let roles: string[] | null = parseTags(row.roles);
+    if (body.roles !== undefined) {
+      const rolesIn = parseRolesInput(body.roles);
+      if (rolesIn.ok === false) throw new Error(rolesIn.error);
+      roles = rolesIn.roles;
+    }
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);
     // update does not touch status — transitions are the only status path
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, updated_ts = ? WHERE id = ?`,
-      title, bodyMd, meta, tags ? JSON.stringify(tags) : null, Date.now(), id,
+      `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
+      title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
     );
     this.audit(actor, "update", id, {});
     const changed = [
       body.title !== undefined && "title", body.body_md !== undefined && "body",
       body.meta !== undefined && "meta", body.tags !== undefined && "tags",
+      body.roles !== undefined && "roles",
     ].filter(Boolean);
     this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}`, { title, body_md: bodyMd });
     await this.embedArtefact(id, title, bodyMd);
@@ -1408,8 +1458,8 @@ export class KnowledgeHub {
    *  decision linked either way. Declarations (meta.qualified / meta.qualification) don't count. */
   private hasEvidence(row: any, kind: "analysis" | "review"): { ok: boolean; via?: string } {
     const roleFilter = kind === "analysis"
-      ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')`
-      : `c.tags LIKE '%"role:review"%'`;
+      ? `(c.roles LIKE '%"analysis"%' OR c.roles LIKE '%"review"%')`
+      : `c.roles LIKE '%"review"%'`;
     const child = this.one(
       `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${roleFilter} LIMIT 1`,
@@ -1446,8 +1496,8 @@ export class KnowledgeHub {
       const sib = this.one(
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${kind === "analysis"
-           ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')`
-           : `c.tags LIKE '%"role:review"%'`} LIMIT 1`,
+           ? `(c.roles LIKE '%"analysis"%' OR c.roles LIKE '%"review"%')`
+           : `c.roles LIKE '%"review"%'`} LIMIT 1`,
         parent.id,
       );
       if (sib) return { ok: true, via: `sibling:${sib.id}` };
@@ -1466,7 +1516,7 @@ export class KnowledgeHub {
    *  Roles are playbooks, not gates — the done-gate already enforces
    *  review-before-completion where it belongs. */
   private enforceableBars(bars: string[]): string[] {
-    return bars.filter((b) => !/^role:(analysis|review|impl|unblock)$/.test(String(b)));
+    return bars.filter((b) => !/^(?:role:)?(analysis|review|impl|unblock)$/.test(String(b)));
   }
 
   private unmetBars(row: any): string[] {
@@ -1480,12 +1530,12 @@ export class KnowledgeHub {
   private qualificationEvidence(): { analysisEv: Set<string>; reviewEv: Set<string> } {
     const analysisEv = new Set<string>(), reviewEv = new Set<string>();
     for (const k of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS pid, c.tags AS tags FROM relations r JOIN artefacts c ON c.id = r.src_id
+      `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status = 'done'`,
     ).toArray() as any[]) {
-      const tags: string[] = parseTags(k.tags);
-      if (tags.includes("role:review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
-      else if (tags.includes("role:analysis")) analysisEv.add(k.pid);
+      const roles: string[] = parseTags(k.roles);
+      if (roles.includes("review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
+      else if (roles.includes("analysis")) analysisEv.add(k.pid);
     }
     for (const d of this.state.storage.sql.exec(
       `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
@@ -1535,7 +1585,7 @@ export class KnowledgeHub {
       },
       unmetBars: () => this.unmetBars(row),
       session: () => this.resolveSession(body, String(body?.token_id ?? "")),
-      evidence: (eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid),
+      evidence: (eid) => this.one(`SELECT type, tags, roles, meta FROM artefacts WHERE id = ?`, eid),
       parent: () =>
         this.one(
           `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -1559,8 +1609,9 @@ export class KnowledgeHub {
     // ---- the law: one table, one checker (machine.ts). Every role/intent
     // rule lives in RULES there; this is the only legality gate. ----
     const tTags: string[] = parseTags(row.tags);
+    const tRoles: string[] = parseTags(row.roles);
     const rejection = await checkRules(
-      { id, type: row.type, status: row.status, to, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+      { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
       this.ruleCtx(row, body, id, tTags),
     );
     if (rejection) throw new Error(rejection);
@@ -1638,7 +1689,7 @@ export class KnowledgeHub {
       if (row.owner && row.owner !== actor && !isHuman && !isSystem)
         throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
       const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
-      const verdictDuty = tTags.includes("role:review") || tTags.includes("role:unblock");
+      const verdictDuty = tRoles.includes("review") || tRoles.includes("unblock");
       const churn = churnRelease(nextAttempts, verdictDuty, row.status);
       if (churn === "escalate") {
         // verdict duties may not block (machine.ts) — repeated gate rejections
@@ -1650,7 +1701,7 @@ export class KnowledgeHub {
           reason: `verdict duty released ${nextAttempts} times without completing — the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`,
         };
         meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-        this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tTags.find((t) => t.startsWith("role:")) ?? "unknown" });
+        this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tRoles[0] ?? "unknown" });
         this.version(id, "system:churn-guard", "transition", `escalated to human — ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
       } else if (churn === "redirect") {
         // churn guard: the pool has re-run this task N times and a gate keeps
@@ -1670,9 +1721,7 @@ export class KnowledgeHub {
         this.version(id, "system:churn-guard", "transition", `release redirected to blocked — ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
       } else {
         owner = "";
-        const tags: string[] = parseTags(row.tags);
-        if (!tags.includes("attempted")) tags.push("attempted");
-        this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
+        // attempts live in meta.attempt only (roles_v1) — no system tag writes
         meta.attempt = {
           by: actor, at: ts,
           attempts: nextAttempts,
@@ -1686,7 +1735,7 @@ export class KnowledgeHub {
     // child cannot carry the parent into implementation. If the parent is
     // claimed by the same session, release it — impl requires a fresh claim
     // (fresh session). The claim gate will then allow it (evidence session ≠ new session).
-    if (row.type === "task" && to === "done" && tTags.includes("role:analysis")) {
+    if (row.type === "task" && to === "done" && tRoles.includes("analysis")) {
       const parent = this.one(
         `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
@@ -1706,7 +1755,7 @@ export class KnowledgeHub {
     );
     // post-conditions on the single write path: violations are breaches (a
     // loud audited trail), never silent repairs.
-    const violations = checkInvariants({ type: row.type, status: to, tags: tTags, meta });
+    const violations = checkInvariants({ type: row.type, status: to, roles: tRoles, tags: tTags, meta });
     if (violations.length) {
       this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
       this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} → ${to}: ${violations.join("; ")}`, { violations });
@@ -1772,7 +1821,7 @@ export class KnowledgeHub {
     // bounces it (in_progress with findings). The impl agent keeps the parent
     // claim and waits — in_review is the blocked-until-verdict state.
     let verifyTaskId: string | undefined;
-    if (row.type === "task" && to === "in_review" && !tTags.includes("role:review")) {
+    if (row.type === "task" && to === "in_review" && !tRoles.includes("review")) {
       // recursion guard, enforced: reviews don't spawn verify-of-verify, and
       // child_of chains are capped at 3. The verify round always names the
       // ROOT task in its title — the chain lives in child_of, never "Verify: Verify: ...".
@@ -1780,12 +1829,12 @@ export class KnowledgeHub {
       let cursor = id, depth = 0;
       while (depth < 10) {
         const p = this.one(
-          `SELECT p.id AS id, p.tags AS tags FROM relations r JOIN artefacts p ON p.id = r.dst_id
+          `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
         );
         if (!p) break;
         depth++;
-        if (String(p.tags ?? "").includes("role:review")) { guardHit = `ancestor ${p.id} is a review task — verify-of-verify is blocked`; break; }
+        if (parseTags(p.roles).includes("review")) { guardHit = `ancestor ${p.id} is a review task — verify-of-verify is blocked`; break; }
         if (depth >= 3) { guardHit = `nesting depth ${depth} would exceed the child_of cap of 3`; break; }
         cursor = p.id;
       }
@@ -1797,7 +1846,7 @@ export class KnowledgeHub {
         const existing = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
+             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
         );
         if (existing) {
           verifyTaskId = existing.id;
@@ -1810,7 +1859,7 @@ export class KnowledgeHub {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
               body_md: `Verification duty for ${id} — "${rootTitle}".\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\nComplete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
-              tags: ["role:review"],
+              roles: ["review"],
             },
             actor,
           );
@@ -1832,7 +1881,7 @@ export class KnowledgeHub {
       const fromStatuses = ["todo", "in_progress", "blocked"];
       for (const v of this.state.storage.sql.exec(
         `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`, id,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`, id,
       ).toArray() as any[]) {
         const vm = JSON.parse(v.meta ?? "{}");
         vm.superseded_reason = to === "in_progress"
@@ -1855,7 +1904,7 @@ export class KnowledgeHub {
       const isBounce = row.status === "in_review" && to === "in_progress";
       const verifyChildren = this.state.storage.sql.exec(
         `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC`, id,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC`, id,
       ).toArray() as any[];
       verifyChildren.forEach((v, i) => {
         if (isBounce && i === 0) return; // newest survives the bounce — same round re-enters
@@ -1872,7 +1921,7 @@ export class KnowledgeHub {
       // the parent moves on (done or bounce) — never accumulating orphans
       for (const v of this.state.storage.sql.exec(
         `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`, id,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`, id,
       ).toArray() as any[]) {
         const vm = JSON.parse(v.meta ?? "{}");
         vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — unblock round closed`;
@@ -1889,13 +1938,13 @@ export class KnowledgeHub {
     // parent (in_progress with resolution); if no, record findings and close
     // yourself". Ask-gated blocks are excluded — the ask answer auto-resumes
     // them, and a spawned unblock task would race the answer.
-    if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tTags.includes("role:unblock")) {
+    if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tRoles.includes("unblock")) {
       // at most ONE live unblock child per parent, ever: if any exists in an
       // open state (todo/in_progress/blocked), reuse it — refresh its body
       // with the current exit condition instead of spawning a duplicate.
       const existing = this.one(
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%' LIMIT 1`, id,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%' LIMIT 1`, id,
       );
       if (existing) {
         this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
@@ -1920,7 +1969,7 @@ export class KnowledgeHub {
           type: "task",
           title: `Unblock: ${rootTitle.slice(0, 200)}`,
           body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${blockWhy || "see parent"}.\nExit condition: ${exitCond || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
-          tags: ["role:unblock"],
+          roles: ["unblock"],
         },
         actor,
       );
@@ -1939,8 +1988,8 @@ export class KnowledgeHub {
   private async link(body: any, actor: string) {
     const srcId = String(body.src ?? ""), rel = String(body.relation ?? ""), dstId = String(body.dst ?? "");
     if (!isRelation(rel)) throw new Error(`unknown relation '${rel}'`);
-    const src = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, srcId);
-    const dst = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, dstId);
+    const src = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, srcId);
+    const dst = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, dstId);
     if (!src || !dst) throw new Error("both src and dst must exist");
     const verdict = validateRelation(rel, src.type as ArtefactType, dst.type as ArtefactType);
     if (verdict.ok === false) throw new Error(verdict.reason);
@@ -1948,11 +1997,11 @@ export class KnowledgeHub {
     // a child of a verify task (or of an unblock task — same ephemerality).
     // Enforced here at the relation level, not just the auto-spawn path.
     if (rel === "child_of") {
-      const childTags = parseTags(src.tags);
-      const parentTags = parseTags(dst.tags);
-      if (childTags.includes("role:review") && (parentTags.includes("role:review") || parentTags.includes("role:unblock")))
-        throw new Error(`link rejected: ${srcId} is a verify task — verify tasks are terminal-at-birth and cannot nest under ${parentTags.includes("role:review") ? "another verify" : "an unblock"} task`);
-      if (childTags.includes("role:unblock") && (parentTags.includes("role:unblock") || parentTags.includes("role:review")))
+      const childRoles = parseTags((src as any).roles);
+      const parentRoles = parseTags((dst as any).roles);
+      if (childRoles.includes("review") && (parentRoles.includes("review") || parentRoles.includes("unblock")))
+        throw new Error(`link rejected: ${srcId} is a verify task — verify tasks are terminal-at-birth and cannot nest under ${parentRoles.includes("review") ? "another verify" : "an unblock"} task`);
+      if (childRoles.includes("unblock") && (parentRoles.includes("unblock") || parentRoles.includes("review")))
         throw new Error(`link rejected: ${srcId} is an unblock task — unblock tasks are terminal-at-birth and cannot nest under another ephemeral task`);
     }
     // nesting depth cap: child_of chains max 3 deep — references give structure,
@@ -2100,20 +2149,20 @@ export class KnowledgeHub {
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
       // otherwise say WHY instead of silently logging into a card that never moves.
-      const tTags: string[] = JSON.parse(row.tags ?? "[]");
-      // question tasks: contributions never claim — the author closes with an ADR
-      if (tTags.includes("question")) {
+      const tRoles: string[] = parseTags(row.roles);
+      // questions: contributions never claim — the author closes with an ADR
+      if (row.type === "question") {
         return {
           id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task).",
+          note_postscript: "contribution logged on a question — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task).",
         };
       }
-      const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
+      const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
       const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
       if (!q.ok) {
         return {
           id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`,
+          note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
         };
       }
       await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
@@ -2290,17 +2339,16 @@ export class KnowledgeHub {
       const dup = this.one(
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-           AND c.tags LIKE '%question%' AND c.title = ? LIMIT 1`,
+           AND c.type = 'question' AND c.title = ? LIMIT 1`,
         artefactId, question.slice(0, 200),
       );
       if (dup) throw new Error(`an identical ask is already open: ${dup.id} — answer or reframe it instead of re-asking`);
     }
     const created = await this.create(
       {
-        type: "task",
+        type: "question",
         title: question.slice(0, 200),
         body_md: details || question,
-        tags: ["question"],
         owner: "",
         meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined } },
       },
@@ -2331,7 +2379,7 @@ export class KnowledgeHub {
     // converts them (they then read status 'migrated' and vanish naturally)
     const nodes = this.state.storage.sql.exec(
       `SELECT id, meta, created_ts FROM artefacts
-       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND tags LIKE '%"question"'
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked')
        ORDER BY created_ts DESC LIMIT 50`,
     ).toArray() as any[];
     const inbox = nodes
@@ -2365,7 +2413,7 @@ export class KnowledgeHub {
     const id = String(body.id ?? "");
     const feedback = String(body.feedback ?? "").trim().slice(0, 1000) ||
       "REFRAME — restructure per the ask contract: one imperative question ≤240 chars, 2-8 one-click options, and why this is escalated instead of automatic.";
-    const node = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND tags LIKE '%question%'`, id);
+    const node = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND type = 'question'`, id);
     if (!node) throw new Error(`no such ask: ${id}`);
     const m = JSON.parse(node.meta ?? "{}");
     m.ask = { ...(m.ask ?? {}), reframe: { by: actor, feedback, ts: Date.now() } };
@@ -2501,7 +2549,7 @@ export class KnowledgeHub {
     for (const c of this.state.storage.sql.exec(
       `SELECT r.dst_id AS parent, c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC`,
+         AND c.type = 'question' ORDER BY c.created_ts DESC`,
     ).toArray() as any[]) {
       if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
     }
@@ -2531,14 +2579,14 @@ export class KnowledgeHub {
     // plus any whose role:* tags match the caller's — delivered at orient and
     // at dispatch. The mechanism the merge ladder rides (BR#2799).
     const steeringRows = this.state.storage.sql.exec(
-      `SELECT id, title, body_md, tags FROM artefacts
+      `SELECT id, title, body_md, tags, roles FROM artefacts
        WHERE type = 'steering' AND status = 'active' ORDER BY updated_ts DESC LIMIT 20`,
     ).toArray();
     const steering = (steeringRows as any[])
-      .map((s: any) => ({ id: s.id, title: s.title, body_md: String(s.body_md ?? "").slice(0, 1500), tags: parseTags(s.tags) }))
+      .map((s: any) => ({ id: s.id, title: s.title, body_md: String(s.body_md ?? "").slice(0, 1500), tags: parseTags(s.tags), roles: parseTags(s.roles) }))
       .filter((s: any) => {
-        const roles = s.tags.filter((t: string) => t.startsWith("role:"));
-        return roles.length === 0 || roles.some((r: string) => tags.includes(r));
+        const roles: string[] = s.roles ?? [];
+        return roles.length === 0 || roles.some((r: string) => tags.includes(`role:${r}`));
       });
     const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
     const askMarks = askPlaceholders.map(() => "?").join(",");
@@ -2574,10 +2622,10 @@ export class KnowledgeHub {
     // constantly displaced older-but-ranked items, so they were invisible to
     // the runner and sat in Backlog "blocked" forever.
     const pool = this.state.storage.sql.exec(
-      `SELECT id, title, tags, meta, project, updated_ts, status FROM artefacts
+      `SELECT id, type, title, tags, roles, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
        ORDER BY updated_ts DESC LIMIT 400`,
-    ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
+    ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // gateway callers dispatch sessions and never claim blocked work —
     // resolving an unblock condition is role:unblock duty. Ten blocked cards
     // rank above plain todo and filled the dispatch slice, starving the
@@ -2603,7 +2651,7 @@ export class KnowledgeHub {
       if (l.pstatus === "in_review") verifyParents.set(l.src_id, l);
     }
     const unclaimedWork = dispatchPool.filter((t: any) => {
-      const need = t.tags.filter((x: string) => x.startsWith("role:"));
+      const need: string[] = t.roles ?? [];
       const m = JSON.parse(t.meta ?? "{}");
       const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
@@ -2634,14 +2682,14 @@ export class KnowledgeHub {
         if (m.boosted) return -1;
         // release-parked-work levers FIRST, above everything claimable:
         // verify duty (an in_review task parks its owner until a fresh
-        // session rules) and unblock duty. Verify starved below
+        // session rules) and unblock duty share rank 0. Verify starved below
         // blocked-with-condition (2026-10-24, Ray): ranks 0-1 filled the
         // 10-slot slice, verify children never surfaced, impls piled up
         // in_review while new impl todo kept getting claimed.
+        if (t.roles?.includes("unblock")) return 0;
         if (verifyParents.has(t.id)) return 0;
-        if (t.tags?.includes("role:unblock")) return 0;
         if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
-        if (t.tags?.includes("question")) return 3;
+        if (t.type === "question") return 3;
         return 4;
       };
       return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
@@ -2660,9 +2708,8 @@ export class KnowledgeHub {
         t.is_claimable = !!t.unblock_condition; // resume via transition in_progress with resolution
         if (!t.unblock_condition) t.claim_reason = "blocked without an unblock condition — open the card, resolve or re-scope it";
       }
-      // questions by kind (meta.kind = "question"), not by legacy tag — tags are
-      // roles, kind is the pickup model. Legacy-tagged rows still register.
-      t.is_question = isQuestionTask(m) || t.tags?.includes("question") || false;
+      // questions are a TYPE (asks v3 / BR#2983) — the pickup model, never a tag
+      t.is_question = t.type === "question" || isQuestionTask(m) || false;
       const gated = m.operator_gated;
       if (t.status !== "blocked") {
         t.is_claimable = !t.is_question && !gated;
@@ -2706,11 +2753,11 @@ export class KnowledgeHub {
        FROM relations r
        JOIN artefacts c ON c.id = r.src_id
        JOIN artefacts p ON p.id = r.dst_id
-       WHERE r.relation = 'child_of'
-         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-         AND c.tags LIKE '%"role:review"%'
-         AND p.type = 'task' AND p.status = 'in_review'
-         AND p.updated_ts < ?`,
+        WHERE r.relation = 'child_of'
+          AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+          AND c.roles LIKE '%"review"%'
+          AND p.type = 'task' AND p.status = 'in_review'
+          AND p.updated_ts < ?`,
       [Date.now() - 48 * 60 * 60 * 1000],
     ).toArray() as any[];
 
@@ -2898,8 +2945,7 @@ export class KnowledgeHub {
     const slug = DEFAULT_WS_SLUG;
     // this DO *is* the default workspace — stamp it so tokens minted here embed the slug
     this.state.storage.sql.exec(
-      `INSERT INTO settings (key, value) VALUES ('ws_slug', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('ws_slug', ?)`,
       JSON.stringify(slug),
     );
     this.state.storage.sql.exec(
@@ -3361,8 +3407,7 @@ export class KnowledgeHub {
     if (entries.length === 0) throw new Error("no valid settings keys (lowercase [a-z0-9_])");
     for (const [k, v] of entries) {
       this.state.storage.sql.exec(
-        `INSERT INTO settings (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
         k, JSON.stringify(v),
       );
       this.audit("admin", "settings", k, {});
@@ -3502,7 +3547,7 @@ export class KnowledgeHub {
   }
 
   private shape(row: any): any {
-    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags) };
+    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
   }
 
   private json(obj: unknown, status = 200) {

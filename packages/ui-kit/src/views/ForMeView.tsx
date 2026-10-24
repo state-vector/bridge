@@ -193,7 +193,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
   // open question nodes = the ask feed (one plane)
   const asked = useMemo(
     () => (tasks as any[]).filter((t) => {
-      if (!(t.tags ?? []).includes("question") || !t.meta?.ask) return false;
+      if (t.type !== "question" || !t.meta?.ask) return false;
       if (!["todo", "in_progress", "blocked"].includes(t.status)) return false;
       const am = t.meta.ask ?? {};
       return !(String(am.to ?? "").includes("@")); // session-scoped asks are agent-to-agent
@@ -202,7 +202,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
   );
 
   const questions = useMemo(
-    () => tasks.filter((t) => t.meta?.kind === "question" || (t.tags ?? []).includes("question")),
+    () => tasks.filter((t) => t.type === "question" || t.meta?.kind === "question"),
     [tasks],
   );
 
@@ -222,7 +222,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
         <Card>
           <h2>Steering ({steering!.length})</h2>
           {steering!.map((s) => {
-            const roles = (s.tags ?? []).filter((t) => t.startsWith("role:"));
+            const roles: string[] = s.roles ?? [];
             const root = roles.length ? roles.join(", ") : "all roles";
             return (
               <div key={s.id} className="forme-item">

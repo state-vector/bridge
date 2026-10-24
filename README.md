@@ -231,6 +231,13 @@ not by client convention.
 - Subagent prompt seed: the pinned card at `packages/adapters/bridge-protocol-card.md`.
 - Full contract: `docs/roles-and-playbooks.md`.
 
+On **tasks**, roles live in a dedicated `roles` column — `create_artefact { roles: ["review"] }` —
+never in tags. `tags` are 100% free-form user/agent labels (themes like `gtm`, `deploy-train`,
+`pricing`): they render as chips and drive the filterable theme bar in Top and Backlog, but they
+never change system behaviour — tagging a task `role:review` does nothing. **Questions are their
+own artefact type** (`type: "question"`; asks create them automatically): open participation,
+answered via the ask band or progress entries, closed to done/superseded — never claimed.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

@@ -14,6 +14,8 @@ export interface KbArtefact {
   title: string;
   status: string;
   tags?: string[] | null;
+  /** dispatch/gating lanes (review/unblock/analysis/…) — structural, never tags (BR#2983) */
+  roles?: string[] | null;
   board?: string | null;
   owner?: string;
   body_md?: string;
@@ -181,13 +183,13 @@ export const kbApi = {
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
   progressGauges: (body: { id: string; note: string; sentiment?: string; completion_pct?: number; confidence_pct?: number; risk_pct?: number }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify(body) }),
-  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
+  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string; tags?: string[]; roles?: string[] }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
-  update: (id: string, patch: { title?: string; body_md?: string; meta?: object }) =>
+  update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[]; roles?: string[] }) =>
     j<{ id: string }>("/api/kb/update", { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 
   // admin (connect page) — cookie-session only; tokens are rejected by design

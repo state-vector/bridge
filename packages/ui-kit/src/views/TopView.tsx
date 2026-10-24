@@ -3,6 +3,7 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
+import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
 
@@ -72,6 +73,7 @@ interface TopRow {
   pinned?: boolean;
   boosted?: boolean;
   kind?: string;
+  tags?: string[];
   partOf?: string;
   score?: number;
   grade?: string;
@@ -144,6 +146,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         pinned: !!meta.pinned,
         boosted: !!meta.boosted,
         kind: kindOf(t as any),
+        tags: (t as any).tags,
         partOf: (t as any).part_of,
         score: sc?.score,
         grade: sc?.grade,
@@ -184,6 +187,9 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     );
   }, [tasks, sessions, agents, now]);
 
+  // tag themes: counts over ALL open work (not just in-flight), filter applies here
+  const tagTheme = useTagTheme(tasks.filter((t) => !["done", "superseded"].includes(t.status)));
+
   // tree view: children (verify / unblock / analysis / impl children) nested
   // under their parent task — you can see at a glance whether the confirm
   // round is running, parked, or missing. Orphan children (parent not in the
@@ -207,8 +213,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       for (const c of childrenOf.get(r.taskId ?? r.key) ?? []) walk(c, depth + 1);
     };
     for (const r of roots) walk(r, 0);
-    return out;
-  }, [rows]);
+    return out.filter(({ row }) => tagTheme.passes({ tags: row.tags }));
+  }, [rows, tagTheme]);
 
   // human-ask plane: exactly-once placement — nested under a visible subject,
   // else the residual band (2026-10-23 design)
@@ -228,6 +234,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <h2>Top</h2>
         <span className="muted-note">fleet processes — status dot · agent · gauges · ages. blocked rows appear only with a pending human ask or a live unblock child; churn parks + lever-less blocks live in Backlog.</span>
       </div>
+      <TagThemeBar theme={tagTheme} />
 
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
@@ -274,6 +281,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {depth > 0 && <span className="tree-branch" title={`child of ${r.partOf ?? "parent"}`}>└─ </span>}
             <span className={`kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.goal ?? "—"}
+            <TagChips tags={r.tags} />
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
