@@ -669,6 +669,17 @@ fn doctor() -> bool {
 
 /// systemd user unit (linux): run forever, restart on failure, survive logout.
 /// macOS has no systemd — prints the launchd/nohup alternative.
+///
+/// Two things the service environment gets wrong on real hosts, both baked at
+/// install time:
+/// - logs go to ~/bridge.log (StandardOutput/Error=append:), not the journal —
+///   user journals are unreadable on many minimal cloud images (journald
+///   Storage=volatile, or the session predates linger), which turned
+///   `journalctl --user` into a dead end while the service itself ran fine;
+/// - PATH: systemd runs user units with a minimal default PATH that misses
+///   ~/.local/bin, so agent CLIs that work in the operator's shell are
+///   unrunnable under the service. The install shell's PATH is written into
+///   the unit, with the configured agent CLIs' dirs pinned first.
 fn service_install() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         println!("no systemd on this OS. run the runner persistently with:");
@@ -680,11 +691,36 @@ fn service_install() -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME")?;
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir).map_err(|e| e.to_string())?;
+
+    // PATH to bake: dirs of the configured agent CLIs first, then the install
+    // shell's PATH — whatever dispatches here keeps dispatching under the
+    // service. A configured bin that doesn't resolve is a warning, not a
+    // failure (doctor is the gate for that).
+    let mut agent_bins: Vec<String> = Vec::new();
+    if let Some(cfg) = DispatchConfig::resolve() {
+        for (b, section) in &cfg.backends {
+            agent_bins.push(
+                section
+                    .bin
+                    .clone()
+                    .unwrap_or_else(|| if b == "kiro" { "kiro".to_string() } else { cfg.opencode_bin.clone() }),
+            );
+        }
+    }
+    let (dirs, missing) = baked_path_dirs(&agent_bins);
+    let baked_path = std::env::join_paths(&dirs)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+
+    let log_path = PathBuf::from(&home).join("bridge.log");
     let unit = format!(
-        "[Unit]\nDescription=bridge fleet runner\nAfter=network-online.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=10\nWorkingDirectory={}\nEnvironmentFile=-{}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=bridge fleet runner\nAfter=network-online.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=10\nWorkingDirectory={}\nEnvironmentFile=-{}\nEnvironment=PATH={}\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
         bin.display(),
         std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
         PathBuf::from(&home).join(".bridge/env").display(),
+        baked_path,
+        log_path.display(),
+        log_path.display(),
     );
     let path = unit_dir.join("bridge.service");
     std::fs::write(&path, unit).map_err(|e| e.to_string())?;
@@ -693,8 +729,94 @@ fn service_install() -> Result<(), String> {
     println!("  systemctl --user daemon-reload");
     println!("  systemctl --user enable --now bridge");
     println!("  loginctl enable-linger $USER    # survive logout / run at boot");
-    println!("  journalctl --user -u bridge -f  # watch the dispatch log");
+    println!("  tail -f ~/bridge.log            # watch the dispatch log (file logging — the journal is bypassed)");
+    for agent_bin in &missing {
+        println!("  \x1b[33mwarn\x1b[0m  {agent_bin} not found on this PATH — the service won't dispatch with it until it's runnable (`bridge doctor`)");
+    }
+    println!("PATH baked from this shell — re-run `bridge service install` if agent CLIs move (or set PATH in ~/.bridge/env to override)");
     Ok(())
+}
+
+/// PATH lookup for a bare bin name; an absolute/relative path resolves as-is.
+fn which(bin: &str) -> Option<PathBuf> {
+    if bin.contains('/') {
+        let p = PathBuf::from(bin);
+        return if p.is_file() { Some(p) } else { None };
+    }
+    let path = std::env::var("PATH").ok()?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|cand| cand.is_file())
+}
+
+/// Dirs to bake into the unit's `Environment=PATH`: the configured agent
+/// CLIs' dirs first, then the install shell's PATH — order-preserving,
+/// de-duplicated. Also returns the bins that didn't resolve (warning fodder:
+/// the service can't dispatch with them until they're runnable).
+fn baked_path_dirs(agent_bins: &[String]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for bin in agent_bins {
+        match which(bin) {
+            Some(found) => {
+                if let Some(dir) = found.parent() {
+                    push_unique(&mut dirs, dir.to_path_buf());
+                }
+            }
+            None => missing.push(bin.clone()),
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            push_unique(&mut dirs, dir);
+        }
+    }
+    (dirs, missing)
+}
+
+fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baked_path_pins_agent_cli_dirs_first_then_carries_the_install_shell_path() {
+        // BR#2633: systemd user units run with a minimal default PATH that
+        // misses ~/.local/bin — the unit must carry the install shell's PATH,
+        // with the agent CLIs' dirs pinned ahead of it, or dispatch regresses
+        // to "no dispatchable agents" under the service while the same binary
+        // works fine in the operator's shell.
+        let sh = which("sh").expect("sh resolves on any host/CI");
+        let (dirs, missing) = baked_path_dirs(&["sh".to_string(), "bridge-no-such-bin-2633".to_string()]);
+        assert_eq!(dirs.first().map(|d| d.as_path()), sh.parent());
+        assert_eq!(missing, vec!["bridge-no-such-bin-2633".to_string()]);
+        // every dir on the current PATH survives the bake (minus empties)
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                if dir.as_os_str().is_empty() {
+                    continue;
+                }
+                assert!(dirs.contains(&dir), "install-shell dir dropped from the bake: {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn which_resolves_absolute_bins_directly_and_bare_names_on_path() {
+        // backends.*.bin may be an absolute path (no PATH search needed) or a
+        // bare name (resolved on the install shell's PATH); neither may panic.
+        let sh = which("sh").unwrap();
+        assert_eq!(which(sh.to_str().unwrap()).as_deref(), Some(sh.as_path()));
+        assert_eq!(which("bridge-definitely-not-a-bin-2633"), None);
+    }
 }
 
 fn print_help() {

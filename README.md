@@ -79,8 +79,10 @@ bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
 loginctl enable-linger $USER   # run at boot, survive logout
-journalctl --user -u bridge -f # watch the dispatch log
+tail -f ~/bridge.log           # watch the dispatch log
 ```
+
+The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
 Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
 
