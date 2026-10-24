@@ -12,6 +12,7 @@ export const ARTEFACT_TYPES = [
   "goal",
   "decision",
   "task",
+  "question",
   "progress",
   "agent",
 ] as const;
@@ -21,23 +22,74 @@ export function isArtefactType(t: unknown): t is ArtefactType {
   return typeof t === "string" && (ARTEFACT_TYPES as readonly string[]).includes(t);
 }
 
-/** Task kinds — one task type, distinguished by TAGS (phase-2 classification:
- *  type is structural, tags are labels). meta.kind is legacy read-only. */
+/** Task kinds — one task type, distinguished by TYPE + ROLES (phase-3
+ *  classification: type and roles are structural, tags are inert user
+ *  labels — a tag can never change system behaviour). meta.kind is legacy
+ *  read-only, normalized at create. */
 export const TASK_KINDS = ["impl", "analysis", "review", "research", "question"] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 
-/** The tag that carries a task kind, for normalization at create time. */
-export const KIND_TAG: Record<TaskKind, string | null> = {
-  impl: null, analysis: "role:analysis", review: "role:review", research: "research", question: "question",
-};
+/** meta.kind normalization at create: where each legacy kind lands now. */
+export const KIND_TYPE: Partial<Record<TaskKind, ArtefactType>> = { question: "question" };
+export const KIND_ROLE: Partial<Record<TaskKind, string>> = { analysis: "analysis", review: "review" };
+export const KIND_TAG: Partial<Record<TaskKind, string>> = { research: "research" };
 
-/** A task's kind, defaulting to impl. Questions are the open, non-exclusive kind. */
+/** The role lanes the machine enforces (dispatch, gating, verdict duties).
+ *  Roles live in the `roles` column — NEVER in tags (user-definable, inert). */
+export const ROLE_NAMES = ["impl", "analysis", "review", "unblock", "human"] as const;
+export type RoleName = (typeof ROLE_NAMES)[number];
+
+/** Parse+validate role input (["review"], ["role:review"] tolerated).
+ *  Strict on unknown names: a typo'd role silently vanishing would strip a
+ *  task's gating — fail loud instead. */
+export function parseRolesInput(raw: unknown): { ok: true; roles: RoleName[] } | { ok: false; error: string } {
+  if (raw == null) return { ok: true, roles: [] };
+  const arr = typeof raw === "string" ? raw.split(",") : raw;
+  if (!Array.isArray(arr)) return { ok: false, error: "roles must be an array of role names" };
+  const out: RoleName[] = [];
+  for (const v of arr) {
+    const name = String(v ?? "").trim().toLowerCase().replace(/^role:/, "");
+    if (!name) continue;
+    if (!(ROLE_NAMES as readonly string[]).includes(name))
+      return { ok: false, error: `unknown role '${name}' (valid: ${ROLE_NAMES.join(", ")})` };
+    if (!out.includes(name as RoleName)) out.push(name as RoleName);
+  }
+  return { ok: true, roles: out.slice(0, 5) };
+}
+
+/** The roles_v1 per-row transform, pure so it is unit-testable against every
+ *  legacy encoding parseTags() can produce. Moves system meaning OUT of tags:
+ *  role:* → roles (bare), "question" tag → type question, "attempted" tag →
+ *  meta.attempt (backfilled when absent). User tags pass through untouched. */
+export function splitSystemTags(
+  rowType: string,
+  rawTags: string[],
+  meta: any,
+  now: number,
+): { type: string; tags: string[]; roles: string[]; meta: any; changed: boolean } {
+  const tags = [...rawTags];
+  const roles = [...new Set(tags.filter((t) => t.startsWith("role:")).map((t) => t.slice(5)))];
+  const wasQuestion = tags.includes("question");
+  const wasAttempted = tags.includes("attempted");
+  const rest = tags.filter((t) => !t.startsWith("role:") && t !== "question" && t !== "attempted");
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  let type = rowType;
+  if (rowType === "task" && wasQuestion) type = "question";
+  if (wasAttempted && !m.attempt) m.attempt = { by: "system:migration", at: now, attempts: 1 };
+  const changed = roles.length > 0 || rest.length !== tags.length || type !== rowType || (wasAttempted && !(meta && typeof meta === "object" && meta.attempt));
+  return { type, tags: rest, roles, meta: m, changed };
+}
+
+/** A task's kind, defaulting to impl. LEGACY: reads meta.kind, which create()
+ *  normalizes away — the authority is type ("question") + roles column. Kept
+ *  for pre-migration rows and tests. */
 export function taskKind(meta: any): TaskKind {
   const k = typeof meta?.kind === "string" ? meta.kind : undefined;
   return (TASK_KINDS as readonly string[]).includes(k ?? "") ? (k as TaskKind) : "impl";
 }
 
-/** Open tasks anyone may contribute to; never claimed, never swept by the watchdog. */
+/** Open questions anyone may contribute to; never claimed, never swept. LEGACY
+ *  meta.kind path — the authority is type === "question". */
 export function isQuestionTask(meta: any): boolean {
   return taskKind(meta) === "question";
 }
@@ -48,6 +100,8 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
   decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
   task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+  // questions are answered, never claimed: todo → done (answer) or superseded (closed by ADR)
+  question: { todo: ["done", "superseded"] },
   progress: {},
   agent: {},
 };
@@ -58,6 +112,7 @@ export const INITIAL_STATUS: Record<ArtefactType, string> = {
   goal: "draft",
   decision: "proposed",
   task: "todo",
+  question: "todo",
   progress: "logged",
   agent: "active",
 };
@@ -105,8 +160,8 @@ export function validateRelation(
     return { ok: false, reason: "implements: source must be a task, target a goal" };
   if (relation === "constrains" && srcType !== "steering")
     return { ok: false, reason: "constrains: source must be steering" };
-  if (relation === "child_of" && !(srcType === "task" && dstType === "task"))
-    return { ok: false, reason: "child_of: both source and target must be tasks (flat structure — the board never nests, relations do)" };
+  if (relation === "child_of" && !((srcType === "task" || srcType === "question") && dstType === "task"))
+    return { ok: false, reason: "child_of: source must be a task or question, target a task (flat structure — the board never nests, relations do)" };
   return { ok: true };
 }
 
@@ -327,8 +382,8 @@ export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
   analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
 - Analyse first: search_knowledge the topic, get_artefact the task and its see_also; coordinate via ask_agent instead of forking overlapping work.
-- Decompose into child tasks (child_of the parent): one per coherent unit, each tagged with its role (role:impl / role:review), each carrying concrete checkable acceptance criteria in body_md ("done when X" plus what is OUT of scope). A vague child task is a defect you created; rewrite it before you finish.
-- Qualify the parent by completing a role:analysis child that summarises the plan and open questions, then transition it to done. A done role:analysis child is what lifts the parent's pickup gate. If the publisher requested stacked bars (await), create the matching role:review child so the bar can be met.
+- Decompose into child tasks (child_of the parent): one per coherent unit, each carrying its role (roles: ["impl"] / ["review"] — never tags), each carrying concrete checkable acceptance criteria in body_md ("done when X" plus what is OUT of scope). A vague child task is a defect you created; rewrite it before you finish.
+- Qualify the parent by completing an analysis child (roles: ["analysis"]) that summarises the plan and open questions, then transition it to done. A done analysis child is what lifts the parent's pickup gate. If the publisher requested stacked bars (await), create the matching review child (roles: ["review"]) so the bar can be met.
 - Never implement the children; never transition the parent to done. Unanalysable? Move it to blocked with a reason + unblock condition and ask the specific question.`,
   impl: `BUILD: claim qualified work matching your roles, work it to a natural stopping point, and hand over for review — in_review with the PR link in the note. You cannot self-approve done; you stay owner until the verdict.`,
   review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.`,

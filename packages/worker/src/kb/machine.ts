@@ -12,12 +12,14 @@ import { parseTags, validateTransition } from "./core";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
-export function effectiveRole(tags: string[]): Role {
-  if (tags.includes("role:review")) return "review";
-  if (tags.includes("role:unblock")) return "unblock";
-  if (tags.includes("role:analysis")) return "analysis";
-  if (tags.includes("role:impl")) return "impl";
-  if (tags.includes("role:human")) return "human";
+/** A task's lane from its roles column (bare names, JSON array). Tags never
+ *  carry roles — they are inert user labels (decision BR#2983). */
+export function effectiveRole(roles: string[]): Role {
+  if (roles.includes("review")) return "review";
+  if (roles.includes("unblock")) return "unblock";
+  if (roles.includes("analysis")) return "analysis";
+  if (roles.includes("impl")) return "impl";
+  if (roles.includes("human")) return "human";
   return "plain";
 }
 
@@ -30,6 +32,7 @@ export interface RuleInput {
   type: string;
   status: string;
   to: string;
+  roles: string[];
   tags: string[];
   meta: any;
   actor: string;
@@ -42,7 +45,7 @@ export interface RuleCtx {
   qualify(kind: "analysis" | "review"): { ok: boolean; via?: string } | Promise<{ ok: boolean; via?: string }>;
   unmetBars(): string[] | Promise<string[]>;
   session(): string | null | Promise<string | null>;
-  evidence(id: string): { type: string; tags: string[]; meta: any } | null | Promise<{ type: string; tags: string[]; meta: any } | null>;
+  evidence(id: string): { type: string; roles?: string[]; tags?: string[]; meta: any } | null | Promise<{ type: string; roles?: string[]; tags?: string[]; meta: any } | null>;
   parent(): { id: string; status?: string; meta: any } | null | Promise<{ id: string; status?: string; meta: any } | null>;
   openChildren(): number | Promise<number>;
 }
@@ -55,7 +58,7 @@ export interface Rule {
   guard: Guard;
 }
 
-const role = (i: RuleInput) => effectiveRole(i.tags);
+const role = (i: RuleInput) => effectiveRole(i.roles ?? []);
 const isTask = (i: RuleInput) => i.type === "task";
 const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
 const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
@@ -125,7 +128,7 @@ export const RULES: Rule[] = [
     name: "human-signoff-done",
     when: (i) => isTask(i) && i.to === "done" && role(i) === "human" && !HUMAN_ACTOR.test(i.actor),
     guard: (i) =>
-      `task ${i.id} is a human sign-off task (role:human) — completion is human-authoritative; a human marks it done in the webapp.`,
+      `task ${i.id} is a human sign-off task (role: human) — completion is human-authoritative; a human marks it done in the webapp.`,
   },
   {
     name: "claim-bars",
@@ -143,7 +146,7 @@ export const RULES: Rule[] = [
       const q = await c.qualify("analysis");
       if (!q.ok || !q.via || q.via === "declared" || String(q.via).startsWith("parent:")) return null;
       const ev = await c.evidence(String(q.via));
-      if (!ev || ev.type !== "task" || !ev.tags.includes("role:analysis")) return null;
+      if (!ev || ev.type !== "task" || !(ev.roles ?? []).includes("analysis")) return null;
       const evSession = metaOf(ev.meta).session;
       const sess = await c.session();
       if (evSession && sess && evSession === sess)
@@ -160,14 +163,14 @@ export const RULES: Rule[] = [
     guard: async (i, c) => {
       const r = await c.qualify("review");
       if (r.ok) return null;
-      return `task ${i.id} cannot be completed unreviewed — complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`;
+      return `task ${i.id} cannot be completed unreviewed — complete a verify (review-role) child task or link an accepted decision (e.g. a Superpositional verdict) first`;
     },
   },
   {
     name: "question-not-claimable",
-    when: (i) => isTask(i) && i.to === "in_progress" && i.tags.includes("question"),
+    when: (i) => i.type === "question" && i.to === "in_progress",
     guard: (i) =>
-      `task ${i.id} is a question (tagged 'question') — questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`,
+      `task ${i.id} is a question — questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`,
   },
   {
     name: "operator-gated",
@@ -259,21 +262,21 @@ export async function check(i: RuleInput, c: RuleCtx): Promise<string | null> {
 
 /** Structural facts that must hold for any stored artefact. Violations are
  *  breaches (loud trail + quarantine), never silently repaired. */
-export function invariants(a: { type: string; status: string; tags: string[]; meta: any }): string[] {
+export function invariants(a: { type: string; status: string; roles?: string[]; tags?: string[]; meta: any }): string[] {
   const v: string[] = [];
-  const r = effectiveRole(a.tags);
+  const r = effectiveRole(a.roles ?? []);
   if (a.type === "task") {
     if (VERDICT_ROLES.includes(r) && a.status === "blocked")
       v.push(`verdict role ${r} is blocked — verdict duties are done-only terminals`);
     if (VERDICT_ROLES.includes(r) && a.status === "in_review")
       v.push(`verdict role ${r} is in_review — verdict duties are never reviewed`);
-    if (a.tags.includes("question") && a.status === "in_progress")
-      v.push("question task is in_progress — questions are answered, not claimed");
     if (!a.meta?.blocked && a.status === "blocked")
       v.push("status is blocked with no meta.blocked record (reason + unblock condition missing)");
     if (a.meta?.blocked && a.status !== "blocked")
       v.push("meta.blocked record on a non-blocked task (stale dead-end record)");
   }
+  if (a.type === "question" && a.status === "in_progress")
+    v.push("question is in_progress — questions are answered, not claimed");
   return v;
 }
 

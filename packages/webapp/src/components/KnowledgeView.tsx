@@ -55,9 +55,10 @@ export function KnowledgeView() {
   };
 
   const create = async () => {
-    const tags = tagsInput.split(",").map((x) => x.trim()).filter(Boolean).map((t) => t.startsWith("role:") ? t : `role:${t}`);
+    // steering role targeting lives in the roles column (BR#2983) — never tags
+    const roles = tagsInput.split(",").map((x) => x.trim()).filter(Boolean).map((t) => t.replace(/^role:/, ""));
     try {
-      await kbApi.create({ type: createType, title: title.trim(), body_md: body, tags } as any);
+      await kbApi.create({ type: createType, title: title.trim(), body_md: body, ...(createType === "steering" && roles.length ? { roles } : {}) } as any);
       setTitle(""); setBody(""); setTagsInput(""); setMsg("created"); setTimeout(() => setMsg(""), 1500);
       await loadAll();
     } catch (e) { setMsg((e as Error).message); }
@@ -155,8 +156,8 @@ export function KnowledgeView() {
                   <button key={a.id} className="know-row" onClick={() => void open(a.id)}>
                     <StatusChip status={a.status} />
                     <span className="know-row-title">{a.title}</span>
-                    {g === "steering" && (a.tags ?? []).filter((t: string) => t.startsWith("role:")).length > 0 && (
-                      <span className="know-row-meta">{(a.tags ?? []).filter((t: string) => t.startsWith("role:")).map((t: string) => t.slice(5)).join(", ")}</span>
+                    {g === "steering" && (a.roles ?? []).length > 0 && (
+                      <span className="know-row-meta">{(a.roles ?? []).join(", ")}</span>
                     )}
                     <span className="know-row-meta">{a.id} · {rel(a.updated_ts)}</span>
                   </button>

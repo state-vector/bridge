@@ -35,7 +35,7 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   const tasks = useKb((s) => s.tasks);
   const nodeAsks = useMemo(
     () => (tasks as any[])
-      .filter((t) => (t.tags ?? []).includes("question") && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status))
+      .filter((t) => t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status))
       .sort((x, y) => y.created_ts - x.created_ts),
     [tasks],
   );

@@ -144,3 +144,87 @@ describe("session registration (the migration that never ran in prod)", () => {
     expect(body.session).toBeTruthy();
   });
 });
+
+// ---------- BR#2983: roles column + question type, through the real DO ----------
+
+describe("roles/question/tags semantics (BR#2983, real storage)", () => {
+  it("create with roles stores the roles column; tags stay free-form", async () => {
+    const { status, body } = await kbJson("/create", {
+      type: "task",
+      title: "roles smoke",
+      roles: ["review"],
+      tags: ["gtm", "deploy-train"],
+    });
+    expect(status).toBe(200);
+    const got = await kbJson("/get", { id: body.id });
+    expect(got.body.roles).toEqual(["review"]);
+    expect(got.body.tags).toEqual(["gtm", "deploy-train"]);
+  });
+
+  it("unknown roles are rejected loudly (no silent gating loss)", async () => {
+    const { status, body } = await kbJson("/create", { type: "task", title: "bad role", roles: ["reveiw"] });
+    expect(status).toBe(400);
+    expect(String(body.error)).toContain("unknown role");
+  });
+
+  it("a task TAGGED 'role:review' is NOT a verify task — tags are inert", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "tagged not gated", tags: ["role:review"] });
+    expect(body.id).toBeTruthy();
+    // plain tasks may enter in_review; verdict duties may not. If the tag still
+    // gated, this transition would be rejected as verify-terminal.
+    const tr = await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    expect(tr.status).toBe(200);
+    const rev = await kbJson("/transition", { id: body.id, to: "in_review", note: "PR https://github.com/x/y/pull/1" });
+    expect(rev.status).toBe(200);
+  });
+
+  it("roles: [review] IS a verify task — in_review is rejected as its own terminal", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "gated by roles", roles: ["review"] });
+    await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    const rev = await kbJson("/transition", { id: body.id, to: "in_review", note: "PR https://github.com/x/y/pull/1" });
+    expect(rev.status).toBe(400);
+    expect(String(rev.body.error)).toContain("verify");
+  });
+
+  it("entering in_review spawns a verify child carrying roles [review]", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "spawn source", qualified: true });
+    await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    const rev = await kbJson("/transition", { id: body.id, to: "in_review", note: "PR https://github.com/x/y/pull/2" });
+    expect(rev.status).toBe(200);
+    expect(rev.body.verify_task).toBeTruthy();
+    const child = await kbJson("/get", { id: rev.body.verify_task });
+    expect(child.body.roles).toEqual(["review"]);
+    expect(child.body.tags).toEqual([]); // no system tags leak into the tag namespace
+  });
+
+  it("asks create type=question nodes (no question tag), answerable to done", async () => {
+    const ask = await kbJson("/ask.create", {
+      question: "integration: merge the roles column PR?",
+      options: ["GO — merge", "NO-GO — hold"],
+      reason: "integration test coverage",
+      to: "human",
+    });
+    expect(ask.status).toBe(200);
+    const node = await kbJson("/get", { id: ask.body.id });
+    expect(node.body.type).toBe("question");
+    expect(node.body.tags).toEqual([]);
+    // claim is refused (lifecycle has no in_progress edge)
+    const claim = await kbJson("/transition", { id: ask.body.id, to: "in_progress", note: "claim" });
+    expect(claim.status).toBe(400);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO — merge" });
+    expect(ans.status).toBe(200);
+    const done = await kbJson("/get", { id: ask.body.id });
+    expect(done.body.status).toBe("done");
+  });
+
+  it("board payload carries type + roles for UI kind derivation and tag filters", async () => {
+    const r = await kb("/board");
+    const b = (await r.json()) as any;
+    expect(Array.isArray(b.tasks)).toBe(true);
+    for (const t of b.tasks) {
+      expect(typeof t.type).toBe("string");
+      expect(Array.isArray(t.roles)).toBe(true);
+      expect(Array.isArray(t.tags)).toBe(true);
+    }
+  });
+});
