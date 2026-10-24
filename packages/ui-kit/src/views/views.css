@@ -679,8 +679,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-bar-label { flex: none; width: 34px; text-align: right; }
 .topc-age { white-space: nowrap; }
 @media (max-width: 1280px) {
-  .top-head, .top-row { grid-template-columns: 96px minmax(100px, 120px) minmax(130px, 1.3fr) 110px 44px minmax(90px, 1fr) 60px 60px; }
   .topc-gauge, .top-sent, .topc-session { display: none; }
+  /* compact template MATCHES the visible columns (agent, goal, status,
+     score, bar, ages) — hiding cells without re-templating misaligns
+     every remaining cell into the wrong track */
+  .top-head, .top-row {
+    grid-template-columns: minmax(118px, max-content) minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+  }
 }
 
 /* ---- role picker (Connect mint) ---- */
@@ -876,3 +881,36 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ab-head .why-line { flex: 0 1 auto; }
 .topc-goal { overflow: hidden; }
 .topc-goal .top-will, .topc-goal .kind-pill { white-space: normal; }
+
+/* wide-width cell fixes (measured, headless probe 2026-10-24):
+   goal + exit cells wrapped, form inputs constrained at any width */
+.topc-goal { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
+.top-unblock { white-space: normal; text-overflow: clip; max-width: 100%; overflow-wrap: anywhere; }
+.topc-goal .top-will { white-space: normal; }
+.pct-inputs { max-width: 480px; }
+.pct-inputs input, .pct-inputs .kit-input { width: auto; flex: 1 1 70px; max-width: 150px; min-width: 0; }
+.steer-box { max-width: 640px; }
+.steer-box input, .steer-box .kit-input { flex: 1 1 180px; min-width: 0; width: auto; }
+
+/* age/agent tracks size to content at wide widths (no clipped "4h 12m") */
+.top-head, .top-row {
+  grid-template-columns: minmax(118px, max-content) 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+}
+
+/* compact template LAST so it actually overrides (cascade order): the visible
+   columns at ≤1280 are agent, goal, status, score, bar, ages */
+@media (max-width: 1280px) {
+  .top-head, .top-row {
+    grid-template-columns: minmax(118px, max-content) minmax(160px, 1.4fr) 110px 44px minmax(120px, 1fr) minmax(84px, max-content) minmax(84px, max-content);
+  }
+}
+
+/* rows are ONE line, dense — wrap fixes overcorrected into tall rows.
+   Overflow ellipsizes (full text on hover); tracks + min-width keep cells
+   from ever escaping the viewport (the actual wide-width bug). */
+.topc-goal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topc-goal .top-will { white-space: nowrap; }
+.top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topc-agent { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topc-session { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top-row { line-height: 1.5; }
