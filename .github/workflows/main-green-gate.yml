@@ -1,0 +1,53 @@
+# The destination-green stop-the-line gate (BR#3008, accepted decision BR#3009).
+#
+# Merges must not land while destination main is red. This workflow runs on
+# every PR and reports the `main-green gate` check; the ruleset
+# "main: main-green gate required" makes it a required check, so GitHub
+# mechanically refuses the merge while main's HEAD has failing checks. The
+# remediation carve-out (PR green on the exact checks main fails) lives in
+# scripts/main-green-gate.sh — the remediation-merge path from BR#3009.
+#
+# The loud half of stop-the-line — the board alert — does not live here: the
+# hub's watchdog sweep (packages/worker/src/kb/do.ts, stopTheLineSweep) files
+# ONE urgent ask per red episode, deduped per main-HEAD sha, independent of
+# any PR. A red main must page the board even when nobody opens a PR.
+name: main-green gate
+
+on:
+  pull_request:
+  # Manual re-check / red-green drills: run the gate against live main, or
+  # against an explicit sha pair (main_sha + pr_sha) to reproduce a historic
+  # episode without waiting for one.
+  workflow_dispatch:
+    inputs:
+      main_sha:
+        description: "main HEAD sha to judge (default: live main)"
+        required: false
+      pr_sha:
+        description: "PR head sha for the remediation carve-out (optional)"
+        required: false
+
+permissions:
+  contents: read
+  checks: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    # The check-run name is the JOB name — it must stay byte-identical to the
+    # context in the ruleset ("main: main-green gate required").
+    name: main-green gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assert destination main is green (or this PR remediates it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_GREEN_REPO: ${{ github.repository }}
+          MAIN_GREEN_SHA: ${{ github.event.inputs.main_sha }}
+          MAIN_GREEN_PR_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.pr_sha }}
+        run: bash scripts/main-green-gate.sh

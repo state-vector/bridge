@@ -57,6 +57,8 @@ import {
   resolveRolePlaybook,
   selfProvisionLabel,
   sanitizeTags,
+  stopLineAskTitle,
+  classifyMainCheckRuns,
   validateRelation,
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
@@ -66,6 +68,12 @@ import {
   churnRelease,
   RuleCtx,
 } from "./machine.ts";
+
+/** The standing ask sink for the destination-green stop-the-line sweep
+ *  (BR#3008) — asks bind to it, so askCreate's identical-open-ask guard can
+ *  dedupe per red episode. Override with the `stop_line_artefact_id` setting
+ *  if the sink card is ever re-issued. */
+const STOP_LINE_SINK_ID = "BR#3124";
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
@@ -333,6 +341,17 @@ export class KnowledgeHub {
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
       });
     }
+    // (B) destination-green stop-the-line (BR#3008): one sweep on a slow
+    // cadence, failures isolated — an alarm-layer outage in GitHub's API must
+    // never take the watchdog down with it.
+    try {
+      await this.stopTheLineSweep(now);
+    } catch (e) {
+      try {
+        this.audit("hub:stop-the-line", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+      } catch { /* next tick retries */ }
+    }
+
     // observability: the board can answer "is the watchdog alive?" via
     // /api/kb/stats — last tick, next alarm ts (poison detection: a
     // next_alarm_ts stuck in the past means the schedule is jammed), stale
@@ -360,6 +379,123 @@ export class KnowledgeHub {
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
       JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks }),
     );
+  }
+
+  // ---------- destination-green stop-the-line sweep (BR#3008) ----------
+  // The loud half of BR#3009's destination-green precondition. The mechanical
+  // half is the required `main-green gate` check (workflow +
+  // scripts/main-green-gate.sh); this sweep pages the board when the line is
+  // stopped EVEN IF nobody opens a PR — a red main must be loud on its own.
+  //
+  // Reads main's HEAD check runs from the public GitHub API (the repo is
+  // public; no token lives in the worker), classifies with the same rule as
+  // the gate (classifyMainCheckRuns), and on RED files ONE urgent ask per red
+  // episode — deduped per main-HEAD sha via the deterministic ask title and
+  // askCreate's identical-open-ask guard, so ten PRs observing one red sha
+  // produce one ask, not ten.
+  //
+  // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
+  // `stop_line_artefact_id` (ask sink; the standing card the asks bind to),
+  // `stop_line_repo` (default state-vector/bridge), `stop_line_gh_api_base`
+  // (default https://api.github.com — point at a GHES/mock for drills).
+  private settingValue(key: string, fallback: string): string {
+    const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
+    if (!row) return fallback;
+    const raw = String(row.value);
+    // settingsSet stores JSON-encoded values ("\"BR#123\""); the sweep's own
+    // pacing writes store raw — tolerate both shapes.
+    try {
+      const v = JSON.parse(raw);
+      if (typeof v === "string" || typeof v === "number") return String(v);
+    } catch { /* raw */ }
+    return raw;
+  }
+
+  private async stopTheLineSweep(now: number): Promise<void> {
+    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("stop_line_sweep_minutes", "5"), 10) || 5));
+    if (periodMin === 0) return; // explicitly disabled
+    const last = Number(this.settingValue("stop_line_last_sweep_ts", "0")) || 0;
+    if (now - last < periodMin * 60_000) return;
+    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the alarm
+    const setLast = (ts: number) =>
+      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('stop_line_last_sweep_ts', ?)`, String(ts));
+    setLast(now);
+
+    const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
+    const base = this.settingValue("stop_line_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+    const headers = { "User-Agent": "bridge-stop-the-line-sweep", "Accept": "application/vnd.github+json" };
+    const ghGet = async (path: string): Promise<Response> => {
+      const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
+      if (res.status === 403 || res.status === 429) {
+        // unauthenticated GitHub quota is per egress IP and shared — back off
+        // a full quota window rather than hammering; a skipped cycle only
+        // delays an alert, it can never fake a green.
+        setLast(now + 60 * 60_000);
+        throw new Error(`github rate limited (HTTP ${res.status}) — backed off 60m`);
+      }
+      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+      return res;
+    };
+
+    const head = await (await ghGet("/commits/main")).json() as any;
+    const sha = String(head?.sha ?? "");
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`commits/main returned no sha`);
+    const runsBody = await (await ghGet(`/commits/${sha}/check-runs?per_page=100`)).json() as any;
+    const verdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
+
+    if (verdict.verdict === "green") {
+      this.audit("hub:stop-the-line", "green", null, { sha: sha.slice(0, 9), green: verdict.green });
+      return;
+    }
+    if (verdict.verdict !== "red") {
+      // unsettled/empty: CI still running (or nothing ran) — the gate blocks
+      // merges on its own; here we only wait. A red line pages, a running
+      // line does not.
+      this.audit("hub:stop-the-line", "quiet", null, { sha: sha.slice(0, 9), verdict: verdict.verdict, unsettled: verdict.unsettled.slice(0, 5) });
+      return;
+    }
+
+    const names = verdict.red.map((r) => r.name);
+    const title = stopLineAskTitle(sha, names);
+    const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
+    // explicit open-ask check (same rule askCreate enforces) — keeps the
+    // audit trail honest about skips. Questions are a TYPE in the ask
+    // contract (the legacy `question` tag is stripped on write), so match
+    // on type — a tag match would never fire and every re-sweep would fall
+    // through to askCreate's guard and 400 instead of deduping quietly.
+    const dup = this.one(
+      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND c.title = ? LIMIT 1`,
+      sinkId, title.slice(0, 200),
+    );
+    if (dup) {
+      this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
+      return;
+    }
+    const details = [
+      `**STOP THE LINE — bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+      ``,
+      `**Red checks on main ${sha.slice(0, 9)}:**`,
+      ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
+      ``,
+      `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+      ``,
+      `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha — not per PR._`,
+    ].join("\n");
+    const created = await this.askCreate(
+      {
+        to: "rayh",
+        urgency: "time-sensitive",
+        question: title,
+        details,
+        reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+        options: ["Acknowledge — on it", "Line stays stopped until green"],
+        artefact_id: sinkId,
+      },
+      "hub:stop-the-line",
+    );
+    this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
   }
 
   async eventsSince(since: number, limit: number) {
@@ -1061,12 +1197,21 @@ export class KnowledgeHub {
         case "admin.token_tags":
         case "admin.settings_get":
         case "admin.settings_set":
+        case "admin.stop_line_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
+          if (op === "admin.stop_line_sweep") {
+            // drill/liveness path for the destination-green sweep (BR#3008):
+            // dedupe still applies; pass now=<future epoch ms> to also bypass
+            // the cadence window (the next scheduled sweep waits it out).
+            await this.stopTheLineSweep(Number(body.now ?? Date.now()));
+            const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
+            return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+          }
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
@@ -2331,7 +2476,12 @@ export class KnowledgeHub {
       .filter((x: string) => x && !/\[object\s*object\]/i.test(x))
       .map((x: string) => x.slice(0, 200)))].slice(0, 8);
     if (options.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (options: ['GO', 'NO-GO'])");
-    const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
+    // urgency is an ASK vocabulary (contract v2 — the same words the FlowsHub
+    // ingest accepts and DecisionCard renders; "time-sensitive" = the urgent
+    // NOW chip), not a progress sentiment. Validating with isSentiment made
+    // every urgent ask collapse to a normal-looking one: the urgent door
+    // silently failed (found wiring BR#3008's stop-the-line sweep).
+    const urgency = body.urgency === "time-sensitive" ? "time-sensitive" : "normal";
 
     // the ask IS a question node: BR#-numbered, child_of its subject, answered
     // by transition. The legacy asks row is no longer written.

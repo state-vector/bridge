@@ -640,3 +640,86 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
   return { score, grade, hints };
 }
+
+// ---------- destination-green stop-the-line (BR#3008) ----------
+// The classifier for main's HEAD check runs, shared by the hub's
+// stopTheLineSweep (the loud half of BR#3009's destination-green rule). Pure
+// by construction: the same decision rule as scripts/main-green-gate.sh (the
+// mechanical half — the required `main-green gate` check), kept in lockstep
+// by both being pinned in tests.
+
+export type MainCheckRun = {
+  id: number;
+  name: string;
+  status?: string | null;
+  conclusion?: string | null;
+  html_url?: string | null;
+};
+
+export type MainRedCheck = { name: string; conclusion: string; url: string };
+
+export type MainCheckVerdict = {
+  /** green: every check settled green · red: ≥1 failure · unsettled: running/inconclusive · empty: no check runs at all */
+  verdict: "green" | "red" | "unsettled" | "empty";
+  /** failures on main's HEAD (verdict red) */
+  red: MainRedCheck[];
+  /** checks that did not vouch: still running, inconclusive, or unknown conclusion */
+  unsettled: string[];
+  /** settled-green check count (receipt line) */
+  green: number;
+};
+
+/** Conclusions that mean the line is stopped. `cancelled` and null are NOT
+ *  here: a cancelled run says nothing (the judge falls back to the newest
+ *  non-cancelled run of that name), and a null conclusion is unsettled. */
+export const MAIN_RED_CONCLUSIONS = new Set([
+  "failure",
+  "timed_out",
+  "action_required",
+  "startup_failure",
+]);
+
+export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
+  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0 };
+  const byName = new Map<string, MainCheckRun[]>();
+  for (const r of runs) {
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const red: MainRedCheck[] = [];
+  const unsettled: string[] = [];
+  let green = 0;
+  for (const [name, list] of byName) {
+    // the newest non-cancelled run judges; cancelled runs say nothing
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge || judge.conclusion == null) {
+      unsettled.push(judge ? name : `${name} (only cancelled runs)`);
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+      red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    } else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") {
+      green += 1;
+    } else {
+      unsettled.push(`${name} (unknown conclusion: ${judge.conclusion})`);
+    }
+  }
+  if (red.length) return { verdict: "red", red, unsettled, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
+  return { verdict: "green", red, unsettled, green };
+}
+
+/** Deterministic ask title for one red episode — the sha makes the title
+ *  unique per episode, and askCreate's identical-open-ask guard turns that
+ *  into exactly ONE ask per red main-HEAD sha, no matter how many PRs or
+ *  sweeps observe it. Always ≤240 chars (the ask contract) and always ends
+ *  in "?" (also the contract). */
+export function stopLineAskTitle(sha: string, names: string[]): string {
+  const prefix = `STOP THE LINE: bridge main ${sha.slice(0, 9)} is RED (`;
+  const suffix = `) — merges halted until green. Acknowledge?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let namesText = names.join(", ");
+  if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + namesText + suffix;
+}

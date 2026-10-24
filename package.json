@@ -15,6 +15,7 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "test:main-green-gate": "bash scripts/tests/main-green-gate.test.sh",
     "lint": "npm run lint --workspaces --if-present"
   },
   "devDependencies": {

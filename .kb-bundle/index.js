@@ -45,6 +45,33 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 function isArtefactType(t) {
   return typeof t === "string" && ARTEFACT_TYPES.includes(t);
 }
+function parseRolesInput(raw) {
+  if (raw == null) return { ok: true, roles: [] };
+  const arr = typeof raw === "string" ? raw.split(",") : raw;
+  if (!Array.isArray(arr)) return { ok: false, error: "roles must be an array of role names" };
+  const out = [];
+  for (const v of arr) {
+    const name = String(v ?? "").trim().toLowerCase().replace(/^role:/, "");
+    if (!name) continue;
+    if (!ROLE_NAMES.includes(name))
+      return { ok: false, error: `unknown role '${name}' (valid: ${ROLE_NAMES.join(", ")})` };
+    if (!out.includes(name)) out.push(name);
+  }
+  return { ok: true, roles: out.slice(0, 5) };
+}
+function splitSystemTags(rowType, rawTags, meta, now) {
+  const tags = [...rawTags];
+  const roles = [...new Set(tags.filter((t) => t.startsWith("role:")).map((t) => t.slice(5)))];
+  const wasQuestion = tags.includes("question");
+  const wasAttempted = tags.includes("attempted");
+  const rest = tags.filter((t) => !t.startsWith("role:") && t !== "question" && t !== "attempted");
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  let type = rowType;
+  if (rowType === "task" && wasQuestion) type = "question";
+  if (wasAttempted && !m.attempt) m.attempt = { by: "system:migration", at: now, attempts: 1 };
+  const changed = roles.length > 0 || rest.length !== tags.length || type !== rowType || wasAttempted && !(meta && typeof meta === "object" && meta.attempt);
+  return { type, tags: rest, roles, meta: m, changed };
+}
 function taskKind(meta) {
   const k = typeof meta?.kind === "string" ? meta.kind : void 0;
   return TASK_KINDS.includes(k ?? "") ? k : "impl";
@@ -69,8 +96,8 @@ function validateRelation(relation, srcType, dstType) {
     return { ok: false, reason: "implements: source must be a task, target a goal" };
   if (relation === "constrains" && srcType !== "steering")
     return { ok: false, reason: "constrains: source must be steering" };
-  if (relation === "child_of" && !(srcType === "task" && dstType === "task"))
-    return { ok: false, reason: "child_of: both source and target must be tasks (flat structure \u2014 the board never nests, relations do)" };
+  if (relation === "child_of" && !((srcType === "task" || srcType === "question") && dstType === "task"))
+    return { ok: false, reason: "child_of: source must be a task or question, target a task (flat structure \u2014 the board never nests, relations do)" };
   return { ok: true };
 }
 function formatId(seq) {
@@ -293,7 +320,44 @@ function scoreAgent(raw) {
   const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
   return { score, grade, hints };
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TAG, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM;
+function classifyMainCheckRuns(runs) {
+  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0 };
+  const byName = /* @__PURE__ */ new Map();
+  for (const r of runs) {
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const red = [];
+  const unsettled = [];
+  let green = 0;
+  for (const [name, list] of byName) {
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge || judge.conclusion == null) {
+      unsettled.push(judge ? name : `${name} (only cancelled runs)`);
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+      red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    } else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") {
+      green += 1;
+    } else {
+      unsettled.push(`${name} (unknown conclusion: ${judge.conclusion})`);
+    }
+  }
+  if (red.length) return { verdict: "red", red, unsettled, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
+  return { verdict: "green", red, unsettled, green };
+}
+function stopLineAskTitle(sha, names) {
+  const prefix = `STOP THE LINE: bridge main ${sha.slice(0, 9)} is RED (`;
+  const suffix = `) \u2014 merges halted until green. Acknowledge?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let namesText = names.join(", ");
+  if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + namesText + suffix;
+}
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -301,18 +365,18 @@ var init_core = __esm({
       "goal",
       "decision",
       "task",
+      "question",
       "progress",
       "agent"
     ];
     __name(isArtefactType, "isArtefactType");
     TASK_KINDS = ["impl", "analysis", "review", "research", "question"];
-    KIND_TAG = {
-      impl: null,
-      analysis: "role:analysis",
-      review: "role:review",
-      research: "research",
-      question: "question"
-    };
+    KIND_TYPE = { question: "question" };
+    KIND_ROLE = { analysis: "analysis", review: "review" };
+    KIND_TAG = { research: "research" };
+    ROLE_NAMES = ["impl", "analysis", "review", "unblock", "human"];
+    __name(parseRolesInput, "parseRolesInput");
+    __name(splitSystemTags, "splitSystemTags");
     __name(taskKind, "taskKind");
     __name(isQuestionTask, "isQuestionTask");
     LIFECYCLES = {
@@ -320,6 +384,8 @@ var init_core = __esm({
       goal: { draft: ["active"], active: ["achieved", "dropped"] },
       decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
       task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+      // questions are answered, never claimed: todo → done (answer) or superseded (closed by ADR)
+      question: { todo: ["done", "superseded"] },
       progress: {},
       agent: {}
     };
@@ -328,6 +394,7 @@ var init_core = __esm({
       goal: "draft",
       decision: "proposed",
       task: "todo",
+      question: "todo",
       progress: "logged",
       agent: "active"
     };
@@ -367,15 +434,15 @@ var init_core = __esm({
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
 1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
 2. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
-3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end.
+3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
 4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
 5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
 - Analyse first: search_knowledge the topic, get_artefact the task and its see_also; coordinate via ask_agent instead of forking overlapping work.
-- Decompose into child tasks (child_of the parent): one per coherent unit, each tagged with its role (role:impl / role:review), each carrying concrete checkable acceptance criteria in body_md ("done when X" plus what is OUT of scope). A vague child task is a defect you created; rewrite it before you finish.
-- Qualify the parent by completing a role:analysis child that summarises the plan and open questions, then transition it to done. A done role:analysis child is what lifts the parent's pickup gate. If the publisher requested stacked bars (await), create the matching role:review child so the bar can be met.
+- Decompose into child tasks (child_of the parent): one per coherent unit, each carrying its role (roles: ["impl"] / ["review"] \u2014 never tags), each carrying concrete checkable acceptance criteria in body_md ("done when X" plus what is OUT of scope). A vague child task is a defect you created; rewrite it before you finish.
+- Qualify the parent by completing an analysis child (roles: ["analysis"]) that summarises the plan and open questions, then transition it to done. A done analysis child is what lifts the parent's pickup gate. If the publisher requested stacked bars (await), create the matching review child (roles: ["review"]) so the bar can be met.
 - Never implement the children; never transition the parent to done. Unanalysable? Move it to blocked with a reason + unblock condition and ask the specific question.`,
       impl: `BUILD: claim qualified work matching your roles, work it to a natural stopping point, and hand over for review \u2014 in_review with the PR link in the note. You cannot self-approve done; you stay owner until the verdict.`,
       review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.`
@@ -402,6 +469,14 @@ var init_core = __esm({
     TRIGRAM_DIM = 256;
     __name(trigramVec, "trigramVec");
     __name(scoreAgent, "scoreAgent");
+    MAIN_RED_CONCLUSIONS = /* @__PURE__ */ new Set([
+      "failure",
+      "timed_out",
+      "action_required",
+      "startup_failure"
+    ]);
+    __name(classifyMainCheckRuns, "classifyMainCheckRuns");
+    __name(stopLineAskTitle, "stopLineAskTitle");
   }
 });
 
@@ -452,12 +527,12 @@ var init_throughput = __esm({
 });
 
 // src/kb/machine.ts
-function effectiveRole(tags) {
-  if (tags.includes("role:review")) return "review";
-  if (tags.includes("role:unblock")) return "unblock";
-  if (tags.includes("role:analysis")) return "analysis";
-  if (tags.includes("role:impl")) return "impl";
-  if (tags.includes("role:human")) return "human";
+function effectiveRole(roles) {
+  if (roles.includes("review")) return "review";
+  if (roles.includes("unblock")) return "unblock";
+  if (roles.includes("analysis")) return "analysis";
+  if (roles.includes("impl")) return "impl";
+  if (roles.includes("human")) return "human";
   return "plain";
 }
 function metaOf(m) {
@@ -487,19 +562,19 @@ async function check(i, c) {
 }
 function invariants(a) {
   const v = [];
-  const r = effectiveRole(a.tags);
+  const r = effectiveRole(a.roles ?? []);
   if (a.type === "task") {
     if (VERDICT_ROLES.includes(r) && a.status === "blocked")
       v.push(`verdict role ${r} is blocked \u2014 verdict duties are done-only terminals`);
     if (VERDICT_ROLES.includes(r) && a.status === "in_review")
       v.push(`verdict role ${r} is in_review \u2014 verdict duties are never reviewed`);
-    if (a.tags.includes("question") && a.status === "in_progress")
-      v.push("question task is in_progress \u2014 questions are answered, not claimed");
     if (!a.meta?.blocked && a.status === "blocked")
       v.push("status is blocked with no meta.blocked record (reason + unblock condition missing)");
     if (a.meta?.blocked && a.status !== "blocked")
       v.push("meta.blocked record on a non-blocked task (stale dead-end record)");
   }
+  if (a.type === "question" && a.status === "in_progress")
+    v.push("question is in_progress \u2014 questions are answered, not claimed");
   return v;
 }
 var VERDICT_ROLES, HUMAN_ACTOR, role, isTask, noteOf, hasEvidenceLink, hasReceipts, CHURN_REDIRECT_ATTEMPTS, CHURN_ESCALATE_ATTEMPTS, RULES, BREACH_WINDOW_MS;
@@ -509,7 +584,7 @@ var init_machine = __esm({
     __name(effectiveRole, "effectiveRole");
     VERDICT_ROLES = ["review", "unblock"];
     HUMAN_ACTOR = /^web(:|$)|^human:/;
-    role = /* @__PURE__ */ __name((i) => effectiveRole(i.tags), "role");
+    role = /* @__PURE__ */ __name((i) => effectiveRole(i.roles ?? []), "role");
     isTask = /* @__PURE__ */ __name((i) => i.type === "task", "isTask");
     noteOf = /* @__PURE__ */ __name((i) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim(), "noteOf");
     hasEvidenceLink = /* @__PURE__ */ __name((s) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s), "hasEvidenceLink");
@@ -538,7 +613,7 @@ var init_machine = __esm({
       {
         name: "human-signoff-done",
         when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done" && role(i) === "human" && !HUMAN_ACTOR.test(i.actor), "when"),
-        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a human sign-off task (role:human) \u2014 completion is human-authoritative; a human marks it done in the webapp.`, "guard")
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a human sign-off task (role: human) \u2014 completion is human-authoritative; a human marks it done in the webapp.`, "guard")
       },
       {
         name: "claim-bars",
@@ -556,7 +631,7 @@ var init_machine = __esm({
           const q = await c.qualify("analysis");
           if (!q.ok || !q.via || q.via === "declared" || String(q.via).startsWith("parent:")) return null;
           const ev = await c.evidence(String(q.via));
-          if (!ev || ev.type !== "task" || !ev.tags.includes("role:analysis")) return null;
+          if (!ev || ev.type !== "task" || !(ev.roles ?? []).includes("analysis")) return null;
           const evSession = metaOf(ev.meta).session;
           const sess = await c.session();
           if (evSession && sess && evSession === sess)
@@ -570,13 +645,13 @@ var init_machine = __esm({
         guard: /* @__PURE__ */ __name(async (i, c) => {
           const r = await c.qualify("review");
           if (r.ok) return null;
-          return `task ${i.id} cannot be completed unreviewed \u2014 complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`;
+          return `task ${i.id} cannot be completed unreviewed \u2014 complete a verify (review-role) child task or link an accepted decision (e.g. a Superpositional verdict) first`;
         }, "guard")
       },
       {
         name: "question-not-claimable",
-        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "in_progress" && i.tags.includes("question"), "when"),
-        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a question (tagged 'question') \u2014 questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`, "guard")
+        when: /* @__PURE__ */ __name((i) => i.type === "question" && i.to === "in_progress", "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a question \u2014 questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`, "guard")
       },
       {
         name: "operator-gated",
@@ -640,12 +715,13 @@ var init_machine = __esm({
 });
 
 // src/kb/do.ts
-var KnowledgeHub;
+var STOP_LINE_SINK_ID, KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
     init_core();
     init_throughput();
     init_machine();
+    STOP_LINE_SINK_ID = "BR#3124";
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
         this.state = state;
@@ -756,8 +832,8 @@ var init_do = __esm({
                 const derived = this.one(
                   `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
              JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-               AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC LIMIT 1`,
+              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+                AND c.type = 'question' ORDER BY c.created_ts DESC LIMIT 1`,
                   r.id
                 );
                 if (derived) {
@@ -830,8 +906,8 @@ var init_do = __esm({
             if (openAsk) continue;
             const activeVerify = this.one(
               `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'in_progress'
-             AND c.tags LIKE '%"role:review"%' LIMIT 1`,
+            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'in_progress'
+              AND c.roles LIKE '%"review"%' LIMIT 1`,
               r.id
             );
             if (activeVerify) continue;
@@ -878,10 +954,10 @@ var init_do = __esm({
        FROM relations r
        JOIN artefacts c ON c.id = r.src_id
        JOIN artefacts p ON p.id = r.dst_id
-       WHERE r.relation = 'child_of'
-         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-         AND c.tags LIKE '%"role:review"%'
-         AND p.type = 'task' AND p.status = 'in_review'`
+        WHERE r.relation = 'child_of'
+          AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+          AND c.roles LIKE '%"review"%'
+          AND p.type = 'task' AND p.status = 'in_review'`
         ).toArray();
         for (const v of nudgeRows) {
           const age = now - (v.age_ts ?? now);
@@ -899,15 +975,21 @@ var init_do = __esm({
             age_min: mins
           });
         }
+        try {
+          await this.stopTheLineSweep(now);
+        } catch (e) {
+          try {
+            this.audit("hub:stop-the-line", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
         const nextAlarm = await this.state.storage.getAlarm();
         this.state.storage.sql.exec(
-          `INSERT INTO settings (key, value) VALUES ('watchdog.last_tick', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.last_tick', ?)`,
           String(now)
         );
         this.state.storage.sql.exec(
-          `INSERT INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)`,
           String(nextAlarm ?? 0)
         );
         const staleNow = this.one(
@@ -921,10 +1003,107 @@ var init_do = __esm({
         )?.n ?? 0;
         const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
         this.state.storage.sql.exec(
-          `INSERT INTO settings (key, value) VALUES ('watchdog.sweep', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
           JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks })
         );
+      }
+      // ---------- destination-green stop-the-line sweep (BR#3008) ----------
+      // The loud half of BR#3009's destination-green precondition. The mechanical
+      // half is the required `main-green gate` check (workflow +
+      // scripts/main-green-gate.sh); this sweep pages the board when the line is
+      // stopped EVEN IF nobody opens a PR — a red main must be loud on its own.
+      //
+      // Reads main's HEAD check runs from the public GitHub API (the repo is
+      // public; no token lives in the worker), classifies with the same rule as
+      // the gate (classifyMainCheckRuns), and on RED files ONE urgent ask per red
+      // episode — deduped per main-HEAD sha via the deterministic ask title and
+      // askCreate's identical-open-ask guard, so ten PRs observing one red sha
+      // produce one ask, not ten.
+      //
+      // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
+      // `stop_line_artefact_id` (ask sink; the standing card the asks bind to),
+      // `stop_line_repo` (default state-vector/bridge), `stop_line_gh_api_base`
+      // (default https://api.github.com — point at a GHES/mock for drills).
+      settingValue(key, fallback) {
+        const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
+        if (!row) return fallback;
+        const raw = String(row.value);
+        try {
+          const v = JSON.parse(raw);
+          if (typeof v === "string" || typeof v === "number") return String(v);
+        } catch {
+        }
+        return raw;
+      }
+      async stopTheLineSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("stop_line_sweep_minutes", "5"), 10) || 5));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("stop_line_last_sweep_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('stop_line_last_sweep_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
+        const base = this.settingValue("stop_line_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const headers = { "User-Agent": "bridge-stop-the-line-sweep", "Accept": "application/vnd.github+json" };
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status}) \u2014 backed off 60m`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res;
+        }, "ghGet");
+        const head = await (await ghGet("/commits/main")).json();
+        const sha = String(head?.sha ?? "");
+        if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`commits/main returned no sha`);
+        const runsBody = await (await ghGet(`/commits/${sha}/check-runs?per_page=100`)).json();
+        const verdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
+        if (verdict.verdict === "green") {
+          this.audit("hub:stop-the-line", "green", null, { sha: sha.slice(0, 9), green: verdict.green });
+          return;
+        }
+        if (verdict.verdict !== "red") {
+          this.audit("hub:stop-the-line", "quiet", null, { sha: sha.slice(0, 9), verdict: verdict.verdict, unsettled: verdict.unsettled.slice(0, 5) });
+          return;
+        }
+        const names = verdict.red.map((r) => r.name);
+        const title = stopLineAskTitle(sha, names);
+        const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
+        const dup = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND c.title = ? LIMIT 1`,
+          sinkId,
+          title.slice(0, 200)
+        );
+        if (dup) {
+          this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
+          return;
+        }
+        const details = [
+          `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+          ``,
+          `**Red checks on main ${sha.slice(0, 9)}:**`,
+          ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+          ``,
+          `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+          ``,
+          `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR._`
+        ].join("\n");
+        const created = await this.askCreate(
+          {
+            to: "rayh",
+            urgency: "time-sensitive",
+            question: title,
+            details,
+            reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+            options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
+            artefact_id: sinkId
+          },
+          "hub:stop-the-line"
+        );
+        this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
       }
       async eventsSince(since, limit) {
         const rows = since > 0 ? this.state.storage.sql.exec(
@@ -940,9 +1119,9 @@ var init_do = __esm({
       }
       async board() {
         const tasks = this.state.storage.sql.exec(
-          `SELECT id, title, status, owner, tags, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
-       WHERE type = 'task' ORDER BY updated_ts DESC LIMIT 200`
-        ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags) }));
+          `SELECT id, type, title, status, owner, tags, roles, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
+       WHERE type IN ('task','question') ORDER BY updated_ts DESC LIMIT 200`
+        ).toArray().map((t) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
         const links = this.state.storage.sql.exec(
           `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`
         ).toArray();
@@ -972,8 +1151,8 @@ var init_do = __esm({
           const unmet = this.enforceableBars(bars).filter((b) => !(/review/.test(b) ? reviewEv : analysisEv).has(t.id));
           t.qualification = { state: declared ?? (analysisOk ? "qualified" : "open"), how: q.how, by: q.by, bars, unmet_bars: unmet, ready: analysisOk && unmet.length === 0 };
           const tagsArr = t.tags ?? [];
-          const roleTagged = tagsArr.some((x) => ["role:analysis", "role:review", "role:impl", "role:unblock"].includes(x));
-          const isQ = tagsArr.includes("question") || t.meta.kind === "question";
+          const roleTagged = (t.roles ?? []).some((x) => ["analysis", "review", "impl", "unblock"].includes(x));
+          const isQ = t.type === "question";
           const gated = t.meta.operator_gated;
           const roleWorkReady = roleTagged && t.qualification.ready !== false ? true : roleTagged;
           t.is_claimable = t.status === "todo" && !isQ && !gated && (roleWorkReady || t.qualification.ready !== false);
@@ -989,7 +1168,7 @@ var init_do = __esm({
           `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
        FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%question%'
+         AND c.type = 'question'
        ORDER BY c.created_ts DESC`
         ).toArray();
         const askChildOf = /* @__PURE__ */ new Map();
@@ -1084,7 +1263,7 @@ var init_do = __esm({
             s.verify_duty_backlog = this.one(
               `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-           AND c.tags LIKE '%"role:review"%' AND p.status = 'in_review'`
+           AND c.roles LIKE '%"review"%' AND p.status = 'in_review'`
             )?.n ?? 0;
           }
         }
@@ -1213,6 +1392,31 @@ var init_do = __esm({
         answered_ts INTEGER
       );
     `);
+        for (const ddl of [
+          `ALTER TABLE decisions ADD COLUMN options TEXT`,
+          `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
+          `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
+          `ALTER TABLE decisions ADD COLUMN asker TEXT`,
+          `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
+          `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
+          `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
+          `ALTER TABLE artefacts ADD COLUMN roles TEXT`,
+          `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
+          `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
+          `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
+          `ALTER TABLE pairings ADD COLUMN type TEXT`,
+          `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
+          `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
+          `ALTER TABLE pairings ADD COLUMN principal TEXT`,
+          `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
+          `ALTER TABLE sessions ADD COLUMN kind TEXT`
+        ]) {
+          try {
+            this.state.storage.sql.exec(ddl);
+          } catch {
+          }
+        }
         this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -1242,8 +1446,7 @@ var init_do = __esm({
           SELECT seq, ts, actor, action AS op, artefact_id, data AS detail FROM ledger WHERE kind = 'signal'`);
             this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS artefact_versions AS
           SELECT seq, ts, actor, action, artefact_id, summary, data FROM ledger WHERE kind = 'mutation'`);
-            this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('ledger_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+            this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('ledger_v1', ?)`, String(Date.now()));
             this.audit("system:migration", "ledger_v1", null, { backfilled: !!(hasEvents || hasVersions) });
           } else {
             this.state.storage.sql.exec(`CREATE VIEW IF NOT EXISTS events AS
@@ -1270,10 +1473,9 @@ var init_do = __esm({
             for (const a of legacy) {
               const created = await this.create(
                 {
-                  type: "task",
+                  type: "question",
                   title: String(a.question ?? "").slice(0, 200),
                   body_md: String(a.question ?? ""),
-                  tags: ["question"],
                   owner: "",
                   meta: { ask: { to: a.to_target ?? "any", from: a.from_label ?? "agent", urgency: "normal", options: [], artefact_id: a.artefact_id || void 0, legacy_id: a.id } }
                 },
@@ -1302,8 +1504,7 @@ var init_do = __esm({
               this.audit("system:migration", "ask_migrated", a.artefact_id || null, { legacy: a.id, node: created.id });
               n++;
             }
-            this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_v2', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+            this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('asks_v2', ?)`, String(Date.now()));
             if (n) this.audit("system:migration", "asks_v2", null, { migrated: n });
           }
         } catch (e) {
@@ -1313,7 +1514,7 @@ var init_do = __esm({
           if (!this.one(`SELECT value FROM settings WHERE key = 'asks_options_v1'`)) {
             const nodes = this.state.storage.sql.exec(
               `SELECT id, title, body_md, meta FROM artefacts
-           WHERE type = 'task' AND tags LIKE '%question%' AND status NOT IN ('done','superseded')`
+           WHERE status NOT IN ('done','superseded') AND (type = 'question' OR (type = 'task' AND tags LIKE '%question%'))`
             ).toArray();
             let n = 0;
             for (const node of nodes) {
@@ -1337,8 +1538,7 @@ var init_do = __esm({
               this.version(node.id, "system:migration", "update", `ask options backfilled (${m.ask.options.length})`, { options: m.ask.options });
               n++;
             }
-            this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('asks_options_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+            this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('asks_options_v1', ?)`, String(Date.now()));
             if (n) this.audit("system:migration", "ask_options_backfilled", null, { nodes: n });
           }
         } catch (e) {
@@ -1368,36 +1568,38 @@ var init_do = __esm({
                 fixed++;
               }
             }
-            this.state.storage.sql.exec(`INSERT INTO settings (key, value) VALUES ('tags_v1', String(Date.now()))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+            this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('tags_v1', ?)`, String(Date.now()));
             this.audit("system:migration", "tags_v1", null, { canonicalized: fixed });
           }
         } catch (e) {
           console.log("tags_v1 migration:", String(e).slice(0, 200));
         }
-        for (const ddl of [
-          `ALTER TABLE decisions ADD COLUMN options TEXT`,
-          `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
-          `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
-          `ALTER TABLE decisions ADD COLUMN asker TEXT`,
-          `ALTER TABLE auth_tokens ADD COLUMN transport TEXT`,
-          `ALTER TABLE artefacts ADD COLUMN status_ts INTEGER`,
-          `ALTER TABLE artefacts ADD COLUMN tags TEXT`,
-          `ALTER TABLE embeddings ADD COLUMN dim INTEGER DEFAULT 0`,
-          `ALTER TABLE asks ADD COLUMN artefact_id TEXT`,
-          `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
-          `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
-          `ALTER TABLE pairings ADD COLUMN type TEXT`,
-          `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
-          `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
-          `ALTER TABLE pairings ADD COLUMN principal TEXT`,
-          `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
-          `ALTER TABLE sessions ADD COLUMN kind TEXT`
-        ]) {
-          try {
-            this.state.storage.sql.exec(ddl);
-          } catch {
+        try {
+          if (!this.one(`SELECT value FROM settings WHERE key = 'roles_v1'`)) {
+            let roleRows = 0, questionRows = 0, attemptRows = 0;
+            for (const r of this.state.storage.sql.exec(`SELECT id, type, tags, meta, updated_ts FROM artefacts`).toArray()) {
+              const tags = parseTags(r.tags);
+              if (!tags.length) continue;
+              const meta = JSON.parse(r.meta ?? "{}");
+              const out = splitSystemTags(String(r.type ?? ""), tags, meta, Number(r.updated_ts ?? Date.now()));
+              if (!out.changed) continue;
+              this.state.storage.sql.exec(
+                `UPDATE artefacts SET type = ?, tags = ?, roles = ?, meta = ? WHERE id = ?`,
+                out.type,
+                out.tags.length ? JSON.stringify(out.tags) : null,
+                out.roles.length ? JSON.stringify(out.roles) : null,
+                JSON.stringify(out.meta),
+                r.id
+              );
+              if (out.roles.length) roleRows++;
+              if (out.type !== r.type) questionRows++;
+              if (tags.includes("attempted")) attemptRows++;
+            }
+            this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('roles_v1', ?)`, String(Date.now()));
+            this.audit("system:migration", "roles_v1", null, { role_rows: roleRows, question_rows: questionRows, attempt_rows: attemptRows });
           }
+        } catch (e) {
+          console.log("roles_v1 migration:", String(e).slice(0, 200));
         }
         const projectName = this.settingsMap().project_name || "superpositional";
         this.state.storage.sql.exec(
@@ -1579,12 +1781,18 @@ var init_do = __esm({
             case "admin.token_tags":
             case "admin.settings_get":
             case "admin.settings_set":
+            case "admin.stop_line_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
               if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
               if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
               if (op === "admin.settings_get") return this.json(await this.settingsGet());
+              if (op === "admin.stop_line_sweep") {
+                await this.stopTheLineSweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
               return this.json(await this.settingsSet(body));
             default:
               return this.json({ error: `unknown op ${op}` }, 404);
@@ -1595,7 +1803,7 @@ var init_do = __esm({
       }
       // ---------- ops ----------
       async create(body, actor) {
-        const type = body.type;
+        let type = body.type;
         if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
         const title = String(body.title ?? "");
         let bodyMd = String(body.body_md ?? "");
@@ -1606,6 +1814,9 @@ var init_do = __esm({
         const ts = Date.now();
         const status = INITIAL_STATUS[type];
         const tags = sanitizeTags(body.tags);
+        const rolesIn = parseRolesInput(body.roles);
+        if (rolesIn.ok === false) throw new Error(rolesIn.error);
+        const roles = rolesIn.roles;
         const session = await this.resolveSession(body, String(body.token_id ?? ""));
         const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
         let owner = type === "task" ? String(body.owner ?? "").trim() : "";
@@ -1614,15 +1825,19 @@ var init_do = __esm({
           if (type === "decision" && !pm.proposed_by) pm.proposed_by = actor;
         }
         const createMeta = { ...body.meta ?? {} };
-        if (createMeta.ask && type === "task") {
+        if (createMeta.ask && (type === "task" || type === "question")) {
           const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
           if (opts.length < 2) throw new Error("asks require 2-8 answer options \u2014 give the human one-click answers (meta.ask.options)");
           if (!String(body.title ?? "").trimEnd().endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' \u2014 e.g. 'Do you want to merge PR #84 into main?'");
         }
         if (createMeta.kind !== void 0) {
           const k = String(createMeta.kind);
-          const tag2 = KIND_TAG[k];
-          if (tag2 && !tags.includes(tag2)) tags.push(tag2);
+          const kindType = KIND_TYPE[k];
+          if (kindType && type === "task") type = kindType;
+          const kindRole = KIND_ROLE[k];
+          if (kindRole && !roles.includes(kindRole)) roles.push(kindRole);
+          const kindTag = KIND_TAG[k];
+          if (kindTag && !tags.includes(kindTag)) tags.push(kindTag);
           delete createMeta.kind;
         }
         if (type === "task" && (body.qualified === true || Array.isArray(body.await) && body.await.length)) {
@@ -1686,8 +1901,8 @@ var init_do = __esm({
 ${bodyMd.trim()}`.trim();
         }
         this.state.storage.sql.exec(
-          `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, status_ts, project, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, roles, status_ts, project, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           id,
           type,
           title,
@@ -1698,6 +1913,7 @@ ${bodyMd.trim()}`.trim();
           ts,
           ts,
           tags ? JSON.stringify(tags) : null,
+          roles.length ? JSON.stringify(roles) : null,
           ts,
           project,
           actor
@@ -1706,7 +1922,7 @@ ${bodyMd.trim()}`.trim();
           bodyMd = scaffoldBody(title, owner || actor);
         }
         this.audit(actor, "create", id, { type, title });
-        this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [] });
+        this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [], roles });
         await this.embedArtefact(id, title, bodyMd);
         if (this.env.GH_TOKEN) {
           const ref = issueRef(title);
@@ -1728,17 +1944,18 @@ ${bodyMd.trim()}`.trim();
         const raw = String(metaObj?.task ?? "").trim();
         if (!raw) return;
         const candidates = [raw, raw.replace(/^#/, "BR#"), `BR#${raw.replace(/^#/, "")}`];
-        const t = candidates.map((c) => this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ? AND type = 'task'`, c)).find(Boolean);
+        const t = candidates.map((c) => this.one(`SELECT id, type, status, meta, tags, roles FROM artefacts WHERE id = ? AND type IN ('task','question')`, c)).find(Boolean);
         if (!t) return;
         const tmeta = JSON.parse(t.meta ?? "{}");
         const tTags = parseTags(t.tags);
-        const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
+        const tRoles = parseTags(t.roles);
+        const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
         if (t.status === "blocked" && (tmeta.blocked?.reason ?? "").startsWith("abandoned")) {
           await this.transition({ id: t.id, to: "in_progress", note: "re-claimed \u2014 progress artefact logged" }, actor);
           delete tmeta.blocked;
         } else if (t.status === "todo") {
           const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
-          if (q.ok && !tTags.includes("question")) await this.transition({ id: t.id, to: "in_progress", note: "started \u2014 progress artefact logged" }, actor);
+          if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started \u2014 progress artefact logged" }, actor);
         }
         tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
         delete tmeta.grace_until;
@@ -1935,14 +2152,21 @@ ${bodyMd.trim()}`.trim();
         const meta = JSON.stringify(metaObj);
         if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
         const tags = body.tags !== void 0 ? sanitizeTags(body.tags) : row.tags;
+        let roles = parseTags(row.roles);
+        if (body.roles !== void 0) {
+          const rolesIn = parseRolesInput(body.roles);
+          if (rolesIn.ok === false) throw new Error(rolesIn.error);
+          roles = rolesIn.roles;
+        }
         const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
         if (limitErr) throw new Error(limitErr);
         this.state.storage.sql.exec(
-          `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, updated_ts = ? WHERE id = ?`,
+          `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
           title,
           bodyMd,
           meta,
           tags ? JSON.stringify(tags) : null,
+          roles && roles.length ? JSON.stringify(roles) : null,
           Date.now(),
           id
         );
@@ -1951,7 +2175,8 @@ ${bodyMd.trim()}`.trim();
           body.title !== void 0 && "title",
           body.body_md !== void 0 && "body",
           body.meta !== void 0 && "meta",
-          body.tags !== void 0 && "tags"
+          body.tags !== void 0 && "tags",
+          body.roles !== void 0 && "roles"
         ].filter(Boolean);
         this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}`, { title, body_md: bodyMd });
         await this.embedArtefact(id, title, bodyMd);
@@ -1960,7 +2185,7 @@ ${bodyMd.trim()}`.trim();
       /** Pure evidence for a qualification kind: a done analysis/review child, or an accepted
        *  decision linked either way. Declarations (meta.qualified / meta.qualification) don't count. */
       hasEvidence(row, kind) {
-        const roleFilter = kind === "analysis" ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')` : `c.tags LIKE '%"role:review"%'`;
+        const roleFilter = kind === "analysis" ? `(c.roles LIKE '%"analysis"%' OR c.roles LIKE '%"review"%')` : `c.roles LIKE '%"review"%'`;
         const child = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${roleFilter} LIMIT 1`,
@@ -1995,7 +2220,7 @@ ${bodyMd.trim()}`.trim();
             return { ok: true, via: `parent:${parent.id}` };
           const sib = this.one(
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${kind === "analysis" ? `(c.tags LIKE '%"role:analysis"%' OR c.tags LIKE '%"role:review"%')` : `c.tags LIKE '%"role:review"%'`} LIMIT 1`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND ${kind === "analysis" ? `(c.roles LIKE '%"analysis"%' OR c.roles LIKE '%"review"%')` : `c.roles LIKE '%"review"%'`} LIMIT 1`,
             parent.id
           );
           if (sib) return { ok: true, via: `sibling:${sib.id}` };
@@ -2013,7 +2238,7 @@ ${bodyMd.trim()}`.trim();
        *  Roles are playbooks, not gates — the done-gate already enforces
        *  review-before-completion where it belongs. */
       enforceableBars(bars) {
-        return bars.filter((b) => !/^role:(analysis|review|impl|unblock)$/.test(String(b)));
+        return bars.filter((b) => !/^(?:role:)?(analysis|review|impl|unblock)$/.test(String(b)));
       }
       unmetBars(row) {
         const meta = JSON.parse(row.meta ?? "{}");
@@ -2025,14 +2250,14 @@ ${bodyMd.trim()}`.trim();
       qualificationEvidence() {
         const analysisEv = /* @__PURE__ */ new Set(), reviewEv = /* @__PURE__ */ new Set();
         for (const k of this.state.storage.sql.exec(
-          `SELECT r.dst_id AS pid, c.tags AS tags FROM relations r JOIN artefacts c ON c.id = r.src_id
+          `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status = 'done'`
         ).toArray()) {
-          const tags = parseTags(k.tags);
-          if (tags.includes("role:review")) {
+          const roles = parseTags(k.roles);
+          if (roles.includes("review")) {
             reviewEv.add(k.pid);
             analysisEv.add(k.pid);
-          } else if (tags.includes("role:analysis")) analysisEv.add(k.pid);
+          } else if (roles.includes("analysis")) analysisEv.add(k.pid);
         }
         for (const d of this.state.storage.sql.exec(
           `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
@@ -2082,7 +2307,7 @@ ${bodyMd.trim()}`.trim();
           }, "qualify"),
           unmetBars: /* @__PURE__ */ __name(() => this.unmetBars(row), "unmetBars"),
           session: /* @__PURE__ */ __name(() => this.resolveSession(body, String(body?.token_id ?? "")), "session"),
-          evidence: /* @__PURE__ */ __name((eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid), "evidence"),
+          evidence: /* @__PURE__ */ __name((eid) => this.one(`SELECT type, tags, roles, meta FROM artefacts WHERE id = ?`, eid), "evidence"),
           parent: /* @__PURE__ */ __name(() => this.one(
             `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
@@ -2101,8 +2326,9 @@ ${bodyMd.trim()}`.trim();
         const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
         if (!row) throw new Error(`no such artefact: ${id}`);
         const tTags = parseTags(row.tags);
+        const tRoles = parseTags(row.roles);
         const rejection = await check(
-          { id, type: row.type, status: row.status, to, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+          { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
           this.ruleCtx(row, body, id, tTags)
         );
         if (rejection) throw new Error(rejection);
@@ -2154,7 +2380,7 @@ ${bodyMd.trim()}`.trim();
           if (row.owner && row.owner !== actor && !isHuman && !isSystem)
             throw new Error(`task ${id} is claimed by ${row.owner} \u2014 only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
           const nextAttempts = (meta.attempt?.attempts ?? 0) + 1;
-          const verdictDuty = tTags.includes("role:review") || tTags.includes("role:unblock");
+          const verdictDuty = tRoles.includes("review") || tRoles.includes("unblock");
           const churn = churnRelease(nextAttempts, verdictDuty, row.status);
           if (churn === "escalate") {
             owner = "";
@@ -2164,7 +2390,7 @@ ${bodyMd.trim()}`.trim();
               reason: `verdict duty released ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`
             };
             meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-            this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tTags.find((t) => t.startsWith("role:")) ?? "unknown" });
+            this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tRoles[0] ?? "unknown" });
             this.version(id, "system:churn-guard", "transition", `escalated to human \u2014 ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
           } else if (churn === "redirect") {
             to = "blocked";
@@ -2178,9 +2404,6 @@ ${bodyMd.trim()}`.trim();
             this.version(id, "system:churn-guard", "transition", `release redirected to blocked \u2014 ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
           } else {
             owner = "";
-            const tags = parseTags(row.tags);
-            if (!tags.includes("attempted")) tags.push("attempted");
-            this.state.storage.sql.exec(`UPDATE artefacts SET tags = ? WHERE id = ?`, JSON.stringify(tags), id);
             meta.attempt = {
               by: actor,
               at: ts,
@@ -2190,7 +2413,7 @@ ${bodyMd.trim()}`.trim();
             };
           }
         }
-        if (row.type === "task" && to === "done" && tTags.includes("role:analysis")) {
+        if (row.type === "task" && to === "done" && tRoles.includes("analysis")) {
           const parent = this.one(
             `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
@@ -2214,7 +2437,7 @@ ${bodyMd.trim()}`.trim();
           owner,
           id
         );
-        const violations = invariants({ type: row.type, status: to, tags: tTags, meta });
+        const violations = invariants({ type: row.type, status: to, roles: tRoles, tags: tTags, meta });
         if (violations.length) {
           this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
           this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} \u2192 ${to}: ${violations.join("; ")}`, { violations });
@@ -2267,18 +2490,18 @@ ${bodyMd.trim()}`.trim();
           }
         }
         let verifyTaskId;
-        if (row.type === "task" && to === "in_review" && !tTags.includes("role:review")) {
+        if (row.type === "task" && to === "in_review" && !tRoles.includes("review")) {
           let guardHit;
           let cursor = id, depth = 0;
           while (depth < 10) {
             const p = this.one(
-              `SELECT p.id AS id, p.tags AS tags FROM relations r JOIN artefacts p ON p.id = r.dst_id
+              `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
               cursor
             );
             if (!p) break;
             depth++;
-            if (String(p.tags ?? "").includes("role:review")) {
+            if (parseTags(p.roles).includes("review")) {
               guardHit = `ancestor ${p.id} is a review task \u2014 verify-of-verify is blocked`;
               break;
             }
@@ -2294,7 +2517,7 @@ ${bodyMd.trim()}`.trim();
             const existing = this.one(
               `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
               id
             );
             if (existing) {
@@ -2317,7 +2540,7 @@ VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 uns
 
 Then double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.
 Complete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
-                  tags: ["role:review"]
+                  roles: ["review"]
                 },
                 actor
               );
@@ -2336,7 +2559,7 @@ Complete with receipts in the note, then close ${id} (done) or bounce it (in_pro
           const fromStatuses = ["todo", "in_progress", "blocked"];
           for (const v of this.state.storage.sql.exec(
             `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
             id
           ).toArray()) {
             const vm = JSON.parse(v.meta ?? "{}");
@@ -2356,7 +2579,7 @@ Complete with receipts in the note, then close ${id} (done) or bounce it (in_pro
           const isBounce = row.status === "in_review" && to === "in_progress";
           const verifyChildren = this.state.storage.sql.exec(
             `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:review"%' ORDER BY c.updated_ts DESC`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC`,
             id
           ).toArray();
           verifyChildren.forEach((v, i) => {
@@ -2375,7 +2598,7 @@ Complete with receipts in the note, then close ${id} (done) or bounce it (in_pro
           });
           for (const v of this.state.storage.sql.exec(
             `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%'`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
             id
           ).toArray()) {
             const vm = JSON.parse(v.meta ?? "{}");
@@ -2391,10 +2614,10 @@ Complete with receipts in the note, then close ${id} (done) or bounce it (in_pro
             this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
           }
         }
-        if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tTags.includes("role:unblock")) {
+        if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tRoles.includes("unblock")) {
           const existing = this.one(
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.tags LIKE '%"role:unblock"%' LIMIT 1`,
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%' LIMIT 1`,
             id
           );
           if (existing) {
@@ -2418,7 +2641,7 @@ Blocked why: ${blockWhy || "see parent"}.
 Exit condition: ${exitCond || "none recorded \u2014 read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.
 
 Contract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
-                tags: ["role:unblock"]
+                roles: ["unblock"]
               },
               actor
             );
@@ -2438,17 +2661,17 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
       async link(body, actor) {
         const srcId = String(body.src ?? ""), rel = String(body.relation ?? ""), dstId = String(body.dst ?? "");
         if (!isRelation(rel)) throw new Error(`unknown relation '${rel}'`);
-        const src = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, srcId);
-        const dst = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, dstId);
+        const src = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, srcId);
+        const dst = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, dstId);
         if (!src || !dst) throw new Error("both src and dst must exist");
         const verdict = validateRelation(rel, src.type, dst.type);
         if (verdict.ok === false) throw new Error(verdict.reason);
         if (rel === "child_of") {
-          const childTags = parseTags(src.tags);
-          const parentTags = parseTags(dst.tags);
-          if (childTags.includes("role:review") && (parentTags.includes("role:review") || parentTags.includes("role:unblock")))
-            throw new Error(`link rejected: ${srcId} is a verify task \u2014 verify tasks are terminal-at-birth and cannot nest under ${parentTags.includes("role:review") ? "another verify" : "an unblock"} task`);
-          if (childTags.includes("role:unblock") && (parentTags.includes("role:unblock") || parentTags.includes("role:review")))
+          const childRoles = parseTags(src.roles);
+          const parentRoles = parseTags(dst.roles);
+          if (childRoles.includes("review") && (parentRoles.includes("review") || parentRoles.includes("unblock")))
+            throw new Error(`link rejected: ${srcId} is a verify task \u2014 verify tasks are terminal-at-birth and cannot nest under ${parentRoles.includes("review") ? "another verify" : "an unblock"} task`);
+          if (childRoles.includes("unblock") && (parentRoles.includes("unblock") || parentRoles.includes("review")))
             throw new Error(`link rejected: ${srcId} is an unblock task \u2014 unblock tasks are terminal-at-birth and cannot nest under another ephemeral task`);
         }
         if (rel === "child_of") {
@@ -2591,8 +2814,8 @@ ${m.bootstrap_md}` : "") + scoreLine;
           await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed \u2014 subprocess resolved" : "re-claimed \u2014 agent resumed (heartbeat)", gateway: body.gateway, agent: body.agent }, actor);
           delete meta.blocked;
         } else if (row.status === "todo") {
-          const tTags = JSON.parse(row.tags ?? "[]");
-          if (tTags.includes("question")) {
+          const tRoles = parseTags(row.roles);
+          if (row.type === "question") {
             return {
               id,
               note,
@@ -2603,10 +2826,10 @@ ${m.bootstrap_md}` : "") + scoreLine;
               risk_pct,
               context_pct,
               instructions,
-              note_postscript: "contribution logged on a question task \u2014 questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task)."
+              note_postscript: "contribution logged on a question \u2014 questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task)."
             };
           }
-          const isQualifier = tTags.includes("role:analysis") || tTags.includes("role:review") || tTags.includes("role:unblock");
+          const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
           const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
           if (!q.ok) {
             return {
@@ -2619,7 +2842,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
               risk_pct,
               context_pct,
               instructions,
-              note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED \u2014 ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete a role:analysis child task, link an accepted decision, or pick qualified work. role:analysis/role:review agents may claim unqualified work.`
+              note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED \u2014 ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`
             };
           }
           await this.transition({ id, to: "in_progress", note: "started \u2014 progress logged", gateway: body.gateway, agent: body.agent }, actor);
@@ -2772,12 +2995,12 @@ ${m.bootstrap_md}` : "") + scoreLine;
         const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
         const options = [...new Set((Array.isArray(body.options) ? body.options : []).map((o) => typeof o === "string" ? o : String(o?.label ?? o?.text ?? o?.value ?? o?.title ?? "")).map((x) => x.trim()).filter((x) => x && !/\[object\s*object\]/i.test(x)).map((x) => x.slice(0, 200)))].slice(0, 8);
         if (options.length < 2) throw new Error("asks require 2-8 answer options \u2014 give the human one-click answers (options: ['GO', 'NO-GO'])");
-        const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
+        const urgency = body.urgency === "time-sensitive" ? "time-sensitive" : "normal";
         if (artefactId) {
           const dup = this.one(
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-           AND c.tags LIKE '%question%' AND c.title = ? LIMIT 1`,
+           AND c.type = 'question' AND c.title = ? LIMIT 1`,
             artefactId,
             question.slice(0, 200)
           );
@@ -2785,10 +3008,9 @@ ${m.bootstrap_md}` : "") + scoreLine;
         }
         const created = await this.create(
           {
-            type: "task",
+            type: "question",
             title: question.slice(0, 200),
             body_md: details || question,
-            tags: ["question"],
             owner: "",
             meta: { ask: { to, urgency, options, from: actor, reason: reason || void 0, artefact_id: artefactId || void 0 } }
           },
@@ -2819,7 +3041,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
         const label = String(body.label ?? "");
         const nodes = this.state.storage.sql.exec(
           `SELECT id, meta, created_ts FROM artefacts
-       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND tags LIKE '%"question"'
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked')
        ORDER BY created_ts DESC LIMIT 50`
         ).toArray();
         const inbox = nodes.map((n) => {
@@ -2848,7 +3070,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
       async askReframe(body, actor) {
         const id = String(body.id ?? "");
         const feedback = String(body.feedback ?? "").trim().slice(0, 1e3) || "REFRAME \u2014 restructure per the ask contract: one imperative question \u2264240 chars, 2-8 one-click options, and why this is escalated instead of automatic.";
-        const node = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND tags LIKE '%question%'`, id);
+        const node = this.one(`SELECT id, meta FROM artefacts WHERE id = ? AND type = 'question'`, id);
         if (!node) throw new Error(`no such ask: ${id}`);
         const m = JSON.parse(node.meta ?? "{}");
         m.ask = { ...m.ask ?? {}, reframe: { by: actor, feedback, ts: Date.now() } };
@@ -2994,7 +3216,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
         for (const c of this.state.storage.sql.exec(
           `SELECT r.dst_id AS parent, c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.tags LIKE '%question%' ORDER BY c.created_ts DESC`
+         AND c.type = 'question' ORDER BY c.created_ts DESC`
         ).toArray()) {
           if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
         }
@@ -3022,12 +3244,12 @@ ${m.bootstrap_md}` : "") + scoreLine;
           return t;
         });
         const steeringRows = this.state.storage.sql.exec(
-          `SELECT id, title, body_md, tags FROM artefacts
+          `SELECT id, title, body_md, tags, roles FROM artefacts
        WHERE type = 'steering' AND status = 'active' ORDER BY updated_ts DESC LIMIT 20`
         ).toArray();
-        const steering = steeringRows.map((s) => ({ id: s.id, title: s.title, body_md: String(s.body_md ?? "").slice(0, 1500), tags: parseTags(s.tags) })).filter((s) => {
-          const roles = s.tags.filter((t) => t.startsWith("role:"));
-          return roles.length === 0 || roles.some((r) => tags.includes(r));
+        const steering = steeringRows.map((s) => ({ id: s.id, title: s.title, body_md: String(s.body_md ?? "").slice(0, 1500), tags: parseTags(s.tags), roles: parseTags(s.roles) })).filter((s) => {
+          const roles = s.roles ?? [];
+          return roles.length === 0 || roles.some((r) => tags.includes(`role:${r}`));
         });
         const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
         const askMarks = askPlaceholders.map(() => "?").join(",");
@@ -3053,10 +3275,10 @@ ${m.bootstrap_md}` : "") + scoreLine;
           body.principal ?? null
         ).toArray();
         const pool = this.state.storage.sql.exec(
-          `SELECT id, title, tags, meta, project, updated_ts, status FROM artefacts
+          `SELECT id, type, title, tags, roles, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
        ORDER BY updated_ts DESC LIMIT 400`
-        ).toArray().map((t) => ({ ...t, tags: parseTags(t.tags) }));
+        ).toArray().map((t) => ({ ...t, tags: parseTags(t.tags), roles: parseTags(t.roles) }));
         const callerIsGateway = tags.some((t) => t.toLowerCase() === "gateway");
         const dispatchPool = callerIsGateway ? pool.filter((t) => t.status !== "blocked") : pool;
         const { analysisEv, reviewEv } = this.qualificationEvidence();
@@ -3077,7 +3299,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
           if (l.pstatus === "in_review") verifyParents.set(l.src_id, l);
         }
         const unclaimedWork = dispatchPool.filter((t) => {
-          const need = t.tags.filter((x) => x.startsWith("role:"));
+          const need = t.roles ?? [];
           const m = JSON.parse(t.meta ?? "{}");
           const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : void 0);
           const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
@@ -3090,10 +3312,10 @@ ${m.bootstrap_md}` : "") + scoreLine;
           const rank = /* @__PURE__ */ __name((t) => {
             const m = JSON.parse(t.meta ?? "{}");
             if (m.boosted) return -1;
-            if (t.tags?.includes("role:unblock")) return 0;
+            if (t.roles?.includes("unblock")) return 0;
+            if (verifyParents.has(t.id)) return 0;
             if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
-            if (verifyParents.has(t.id)) return 2;
-            if (t.tags?.includes("question")) return 3;
+            if (t.type === "question") return 3;
             return 4;
           }, "rank");
           return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
@@ -3106,7 +3328,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
             t.is_claimable = !!t.unblock_condition;
             if (!t.unblock_condition) t.claim_reason = "blocked without an unblock condition \u2014 open the card, resolve or re-scope it";
           }
-          t.is_question = isQuestionTask(m) || t.tags?.includes("question") || false;
+          t.is_question = t.type === "question" || isQuestionTask(m) || false;
           const gated = m.operator_gated;
           if (t.status !== "blocked") {
             t.is_claimable = !t.is_question && !gated;
@@ -3138,11 +3360,11 @@ ${m.bootstrap_md}` : "") + scoreLine;
        FROM relations r
        JOIN artefacts c ON c.id = r.src_id
        JOIN artefacts p ON p.id = r.dst_id
-       WHERE r.relation = 'child_of'
-         AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
-         AND c.tags LIKE '%"role:review"%'
-         AND p.type = 'task' AND p.status = 'in_review'
-         AND p.updated_ts < ?`,
+        WHERE r.relation = 'child_of'
+          AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+          AND c.roles LIKE '%"review"%'
+          AND p.type = 'task' AND p.status = 'in_review'
+          AND p.updated_ts < ?`,
           [Date.now() - 48 * 60 * 60 * 1e3]
         ).toArray();
         const reviewPending = stalledVerify.filter((v) => v.parent_owner === label).map((v) => ({
@@ -3311,8 +3533,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const now = Date.now();
         const slug = DEFAULT_WS_SLUG;
         this.state.storage.sql.exec(
-          `INSERT INTO settings (key, value) VALUES ('ws_slug', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('ws_slug', ?)`,
           JSON.stringify(slug)
         );
         this.state.storage.sql.exec(
@@ -3764,8 +3985,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         if (entries.length === 0) throw new Error("no valid settings keys (lowercase [a-z0-9_])");
         for (const [k, v] of entries) {
           this.state.storage.sql.exec(
-            `INSERT INTO settings (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
             k,
             JSON.stringify(v)
           );
@@ -3901,7 +4121,7 @@ ${String(issue.body ?? "").slice(0, 2e3)}
         return this.state.storage.sql.exec(query, ...params).toArray()[0] ?? null;
       }
       shape(row) {
-        return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags) };
+        return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
       }
       json(obj, status = 200) {
         return new Response(JSON.stringify(obj), {
@@ -3984,7 +4204,7 @@ async function handleMcp(request, env) {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id, principal: identity.principal ?? null })
+      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id })
     });
     const out = await r.json();
     if (!r.ok) throw new Error(out.error ?? `kb ${op} failed`);
@@ -4256,15 +4476,16 @@ var init_mcp = __esm({
             owner: { type: "string", description: "leave empty for tasks \u2014 work enters as unclaimed todo; set only to pre-assign" },
             project: { type: "string", description: "project slug, e.g. superpositional or bridge; defaults to the deployment's project" },
             qualified: { type: "boolean", description: "declare you already analysed this task \u2014 it goes ready for pickup (publishers are scored on the quality of their self-qualified tasks)" },
-            await: { type: "array", items: { type: "string" }, description: 'stacked qualification: further confirmation required before pickup, e.g. ["role:review"] \u2014 satisfied by a done child of that role or an accepted decision' },
-            tags: { type: "array", items: { type: "string" }, description: "categories + role gating for tasks, e.g. [ingestion, role:impl]" },
+            await: { type: "array", items: { type: "string" }, description: 'stacked qualification: further confirmation required before pickup, e.g. ["review"] \u2014 satisfied by a done child of that role or an accepted decision' },
+            tags: { type: "array", items: { type: "string" }, description: "user-defined categories \u2014 fully free-form, no system meaning; they render and filter in the UI (e.g. [gtm, deploy-train, pricing])" },
+            roles: { type: "array", items: { type: "string", enum: ["impl", "analysis", "review", "unblock", "human"] }, description: "dispatch/gating lane for task children \u2014 what the machine enforces (verify children are review, unblock children unblock). Never express roles as tags." },
             session: { type: "string", description: "your session name \u2014 attributes the card to your session" }
           }
         }
       },
       {
         name: "update_artefact",
-        description: "Edit title/body/meta. Does not change status \u2014 use transition.",
+        description: "Edit title/body/meta/tags/roles. Does not change status \u2014 use transition.",
         inputSchema: {
           type: "object",
           required: ["id"],
@@ -4272,7 +4493,9 @@ var init_mcp = __esm({
             id: { type: "string" },
             title: { type: "string" },
             body_md: { type: "string" },
-            meta: { type: "object" }
+            meta: { type: "object" },
+            tags: { type: "array", items: { type: "string" }, description: "replaces the user-defined category tags (free-form, inert)" },
+            roles: { type: "array", items: { type: "string", enum: ["impl", "analysis", "review", "unblock", "human"] }, description: "replaces the dispatch/gating roles" }
           }
         }
       },
@@ -4389,7 +4612,10 @@ var init_mcp = __esm({
         inputSchema: {
           type: "object",
           required: ["id", "answer"],
-          properties: { id: { type: "string" }, answer: { type: "string" } }
+          properties: {
+            id: { type: "string", description: "BR# id of the question task to answer (asks are BR#-numbered question nodes, not ASK-* artefact ids)" },
+            answer: { type: "string" }
+          }
         }
       }
     ];
@@ -4400,7 +4626,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "129b5616871dce3b325eff6f00027c35046a8708", built_at: "2026-10-24T10:29:30Z" };
+    module.exports = { commit: "e9807d2aeb02677164abdcfd4c700bdd09cc0d2c", built_at: "2026-10-24T18:35:57Z" };
   }
 });
 
