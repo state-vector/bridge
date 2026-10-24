@@ -18,6 +18,10 @@ use crate::scm;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatchConfig {
+    /// Serialized shape version — written by store::save_config (the one
+    /// writer), checked on load; files from the future warn loudly.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u64,
     pub url: String,
     /// The gateway secret lives in the OS keychain (crate::keychain) — this
     /// field is runtime-only and never serialized: config.json stays
@@ -148,6 +152,9 @@ impl DispatchConfig {
 
 }
 
+pub fn default_schema_version() -> u64 {
+    crate::store::CONFIG_SCHEMA_VERSION
+}
 fn default_max_sessions() -> usize {
     1
 }
@@ -187,6 +194,7 @@ impl DispatchConfig {
         let url = std::env::var("BRIDGE_URL").ok()?;
         let token = String::new();
         Some(Self {
+            schema_version: default_schema_version(),
             url: url.trim_end_matches('/').into(),
             token,
             workdir: std::env::var("BRIDGE_WORKDIR").unwrap_or_else(|_| default_workdir()),
@@ -246,96 +254,38 @@ impl DispatchConfig {
     }
 
     /// Resolution order: env vars > ~/.bridge/config.json > None (→ device pairing).
-    /// The token is NEVER taken from either — keychain only.
+    /// The token is NEVER taken from either — keychain only, via the store
+    /// (which also migrates any legacy on-disk plaintext once).
     pub fn resolve() -> Option<Self> {
         let mut c = Self::from_env().or_else(load_config)?;
         c.normalize();
-        c.refresh_token_from_keychain();
+        crate::store::TokenStore::open().attach_token(&mut c);
         Some(c)
     }
 
-    /// One-time migration + keychain attach: a legacy config carries the
-    /// token on disk — move it to the OS keychain, then always load from
-    /// there so the keychain is the single source of truth (admin revoke +
-    /// re-vend state included).
-    pub fn refresh_token_from_keychain(&mut self) {
-        if !self.token.is_empty() {
-            match crate::keychain::save_token(&self.token) {
-                Ok(()) => eprintln!("[dispatch] migrated gateway token from config.json to the OS keychain"),
-                Err(e) => eprintln!("[dispatch] WARNING: keychain migration failed ({e}) — token cleared from config anyway; sign in to re-provision"),
-            }
-            self.token.clear();
-        }
-        self.token = crate::keychain::load_token().unwrap_or_default();
-    }
-
+    /// One writer for config.json (BR#2840): full versioned struct, atomic
+    /// temp+rename, 0600 — see store.rs. Every caller funnels through here.
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        let dir = path
-            .parent()
-            .ok_or("no config dir")?
-            .to_path_buf();
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
-        }
-        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, body).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-        eprintln!("[dispatch] config saved to {}", path.display());
-        Ok(())
+        crate::store::TokenStore::open().save_config(self)
     }
 }
 
-/// The machine's stable principal: read from the config, generated once and
-/// written back when absent. Short by design — it is a handle, not a secret
-/// (the secret is the bkw_ token). Survives re-pairings, rotations, renames.
+/// The machine's stable principal: write-once, `~/.bridge/principal` —
+/// read via the store (which migrates a legacy config.json field once).
+/// Short by design — it is a handle, not a secret (the secret is the
+/// bkw_ token). Survives re-pairings, rotations, renames.
 pub fn ensure_principal_from_file() -> String {
-    let path = config_path();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(c) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(existing) = c.get("principal").and_then(|p| p.as_str()) {
-                if !existing.is_empty() {
-                    return existing.to_string();
-                }
-            }
-        }
-    }
-    String::new() // empty = not yet vended — the hub mints the device credential on first provision
+    crate::store::TokenStore::open().principal()
 }
 
-/// Persist the hub-vended device credential (adopted on first provision;
-/// never regenerated client-side — ONE random generation approach).
+/// Persist the hub-vended device credential — the store decides where it
+/// lives (one file, 0600); rotation rewrites exactly that one place.
 fn store_principal(p: &str) {
-    let path = config_path();
-    if let Ok(mut c) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap_or_default()) {
-        if let Some(obj) = c.as_object_mut() {
-            obj.insert("principal".into(), serde_json::Value::String(p.to_string()));
-            let body = serde_json::to_string_pretty(&c).unwrap_or_default();
-            let _ = std::fs::write(&path, body);
-            #[cfg(unix)]
-            let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
-        }
-    }
-}
-
-fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".bridge").join("config.json")
+    crate::store::TokenStore::open().adopt_principal(p);
 }
 
 fn load_config() -> Option<DispatchConfig> {
-    let raw = std::fs::read_to_string(config_path()).ok()?;
-    serde_json::from_str(&raw)
-        .map_err(|e| {
-            eprintln!("[dispatch] ERROR: bad config file: {e}");
-            e
-        })
-        .ok()
+    crate::store::TokenStore::open().load_config()
 }
 
 /// Device pairing (bridge-native github-like device flow): request a code, the
@@ -475,8 +425,9 @@ pub enum PairPoll {
 
 /// Fresh defaults for a device with no config yet (paired fresh / first
 /// self-provision). User settings always merge over this.
-fn default_config() -> DispatchConfig {
+pub fn default_config() -> DispatchConfig {
     DispatchConfig {
+        schema_version: default_schema_version(),
         url: String::new(),
         token: String::new(),
         workdir: default_workdir(),
@@ -511,13 +462,13 @@ fn apply_vended_credentials(
     label: Option<String>,
     gateway_class: bool,
 ) -> Result<(), String> {
-    crate::keychain::save_token(token)?;
+    let store = crate::store::TokenStore::open();
     cfg.url = url.trim_end_matches('/').to_string();
-    // The secret stays IN MEMORY for this process — the loop thread receives
-    // it via cfg (the BR#2455 identity check refuses an empty token). The
-    // field is skip_serializing, so config.json stays secret-free; later
-    // resolves reload from the keychain (refresh_token_from_keychain).
-    cfg.token = token.to_string();
+    // Rotate = persistent store AND in-memory token move together (one
+    // call, no stale window; empty vends are refused — that is how
+    // credentials used to vanish). The field is skip_serializing, so
+    // config.json stays secret-free; later resolves reload from the store.
+    store.rotate(cfg, token)?;
     cfg.ws = Some(ws.to_string());
     cfg.label = label;
     cfg.gateway = Some(gateway_class);
@@ -2482,6 +2433,12 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.max_sessions = cfg.max_sessions;
     }
     let mut did_logout = false;
+    // Self-healing law (BR#2840): a hub-rejected token gets exactly ONE
+    // repair attempt per loop run (re-vend via self-provision — the
+    // deterministic label rotates in place hub-side). Repair fails → loud
+    // logout with a human-readable reason. Never silent, never snap-only.
+    let mut token_repair_attempted = false;
+    let mut cfg = cfg;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -2508,13 +2465,35 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
             Err(e) => {
                 // A hub-rejected token (401: revoked/expired/rotated away) is
-                // not retryable — every call will fail the same way. Clear the
-                // dead credential and await the next login: self-provision
-                // re-vends at no cost beyond the login itself. (Tick errors
-                // reaching here are orient's — "bridge {status} on /mcp" — so
-                // the prefix match cannot hit task IDs.)
+                // not retryable as-is — but before giving up, attempt repair
+                // ONCE: re-vend through the live human session (the login is
+                // the approval). Headless (no session) or failed repair →
+                // loud logout, clear the dead credential, await the next
+                // login. (Tick errors reaching here are orient's —
+                // "bridge {status} on /mcp" — so the prefix match cannot hit
+                // task IDs.)
                 if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
-                    let msg = format!("logged out — hub rejected the token ({e}); sign in to re-provision");
+                    if !token_repair_attempted {
+                        token_repair_attempted = true;
+                        let repaired = crate::session::load().and_then(|s| {
+                            let client = reqwest::blocking::Client::builder()
+                                .timeout(Duration::from_secs(30))
+                                .build()
+                                .ok()?;
+                            self_provision(&client, &cfg.url, &s.value).ok()
+                        });
+                        if let Some(fresh) = repaired {
+                            cfg = fresh;
+                            let msg = "gateway token repaired — re-vended by self-provision after hub 401".to_string();
+                            eprintln!("[dispatch] {msg}");
+                            snap_activity(&snap, "dispatch", &msg);
+                            write_runner_state(&snap);
+                            continue;
+                        }
+                    }
+                    let msg = format!(
+                        "logged out — hub rejected the token ({e}) and one-time repair failed; sign in to re-provision"
+                    );
                     eprintln!("[dispatch] {msg}");
                     snap_activity(&snap, "error", &msg);
                     logout_core(&stop, &running, &snap, true);
@@ -2637,8 +2616,8 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     stop.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
     if clear_credential {
-        if let Err(e) = crate::keychain::delete_token() {
-            eprintln!("[dispatch] WARNING: keychain clear failed: {e}");
+        if let Err(e) = crate::store::TokenStore::open().clear_token() {
+            eprintln!("[dispatch] WARNING: credential clear failed: {e}");
         }
         if let Some(dir) = dispatch_dir() {
             // vendored per-agent credentials — re-provisioned after the next login

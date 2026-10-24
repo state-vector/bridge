@@ -41,30 +41,40 @@ jobs:
       - name: Compile check (locked)
         working-directory: packages/cli
         run: cargo check --locked --all-targets
+      # the credential/config store regression suite (BR#2840): atomic
+      # writes, rotate-in-one-call, write-once principal, legacy migration
+      # — these gate the merge, not just the release build
+      - name: CLI tests (locked)
+        working-directory: packages/cli
+        run: cargo test --locked
 
   deploy-check:
     name: Deploy drift alarm
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: test
+    # main pushes only: the alarm compares the LIVE hub (which deploys
+    # main via CF Workers Builds) against the pushed SHA — on a PR event
+    # github.sha is the PR head, which the live hub can never match
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Probe live hub __version vs pushed SHA
         env:
           HUB_URL: https://bridge.ray-013.workers.dev
           EXPECTED: ${{ github.sha }}
-      run: |
-        for i in 1 2 3 4 5; do
-          sleep 60
-          LIVE=$(curl -sf --max-time 15 "$HUB_URL/__version" 2>/dev/null | jq -r '.commit // empty' 2>/dev/null)
-          if [ -n "$LIVE" ]; then break; fi
-          echo "probe $i: hub not answering __version yet, retrying"
-        done
-        if [ -z "$LIVE" ]; then
-          echo "::error::__version unreachable after 5 probes — the deploy may have stalled or the route broke"
-          exit 1
-        fi
-        if [ "$LIVE" != "$EXPECTED" ]; then
-          echo "::error::deploy drift — live hub is $LIVE, expected $EXPECTED. CF Builds stalled or bypassed?"
-          exit 1
-        fi
-        echo "live hub matches $EXPECTED ✓"
+        run: |
+          for i in 1 2 3 4 5; do
+            sleep 60
+            LIVE=$(curl -sf --max-time 15 "$HUB_URL/__version" 2>/dev/null | jq -r '.commit // empty' 2>/dev/null)
+            if [ -n "$LIVE" ]; then break; fi
+            echo "probe $i: hub not answering __version yet, retrying"
+          done
+          if [ -z "$LIVE" ]; then
+            echo "::error::__version unreachable after 5 probes — the deploy may have stalled or the route broke"
+            exit 1
+          fi
+          if [ "$LIVE" != "$EXPECTED" ]; then
+            echo "::error::deploy drift — live hub is $LIVE, expected $EXPECTED. CF Builds stalled or bypassed?"
+            exit 1
+          fi
+          echo "live hub matches $EXPECTED ✓"

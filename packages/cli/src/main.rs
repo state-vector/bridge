@@ -5,13 +5,16 @@
 //! no-GUI build for linux/mac hosts: `curl -fsSL …/install.sh | bash`.
 //!
 //! Usage:
-//!   bridge                      run using env/config (BRIDGE_URL, BRIDGE_TOKEN)
+//!   bridge                      run using env/config (BRIDGE_URL; token from the keychain)
 //!   bridge pair <hub-url>       device-flow pairing — prints a code, saves config, runs
 //!   bridge status               print runner state (~/.bridge/dispatch/runner.json)
+//!   bridge reset-principal      clear the write-once device identity (~/.bridge/principal)
 //!
 //! Signals: Ctrl-C kills the process. Ephemeral state lives under
 //! ~/.bridge/dispatch/; the hub owns all authoritative state, so a killed
-//! runner leaves nothing inconsistent behind.
+//! runner leaves nothing inconsistent behind. Credentials live in the OS
+//! keychain (file fallback `~/.bridge/gateway-token`, 0600) — never in
+//! config.json.
 
 // The dispatch core is shared verbatim with the desktop gateway (single source
 // of truth — no drift between GUI and CLI).
@@ -31,6 +34,8 @@ mod scm;
 #[path = "../../desktop/src-tauri/src/session.rs"]
 #[allow(dead_code)]
 mod session;
+#[path = "../../desktop/src-tauri/src/store.rs"]
+mod store;
 #[path = "../../desktop/src-tauri/src/transport.rs"]
 mod transport;
 
@@ -86,6 +91,21 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        "reset-principal" => {
+            // the ONLY local principal clear (BR#2840): debugging tool — the
+            // hub mints a fresh device credential on the next provision
+            let store = store::TokenStore::open();
+            let had = !store.principal().is_empty();
+            if let Err(e) = store.reset_principal() {
+                eprintln!("[bridge] reset-principal failed: {e}");
+                std::process::exit(1);
+            }
+            println!(
+                "{}",
+                if had { "principal cleared — the hub mints a new one at the next provision" }
+                else { "no principal on this machine — nothing to clear" }
+            );
         }
         "agent" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("install");
@@ -176,7 +196,9 @@ fn run(cfg: Option<DispatchConfig>) {
                 match dispatch::pair_device(&url) {
                     Ok(fresh) => {
                         *c = fresh;
-                        let _ = c.save();
+                        if let Err(e) = c.save() {
+                            eprintln!("[bridge] WARNING: config save failed after repair-pair: {e}");
+                        }
                         println!("\n== paired — starting the runner ==\n");
                     }
                     Err(e) => {
@@ -199,8 +221,11 @@ fn run(cfg: Option<DispatchConfig>) {
                     c
                 }
                 None => DispatchConfig {
+                    schema_version: dispatch::default_schema_version(),
                     url: std::env::var("BRIDGE_URL").unwrap_or_default().trim_end_matches('/').into(),
-                    token: std::env::var("BRIDGE_TOKEN").unwrap_or_default(),
+                    // token never comes from env (credential-class ADR) —
+                    // the store attaches it from the keychain
+                    token: String::new(),
                     workdir: std::env::var("BRIDGE_WORKDIR").unwrap_or_else(|_| {
                         std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
                     }),
@@ -471,13 +496,13 @@ fn doctor() -> bool {
 
     let cfg = DispatchConfig::resolve();
     match &cfg {
-        None => {
-            println!("  \x1b[31mFAIL\x1b[0m  config — none found. Run `bridge pair <hub-url>` or set BRIDGE_URL + BRIDGE_TOKEN");
-            return true;
-        }
+            None => {
+                println!("  \x1b[31mFAIL\x1b[0m  config — none found. Run `bridge pair <hub-url>` or set BRIDGE_URL");
+                return true;
+            }
         Some(c) => {
             ok("hub url", if c.url.is_empty() { "not set" } else { "" }, &mut bad, true);
-            ok("token", if c.token.is_empty() { "not set — re-pair or set BRIDGE_TOKEN" } else { "" }, &mut bad, true);
+            ok("token", if c.token.is_empty() { "not set — re-pair (`bridge pair <hub-url>`) to provision one" } else { "" }, &mut bad, true);
             ok("workdir", if c.workdir.is_empty() { "not set" } else { "" }, &mut bad, true);
         }
     }

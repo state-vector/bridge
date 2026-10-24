@@ -162,6 +162,12 @@ pub fn delete_token() -> Result<(), String> {
     imp::delete_token()
 }
 
+/// Serializes every test that touches the real persistent token store
+/// (this module's round-trip + store.rs's real-store tests) — the default
+/// test harness runs them in parallel otherwise.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +177,10 @@ mod tests {
         // real store — protected keychain on signed builds, the 0600 file
         // fallback on unsigned dev binaries; exercises the exact paths
         // production uses
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // snapshot/restore: a dev machine may hold a live CLI token in the
+        // fallback file — the test must never wipe a real credential
+        let saved = load_token().unwrap_or_default();
         save_token("bkw_test_secret").expect("save");
         assert_eq!(load_token().expect("load"), "bkw_test_secret");
         // overwrite = rotate-in-place (same entry, no accumulation)
@@ -180,5 +190,8 @@ mod tests {
         assert_eq!(load_token().expect("load after delete"), "");
         // deleting an absent entry is idempotent
         delete_token().expect("delete again");
+        if !saved.is_empty() {
+            save_token(&saved).expect("restore real token");
+        }
     }
 }

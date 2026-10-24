@@ -6,6 +6,7 @@ mod menubar;
 mod opencode;
 mod scm;
 mod session;
+mod store;
 mod transport;
 
 use serde::Deserialize;
