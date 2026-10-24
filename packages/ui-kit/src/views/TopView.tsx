@@ -3,8 +3,8 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
-import { kindOf } from "../server/views";
-import { Chip, ConnDot, type ChipTone } from "./index-kit";
+import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { Chip, type ChipTone } from "./index-kit";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -50,13 +50,19 @@ function staleness(ts: number | undefined, now: number): "fresh" | "warn" | "dea
   return "fresh";
 }
 
-const ONLINE_MS = 10 * 60_000;
+/** Status dot colour — scannable status on the LEFT edge (2026-10-24, Ray):
+ *  green = in progress, red = blocked, amber = in review. Duplicates the
+ *  status column by design; liveness stays readable in "last signal". */
+const STATUS_DOT_TITLE: Record<string, string> = {
+  in_progress: "in progress",
+  blocked: "blocked",
+  in_review: "in review",
+};
 
 interface TopRow {
   key: string;
   agent: string;
   session?: string;
-  online: boolean;
   lastSeen: number | undefined;
   taskId?: string;
   goal?: string;
@@ -100,20 +106,24 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   const rows = useMemo<TopRow[]>(() => {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
-    // top = what is RUNNING right now: in_progress + blocked. todo/done/in_review are noise here.
-    // Pinned tasks (meta.pinned) ride first — the human's watchlist.
-    const inFlight = tasks.filter((t) => ["in_progress", "blocked"].includes(t.status));
-    const taskRows: TopRow[] = inFlight.map((t) => {
+    // top = what is RUNNING right now, plus ONLY the blocked rows a human or
+    // an active duty can move (2026-10-24 spec, Ray): in_progress always;
+    // blocked only with a pending human ask (meta.awaiting_ask) or a live
+    // "Unblock:" twin. Churn/rework machine parks and blocked-with-no-lever
+    // rows live in Backlog (TIMEOUT / blocked groups), not here.
+    const twinIdx = unblockTwinIndex(tasks as any[]);
+    const admitted = (tasks as any[]).filter((t) =>
+      t.status === "in_progress"
+      || (t.status === "blocked"
+        && !isTimeoutBlock(t)
+        && (t.meta?.awaiting_ask?.ask_id || activeUnblockTwinOf(t, twinIdx))),
+    );
+    const taskRows: TopRow[] = admitted.map((t) => {
       const meta = (t.meta ?? {}) as any;
       const p = meta.last_progress;
       const agent = t.owner || "unclaimed";
       const sc: any = scoreBy.get(agent);
       const sessionSeen = sessions.find((s) => s.label === agent)?.last_seen_ts;
-      // online = either the session pinged recently OR the task itself has a
-      // fresh signal (the runner heartbeats last_progress mid-run — session
-      // touches alone go stale during long headless opencode runs)
-      const lastFresh = Math.max(sessionSeen ?? 0, p?.ts ?? 0);
-      const online = now - lastFresh < ONLINE_MS;
       // task-scoped signal: when THIS task was last touched by anyone (agent
       // log, transition). Deliberately excludes the label's session ping — a
       // runner or cron touching the hub must not make idle tasks look alive.
@@ -125,7 +135,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         key: t.id,
         agent,
         session: meta.session ?? p?.session,
-        online,
         lastSeen: sessionSeen,
         taskId: t.id,
         goal: t.title,
@@ -150,7 +159,21 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         lastSignal: Math.max(p?.ts ?? 0, (t as any).updated_ts ?? 0),
       };
     });
-    // pinned first (meta.pinned), then subprocess/blocked, then in_progress;
+    // the live unblock twin is itself in_progress → already in the set; force
+    // it to NEST under its blocked parent (part_of when the server set it,
+    // title-convention match otherwise) so no blocked row stands alone.
+    const rowById = new Map(taskRows.map((r) => [r.taskId ?? r.key, r]));
+    const idByTitle = new Map((tasks as any[]).map((t) => [t.title, t.id]));
+    for (const twin of twinIdx.byPartOf.values()) {
+      const tr = rowById.get(twin.id);
+      if (tr) tr.partOf = twin.part_of;
+    }
+    for (const [parentTitle, twin] of twinIdx.byTitle) {
+      const tr = rowById.get(twin.id);
+      const pid = idByTitle.get(parentTitle);
+      if (tr && pid && !tr.partOf) tr.partOf = pid;
+    }
+    // pinned first (meta.pinned), then blocked, then in_progress;
     // within a bucket, most recent signal first
     const weight: Record<string, number> = { blocked: 0, in_progress: 1 };
     return taskRows.sort(
@@ -203,7 +226,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <div className="view-head">
         <h2>Top</h2>
-        <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
+        <span className="muted-note">fleet processes — status dot · agent · gauges · ages. blocked rows appear only with a pending human ask or a live unblock child; churn parks + lever-less blocks live in Backlog.</span>
       </div>
 
       <div className="ktable-head top-head">
@@ -223,15 +246,24 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
       {treeRows.flatMap(({ row: r, depth }) => {
         const asks: AskEntry[] = humanAsks.byTask.get(r.taskId ?? r.key) ?? [];
+        // every blocked row carries a child: its live unblock twin (nested via
+        // partOf), the human question (nested ask rows below), or — when the
+        // ask node isn't renderable (e.g. an answered GO awaiting execution) —
+        // a synthetic "awaiting you" child. No blocked row stands alone.
+        const needsAwaitChild = depth === 0 && r.status === "blocked"
+          && asks.length === 0 && !treeRows.some((x) => x.row.partOf === (r.taskId ?? r.key));
         return [
         <div
           key={r.key}
-          className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "ktable-child" : ""}`}
+          className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${depth > 0 ? "ktable-child" : ""}`}
           style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-task" title={r.taskId ?? ""}>
-            <ConnDot state={r.online ? "open" : "closed"} className="conn" title={r.online ? "online" : "offline"} />
+            <span
+              className={`top-sdot sd-${r.status ?? "none"}`}
+              title={STATUS_DOT_TITLE[r.status ?? ""] ?? r.status ?? ""}
+            />
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
           </span>
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
@@ -288,11 +320,19 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             <AskEntries entries={asks} onDone={bumpAsks} openDecision={openAskDetails} nested />
           </div>
         ),
+        needsAwaitChild && (
+          <div key={`${r.key}-await`} className="ktable-child top-await-note" onClick={() => r.taskId && openDetails(r.taskId)}>
+            <Chip tone="needs">awaiting you</Chip>
+            <span className="top-await-text" title={r.unblock ?? r.askPending ?? ""}>
+              {r.unblock || r.askPending || "human input required — open the card"}
+            </span>
+          </div>
+        ),
         ];
       })}
 
       {treeRows.length === 0 && (
-        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work."}</p>
+        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Blocked work without a pending ask or live unblock duty lives in Backlog."}</p>
       )}
 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}

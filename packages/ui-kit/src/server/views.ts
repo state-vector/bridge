@@ -63,3 +63,37 @@ export function kindOf(task: { tags?: string[] | null; meta?: any }): string {
 
 /** Task references (BR#12, TASK-007) inside arbitrary text — for hyperlinking. */
 export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+)\b/g;
+
+/* ---- blocked-park classes shared by Top + Backlog (2026-10-24 spec, Ray) ---- */
+
+/** Watchdog machine parks (churn guard / rework loop): nobody — human or
+ *  agent — can action these right now; the owning agent resumes or the park
+ *  lapses. Top excludes them; Backlog files them under TIMEOUT. */
+export const TIMEOUT_BLOCK_RX = /rework loop|churn guard/i;
+
+export function isTimeoutBlock(t: { status?: string; meta?: any }): boolean {
+  return t.status === "blocked" && TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
+}
+
+export interface UnblockTwinIndex {
+  byPartOf: Map<string, any>;
+  byTitle: Map<string, any>;
+}
+
+/** in_progress "Unblock: <parent title>" duty cards (role:unblock), keyed by
+ *  parent id (part_of) and by the watchdog's naming convention. */
+export function unblockTwinIndex(tasks: any[]): UnblockTwinIndex {
+  const byPartOf = new Map<string, any>();
+  const byTitle = new Map<string, any>();
+  for (const t of tasks ?? []) {
+    if (t.status !== "in_progress" || !(t.tags ?? []).includes("role:unblock")) continue;
+    if (t.part_of) byPartOf.set(t.part_of, t);
+    if (String(t.title ?? "").startsWith("Unblock: ")) byTitle.set(t.title.slice("Unblock: ".length), t);
+  }
+  return { byPartOf, byTitle };
+}
+
+/** The live unblock duty working this blocked task, if any. */
+export function activeUnblockTwinOf(t: any, idx: UnblockTwinIndex): any | undefined {
+  return idx.byPartOf.get(t.id) ?? idx.byTitle.get(t.title);
+}
