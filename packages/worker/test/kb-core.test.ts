@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   checkLimits,
-  parseRolesInput,
-  splitSystemTags,
-  validateRelation,
   ftsQuery,
   formatId,
   idSeq,
@@ -13,6 +10,7 @@ import {
   resolveRolePlaybook,
   sanitizeTags,
   taskKind,
+  validateRelation,
   validateTransition,
   verifyVerdictStatement,
 } from "../src/kb/core.ts";
@@ -264,72 +262,5 @@ describe("verify-verdict decision statement (human-facing ask prepended at creat
   it("stays well under the body limit so prepending never trips checkLimits", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", verify_target: "BR#123456", verdict: "pass", round: "12", session: "a-very-long-session-name-indeed" });
     expect(s.length).toBeLessThan(1000);
-  });
-});
-
-// ---------- BR#2983: question type, roles parsing, splitSystemTags migration ----------
-
-describe("question type (BR#2983)", () => {
-  it("question lifecycle: todo → done|superseded only — never claimed", () => {
-    expect(validateTransition("question", "todo", "done").ok).toBe(true);
-    expect(validateTransition("question", "todo", "superseded").ok).toBe(true);
-    expect(validateTransition("question", "todo", "in_progress").ok).toBe(false);
-    expect(validateTransition("question", "todo", "blocked").ok).toBe(false);
-  });
-  it("child_of: question may nest under its subject task; questions are never parents", () => {
-    expect(validateRelation("child_of", "question", "task").ok).toBe(true);
-    expect(validateRelation("child_of", "task", "task").ok).toBe(true);
-    expect(validateRelation("child_of", "task", "question").ok).toBe(false);
-    expect(validateRelation("child_of", "question", "question").ok).toBe(false);
-  });
-});
-
-describe("parseRolesInput", () => {
-  it("accepts bare names, tolerates role: prefix, dedupes", () => {
-    expect(parseRolesInput(null)).toEqual({ ok: true, roles: [] });
-    expect(parseRolesInput(["review"])).toEqual({ ok: true, roles: ["review"] });
-    expect(parseRolesInput(["role:unblock", "unblock"])).toEqual({ ok: true, roles: ["unblock"] });
-    expect(parseRolesInput("review, impl")).toEqual({ ok: true, roles: ["review", "impl"] });
-  });
-  it("rejects unknown roles loudly", () => {
-    expect(parseRolesInput(["reveiw"]).ok).toBe(false);
-    expect(parseRolesInput(["gateway"]).ok).toBe(false); // token trait, not an artefact role
-  });
-});
-
-describe("splitSystemTags (roles_v1 migration transform)", () => {
-  it("extracts role tags to bare roles, keeps user tags untouched", () => {
-    const out = splitSystemTags("task", ["role:review", "gtm", "role:analysis"], {}, 1);
-    expect(out.roles).toEqual(["review", "analysis"]);
-    expect(out.tags).toEqual(["gtm"]);
-    expect(out.type).toBe("task");
-    expect(out.changed).toBe(true);
-  });
-  it("question tag on a task becomes type question (asks v2 nodes)", () => {
-    const out = splitSystemTags("task", ["question", "gtm"], {}, 1);
-    expect(out.type).toBe("question");
-    expect(out.tags).toEqual(["gtm"]);
-  });
-  it("question tag on non-task types is dropped without a type change", () => {
-    const out = splitSystemTags("decision", ["question"], {}, 1);
-    expect(out.type).toBe("decision");
-  });
-  it("attempted tag backfills meta.attempt; existing attempt record wins", () => {
-    const a = splitSystemTags("task", ["attempted"], {}, 123);
-    expect(a.meta.attempt).toEqual({ by: "system:migration", at: 123, attempts: 1 });
-    const b = splitSystemTags("task", ["attempted"], { attempt: { by: "x", attempts: 5 } }, 123);
-    expect(b.meta.attempt.attempts).toBe(5);
-  });
-  it("legacy encodings via parseTags: bare strings, nested JSON, comma lists", () => {
-    const encodings = ['["role:impl","x"]', '"role:impl"', "role:impl", ["role:review"], ['"[\\\"role:z\\"]"']];
-    for (const enc of encodings) {
-      const out = splitSystemTags("task", parseTags(enc), {}, 1);
-      expect(out.roles.length).toBeGreaterThan(0);
-      expect(out.tags.some((t) => t.startsWith("role:"))).toBe(false);
-    }
-  });
-  it("pure user tags: unchanged, not a migration", () => {
-    const out = splitSystemTags("task", ["gtm", "deploy-train"], { a: 1 }, 1);
-    expect(out).toEqual({ type: "task", tags: ["gtm", "deploy-train"], roles: [], meta: { a: 1 }, changed: false });
   });
 });

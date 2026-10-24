@@ -107,7 +107,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id }),
+      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id, principal: identity.principal ?? null }),
     });
     const out = await r.json();
     if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
@@ -421,16 +421,15 @@ const TOOLS = [
         owner: { type: "string", description: "leave empty for tasks — work enters as unclaimed todo; set only to pre-assign" },
         project: { type: "string", description: "project slug, e.g. superpositional or bridge; defaults to the deployment's project" },
         qualified: { type: "boolean", description: "declare you already analysed this task — it goes ready for pickup (publishers are scored on the quality of their self-qualified tasks)" },
-        await: { type: "array", items: { type: "string" }, description: "stacked qualification: further confirmation required before pickup, e.g. [\"review\"] — satisfied by a done child of that role or an accepted decision" },
-        tags: { type: "array", items: { type: "string" }, description: "user-defined categories — fully free-form, no system meaning; they render and filter in the UI (e.g. [gtm, deploy-train, pricing])" },
-        roles: { type: "array", items: { type: "string", enum: ["impl", "analysis", "review", "unblock", "human"] }, description: "dispatch/gating lane for task children — what the machine enforces (verify children are review, unblock children unblock). Never express roles as tags." },
+        await: { type: "array", items: { type: "string" }, description: "stacked qualification: further confirmation required before pickup, e.g. [\"role:review\"] — satisfied by a done child of that role or an accepted decision" },
+        tags: { type: "array", items: { type: "string" }, description: "categories + role gating for tasks, e.g. [ingestion, role:impl]" },
         session: { type: "string", description: "your session name — attributes the card to your session" },
       },
     },
   },
   {
     name: "update_artefact",
-    description: "Edit title/body/meta/tags/roles. Does not change status — use transition.",
+    description: "Edit title/body/meta. Does not change status — use transition.",
     inputSchema: {
       type: "object",
       required: ["id"],
@@ -439,8 +438,6 @@ const TOOLS = [
         title: { type: "string" },
         body_md: { type: "string" },
         meta: { type: "object" },
-        tags: { type: "array", items: { type: "string" }, description: "replaces the user-defined category tags (free-form, inert)" },
-        roles: { type: "array", items: { type: "string", enum: ["impl", "analysis", "review", "unblock", "human"] }, description: "replaces the dispatch/gating roles" },
       },
     },
   },
@@ -559,10 +556,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["id", "answer"],
-      properties: {
-        id: { type: "string", description: "BR# id of the question task to answer (asks are BR#-numbered question nodes, not ASK-* artefact ids)" },
-        answer: { type: "string" },
-      },
+      properties: { id: { type: "string" }, answer: { type: "string" } },
     },
   },
 ];

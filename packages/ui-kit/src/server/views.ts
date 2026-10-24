@@ -50,16 +50,14 @@ export function presenceLabel(p: Presence): string {
   return p.label && p.label !== p.id ? p.label : (p.id.split(":")[1] ?? p.id);
 }
 
-/** What the task IS: question / verify / analysis / research / impl.
- *  Structural: type + roles column (BR#2983) — tags are inert user labels
- *  and can no longer change the kind. */
-export function kindOf(task: { type?: string; roles?: string[] | null; tags?: string[] | null; meta?: any }): string {
+/** What the task IS: question / verify / analysis / research / impl. */
+export function kindOf(task: { tags?: string[] | null; meta?: any }): string {
+  const tags = (task.tags ?? []) as string[];
   const m = task.meta ?? {};
-  if (task.type === "question" || m.kind === "question") return "question";
-  const roles = (task.roles ?? []) as string[];
-  if (roles.includes("review") || m.kind === "review") return "verify";
-  if (roles.includes("analysis") || m.kind === "analysis") return "analysis";
-  if ((task.tags ?? []).includes("research")) return "research";
+  if (m.kind === "question" || tags.includes("question")) return "question";
+  if (tags.includes("role:review") || m.kind === "review") return "verify";
+  if (tags.includes("role:analysis") || m.kind === "analysis") return "analysis";
+  if (m.kind === "research") return "research";
   return "impl";
 }
 
@@ -82,13 +80,13 @@ export interface UnblockTwinIndex {
   byTitle: Map<string, any>;
 }
 
-/** in_progress "Unblock: <parent title>" duty cards (roles: ["unblock"]),
- *  keyed by parent id (part_of) and by the watchdog's naming convention. */
+/** in_progress "Unblock: <parent title>" duty cards (role:unblock), keyed by
+ *  parent id (part_of) and by the watchdog's naming convention. */
 export function unblockTwinIndex(tasks: any[]): UnblockTwinIndex {
   const byPartOf = new Map<string, any>();
   const byTitle = new Map<string, any>();
   for (const t of tasks ?? []) {
-    if (t.status !== "in_progress" || !(t.roles ?? []).includes("unblock")) continue;
+    if (t.status !== "in_progress" || !(t.tags ?? []).includes("role:unblock")) continue;
     if (t.part_of) byPartOf.set(t.part_of, t);
     if (String(t.title ?? "").startsWith("Unblock: ")) byTitle.set(t.title.slice("Unblock: ".length), t);
   }

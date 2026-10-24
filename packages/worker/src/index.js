@@ -156,9 +156,8 @@ export default {
       if (auth instanceof Response) return auth;
       const body = await request.json().catch(() => ({}));
       // the actor is the human session (this op only exists on the human
-      // plane) — the LOGIN rides along (web:<login>) so the audit names WHO
-      // approved, never the identity-less fallback "web"
-      body.actor = `web:${auth.login ?? "anon"}`;
+      // plane); the DO stamps the audit with it
+      body.actor = "web";
       const kbId = env.KB.idFromName(doWs(auth.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",
@@ -183,6 +182,23 @@ export default {
       if (auth instanceof Response) return kbCors(auth);
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
+      // Loud-failure boundary (2026-10-24 naked-500 incident: a transient DO
+      // reset on ask_answer surfaced as an unattributed 500 with no log, no
+      // audit — the exact failure was unrecoverable afterwards). The DO's own
+      // op errors return 4xx with a message; anything that REJECTS here is a
+      // transport/runtime fault: log it (tail + observability) and return a
+      // 502 naming the fault so the client can retry with a cause, never a
+      // naked 500. No auto-retry: POSTs are non-idempotent (create), the
+      // client decides.
+      const kbDo = async (kbUrl, init) => {
+        try {
+          return await env.KB.get(kbId).fetch(kbUrl, init);
+        } catch (e) {
+          const fault = String((e && e.message) || e).slice(0, 200);
+          console.error(`kb DO fetch failed op=${kbUrl.replace("https://kb/", "")} ws=${auth.ws} fault=${fault}`);
+          return kbCors(json({ error: `knowledge hub unreachable: ${fault}`, retryable: true }, 502));
+        }
+      };
       if (request.method === "GET") {
         const kbUrl = sub === "board" ? "https://kb/board"
           : sub === "events" ? "https://kb/events"
@@ -193,33 +209,32 @@ export default {
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
-          : sub === "metrics/throughput" ? "https://kb/metrics.throughput"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
-        return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
+        return kbCors(await kbDo(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
-        return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
+        body.actor = auth.bearer ? "gateway" : "web";
+        return kbCors(await kbDo("https://kb/ask.reframe", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
       if (sub === "purge_smoke" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
-        return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
+        body.actor = auth.bearer ? "gateway" : "web";
+        return kbCors(await kbDo("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        body.actor = auth.bearer ? "gateway" : "web";
         // do ops are dot-namespaced (ask.answer); the web plane uses snake_case
-        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
+        return kbCors(await kbDo(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),

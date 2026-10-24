@@ -14,8 +14,6 @@ export interface KbArtefact {
   title: string;
   status: string;
   tags?: string[] | null;
-  /** dispatch/gating lanes (review/unblock/analysis/…) — structural, never tags (BR#2983) */
-  roles?: string[] | null;
   board?: string | null;
   owner?: string;
   body_md?: string;
@@ -80,16 +78,6 @@ export interface KbSeriesPoint {
   confidence_pct?: number;
   risk_pct?: number;
   context_pct?: number;
-}
-
-/** Task-done throughput (BR#2937): done transitions per bucket + cumulative. */
-export interface KbThroughput {
-  bucket: string;
-  range_days: number;
-  from_ts: number;
-  to_ts: number;
-  total: number;
-  buckets: Array<{ t: number; n: number; cumulative: number }>;
 }
 
 /** One entry of an artefact's version history: every mutation, who/when/what. */
@@ -160,10 +148,6 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const kbApi = {
   board: () => j<KbBoard>("/api/kb/board"),
-  throughput: (q?: { bucket?: "day" | "week"; range?: string }) => {
-    const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
-    return j<KbThroughput>(`/api/kb/metrics/throughput${p.size ? `?${p}` : ""}`);
-  },
   events: (since: number) => j<{ events: KbEvent[]; last_seq: number }>(`/api/kb/events?since=${since}&limit=200`),
   artefacts: (q?: { type?: string; status?: string; limit?: number }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
@@ -183,13 +167,13 @@ export const kbApi = {
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
   progressGauges: (body: { id: string; note: string; sentiment?: string; completion_pct?: number; confidence_pct?: number; risk_pct?: number }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify(body) }),
-  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string; tags?: string[]; roles?: string[] }) =>
+  create: (body: { type: string; title: string; body_md?: string; meta?: object; owner?: string }) =>
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
-  update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[]; roles?: string[] }) =>
+  update: (id: string, patch: { title?: string; body_md?: string; meta?: object }) =>
     j<{ id: string }>("/api/kb/update", { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 
   // admin (connect page) — cookie-session only; tokens are rejected by design

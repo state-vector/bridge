@@ -405,52 +405,6 @@ var init_core = __esm({
   }
 });
 
-// src/kb/throughput.ts
-function parseThroughputParams(bucket, range) {
-  const b = String(bucket ?? "day");
-  if (!(b in BUCKET_MS)) return { error: `bucket must be one of ${Object.keys(BUCKET_MS).join(", ")} (got '${b}')` };
-  const m = /^(\d{1,3})d?$/.exec(String(range ?? "30d"));
-  if (!m) return { error: `range must look like '30d' or '30' (got '${String(range)}')` };
-  const days = parseInt(m[1], 10);
-  if (days < 1 || days > 365) return { error: `range must be 1-365 days (got ${days})` };
-  return { bucket: b, rangeDays: days };
-}
-function aggregateThroughput(events, fallback, opts) {
-  const bucketMs = BUCKET_MS[opts.bucket];
-  const to = opts.now;
-  const from = to - opts.rangeDays * 864e5;
-  const lastStart = Math.floor(to / bucketMs) * bucketMs;
-  const firstStart = lastStart - (Math.ceil(opts.rangeDays * 864e5 / bucketMs) - 1) * bucketMs;
-  const nBuckets = Math.round((lastStart - firstStart) / bucketMs) + 1;
-  const buckets = Array.from({ length: nBuckets }, (_, i) => ({ t: firstStart + i * bucketMs, n: 0, cumulative: 0 }));
-  const seenViaEvent = /* @__PURE__ */ new Set();
-  let running = 0;
-  const idxOf = /* @__PURE__ */ __name((ts) => ts < from ? -1 : Math.floor(ts / bucketMs) - Math.floor(firstStart / bucketMs), "idxOf");
-  for (const e of events) {
-    seenViaEvent.add(e.artefact_id);
-    const idx = idxOf(e.ts);
-    if (idx >= 0 && idx < nBuckets) buckets[idx].n++;
-  }
-  for (const f of fallback) {
-    if (seenViaEvent.has(f.id)) continue;
-    const idx = idxOf(f.status_ts);
-    if (idx >= 0 && idx < nBuckets) buckets[idx].n++;
-  }
-  for (const b of buckets) {
-    running += b.n;
-    b.cumulative = running;
-  }
-  return buckets;
-}
-var BUCKET_MS;
-var init_throughput = __esm({
-  "src/kb/throughput.ts"() {
-    BUCKET_MS = { day: 864e5, week: 7 * 864e5 };
-    __name(parseThroughputParams, "parseThroughputParams");
-    __name(aggregateThroughput, "aggregateThroughput");
-  }
-});
-
 // src/kb/machine.ts
 function effectiveRole(tags) {
   if (tags.includes("role:review")) return "review";
@@ -644,7 +598,6 @@ var KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
     init_core();
-    init_throughput();
     init_machine();
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
@@ -1445,31 +1398,25 @@ var init_do = __esm({
           return this.json({ ok: true, from: old.label, to: newLabel });
         }
         if (request.method === "GET") {
-          try {
-            switch (url.pathname) {
-              case "/artefacts":
-                return this.json(await this.list({ type: url.searchParams.get("type") ?? void 0, status: url.searchParams.get("status") ?? void 0, tag: url.searchParams.get("tag") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
-              case "/artefact":
-                return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
-              case "/search":
-                return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
-              case "/events":
-                return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-              case "/board":
-                return this.json(await this.board());
-              case "/stats":
-                return this.json(await this.stats());
-              case "/metrics.throughput":
-                return this.json(await this.metricsThroughput(url.searchParams));
-              case "/history":
-                return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
-              case "/ask": {
-                const a = await this.askGet(String(url.searchParams.get("id")));
-                return a ? this.json(a) : this.json({ error: "no such ask" }, 404);
-              }
+          switch (url.pathname) {
+            case "/artefacts":
+              return this.json(await this.list({ type: url.searchParams.get("type") ?? void 0, status: url.searchParams.get("status") ?? void 0, tag: url.searchParams.get("tag") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
+            case "/artefact":
+              return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+            case "/search":
+              return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
+            case "/events":
+              return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+            case "/board":
+              return this.json(await this.board());
+            case "/stats":
+              return this.json(await this.stats());
+            case "/history":
+              return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
+            case "/ask": {
+              const a = await this.askGet(String(url.searchParams.get("id")));
+              return a ? this.json(a) : this.json({ error: "no such ask" }, 404);
             }
-          } catch (e) {
-            return this.json({ error: String(e.message ?? e) }, 400);
           }
         }
         const op = url.pathname.slice(1);
@@ -2494,47 +2441,6 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
           id
         ).toArray();
         return { id, relations: out };
-      }
-      /** Task-done throughput (BR#2937): done transitions per bucket + cumulative,
-       *  aggregated from ledger mutation rows (true transition events — immune to
-       *  later status flips) with a status_ts fallback for rows whose history has
-       *  compacted. Read-only; no audit (reads don't ledger). */
-      async metricsThroughput(sp) {
-        const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
-        if ("error" in parsed) throw new Error(parsed.error);
-        const now = Date.now();
-        const from = now - parsed.rangeDays * 864e5;
-        const taskIds = new Set(
-          this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task'`).toArray().map((r) => String(r.id))
-        );
-        const events = [];
-        for (const r of this.state.storage.sql.exec(
-          `SELECT ts, artefact_id, data FROM ledger
-       WHERE kind = 'mutation' AND action = 'transition' AND ts >= ? AND data LIKE '%"to":"done"%'`,
-          from
-        ).toArray()) {
-          let to = "";
-          try {
-            to = String(JSON.parse(r.data ?? "{}").to ?? "");
-          } catch {
-            continue;
-          }
-          if (to !== "done" || !taskIds.has(String(r.artefact_id))) continue;
-          events.push({ ts: Number(r.ts), artefact_id: String(r.artefact_id) });
-        }
-        const fallback = this.state.storage.sql.exec(
-          `SELECT id, status_ts FROM artefacts WHERE type = 'task' AND status = 'done' AND status_ts >= ?`,
-          from
-        ).toArray().map((r) => ({ id: String(r.id), status_ts: Number(r.status_ts) }));
-        const buckets = aggregateThroughput(events, fallback, { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now });
-        return {
-          bucket: parsed.bucket,
-          range_days: parsed.rangeDays,
-          from_ts: buckets[0]?.t ?? from,
-          to_ts: now,
-          total: buckets.reduce((n, b) => n + b.n, 0),
-          buckets
-        };
       }
       async stats() {
         const byType = this.state.storage.sql.exec(
@@ -4400,7 +4306,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "129b5616871dce3b325eff6f00027c35046a8708", built_at: "2026-10-24T10:29:30Z" };
+    module.exports = { commit: "129b5616871dce3b325eff6f00027c35046a8708", built_at: "2026-10-24T10:09:44Z" };
   }
 });
 
@@ -9272,16 +9178,25 @@ var index_default = {
       if (auth2 instanceof Response) return kbCors(auth2);
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       const sub = url.pathname.slice("/api/kb/".length);
+      const kbDo = /* @__PURE__ */ __name(async (kbUrl, init) => {
+        try {
+          return await env.KB.get(kbId).fetch(kbUrl, init);
+        } catch (e) {
+          const fault = String(e && e.message || e).slice(0, 200);
+          console.error(`kb DO fetch failed op=${kbUrl.replace("https://kb/", "")} ws=${auth2.ws} fault=${fault}`);
+          return kbCors(json2({ error: `knowledge hub unreachable: ${fault}`, retryable: true }, 502));
+        }
+      }, "kbDo");
       if (request.method === "GET") {
-        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "metrics/throughput" ? "https://kb/metrics.throughput" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
+        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
-        return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
+        return kbCors(await kbDo(kbUrl + url.search, request));
       }
       if (request.method === "POST") {
         if (sub === "ask_reframe" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
           body2.actor = auth2.bearer ? "gateway" : "web";
-          return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
+          return kbCors(await kbDo("https://kb/ask.reframe", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(body2)
@@ -9290,7 +9205,7 @@ var index_default = {
         if (sub === "purge_smoke" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
           body2.actor = auth2.bearer ? "gateway" : "web";
-          return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
+          return kbCors(await kbDo("https://kb/purge_smoke", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(body2)
@@ -9300,7 +9215,7 @@ var index_default = {
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
         body.actor = auth2.bearer ? "gateway" : "web";
-        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
+        return kbCors(await kbDo(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body)

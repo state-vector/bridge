@@ -37,8 +37,6 @@ interface Snapshot {
   max_sessions: number;
   in_flight: InFlight[];
   activity: Activity[];
-  logout_reason?: string | null; // set when the run gate auto-signs-out (BR#2532) — rendered on the pair screen
-  logout_ts?: number | null;
 }
 /** Mirrors dispatch.rs DispatchConfig (serde). */
 interface Cfg {
@@ -130,11 +128,6 @@ export function App() {
 
   // signed in = the human session exists and is live (probe clears dead sessions)
   const paired = !!session?.signed_in;
-  // BR#2532: the 2s poll compares keychain-token presence against this ref —
-  // config reloads only when the token flips under us (re-reading on every
-  // tick would clobber in-flight settings edits). The sign-in screen then
-  // shows the guided auto-logout notice from the snapshot.
-  const pairedRef = useRef(false);
 
   const refreshSession = useCallback(async () => {
     try {
@@ -152,6 +145,9 @@ export function App() {
       void refreshSession();
     });
   }, [refreshSession]);
+
+
+
 
 
   // native menu (tray + app menu) actions arrive as events
@@ -210,7 +206,6 @@ export function App() {
       const c = await invoke<Cfg | null>("dispatch_config");
       if (c) {
         setCfg(c);
-        pairedRef.current = !!c.token;
         setMaxSessions(c.max_sessions);
         // backends dict (new) or legacy array + flat maps
         const sections: Record<string, { model?: string; agent?: string }> = {};
@@ -272,17 +267,7 @@ export function App() {
   useEffect(() => {
     void pull();
     void loadCfg();
-    const t = setInterval(async () => {
-      void pull();
-      // BR#2532: notice an involuntary sign-out — the run gate erases the
-      // token under us, so reload config only when the paired-bit flips
-      // (re-reading on every tick would clobber in-flight settings edits).
-      // The pair screen then shows the guided logout notice from the snapshot.
-      try {
-        const c = await invoke<Cfg | null>("dispatch_config");
-        if (!!c?.token !== pairedRef.current) await loadCfg();
-      } catch { /* no shell */ }
-    }, 2000);
+    const t = setInterval(() => void pull(), 2000);
     return () => clearInterval(t);
   }, [pull, loadCfg]);
 
@@ -306,18 +291,6 @@ export function App() {
         <main className="gw-main">
           <Card>
             <h2>Sign in to Bridge</h2>
-            {snap?.logout_reason && (
-              <div style={{
-                marginBottom: 14, padding: "10px 12px", borderRadius: 8,
-                border: "1px solid var(--line)", background: "var(--panel, transparent)",
-              }}>
-                <span className="k-err" style={{ display: "block", whiteSpace: "pre-wrap" }}>{snap.logout_reason}</span>
-                <span className="gw-note" style={{ display: "block", marginTop: 6 }}>
-                  Signing back in is one click: your hub URL below is kept — press Sign in with GitHub and approve
-                  in your browser (the page opens itself). A fresh gateway-class token is vended for this same device.
-                </span>
-              </div>
-            )}
             <div className="gw-row">
               <TextInput style={{ flex: 1 }} value={hubUrl} placeholder="https://bridge…workers.dev"
                 onChange={(e) => setHubUrl(e.target.value)} />

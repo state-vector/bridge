@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the gateway identity is labelled with the hostname slug (e.g. `macbookpro`) and tagged with the gateway class, which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
+Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the identity becomes `gw-<hostname>` (e.g. `gw-macbookpro`), which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
 
 Prefer building from source?
 
@@ -79,10 +79,8 @@ bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
 loginctl enable-linger $USER   # run at boot, survive logout
-tail -f ~/bridge.log           # watch the dispatch log
+journalctl --user -u bridge -f # watch the dispatch log
 ```
-
-The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
 Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
 
@@ -92,14 +90,13 @@ The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge
 view components (Top, Backlog, Completed, task detail with dep graph and
 live work tree) from the shared kit `@bridge/ui-kit`, over the same data
 layer — the desktop opens a live WebSocket to the hub with its paired
-gateway-class token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
+`gw-*` token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
 cookie-only), so both surfaces always look and update identically.
 
-Beyond dispatch it carries three human-facing surfaces:
+Beyond dispatch it carries two human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
 - **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). Verify-verdict notifications state the ask ("Accept verification of BR#X? — verdict PASS"), not the raw receipts title. No runner required.
-- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade, or a token the hub rejects), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates.
 
 ### Runner config file
 
@@ -150,17 +147,15 @@ Notes:
   one; the CLI's own default is how a stale pin silently downgrades a fleet).
   Kiro is profile-driven, so it needs no model entry.
 - **Identity**: gateways and agents share one label namespace with a class
-  boundary — gateway tokens are infrastructure labelled with the hostname slug
-  (e.g. `macbookpro`) and tagged with the gateway class; they are never task
-  owners, and agent labels (`opencode-ray`) never take the gateway tag. The
-  boundary is enforced at mint, pairing, rename and
+  boundary — gateway tokens are infrastructure named `gw-<hostname>` (e.g.
+  `gw-macbookpro`) and never task owners; agent labels (`opencode-ray`) never
+  take the `gw-` prefix. The boundary is enforced at mint, pairing, rename and
   tag-edit time: a mis-named token is rejected, not rendered wrong. Connect
   shows gateways with the agents they dispatched, attributed agents nested
   under their gateway. Dispatched work is attributed to the agent the gateway
   dispatched as, named `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or
   overridden with `"agent_name"` in the config. Legacy tokens keep their
-  labels — the boundary is enforced by the gateway tag on the token, never
-  by the name.
+  labels — pair a new device as a gateway (or mint `gw-*`) to get the law.
 - **Model cost**: whatever you set here is what every dispatched session uses.
   Check the opencode CLI's own config (`~/.config/opencode/opencode.json`,
   `"model"` key) if spend looks high despite a pin here.
@@ -236,35 +231,6 @@ not by client convention.
 - Subagent prompt seed: the pinned card at `packages/adapters/bridge-protocol-card.md`.
 - Full contract: `docs/roles-and-playbooks.md`.
 
-On **tasks**, roles live in a dedicated `roles` column — `create_artefact { roles: ["review"] }` —
-never in tags. `tags` are 100% free-form user/agent labels (themes like `gtm`, `deploy-train`,
-`pricing`): they render as chips and drive the filterable theme bar in Top and Backlog, but they
-never change system behaviour — tagging a task `role:review` does nothing. **Questions are their
-own artefact type** (`type: "question"`; asks create them automatically): open participation,
-answered via the ask band or progress entries, closed to done/superseded — never claimed.
-
-## The ask contract: asks are question nodes
-
-`ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
-`type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
-subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
-`in_progress`. Three fields are the whole contract, enforced server-side (`askCreate` /
-`askAnswer` in `packages/worker/src/kb/do.ts`):
-
-- **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes
-  the node title. Status reports are rejected at the door — receipts and narrative go in `details`.
-- **`reason` — the why_escalated.** Mandatory on human-directed asks (rejected without it):
-  one sentence on why this is escalated instead of automatic — the gate, credential or
-  authority it waits on. ≤400 chars.
-- **`options` — the decision.** 2–8 one-click answers (rejected with fewer): the recorded
-  click is the answer, and it closes the question `done`.
-
-Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
-`TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
-any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
-artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
-open ask with its options as one-click buttons.
-
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
@@ -282,19 +248,6 @@ npm run test -w packages/worker  # worker tests (syntax → tsc --noEmit typeche
 npm run typecheck -w packages/worker  # worker type gate only — TS2304-class undefined names (the Oct 2026 board-500 bug class) fail here at any strictness
 ```
 
-### Shared UI kit
-
-Every surface (web, gateway UI, mobile) renders from one component kit,
-`packages/ui-kit` (`@bridge/ui-kit`): design tokens (`tokens.css`) plus
-`Btn` / `Chip` / `Card` / `Field` / `TextInput` / `TextArea` / `Select` /
-`ActionRow` / `FormRow` / `ConnDot` / `RelTime`. Import the css once per
-shell (`@bridge/ui-kit/ui-kit.css`, tokens included) and use the
-components — surfaces keep layout css only and may re-point tokens (the
-webapp overrides the palette in its `:root`; mobile sets
-`--kit-radius: 12px` for touch scale). No surface re-declares button,
-chip, card or field styles: the drift those per-surface copies caused is
-the bug this kit removes.
-
 **Docs are part of the change.** README.md and `packages/site/content.md`
 describe shipped behaviour — a change that alters user-visible behaviour
 (UI, config, protocol, gates) updates both in the same commit. Agents get
@@ -308,7 +261,6 @@ contract.
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
 | `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
 | `packages/webapp` | the full web UI (browser-only — no shell forks) |
-| `packages/ui-kit` | `@bridge/ui-kit` — shared design tokens + Btn/Chip/Card/Field/ConnDot/RelTime; one look for webapp, gateway UI and mobile |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
 | `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |
