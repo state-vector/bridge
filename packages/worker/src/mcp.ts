@@ -559,7 +559,10 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["id", "answer"],
-      properties: { id: { type: "string" }, answer: { type: "string" } },
+      properties: {
+        id: { type: "string", description: "BR# id of the question task to answer (asks are BR#-numbered question nodes, not ASK-* artefact ids)" },
+        answer: { type: "string" },
+      },
     },
   },
 ];
