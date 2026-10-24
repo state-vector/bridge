@@ -106,7 +106,11 @@ updating the same file). **Credentials never live there**: the gateway token
 is stored in the OS keychain (data-protection keychain on signed macOS
 builds; `~/.bridge/gateway-token`, mode 0600, on unsigned dev builds and
 Linux), and the device principal is write-once at `~/.bridge/principal`
-(0600) — `bridge reset-principal` is the only local clear:
+(0600) — `bridge reset-principal` is the only local clear. The principal is
+the device credential and anchors identity: the hub vends it on first pairing
+(24 random bytes, generated once, never regenerated), the device presents it
+on every pairing and desktop login, and re-pairing or re-login rotates the
+gateway token in place against it — the hostname is a display label only:
 
 ```jsonc
 {

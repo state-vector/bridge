@@ -596,7 +596,6 @@ export class KnowledgeHub {
         label TEXT NOT NULL UNIQUE,
         hash TEXT NOT NULL UNIQUE,
         tags TEXT NOT NULL DEFAULT '[]',
-        device_id TEXT,
         principal TEXT,
         transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
@@ -644,7 +643,6 @@ export class KnowledgeHub {
         code TEXT PRIMARY KEY,
         device TEXT NOT NULL,
         type TEXT,
-        device_id TEXT,
         principal TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         ws TEXT,
@@ -867,8 +865,6 @@ export class KnowledgeHub {
       `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE pairings ADD COLUMN type TEXT`,
-      `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
-      `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
       `ALTER TABLE pairings ADD COLUMN principal TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
       `ALTER TABLE sessions ADD COLUMN kind TEXT`,
@@ -2985,11 +2981,13 @@ export class KnowledgeHub {
     // self-paired), so an absent/unrecognized type defaults to gateway —
     // legacy CLIs that predate the field pair as gateways too.
     const type = body.type === "agent" ? "agent" : "gateway";
-    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
     const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
     this.state.storage.sql.exec(
-      `INSERT INTO pairings (code, device, type, device_id, principal, status, created_ts) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-      code, String(body.device ?? "device").slice(0, 80), type, device_id, principal, now,
+      `INSERT INTO pairings (code, device, type, principal, status, created_ts) VALUES (?, ?, ?, ?, 'pending', ?)`,
+      // host is the DISPLAY name (BR#899: labels display, the device
+      // credential anchors); body.device fallback covers desktops predating
+      // the field rename
+      code, String(body.host ?? body.device ?? "device").slice(0, 80), type, principal, now,
     );
     return { code, type, expires_ts: now + KnowledgeHub.PAIR_TTL_MS };
   }
@@ -3012,7 +3010,7 @@ export class KnowledgeHub {
     const ws = String(body.ws ?? "").trim();
     const label = String(body.label ?? "").trim();
     const login = String(body.login ?? "").toLowerCase();
-    const row = this.one(`SELECT code, created_ts, status, device, type, device_id, principal FROM pairings WHERE code = ?`, code);
+    const row = this.one(`SELECT code, created_ts, status, device, type, principal FROM pairings WHERE code = ?`, code);
     if (!row || row.status !== "pending") throw new Error("pairing code not pending");
     if (Date.now() - row.created_ts > KnowledgeHub.PAIR_TTL_MS) {
       this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
@@ -3036,7 +3034,7 @@ export class KnowledgeHub {
     const mintRes = await stub.fetch("https://kb/admin.mint", {
       method: "POST",
       headers: { "content-type": "application/json", "x-kb-admin": "1" },
-      body: JSON.stringify({ label, tags, device_id: row.device_id ?? null, principal: row.principal ?? null }),
+      body: JSON.stringify({ label, tags, principal: row.principal ?? null }),
     });
     const minted = await (mintRes as any).json();
     if (!(mintRes as any).ok || !minted.secret) {
@@ -3122,8 +3120,8 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-      id, label, hash, tags, body.device_id ?? null, body.principal ?? null, ts,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+      id, label, hash, tags, body.principal ?? null, ts,
     );
     const ws = this.wsSlug();
     if (ws) {
@@ -3200,14 +3198,18 @@ export class KnowledgeHub {
     if (label.includes("/") && !label.startsWith("_direct/")) {
       throw new Error("labels cannot contain '/' — only the reserved _direct/ root (directly connected agents) may");
     }
-    const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
+    // The device credential (principal) is the rotation anchor — BR#2711 §2:
+    // labels are display; the hub-vended, generate-once-never-change
+    // credential keys replace-on-re-pair (no IOPlatformUUID, no device_id —
+    // both withdrawn).
+    const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
     // Replace semantics (pairing is an approval): the same machine re-pairing
     // rotates its token — renamed or not — and re-using a label REPLACES the
     // token that held it. A name has exactly one live token; nothing
     // accumulates, nothing dead-ends on "already exists".
     const secret = generateAuthToken();
     const hash = await hashAuthToken(secret);
-    let own = device_id ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id) : null;
+    let own = principal ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ?`, principal) : null;
     const byLabel = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE label = ?`, label);
     if (own && byLabel && own.id !== byLabel.id) {
       // renaming this machine onto another token's name: that identity is
@@ -3221,8 +3223,8 @@ export class KnowledgeHub {
       // not leave the row carrying the replaced token's stale tags
       const mintTags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
       this.state.storage.sql.exec(
-        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, device_id = COALESCE(?, device_id), principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
-        hash, label, JSON.stringify(mintTags), device_id, body.principal ?? null, target.id,
+        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
+        hash, label, JSON.stringify(mintTags), principal, target.id,
       );
       const ws = this.wsSlug();
       if (ws) {
@@ -3240,8 +3242,8 @@ export class KnowledgeHub {
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, label, hash, JSON.stringify(tags), transport, device_id, body.principal ?? null, ts,
+      `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      id, label, hash, JSON.stringify(tags), transport, principal, ts,
     );
     // register hash → workspace in the central registry so /mcp routes this
     // token here. Registry failure must fail the mint — a silently unregistered
