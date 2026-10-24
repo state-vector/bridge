@@ -314,8 +314,7 @@ export function App() {
                 <span className="k-err" style={{ display: "block", whiteSpace: "pre-wrap" }}>{snap.logout_reason}</span>
                 <span className="gw-note" style={{ display: "block", marginTop: 6 }}>
                   Signing back in is one click: your hub URL below is kept — press Sign in with GitHub and approve
-                  in your browser (the page opens itself). A fresh gateway-class token is vended for this device
-                  and listed as <span className="gw-mono">gw-&lt;hostname&gt;</span>.
+                  in your browser (the page opens itself). A fresh gateway-class token is vended for this same device.
                 </span>
               </div>
             )}
