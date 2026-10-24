@@ -2606,14 +2606,17 @@ export class KnowledgeHub {
     // so a gateway's my_tasks is a prefix glob — its own label plus everything
     // under it — with the gateway_agents edges kept for legacy unprefixed
     // workers.
+    // `tags` rides my_tasks items (BR#2844 contract): the runner reads
+    // role:* off them to route resumes — for months it read a key the hub
+    // never sent (the silent-zero class); the contract now pins it.
     const myTasks = this.state.storage.sql.exec(
-      `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+      `SELECT id, title, status, tags FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
        AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '/'
             OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
             OR owner = ?)
        ORDER BY updated_ts DESC LIMIT 10`,
       label, label, label, label, body.principal ?? null,
-    ).toArray();
+    ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
     // (a blocked card with an unblock condition is actionable — unblocking is
     // priority work). Rank-then-slice: fetch the full open pool FIRST, rank in

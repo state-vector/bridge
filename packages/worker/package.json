@@ -12,6 +12,7 @@
     "check": "npm run build -w @bridge/webapp && wrangler deploy --dry-run"
   },
   "dependencies": {
+    "@bridge/contracts": "*",
     "jose": "^5.9.6"
   },
   "devDependencies": {

@@ -253,6 +253,60 @@ impl TokenStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn saved_config_matches_the_checked_in_contracts_schema() {
+        // BR#2844: packages/contracts/config.schema.json is THE config shape;
+        // this single-writer module serializes through it. A serde field
+        // added without a contract update breaks here (and the contracts
+        // regen-diff test breaks the mirror direction), so the two can only
+        // move together.
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/config.schema.json"
+        ))
+        .expect("contracts config schema parses");
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema properties");
+        let mut cfg: DispatchConfig = crate::dispatch::default_config();
+        cfg.normalize();
+        let written = serde_json::to_value(&cfg).expect("config serializes");
+        let keys: Vec<&String> = written.as_object().expect("object").keys().collect();
+        assert!(
+            !keys.is_empty(),
+            "the writer emitted no keys — serialization is broken"
+        );
+        for k in &keys {
+            assert!(
+                props.contains_key(*k),
+                "config key `{k}` is written but absent from packages/contracts/config.schema.json — update the contract in the same PR (BR#2844)"
+            );
+        }
+        let required = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("schema required set");
+        for r in required {
+            let r = r.as_str().expect("required entries are strings");
+            assert!(
+                keys.contains(&&r.to_string()),
+                "the contract requires `{r}` but the writer omits it — the single writer drifted from the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_config_never_holds_a_credential() {
+        // The keychain law (BR#2840) + the principal file law, pinned against
+        // the contract's forbidden keys (BR#2844 CONFIG_FORBIDDEN_KEYS).
+        let mut cfg: DispatchConfig = crate::dispatch::default_config();
+        cfg.normalize();
+        let written = serde_json::to_value(&cfg).unwrap();
+        let obj = written.as_object().unwrap();
+        assert!(!obj.contains_key("token"), "config.json never holds the token — it lives in the OS keychain");
+        assert!(!obj.contains_key("principal"), "principal is its own write-once file (BR#2840), never a config key");
+    }
+
     fn temp_root(tag: &str) -> PathBuf {
         let uniq = format!(
             "{}-{}",

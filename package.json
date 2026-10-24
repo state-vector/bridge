@@ -4,6 +4,7 @@
   "type": "module",
   "description": "bridge: work orchestration for agents + humans — web app first",
   "workspaces": [
+    "packages/contracts",
     "packages/specs",
     "packages/ui-kit",
     "packages/worker",
