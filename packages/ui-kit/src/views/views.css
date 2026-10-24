@@ -859,3 +859,44 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .topc-goal { display: flex; align-items: center; gap: 6px; }
 .topc-goal .top-will { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topc-goal .kind-pill { flex: 0 0 auto; }
+
+/* ============================================================
+   KTABLE — THE table primitive. One place owns grid rows, column
+   alignment, clipping, borders, hover. Every table view (Top,
+   Backlog, future) sets --cols and uses these classes. No per-view
+   layout CSS, ever again.
+   ============================================================ */
+.ktable-head, .ktable-row {
+  display: grid;
+  grid-template-columns: var(--cols, none);
+  gap: 8px;
+  align-items: center;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+.ktable-head {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint, #8b94a7);
+  border-bottom: 1px solid var(--line, #232b3b);
+}
+.ktable-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--line, #232b3b) 55%, transparent);
+}
+.ktable-row:hover { background: color-mix(in srgb, var(--accent, #5b9dff) 5%, transparent); }
+.ktable-head > *, .ktable-row > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ktable-child { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent, #5b9dff) 40%, transparent); padding-left: 20px; }
+
+/* per-table column templates — layout lives ONLY here, as --cols */
+.top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
+.backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
+@media (max-width: 1280px) {
+  .topc-session, .topc-gauge, .top-sent { display: none; }
+  .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
+}

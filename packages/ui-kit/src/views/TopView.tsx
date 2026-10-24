@@ -206,7 +206,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <span className="muted-note">fleet processes — agent · goal · status · compliance · gauges · ages. children indented under their parent.</span>
       </div>
 
-      <div className="top-head">
+      <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
         <span className="topc-agent">machine / agent</span>
         <span className="topc-session">session</span>
@@ -226,7 +226,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         return [
         <div
           key={r.key}
-          className={`top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "top-row-child" : ""}`}
+          className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${r.status === "blocked" && r.blockedClass !== "subprocess" ? "top-blocked" : ""} ${depth > 0 ? "ktable-child" : ""}`}
           style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >

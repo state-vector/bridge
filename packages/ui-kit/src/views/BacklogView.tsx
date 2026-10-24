@@ -96,7 +96,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
         {queue.map(({ t, rank, why, boosted, attempts }) => {
           const kind = kindOf(t);
           return (
-            <div key={t.id} className={`backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => openDetails(t.id)}>
+            <div key={t.id} className={`ktable-row backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => openDetails(t.id)}>
               <span className="backlog-rank" title={`pickup rank: ${why}`}>{boosted ? "▲" : rank + 1}</span>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
@@ -140,7 +140,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
             {parked.map(({ t, attempts }) => {
               const kind = kindOf(t);
               return (
-                <div key={t.id} className="backlog-row backlog-parked" onClick={() => openDetails(t.id)}>
+                <div key={t.id} className="ktable-row backlog-row backlog-parked" onClick={() => openDetails(t.id)}>
                   <span className="backlog-rank backlog-rank-parked">▪</span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">
@@ -185,7 +185,7 @@ export function CompletedView({ openTask }: { openTask?: (id: string) => void } 
           const kind = kindOf(t);
           const lifetime = t.created_ts && t.status_ts ? Math.round((t.status_ts - t.created_ts) / 60000) : null;
           return (
-            <div key={t.id} className="backlog-row backlog-done" onClick={() => openDetails(t.id)}>
+            <div key={t.id} className="ktable-row backlog-row backlog-done" onClick={() => openDetails(t.id)}>
               <span className="backlog-id">{t.id}</span>
               <span className="backlog-main">
                 <span className={`kind-pill kp-${kind}`}>{kind}</span>
