@@ -657,7 +657,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .topc-task { display: flex; align-items: center; gap: 5px; font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; white-space: nowrap; overflow: hidden; }
 .top-head { color: var(--text-faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; padding-bottom: 2px; }
 .top-row { background: color-mix(in srgb, var(--panel) 60%, transparent); border: 1px solid var(--line); }
-.top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
 .topc-status { flex-wrap: nowrap; }
 .top-row.top-click { cursor: pointer; }
 .top-row.top-click:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); background: color-mix(in srgb, var(--accent) 4%, transparent); }
@@ -727,7 +726,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---------- top v2: task ids + unblock exit conditions ---------- */
 .top-task-id { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px; margin-right: 5px; opacity: .9; }
-.top-unblock { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 
 /* tree structure: children indented under parent with a connector rule */
 .top-row-child { border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--line)); margin-left: 14px; border-radius: 0 6px 6px 0; }
@@ -885,7 +883,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* wide-width cell fixes (measured, headless probe 2026-10-24):
    goal + exit cells wrapped, form inputs constrained at any width */
 .topc-goal { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
-.top-unblock { white-space: normal; text-overflow: clip; max-width: 100%; overflow-wrap: anywhere; }
 .topc-goal .top-will { white-space: normal; }
 .pct-inputs { max-width: 480px; }
 .pct-inputs input, .pct-inputs .kit-input { width: auto; flex: 1 1 70px; max-width: 150px; min-width: 0; }
@@ -910,7 +907,10 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    from ever escaping the viewport (the actual wide-width bug). */
 .topc-goal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topc-goal .top-will { white-space: nowrap; }
-.top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topc-agent { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topc-session { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .top-row { line-height: 1.5; }
+
+/* THE unblock/exit cell rule: one line, ellipsis — the wrap variant made
+   every blocked row 3 lines tall (vertically fat rows) */
+.top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
