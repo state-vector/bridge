@@ -3107,8 +3107,15 @@ export class KnowledgeHub {
       return { exists: true, id: existing.id, label };
     }
     if (existing) {
-      this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, ts, existing.id);
-      this.audit(caller, "rotate", label, { old: existing.id });
+      // label is UNIQUE across ALL rows (schema: `label TEXT NOT NULL UNIQUE`),
+      // so the old revoke-then-INSERT could NEVER satisfy it — rotate 400'd
+      // with SQLITE_CONSTRAINT_UNIQUE on its first real exercise (2026-10-24;
+      // the runner's rotate-retry exposed it). Rotate = replace the row
+      // outright: DELETE + INSERT. The audit trail is the history (a revoked
+      // row authenticates nothing); sessions.token_id has no FK — an orphaned
+      // reference renders label-less in the registry join, harmless.
+      this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE label = ?`, label);
+      this.audit(caller, "rotate", label, { old: existing.id, replaced: true });
     }
     const secret = generateAuthToken();
     const hash = await hashAuthToken(secret);
