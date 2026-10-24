@@ -337,7 +337,18 @@ pub fn run() {
                     // process — observe it, never race it for claims
                     eprintln!("[dispatch] runner live in pid {pid} — observing, not starting a second loop");
                 } else {
-                    dispatch::start(&state, cfg)?;
+                    // A failed start (hub unreachable, self-provision error)
+                    // must NEVER abort the app: the setup hook cannot unwind,
+                    // so the `?` here was a hard panic→abort at boot. Surface
+                    // the reason in the UI state instead — the app opens to
+                    // its login/pairing screen and Settings → Reconnect
+                    // retries the whole path.
+                    if let Err(e) = dispatch::start(&state, cfg) {
+                        eprintln!("[dispatch] startup failed — app continues, retry from Settings: {e}");
+                        if let Ok(mut g) = state.last_error.lock() {
+                            *g = Some(format!("gateway did not start: {e}"));
+                        }
+                    }
                 }
             }
             Ok(())

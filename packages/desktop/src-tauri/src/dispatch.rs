@@ -494,7 +494,7 @@ pub fn self_provision(
     if cookie.is_empty() {
         return Err("no web session — sign in first (the login is what authorizes the gateway)".into());
     }
-    let resp: serde_json::Value = client
+    let resp = client
         .post(format!("{url}/api/kb/self-provision"))
         .header("content-type", "application/json")
         .header("cookie", format!("bridge_session={cookie}"))
@@ -509,9 +509,17 @@ pub fn self_provision(
             .to_string(),
         )
         .send()
-        .map_err(|e| format!("bridge unreachable: {e}"))?
-        .json()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("bridge unreachable: {e}"))?;
+    // read the body as text first so a non-JSON response (Cloudflare error
+    // page, HTML redirect, plain-text 500) is NAMED in the error instead of
+    // the useless reqwest "error decoding response body"
+    let body_text = resp.text().map_err(|e| format!("read body: {e}"))?;
+    let resp: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+        format!(
+            "hub returned non-JSON for self-provision: {e} — body: {}",
+            body_text.chars().take(200).collect::<String>()
+        )
+    })?;
     let err = || {
         format!(
             "self-provision failed: {}",
