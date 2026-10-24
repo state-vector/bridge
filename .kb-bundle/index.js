@@ -4,6 +4,7 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 var __esm = (fn, res, err2) => function __init() {
   if (err2) throw err2[0];
   try {
@@ -160,7 +161,7 @@ function sanitizeTags(raw) {
 function parseTags(raw) {
   if (raw == null || raw === "") return [];
   let v = raw;
-  const unwrap3 = (x, depth) => {
+  const unwrap3 = /* @__PURE__ */ __name((x, depth) => {
     if (typeof x === "string") {
       const s = x.trim();
       if (!s) return [];
@@ -176,7 +177,7 @@ function parseTags(raw) {
     }
     if (Array.isArray(x)) return x.flatMap((e) => unwrap3(e, depth + 1));
     return [];
-  };
+  }, "unwrap");
   return unwrap3(v, 0);
 }
 function checkLimits(title, body, meta) {
@@ -303,6 +304,7 @@ var init_core = __esm({
       "progress",
       "agent"
     ];
+    __name(isArtefactType, "isArtefactType");
     TASK_KINDS = ["impl", "analysis", "review", "research", "question"];
     KIND_TAG = {
       impl: null,
@@ -311,6 +313,8 @@ var init_core = __esm({
       research: "research",
       question: "question"
     };
+    __name(taskKind, "taskKind");
+    __name(isQuestionTask, "isQuestionTask");
     LIFECYCLES = {
       steering: { draft: ["active"], active: ["superseded"] },
       goal: { draft: ["active"], active: ["achieved", "dropped"] },
@@ -327,6 +331,7 @@ var init_core = __esm({
       progress: "logged",
       agent: "active"
     };
+    __name(validateTransition, "validateTransition");
     RELATIONS = [
       "supports",
       "contradicts",
@@ -339,13 +344,26 @@ var init_core = __esm({
       "child_of",
       "relates"
     ];
+    __name(isRelation, "isRelation");
+    __name(validateRelation, "validateRelation");
+    __name(formatId, "formatId");
+    __name(ftsQuery, "ftsQuery");
     WS_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+    __name(isWsSlug, "isWsSlug");
+    __name(generateAuthToken, "generateAuthToken");
+    __name(hashAuthToken, "hashAuthToken");
+    __name(tokenWorkspace, "tokenWorkspace");
+    __name(tagsSayGateway, "tagsSayGateway");
+    __name(selfProvisionLabel, "selfProvisionLabel");
     DEFAULT_WS_SLUG = "state-vector";
+    __name(doWs, "doWs");
+    __name(isValidAskTarget, "isValidAskTarget");
     ASK_OPEN = "open";
     ASK_ANSWERED = "answered";
     TRANSPORTS = ["mcp", "a2a", "acp-proxy", "board"];
     DEFAULT_BOARD = { mode: "none" };
     DEFAULT_PROJECT = "Superpositional";
+    __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
 1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
 2. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
@@ -362,15 +380,74 @@ var init_core = __esm({
       impl: `BUILD: claim qualified work matching your roles, work it to a natural stopping point, and hand over for review \u2014 in_review with the PR link in the note. You cannot self-approve done; you stay owner until the verdict.`,
       review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.`
     };
+    __name(resolveRolePlaybook, "resolveRolePlaybook");
     SENTIMENTS = ["going_well", "neutral", "struggling", "converging", "diverging"];
+    __name(isSentiment, "isSentiment");
+    __name(sanitizeTags, "sanitizeTags");
+    __name(parseTags, "parseTags");
     LIMITS = {
       title: 300,
       body: 1e5,
       metaKeys: 20,
       relationsPerArtefact: 100
     };
+    __name(checkLimits, "checkLimits");
+    __name(verifyVerdictStatement, "verifyVerdictStatement");
+    __name(cosine, "cosine");
+    __name(hybridMerge, "hybridMerge");
+    __name(embedText, "embedText");
     EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
+    __name(issueRef, "issueRef");
+    __name(scaffoldBody, "scaffoldBody");
     TRIGRAM_DIM = 256;
+    __name(trigramVec, "trigramVec");
+    __name(scoreAgent, "scoreAgent");
+  }
+});
+
+// src/kb/throughput.ts
+function parseThroughputParams(bucket, range) {
+  const b = String(bucket ?? "day");
+  if (!(b in BUCKET_MS)) return { error: `bucket must be one of ${Object.keys(BUCKET_MS).join(", ")} (got '${b}')` };
+  const m = /^(\d{1,3})d?$/.exec(String(range ?? "30d"));
+  if (!m) return { error: `range must look like '30d' or '30' (got '${String(range)}')` };
+  const days = parseInt(m[1], 10);
+  if (days < 1 || days > 365) return { error: `range must be 1-365 days (got ${days})` };
+  return { bucket: b, rangeDays: days };
+}
+function aggregateThroughput(events, fallback, opts) {
+  const bucketMs = BUCKET_MS[opts.bucket];
+  const to = opts.now;
+  const from = to - opts.rangeDays * 864e5;
+  const lastStart = Math.floor(to / bucketMs) * bucketMs;
+  const firstStart = lastStart - (Math.ceil(opts.rangeDays * 864e5 / bucketMs) - 1) * bucketMs;
+  const nBuckets = Math.round((lastStart - firstStart) / bucketMs) + 1;
+  const buckets = Array.from({ length: nBuckets }, (_, i) => ({ t: firstStart + i * bucketMs, n: 0, cumulative: 0 }));
+  const seenViaEvent = /* @__PURE__ */ new Set();
+  let running = 0;
+  const idxOf = /* @__PURE__ */ __name((ts) => ts < from ? -1 : Math.floor(ts / bucketMs) - Math.floor(firstStart / bucketMs), "idxOf");
+  for (const e of events) {
+    seenViaEvent.add(e.artefact_id);
+    const idx = idxOf(e.ts);
+    if (idx >= 0 && idx < nBuckets) buckets[idx].n++;
+  }
+  for (const f of fallback) {
+    if (seenViaEvent.has(f.id)) continue;
+    const idx = idxOf(f.status_ts);
+    if (idx >= 0 && idx < nBuckets) buckets[idx].n++;
+  }
+  for (const b of buckets) {
+    running += b.n;
+    b.cumulative = running;
+  }
+  return buckets;
+}
+var BUCKET_MS;
+var init_throughput = __esm({
+  "src/kb/throughput.ts"() {
+    BUCKET_MS = { day: 864e5, week: 7 * 864e5 };
+    __name(parseThroughputParams, "parseThroughputParams");
+    __name(aggregateThroughput, "aggregateThroughput");
   }
 });
 
@@ -429,50 +506,53 @@ var VERDICT_ROLES, HUMAN_ACTOR, role, isTask, noteOf, hasEvidenceLink, hasReceip
 var init_machine = __esm({
   "src/kb/machine.ts"() {
     init_core();
+    __name(effectiveRole, "effectiveRole");
     VERDICT_ROLES = ["review", "unblock"];
     HUMAN_ACTOR = /^web(:|$)|^human:/;
-    role = (i) => effectiveRole(i.tags);
-    isTask = (i) => i.type === "task";
-    noteOf = (i) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
-    hasEvidenceLink = (s) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
-    hasReceipts = (s) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
+    role = /* @__PURE__ */ __name((i) => effectiveRole(i.tags), "role");
+    isTask = /* @__PURE__ */ __name((i) => i.type === "task", "isTask");
+    noteOf = /* @__PURE__ */ __name((i) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim(), "noteOf");
+    hasEvidenceLink = /* @__PURE__ */ __name((s) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s), "hasEvidenceLink");
+    hasReceipts = /* @__PURE__ */ __name((s) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s), "hasReceipts");
+    __name(metaOf, "metaOf");
     CHURN_REDIRECT_ATTEMPTS = 5;
     CHURN_ESCALATE_ATTEMPTS = 3;
+    __name(churnRelease, "churnRelease");
     RULES = [
       {
         name: "verdict-no-in_review",
-        when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
-        guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)), "when"),
+        guard: /* @__PURE__ */ __name((i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`, "guard")
       },
       {
         name: "verdict-no-blocked",
-        when: (i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id,
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id, "when"),
         // an ask-gate pauses the duty; it auto-resumes on the answer
-        guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`
+        guard: /* @__PURE__ */ __name((i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`, "guard")
       },
       {
         name: "decision-acceptance-human",
-        when: (i) => i.type === "decision" && i.to === "accepted" && !HUMAN_ACTOR.test(i.actor),
-        guard: (i) => `decision ${i.id} acceptance is human-authoritative \u2014 agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`
+        when: /* @__PURE__ */ __name((i) => i.type === "decision" && i.to === "accepted" && !HUMAN_ACTOR.test(i.actor), "when"),
+        guard: /* @__PURE__ */ __name((i) => `decision ${i.id} acceptance is human-authoritative \u2014 agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`, "guard")
       },
       {
         name: "human-signoff-done",
-        when: (i) => isTask(i) && i.to === "done" && role(i) === "human" && !HUMAN_ACTOR.test(i.actor),
-        guard: (i) => `task ${i.id} is a human sign-off task (role:human) \u2014 completion is human-authoritative; a human marks it done in the webapp.`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done" && role(i) === "human" && !HUMAN_ACTOR.test(i.actor), "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a human sign-off task (role:human) \u2014 completion is human-authoritative; a human marks it done in the webapp.`, "guard")
       },
       {
         name: "claim-bars",
-        when: (i) => isTask(i) && i.status === "todo" && i.to === "in_progress",
-        guard: async (i, c) => {
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.status === "todo" && i.to === "in_progress", "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
           const bars = await c.unmetBars();
           if (!bars.length) return null;
           return `task ${i.id} is qualified but its publisher requested further confirmation before it goes ready \u2014 unmet bars: ${bars.join(", ")}. Satisfy them with a done child task of that role or an accepted decision.`;
-        }
+        }, "guard")
       },
       {
         name: "claim-separation-of-duties",
-        when: (i) => isTask(i) && i.status === "todo" && i.to === "in_progress",
-        guard: async (i, c) => {
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.status === "todo" && i.to === "in_progress", "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
           const q = await c.qualify("analysis");
           if (!q.ok || !q.via || q.via === "declared" || String(q.via).startsWith("parent:")) return null;
           const ev = await c.evidence(String(q.via));
@@ -482,77 +562,79 @@ var init_machine = __esm({
           if (evSession && sess && evSession === sess)
             return `separation of duties: session "${sess}" completed the analysis on ${i.id} \u2014 analysis and impl are separate sessions. End this session, start a new one, then claim ${i.id} for implementation.`;
           return null;
-        }
+        }, "guard")
       },
       {
         name: "done-unreviewed",
-        when: (i) => isTask(i) && i.to === "done" && !["analysis", "review", "unblock"].includes(role(i)),
-        guard: async (i, c) => {
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done" && !["analysis", "review", "unblock"].includes(role(i)), "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
           const r = await c.qualify("review");
           if (r.ok) return null;
           return `task ${i.id} cannot be completed unreviewed \u2014 complete a role:review child task or link an accepted decision (e.g. a Superpositional verdict) first`;
-        }
+        }, "guard")
       },
       {
         name: "question-not-claimable",
-        when: (i) => isTask(i) && i.to === "in_progress" && i.tags.includes("question"),
-        guard: (i) => `task ${i.id} is a question (tagged 'question') \u2014 questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "in_progress" && i.tags.includes("question"), "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is a question (tagged 'question') \u2014 questions are answered, not claimed. Contribute via log_progress {id, did, will}; the author closes it with an ADR (decision artefact, derived_from this task).`, "guard")
       },
       {
         name: "operator-gated",
-        when: (i) => isTask(i) && i.to === "in_progress" && i.meta?.operator_gated,
-        guard: (i) => `task ${i.id} is operator-gated (${i.meta.operator_gated}) \u2014 a human clears this by updating the task (remove operator_gated from meta) before it can be claimed.`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "in_progress" && i.meta?.operator_gated, "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is operator-gated (${i.meta.operator_gated}) \u2014 a human clears this by updating the task (remove operator_gated from meta) before it can be claimed.`, "guard")
       },
       {
         name: "unblock-needs-resolution",
-        when: (i) => i.status === "blocked" && i.to === "in_progress",
-        guard: (i) => noteOf(i) ? null : `moving out of blocked requires a resolution (note) \u2014 the card promised an unblock condition; cite how it resolved`
+        when: /* @__PURE__ */ __name((i) => i.status === "blocked" && i.to === "in_progress", "when"),
+        guard: /* @__PURE__ */ __name((i) => noteOf(i) ? null : `moving out of blocked requires a resolution (note) \u2014 the card promised an unblock condition; cite how it resolved`, "guard")
       },
       {
         name: "review-needs-pr",
-        when: (i) => isTask(i) && i.to === "in_review",
-        guard: (i) => hasEvidenceLink(noteOf(i)) ? null : `moving to in_review requires the PR link in the note (you stay owner until the verdict \u2014 done requires review acceptance, not your call)`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "in_review", "when"),
+        guard: /* @__PURE__ */ __name((i) => hasEvidenceLink(noteOf(i)) ? null : `moving to in_review requires the PR link in the note (you stay owner until the verdict \u2014 done requires review acceptance, not your call)`, "guard")
       },
       {
         name: "bounce-needs-findings",
-        when: (i) => i.status === "in_review" && i.to === "in_progress",
-        guard: (i) => noteOf(i) ? null : `bouncing back from review requires the reviewer's findings (note) \u2014 "no" without reasons is not an answer`
+        when: /* @__PURE__ */ __name((i) => i.status === "in_review" && i.to === "in_progress", "when"),
+        guard: /* @__PURE__ */ __name((i) => noteOf(i) ? null : `bouncing back from review requires the reviewer's findings (note) \u2014 "no" without reasons is not an answer`, "guard")
       },
       {
         name: "blocked-needs-path",
-        when: (i) => i.to === "blocked",
-        guard: (i) => {
+        when: /* @__PURE__ */ __name((i) => i.to === "blocked", "when"),
+        guard: /* @__PURE__ */ __name((i) => {
           const reason = String(i.body?.note ?? i.body?.reason ?? "").trim();
           const unblock = String(i.body?.unblock_condition ?? "").trim();
           return reason && unblock ? null : "moving to blocked requires BOTH a reason (note) and an unblock condition \u2014 a blocked card without an unblock path is a dead end";
-        }
+        }, "guard")
       },
       {
         name: "verdict-done-needs-receipts",
-        when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
-        guard: (i) => hasReceipts(noteOf(i)) ? null : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts \u2014 cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"), "when"),
+        guard: /* @__PURE__ */ __name((i) => hasReceipts(noteOf(i)) ? null : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts \u2014 cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`, "guard")
       },
       {
         name: "review-separation-of-duties",
-        when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
-        guard: async (i, c) => {
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"), "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
           const parent = await c.parent();
           const implSession = parent ? metaOf(parent.meta).session : void 0;
           const reviewSession = metaOf(i.meta).session;
           if (implSession && reviewSession && implSession === reviewSession)
             return `separation of duties: session "${reviewSession}" implemented ${parent?.id} \u2014 it cannot also produce the review. Review from a different session.`;
           return null;
-        }
+        }, "guard")
       },
       {
         name: "done-open-children",
-        when: (i) => isTask(i) && i.to === "done",
-        guard: async (i, c) => {
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done", "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
           const open = await c.openChildren();
           return open > 0 ? `parent ${i.id} still has ${open} open child task(s) \u2014 finish or close them first (decomposition owns its children)` : null;
-        }
+        }, "guard")
       }
     ];
+    __name(check, "check");
+    __name(invariants, "invariants");
     BREACH_WINDOW_MS = 30 * 6e4;
   }
 });
@@ -562,6 +644,7 @@ var KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
     init_core();
+    init_throughput();
     init_machine();
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
@@ -570,6 +653,9 @@ var init_do = __esm({
       }
       state;
       env;
+      static {
+        __name(this, "KnowledgeHub");
+      }
       /** ensureSchema runs once per isolate, not per request — its migration
        *  queries are full-table scans, and the free-tier DO row-read quota
        *  dies under per-request schema checks (2026-10-18 outage). */
@@ -940,14 +1026,14 @@ var init_do = __esm({
           `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`
         ).toArray();
         const signals = /* @__PURE__ */ new Map();
-        const sig = (label) => {
+        const sig = /* @__PURE__ */ __name((label) => {
           let s = signals.get(label);
           if (!s) {
             s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
             signals.set(label, s);
           }
           return s;
-        };
+        }, "sig");
         for (const t of tokens) sig(t.label);
         for (const p of this.state.storage.sql.exec(
           `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
@@ -1359,25 +1445,31 @@ var init_do = __esm({
           return this.json({ ok: true, from: old.label, to: newLabel });
         }
         if (request.method === "GET") {
-          switch (url.pathname) {
-            case "/artefacts":
-              return this.json(await this.list({ type: url.searchParams.get("type") ?? void 0, status: url.searchParams.get("status") ?? void 0, tag: url.searchParams.get("tag") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
-            case "/artefact":
-              return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
-            case "/search":
-              return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
-            case "/events":
-              return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-            case "/board":
-              return this.json(await this.board());
-            case "/stats":
-              return this.json(await this.stats());
-            case "/history":
-              return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
-            case "/ask": {
-              const a = await this.askGet(String(url.searchParams.get("id")));
-              return a ? this.json(a) : this.json({ error: "no such ask" }, 404);
+          try {
+            switch (url.pathname) {
+              case "/artefacts":
+                return this.json(await this.list({ type: url.searchParams.get("type") ?? void 0, status: url.searchParams.get("status") ?? void 0, tag: url.searchParams.get("tag") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
+              case "/artefact":
+                return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+              case "/search":
+                return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? void 0, limit: url.searchParams.get("limit") ?? void 0 }));
+              case "/events":
+                return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+              case "/board":
+                return this.json(await this.board());
+              case "/stats":
+                return this.json(await this.stats());
+              case "/metrics.throughput":
+                return this.json(await this.metricsThroughput(url.searchParams));
+              case "/history":
+                return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
+              case "/ask": {
+                const a = await this.askGet(String(url.searchParams.get("id")));
+                return a ? this.json(a) : this.json({ error: "no such ask" }, 404);
+              }
             }
+          } catch (e) {
+            return this.json({ error: String(e.message ?? e) }, 400);
           }
         }
         const op = url.pathname.slice(1);
@@ -1554,7 +1646,7 @@ var init_do = __esm({
               target,
               target
             );
-            const fp = (m) => JSON.stringify(Object.entries(m ?? {}).filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round"].includes(k)).sort(([a], [b]) => a.localeCompare(b)));
+            const fp = /* @__PURE__ */ __name((m) => JSON.stringify(Object.entries(m ?? {}).filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round"].includes(k)).sort(([a], [b]) => a.localeCompare(b))), "fp");
             const same = prev && String(JSON.parse(prev.meta ?? "{}").verdict ?? "").toLowerCase() === verdict && fp(createMeta) === fp(JSON.parse(prev.meta ?? "{}"));
             if (same) {
               const trow = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, target);
@@ -1984,23 +2076,23 @@ ${bodyMd.trim()}`.trim();
        *  what it actually reads, so cheap transitions stay cheap. */
       ruleCtx(row, body, id, tTags) {
         return {
-          qualify: (kind) => {
+          qualify: /* @__PURE__ */ __name((kind) => {
             const unmet = this.unmetBars(row);
             return unmet.length === 0 ? { ok: true, via: "no-bars" } : { ok: false };
-          },
-          unmetBars: () => this.unmetBars(row),
-          session: () => this.resolveSession(body, String(body?.token_id ?? "")),
-          evidence: (eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid),
-          parent: () => this.one(
+          }, "qualify"),
+          unmetBars: /* @__PURE__ */ __name(() => this.unmetBars(row), "unmetBars"),
+          session: /* @__PURE__ */ __name(() => this.resolveSession(body, String(body?.token_id ?? "")), "session"),
+          evidence: /* @__PURE__ */ __name((eid) => this.one(`SELECT type, tags, meta FROM artefacts WHERE id = ?`, eid), "evidence"),
+          parent: /* @__PURE__ */ __name(() => this.one(
             `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
            WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
             id
-          ),
-          openChildren: () => this.one(
+          ), "parent"),
+          openChildren: /* @__PURE__ */ __name(() => this.one(
             `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
             id
-          )?.n ?? 0
+          )?.n ?? 0, "openChildren")
         };
       }
       async doTransition(body, actor) {
@@ -2403,6 +2495,47 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
         ).toArray();
         return { id, relations: out };
       }
+      /** Task-done throughput (BR#2937): done transitions per bucket + cumulative,
+       *  aggregated from ledger mutation rows (true transition events — immune to
+       *  later status flips) with a status_ts fallback for rows whose history has
+       *  compacted. Read-only; no audit (reads don't ledger). */
+      async metricsThroughput(sp) {
+        const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
+        if ("error" in parsed) throw new Error(parsed.error);
+        const now = Date.now();
+        const from = now - parsed.rangeDays * 864e5;
+        const taskIds = new Set(
+          this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task'`).toArray().map((r) => String(r.id))
+        );
+        const events = [];
+        for (const r of this.state.storage.sql.exec(
+          `SELECT ts, artefact_id, data FROM ledger
+       WHERE kind = 'mutation' AND action = 'transition' AND ts >= ? AND data LIKE '%"to":"done"%'`,
+          from
+        ).toArray()) {
+          let to = "";
+          try {
+            to = String(JSON.parse(r.data ?? "{}").to ?? "");
+          } catch {
+            continue;
+          }
+          if (to !== "done" || !taskIds.has(String(r.artefact_id))) continue;
+          events.push({ ts: Number(r.ts), artefact_id: String(r.artefact_id) });
+        }
+        const fallback = this.state.storage.sql.exec(
+          `SELECT id, status_ts FROM artefacts WHERE type = 'task' AND status = 'done' AND status_ts >= ?`,
+          from
+        ).toArray().map((r) => ({ id: String(r.id), status_ts: Number(r.status_ts) }));
+        const buckets = aggregateThroughput(events, fallback, { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now });
+        return {
+          bucket: parsed.bucket,
+          range_days: parsed.rangeDays,
+          from_ts: buckets[0]?.t ?? from,
+          to_ts: now,
+          total: buckets.reduce((n, b) => n + b.n, 0),
+          buckets
+        };
+      }
       async stats() {
         const byType = this.state.storage.sql.exec(
           `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`
@@ -2437,7 +2570,7 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
         const note = String(body.note ?? body.did ?? "").trim().slice(0, 500);
         const will = String(body.will ?? "").trim().slice(0, 500);
         const sentiment = isSentiment(body.sentiment) ? body.sentiment : "neutral";
-        const pct = (v) => Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : void 0;
+        const pct = /* @__PURE__ */ __name((v) => Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : void 0, "pct");
         const completion_pct = pct(body.completion_pct);
         const confidence_pct = pct(body.confidence_pct);
         const risk_pct = pct(body.risk_pct);
@@ -2564,13 +2697,13 @@ ${m.bootstrap_md}` : "") + scoreLine;
         const rows = this.state.storage.sql.exec(
           `SELECT label, tags, transport, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC`
         ).toArray().filter((a) => !a.revoked_ts);
-        const shape = (a) => ({
+        const shape = /* @__PURE__ */ __name((a) => ({
           label: a.label,
           tags: parseTags(a.tags),
           transport: a.transport ?? "mcp",
           online: a.last_seen_ts >= cutoff,
           last_seen_ts: a.last_seen_ts
-        });
+        }), "shape");
         const agents = rows.filter((a) => !tagsSayGateway(a.tags)).map((a) => ({ ...shape(a), tags: [] }));
         const gateways = rows.filter((a) => tagsSayGateway(a.tags)).map((g) => ({
           ...shape(g),
@@ -2954,7 +3087,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
           if (need.length) t.target_roles = need;
           return callerIsGateway ? !t.needs_qualification : true;
         }).sort((a, b) => {
-          const rank = (t) => {
+          const rank = /* @__PURE__ */ __name((t) => {
             const m = JSON.parse(t.meta ?? "{}");
             if (m.boosted) return -1;
             if (t.tags?.includes("role:unblock")) return 0;
@@ -2962,7 +3095,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
             if (verifyParents.has(t.id)) return 2;
             if (t.tags?.includes("question")) return 3;
             return 4;
-          };
+          }, "rank");
           return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
         }).slice(0, 10).map((t) => {
           const m = JSON.parse(t.meta ?? "{}");
@@ -3437,8 +3570,8 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
           return { exists: true, id: existing.id, label };
         }
         if (existing) {
-          this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, ts, existing.id);
-          this.audit(caller, "rotate", label, { old: existing.id });
+          this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE label = ?`, label);
+          this.audit(caller, "rotate", label, { old: existing.id, replaced: true });
         }
         const secret = generateAuthToken();
         const hash = await hashAuthToken(secret);
@@ -3484,11 +3617,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const secret = generateAuthToken();
         const hash = await hashAuthToken(secret);
         const mintTags = JSON.stringify(["gateway"]);
-        const register = (h) => this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/ws.token_register", {
+        const register = /* @__PURE__ */ __name((h) => this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/ws.token_register", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ hash: h, ws })
-        });
+        }), "register");
         let id;
         let vended;
         let own = principal ? this.one(`SELECT id, label FROM auth_tokens WHERE principal = ?`, principal) : null;
@@ -3847,7 +3980,7 @@ async function handleMcp(request, env) {
     );
   }
   const sessionName = String(msg.params?.arguments?.session ?? msg.params?.arguments?.__session ?? "");
-  const call = async (op, payload) => {
+  const call = /* @__PURE__ */ __name(async (op, payload) => {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -3856,7 +3989,7 @@ async function handleMcp(request, env) {
     const out = await r.json();
     if (!r.ok) throw new Error(out.error ?? `kb ${op} failed`);
     return out;
-  };
+  }, "call");
   let result;
   try {
     switch (msg.method) {
@@ -3920,13 +4053,13 @@ async function seeAlso(a, rel, identity, call) {
     q.trim() ? call("search", { q, limit: 6 }).catch(() => ({ artefacts: [] })) : { artefacts: [] }
   ]);
   const byId = /* @__PURE__ */ new Map();
-  const put = (x, why, rank) => {
+  const put = /* @__PURE__ */ __name((x, why, rank) => {
     if (!x || x.id === a.id) return;
     const e = byId.get(x.id) ?? { ...shallow(x), owner: x.owner, tags: x.tags, why: /* @__PURE__ */ new Set(), _rank: 0 };
     e.why.add(why);
     e._rank = Math.max(e._rank, rank);
     byId.set(x.id, e);
-  };
+  }, "put");
   for (const r of rel.relations ?? []) {
     const full = r.artefact_id ? await call("get", { id: r.artefact_id }).catch(() => null) : null;
     put(full, r.relation, 0);
@@ -4073,10 +4206,15 @@ var init_mcp = __esm({
     init_do();
     BUILD = "0.3.5";
     wsRouteCache = /* @__PURE__ */ new Map();
+    __name(resolveTokenWs, "resolveTokenWs");
+    __name(handleMcp, "handleMcp");
+    __name(kb, "kb");
     OPEN_STATUSES = /* @__PURE__ */ new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
-    shallow = (a) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts, created_by: a.created_by });
-    text = (t) => ({ content: [{ type: "text", text: t }] });
-    err = (t) => ({ content: [{ type: "text", text: t }], isError: true });
+    __name(seeAlso, "seeAlso");
+    __name(callTool, "callTool");
+    shallow = /* @__PURE__ */ __name((a) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts, created_by: a.created_by }), "shallow");
+    text = /* @__PURE__ */ __name((t) => ({ content: [{ type: "text", text: t }] }), "text");
+    err = /* @__PURE__ */ __name((t) => ({ content: [{ type: "text", text: t }], isError: true }), "err");
     TOOLS = [
       {
         name: "orient",
@@ -4255,13 +4393,14 @@ var init_mcp = __esm({
         }
       }
     ];
+    __name(json, "json");
   }
 });
 
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "0a81f172c7f337a7f0835965f6989bd719a88465", built_at: "2026-10-23T12:30:08Z" };
+    module.exports = { commit: "129b5616871dce3b325eff6f00027c35046a8708", built_at: "2026-10-24T10:29:30Z" };
   }
 });
 
@@ -4270,7 +4409,7 @@ var webcrypto_default, isCryptoKey;
 var init_webcrypto = __esm({
   "../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
     webcrypto_default = crypto;
-    isCryptoKey = (key) => key instanceof CryptoKey;
+    isCryptoKey = /* @__PURE__ */ __name((key) => key instanceof CryptoKey, "isCryptoKey");
   }
 });
 
@@ -4279,10 +4418,10 @@ var digest, digest_default;
 var init_digest = __esm({
   "../../node_modules/jose/dist/browser/runtime/digest.js"() {
     init_webcrypto();
-    digest = async (algorithm, data) => {
+    digest = /* @__PURE__ */ __name(async (algorithm, data) => {
       const subtleDigest = `SHA-${algorithm.slice(-3)}`;
       return new Uint8Array(await webcrypto_default.subtle.digest(subtleDigest, data));
-    };
+    }, "digest");
     digest_default = digest;
   }
 });
@@ -4342,6 +4481,13 @@ var init_buffer_utils = __esm({
     encoder = new TextEncoder();
     decoder = new TextDecoder();
     MAX_INT32 = 2 ** 32;
+    __name(concat, "concat");
+    __name(p2s, "p2s");
+    __name(writeUInt32BE, "writeUInt32BE");
+    __name(uint64be, "uint64be");
+    __name(uint32be, "uint32be");
+    __name(lengthAndInput, "lengthAndInput");
+    __name(concatKdf, "concatKdf");
   }
 });
 
@@ -4350,7 +4496,7 @@ var encodeBase64, encode, decodeBase64, decode;
 var init_base64url = __esm({
   "../../node_modules/jose/dist/browser/runtime/base64url.js"() {
     init_buffer_utils();
-    encodeBase64 = (input) => {
+    encodeBase64 = /* @__PURE__ */ __name((input) => {
       let unencoded = input;
       if (typeof unencoded === "string") {
         unencoded = encoder.encode(unencoded);
@@ -4361,19 +4507,19 @@ var init_base64url = __esm({
         arr.push(String.fromCharCode.apply(null, unencoded.subarray(i, i + CHUNK_SIZE)));
       }
       return btoa(arr.join(""));
-    };
-    encode = (input) => {
+    }, "encodeBase64");
+    encode = /* @__PURE__ */ __name((input) => {
       return encodeBase64(input).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-    };
-    decodeBase64 = (encoded) => {
+    }, "encode");
+    decodeBase64 = /* @__PURE__ */ __name((encoded) => {
       const binary = atob(encoded);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
       return bytes;
-    };
-    decode = (input) => {
+    }, "decodeBase64");
+    decode = /* @__PURE__ */ __name((input) => {
       let encoded = input;
       if (encoded instanceof Uint8Array) {
         encoded = decoder.decode(encoded);
@@ -4384,7 +4530,7 @@ var init_base64url = __esm({
       } catch {
         throw new TypeError("The input to be decoded is not correctly encoded.");
       }
-    };
+    }, "decode");
   }
 });
 
@@ -4411,6 +4557,9 @@ var JOSEError, JWTClaimValidationFailed, JWTExpired, JOSEAlgNotAllowed, JOSENotS
 var init_errors = __esm({
   "../../node_modules/jose/dist/browser/util/errors.js"() {
     JOSEError = class extends Error {
+      static {
+        __name(this, "JOSEError");
+      }
       constructor(message2, options) {
         super(message2, options);
         this.code = "ERR_JOSE_GENERIC";
@@ -4420,6 +4569,9 @@ var init_errors = __esm({
     };
     JOSEError.code = "ERR_JOSE_GENERIC";
     JWTClaimValidationFailed = class extends JOSEError {
+      static {
+        __name(this, "JWTClaimValidationFailed");
+      }
       constructor(message2, payload, claim = "unspecified", reason = "unspecified") {
         super(message2, { cause: { claim, reason, payload } });
         this.code = "ERR_JWT_CLAIM_VALIDATION_FAILED";
@@ -4430,6 +4582,9 @@ var init_errors = __esm({
     };
     JWTClaimValidationFailed.code = "ERR_JWT_CLAIM_VALIDATION_FAILED";
     JWTExpired = class extends JOSEError {
+      static {
+        __name(this, "JWTExpired");
+      }
       constructor(message2, payload, claim = "unspecified", reason = "unspecified") {
         super(message2, { cause: { claim, reason, payload } });
         this.code = "ERR_JWT_EXPIRED";
@@ -4440,6 +4595,9 @@ var init_errors = __esm({
     };
     JWTExpired.code = "ERR_JWT_EXPIRED";
     JOSEAlgNotAllowed = class extends JOSEError {
+      static {
+        __name(this, "JOSEAlgNotAllowed");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JOSE_ALG_NOT_ALLOWED";
@@ -4447,6 +4605,9 @@ var init_errors = __esm({
     };
     JOSEAlgNotAllowed.code = "ERR_JOSE_ALG_NOT_ALLOWED";
     JOSENotSupported = class extends JOSEError {
+      static {
+        __name(this, "JOSENotSupported");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JOSE_NOT_SUPPORTED";
@@ -4454,6 +4615,9 @@ var init_errors = __esm({
     };
     JOSENotSupported.code = "ERR_JOSE_NOT_SUPPORTED";
     JWEDecryptionFailed = class extends JOSEError {
+      static {
+        __name(this, "JWEDecryptionFailed");
+      }
       constructor(message2 = "decryption operation failed", options) {
         super(message2, options);
         this.code = "ERR_JWE_DECRYPTION_FAILED";
@@ -4461,6 +4625,9 @@ var init_errors = __esm({
     };
     JWEDecryptionFailed.code = "ERR_JWE_DECRYPTION_FAILED";
     JWEInvalid = class extends JOSEError {
+      static {
+        __name(this, "JWEInvalid");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JWE_INVALID";
@@ -4468,6 +4635,9 @@ var init_errors = __esm({
     };
     JWEInvalid.code = "ERR_JWE_INVALID";
     JWSInvalid = class extends JOSEError {
+      static {
+        __name(this, "JWSInvalid");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JWS_INVALID";
@@ -4475,6 +4645,9 @@ var init_errors = __esm({
     };
     JWSInvalid.code = "ERR_JWS_INVALID";
     JWTInvalid = class extends JOSEError {
+      static {
+        __name(this, "JWTInvalid");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JWT_INVALID";
@@ -4482,6 +4655,9 @@ var init_errors = __esm({
     };
     JWTInvalid.code = "ERR_JWT_INVALID";
     JWKInvalid = class extends JOSEError {
+      static {
+        __name(this, "JWKInvalid");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JWK_INVALID";
@@ -4489,6 +4665,9 @@ var init_errors = __esm({
     };
     JWKInvalid.code = "ERR_JWK_INVALID";
     JWKSInvalid = class extends JOSEError {
+      static {
+        __name(this, "JWKSInvalid");
+      }
       constructor() {
         super(...arguments);
         this.code = "ERR_JWKS_INVALID";
@@ -4496,6 +4675,9 @@ var init_errors = __esm({
     };
     JWKSInvalid.code = "ERR_JWKS_INVALID";
     JWKSNoMatchingKey = class extends JOSEError {
+      static {
+        __name(this, "JWKSNoMatchingKey");
+      }
       constructor(message2 = "no applicable key found in the JSON Web Key Set", options) {
         super(message2, options);
         this.code = "ERR_JWKS_NO_MATCHING_KEY";
@@ -4503,6 +4685,9 @@ var init_errors = __esm({
     };
     JWKSNoMatchingKey.code = "ERR_JWKS_NO_MATCHING_KEY";
     JWKSMultipleMatchingKeys = class extends JOSEError {
+      static {
+        __name(this, "JWKSMultipleMatchingKeys");
+      }
       constructor(message2 = "multiple matching keys found in the JSON Web Key Set", options) {
         super(message2, options);
         this.code = "ERR_JWKS_MULTIPLE_MATCHING_KEYS";
@@ -4510,6 +4695,9 @@ var init_errors = __esm({
     };
     JWKSMultipleMatchingKeys.code = "ERR_JWKS_MULTIPLE_MATCHING_KEYS";
     JWKSTimeout = class extends JOSEError {
+      static {
+        __name(this, "JWKSTimeout");
+      }
       constructor(message2 = "request timed out", options) {
         super(message2, options);
         this.code = "ERR_JWKS_TIMEOUT";
@@ -4517,6 +4705,9 @@ var init_errors = __esm({
     };
     JWKSTimeout.code = "ERR_JWKS_TIMEOUT";
     JWSSignatureVerificationFailed = class extends JOSEError {
+      static {
+        __name(this, "JWSSignatureVerificationFailed");
+      }
       constructor(message2 = "signature verification failed", options) {
         super(message2, options);
         this.code = "ERR_JWS_SIGNATURE_VERIFICATION_FAILED";
@@ -4558,7 +4749,8 @@ var init_iv = __esm({
   "../../node_modules/jose/dist/browser/lib/iv.js"() {
     init_errors();
     init_random();
-    iv_default = (alg) => random_default(new Uint8Array(bitLength(alg) >> 3));
+    __name(bitLength, "bitLength");
+    iv_default = /* @__PURE__ */ __name((alg) => random_default(new Uint8Array(bitLength(alg) >> 3)), "default");
   }
 });
 
@@ -4568,11 +4760,11 @@ var init_check_iv_length = __esm({
   "../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
     init_errors();
     init_iv();
-    checkIvLength = (enc, iv) => {
+    checkIvLength = /* @__PURE__ */ __name((enc, iv) => {
       if (iv.length << 3 !== bitLength(enc)) {
         throw new JWEInvalid("Invalid Initialization Vector length");
       }
-    };
+    }, "checkIvLength");
     check_iv_length_default = checkIvLength;
   }
 });
@@ -4582,12 +4774,12 @@ var checkCekLength, check_cek_length_default;
 var init_check_cek_length = __esm({
   "../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
     init_errors();
-    checkCekLength = (cek, expected) => {
+    checkCekLength = /* @__PURE__ */ __name((cek, expected) => {
       const actual = cek.byteLength << 3;
       if (actual !== expected) {
         throw new JWEInvalid(`Invalid Content Encryption Key length. Expected ${expected} bits, got ${actual} bits`);
       }
-    };
+    }, "checkCekLength");
     check_cek_length_default = checkCekLength;
   }
 });
@@ -4596,7 +4788,7 @@ var init_check_cek_length = __esm({
 var timingSafeEqual, timing_safe_equal_default;
 var init_timing_safe_equal = __esm({
   "../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
-    timingSafeEqual = (a, b) => {
+    timingSafeEqual = /* @__PURE__ */ __name((a, b) => {
       if (!(a instanceof Uint8Array)) {
         throw new TypeError("First argument must be a buffer");
       }
@@ -4613,7 +4805,7 @@ var init_timing_safe_equal = __esm({
         out |= a[i] ^ b[i];
       }
       return out === 0;
-    };
+    }, "timingSafeEqual");
     timing_safe_equal_default = timingSafeEqual;
   }
 });
@@ -4776,6 +4968,13 @@ function checkEncCryptoKey(key, alg, ...usages) {
 }
 var init_crypto_key = __esm({
   "../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
+    __name(unusable, "unusable");
+    __name(isAlgorithm, "isAlgorithm");
+    __name(getHashLength, "getHashLength");
+    __name(getNamedCurve, "getNamedCurve");
+    __name(checkUsage, "checkUsage");
+    __name(checkSigCryptoKey, "checkSigCryptoKey");
+    __name(checkEncCryptoKey, "checkEncCryptoKey");
   }
 });
 
@@ -4807,9 +5006,11 @@ function withAlg(alg, actual, ...types2) {
 var invalid_key_input_default;
 var init_invalid_key_input = __esm({
   "../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
-    invalid_key_input_default = (actual, ...types2) => {
+    __name(message, "message");
+    invalid_key_input_default = /* @__PURE__ */ __name((actual, ...types2) => {
       return message("Key must be ", actual, ...types2);
-    };
+    }, "default");
+    __name(withAlg, "withAlg");
   }
 });
 
@@ -4818,12 +5019,12 @@ var is_key_like_default, types;
 var init_is_key_like = __esm({
   "../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
     init_webcrypto();
-    is_key_like_default = (key) => {
+    is_key_like_default = /* @__PURE__ */ __name((key) => {
       if (isCryptoKey(key)) {
         return true;
       }
       return key?.[Symbol.toStringTag] === "KeyObject";
-    };
+    }, "default");
     types = ["CryptoKey"];
   }
 });
@@ -4890,7 +5091,9 @@ var init_decrypt = __esm({
     init_crypto_key();
     init_invalid_key_input();
     init_is_key_like();
-    decrypt = async (enc, cek, ciphertext, iv, tag2, aad) => {
+    __name(cbcDecrypt, "cbcDecrypt");
+    __name(gcmDecrypt, "gcmDecrypt");
+    decrypt = /* @__PURE__ */ __name(async (enc, cek, ciphertext, iv, tag2, aad) => {
       if (!isCryptoKey(cek) && !(cek instanceof Uint8Array)) {
         throw new TypeError(invalid_key_input_default(cek, ...types, "Uint8Array"));
       }
@@ -4917,7 +5120,7 @@ var init_decrypt = __esm({
         default:
           throw new JOSENotSupported("Unsupported JWE Content Encryption Algorithm");
       }
-    };
+    }, "decrypt");
     decrypt_default = decrypt;
   }
 });
@@ -4926,7 +5129,7 @@ var init_decrypt = __esm({
 var isDisjoint, is_disjoint_default;
 var init_is_disjoint = __esm({
   "../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
-    isDisjoint = (...headers) => {
+    isDisjoint = /* @__PURE__ */ __name((...headers) => {
       const sources = headers.filter(Boolean);
       if (sources.length === 0 || sources.length === 1) {
         return true;
@@ -4946,7 +5149,7 @@ var init_is_disjoint = __esm({
         }
       }
       return true;
-    };
+    }, "isDisjoint");
     is_disjoint_default = isDisjoint;
   }
 });
@@ -4970,6 +5173,8 @@ function isObject(input) {
 }
 var init_is_object = __esm({
   "../../node_modules/jose/dist/browser/lib/is_object.js"() {
+    __name(isObjectLike, "isObjectLike");
+    __name(isObject, "isObject");
   }
 });
 
@@ -5010,18 +5215,20 @@ var init_aeskw = __esm({
     init_crypto_key();
     init_invalid_key_input();
     init_is_key_like();
-    wrap = async (alg, key, cek) => {
+    __name(checkKeySize, "checkKeySize");
+    __name(getCryptoKey, "getCryptoKey");
+    wrap = /* @__PURE__ */ __name(async (alg, key, cek) => {
       const cryptoKey = await getCryptoKey(key, alg, "wrapKey");
       checkKeySize(cryptoKey, alg);
       const cryptoKeyCek = await webcrypto_default.subtle.importKey("raw", cek, ...bogus_default);
       return new Uint8Array(await webcrypto_default.subtle.wrapKey("raw", cryptoKeyCek, cryptoKey, "AES-KW"));
-    };
-    unwrap = async (alg, key, encryptedKey) => {
+    }, "wrap");
+    unwrap = /* @__PURE__ */ __name(async (alg, key, encryptedKey) => {
       const cryptoKey = await getCryptoKey(key, alg, "unwrapKey");
       checkKeySize(cryptoKey, alg);
       const cryptoKeyCek = await webcrypto_default.subtle.unwrapKey("raw", encryptedKey, cryptoKey, "AES-KW", ...bogus_default);
       return new Uint8Array(await webcrypto_default.subtle.exportKey("raw", cryptoKeyCek));
-    };
+    }, "unwrap");
   }
 });
 
@@ -5069,6 +5276,9 @@ var init_ecdhes = __esm({
     init_crypto_key();
     init_invalid_key_input();
     init_is_key_like();
+    __name(deriveKey, "deriveKey");
+    __name(generateEpk, "generateEpk");
+    __name(ecdhAllowed, "ecdhAllowed");
   }
 });
 
@@ -5081,6 +5291,7 @@ function checkP2s(p2s2) {
 var init_check_p2s = __esm({
   "../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
     init_errors();
+    __name(checkP2s, "checkP2s");
   }
 });
 
@@ -5130,15 +5341,17 @@ var init_pbes2kw = __esm({
     init_crypto_key();
     init_invalid_key_input();
     init_is_key_like();
-    encrypt = async (alg, key, cek, p2c = 2048, p2s2 = random_default(new Uint8Array(16))) => {
+    __name(getCryptoKey2, "getCryptoKey");
+    __name(deriveKey2, "deriveKey");
+    encrypt = /* @__PURE__ */ __name(async (alg, key, cek, p2c = 2048, p2s2 = random_default(new Uint8Array(16))) => {
       const derived = await deriveKey2(p2s2, alg, p2c, key);
       const encryptedKey = await wrap(alg.slice(-6), derived, cek);
       return { encryptedKey, p2c, p2s: encode(p2s2) };
-    };
-    decrypt2 = async (alg, key, encryptedKey, p2c, p2s2) => {
+    }, "encrypt");
+    decrypt2 = /* @__PURE__ */ __name(async (alg, key, encryptedKey, p2c, p2s2) => {
       const derived = await deriveKey2(p2s2, alg, p2c, key);
       return unwrap(alg.slice(-6), derived, encryptedKey);
-    };
+    }, "decrypt");
   }
 });
 
@@ -5157,6 +5370,7 @@ function subtleRsaEs(alg) {
 var init_subtle_rsaes = __esm({
   "../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
     init_errors();
+    __name(subtleRsaEs, "subtleRsaEs");
   }
 });
 
@@ -5164,14 +5378,14 @@ var init_subtle_rsaes = __esm({
 var check_key_length_default;
 var init_check_key_length = __esm({
   "../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
-    check_key_length_default = (alg, key) => {
+    check_key_length_default = /* @__PURE__ */ __name((alg, key) => {
       if (alg.startsWith("RS") || alg.startsWith("PS")) {
         const { modulusLength } = key.algorithm;
         if (typeof modulusLength !== "number" || modulusLength < 2048) {
           throw new TypeError(`${alg} requires key modulusLength to be 2048 bits or larger`);
         }
       }
-    };
+    }, "default");
   }
 });
 
@@ -5186,7 +5400,7 @@ var init_rsaes = __esm({
     init_check_key_length();
     init_invalid_key_input();
     init_is_key_like();
-    encrypt2 = async (alg, key, cek) => {
+    encrypt2 = /* @__PURE__ */ __name(async (alg, key, cek) => {
       if (!isCryptoKey(key)) {
         throw new TypeError(invalid_key_input_default(key, ...types));
       }
@@ -5200,8 +5414,8 @@ var init_rsaes = __esm({
         return new Uint8Array(await webcrypto_default.subtle.wrapKey("raw", cryptoKeyCek, key, subtleRsaEs(alg)));
       }
       throw new TypeError('RSA-OAEP key "usages" must include "encrypt" or "wrapKey" for this operation');
-    };
-    decrypt3 = async (alg, key, encryptedKey) => {
+    }, "encrypt");
+    decrypt3 = /* @__PURE__ */ __name(async (alg, key, encryptedKey) => {
       if (!isCryptoKey(key)) {
         throw new TypeError(invalid_key_input_default(key, ...types));
       }
@@ -5215,7 +5429,7 @@ var init_rsaes = __esm({
         return new Uint8Array(await webcrypto_default.subtle.exportKey("raw", cryptoKeyCek));
       }
       throw new TypeError('RSA-OAEP key "usages" must include "decrypt" or "unwrapKey" for this operation');
-    };
+    }, "decrypt");
   }
 });
 
@@ -5235,6 +5449,10 @@ function isSecretJWK(key) {
 var init_is_jwk = __esm({
   "../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
     init_is_object();
+    __name(isJWK, "isJWK");
+    __name(isPrivateJWK, "isPrivateJWK");
+    __name(isPublicJWK, "isPublicJWK");
+    __name(isSecretJWK, "isSecretJWK");
   }
 });
 
@@ -5330,7 +5548,8 @@ var init_jwk_to_key = __esm({
   "../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
     init_webcrypto();
     init_errors();
-    parse = async (jwk) => {
+    __name(subtleMapping, "subtleMapping");
+    parse = /* @__PURE__ */ __name(async (jwk) => {
       if (!jwk.alg) {
         throw new TypeError('"alg" argument is required when "jwk.alg" is not present');
       }
@@ -5344,7 +5563,7 @@ var init_jwk_to_key = __esm({
       delete keyData.alg;
       delete keyData.use;
       return webcrypto_default.subtle.importKey("jwk", keyData, ...rest);
-    };
+    }, "parse");
     jwk_to_key_default = parse;
   }
 });
@@ -5356,11 +5575,11 @@ var init_normalize_key = __esm({
     init_is_jwk();
     init_base64url();
     init_jwk_to_key();
-    exportKeyValue = (k) => decode(k);
-    isKeyObject = (key) => {
+    exportKeyValue = /* @__PURE__ */ __name((k) => decode(k), "exportKeyValue");
+    isKeyObject = /* @__PURE__ */ __name((key) => {
       return key?.[Symbol.toStringTag] === "KeyObject";
-    };
-    importAndCache = async (cache, key, jwk, alg, freeze = false) => {
+    }, "isKeyObject");
+    importAndCache = /* @__PURE__ */ __name(async (cache, key, jwk, alg, freeze = false) => {
       let cached = cache.get(key);
       if (cached?.[alg]) {
         return cached[alg];
@@ -5374,8 +5593,8 @@ var init_normalize_key = __esm({
         cached[alg] = cryptoKey;
       }
       return cryptoKey;
-    };
-    normalizePublicKey = (key, alg) => {
+    }, "importAndCache");
+    normalizePublicKey = /* @__PURE__ */ __name((key, alg) => {
       if (isKeyObject(key)) {
         let jwk = key.export({ format: "jwk" });
         delete jwk.d;
@@ -5398,8 +5617,8 @@ var init_normalize_key = __esm({
         return cryptoKey;
       }
       return key;
-    };
-    normalizePrivateKey = (key, alg) => {
+    }, "normalizePublicKey");
+    normalizePrivateKey = /* @__PURE__ */ __name((key, alg) => {
       if (isKeyObject(key)) {
         let jwk = key.export({ format: "jwk" });
         if (jwk.k) {
@@ -5416,7 +5635,7 @@ var init_normalize_key = __esm({
         return cryptoKey;
       }
       return key;
-    };
+    }, "normalizePrivateKey");
     normalize_key_default = { normalizePublicKey, normalizePrivateKey };
   }
 });
@@ -5444,7 +5663,8 @@ var init_cek = __esm({
   "../../node_modules/jose/dist/browser/lib/cek.js"() {
     init_errors();
     init_random();
-    cek_default = (alg) => random_default(new Uint8Array(bitLength2(alg) >> 3));
+    __name(bitLength2, "bitLength");
+    cek_default = /* @__PURE__ */ __name((alg) => random_default(new Uint8Array(bitLength2(alg) >> 3)), "default");
   }
 });
 
@@ -5452,12 +5672,12 @@ var init_cek = __esm({
 var format_pem_default;
 var init_format_pem = __esm({
   "../../node_modules/jose/dist/browser/lib/format_pem.js"() {
-    format_pem_default = (b64, descriptor) => {
+    format_pem_default = /* @__PURE__ */ __name((b64, descriptor) => {
       const newlined = (b64.match(/.{1,64}/g) || []).join("\n");
       return `-----BEGIN ${descriptor}-----
 ${newlined}
 -----END ${descriptor}-----`;
-    };
+    }, "default");
   }
 });
 
@@ -5537,7 +5757,7 @@ var init_asn1 = __esm({
     init_format_pem();
     init_errors();
     init_is_key_like();
-    genericExport = async (keyType, keyFormat, key) => {
+    genericExport = /* @__PURE__ */ __name(async (keyType, keyFormat, key) => {
       if (!isCryptoKey(key)) {
         throw new TypeError(invalid_key_input_default(key, ...types));
       }
@@ -5548,14 +5768,14 @@ var init_asn1 = __esm({
         throw new TypeError(`key is not a ${keyType} key`);
       }
       return format_pem_default(encodeBase64(new Uint8Array(await webcrypto_default.subtle.exportKey(keyFormat, key))), `${keyType.toUpperCase()} KEY`);
-    };
-    toSPKI = (key) => {
+    }, "genericExport");
+    toSPKI = /* @__PURE__ */ __name((key) => {
       return genericExport("public", "spki", key);
-    };
-    toPKCS8 = (key) => {
+    }, "toSPKI");
+    toPKCS8 = /* @__PURE__ */ __name((key) => {
       return genericExport("private", "pkcs8", key);
-    };
-    findOid = (keyData, oid, from = 0) => {
+    }, "toPKCS8");
+    findOid = /* @__PURE__ */ __name((keyData, oid, from = 0) => {
       if (from === 0) {
         oid.unshift(oid.length);
         oid.unshift(6);
@@ -5567,8 +5787,8 @@ var init_asn1 = __esm({
       if (sub.length !== oid.length)
         return false;
       return sub.every((value, index) => value === oid[index]) || findOid(keyData, oid, i + 1);
-    };
-    getNamedCurve2 = (keyData) => {
+    }, "findOid");
+    getNamedCurve2 = /* @__PURE__ */ __name((keyData) => {
       switch (true) {
         case findOid(keyData, [42, 134, 72, 206, 61, 3, 1, 7]):
           return "P-256";
@@ -5587,8 +5807,8 @@ var init_asn1 = __esm({
         default:
           throw new JOSENotSupported("Invalid or unsupported EC Key Curve or OKP Key Sub Type");
       }
-    };
-    genericImport = async (replace, keyFormat, pem, alg, options) => {
+    }, "getNamedCurve");
+    genericImport = /* @__PURE__ */ __name(async (replace, keyFormat, pem, alg, options) => {
       let algorithm;
       let keyUsages;
       const keyData = new Uint8Array(atob(pem.replace(replace, "")).split("").map((c) => c.charCodeAt(0)));
@@ -5649,14 +5869,18 @@ var init_asn1 = __esm({
           throw new JOSENotSupported('Invalid or unsupported "alg" (Algorithm) value');
       }
       return webcrypto_default.subtle.importKey(keyFormat, keyData, algorithm, options?.extractable ?? false, keyUsages);
-    };
-    fromPKCS8 = (pem, alg, options) => {
+    }, "genericImport");
+    fromPKCS8 = /* @__PURE__ */ __name((pem, alg, options) => {
       return genericImport(/(?:-----(?:BEGIN|END) PRIVATE KEY-----|\s)/g, "pkcs8", pem, alg, options);
-    };
-    fromSPKI = (pem, alg, options) => {
+    }, "fromPKCS8");
+    fromSPKI = /* @__PURE__ */ __name((pem, alg, options) => {
       return genericImport(/(?:-----(?:BEGIN|END) PUBLIC KEY-----|\s)/g, "spki", pem, alg, options);
-    };
-    fromX509 = (pem, alg, options) => {
+    }, "fromSPKI");
+    __name(getElement, "getElement");
+    __name(parseElement, "parseElement");
+    __name(spkiFromX509, "spkiFromX509");
+    __name(getSPKI, "getSPKI");
+    fromX509 = /* @__PURE__ */ __name((pem, alg, options) => {
       let spki;
       try {
         spki = getSPKI(pem);
@@ -5664,7 +5888,7 @@ var init_asn1 = __esm({
         throw new TypeError("Failed to parse the X.509 certificate", { cause });
       }
       return fromSPKI(spki, alg, options);
-    };
+    }, "fromX509");
   }
 });
 
@@ -5716,6 +5940,10 @@ var init_import = __esm({
     init_jwk_to_key();
     init_errors();
     init_is_object();
+    __name(importSPKI, "importSPKI");
+    __name(importX509, "importX509");
+    __name(importPKCS8, "importPKCS8");
+    __name(importJWK, "importJWK");
   }
 });
 
@@ -5734,8 +5962,8 @@ var init_check_key_type = __esm({
     init_invalid_key_input();
     init_is_key_like();
     init_is_jwk();
-    tag = (key) => key?.[Symbol.toStringTag];
-    jwkMatchesOp = (alg, key, usage) => {
+    tag = /* @__PURE__ */ __name((key) => key?.[Symbol.toStringTag], "tag");
+    jwkMatchesOp = /* @__PURE__ */ __name((alg, key, usage) => {
       if (key.use !== void 0 && key.use !== "sig") {
         throw new TypeError("Invalid key for this operation, when present its use must be sig");
       }
@@ -5746,8 +5974,8 @@ var init_check_key_type = __esm({
         throw new TypeError(`Invalid key for this operation, when present its alg must be ${alg}`);
       }
       return true;
-    };
-    symmetricTypeCheck = (alg, key, usage, allowJwk) => {
+    }, "jwkMatchesOp");
+    symmetricTypeCheck = /* @__PURE__ */ __name((alg, key, usage, allowJwk) => {
       if (key instanceof Uint8Array)
         return;
       if (allowJwk && isJWK(key)) {
@@ -5761,8 +5989,8 @@ var init_check_key_type = __esm({
       if (key.type !== "secret") {
         throw new TypeError(`${tag(key)} instances for symmetric algorithms must be of type "secret"`);
       }
-    };
-    asymmetricTypeCheck = (alg, key, usage, allowJwk) => {
+    }, "symmetricTypeCheck");
+    asymmetricTypeCheck = /* @__PURE__ */ __name((alg, key, usage, allowJwk) => {
       if (allowJwk && isJWK(key)) {
         switch (usage) {
           case "sign":
@@ -5793,7 +6021,8 @@ var init_check_key_type = __esm({
       if (key.algorithm && usage === "encrypt" && key.type === "private") {
         throw new TypeError(`${tag(key)} instances for asymmetric algorithm encryption must be of type "public"`);
       }
-    };
+    }, "asymmetricTypeCheck");
+    __name(checkKeyType, "checkKeyType");
     check_key_type_default = checkKeyType.bind(void 0, false);
     checkKeyTypeWithJwk = checkKeyType.bind(void 0, true);
   }
@@ -5848,7 +6077,9 @@ var init_encrypt = __esm({
     init_iv();
     init_errors();
     init_is_key_like();
-    encrypt3 = async (enc, plaintext, cek, iv, aad) => {
+    __name(cbcEncrypt, "cbcEncrypt");
+    __name(gcmEncrypt, "gcmEncrypt");
+    encrypt3 = /* @__PURE__ */ __name(async (enc, plaintext, cek, iv, aad) => {
       if (!isCryptoKey(cek) && !(cek instanceof Uint8Array)) {
         throw new TypeError(invalid_key_input_default(cek, ...types, "Uint8Array"));
       }
@@ -5875,7 +6106,7 @@ var init_encrypt = __esm({
         default:
           throw new JOSENotSupported("Unsupported JWE Content Encryption Algorithm");
       }
-    };
+    }, "encrypt");
     encrypt_default = encrypt3;
   }
 });
@@ -5899,6 +6130,8 @@ var init_aesgcmkw = __esm({
     init_encrypt();
     init_decrypt();
     init_base64url();
+    __name(wrap2, "wrap");
+    __name(unwrap2, "unwrap");
   }
 });
 
@@ -6029,6 +6262,7 @@ var init_decrypt_key_management = __esm({
     init_check_key_type();
     init_is_object();
     init_aesgcmkw();
+    __name(decryptKeyManagement, "decryptKeyManagement");
     decrypt_key_management_default = decryptKeyManagement;
   }
 });
@@ -6067,6 +6301,7 @@ var validate_crit_default;
 var init_validate_crit = __esm({
   "../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
     init_errors();
+    __name(validateCrit, "validateCrit");
     validate_crit_default = validateCrit;
   }
 });
@@ -6075,7 +6310,7 @@ var init_validate_crit = __esm({
 var validateAlgorithms, validate_algorithms_default;
 var init_validate_algorithms = __esm({
   "../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
-    validateAlgorithms = (option, algorithms) => {
+    validateAlgorithms = /* @__PURE__ */ __name((option, algorithms) => {
       if (algorithms !== void 0 && (!Array.isArray(algorithms) || algorithms.some((s) => typeof s !== "string"))) {
         throw new TypeError(`"${option}" option must be an array of strings`);
       }
@@ -6083,7 +6318,7 @@ var init_validate_algorithms = __esm({
         return void 0;
       }
       return new Set(algorithms);
-    };
+    }, "validateAlgorithms");
     validate_algorithms_default = validateAlgorithms;
   }
 });
@@ -6242,6 +6477,7 @@ var init_decrypt2 = __esm({
     init_cek();
     init_validate_crit();
     init_validate_algorithms();
+    __name(flattenedDecrypt, "flattenedDecrypt");
   }
 });
 
@@ -6275,6 +6511,7 @@ var init_decrypt3 = __esm({
     init_decrypt2();
     init_errors();
     init_buffer_utils();
+    __name(compactDecrypt, "compactDecrypt");
   }
 });
 
@@ -6311,6 +6548,7 @@ var init_decrypt4 = __esm({
     init_decrypt2();
     init_errors();
     init_is_object();
+    __name(generalDecrypt, "generalDecrypt");
   }
 });
 
@@ -6330,7 +6568,7 @@ var init_key_to_jwk = __esm({
     init_invalid_key_input();
     init_base64url();
     init_is_key_like();
-    keyToJWK = async (key) => {
+    keyToJWK = /* @__PURE__ */ __name(async (key) => {
       if (key instanceof Uint8Array) {
         return {
           kty: "oct",
@@ -6345,7 +6583,7 @@ var init_key_to_jwk = __esm({
       }
       const { ext, key_ops, alg, use, ...jwk } = await webcrypto_default.subtle.exportKey("jwk", key);
       return jwk;
-    };
+    }, "keyToJWK");
     key_to_jwk_default = keyToJWK;
   }
 });
@@ -6365,6 +6603,9 @@ var init_export = __esm({
     init_asn1();
     init_asn1();
     init_key_to_jwk();
+    __name(exportSPKI, "exportSPKI");
+    __name(exportPKCS8, "exportPKCS8");
+    __name(exportJWK, "exportJWK");
   }
 });
 
@@ -6460,6 +6701,7 @@ var init_encrypt_key_management = __esm({
     init_export();
     init_check_key_type();
     init_aesgcmkw();
+    __name(encryptKeyManagement, "encryptKeyManagement");
     encrypt_key_management_default = encryptKeyManagement;
   }
 });
@@ -6477,6 +6719,9 @@ var init_encrypt2 = __esm({
     init_buffer_utils();
     init_validate_crit();
     FlattenedEncrypt = class {
+      static {
+        __name(this, "FlattenedEncrypt");
+      }
       constructor(plaintext) {
         if (!(plaintext instanceof Uint8Array)) {
           throw new TypeError("plaintext must be an instance of Uint8Array");
@@ -6632,6 +6877,9 @@ var init_encrypt3 = __esm({
     init_base64url();
     init_validate_crit();
     IndividualRecipient = class {
+      static {
+        __name(this, "IndividualRecipient");
+      }
       constructor(enc, key, options) {
         this.parent = enc;
         this.key = key;
@@ -6655,6 +6903,9 @@ var init_encrypt3 = __esm({
       }
     };
     GeneralEncrypt = class {
+      static {
+        __name(this, "GeneralEncrypt");
+      }
       constructor(plaintext) {
         this._recipients = [];
         this._plaintext = plaintext;
@@ -6816,6 +7067,7 @@ function subtleDsa(alg, algorithm) {
 var init_subtle_dsa = __esm({
   "../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
     init_errors();
+    __name(subtleDsa, "subtleDsa");
   }
 });
 
@@ -6846,6 +7098,7 @@ var init_get_sign_verify_key = __esm({
     init_invalid_key_input();
     init_is_key_like();
     init_normalize_key();
+    __name(getCryptoKey3, "getCryptoKey");
   }
 });
 
@@ -6857,7 +7110,7 @@ var init_verify = __esm({
     init_webcrypto();
     init_check_key_length();
     init_get_sign_verify_key();
-    verify = async (alg, key, signature, data) => {
+    verify = /* @__PURE__ */ __name(async (alg, key, signature, data) => {
       const cryptoKey = await getCryptoKey3(alg, key, "verify");
       check_key_length_default(alg, cryptoKey);
       const algorithm = subtleDsa(alg, cryptoKey.algorithm);
@@ -6866,7 +7119,7 @@ var init_verify = __esm({
       } catch {
         return false;
       }
-    };
+    }, "verify");
     verify_default = verify;
   }
 });
@@ -6989,6 +7242,7 @@ var init_verify2 = __esm({
     init_validate_algorithms();
     init_is_jwk();
     init_import();
+    __name(flattenedVerify, "flattenedVerify");
   }
 });
 
@@ -7016,6 +7270,7 @@ var init_verify3 = __esm({
     init_verify2();
     init_errors();
     init_buffer_utils();
+    __name(compactVerify, "compactVerify");
   }
 });
 
@@ -7045,6 +7300,7 @@ var init_verify4 = __esm({
     init_verify2();
     init_errors();
     init_is_object();
+    __name(generalVerify, "generalVerify");
   }
 });
 
@@ -7052,7 +7308,7 @@ var init_verify4 = __esm({
 var epoch_default;
 var init_epoch = __esm({
   "../../node_modules/jose/dist/browser/lib/epoch.js"() {
-    epoch_default = (date) => Math.floor(date.getTime() / 1e3);
+    epoch_default = /* @__PURE__ */ __name((date) => Math.floor(date.getTime() / 1e3), "default");
   }
 });
 
@@ -7066,7 +7322,7 @@ var init_secs = __esm({
     week = day * 7;
     year = day * 365.25;
     REGEX = /^(\+|\-)? ?(\d+|\d+\.\d+) ?(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)(?: (ago|from now))?$/i;
-    secs_default = (str) => {
+    secs_default = /* @__PURE__ */ __name((str) => {
       const matched = REGEX.exec(str);
       if (!matched || matched[4] && matched[1]) {
         throw new TypeError("Invalid time period format");
@@ -7114,7 +7370,7 @@ var init_secs = __esm({
         return -numericDate;
       }
       return numericDate;
-    };
+    }, "default");
   }
 });
 
@@ -7127,8 +7383,8 @@ var init_jwt_claims_set = __esm({
     init_epoch();
     init_secs();
     init_is_object();
-    normalizeTyp = (value) => value.toLowerCase().replace(/^application\//, "");
-    checkAudiencePresence = (audPayload, audOption) => {
+    normalizeTyp = /* @__PURE__ */ __name((value) => value.toLowerCase().replace(/^application\//, ""), "normalizeTyp");
+    checkAudiencePresence = /* @__PURE__ */ __name((audPayload, audOption) => {
       if (typeof audPayload === "string") {
         return audOption.includes(audPayload);
       }
@@ -7136,8 +7392,8 @@ var init_jwt_claims_set = __esm({
         return audOption.some(Set.prototype.has.bind(new Set(audPayload)));
       }
       return false;
-    };
-    jwt_claims_set_default = (protectedHeader, encodedPayload, options = {}) => {
+    }, "checkAudiencePresence");
+    jwt_claims_set_default = /* @__PURE__ */ __name((protectedHeader, encodedPayload, options = {}) => {
       let payload;
       try {
         payload = JSON.parse(decoder.decode(encodedPayload));
@@ -7220,7 +7476,7 @@ var init_jwt_claims_set = __esm({
         }
       }
       return payload;
-    };
+    }, "default");
   }
 });
 
@@ -7242,6 +7498,7 @@ var init_verify5 = __esm({
     init_verify3();
     init_jwt_claims_set();
     init_errors();
+    __name(jwtVerify, "jwtVerify");
   }
 });
 
@@ -7270,6 +7527,7 @@ var init_decrypt5 = __esm({
     init_decrypt3();
     init_jwt_claims_set();
     init_errors();
+    __name(jwtDecrypt, "jwtDecrypt");
   }
 });
 
@@ -7279,6 +7537,9 @@ var init_encrypt4 = __esm({
   "../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
     init_encrypt2();
     CompactEncrypt = class {
+      static {
+        __name(this, "CompactEncrypt");
+      }
       constructor(plaintext) {
         this._flattened = new FlattenedEncrypt(plaintext);
       }
@@ -7314,12 +7575,12 @@ var init_sign = __esm({
     init_webcrypto();
     init_check_key_length();
     init_get_sign_verify_key();
-    sign = async (alg, key, data) => {
+    sign = /* @__PURE__ */ __name(async (alg, key, data) => {
       const cryptoKey = await getCryptoKey3(alg, key, "sign");
       check_key_length_default(alg, cryptoKey);
       const signature = await webcrypto_default.subtle.sign(subtleDsa(alg, cryptoKey.algorithm), cryptoKey, data);
       return new Uint8Array(signature);
-    };
+    }, "sign");
     sign_default = sign;
   }
 });
@@ -7336,6 +7597,9 @@ var init_sign2 = __esm({
     init_check_key_type();
     init_validate_crit();
     FlattenedSign = class {
+      static {
+        __name(this, "FlattenedSign");
+      }
       constructor(payload) {
         if (!(payload instanceof Uint8Array)) {
           throw new TypeError("payload must be an instance of Uint8Array");
@@ -7417,6 +7681,9 @@ var init_sign3 = __esm({
   "../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
     init_sign2();
     CompactSign = class {
+      static {
+        __name(this, "CompactSign");
+      }
       constructor(payload) {
         this._flattened = new FlattenedSign(payload);
       }
@@ -7442,6 +7709,9 @@ var init_sign4 = __esm({
     init_sign2();
     init_errors();
     IndividualSignature = class {
+      static {
+        __name(this, "IndividualSignature");
+      }
       constructor(sig, key, options) {
         this.parent = sig;
         this.key = key;
@@ -7472,6 +7742,9 @@ var init_sign4 = __esm({
       }
     };
     GeneralSign = class {
+      static {
+        __name(this, "GeneralSign");
+      }
       constructor(payload) {
         this._signatures = [];
         this._payload = payload;
@@ -7521,7 +7794,11 @@ var init_produce = __esm({
     init_epoch();
     init_is_object();
     init_secs();
+    __name(validateInput, "validateInput");
     ProduceJWT = class {
+      static {
+        __name(this, "ProduceJWT");
+      }
       constructor(payload = {}) {
         if (!isObject(payload)) {
           throw new TypeError("JWT Claims Set MUST be an object");
@@ -7592,6 +7869,9 @@ var init_sign5 = __esm({
     init_buffer_utils();
     init_produce();
     SignJWT = class extends ProduceJWT {
+      static {
+        __name(this, "SignJWT");
+      }
       setProtectedHeader(protectedHeader) {
         this._protectedHeader = protectedHeader;
         return this;
@@ -7616,6 +7896,9 @@ var init_encrypt5 = __esm({
     init_buffer_utils();
     init_produce();
     EncryptJWT = class extends ProduceJWT {
+      static {
+        __name(this, "EncryptJWT");
+      }
       setProtectedHeader(protectedHeader) {
         if (this._protectedHeader) {
           throw new TypeError("setProtectedHeader can only be called once");
@@ -7733,11 +8016,13 @@ var init_thumbprint = __esm({
     init_errors();
     init_buffer_utils();
     init_is_object();
-    check2 = (value, description) => {
+    check2 = /* @__PURE__ */ __name((value, description) => {
       if (typeof value !== "string" || !value) {
         throw new JWKInvalid(`${description} missing or invalid`);
       }
-    };
+    }, "check");
+    __name(calculateJwkThumbprint, "calculateJwkThumbprint");
+    __name(calculateJwkThumbprintUri, "calculateJwkThumbprintUri");
   }
 });
 
@@ -7761,6 +8046,7 @@ var init_embedded = __esm({
     init_import();
     init_is_object();
     init_errors();
+    __name(EmbeddedJWK, "EmbeddedJWK");
   }
 });
 
@@ -7803,10 +8089,10 @@ async function importWithAlgCache(cache, jwk, alg) {
 }
 function createLocalJWKSet(jwks) {
   const set = new LocalJWKSet(jwks);
-  const localJWKSet = async (protectedHeader, token) => set.getKey(protectedHeader, token);
+  const localJWKSet = /* @__PURE__ */ __name(async (protectedHeader, token) => set.getKey(protectedHeader, token), "localJWKSet");
   Object.defineProperties(localJWKSet, {
     jwks: {
-      value: () => clone(set._jwks),
+      value: /* @__PURE__ */ __name(() => clone(set._jwks), "value"),
       enumerable: true,
       configurable: false,
       writable: false
@@ -7820,7 +8106,14 @@ var init_local = __esm({
     init_import();
     init_errors();
     init_is_object();
+    __name(getKtyFromAlg, "getKtyFromAlg");
+    __name(isJWKSLike, "isJWKSLike");
+    __name(isJWKLike, "isJWKLike");
+    __name(clone, "clone");
     LocalJWKSet = class {
+      static {
+        __name(this, "LocalJWKSet");
+      }
       constructor(jwks) {
         this._cached = /* @__PURE__ */ new WeakMap();
         if (!isJWKSLike(jwks)) {
@@ -7889,6 +8182,8 @@ var init_local = __esm({
         return importWithAlgCache(this._cached, jwk, alg);
       }
     };
+    __name(importWithAlgCache, "importWithAlgCache");
+    __name(createLocalJWKSet, "createLocalJWKSet");
   }
 });
 
@@ -7897,7 +8192,7 @@ var fetchJwks, fetch_jwks_default;
 var init_fetch_jwks = __esm({
   "../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
     init_errors();
-    fetchJwks = async (url, timeout, options) => {
+    fetchJwks = /* @__PURE__ */ __name(async (url, timeout, options) => {
       let controller;
       let id;
       let timedOut = false;
@@ -7927,14 +8222,14 @@ var init_fetch_jwks = __esm({
       } catch {
         throw new JOSEError("Failed to parse the JSON Web Key Set HTTP response as JSON");
       }
-    };
+    }, "fetchJwks");
     fetch_jwks_default = fetchJwks;
   }
 });
 
 // ../../node_modules/jose/dist/browser/jwks/remote.js
 function isCloudflareWorkers() {
-  return typeof WebSocketPair !== "undefined" || typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers" || typeof EdgeRuntime !== "undefined" && EdgeRuntime === "vercel";
+  return typeof WebSocketPair !== "undefined" || typeof navigator !== "undefined" && true || typeof EdgeRuntime !== "undefined" && EdgeRuntime === "vercel";
 }
 function isFreshJwksCache(input, cacheMaxAge) {
   if (typeof input !== "object" || input === null) {
@@ -7950,31 +8245,31 @@ function isFreshJwksCache(input, cacheMaxAge) {
 }
 function createRemoteJWKSet(url, options) {
   const set = new RemoteJWKSet(url, options);
-  const remoteJWKSet = async (protectedHeader, token) => set.getKey(protectedHeader, token);
+  const remoteJWKSet = /* @__PURE__ */ __name(async (protectedHeader, token) => set.getKey(protectedHeader, token), "remoteJWKSet");
   Object.defineProperties(remoteJWKSet, {
     coolingDown: {
-      get: () => set.coolingDown(),
+      get: /* @__PURE__ */ __name(() => set.coolingDown(), "get"),
       enumerable: true,
       configurable: false
     },
     fresh: {
-      get: () => set.fresh(),
+      get: /* @__PURE__ */ __name(() => set.fresh(), "get"),
       enumerable: true,
       configurable: false
     },
     reload: {
-      value: () => set.reload(),
+      value: /* @__PURE__ */ __name(() => set.reload(), "value"),
       enumerable: true,
       configurable: false,
       writable: false
     },
     reloading: {
-      get: () => !!set._pendingFetch,
+      get: /* @__PURE__ */ __name(() => !!set._pendingFetch, "get"),
       enumerable: true,
       configurable: false
     },
     jwks: {
-      value: () => set._local?.jwks(),
+      value: /* @__PURE__ */ __name(() => set._local?.jwks(), "value"),
       enumerable: true,
       configurable: false,
       writable: false
@@ -7989,13 +8284,18 @@ var init_remote = __esm({
     init_errors();
     init_local();
     init_is_object();
-    if (typeof navigator === "undefined" || !navigator.userAgent?.startsWith?.("Mozilla/5.0 ")) {
+    __name(isCloudflareWorkers, "isCloudflareWorkers");
+    if (typeof navigator === "undefined" || !"Cloudflare-Workers"?.startsWith?.("Mozilla/5.0 ")) {
       const NAME = "jose";
       const VERSION = "v5.10.0";
       USER_AGENT = `${NAME}/${VERSION}`;
     }
     jwksCache = /* @__PURE__ */ Symbol();
+    __name(isFreshJwksCache, "isFreshJwksCache");
     RemoteJWKSet = class {
+      static {
+        __name(this, "RemoteJWKSet");
+      }
       constructor(url, options) {
         if (!(url instanceof URL)) {
           throw new TypeError("url must be an instance of URL");
@@ -8059,6 +8359,7 @@ var init_remote = __esm({
         await this._pendingFetch;
       }
     };
+    __name(createRemoteJWKSet, "createRemoteJWKSet");
     experimental_jwksCache = jwksCache;
   }
 });
@@ -8073,6 +8374,9 @@ var init_unsecured = __esm({
     init_jwt_claims_set();
     init_produce();
     UnsecuredJWT = class extends ProduceJWT {
+      static {
+        __name(this, "UnsecuredJWT");
+      }
       encode() {
         const header = encode(JSON.stringify({ alg: "none" }));
         const payload = encode(JSON.stringify(this._payload));
@@ -8150,6 +8454,7 @@ var init_decode_protected_header = __esm({
     init_base64url2();
     init_buffer_utils();
     init_is_object();
+    __name(decodeProtectedHeader, "decodeProtectedHeader");
   }
 });
 
@@ -8186,6 +8491,7 @@ var init_decode_jwt = __esm({
     init_buffer_utils();
     init_is_object();
     init_errors();
+    __name(decodeJwt, "decodeJwt");
   }
 });
 
@@ -8335,6 +8641,9 @@ var init_generate = __esm({
     init_webcrypto();
     init_errors();
     init_random();
+    __name(generateSecret, "generateSecret");
+    __name(getModulusLengthOption, "getModulusLengthOption");
+    __name(generateKeyPair, "generateKeyPair");
   }
 });
 
@@ -8345,6 +8654,7 @@ async function generateKeyPair2(alg, options) {
 var init_generate_key_pair = __esm({
   "../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
     init_generate();
+    __name(generateKeyPair2, "generateKeyPair");
   }
 });
 
@@ -8355,6 +8665,7 @@ async function generateSecret2(alg, options) {
 var init_generate_secret = __esm({
   "../../node_modules/jose/dist/browser/key/generate_secret.js"() {
     init_generate();
+    __name(generateSecret2, "generateSecret");
   }
 });
 
@@ -8544,6 +8855,9 @@ connect();
 var MAX_EVENTS = 5e3;
 var HEARTBEAT_WINDOW_MS = 6e4;
 var FlowsHub = class {
+  static {
+    __name(this, "FlowsHub");
+  }
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -8763,11 +9077,13 @@ function normalize(e, now) {
     payload: e.payload && typeof e.payload === "object" ? e.payload : {}
   };
 }
+__name(normalize, "normalize");
 function classifyActor(actor) {
   if (actor.startsWith("human:")) return "human";
   if (actor.startsWith("agent:")) return "agent";
   return "system";
 }
+__name(classifyActor, "classifyActor");
 function safeParse(s) {
   try {
     return JSON.parse(s);
@@ -8775,6 +9091,7 @@ function safeParse(s) {
     return {};
   }
 }
+__name(safeParse, "safeParse");
 function normalizeOptions(raw) {
   if (!Array.isArray(raw)) return null;
   const out = raw.slice(0, 6).filter((o) => o && typeof o === "object" && o.id && o.label).map((o) => ({
@@ -8784,6 +9101,7 @@ function normalizeOptions(raw) {
   }));
   return out.length ? out : null;
 }
+__name(normalizeOptions, "normalizeOptions");
 
 // src/index.js
 init_mcp();
@@ -8955,7 +9273,7 @@ var index_default = {
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
-        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
+        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "metrics/throughput" ? "https://kb/metrics.throughput" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
         return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
       }
@@ -9115,10 +9433,12 @@ async function handleIngest(request, env) {
     body: JSON.stringify({ events })
   });
 }
+__name(handleIngest, "handleIngest");
 var LEGACY_WS_MEMBERS = ["rayh"];
 function wsRegistry(env) {
   return env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
 }
+__name(wsRegistry, "wsRegistry");
 async function wsCall(env, op, body) {
   const r = await wsRegistry(env).fetch(`https://kb/${op}`, {
     method: "POST",
@@ -9129,6 +9449,7 @@ async function wsCall(env, op, body) {
   if (!r.ok) throw new Error(out.error ?? `ws ${op} failed`);
   return out;
 }
+__name(wsCall, "wsCall");
 async function wsHome(env, login) {
   const l = login.toLowerCase();
   await wsCall(env, "ws.seed", { logins: LEGACY_WS_MEMBERS }).catch(() => {
@@ -9142,12 +9463,14 @@ async function wsHome(env, login) {
   }
   return hasDefault ? DEFAULT_WS_SLUG : l;
 }
+__name(wsHome, "wsHome");
 var SESSION_COOKIE = "bridge_session";
 var OAUTH_COOKIE = "bridge_oauth";
 var SESSION_TTL_MS = 30 * 24 * 3600 * 1e3;
 function githubConfigured(env) {
   return !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
 }
+__name(githubConfigured, "githubConfigured");
 async function authKb(request, env) {
   const session = await checkAuth(request, env);
   if (!(session instanceof Response)) return session;
@@ -9163,6 +9486,7 @@ async function authKb(request, env) {
   if (!ws) return session;
   return { login: null, ws, bearer: true };
 }
+__name(authKb, "authKb");
 function kbCors(r) {
   if (!r || !r.headers) return r;
   const h = new Headers(r.headers);
@@ -9171,9 +9495,11 @@ function kbCors(r) {
   h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h, webSocket: r.webSocket });
 }
+__name(kbCors, "kbCors");
 function kbPreflight() {
   return kbCors(new Response(null, { status: 204 }));
 }
+__name(kbPreflight, "kbPreflight");
 async function checkAuth(request, env) {
   if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) {
     const a = await requireAccess(request, env);
@@ -9193,6 +9519,7 @@ async function checkAuth(request, env) {
   if (!session) return loginResponse(request);
   return session;
 }
+__name(checkAuth, "checkAuth");
 function parseLegacyPasswordCookie(request, env) {
   const m = (request.headers.get("Cookie") || "").match(new RegExp(`${SESSION_COOKIE}=([^;\\s]+)`));
   if (!m) return false;
@@ -9202,6 +9529,7 @@ function parseLegacyPasswordCookie(request, env) {
   if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
   return sign2(exp, env.BRIDGE_UI_PASSWORD).then((expected) => expected === m[1].slice(dot + 1));
 }
+__name(parseLegacyPasswordCookie, "parseLegacyPasswordCookie");
 async function handleSession(request, env) {
   if (env.CF_ACCESS_TEAM && env.CF_ACCESS_AUD) {
     const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
@@ -9230,6 +9558,7 @@ async function handleSession(request, env) {
   const dot = m[1].indexOf(".");
   return json2({ mode: "github", user: session.login, workspace: session.ws, expires_ts: Number(m[1].slice(0, dot)) });
 }
+__name(handleSession, "handleSession");
 function loginResponse(request) {
   const wantsHtml = (request.headers.get("Accept") || "").includes("text/html");
   if (wantsHtml) {
@@ -9240,6 +9569,7 @@ function loginResponse(request) {
   }
   return json2({ error: "unauthorized: sign in via GET /login (github oauth)" }, 401);
 }
+__name(loginResponse, "loginResponse");
 function startGithubLogin(env, state) {
   const redirect = new URL("https://github.com/login/oauth/authorize");
   redirect.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
@@ -9254,6 +9584,7 @@ function startGithubLogin(env, state) {
     }
   });
 }
+__name(startGithubLogin, "startGithubLogin");
 function handleGithubLogin(request, env) {
   if (!githubConfigured(env)) {
     return json2({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET" }, 503);
@@ -9269,6 +9600,7 @@ function handleGithubLogin(request, env) {
   }
   return startGithubLogin(env, state);
 }
+__name(handleGithubLogin, "handleGithubLogin");
 function parseDesktopState(state) {
   const m = /^desktop-(\d{1,5})-[0-9a-f]{64}$/.exec(String(state ?? ""));
   if (!m) return null;
@@ -9276,11 +9608,13 @@ function parseDesktopState(state) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   return { port };
 }
+__name(parseDesktopState, "parseDesktopState");
 function oauthFailure(origin, reason = "unknown") {
   const headers = new Headers({ Location: `${origin}/?login=failed&reason=${reason}`, "Cache-Control": "no-store" });
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
   return new Response(null, { status: 302, headers });
 }
+__name(oauthFailure, "oauthFailure");
 async function handleGithubCallback(request, env) {
   if (!githubConfigured(env)) return json2({ error: "auth not configured" }, 503);
   const url = new URL(request.url);
@@ -9341,9 +9675,11 @@ async function handleGithubCallback(request, env) {
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
   return new Response(null, { status: 302, headers });
 }
+__name(handleGithubCallback, "handleGithubCallback");
 function hex(buf) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+__name(hex, "hex");
 async function sign2(payload, secret) {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -9354,6 +9690,7 @@ async function sign2(payload, secret) {
   );
   return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
 }
+__name(sign2, "sign");
 async function verifySession(value, secret) {
   const i1 = value.indexOf("."), i2 = value.lastIndexOf(".");
   if (i1 <= 0 || i2 <= i1) return null;
@@ -9378,6 +9715,7 @@ async function verifySession(value, secret) {
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
   return diff === 0 ? { login, ws } : null;
 }
+__name(verifySession, "verifySession");
 async function requireAccess(request, env) {
   const team = env.CF_ACCESS_TEAM, aud = env.CF_ACCESS_AUD;
   const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
@@ -9391,14 +9729,17 @@ async function requireAccess(request, env) {
     return json2({ error: "invalid access jwt", detail: String(e).slice(0, 120) }, 403);
   }
 }
+__name(requireAccess, "requireAccess");
 function json2(obj, status = 200, extra = {}) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...extra }
   });
 }
+__name(json2, "json");
 export {
   FlowsHub,
   KnowledgeHub,
   index_default as default
 };
+//# sourceMappingURL=index.js.map

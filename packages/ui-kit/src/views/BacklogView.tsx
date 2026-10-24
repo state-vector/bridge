@@ -2,29 +2,43 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel } from "../server/views";
+import { kindOf, rel, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 
-/** Backlog + Completed: the queue and the ledger.
- *  Backlog = work to be done, ranked by what gets picked up next (the same
- *  ranking orient feeds the runner: unblock duties first, then blocked with an
- *  exit condition, then verify duty, then questions, then plain todo — oldest
- *  first within a rank). Completed = done work, newest first. Everything else
- *  lives in Top; Board keeps the swimlane view. */
+/** Backlog + Completed: the whole queue, categorised (2026-10-24 spec, Ray):
+ *  NEXT (todo, claim-ranked — boost/park from the card), BLOCKED grouped by
+ *  reason (awaiting human · awaiting verify · unblock duty live · other),
+ *  TIMEOUT (churn/rework machine parks — nobody can action them), PARKED
+ *  (deliberately not dispatchable). Completed = done work, newest first.
+ *  Same ktable primitive as Top; only --cols differ. */
 
-function rankOf(t: any, parentIdOf: Map<string, string>): { rank: number; why: string } {
+function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<string>): { rank: number; why: string } {
   const tags: string[] = t.tags ?? [];
   const m = t.meta ?? {};
+  // release-parked-work levers first (verify + unblock — mirrors the orient
+  // pool ranking in worker do.ts, 2026-10-24): in_review work parks its
+  // owner until a fresh session rules; nothing outranks clearing that.
+  const parentId = parentIdOf.get(t.id);
+  if (parentId && tags.includes("role:review") && (!inReviewIds || inReviewIds.has(parentId))) {
+    return { rank: 0, why: `verify duty — parks ${parentId}'s owner` };
+  }
   if (tags.includes("role:unblock")) return { rank: 0, why: "unblock duty — cheapest lever on parked work" };
   if (t.status === "blocked") {
     if (m.blocked?.unblock_condition) return { rank: 1, why: "blocked with an exit condition — resumable now" };
     return { rank: 5, why: "blocked without an exit condition — needs re-scope" };
   }
-  const parentId = parentIdOf.get(t.id);
-  if (parentId && tags.includes("role:review")) return { rank: 2, why: `verify duty — parks ${parentId}'s owner` };
   if (tags.includes("question")) return { rank: 3, why: "question — open for contributions" };
   if (tags.includes("role:analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
   return { rank: 4, why: "todo" };
+}
+
+interface BlGroup {
+  key: string;
+  title: string;
+  note: string;
+  rows: any[];
+  showRank: boolean;
+  showBoost: boolean;
 }
 
 export function BacklogView({ openTask }: { openTask?: (id: string) => void } = {}) {
@@ -34,39 +48,48 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
   const openDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const [msg, setMsg] = useState("");
 
-  const { queue, parked } = useMemo(() => {
+  const groups = useMemo<BlGroup[]>(() => {
+    const ts = tasks as any[];
     const parentOf = new Map<string, string>();
-    for (const t of tasks as any[]) if ((t as any).part_of) parentOf.set(t.id, (t as any).part_of);
-    const inReview = new Set((tasks as any[]).filter((t) => t.status === "in_review").map((t) => t.id));
+    for (const t of ts) if (t.part_of) parentOf.set(t.id, t.part_of);
+    const inReviewIds = new Set(ts.filter((t) => t.status === "in_review").map((t) => t.id));
+    const twinIdx = unblockTwinIndex(ts);
     const decorate = (t: any) => {
-      const tags: string[] = t.tags ?? [];
-      const isVerify = tags.includes("role:review") && parentOf.get(t.id) && inReview.has(parentOf.get(t.id)!);
-      const { rank, why } = rankOf(t, parentOf);
+      const { rank, why } = rankOf(t, parentOf, inReviewIds);
       const boosted = !!(t.meta?.boosted);
       return {
         t,
-        rank: boosted ? -1 : (isVerify ? 2 : rank),
-        why: boosted ? "boosted — priority 0 (human)" : (isVerify ? `verify duty — parks ${parentOf.get(t.id)}'s owner` : why),
+        rank: boosted ? -1 : rank,
+        why: boosted ? "boosted — priority 0 (human)" : why,
         boosted,
         attempts: t.meta?.attempt?.attempts ?? 0,
       };
     };
-    const all = (tasks as any[]).filter((t) => t.status === "todo" || t.status === "blocked").map(decorate);
-    // parked = structurally not dispatchable (server-projected is_claimable) —
-    // shown separately so hours-old items don't masquerade as a stuck queue
-    const parked = all.filter(({ t }) => {
-      const claimable = (t as any).is_claimable;
-      if (t.status === "blocked") return !(t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id);
-      return claimable === false;
-    });
-    const queue = all.filter((r) => !parked.includes(r))
+    const byUpdated = (a: any, b: any) => (b.updated_ts ?? 0) - (a.updated_ts ?? 0);
+
+    const ready = ts.filter((t) => t.status === "todo" && t.is_claimable !== false).map(decorate)
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
-    parked.sort((a, b) => b.t.updated_ts - a.t.updated_ts);
-    return { queue, parked };
+    const blockedHuman = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && t.meta?.awaiting_ask?.ask_id).sort(byUpdated);
+    const verify = ts.filter((t) => t.status === "in_review").sort(byUpdated);
+    const unblocking = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && !t.meta?.awaiting_ask?.ask_id && activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
+    const blockedOther = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && !t.meta?.awaiting_ask?.ask_id && !activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
+    const timeout = ts.filter((t) => isTimeoutBlock(t)).sort(byUpdated);
+    const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false).sort(byUpdated);
+
+    return [
+      { key: "ready", title: "Next — ready to go", note: "claim-ranked: verify duties → unblock duties → questions → todo (verify first — in_review work parks its owner). ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
+      { key: "human", title: "Blocked — awaiting you", note: "pending human ask — answer it and the asker resumes.", rows: blockedHuman, showRank: false, showBoost: false },
+      { key: "verify", title: "Blocked — awaiting verify", note: "in review; the owner stays parked until a fresh verify session rules.", rows: verify, showRank: false, showBoost: false },
+      { key: "unblocking", title: "Blocked — unblock duty live", note: "an agent is actively working the unblock; nothing for you to do.", rows: unblocking, showRank: false, showBoost: false },
+      { key: "other", title: "Blocked — other", note: "machine exit conditions — they move when the condition fires.", rows: blockedOther, showRank: false, showBoost: false },
+      { key: "timeout", title: "Timeout — churn/rework parks", note: "cannot be actioned by anyone; the owning agent resumes or the park lapses.", rows: timeout, showRank: false, showBoost: false },
+      { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
+    ].filter((g) => g.rows.length > 0);
   }, [tasks]);
 
   const parkedReason = (t: any): string => {
-    if (t.status === "blocked") return "blocked without an exit condition — open the card, resolve or re-scope";
+    if (isTimeoutBlock(t)) return "churn/rework park — agent resumes or it lapses";
+    if (t.status === "blocked") return (t.meta?.blocked?.unblock_condition ?? "blocked — open the card, resolve or re-scope").slice(0, 90);
     if ((t.tags ?? []).includes("question") || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
     if (t.meta?.operator_gated) return `operator gate: ${t.meta.operator_gated} — a human clears it`;
     return (t as any).claim_reason || "not dispatchable — see card";
@@ -84,81 +107,74 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     }
   };
 
+  const total = groups.reduce((n, g) => n + g.rows.length, 0);
+
   return (
     <div className="backlog-wrap">
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
       <div className="view-head">
         <h2>Backlog</h2>
-        <span className="muted-note">{queue.length} dispatchable · {parked.length} parked — ranked by what gets picked up next</span>
+        <span className="muted-note">{total} items — next · blocked by reason · timeout · parked</span>
         {msg && <span className="ok">{msg}</span>}
       </div>
-      <div className="backlog-list">
-        {queue.map(({ t, rank, why, boosted, attempts }) => {
-          const kind = kindOf(t);
-          return (
-            <div key={t.id} className={`ktable-row backlog-row ${boosted ? "backlog-boosted" : ""}`} onClick={() => openDetails(t.id)}>
-              <span className="backlog-rank" title={`pickup rank: ${why}`}>{boosted ? "▲" : rank + 1}</span>
-              <span className="backlog-id">{t.id}</span>
-              <span className="backlog-main">
-                <span className={`kind-pill kp-${kind}`}>{kind}</span>
-                <span className="backlog-title">{t.title}</span>
-                {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
-                  <span className="backlog-why">
-                    {t.meta?.awaiting_ask?.ask_id
-                      ? <><Chip tone="urgent">ask</Chip> {t.meta.awaiting_ask.ask_id}</>
-                      : <><Chip tone="scope">exit</Chip> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
-                  </span>
-                )}
-              </span>
-              <span className="backlog-meta">
-                <Btn
-                  size="sm"
-                  className="boost-btn"
-                  on={boosted}
-                  title={boosted ? "remove boost (this task + its open children)" : "boost to priority 0 (this task + its open children)"}
-                  onClick={(e) => void boost(t.id, !boosted, e)}
-                >
-                  {boosted ? "▼ unboost" : "▲ boost"}
-                </Btn>
-                {attempts > 0 && <Chip tone="urgent" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
-                {t.owner ? <span title={`claimed by ${t.owner}`}>{t.owner}</span> : <span className="backlog-pool">pool</span>}
-              </span>
-              <span className="backlog-age top-num" title="last updated">{rel(t.updated_ts)}</span>
-            </div>
-          );
-        })}
-        {queue.length === 0 && <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "Queue empty — everything in flight, parked, or done."}</p>}
-      </div>
-
-      {parked.length > 0 && (
-        <>
-          <div className="view-head">
-            <h2>Parked — not dispatchable</h2>
-            <span className="muted-note">{parked.length} items waiting on a human, an author, or a gate — these will not move on their own</span>
+      {groups.map((g) => (
+        <div key={g.key} className="backlog-group">
+          <div className="view-head backlog-group-head">
+            <h2>{g.title}</h2>
+            <span className="muted-note">{g.rows.length} · {g.note}</span>
           </div>
           <div className="backlog-list">
-            {parked.map(({ t, attempts }) => {
+            {g.rows.map((r: any) => {
+              const t = r.t ?? r;
               const kind = kindOf(t);
+              const rank = r.rank;
+              const boosted = !!r.boosted;
+              const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
               return (
-                <div key={t.id} className="ktable-row backlog-row backlog-parked" onClick={() => openDetails(t.id)}>
-                  <span className="backlog-rank backlog-rank-parked">▪</span>
+                <div
+                  key={t.id}
+                  className={`ktable-row backlog-row ${boosted ? "backlog-boosted" : ""} ${g.key === "timeout" || g.key === "parked" ? "backlog-parked" : ""}`}
+                  onClick={() => openDetails(t.id)}
+                >
+                  <span className="backlog-rank" title={`pickup rank: ${r.why ?? parkedReason(t)}`}>
+                    {boosted ? "▲" : g.showRank ? rank + 1 : g.key === "human" ? "⚑" : g.key === "verify" ? "✓" : g.key === "unblocking" ? "↻" : g.key === "timeout" ? "⏱" : "▪"}
+                  </span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
-                    <span className="backlog-why"><Chip tone="scope">why</Chip> {parkedReason(t)}</span>
+                    {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
+                      <span className="backlog-why">
+                        {t.meta?.awaiting_ask?.ask_id
+                          ? <><Chip tone="urgent">ask</Chip> {t.meta.awaiting_ask.ask_id}</>
+                          : <><Chip tone="scope">exit</Chip> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
+                      </span>
+                    )}
+                    {t.status === "in_review" && <span className="backlog-why"><Chip tone="warn">verify</Chip> awaiting a fresh verify session</span>}
                   </span>
                   <span className="backlog-meta">
+                    {g.showBoost && (
+                      <Btn
+                        size="sm"
+                        className="boost-btn"
+                        on={boosted}
+                        title={boosted ? "remove boost (this task + its open children)" : "boost to priority 0 (this task + its open children)"}
+                        onClick={(e) => void boost(t.id, !boosted, e)}
+                      >
+                        {boosted ? "▼ unboost" : "▲ boost"}
+                      </Btn>
+                    )}
                     {attempts > 0 && <Chip tone="urgent" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
-                    {t.owner ? <span>{t.owner}</span> : <span className="backlog-pool">pool</span>}
+                    {t.owner ? <span title={`claimed by ${t.owner}`}>{t.owner}</span> : <span className="backlog-pool">pool</span>}
                   </span>
                   <span className="backlog-age top-num" title="last updated">{rel(t.updated_ts)}</span>
                 </div>
               );
             })}
           </div>
-        </>
-      )}
+        </div>
+      ))}
+      {groups.length === 0 && <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "Queue empty — everything in flight or done."}</p>}
     </div>
   );
 }
