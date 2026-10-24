@@ -51,8 +51,12 @@ afterAll(async () => {
   await mf.dispose();
 });
 
-const api = (path: string, init?: RequestInit) =>
-  mf.dispatchFetch(`https://main${path}`, { ...init, headers: { cookie, "content-type": "application/json", ...(init?.headers ?? {}) } });
+const api = (path: string, init?: { method?: string; body?: string }) =>
+  mf.dispatchFetch(`https://main${path}`, {
+    method: init?.method ?? "GET",
+    headers: { cookie, "content-type": "application/json" },
+    body: init?.body,
+  });
 
 async function seedDone(title: string): Promise<string> {
   const create = await api("/api/kb/create", {
