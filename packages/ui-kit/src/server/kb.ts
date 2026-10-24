@@ -80,6 +80,16 @@ export interface KbSeriesPoint {
   context_pct?: number;
 }
 
+/** Task-done throughput (BR#2937): done transitions per bucket + cumulative. */
+export interface KbThroughput {
+  bucket: string;
+  range_days: number;
+  from_ts: number;
+  to_ts: number;
+  total: number;
+  buckets: Array<{ t: number; n: number; cumulative: number }>;
+}
+
 /** One entry of an artefact's version history: every mutation, who/when/what. */
 export interface KbVersion {
   seq: number;
@@ -148,6 +158,10 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const kbApi = {
   board: () => j<KbBoard>("/api/kb/board"),
+  throughput: (q?: { bucket?: "day" | "week"; range?: string }) => {
+    const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
+    return j<KbThroughput>(`/api/kb/metrics/throughput${p.size ? `?${p}` : ""}`);
+  },
   events: (since: number) => j<{ events: KbEvent[]; last_seq: number }>(`/api/kb/events?since=${since}&limit=200`),
   artefacts: (q?: { type?: string; status?: string; limit?: number }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));

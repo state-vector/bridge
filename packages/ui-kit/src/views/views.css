@@ -470,6 +470,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .chart-bar.hot { fill: var(--accent); }
 .sentiment-word { text-transform: capitalize; }
 .flow-counts { display: flex; gap: 10px; font-size: 11.5px; flex-wrap: wrap; align-items: center; }
+/* throughput cell (BR#2937): cumulative line over the done bars + day/week toggle */
+.tp-line { fill: none; stroke: var(--green); stroke-width: 1; opacity: 0.7; }
+.tp-toggle { display: inline-flex; gap: 2px; }
+.tp-toggle button { background: var(--bg-hover); color: var(--text-dim); border: none; border-radius: 4px; padding: 1px 7px; font-size: 10.5px; cursor: pointer; }
+.tp-toggle button.tp-on { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text); font-weight: 600; }
 .fc { padding: 2px 8px; border-radius: 99px; font-weight: 600; }
 .fc-todo { background: var(--bg-hover); color: var(--text-dim); }
 .fc-in_progress { background: color-mix(in srgb, var(--amber) 15%, transparent); color: var(--amber); }

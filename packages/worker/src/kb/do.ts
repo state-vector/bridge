@@ -55,6 +55,7 @@ import {
   sanitizeTags,
   validateRelation,
 } from "./core.ts";
+import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
 import {
   check as checkRules,
   invariants as checkInvariants,
@@ -937,17 +938,25 @@ export class KnowledgeHub {
       return this.json({ ok: true, from: old.label, to: newLabel });
     }
 
-    // human-plane GET mirror
+    // human-plane GET mirror — the same error contract as the POST arm: a
+    // rejected read returns 400 with the message, never a naked 500 (the GET
+    // arm predates the try/catch; metrics.throughput's param validation was
+    // the first GET that could throw on user input and exposed the gap)
     if (request.method === "GET") {
-      switch (url.pathname) {
-        case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
-        case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
-        case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
-        case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-        case "/board": return this.json(await this.board());
-        case "/stats": return this.json(await this.stats());
-        case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
-        case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
+      try {
+        switch (url.pathname) {
+          case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
+          case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+          case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
+          case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+          case "/board": return this.json(await this.board());
+          case "/stats": return this.json(await this.stats());
+          case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
+          case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
+          case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
+        }
+      } catch (e) {
+        return this.json({ error: String((e as Error).message ?? e) }, 400);
       }
     }
 
@@ -1983,6 +1992,48 @@ export class KnowledgeHub {
       id, id,
     ).toArray();
     return { id, relations: out };
+  }
+
+  /** Task-done throughput (BR#2937): done transitions per bucket + cumulative,
+   *  aggregated from ledger mutation rows (true transition events — immune to
+   *  later status flips) with a status_ts fallback for rows whose history has
+   *  compacted. Read-only; no audit (reads don't ledger). */
+  private async metricsThroughput(sp: URLSearchParams) {
+    const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
+    if ("error" in parsed) throw new Error(parsed.error);
+    const now = Date.now();
+    const from = now - parsed.rangeDays * 86_400_000;
+    // task ids — only tasks count (decisions/goals have their own lifecycles)
+    const taskIds = new Set(
+      (this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task'`).toArray() as any[]).map((r) => String(r.id)),
+    );
+    // done transition events in range (LIKE prefilter, JSON.parse for truth —
+    // data carries {from, to}; ask-answer rows carry {status:'done'} instead)
+    const events: Array<{ ts: number; artefact_id: string }> = [];
+    for (const r of this.state.storage.sql.exec(
+      `SELECT ts, artefact_id, data FROM ledger
+       WHERE kind = 'mutation' AND action = 'transition' AND ts >= ? AND data LIKE '%"to":"done"%'`,
+      from,
+    ).toArray() as any[]) {
+      let to = "";
+      try { to = String(JSON.parse(r.data ?? "{}").to ?? ""); } catch { continue; }
+      if (to !== "done" || !taskIds.has(String(r.artefact_id))) continue;
+      events.push({ ts: Number(r.ts), artefact_id: String(r.artefact_id) });
+    }
+    // compaction fallback: currently-done tasks with no done-transition row
+    const fallback = (this.state.storage.sql.exec(
+      `SELECT id, status_ts FROM artefacts WHERE type = 'task' AND status = 'done' AND status_ts >= ?`,
+      from,
+    ).toArray() as any[]).map((r) => ({ id: String(r.id), status_ts: Number(r.status_ts) }));
+    const buckets = aggregateThroughput(events, fallback, { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now });
+    return {
+      bucket: parsed.bucket,
+      range_days: parsed.rangeDays,
+      from_ts: buckets[0]?.t ?? from,
+      to_ts: now,
+      total: buckets.reduce((n, b) => n + b.n, 0),
+      buckets,
+    };
   }
 
   private async stats() {

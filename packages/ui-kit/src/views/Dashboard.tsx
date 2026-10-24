@@ -1,7 +1,63 @@
-import { useMemo } from "react";
-import type { KbArtefact } from "../server/kb";
+import { useEffect, useMemo, useState } from "react";
+import type { KbArtefact, KbThroughput } from "../server/kb";
+import { kbApi } from "../server/kb";
+import { useKb } from "../server/kbStore";
 
 const SENTIMENTS = ["going_well", "converging", "neutral", "diverging", "struggling"] as const;
+
+/** Task-done throughput (BR#2937): bars per bucket + cumulative line, from
+ *  /api/kb/metrics/throughput. Refetches when the ledger ticks (a done
+ *  transition is a ledger mutation) and on the day/week toggle. */
+function ThroughputCell() {
+  const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
+  const [bucket, setBucket] = useState<"day" | "week">("day");
+  const [tp, setTp] = useState<KbThroughput | null>(null);
+
+  useEffect(() => {
+    let on = true;
+    kbApi.throughput({ bucket, range: "30d" })
+      .then((r) => { if (on) setTp(r); })
+      .catch(() => { if (on) setTp(null); });
+    return () => { on = false; };
+  }, [bucket, evSeq]);
+
+  const max = useMemo(
+    () => Math.max(1, ...((tp?.buckets ?? []).map((b) => b.n))),
+    [tp],
+  );
+  const maxCum = tp?.buckets?.length ? Math.max(1, tp.buckets[tp.buckets.length - 1].cumulative) : 1;
+
+  return (
+    <div className="dash-cell" title="tasks completed (verified) over time — done transitions per bucket">
+      <div className="row" style={{ alignItems: "center", gap: 6 }}>
+        <span className="fc fc-done" style={{ fontSize: 10.5 }}>THROUGHPUT</span>
+        <span className="tp-toggle">
+          {(["day", "week"] as const).map((b) => (
+            <button key={b} className={bucket === b ? "tp-on" : ""} onClick={() => setBucket(b)}>{b}</button>
+          ))}
+        </span>
+      </div>
+      {tp && tp.buckets.length > 0 ? (
+        <svg viewBox={`0 0 ${tp.buckets.length * 4} 28`} className="chart-svg" preserveAspectRatio="none">
+          {tp.buckets.map((b, i) => (
+            <rect key={i} x={i * 4} y={28 - (b.n / max) * 26} width={3}
+              height={Math.max(b.n ? 2 : 0.5, (b.n / max) * 26)}
+              className={b.n ? "chart-bar hot" : "chart-bar"}>
+              <title>{`${new Date(b.t).toISOString().slice(0, 10)} — ${b.n} done (cumulative ${b.cumulative})`}</title>
+            </rect>
+          ))}
+          <polyline className="tp-line"
+            points={tp.buckets.map((b, i) => `${i * 4 + 1.5},${28 - (b.cumulative / maxCum) * 26}`).join(" ")} />
+        </svg>
+      ) : (
+        <svg className="chart-svg" preserveAspectRatio="none" />
+      )}
+      <span className="muted-note">
+        {tp ? `${tp.total} done · last ${tp.range_days}d${tp.total ? ` · peak ${max}/${tp.bucket}` : " — none yet"}` : "throughput unavailable"}
+      </span>
+    </div>
+  );
+}
 
 
 /** Top-of-board dashboard: activity chart + sentiment distribution + flow counters. */
@@ -61,6 +117,7 @@ export function DashboardSummary({ tasks, events }: { tasks: KbArtefact[]; event
           ))}
         </div>
       </div>
+      <ThroughputCell />
     </div>
   );
 }
