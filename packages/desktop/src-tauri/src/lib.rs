@@ -79,7 +79,12 @@ fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_
     if state.running.load(std::sync::atomic::Ordering::Relaxed) {
         return state.snapshot.lock().map(|s| serde_json::to_value(&*s).unwrap_or_default()).unwrap_or_default();
     }
-    dispatch::external_snapshot().unwrap_or(serde_json::Value::Null)
+    let mut v = dispatch::external_snapshot().unwrap_or(serde_json::Value::Null);
+    // BR#2532: the loop is stopped — possibly auto-logged-out by the run gate.
+    // Overlay the in-memory logout notice so the pair screen can guide the
+    // re-pair instead of the logout living only in the dispatch log.
+    dispatch::overlay_logout_notice(&state.snapshot, &mut v);
+    v
 }
 
 /// "For you" — the human's inbox (proposed decisions, blocked work, questions).

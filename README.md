@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the identity becomes `gw-<hostname>` (e.g. `gw-macbookpro`), which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
+Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the gateway identity is labelled with the hostname slug (e.g. `macbookpro`) and tagged with the gateway class, which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
 
 Prefer building from source?
 
@@ -90,13 +90,14 @@ The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge
 view components (Top, Backlog, Completed, task detail with dep graph and
 live work tree) from the shared kit `@bridge/ui-kit`, over the same data
 layer — the desktop opens a live WebSocket to the hub with its paired
-`gw-*` token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
+gateway-class token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
 cookie-only), so both surfaces always look and update identically.
 
-Beyond dispatch it carries two human-facing surfaces:
+Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
 - **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). Verify-verdict notifications state the ask ("Accept verification of BR#X? — verdict PASS"), not the raw receipts title. No runner required.
+- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade, or a token the hub rejects), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates.
 
 ### Runner config file
 
@@ -147,15 +148,17 @@ Notes:
   one; the CLI's own default is how a stale pin silently downgrades a fleet).
   Kiro is profile-driven, so it needs no model entry.
 - **Identity**: gateways and agents share one label namespace with a class
-  boundary — gateway tokens are infrastructure named `gw-<hostname>` (e.g.
-  `gw-macbookpro`) and never task owners; agent labels (`opencode-ray`) never
-  take the `gw-` prefix. The boundary is enforced at mint, pairing, rename and
+  boundary — gateway tokens are infrastructure labelled with the hostname slug
+  (e.g. `macbookpro`) and tagged with the gateway class; they are never task
+  owners, and agent labels (`opencode-ray`) never take the gateway tag. The
+  boundary is enforced at mint, pairing, rename and
   tag-edit time: a mis-named token is rejected, not rendered wrong. Connect
   shows gateways with the agents they dispatched, attributed agents nested
   under their gateway. Dispatched work is attributed to the agent the gateway
   dispatched as, named `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or
   overridden with `"agent_name"` in the config. Legacy tokens keep their
-  labels — pair a new device as a gateway (or mint `gw-*`) to get the law.
+  labels — the boundary is enforced by the gateway tag on the token, never
+  by the name.
 - **Model cost**: whatever you set here is what every dispatched session uses.
   Check the opencode CLI's own config (`~/.config/opencode/opencode.json`,
   `"model"` key) if spend looks high despite a pin here.
