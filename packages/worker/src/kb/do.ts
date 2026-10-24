@@ -3223,10 +3223,27 @@ export class KnowledgeHub {
     const hash = await hashAuthToken(secret);
     const id = `at_${crypto.randomUUID().slice(0, 8)}`;
     const tags = JSON.stringify(["provisioned", `by:${caller}`]);
-    this.state.storage.sql.exec(
-      `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-      id, label, hash, tags, body.device_id ?? null, body.principal ?? null, ts,
-    );
+    try {
+      this.state.storage.sql.exec(
+        `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
+        id, label, hash, tags, body.device_id ?? null, body.principal ?? null, ts,
+      );
+    } catch (e) {
+      // Race: two concurrent rotates of the same label (parallel dispatch
+      // sessions under one agent label are normal in this fleet) can both
+      // pass the lookup, DELETE, then collide on the INSERT — the loser must
+      // converge to update-in-place, never 400 (a provisioning 400 strands
+      // the runner with a dead token and no repair).
+      if (!String(e).includes("UNIQUE")) throw e;
+      const racer = this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label) as any;
+      if (!racer) throw e;
+      this.state.storage.sql.exec(
+        `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+        hash, tags, racer.id,
+      );
+      id = racer.id as string;
+      this.audit(caller, "rotate", label, { replaced: true, raced: true });
+    }
     const ws = this.wsSlug();
     if (ws) {
       const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));
@@ -3284,10 +3301,30 @@ export class KnowledgeHub {
       // generation approach — generateAuthToken is the only generator)
       vended = principal || generateAuthToken();
       id = `at_${crypto.randomUUID().slice(0, 8)}`;
-      this.state.storage.sql.exec(
-        `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
-        id, label, hash, mintTags, vended, Date.now(),
-      );
+      try {
+        this.state.storage.sql.exec(
+          `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+          id, label, hash, mintTags, vended, Date.now(),
+        );
+      } catch (e) {
+        // Race: a concurrent self-provision (a parallel dispatch loop on the
+        // same machine, or a 401-repair storm after a rotation) inserted the
+        // same deterministic label between our lookup and this INSERT —
+        // SQLITE_CONSTRAINT_UNIQUE on label. Converge to replace-in-place
+        // instead of failing the repair: a failed repair is a hard logout
+        // (dispatch.rs), so this path must never 400 on the label collision.
+        if (!String(e).includes("UNIQUE")) throw e;
+        const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label) as any;
+        if (!racer) throw e;
+        this.state.storage.sql.exec(
+          `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+          hash, mintTags, racer.id,
+        );
+        id = racer.id as string;
+        // the surviving row's principal is the credential of record — return
+        // it so the desktop stores what actually authenticates
+        if (racer.principal) vended = racer.principal as string;
+      }
       await register(hash); // registry failure fails the mint — never misroute
     }
     this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own });
