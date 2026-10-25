@@ -133,6 +133,23 @@ fn main() {
             let bad = doctor();
             std::process::exit(if bad { 1 } else { 0 });
         }
+        "logs" => {
+            // headless log view — Ray 2026-10-25. Reads the hub's KB events
+            // feed (GET /api/kb/events) with the gateway bearer; same source
+            // the webapp's Log view renders. Modes:
+            //   bridge logs                last 30 events (compact)
+            //   bridge logs --limit 100    last N events
+            //   bridge logs -f             follow — poll every 5s, print new
+            //   bridge logs --task BR#123  filter to one artefact
+            //   bridge logs --json         raw JSON, no formatting
+            match DispatchConfig::resolve() {
+                Some(cfg) => cmd_logs(&cfg, &args),
+                None => {
+                    eprintln!("bridge logs: no pairing found — run `bridge pair <hub-url>` first (or bridge run to onboard interactively)");
+                    std::process::exit(1);
+                }
+            }
+        }
         "service" => {
             if let Err(e) = service_install() {
                 eprintln!("[bridge] service install failed: {e}");
@@ -485,6 +502,139 @@ fn agent_op(md: &str, name: &str, install: bool) -> Result<Vec<String>, String> 
     Ok(out)
 }
 
+/// Headless log view (Ray 2026-10-25): the hub's KB event feed, same source
+/// the webapp's Log view renders. Everything the fleet did, chronological.
+/// A log command that 500s or hangs in headless is worse than none — every
+/// failure path prints the reason and exits non-zero.
+fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
+    let mut limit: usize = 30;
+    let mut follow = false;
+    let mut task_filter: Option<String> = None;
+    let mut json_out = false;
+    let mut i = 2; // args[0]=bin, args[1]="logs"
+    while i < args.len() {
+        match args[i].as_str() {
+            "--limit" => {
+                limit = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
+                i += 2;
+            }
+            "-f" | "--follow" => {
+                follow = true;
+                i += 1;
+            }
+            "--task" => {
+                task_filter = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--json" => {
+                json_out = true;
+                i += 1;
+            }
+            _ => {
+                eprintln!("bridge logs: unknown arg '{}' — usage: bridge logs [--limit N] [-f] [--task BR#123] [--json]", args[i]);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("bridge logs: http client: {e}");
+            std::process::exit(1);
+        });
+    let url = format!("{}/api/kb/events", cfg.url.trim_end_matches('/'));
+    let token = cfg.token.clone();
+    let fetch = |since: u64| -> Result<serde_json::Value, String> {
+        client
+            .get(&url)
+            .query(&[("since", since.to_string()), ("limit", limit.to_string())])
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .map_err(|e| format!("hub unreachable ({e}) — check `bridge doctor`"))?
+            .error_for_status()
+            .map_err(|e| format!("hub rejected the request ({e}) — is the gateway token valid? `bridge doctor` checks"))
+            .and_then(|r| r.json::<serde_json::Value>().map_err(|e| format!("bad JSON from hub: {e}")))
+    };
+
+    let rel_time = |ts_ms: u64| -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let s = now.saturating_sub(ts_ms) / 1000;
+        if s < 60 { format!("{s}s") }
+        else if s < 3600 { format!("{}m{}s", s / 60, s % 60) }
+        else { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+    };
+
+    let render = |e: &serde_json::Value, json_out: bool| -> Option<String> {
+        if json_out {
+            return Some(serde_json::to_string(e).unwrap_or_default());
+        }
+        let ts = e.get("ts")?.as_u64()?;
+        let actor = e.get("actor")?.as_str().unwrap_or("?");
+        let op = e.get("op")?.as_str().unwrap_or("?");
+        let artefact = e.get("artefact_id").and_then(|v| v.as_str()).unwrap_or("");
+        let detail = e.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        let age = rel_time(ts);
+        if task_filter.as_deref() != Some(artefact) && task_filter.is_some() {
+            return None;
+        }
+        Some(format!("{age:>8}  {actor:<28} {op:<18} {artefact:<10} {detail}"))
+    };
+
+    if !follow {
+        let body = fetch(0).unwrap_or_else(|e| {
+            eprintln!("bridge logs: {e}");
+            std::process::exit(1);
+        });
+        let events = body.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if events.is_empty() {
+            println!("no events yet — the fleet hasn't done anything");
+            return;
+        }
+        for e in events.iter().rev() {
+            // newest first in the feed; render oldest→newest for log reading
+            if let Some(line) = render(e, json_out) {
+                println!("{line}");
+            }
+        }
+        if !json_out {
+            let n = events.len();
+            println!("\n{n} events (oldest → newest) — bridge logs -f to follow");
+        }
+        return;
+    }
+
+    // follow mode: poll, track the last seq, print new events as they land
+    let mut last_seq: u64 = 0;
+    let poll_secs = std::time::Duration::from_secs(5);
+    eprintln!("following the event log (Ctrl-C to stop) — polling {url} every 5s");
+    loop {
+        match fetch(last_seq) {
+            Ok(body) => {
+                let events = body.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                for e in &events {
+                    let seq = e.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if seq <= last_seq {
+                        continue;
+                    }
+                    if let Some(line) = render(e, json_out) {
+                        println!("{line}");
+                    }
+                    if seq > last_seq {
+                        last_seq = seq;
+                    }
+                }
+            }
+            Err(e) => eprintln!("[logs] {e} — retrying in 5s"),
+        }
+        std::thread::sleep(poll_secs);
+    }
+}
+
 /// Headless setup check: every failure names the fix. Exit 1 when setup is
 /// incomplete so scripts can gate on it.
 fn doctor() -> bool {
@@ -834,6 +984,11 @@ USAGE:
   bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
+  bridge logs [opts]     view the hub event log (headless):
+                           --limit N    last N events (default 30)
+                           -f           follow — poll for new events
+                           --task ID    filter to one artefact (BR#123)
+                           --json       raw JSON output
   bridge agent install   install the bridge agent persona into opencode
   bridge agent check     verify the installed persona matches this version
   bridge service install write a systemd user unit (linux) — run forever, restart on failure
