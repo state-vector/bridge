@@ -594,11 +594,15 @@ export const BREACH_THRESHOLD = 3;
 
 /** Per-class thresholds: storms (same-gate rejections) need repetition;
  *  the other classes are breaches on the FIRST event — a double-spawn
- *  attempt, an invariant violation, or a replay mismatch is never noise. */
+ *  attempt, an invariant violation, or a replay mismatch is never noise.
+ *  BR#3337: claim races (lifecycle-edge rejections) are retryable by
+ *  definition — they must never raise a breach card, no matter how many
+ *  pile up in a dispatch storm. */
 export const BREACH_THRESHOLDS: Record<string, number> = {
   invariant: 1,
   replay: 1,
   "spawn-while-open": 1,
+  claim_race: Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -607,6 +611,12 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
  *  deduped even for novel messages. */
 export function breachClass(reason: string): string {
   const r = reason.toLowerCase();
+  // BR#3337: lifecycle-edge rejections are claim races — two dispatchers
+  // raced for one card and the lifecycle table refused the double-claim
+  // (`task: 'in_progress' → 'in_progress' not allowed (allowed: …)` /
+  // `status 'x' is terminal for task`). Benign and self-healing: the loser
+  // skips and the winner proceeds. Observable as claim_race, never a breach.
+  if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
   if (r.includes("pr link")) return "gate:review-needs-pr";
   if (r.includes("unreviewed")) return "gate:done-unreviewed";
   if (r.includes("references no git repository")) return "gate:no-repo";

@@ -640,10 +640,21 @@ fn paired_config() -> Result<DispatchConfig, String> {
     Ok(cfg)
 }
 
-/// Snapshot of resumable opencode sessions: title → session id. Dispatched runs
+/// One rediscoverable opencode session: its id plus the `updated` stamp the
+/// CLI reports (ms epoch). `updated` refreshes while the session streams —
+/// a stale stamp means the session process is gone. That is the runner-side
+/// liveness signal for the BR#3337 stale-claim check (the hub-side signal is
+/// the card's session_alive_ts / last_progress heartbeat).
+#[derive(Debug, Clone)]
+struct SessionEntry {
+    id: String,
+    updated_ms: Option<u64>,
+}
+
+/// Snapshot of resumable opencode sessions: title → entry. Dispatched runs
 /// are titled `bridge-<task_id>`, so sessions are rediscoverable across
 /// runner/app restarts — one `session list` per tick serves every lookup.
-fn session_map(bin: &str, workdir: &str) -> HashMap<String, String> {
+fn session_map(bin: &str, workdir: &str) -> HashMap<String, SessionEntry> {
     let mut map = HashMap::new();
     let Some(out) = Command::new(bin)
         .arg("session")
@@ -674,20 +685,32 @@ fn session_map(bin: &str, workdir: &str) -> HashMap<String, String> {
             .or_else(|| item.get("sessionID"))
             .and_then(|i| i.as_str())
         {
-            map.insert(title, id.to_string());
+            map.insert(
+                title,
+                SessionEntry {
+                    id: id.to_string(),
+                    updated_ms: item.get("updated").and_then(|u| u.as_u64()),
+                },
+            );
         }
     }
     map
 }
 
-/// Find the opencode session id for a dispatched task, from a fresh session map.
-/// (One `session list` per lookup — use `session_map` when scanning candidates.)
-#[allow(dead_code)]
-fn session_id_for(bin: &str, workdir: &str, task_id: &str) -> Option<String> {
-    let want = format!("bridge-{task_id}");
-    session_map(bin, workdir).into_iter().find(|(title, _)| {
-        title == &want || title.contains(&want)
-    }).map(|(_, id)| id)
+/// Find the opencode session entry for a dispatched task: exact
+/// `bridge-<task_id>` title first, then the fuzzy contains-match the resume
+/// path has always used.
+fn find_session<'a>(
+    sessions: &'a HashMap<String, SessionEntry>,
+    task_id: &str,
+) -> Option<&'a SessionEntry> {
+    let want_title = format!("bridge-{task_id}");
+    sessions.get(&want_title).or_else(|| {
+        sessions
+            .iter()
+            .find(|(title, _)| title.contains(&want_title))
+            .map(|(_, e)| e)
+    })
 }
 
 // ---- bridge MCP client (JSON-RPC over POST /mcp) ----
@@ -1774,6 +1797,66 @@ fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) {
     note_task(cfg, tid, did);
 }
 
+// ---- BR#3337: claim races are retryable noise, never dispatch failures ----
+
+/// How fresh a session stamp (or hub heartbeat) must be to count as live: the
+/// same bar the watchdog's stall sweep uses, so the runner never declares a
+/// card deader than the watchdog would.
+const LIVE_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// Liveness verdict for an `in_progress` card of mine (BR#3337). LIVE: an
+/// opencode session for the card refreshed recently, or the hub heartbeat
+/// (session_alive_ts vouch / agent last_progress) is fresh — a live session
+/// owns the work, skip silently. STALE: no fresh signal anywhere — the
+/// dispatched session died holding its claim; release it and claim fresh
+/// (the rule-9 release path the runner takes for its own dead sessions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimLiveness {
+    Live,
+    Stale,
+}
+
+fn claim_liveness(
+    session_updated_ms: Option<u64>,
+    session_alive_ts: Option<u64>,
+    last_progress_ts: Option<u64>,
+    now_ms: u64,
+) -> ClaimLiveness {
+    let fresh = |ts: Option<u64>| matches!(ts, Some(t) if now_ms >= t && now_ms - t <= LIVE_WINDOW_MS);
+    if fresh(session_updated_ms) || fresh(session_alive_ts) || fresh(last_progress_ts) {
+        ClaimLiveness::Live
+    } else {
+        ClaimLiveness::Stale
+    }
+}
+
+/// Classify a claim-transition rejection. Lifecycle-edge rejections
+/// (`task: 'in_progress' → 'in_progress' not allowed (allowed: …)`,
+/// `status 'x' is terminal for task`) and ownership rejections
+/// (`task BR#N is claimed by X — only the owner or a human can release it`)
+/// are claim races: the card moved under us between orient and claim, or
+/// another dispatcher holds it. Retryable next tick, never a dispatch failure.
+fn is_claim_race_error(e: &str) -> bool {
+    e.contains("not allowed (allowed:")
+        || e.contains("is terminal for")
+        || (e.contains("claimed by") && e.contains("only the owner"))
+}
+
+/// A spawned session whose output is a wall of lifecycle/ownership gate
+/// rejections lost a claim race — it worked a card another session owns.
+/// The breaker exists for deterministic agent-CLI breakage (auth, server
+/// down, guardrails); a race is not that, and counting it trips the breaker
+/// on healthy hosts (2026-10-25 incident: 6 races = "6 consecutive dispatch
+/// failures (other)" while the same host dispatched other tasks fine).
+fn claim_race_run(stdout: &str, stderr: &str) -> bool {
+    const SIGS: [&str; 3] = [
+        "not allowed (allowed:",
+        "only the owner or a human can release it",
+        "is claimed by",
+    ];
+    SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
+}
+
 fn spawn_opencode(
     cfg: &DispatchConfig,
     snap: &SharedSnapshot,
@@ -2145,6 +2228,12 @@ struct CircuitBreaker {
 impl CircuitBreaker {
     const THRESHOLD: u32 = 3;
     fn record_failure(&mut self, stdout: &str, stderr: &str) {
+        // BR#3337: claim-race output is benign, self-healing noise — the agent
+        // CLI is healthy. Neither count it toward the streak nor reset the
+        // streak a real failure started.
+        if claim_race_run(stdout, stderr) {
+            return;
+        }
         let sig = ["Unexpected server error", "Model blocked by guardrail", "0 endpoints out of", "no endpoints are available matching your guardrail", "UnknownError"]
             .iter().find(|s| stdout.contains(*s) || stderr.contains(*s))
             .map(|s| s.to_string())
@@ -2368,7 +2457,20 @@ fn tick(
         // hard rule (BR#877): a run that performed no work — non-zero exit,
         // timeout, or a guardrail-void dispatch — can NEVER hand off. Void
         // runs still exit 0, so the exit code alone is not enough.
-        if outcome_ok { breaker.record_success(); } else { breaker.record_failure(&outcome.stdout_tail, &outcome.stderr_tail); }
+        if outcome_ok {
+            breaker.record_success();
+        } else if claim_race_run(&outcome.stdout_tail, &outcome.stderr_tail) {
+            // BR#3337: a session that died racing for a claim performed no
+            // work and proves nothing about the agent CLI — not a dispatch
+            // failure, the breaker stays untouched.
+            eprintln!(
+                "[dispatch] {} lost a claim race (gate rejections, no work) — not a dispatch failure",
+                inf.task_id
+            );
+            snap_activity(snap, "info", &format!("{} — claim race, not a dispatch failure", inf.task_id));
+        } else {
+            breaker.record_failure(&outcome.stdout_tail, &outcome.stderr_tail);
+        }
         // persist final state (incl. PR link and exit code) before handoff
         write_task_state(
             &inf.task_id,
@@ -2722,26 +2824,76 @@ fn tick(
         {
             continue; // silent backoff: runner bookkeeping must not look like agent activity
         }
-        let want_title = format!("bridge-{tid}");
-        let sess = sessions.get(&want_title).cloned().or_else(|| {
-            sessions.iter().find(|(title, _)| title.contains(&want_title)).map(|(_, id)| id.clone())
-        });
-        let msg = match &sess {
-            Some(s) => format!("resumed {tid} — continuing opencode session {s}"),
-            None => format!("re-dispatched {tid} — no prior opencode session found, started fresh"),
-        };
-        let (role_work, role_type) = t.get("tags").and_then(|v| v.as_array()).map(|a| {
-            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
-            (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
-        }).unwrap_or((false, "task".to_string()));
-        // re-dispatch after cleanup needs the task body + repo reference again
+        // BR#3337: liveness check FIRST — never claim-and-fail a race.
+        // get_artefact re-reads the card fresh (the orient slice can be
+        // seconds stale) and carries the hub heartbeat in meta
+        // (session_alive_ts / last_progress.ts).
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess, role_work, &role_type, avail, in_flight);
-        attempts.insert(tid.to_string(), Instant::now());
-        snap_activity(snap, "dispatch", &msg);
-        msgs.push(msg);
+        let meta_obj = task_meta.as_object();
+        let sess = find_session(&sessions, tid);
+        let disposition = claim_liveness(
+            sess.and_then(|s| s.updated_ms),
+            meta_obj.and_then(|m| m.get("session_alive_ts")).and_then(|v| v.as_u64()),
+            meta_obj
+                .and_then(|m| m.get("last_progress"))
+                .and_then(|p| p.get("ts"))
+                .and_then(|v| v.as_u64()),
+            now_ms(),
+        );
+        match disposition {
+            ClaimLiveness::Live => {
+                // a live session owns this card — skip silently. Re-dispatching
+                // into a live session would double-spawn it; resuming a live
+                // session would race it. Its own MCP calls deliver the work.
+                continue;
+            }
+            ClaimLiveness::Stale => {
+                // the dispatched session died holding its claim: release the
+                // stale claim (in_progress → todo), then claim fresh and spawn
+                // a new session (never resume a dead conversation).
+                release_claim(cfg, tid, "runner: stale claim released — session died");
+                match mcp_call_task(
+                    cfg,
+                    id,
+                    "transition",
+                    json!({ "id": tid, "to": "in_progress" }),
+                    &tid,
+                ) {
+                    Ok(_) => {}
+                    Err(e) if is_claim_race_error(&e) => {
+                        // raced between release and re-claim — another
+                        // dispatcher won the card; skip, it is theirs now
+                        eprintln!("[dispatch] {tid}: stale claim released, re-claim raced — skipping");
+                        snap_activity(snap, "info", &format!("{tid} re-claim raced after stale release — skipped"));
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[dispatch] ERROR: re-claim {tid} failed: {e}");
+                        snap_activity(snap, "error", &format!("re-claim {tid} failed: {e}"));
+                        attempts.insert(tid.to_string(), Instant::now());
+                        continue;
+                    }
+                }
+                let _ = mcp_call_task(
+                    cfg,
+                    id,
+                    "log_progress",
+                    json!({ "id": tid, "note": "runner: re-claimed — stale claim released (session died), starting fresh", "sentiment": "neutral" }),
+                    &tid,
+                );
+                let msg = format!("re-claimed {tid} — stale claim released (session died), started fresh");
+                let (role_work, role_type) = t.get("tags").and_then(|v| v.as_array()).map(|a| {
+                    let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
+                    (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
+                }).unwrap_or((false, "task".to_string()));
+                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight);
+                attempts.insert(tid.to_string(), Instant::now());
+                snap_activity(snap, "dispatch", &msg);
+                msgs.push(msg);
+            }
+        }
     }
 
     // 6. claim new claimable tasks until the WIP limit is reached.
@@ -2760,8 +2912,7 @@ fn tick(
         .into_iter()
         .map(|t| {
             let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let want_title = format!("bridge-{tid}");
-            let sess = sessions.get(&want_title).cloned();
+            let sess = find_session(&sessions, &tid).map(|s| s.id.clone());
             (t, sess)
         })
         .collect();
@@ -2825,6 +2976,16 @@ fn tick(
         // best-effort job; capability is the agent's. Nothing is declined for
         // missing metadata.
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+        // BR#3337: re-read the card's status at claim time — the orient slice
+        // can be seconds stale, and a card another dispatcher claimed in
+        // between must skip silently (race lost), never claim-and-fail.
+        if let Some(st) = art.get("status").and_then(|s| s.as_str()) {
+            if st != "todo" {
+                eprintln!("[dispatch] {tid}: claim race lost (status now {st}) — skipping");
+                snap_activity(snap, "info", &format!("{tid} claim race lost (now {st}) — skipped"));
+                continue;
+            }
+        }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
         if let Err(e) = mcp_call_task(
@@ -2834,8 +2995,18 @@ fn tick(
             json!({ "id": tid, "to": "in_progress" }),
             &tid,
         ) {
-            // claim raced or failed — don't kill the tick or the whole claim loop;
-            // surface it on stderr too (snap-only failures read as silence)
+            if is_claim_race_error(&e) {
+                // BR#3337: the lifecycle/ownership gate refused the claim —
+                // another gateway or session owns the card. That is a claim
+                // race: retryable next tick, never a dispatch failure (no
+                // error bookkeeping, no backoff, breaker untouched).
+                eprintln!("[dispatch] {tid}: claim raced (rejected: {}) — skipping", truncate(&e, 100));
+                snap_activity(snap, "info", &format!("{tid} claim raced — skipped (retryable)"));
+                continue;
+            }
+            // claim failed for a real reason — don't kill the tick or the whole
+            // claim loop; surface it on stderr too (snap-only failures read as
+            // silence) and back off this candidate
             eprintln!("[dispatch] ERROR: claim {tid} failed: {e}");
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
@@ -3535,6 +3706,116 @@ mod tests {
         let out = run_with_timeout(quick, 5).expect("a quick program completes");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bridge");
+    }
+
+    // ---- BR#3337 drill: claim races are skipped, stale claims released ----
+
+    fn drill_now() -> u64 {
+        1_800_000_000_000
+    }
+
+    #[test]
+    fn drill_in_progress_card_with_dead_session_is_released_and_reclaimed() {
+        // canned board: card in_progress, my dispatched session listed but dead
+        // (last updated 20m ago), no fresh hub heartbeat → the claim is STALE:
+        // the runner releases it (in_progress → todo, "session died") and
+        // claims fresh — the rule-9 path the runner takes for its own dead
+        // sessions. No dispatch failure is surfaced.
+        let now = drill_now();
+        assert_eq!(
+            claim_liveness(Some(now - 20 * 60_000), None, None, now),
+            ClaimLiveness::Stale,
+            "a dead session's stale claim must be released + re-claimed"
+        );
+        // no discoverable session at all is the same stale-claim case (the
+        // re-dispatch path that used to claim-and-fail)
+        assert_eq!(claim_liveness(None, None, None, now), ClaimLiveness::Stale);
+    }
+
+    #[test]
+    fn drill_in_progress_card_with_live_session_is_skipped_without_error() {
+        // canned board: card in_progress, an opencode session for it updated
+        // 1m ago → LIVE: skip silently, never surface a dispatch failure and
+        // never double-spawn into a session that is still working.
+        let now = drill_now();
+        assert_eq!(
+            claim_liveness(Some(now - 60_000), None, None, now),
+            ClaimLiveness::Live,
+            "a live session owns the card — skip"
+        );
+        // hub heartbeat fresh (runner vouch / agent progress) → live even when
+        // the local session list shows nothing
+        assert_eq!(claim_liveness(None, Some(now - 240_000), None, now), ClaimLiveness::Live);
+        assert_eq!(claim_liveness(None, None, Some(now - 120_000), now), ClaimLiveness::Live);
+        // watchdog-consistency bar: stale everywhere at 11m = dead, releasable
+        assert_eq!(
+            claim_liveness(Some(now - 11 * 60_000), Some(now - 11 * 60_000), None, now),
+            ClaimLiveness::Stale
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejections_are_claim_races_not_failures() {
+        // the exact shapes the hub's gates emit (worker core.ts / machine.ts)
+        assert!(is_claim_race_error(
+            "task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)"
+        ));
+        assert!(is_claim_race_error("status 'in_review' is terminal for task"));
+        assert!(is_claim_race_error(
+            "task BR#3328 is claimed by other-gateway-opencode — only the owner or a human can release it to the pool"
+        ));
+        // genuine failures keep their class
+        assert!(!is_claim_race_error("bridge unreachable: connection refused"));
+        assert!(!is_claim_race_error("mcp error -32603: internal"));
+    }
+
+    #[test]
+    fn breaker_does_not_count_claim_races_and_still_trips_on_real_failures() {
+        let mut b = CircuitBreaker::default();
+        // a storm of raced sessions (gate-rejection walls) must never trip the
+        // breaker — the 2026-10-25 incident class
+        for _ in 0..9 {
+            b.record_failure(
+                "task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)",
+                "",
+            );
+        }
+        assert!(!b.tripped(), "claim races must not count toward the breaker");
+        assert_eq!(b.consecutive_failures, 0);
+        // a race between two real failures must not reset the streak either
+        b.record_failure("", "Unexpected server error. Check server logs");
+        b.record_failure(
+            "task BR#1 is claimed by x — only the owner or a human can release it to the pool",
+            "",
+        );
+        assert_eq!(
+            b.consecutive_failures,
+            1,
+            "a race must not reset the consecutive-failure streak"
+        );
+        b.record_failure("", "Unexpected server error. Check server logs");
+        b.record_failure("", "Unexpected server error. Check server logs");
+        assert!(b.tripped(), "genuine dispatch errors still trip at threshold");
+        // success clears, as before
+        b.record_success();
+        assert!(!b.tripped());
+        assert_eq!(b.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn session_lookup_finds_exact_then_fuzzy() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "bridge-BR#1".to_string(),
+            SessionEntry { id: "ses_1".into(), updated_ms: Some(1) },
+        );
+        sessions.insert(
+            "older title mentioning bridge-BR#2 inside".to_string(),
+            SessionEntry { id: "ses_2".into(), updated_ms: None },
+        );
+        assert_eq!(find_session(&sessions, "BR#1").unwrap().id, "ses_1");
+        assert_eq!(find_session(&sessions, "BR#2").unwrap().id, "ses_2");
+        assert!(find_session(&sessions, "BR#3").is_none());
     }
 }
 
