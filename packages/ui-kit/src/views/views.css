@@ -801,9 +801,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .topc-goal .top-will, .topc-goal .kind-pill { white-space: normal; }
 
 /* PR provenance on Top rows (BR#3307): the PR link chip + verifier badge
-   ride inline in the goal cell — plain link, chips never stretch it */
+   ride inline in the goal cell — plain link, chips never stretch it. Rows
+   without stamped provenance carry the explicit "no bridge provenance"
+   state (BR#3287 spec item 3) — absence is rendered, never silent. */
 .topc-prov { text-decoration: none; }
-.topc-prov .k-chip { white-space: nowrap; }
+.topc-prov .k-chip, .topc-prov-none .k-chip { white-space: nowrap; }
 .topc-prov:hover .k-chip { text-decoration: underline; }
 
 /* wide-width cell fixes (measured, headless probe 2026-10-24):

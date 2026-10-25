@@ -292,7 +292,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             <span className={`kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.goal ?? "—"}
             <TagChips tags={r.tags} />
-            {r.prov && (
+            {r.prov ? (
               <>
                 {" "}
                 <a
@@ -312,6 +312,17 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
                     : "merged without an accepted verify verdict on the head sha"}
                 >
                   {r.prov.verdict_id ? "verified" : "unverified"}
+                </Chip>
+              </>
+            ) : (
+              <>
+                {" "}
+                <Chip
+                  tone="muted"
+                  className="topc-prov-none"
+                  title="no PR provenance stamped (BR#3287): untracked merge, non-bridge work, or the sweep has not stamped this row yet — absence is itself a signal"
+                >
+                  no bridge provenance
                 </Chip>
               </>
             )}
