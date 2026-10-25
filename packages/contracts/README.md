@@ -27,3 +27,4 @@ The shapes every runtime trusts and nothing used to verify — recorded, version
    - `config.schema.json` ↔ `src/config.ts` (regen-diff) ↔ the single writer (`store.rs` serialized-key parity + never-a-credential).
 2. Fixtures are recorded from production (the source of truth), minimized to shape (keys + types), with one live exemplar per collection for realism. Secrets never ride a fixture (redacted placeholders only).
 3. The runner validates inbound orient before acting: the Rust gate fails the tick loudly, naming the drifted key — silent zeros die. Renamed keys without a contract update are a red build, not a production incident.
+4. Required keys are ALWAYS emitted: an empty collection is `[]`, never an absent key. BR#3463 — the hub dropped `gauge_debt` on healthy boards (the zero-debt case), and the runner's required-key gate then aborted every dispatch tick.

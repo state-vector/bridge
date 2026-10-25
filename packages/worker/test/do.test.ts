@@ -300,7 +300,35 @@ describe("gauge carry-forward in log_progress (merge semantics)", () => {
   });
 });
 
-// ---------- BR#3322: replay consistency through the real write path ----------
+// ---------- BR#3463: gauge_debt is a REQUIRED orient contract key ----------
+
+describe("orient always carries gauge_debt (BR#3463 — runner contract key)", () => {
+  // The runner's Rust gate (dispatch.rs orient_contract_error) requires the
+  // key; the conditional emit (`length ? gaugeDebt : undefined`) dropped it
+  // exactly when the board was healthy, and the undefined key vanished from
+  // the JSON — "missing gauge_debt" aborted every dispatch tick.
+
+  it("(a) zero debt → the key is PRESENT as [] (the healthy board; absent key = contract breach)", async () => {
+    const r = await kbJson("/orient", { label: "debt-zero-agent" });
+    expect(r.status).toBe(200);
+    expect(r.body).toHaveProperty("gauge_debt");
+    expect(r.body.gauge_debt).toEqual([]);
+  });
+
+  it("(b) in-flight task with no reported gauges → listed as {id, title} in gauge_debt", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "gauge debt surfacing BR#3463", qualified: true });
+    const claim = await kbJson("/transition", { id: t.id, to: "in_progress", actor: "debt-agent", session: "debt-agent", note: "claim" });
+    expect(claim.status).toBe(200);
+    // gauge-less post: all four gauges absent → debt per the gauge-debt query
+    await kbJson("/progress.log", { id: t.id, actor: "debt-agent", note: "working, no gauges yet" });
+    const r = await kbJson("/orient", { label: "debt-agent" });
+    expect(r.status).toBe(200);
+    expect(r.body).toHaveProperty("gauge_debt");
+    expect(r.body.gauge_debt).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: t.id, title: "gauge debt surfacing BR#3463" })]),
+    );
+  });
+});
 
 describe("replay consistency (BR#3322, real storage)", () => {
   // /history is a GET-only route (the human-plane mirror); encodeURIComponent
