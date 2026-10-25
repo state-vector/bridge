@@ -877,3 +877,139 @@ export function mergeSweepHumanLegTitle(repo: string, reasons: string[]): string
   if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
   return prefix + text + suffix;
 }
+
+// ---------------------------------------------------------------------------
+// PR disposition law (decision BR#3312, accepted; impl BR#3315): no PR floats
+// without a terminal path — merged, closed-with-reason, or actively advancing
+// with a clock. decidePrDisposition composes the standing 5c/verify gate
+// (decideMergeAction) with the law's clock rows; the sweep (kb/do.ts
+// mergeQueueSweep) classifies every open PR each pass and acts on exactly one
+// disposition. Closure is always WITH a reason (the receipt), never silent;
+// PRs are reopenable — the card keeps the work's intent.
+// ---------------------------------------------------------------------------
+
+/** Card states that make the PR a leftover vehicle: close it now. `rejected`
+ *  is the decision-status spelling of a card killed on review; tasks carry
+ *  done/superseded, the law names all three. */
+export const TERMINAL_CARD_STATUSES = ["superseded", "done", "rejected"] as const;
+
+export type PrDisposition =
+  | { kind: "merge"; receipt: string }
+  | { kind: "close_superseded"; reason: string }
+  | { kind: "bounce"; defect: string }
+  | { kind: "escalate"; question: string; reason: string }
+  | { kind: "close_stale"; reason: string }
+  | { kind: "close_orphan"; reason: string }
+  /** no clock row fired — the sweep runs its pre-law arms (note/skip/human_leg) */
+  | { kind: "passthrough"; reason: string };
+
+export interface PrDispositionInput {
+  /** the standing gate decision for this PR (decideMergeAction output) */
+  gate: MergeAction;
+  repo: string;
+  prNumber: number;
+  /** sweep epoch (ms) */
+  now: number;
+  /** max(pr.updated_at, last commit ts); null = GitHub gave neither —
+   *  fail-safe: no activity clock fires on unknown data */
+  lastActivityTs: number | null;
+  /** linked card ref (BR#<n>) from text/branch, or null */
+  cardId: string | null;
+  /** the linked card's status; null when the ref names no live row (dead ref) */
+  cardStatus: string | null;
+  /** the card is in flight with a clock: in_progress/in_review (recently
+   *  updated) or blocked with a park stamped within the TTL — computed by the
+   *  sweep from card meta; a stale card does not shield a stale PR */
+  cardAdvancing: boolean;
+  /** BR#3287: this PR carries bridge provenance (BR# ref resolves, or the
+   *  provenance index has a row). Absence is itself the orphan signal. */
+  hasProvenance: boolean;
+  /** PR created_at (the orphan clock anchor) */
+  prCreatedAt: number | null;
+  /** the card's terminal note when terminal (e.g. superseded_reason) —
+   *  the closure reason cites card + successor */
+  cardTerminalNote?: string | null;
+  /** ts of this PR's last escalation (settings pr_escalated_<repo>_<n>), or null */
+  escalatedAt: number | null;
+  /** the escalation ask's id, when known — cited by the stale-closure reason */
+  escalationAskId?: string | null;
+  /** PR activity newer than the escalation — the owner responded */
+  activitySinceEscalation: boolean;
+  /** knobs (settings): pr_stale_days / pr_orphan_days / pr_grace_hours */
+  prStaleDays: number;
+  prOrphanDays: number;
+  prGraceHours: number;
+}
+
+/** The PR terminal-state law, as one decision table. Order is the law's:
+ *  card-terminal closes FIRST (a terminal card's PR is a leftover vehicle,
+ *  never cargo), then the existing merge leg, then the orphan clock, then the
+ *  stale clocks (escalate once, close on expired silence), then the existing
+ *  bounce, then passthrough. One disposition per PR per pass. */
+export function decidePrDisposition(i: PrDispositionInput): PrDisposition {
+  const iso = (t: number) => new Date(t).toISOString();
+  const staleMs = i.prStaleDays * 86_400_000;
+
+  // (1) card terminal (superseded/done/rejected) — close now, cite card + successor.
+  if (i.cardStatus && (TERMINAL_CARD_STATUSES as readonly string[]).includes(i.cardStatus))
+    return {
+      kind: "close_superseded",
+      reason: `linked card ${i.cardId ?? "?"} is ${i.cardStatus}${i.cardTerminalNote ? ` — ${i.cardTerminalNote}` : ""} — the card's terminal state is this PR's terminal cause; revive via a successor card`,
+    };
+  if (i.gate.kind === "close_superseded") return { kind: "close_superseded", reason: i.gate.reason };
+
+  // (2) the existing merge leg wins over every clock: a fully verified green
+  //     PR merges even if its timestamps look stale (re-runs touch nothing).
+  if (i.gate.kind === "merge") return { kind: "merge", receipt: i.gate.receipt };
+
+  // (3) orphan clock: no bridge provenance at all (BR#3287's "that absence is
+  //     itself a signal") past pr_orphan_days from creation. The sweep
+  //     computes provenance as a RESOLVABLE record: a live card row, or the
+  //     BR#3287 index row — a BR#-text ref whose row is gone is absence, not
+  //     provenance.
+  if (!i.hasProvenance && i.prCreatedAt != null && i.now - i.prCreatedAt > i.prOrphanDays * 86_400_000)
+    return {
+      kind: "close_orphan",
+      reason: `no bridge provenance — no BR# ref (title/body/branch), no provenance index row (BR#3287), and no resolvable card — after ${i.prOrphanDays}d (created ${iso(i.prCreatedAt)}); re-open via a card if this work matters`,
+    };
+
+  // (4) stale clocks: no PR activity within pr_stale_days AND the card not
+  //     advancing. Advancing needs BOTH a card in flight AND (sweep-computed)
+  //     recency — a dead session's card shields nothing. Escalate ONCE per
+  //     episode; close when the grace expires without owner response.
+  const stale = i.lastActivityTs != null && i.now - i.lastActivityTs > staleMs;
+  if (stale && !i.cardAdvancing) {
+    if (i.escalatedAt == null && i.cardId != null && i.cardStatus != null)
+      return {
+        kind: "escalate",
+        question: prEscalationAskTitle(i.repo, i.prNumber, i.cardId, i.prGraceHours, i.prStaleDays),
+        reason: `no PR activity within ${i.prStaleDays}d (last ${iso(i.lastActivityTs)}) and the card not advancing — one bound ask: merge, rebase, or close with reason within ${i.prGraceHours}h`,
+      };
+    if (!i.activitySinceEscalation && i.escalatedAt != null && i.now - i.escalatedAt > i.prGraceHours * 3_600_000)
+      return {
+        kind: "close_stale",
+        reason: `no activity since ${iso(i.lastActivityTs)} (> ${i.prStaleDays}d) and escalation ${i.escalationAskId ?? "(ask id no longer on record)"} unanswered for ${i.prGraceHours}h — closing with reason; revive: re-open this PR once the work resumes (PRs are reopenable, the card keeps the intent)`,
+      };
+  }
+
+  // (5) the existing mechanical bounce, now clocked: it fires while the PR is
+  //     within its clocks; a stale PR past grace was closed at (4) instead.
+  if (i.gate.kind === "bounce") return { kind: "bounce", defect: i.gate.defect };
+
+  // (6) passthrough — fresh, grace window open, owner responded, or the gate
+  //     said note/skip/human_leg and no clock row fired.
+  if (i.gate.kind === "human_leg") return { kind: "passthrough", reason: i.gate.reason };
+  return { kind: "passthrough", reason: i.gate.kind === "note" || i.gate.kind === "skip" ? i.gate.reason : "no disposition row fired" };
+}
+
+/** Deterministic escalation ask (ONE per staleness episode, deduped per PR by
+ *  the sweep's pr_escalated_<repo>_<n> stamp AND askCreate's identical-open-ask
+ *  guard). ≤240 chars, ends in "?" — the ask contract. */
+export function prEscalationAskTitle(repo: string, prNumber: number, cardId: string, graceHours: number, staleDays: number): string {
+  const prefix = `PR #${prNumber} (${repo}) on ${cardId} has been quiet ${staleDays}+ days — `;
+  const suffix = `?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text = `merge, rebase, or close it with reason within ${graceHours}h, or the merge sweep closes it with reason`;
+  if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + text + suffix;
+}
