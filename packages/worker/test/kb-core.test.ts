@@ -170,10 +170,10 @@ describe("trigram fuzzy vectors", () => {
   });
 });
 
-import { scoreAgent, AgentSignals } from "../src/kb/core.ts";
+import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from "../src/kb/core.ts";
 
 const zero: AgentSignals = {
-  progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0,
+  progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
   reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
   artefacts_created: 0, verify_duty_backlog: 0,
 };
@@ -221,6 +221,79 @@ describe("agent behaviour score", () => {
   it("effective range is 15..95 (base 50, penalties capped at 35, bonuses at 45)", () => {
     expect(scoreAgent({ ...zero, abandoned: 99, thin_notes: 99 }).score).toBe(15);
     expect(scoreAgent({ ...zero, gauge_count: 99, asks_answered_on_time: 99, artefacts_created: 99 }).score).toBe(95);
+  });
+
+  it("BR#3352: result_lost is a delivery-channel incident — never a score penalty, always a channel hint", () => {
+    const r = scoreAgent({ ...zero, result_lost: 3 });
+    expect(r.score).toBe(50); // identical to the no-incident baseline
+    expect(r.hints.join(" ")).toMatch(/completed_result_lost/);
+    expect(r.hints.join(" ")).toMatch(/delivery-channel incident, not abandonment/);
+    // abandoned still tanks it — the exemption is scoped to the lost-report class
+    const mixed = scoreAgent({ ...zero, result_lost: 2, abandoned: 1 });
+    expect(mixed.score).toBe(40);
+    expect(mixed.hints.join(" ")).toMatch(/watchdog-blocked/);
+  });
+});
+
+describe("BR#3352 completed_result_lost — session-trail classification", () => {
+  it("a GitHub PR receipt in the last progress note proves landed side effects", () => {
+    const t = detectResultTrail({
+      last_progress_note: "runner: run finished — exit 0 — PR https://github.com/state-vector/superpositional/pull/2341 open",
+      worktree: "/Users/rayh/.bridge/worktrees/br-1234",
+      session: "dispatch-metareview-finds-1025b",
+    });
+    expect(t).not.toBeNull();
+    expect(t!.receipt_url).toBe("https://github.com/state-vector/superpositional/pull/2341");
+    expect(t!.worktree).toBe("/Users/rayh/.bridge/worktrees/br-1234");
+    expect(t!.session).toBe("dispatch-metareview-finds-1025b");
+  });
+
+  it("commit receipts in the recent trail notes count too (deduped, capped)", () => {
+    const t = detectResultTrail({
+      last_progress_note: "shipped",
+      recent_notes: [
+        "pushed https://github.com/state-vector/superpositional/commit/abc1234def0123456789abc1234def0123456789a",
+        "repushed https://github.com/state-vector/superpositional/commit/abc1234def0123456789abc1234def0123456789a",
+        "and https://github.com/state-vector/superpositional/commit/bbc1234def0123456789abc1234def0123456789b",
+      ],
+    });
+    expect(t).not.toBeNull();
+    expect(t!.receipt_url).toBeNull();
+    expect(t!.commit_urls).toHaveLength(2);
+  });
+
+  it("the runner's own completed_result_lost marker alone is evidence", () => {
+    const t = detectResultTrail({
+      last_progress_note: "completed_result_lost — run finished (exit 0) after the claim was lost; agent reply was empty",
+    });
+    expect(t).not.toBeNull();
+  });
+
+  it("a registered worktree/session alone proves NOTHING — every claimed task has one", () => {
+    expect(detectResultTrail({ worktree: "/home/x/.bridge/worktrees/br-9", session: "dispatch-x" })).toBeNull();
+  });
+
+  it("a genuine silent stall (no receipts, no marker) classifies null — plain abandonment path", () => {
+    expect(detectResultTrail({ last_progress_note: "working on it" })).toBeNull();
+  });
+
+  it("issue receipts count as landed-work receipts", () => {
+    const t = detectResultTrail({ last_progress_note: "filed https://github.com/state-vector/superpositional/issues/2338" });
+    expect(t).not.toBeNull();
+    expect(t!.receipt_url).toBe("https://github.com/state-vector/superpositional/issues/2338");
+  });
+
+  it("describeResultTrail is human-readable and bounded", () => {
+    const d = describeResultTrail({
+      receipt_url: "https://github.com/state-vector/superpositional/pull/2341",
+      commit_urls: ["https://github.com/state-vector/superpositional/commit/abc1234def0123456789abc1234def0123456789a"],
+      worktree: "/home/x/.bridge/worktrees/br-9",
+      session: "dispatch-x",
+    });
+    expect(d).toMatch(/pull\/2341/);
+    expect(d).toMatch(/worktree/);
+    expect(d.length).toBeLessThan(220);
+    expect(describeResultTrail({ receipt_url: null, commit_urls: [], worktree: null, session: null })).toMatch(/side effects present/);
   });
 });
 

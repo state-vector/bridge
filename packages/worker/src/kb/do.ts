@@ -21,6 +21,9 @@ import {
   composeBootstrap,
   scoreAgent,
   AgentSignals,
+  detectResultTrail,
+  describeResultTrail,
+  ResultTrail,
   TRANSPORTS,
   ARTEFACT_TYPES,
   ArtefactType,
@@ -259,6 +262,28 @@ export class KnowledgeHub {
       if (openAsk) continue;
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+      // BR#3352: classify the release from the session trail. A silent task
+      // whose trail proves landed side effects (GitHub PR/issue/commit
+      // receipts, or the runner's own completed_result_lost marker) is NOT an
+      // abandonment — the run happened and the report was lost between worker
+      // and hub. Recording the outcome class lets the score side exempt it
+      // and flags the delivery channel instead of punishing the agent.
+      let trail: ResultTrail | null = null;
+      try {
+        const notes = (this.state.storage.sql.exec(
+          `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
+          r.id,
+        ).toArray() as any[]).map((x) => String(x.summary ?? ""));
+        const sess = meta.session
+          ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session))
+          : null;
+        trail = detectResultTrail({
+          last_progress_note: meta.last_progress?.note,
+          recent_notes: notes,
+          worktree: sess?.worktree ?? null,
+          session: meta.session ?? null,
+        });
+      } catch { /* trail read is best-effort — classify as a plain stall on failure */ }
       // STALLED, not blocked: silence means "we haven't heard from the agent"
       // — blocked is reserved for the agent's own explicit "I cannot continue
       // until X". Release straight to todo: the claim drops, the attempted tag
@@ -266,7 +291,10 @@ export class KnowledgeHub {
       // intermediate, no unblock-child spawn for silence.
       await this.transition({
         id: r.id, to: "todo",
-        note: `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+        note: trail
+          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
+          : `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+        ...(trail ? { result_class: "completed_result_lost" } : {}),
       }, "system:watchdog");
       } catch (e) {
         // one bad task must not kill the sweep — log and keep going
@@ -1949,7 +1977,7 @@ export class KnowledgeHub {
     const sig = (label: string): AgentSignals => {
       let s = signals.get(label);
       if (!s) {
-        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
         signals.set(label, s);
       }
       return s;
@@ -1965,11 +1993,21 @@ export class KnowledgeHub {
       if (d.completion_pct != null || d.confidence_pct != null || d.risk_pct != null) s.gauge_count++;
       if (String(d.note ?? "").trim().length < 10) s.thin_notes++;
     }
+    // BR#3352: a watchdog release whose transition detail carries
+    // result_class "completed_result_lost" is a delivery-channel incident
+    // (the run happened, the report was lost) — it must not count as
+    // abandonment. Every other watchdog transition still does.
     for (const r of this.state.storage.sql.exec(
-      `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
-       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
+      `SELECT a.owner AS owner, e.detail AS detail FROM events e JOIN artefacts a ON a.id = e.artefact_id
+       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ?`,
       recentTs,
-    ).toArray() as any[]) sig(r.owner || "unknown").abandoned += r.n;
+    ).toArray() as any[]) {
+      const s = sig(r.owner || "unknown");
+      let d: any = {};
+      try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+      if (d?.result_class === "completed_result_lost") s.result_lost++;
+      else s.abandoned++;
+    }
     for (const r of this.state.storage.sql.exec(
       `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`, recentTs,
     ).toArray() as any[]) {
@@ -3428,6 +3466,7 @@ export class KnowledgeHub {
     this.audit(actor, "transition", id, {
       from: row.status, to: verdict.status, note: body.note ?? "", sentiment,
       ...(attributedAgent ? { agent: attributedAgent } : {}),
+      ...(body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
     // verify-verdict decisions are actionable: the human's answer DOES the
@@ -4531,7 +4570,7 @@ export class KnowledgeHub {
       ? `\n\nGAUGE DEBT — these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) — the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.`
       : "";
     const my_score = this.agentScores().find((a) => a.label === label)
-      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
     // score optimisation is an explicit standing directive: the agent sees its
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.

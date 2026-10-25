@@ -499,31 +499,66 @@ fn extract_update_text(v: &serde_json::Value) -> Option<String> {
     let u = update_payload(v)?;
     let kind = u.get("sessionUpdate").and_then(|k| k.as_str())?;
     // content is a text block ({type:"text",text:...}) or an ARRAY of blocks
-    // depending on the opencode version — accept both. A version whose frames
-    // don't match here used to go completely dark to the runner: no live
-    // line, no session_alive vouches, watchdog releasing working sessions as
-    // "stalled" (fleet incident 2026-10-22, hermes).
+    // depending on the opencode version — accept both. ALL text blocks in a
+    // frame are joined (BR#3352: a multi-block frame used to silently drop
+    // every block after the first). A version whose frames don't match here
+    // used to go completely dark to the runner: no live line, no
+    // session_alive vouches, watchdog releasing working sessions as "stalled"
+    // (fleet incident 2026-10-22, hermes) — and the same class of miss emptied
+    // the runner's result payload while the side effects landed (BR#3352:
+    // "ran, report lost").
     let text_of = |c: &serde_json::Value| -> Option<String> {
         if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
             return Some(t.to_string());
         }
         if let Some(blocks) = c.as_array() {
+            let mut joined = String::new();
             for b in blocks {
                 if b.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        return Some(t.to_string());
+                        joined.push_str(t);
                     }
                 }
             }
+            if !joined.is_empty() {
+                return Some(joined);
+            }
         }
-        None
+        // nested/renamed text shapes ({text:{...}}, {content:{message:…}}):
+        // scan the obvious message keys instead of dropping the frame
+        deep_text(c)
     };
     match kind {
-        "agent_message_chunk" | "agent_thought_chunk" => u.get("content").and_then(text_of),
+        "agent_message_chunk" | "agent_thought_chunk" => {
+            u.get("content").and_then(text_of).or_else(|| u.get("message").and_then(deep_text))
+        }
         "tool_call" | "tool_call_update" => {
             let title = u.get("title").and_then(|t| t.as_str()).unwrap_or("tool");
             Some(format!("[tool] {title}"))
         }
+        // unknown kinds: an unmatched shape used to return None here — the
+        // agent's reply never reached the runner's result payload while its
+        // side effects (worktree, PRs) landed. Accept top-level message/text
+        // payloads on unknown frames; shapes without them still stay None
+        // (plan/mode frames are not results).
+        _ => u.get("message").and_then(deep_text).or_else(|| u.get("text").and_then(deep_text)),
+    }
+}
+
+/// Generic last-resort text extraction for unmatched shapes (BR#3352: the
+/// empty-result class). Strings under the obvious message keys only — a deep
+/// scan would drag tool inputs into the result payload.
+fn deep_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(deep_text),
+        serde_json::Value::Object(o) => o
+            .iter()
+            .filter(|(k, _)| matches!(k.as_str(), "text" | "message" | "content"))
+            .find_map(|(_, v)| deep_text(v)),
         _ => None,
     }
 }
@@ -703,6 +738,63 @@ mod tests {
         });
         assert_eq!(extract_update_text(&v), None);
         assert_eq!(update_kind(&v), "plan_update");
+    }
+
+    // BR#3352 — the empty-result class: an unmatched frame shape silently
+    // dropped the agent's reply from the runner's result payload while the
+    // side effects (worktree, PRs) landed. Unknown message shapes must reach
+    // the payload; plan/mode frames without message text must not.
+
+    #[test]
+    fn br3352_multi_block_array_content_joins_every_block() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": [ { "type": "text", "text": "first " },
+                                     { "type": "text", "text": "second" } ] }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn br3352_unknown_kind_with_message_payload_extracts() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message",
+                        "message": "final reply body" }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("final reply body"));
+    }
+
+    #[test]
+    fn br3352_renamed_plain_text_field_is_reachable_genuinely_unknown_stays_kind_fallback() {
+        // a renamed but plain string field under content IS reachable via the
+        // deep scan…
+        let reachable = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": { "message": "renamed but plain" } }
+        });
+        assert_eq!(extract_update_text(&reachable).as_deref(), Some("renamed but plain"));
+        // …while a shape with no message-string anywhere stays None — the
+        // live-line kind fallback covers liveness, never the result payload.
+        let unknown = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": { "value": "nested" } } }
+        });
+        assert_eq!(extract_update_text(&unknown), None);
+        assert_eq!(update_kind(&unknown), "agent_message_chunk");
+    }
+
+    #[test]
+    fn br3352_tool_input_never_leaks_into_the_result_payload() {
+        let v = serde_json::json!({
+            "method": "session/update",
+            "update": { "sessionUpdate": "tool_call", "title": "bash",
+                        "rawInput": { "command": "rm -rf /" } }
+        });
+        assert_eq!(extract_update_text(&v).as_deref(), Some("[tool] bash"));
     }
 }
 #[cfg(test)]

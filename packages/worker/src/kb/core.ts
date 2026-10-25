@@ -584,6 +584,63 @@ export function trigramVec(text: string, dim = TRIGRAM_DIM): number[] {
   return norm ? v.map((x) => x / norm) : v;
 }
 
+// ---------- completed_result_lost: result-delivery loss classification (BR#3352) ----------
+
+/**
+ * A dispatched run can complete at the worker (worktree + PRs landed) while
+ * its result message is lost between worker and hub. The watchdog then sees
+ * only silence and scores the run as abandoned — punishing the agent for a
+ * delivery-channel failure. The trail classifier proves landed side effects
+ * from what the hub already has (the task's progress trail), so the sweep can
+ * record the outcome class `completed_result_lost` instead of a plain
+ * abandonment, and the score side can exempt it.
+ *
+ * Evidence standard: GitHub receipts (PR/issue/commit URLs) or the runner's
+ * own `completed_result_lost` marker in the trail notes. A registered worktree
+ * or session name alone proves nothing — EVERY runner-claimed task has one at
+ * claim time, so counting those would reclassify every stall as result-lost.
+ */
+export interface ResultTrail {
+  /** GitHub PR or issue URL found in the trail (the landed-work receipt) */
+  receipt_url: string | null;
+  /** GitHub commit URLs found in the trail */
+  commit_urls: string[];
+  /** the claiming session's registered worktree (context, not evidence) */
+  worktree: string | null;
+  /** the claiming session name (context, not evidence) */
+  session: string | null;
+}
+
+const GH_RECEIPT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues)\/\d+/;
+const GH_COMMIT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{7,40}/g;
+
+/** Side effects the session trail can prove. Returns null when the trail
+ *  carries no landed-work evidence (a genuine silent stall). */
+export function detectResultTrail(input: {
+  last_progress_note?: string | null;
+  recent_notes?: string[];
+  worktree?: string | null;
+  session?: string | null;
+}): ResultTrail | null {
+  const notes = [String(input.last_progress_note ?? ""), ...(input.recent_notes ?? []).map(String)];
+  const marker = notes.some((n) => n.includes("completed_result_lost"));
+  const receipt_url = notes.map((n) => n.match(GH_RECEIPT_RE)).find((m) => m)?.[0] ?? null;
+  const commit_urls = marker ? [] : [...new Set(notes.flatMap((n) => n.match(GH_COMMIT_RE) ?? []))].slice(0, 5);
+  if (!marker && !receipt_url && commit_urls.length === 0) return null;
+  const worktree = String(input.worktree ?? "").trim() || null;
+  const session = String(input.session ?? "").trim() || null;
+  return { receipt_url, commit_urls, worktree, session };
+}
+
+/** Human-readable trail summary for the release note (≤ ~200 chars). */
+export function describeResultTrail(t: ResultTrail): string {
+  const bits: string[] = [];
+  if (t.receipt_url) bits.push(`receipt ${t.receipt_url}`);
+  if (t.commit_urls.length) bits.push(`${t.commit_urls.length} commit receipt(s)`);
+  if (t.worktree) bits.push(`worktree ${t.worktree}`);
+  return bits.join(", ") || "side effects present";
+}
+
 // ---------- agent behaviour score (self-reinforcing: gaming it = behaving well) ----------
 
 export interface AgentSignals {
@@ -595,6 +652,8 @@ export interface AgentSignals {
   thin_notes: number;
   /** watchdog abandonments on this agent's tasks */
   abandoned: number;
+  /** watchdog releases classed completed_result_lost (BR#3352) — a delivery-channel incident, NOT abandonment */
+  result_lost: number;
   /** tasks taken away and reassigned after the agent stayed silent post-abandonment */
   reassigned: number;
   /** asks addressed to this agent in the window */
@@ -609,7 +668,7 @@ export interface AgentSignals {
 
 export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
   const s = { ...raw } as Record<string, number>;
-  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
+  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "result_lost", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
     if (typeof s[k] !== "number" || Number.isNaN(s[k])) s[k] = 0;
   let score = 50;
   const hints: string[] = [];
@@ -618,6 +677,12 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   score -= Math.min(25, s.abandoned * 10);
   if (s.abandoned > 0)
     hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked — send log_progress every ≤10m`);
+  // BR#3352: a run whose result was lost in delivery is a channel incident,
+  // not agent abandonment — never penalized. The hint routes the complaint at
+  // the delivery channel (and invites a bounce-note with receipts) instead of
+  // telling the agent to heartbeat harder.
+  if (s.result_lost > 0)
+    hints.push(`${s.result_lost} completed run(s) had their result lost in delivery (completed_result_lost) — a delivery-channel incident, not abandonment; the side effects landed`);
   score -= Math.min(30, s.reassigned * 15);
   if (s.reassigned > 0)
     hints.push(`${s.reassigned} task(s) were taken from you after going silent post-abandonment — reclaim abandoned work or it is reassigned to other agents`);
