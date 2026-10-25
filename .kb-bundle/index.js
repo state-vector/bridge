@@ -291,9 +291,26 @@ function trigramVec(text2, dim = TRIGRAM_DIM) {
   const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0));
   return norm ? v.map((x) => x / norm) : v;
 }
+function detectResultTrail(input) {
+  const notes = [String(input.last_progress_note ?? ""), ...(input.recent_notes ?? []).map(String)];
+  const marker = notes.some((n) => n.includes("completed_result_lost"));
+  const receipt_url = notes.map((n) => n.match(GH_RECEIPT_RE)).find((m) => m)?.[0] ?? null;
+  const commit_urls = marker ? [] : [...new Set(notes.flatMap((n) => n.match(GH_COMMIT_RE) ?? []))].slice(0, 5);
+  if (!marker && !receipt_url && commit_urls.length === 0) return null;
+  const worktree = String(input.worktree ?? "").trim() || null;
+  const session = String(input.session ?? "").trim() || null;
+  return { receipt_url, commit_urls, worktree, session };
+}
+function describeResultTrail(t) {
+  const bits = [];
+  if (t.receipt_url) bits.push(`receipt ${t.receipt_url}`);
+  if (t.commit_urls.length) bits.push(`${t.commit_urls.length} commit receipt(s)`);
+  if (t.worktree) bits.push(`worktree ${t.worktree}`);
+  return bits.join(", ") || "side effects present";
+}
 function scoreAgent(raw) {
   const s = { ...raw };
-  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
+  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "result_lost", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
     if (typeof s[k] !== "number" || Number.isNaN(s[k])) s[k] = 0;
   let score = 50;
   const hints = [];
@@ -301,6 +318,8 @@ function scoreAgent(raw) {
   score -= Math.min(25, s.abandoned * 10);
   if (s.abandoned > 0)
     hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked \u2014 send log_progress every \u226410m`);
+  if (s.result_lost > 0)
+    hints.push(`${s.result_lost} completed run(s) had their result lost in delivery (completed_result_lost) \u2014 a delivery-channel incident, not abandonment; the side effects landed`);
   score -= Math.min(30, s.reassigned * 15);
   if (s.reassigned > 0)
     hints.push(`${s.reassigned} task(s) were taken from you after going silent post-abandonment \u2014 reclaim abandoned work or it is reassigned to other agents`);
@@ -464,7 +483,7 @@ function prEscalationAskTitle(repo, prNumber, cardId, graceHours, staleDays) {
   if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
   return prefix + text2 + suffix;
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS, TERMINAL_CARD_STATUSES;
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS, TERMINAL_CARD_STATUSES;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -576,6 +595,10 @@ var init_core = __esm({
     __name(scaffoldBody, "scaffoldBody");
     TRIGRAM_DIM = 256;
     __name(trigramVec, "trigramVec");
+    GH_RECEIPT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues)\/\d+/;
+    GH_COMMIT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{7,40}/g;
+    __name(detectResultTrail, "detectResultTrail");
+    __name(describeResultTrail, "describeResultTrail");
     __name(scoreAgent, "scoreAgent");
     MAIN_RED_CONCLUSIONS = /* @__PURE__ */ new Set([
       "failure",
@@ -1496,10 +1519,26 @@ var init_do = __esm({
             if (openAsk) continue;
             const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
             const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+            let trail = null;
+            try {
+              const notes = this.state.storage.sql.exec(
+                `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
+                r.id
+              ).toArray().map((x) => String(x.summary ?? ""));
+              const sess = meta.session ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session)) : null;
+              trail = detectResultTrail({
+                last_progress_note: meta.last_progress?.note,
+                recent_notes: notes,
+                worktree: sess?.worktree ?? null,
+                session: meta.session ?? null
+              });
+            } catch {
+            }
             await this.transition({
               id: r.id,
               to: "todo",
-              note: `stalled \u2014 no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`
+              note: trail ? `stalled \u2014 no update for >${staleMin}m; completed_result_lost \u2014 ${describeResultTrail(trail)}; result never reached the hub \u2014 released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}` : `stalled \u2014 no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+              ...trail ? { result_class: "completed_result_lost" } : {}
             }, "system:watchdog");
           } catch (e) {
             this.audit("system:watchdog", "sweep_error", r.id, { error: String(e.message ?? e) });
@@ -3092,7 +3131,7 @@ ${detail.body ?? ""}`;
         const sig = /* @__PURE__ */ __name((label) => {
           let s = signals.get(label);
           if (!s) {
-            s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
+            s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
             signals.set(label, s);
           }
           return s;
@@ -3109,10 +3148,20 @@ ${detail.body ?? ""}`;
           if (String(d.note ?? "").trim().length < 10) s.thin_notes++;
         }
         for (const r of this.state.storage.sql.exec(
-          `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
-       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
+          `SELECT a.owner AS owner, e.detail AS detail FROM events e JOIN artefacts a ON a.id = e.artefact_id
+       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ?`,
           recentTs
-        ).toArray()) sig(r.owner || "unknown").abandoned += r.n;
+        ).toArray()) {
+          const s = sig(r.owner || "unknown");
+          let d = {};
+          try {
+            d = JSON.parse(r.detail ?? "{}");
+          } catch {
+            d = {};
+          }
+          if (d?.result_class === "completed_result_lost") s.result_lost++;
+          else s.abandoned++;
+        }
         for (const r of this.state.storage.sql.exec(
           `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`,
           recentTs
@@ -4541,7 +4590,8 @@ ${doneNote}`);
           to: verdict.status,
           note: body.note ?? "",
           sentiment,
-          ...attributedAgent ? { agent: attributedAgent } : {}
+          ...attributedAgent ? { agent: attributedAgent } : {},
+          ...body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}
         });
         this.version(id, actor, "transition", `${row.status} \u2192 ${verdict.status}${body.note ? ` \u2014 ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
         if (row.type === "decision" && verdict.status === "accepted") {
@@ -5568,7 +5618,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
         const gaugeDebtNote = gaugeDebt.length ? `
 
 GAUGE DEBT \u2014 these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) \u2014 the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.` : "";
-        const my_score = this.agentScores().find((a) => a.label === label) ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
+        const my_score = this.agentScores().find((a) => a.label === label) ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
         const scoreDirective = `
 
 YOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it \u2014 it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") : "No deductions \u2014 keep heartbeats \u226410m, finish with receipts, answer asks fast."}`;
@@ -6838,7 +6888,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "a82a27ee293123a418e76a4b39a3f0b6893a4bd0", built_at: "2026-10-25T15:19:33Z" };
+    module.exports = { commit: "2dd0b42053ad32e7fc431f05a405ea022d004c46", built_at: "2026-10-25T15:33:35Z" };
   }
 });
 

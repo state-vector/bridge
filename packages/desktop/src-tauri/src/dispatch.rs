@@ -1796,6 +1796,31 @@ fn void_run(stdout: &str, stderr: &str) -> bool {
     SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
 }
 
+/// BR#3352: local side-effect receipts appended to completed_result_lost
+/// markers — what the runner can prove at completion time without the hub
+/// probing disk/GitHub. The hub's watchdog classifier greps the trail for the
+/// marker and for GitHub receipts; this wording feeds both.
+fn result_lost_receipts(worktree: Option<&str>, pr: Option<&str>) -> String {
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(w) = worktree {
+        let w = w.trim();
+        if !w.is_empty() {
+            bits.push(format!("worktree {w}"));
+        }
+    }
+    if let Some(p) = pr {
+        let p = p.trim();
+        if !p.is_empty() {
+            bits.push(format!("PR {p}"));
+        }
+    }
+    if bits.is_empty() {
+        " (no local side-effect receipts — check the session trail)".to_string()
+    } else {
+        format!("; side effects: {}", bits.join(", "))
+    }
+}
+
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
 /// delivery contract (commit, push branch, open PR). Uses an isolated worktree
 /// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
@@ -2456,6 +2481,19 @@ fn tick(
             s
         };
         let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
+        // BR#3352: an ok run with an EMPTY result payload is a delivery loss,
+        // not a clean finish — the hub would receive a bare "run finished"
+        // with nothing to verify while the side effects (worktree, PRs) sit
+        // on disk/GitHub. Record the outcome class + the local receipts so
+        // the board can distinguish "ran, report lost" from "abandoned" and
+        // flag the delivery channel instead of scoring an abandonment.
+        let result_lost = outcome_ok && tail.trim().is_empty();
+        if result_lost {
+            note.push_str(&format!(
+                "\ncompleted_result_lost — agent reply was empty (result payload lost in capture){}",
+                result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
+            ));
+        }
         eprintln!(
             "[dispatch] {} {} in ~{}m — agent reply: {}",
             inf.task_id,
@@ -2502,6 +2540,7 @@ fn tick(
                 "pr_url": &pr_url,
                 "last_note": &note,
                 "stdout_tail": &outcome.stdout_tail,
+                "result_lost": result_lost,
             }),
         );        if outcome_ok {
             // YIELD check first: the agent may have blocked/bounced/closed the
@@ -2519,9 +2558,77 @@ fn tick(
                     // mid-run) — drop the ephemeral state file too, not just on
                     // handoff; a retained file made finished tasks look in-flight
                     remove_task_state(&inf.task_id);
-                    snap_activity(snap, "info", &format!("{} yielded — task now {}, session retained for resume", inf.task_id, st));
-                    msgs.push(format!("{} yielded ({}) — released, worktree + session kept", inf.task_title, st));
-                    continue;
+                    // BR#3352: a completed run's result must reach the hub
+                    // even when the claim was lost mid-run. A watchdog release
+                    // ("stalled") while the session kept working is NOT the
+                    // agent yielding — dropping the result here is exactly the
+                    // "ran, report lost" class the board then scored as
+                    // abandoned. todo → re-claim and hand the finished work
+                    // off below; any other state was the agent's own deliberate
+                    // move → deliver the result as a note and touch nothing.
+                    if st == "todo" {
+                        match mcp_call_task(
+                            cfg,
+                            id,
+                            "transition",
+                            json!({
+                                "id": inf.task_id,
+                                "to": "in_progress",
+                                "note": "runner: re-claiming a COMPLETED run — the watchdog released it mid-run while the session kept working; handing the finished work off",
+                            }),
+                            &inf.task_id,
+                        ) {
+                            Ok(_) => {
+                                snap_activity(snap, "info", &format!("{} re-claimed a completed run (was released mid-run) — handing off", inf.task_id));
+                                msgs.push(format!("{} — completed run re-claimed after a mid-run release; handing off", inf.task_title));
+                            }
+                            Err(e) => {
+                                // claim raced (another agent picked it up) or a
+                                // gate refused — fall back to delivering the
+                                // result as a note; the hub still learns what
+                                // happened either way.
+                                snap_activity(snap, "info", &format!("{} re-claim after release failed: {} — delivering result as a note", inf.task_id, truncate(&e, 80)));
+                                let late_note = if tail.trim().is_empty() {
+                                    format!(
+                                        "completed_result_lost — run finished ({exit_txt}, ~{mins}m) after the claim was lost; agent reply was empty (result payload lost in capture){} — result delivered late by the runner",
+                                        result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
+                                    )
+                                } else {
+                                    format!("runner: run finished AFTER release ({exit_txt}, ~{mins}m) — result delivered late: {}", truncate(&tail, 400))
+                                };
+                                let _ = mcp_call_task(
+                                    cfg,
+                                    id,
+                                    "log_progress",
+                                    json!({ "id": inf.task_id, "note": late_note, "sentiment": "neutral" }),
+                                    &inf.task_id,
+                                );
+                                msgs.push(format!("{} — completed after release; result delivered as a note (re-claim failed: {})", inf.task_title, truncate(&e, 60)));
+                                continue;
+                            }
+                        }
+                    } else {
+                        let late_note = if tail.trim().is_empty() {
+                            format!(
+                                "completed_result_lost — run finished ({exit_txt}, ~{mins}m) but the task is now {st}; agent reply was empty (result payload lost in capture){} — result delivered late by the runner",
+                                result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
+                            )
+                        } else {
+                            format!("runner: run finished AFTER the task moved to {st} ({exit_txt}, ~{mins}m) — result delivered late: {}", truncate(&tail, 400))
+                        };
+                        let _ = mcp_call_task(
+                            cfg,
+                            id,
+                            "log_progress",
+                            json!({ "id": inf.task_id, "note": late_note, "sentiment": "neutral" }),
+                            &inf.task_id,
+                        );
+                    }
+                    if st != "todo" {
+                        snap_activity(snap, "info", &format!("{} yielded — task now {}, session retained for resume", inf.task_id, st));
+                        msgs.push(format!("{} yielded ({}) — released, worktree + session kept", inf.task_title, st));
+                        continue;
+                    }
                 }
             }
             // VERIFY/ANALYSIS tasks ARE the review: their completion closes them
@@ -3834,6 +3941,45 @@ mod tests {
         assert_eq!(find_session(&sessions, "BR#1").unwrap().id, "ses_1");
         assert_eq!(find_session(&sessions, "BR#2").unwrap().id, "ses_2");
         assert!(find_session(&sessions, "BR#3").is_none());
+    }
+
+    // BR#3352 — the empty-result class: an ok run whose agent reply never
+    // reached the runner's payload must land on the hub as
+    // completed_result_lost with the local side-effect receipts, never as a
+    // bare "run finished" (or worse: silently dropped on the yield path).
+
+    #[test]
+    fn result_lost_receipts_names_worktree_and_pr() {
+        let s = result_lost_receipts(
+            Some("/Users/rayh/.bridge/worktrees/br-1234"),
+            Some("https://github.com/state-vector/superpositional/pull/2341"),
+        );
+        assert!(s.contains("worktree /Users/rayh/.bridge/worktrees/br-1234"), "{s}");
+        assert!(s.contains("PR https://github.com/state-vector/superpositional/pull/2341"), "{s}");
+        assert!(s.contains("side effects:"), "{s}");
+    }
+
+    #[test]
+    fn result_lost_receipts_without_local_evidence_says_so() {
+        let s = result_lost_receipts(None, None);
+        assert!(s.contains("no local side-effect receipts"), "{s}");
+        assert!(!s.contains("worktree"), "{s}");
+        // blank strings count as absent — Option::Some("") must not print noise
+        let blank = result_lost_receipts(Some("  "), Some(""));
+        assert!(blank.contains("no local side-effect receipts"), "{blank}");
+    }
+
+    #[test]
+    fn result_lost_marker_matches_the_hub_classifier_token() {
+        // the hub's watchdog classifier greps the trail for this exact token
+        // (core.ts detectResultTrail) — renaming one side without the other
+        // silently reverts to scoring lost reports as abandonments.
+        const MARKER: &str = "completed_result_lost";
+        let note = format!(
+            "runner: run finished — exit 0 — \n{MARKER} — agent reply was empty (result payload lost in capture){}",
+            result_lost_receipts(Some("/tmp/wt"), Some("https://github.com/o/r/pull/1"))
+        );
+        assert!(note.contains(MARKER));
     }
 }
 
