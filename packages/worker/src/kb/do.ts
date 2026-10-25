@@ -497,6 +497,11 @@ export class KnowledgeHub {
     const names = verdict.red.map((r) => r.name);
     const title = stopLineAskTitle(sha, names);
     const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
+    // the guilty chain rides the page (BR#3307, residue of BR#3287 spec
+    // item 4): the ask names not just the red checks but the attributed
+    // merge — PR · task · verdict · session · signer — from the provenance
+    // index; honest absence when the sweep has not stamped it yet
+    const chain = await this.guiltyChain(sha);
     // explicit open-ask check (same rule askCreate enforces) — keeps the
     // audit trail honest about skips. Questions are a TYPE in the ask
     // contract (the legacy `question` tag is stripped on write), so match
@@ -516,6 +521,8 @@ export class KnowledgeHub {
         ``,
         `**Red checks on main ${sha.slice(0, 9)}:**`,
         ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
+        ``,
+        `**Guilty chain:** ${this.guiltyChainLine(chain, sha)}`,
         ``,
         `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
         ``,
@@ -581,6 +588,9 @@ export class KnowledgeHub {
     // attribution: which merge broke the line? One bounded walk per episode
     // (the dedupe above keeps this off the re-sweep path) — never per sweep.
     const bisect = await this.stopLineBisect(ghGet, sha);
+    // the guilty chain (BR#3307): the bisect names the breaking sha; the
+    // provenance index turns it into PR → task → verdict → session → signer
+    const chain = await this.guiltyChain(bisect.first_failing_sha);
     const culprit = bisect.first_failing_sha
       ? bisect.first_failing_pr
         ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} — PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.`
@@ -593,6 +603,8 @@ export class KnowledgeHub {
       ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
       ``,
       culprit,
+      ``,
+      `**Guilty chain:** ${this.guiltyChainLine(chain, bisect.first_failing_sha)}`,
       ``,
       `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation — precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
       ``,
@@ -622,6 +634,13 @@ export class KnowledgeHub {
             unsettled: verdict.unsettled,
             first_failing_sha: bisect.first_failing_sha ?? undefined,
             first_failing_pr: bisect.first_failing_pr,
+            // the resolved guilty chain (BR#3307): null when the provenance
+            // sweep has not stamped the breaking merge yet — honest absence
+            guilty_chain: chain.rec ? {
+              repo: chain.rec.repo, pr: chain.rec.pr,
+              task_id: chain.rec.task?.id ?? null, verdict_id: chain.rec.verdict_id,
+              session: chain.rec.session, signer: chain.rec.signer,
+            } : null,
             sink_id: sinkId,
           },
           // priority 0 — the existing urgent handling: first on the board's
@@ -808,16 +827,23 @@ export class KnowledgeHub {
           let session: string | null = null;
           if (taskId && /^[0-9a-f]{40}$/.test(headSha)) {
             // accepted verify lineage: decisions derived_from the linked card
-            // citing the head sha (same join the merge sweep uses)
+            // citing the head sha (same join the merge sweep uses — body_md
+            // is selected: citations live in the verdict body, not just meta)
             const decisions = this.state.storage.sql.exec(
-              `SELECT d.id AS id, d.meta AS meta FROM relations r
+              `SELECT d.id AS id, d.body_md AS body_md, d.meta AS meta FROM relations r
                JOIN artefacts d ON d.id = r.src_id
                WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
               taskId,
             ).toArray() as any[];
+            // verdict selection (BR#3307 residue): only a decision that
+            // actually cites the head sha may vouch. Human merges and older
+            // merges often have no accepted decision on the exact head —
+            // falling back to decisions[0] would attach an arbitrary stale
+            // verdict to the chain; verdict_id stays null instead (honest
+            // "unverified", the same contract as a missing card link).
             const onHead = decisions.find((d: any) =>
               (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9)),
-            ) ?? decisions[0];
+            );
             if (onHead) {
               verdictId = String(onHead.id);
               try { session = String(JSON.parse(onHead.meta ?? "{}")?.session ?? "") || null; } catch { session = null; }
@@ -852,7 +878,9 @@ export class KnowledgeHub {
               await fetch(`${base}/repos/${repo}/issues/${pr.number}/labels`, {
                 method: "POST",
                 headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json" },
-                body: JSON.stringify({ labels: [`bridge:${taskId}`] }),
+                // label format per README/spec: bridge:BR-<id> (BR#3307 — the
+                // raw card id renders "bridge:BR#3287"; normalize the #)
+                body: JSON.stringify({ labels: [`bridge:${taskId.replace("#", "-")}`] }),
               });
             } catch { /* mirror is best-effort only */ }
           }
@@ -886,6 +914,51 @@ export class KnowledgeHub {
       verdict_id: row.verdict_id, session: row.session, signer: row.signer,
       merged_at: row.merged_at, stamped_at: row.stamped_at,
     };
+  }
+
+  /** The guilty-chain outcome for an alarm note (BR#3307, residue of
+   *  BR#3287 spec item 4): explicitly typed — `rec` carries the resolved
+   *  PR → task → verify verdict → agent session → signer chain when the
+   *  provenance index has stamped the merge, and `error` is set ONLY when
+   *  the lookup itself failed. Never throws — attribution must not break
+   *  the filing (the same downgrade philosophy as the bisect walk) — but a
+   *  failure is never converted into success: the caller distinguishes it
+   *  (the note renders the error, not the honest-absence line) and the
+   *  audit trail receipts it (hub:stop-the-line/guilty_chain_error — SP
+   *  review round 1, PR #198: silence was the one thing it must not be). */
+  private async guiltyChain(sha: string | null | undefined): Promise<{ rec: any; error?: string }> {
+    if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return { rec: null };
+    try {
+      return { rec: await this.provenanceBySha(sha) };
+    } catch (e) {
+      const error = String((e as Error).message ?? e).slice(0, 200);
+      this.audit("hub:stop-the-line", "guilty_chain_error", null, {
+        sha: String(sha).slice(0, 9), error,
+      });
+      return { rec: null, error };
+    }
+  }
+
+  /** One markdown chain segment: `PR #N · task BR#X · verdict BR#Y ·
+   *  session s · signer class` — with honest fallback lines: the provenance
+   *  sweep has not stamped the merge yet, or the lookup failed (withheld,
+   *  never guessed). */
+  private guiltyChainLine(chain: { rec: any; error?: string }, sha: string | null | undefined): string {
+    if (chain.error) {
+      return `_provenance lookup failed (${chain.error}) — the chain is withheld rather than guessed; receipted on the audit trail (hub:stop-the-line/guilty_chain_error)_`;
+    }
+    if (!chain.rec) {
+      return `_no bridge provenance for ${sha ? sha.slice(0, 9) : "this sha"} yet — \`GET /api/kb/provenance?sha=\` returns the chain once the provenance sweep stamps the merge_`;
+    }
+    const rec = chain.rec;
+    const prUrl = `https://github.com/${rec.repo}/pull/${rec.pr}`;
+    return [
+      `PR [#${rec.pr}](${prUrl})`,
+      `task ${rec.task?.id ?? "none (no bridge card)"}`,
+      `verdict ${rec.verdict_id ?? "none (unverified merge)"}`,
+      `session ${rec.session ?? "—"}`,
+      `signer ${rec.signer ?? "unknown"}`,
+    ].join(" · ");
   }
 
   private async mergeQueueSweep(now: number): Promise<void> {

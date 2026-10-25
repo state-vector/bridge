@@ -97,37 +97,62 @@ let ghOrigin = "";
 const HEAD_SHA = "c61b4869aad07eccdc738200f004d2dbe0a2bf66";
 const MERGE_SHA = "c28dbd60764a05eae8bccf4b40d9afed2e425ea7";
 const NOCARD_MERGE = "b".repeat(40);
+// the verdict-honesty drill (BR#3307): PR 188 has a bridge card + an ACCEPTED
+// decision, but the decision cites an OLDER head (stale) — the sweep must
+// record verdict_id null (honest unverified), never the stale verdict
+const HEAD2 = "d".repeat(40);
+const MERGE2 = "9".repeat(40);
+const STALE_SHA = "8".repeat(40);
 // the drill card's real id is assigned at create-time; the stub serves the
 // branch/title from this scenario so the join key (BR-<id>) is honest.
 const scenario = { branch: "bridge/BR-3218", refText: "BR#3218" };
+const scenario2 = { on: false, branch: "" };
+// captured mirror-label POST bodies — the label format guard (BR#3307)
+const labelsSeen: string[] = [];
 
 function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
   const json = (res: import("node:http").ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
   };
-  const detail = (n: number, ref: string, title: string, body: string) => ({
+  const detail = (n: number, ref: string, title: string, body: string, headSha = HEAD_SHA, mergeSha?: string) => ({
     number: n, title, body,
-    head: { ref, sha: HEAD_SHA },
+    head: { ref, sha: headSha },
     merged_at: "2026-10-25T00:35:00Z",
-    merge_commit_sha: n === 185 ? MERGE_SHA : NOCARD_MERGE,
+    merge_commit_sha: mergeSha ?? (n === 185 ? MERGE_SHA : NOCARD_MERGE),
   });
   const commits = (cody: boolean) => [
     { sha: HEAD_SHA, commit: { verification: { verified: true }, committer: { email: cody ? "297316395+detached-cody@users.noreply.github.com" : "ray@wirestorm.net" } } },
   ];
   return (req, res) => {
     const url = req.url ?? "/";
-    if (req.method === "POST" && /\/issues\/\d+\/labels/.test(url)) return json(res, 200, { ok: true });
+    if (req.method === "POST" && /\/issues\/\d+\/labels/.test(url)) {
+      // capture the derived mirror labels (BR#3307 format guard), best-effort
+      let raw = "";
+      req.on("data", (c) => { raw += String(c); });
+      req.on("end", () => {
+        try { labelsSeen.push(...(JSON.parse(raw)?.labels ?? [])); } catch { /* mirror capture is best-effort */ }
+        json(res, 200, { ok: true });
+      });
+      return;
+    }
     if (/\/pulls\?state=closed/.test(url)) {
-      return json(res, 200, [
+      const list: any[] = [
         { number: 185, title: `board: drill (${scenario.refText})`, state: "closed", merged_at: "2026-10-25T00:35:00Z", merge_commit_sha: MERGE_SHA },
         { number: 186, title: "chore: no card here", state: "closed", merged_at: "2026-10-25T00:40:00Z", merge_commit_sha: NOCARD_MERGE },
         { number: 187, title: "closed without merging", state: "closed", merged_at: null, merge_commit_sha: null },
-      ]);
+      ];
+      // PR 188 is served only once its drill card exists — the sweep dedupes
+      // per (repo, pr), so an early no-card index would stick forever
+      if (scenario2.on) {
+        list.push({ number: 188, title: "feat: verdict-honesty drill (BR#3307)", state: "closed", merged_at: "2026-10-25T00:45:00Z", merge_commit_sha: MERGE2 });
+      }
+      return json(res, 200, list);
     }
     let m = url.match(/\/pulls\/(\d+)$/);
     if (m) {
       const n = Number(m[1]);
+      if (n === 188) return json(res, 200, detail(188, scenario2.branch, "feat: verdict-honesty drill (BR#3307)", "leg of BR#3307", HEAD2, MERGE2));
       return json(res, 200, n === 185 ? detail(185, scenario.branch, `board: drill (${scenario.refText})`, scenario.refText)
         : detail(186, "chore/random", "chore: no card here", "nothing"));
     }
@@ -179,13 +204,19 @@ const kbJson = async (path: string, body?: unknown): Promise<{ status: number; b
 
 describe("provenance DO drill (BR#3287)", () => {
   it("indexes merged PRs, stamps the card, and the endpoint returns the chain", async () => {
-    // the producing card + an accepted verify verdict citing the head sha
+    // the producing card + an accepted verify verdict citing the head sha —
+    // the citation lives in the BODY (BR#3307: the sweep matches on body/meta,
+    // and the old decisions[0] fallback used to mask a title-only citation)
     const task = await kbJson("/create", { type: "task", title: "IMPL: Claim locally (drill)" });
     expect(task.status).toBe(200);
     const taskId = task.body.id;
     scenario.branch = `bridge/${taskId.replace("#", "-")}`;
     scenario.refText = taskId;
-    const verdict = await kbJson("/create", { type: "decision", title: `verify verdict (drill) — head ${HEAD_SHA.slice(0, 9)} verified` });
+    const verdict = await kbJson("/create", {
+      type: "decision",
+      title: `verify verdict (drill) — head ${HEAD_SHA.slice(0, 9)} verified`,
+      body_md: `verified head ${HEAD_SHA} (drill citation)`,
+    });
     expect(verdict.status).toBe(200);
     await kbJson("/link", { src: verdict.body.id, relation: "derived_from", dst: taskId });
     await kbJson("/transition", { id: verdict.body.id, to: "accepted", actor: "web:ray", note: `drill accept (human actor per the acceptance gate); head ${HEAD_SHA}` });
@@ -240,6 +271,50 @@ expect(byMerge.body.error ?? "").toBe("");
     expect(String(missing.body.error)).toContain("no bridge provenance");
     const bad = await kbJson("/provenance", { sha: "nope" });
     expect(bad.status).toBe(400);
+  });
+
+  it("BR#3307 residue: no accepted decision on the head sha → verdict_id null (never a stale verdict); mirror label is bridge:BR-<id>", async () => {
+    // card2 + an accepted decision citing an OLDER head (the stale verdict
+    // the old decisions[0] fallback would have attached)
+    const card2 = await kbJson("/create", { type: "task", title: "IMPL: verdict-honesty drill (BR#3307)" });
+    expect(card2.status).toBe(200);
+    scenario2.branch = `bridge/${String(card2.body.id).replace("#", "-")}`;
+    scenario2.on = true;
+    const stale = await kbJson("/create", {
+      type: "decision",
+      title: `verify verdict (stale drill) — head ${STALE_SHA.slice(0, 9)} verified`,
+      // the citation names ONLY the stale head — never HEAD2 (the sha must
+      // not appear anywhere in body/meta, or the citation match fires)
+      body_md: `verified head ${STALE_SHA} — an OLDER merge; this verdict must not vouch for a head it does not cite`,
+      session: "bridge-task-BR-3307-stale",
+    });
+    expect(stale.status).toBe(200);
+    await kbJson("/link", { src: stale.body.id, relation: "derived_from", dst: card2.body.id });
+    await kbJson("/transition", { id: stale.body.id, to: "accepted", actor: "web:ray", note: `drill accept for the OLD head ${STALE_SHA}` });
+
+    const sweep = await kbJson("/admin.provenance_sweep", { now: Date.now() + 3_000_000 });
+    expect(sweep.status).toBe(200);
+    expect(sweep.body.error).toBeUndefined();
+    // PR 188 is the only unseen merge → the table grew by exactly it
+    const rec = await kbJson(`/provenance?sha=${MERGE2}`);
+    expect(rec.status).toBe(200);
+    expect(rec.body.task.id).toBe(card2.body.id);
+    // the honest contract: no decision cites head d… → verdict null, session null
+    expect(rec.body.verdict_id).toBeNull();
+    expect(rec.body.session).toBeNull();
+    expect(rec.body.signer).toBe("signed");
+    // by head sha → the same honest record
+    const byHead = await kbJson(`/provenance?sha=${HEAD2.slice(0, 9)}`);
+    expect(byHead.status).toBe(200);
+    expect(byHead.body.verdict_id).toBeNull();
+    // the card stamp is honest too (no stale verdict on the chain)
+    const card = await kbJson(`/artefact?id=${encodeURIComponent(String(card2.body.id))}`);
+    expect(card.body.meta.provenance.verdict_id).toBeNull();
+    expect(card.body.meta.provenance.session).toBeNull();
+    // the derived mirror label carries the documented bridge:BR-<id> form —
+    // never the raw card id ("bridge:BR#3307")
+    expect(labelsSeen).toContain(`bridge:${String(card2.body.id).replace("#", "-")}`);
+    expect(labelsSeen).not.toContain(`bridge:${card2.body.id}`);
   });
 
   it("lookup contract: bad sha → 400, unknown sha → 404", async () => {

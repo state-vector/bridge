@@ -324,8 +324,10 @@ that law, and BR#3008 makes it mechanical instead of discipline. Two halves, sam
   5 min, `0` = off) reads the same public API and, when main is RED, files ONE
   time-sensitive ask to you per red episode — deduped per main-HEAD sha under the
   `ALARM SINK` board card, so ten PRs seeing one red main produce one ask, not ten. A red
-  main pages the board even when nobody opens a PR. `admin.stop_line_sweep` drills it on
-  demand.
+  main pages the board even when nobody opens a PR. The ask carries the **guilty chain**
+  (BR#3307): PR · task · verify verdict · agent session · signer class, resolved from the
+  provenance index — or an honest "no bridge provenance yet" when the sweep has not stamped
+  the merge. `admin.stop_line_sweep` drills it on demand.
 - **The work**: the ask is attention; the episode task is the claimable item (BR#3284).
   On RED the sweep also files ONE P0 task per red episode —
   `STOP-THE-LINE: bridge main RED @ <short-sha> — fix main first` — child of the
@@ -333,7 +335,9 @@ that law, and BR#3008 makes it mechanical instead of discipline. Two halves, sam
   task when a new red sha lands (one live episode task at a time). Its body carries the
   red checks with run links, the **first failing sha** and the PR that landed it (a
   bounded bisect walk over recent main history; a failed walk degrades to "bisect
-  unavailable" on the card and never blocks the filing), the remediation carve-out
+  unavailable" on the card and never blocks the filing), the **guilty chain** from the
+  provenance index (BR#3307: PR · task · verdict · session · signer, with an honest
+  "no bridge provenance yet" fallback), the remediation carve-out
   (BR#3010 precedent), and the done-when: *main tip all check-runs settled green (0 red,
   0 unsettled) + gate reopened*. The task is boosted — priority 0 in the pickup ranking,
   top of the board's ranked queue, ahead of unblock duty — and tagged
@@ -390,9 +394,12 @@ the accepted verify verdict citing that head, the owning agent **session**, and 
 (`detached-cody` / `signed` / `partially-signed` / `unsigned`).
 
 - **Storage of record is the board** (decision BR#3291): the task card carries `meta.provenance`
-  (rendered as a provenance strip in TaskDetail), the DO keeps a `provenance` index table, and
+  (rendered as a provenance strip in TaskDetail, and on the board's Top rows as a PR link +
+  verifier badge for in-flight work — BR#3307), the DO keeps a `provenance` index table, and
   `GET /api/kb/provenance?sha=<7-40 hex>` resolves sha → PR → task → verdict → session. Unknown sha
   = honest 404 "no bridge provenance"; merges with no bridge task are recorded as absence — itself a signal.
+  The verdict leg is honest too (BR#3307): when no accepted decision cites the head sha (human merges,
+  older merges), `verdict_id` is recorded `null` — never an arbitrary stale verdict.
 - **GitHub mirror is derived and non-authoritative**: the sweep best-effort adds a `bridge:BR-<id>`
   label; nothing machine-facing reads it back.
 - Consumers: the red-main guilty-agent attribution loop (BR#3284), humans auditing who landed what,

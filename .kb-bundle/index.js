@@ -1390,6 +1390,7 @@ var init_do = __esm({
         const names = verdict.red.map((r) => r.name);
         const title = stopLineAskTitle(sha, names);
         const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
+        const chain = await this.guiltyChain(sha);
         const dup = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
@@ -1405,6 +1406,8 @@ var init_do = __esm({
             ``,
             `**Red checks on main ${sha.slice(0, 9)}:**`,
             ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+            ``,
+            `**Guilty chain:** ${this.guiltyChainLine(chain, sha)}`,
             ``,
             `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
             ``,
@@ -1458,6 +1461,7 @@ var init_do = __esm({
           return;
         }
         const bisect = await this.stopLineBisect(ghGet, sha);
+        const chain = await this.guiltyChain(bisect.first_failing_sha);
         const culprit = bisect.first_failing_sha ? bisect.first_failing_pr ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.` : `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 the PR that landed it could not be resolved (bisect walked ${bisect.walked} commit(s)); check merge history.` : `**First failing sha:** bisect unavailable (${bisect.note ?? "history walk failed"}) \u2014 check the run history of recent merges manually.`;
         const body = [
           `**STOP-THE-LINE episode task** \u2014 bridge main HEAD ${shortSha} is RED. Merges are mechanically halted by the \`main-green gate\` (accepted decision BR#3009, destination-green precondition). This task is the claimable priority item for putting the line back up. Work continues on branches (worktrees) \u2014 only the line stops.`,
@@ -1466,6 +1470,8 @@ var init_do = __esm({
           ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
           ``,
           culprit,
+          ``,
+          `**Guilty chain:** ${this.guiltyChainLine(chain, bisect.first_failing_sha)}`,
           ``,
           `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation \u2014 precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
           ``,
@@ -1495,6 +1501,16 @@ var init_do = __esm({
                 unsettled: verdict.unsettled,
                 first_failing_sha: bisect.first_failing_sha ?? void 0,
                 first_failing_pr: bisect.first_failing_pr,
+                // the resolved guilty chain (BR#3307): null when the provenance
+                // sweep has not stamped the breaking merge yet — honest absence
+                guilty_chain: chain.rec ? {
+                  repo: chain.rec.repo,
+                  pr: chain.rec.pr,
+                  task_id: chain.rec.task?.id ?? null,
+                  verdict_id: chain.rec.verdict_id,
+                  session: chain.rec.session,
+                  signer: chain.rec.signer
+                } : null,
                 sink_id: sinkId
               },
               // priority 0 — the existing urgent handling: first on the board's
@@ -1679,14 +1695,14 @@ ${detail?.body ?? ""}`);
               let session = null;
               if (taskId && /^[0-9a-f]{40}$/.test(headSha)) {
                 const decisions = this.state.storage.sql.exec(
-                  `SELECT d.id AS id, d.meta AS meta FROM relations r
+                  `SELECT d.id AS id, d.body_md AS body_md, d.meta AS meta FROM relations r
                JOIN artefacts d ON d.id = r.src_id
                WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
                   taskId
                 ).toArray();
                 const onHead = decisions.find(
                   (d) => (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9))
-                ) ?? decisions[0];
+                );
                 if (onHead) {
                   verdictId = String(onHead.id);
                   try {
@@ -1736,7 +1752,9 @@ ${detail?.body ?? ""}`);
                   await fetch(`${base}/repos/${repo}/issues/${pr.number}/labels`, {
                     method: "POST",
                     headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json" },
-                    body: JSON.stringify({ labels: [`bridge:${taskId}`] })
+                    // label format per README/spec: bridge:BR-<id> (BR#3307 — the
+                    // raw card id renders "bridge:BR#3287"; normalize the #)
+                    body: JSON.stringify({ labels: [`bridge:${taskId.replace("#", "-")}`] })
                   });
                 } catch {
                 }
@@ -1752,7 +1770,9 @@ ${detail?.body ?? ""}`);
        *  merge sha or head sha (7+ hex prefix). Returns null when nothing is
        *  known — an honest "no bridge provenance" (404) rather than a guess. */
       async provenanceLookup(sp) {
-        const sha = parseProvenanceSha(sp);
+        return this.provenanceBySha(parseProvenanceSha(sp));
+      }
+      async provenanceBySha(sha) {
         const row = this.one(
           `SELECT * FROM provenance WHERE merge_sha = ? OR merge_sha LIKE ? OR head_sha = ? OR head_sha LIKE ? LIMIT 1`,
           sha,
@@ -1775,6 +1795,50 @@ ${detail?.body ?? ""}`);
           merged_at: row.merged_at,
           stamped_at: row.stamped_at
         };
+      }
+      /** The guilty-chain outcome for an alarm note (BR#3307, residue of
+       *  BR#3287 spec item 4): explicitly typed — `rec` carries the resolved
+       *  PR → task → verify verdict → agent session → signer chain when the
+       *  provenance index has stamped the merge, and `error` is set ONLY when
+       *  the lookup itself failed. Never throws — attribution must not break
+       *  the filing (the same downgrade philosophy as the bisect walk) — but a
+       *  failure is never converted into success: the caller distinguishes it
+       *  (the note renders the error, not the honest-absence line) and the
+       *  audit trail receipts it (hub:stop-the-line/guilty_chain_error — SP
+       *  review round 1, PR #198: silence was the one thing it must not be). */
+      async guiltyChain(sha) {
+        if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return { rec: null };
+        try {
+          return { rec: await this.provenanceBySha(sha) };
+        } catch (e) {
+          const error = String(e.message ?? e).slice(0, 200);
+          this.audit("hub:stop-the-line", "guilty_chain_error", null, {
+            sha: String(sha).slice(0, 9),
+            error
+          });
+          return { rec: null, error };
+        }
+      }
+      /** One markdown chain segment: `PR #N · task BR#X · verdict BR#Y ·
+       *  session s · signer class` — with honest fallback lines: the provenance
+       *  sweep has not stamped the merge yet, or the lookup failed (withheld,
+       *  never guessed). */
+      guiltyChainLine(chain, sha) {
+        if (chain.error) {
+          return `_provenance lookup failed (${chain.error}) \u2014 the chain is withheld rather than guessed; receipted on the audit trail (hub:stop-the-line/guilty_chain_error)_`;
+        }
+        if (!chain.rec) {
+          return `_no bridge provenance for ${sha ? sha.slice(0, 9) : "this sha"} yet \u2014 \`GET /api/kb/provenance?sha=\` returns the chain once the provenance sweep stamps the merge_`;
+        }
+        const rec = chain.rec;
+        const prUrl = `https://github.com/${rec.repo}/pull/${rec.pr}`;
+        return [
+          `PR [#${rec.pr}](${prUrl})`,
+          `task ${rec.task?.id ?? "none (no bridge card)"}`,
+          `verdict ${rec.verdict_id ?? "none (unverified merge)"}`,
+          `session ${rec.session ?? "\u2014"}`,
+          `signer ${rec.signer ?? "unknown"}`
+        ].join(" \xB7 ");
       }
       async mergeQueueSweep(now) {
         const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
@@ -2605,6 +2669,10 @@ ${detail.body ?? ""}`);
               return this.json(await this.list(body));
             case "search":
               return this.json(await this.search(body));
+            case "provenance": {
+              const rec = await this.provenanceBySha(parseProvenanceSha(new URLSearchParams({ sha: String(body?.sha ?? "") })));
+              return rec ? this.json(rec) : this.json({ error: "no bridge provenance for this sha", sha: String(body?.sha ?? "") }, 404);
+            }
             case "related":
               return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
             case "enrich":
@@ -5388,6 +5456,8 @@ ${required.join("\n")}` : named ? void 0 : 'you did not name this session \u2014
     }
     case "search_knowledge":
       return text(JSON.stringify(await call("search", { q: args.q, type: args.type, limit: args.limit })));
+    case "provenance":
+      return text(JSON.stringify(await call("provenance", { sha: String(args.sha ?? "") })));
     case "get_artefact": {
       const a = await call("get", { id: args.id });
       const rel = await call("relations", { id: args.id });
@@ -5610,6 +5680,15 @@ var init_mcp = __esm({
         }
       },
       {
+        name: "provenance",
+        description: "PR provenance (BR#3287): commit sha \u2192 PR \u2192 producing task \u2192 verify verdict \u2192 agent session \u2192 signer class. sha = the merge or head commit, 7-40 hex. Unknown sha returns an honest 'no bridge provenance' error (direct push / unindexed).",
+        inputSchema: {
+          type: "object",
+          required: ["sha"],
+          properties: { sha: { type: "string", description: "merge or head commit sha, 7-40 hex" } }
+        }
+      },
+      {
         name: "session_alive",
         description: "Runner-side liveness vouch: the session process is alive and producing output (stdout/ACP stream moved). Updates the watchdog liveness stamp only \u2014 no board event, no progress entry. Called by the runner, throttled; agents should use log_progress for narrative.",
         inputSchema: {
@@ -5687,7 +5766,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "3b58fb3c9e19ee78ff99880148361d9dea8e43bc", built_at: "2026-10-25T11:53:34Z" };
+    module.exports = { commit: "9a7b824a129c0bceb979ac0dca9c9c94e9979382", built_at: "2026-10-25T12:37:56Z" };
   }
 });
 
