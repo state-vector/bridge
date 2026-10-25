@@ -1,0 +1,22 @@
+{
+  "recorded": "2026-10-25",
+  "note": "pairing contract (start + poll) — recorded from kb/do.ts wsPairStart/wsPairPoll (the /api/pair/* routes), minimized. The runner's Rust pairing flow (dispatch.rs pair_start/pair_poll) consumes these payloads; the poll's authorized variant carries the vended token, which leaves the registry exactly once — fixtures record it redacted. Validated against src/pairing.ts in CI.",
+  "start_response": {
+    "code": "K7QF-2ZRM",
+    "type": "gateway",
+    "expires_ts": 1792900000000
+  },
+  "poll_responses": {
+    "pending": { "status": "pending" },
+    "slow_down": { "status": "slow_down" },
+    "denied": { "status": "denied" },
+    "expired": { "status": "expired" },
+    "authorized": {
+      "status": "authorized",
+      "token": "bkw_<redacted — vended once, never recorded>",
+      "ws": "default",
+      "label": "gw-macbook-pro",
+      "tags": ["gateway"]
+    }
+  }
+}

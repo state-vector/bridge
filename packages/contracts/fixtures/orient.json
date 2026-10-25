@@ -1,6 +1,6 @@
 {
-  "recorded": "2026-10-23",
-  "note": "orient response shape \u2014 the contract between the hub and every runner/session. Drift here breaks runners silently (the candidates-key incident). Validate against this in CI; change via PR with both sides updated.",
+  "recorded": "2026-10-25",
+  "note": "orient response shape — the contract between the hub and every runner/session. Drift here breaks runners silently (the candidates-key incident). Validated against src/orient.ts in CI; the Rust runner gates on the same keys (dispatch.rs orient_contract_error). 2026-10-25: my_tasks now records `tags` — the runner always read it (role:* resume hints) while the hub never sent it; both sides fixed in the BR#2844 PR. Change via PR with both sides updated.",
   "shape": {
     "project": {
       "type": "str",
@@ -43,6 +43,7 @@
       "item_keys": [
         "id",
         "status",
+        "tags",
         "title"
       ]
     },

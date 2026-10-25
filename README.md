@@ -529,6 +529,7 @@ audit ok/false + correction; fence audit + lease). `admin.unblock_proxy_sweep` /
 npm run demo -w @bridge/webapp    # mock hub + web UI, offline
 npm run build -w @bridge/webapp   # webapp dist is committed and served as worker assets
 npm run test -w packages/worker  # worker tests (syntax → tsc --noEmit typecheck → bundle dry-run → vitest)
+npm run test -w packages/contracts  # contract tests: fixtures ↔ zod schemas ↔ the recorded MCP registry ↔ config schema
 npm run typecheck -w packages/worker  # worker type gate only — TS2304-class undefined names (the Oct 2026 board-500 bug class) fail here at any strictness
 ```
 
@@ -555,6 +556,7 @@ contract.
 
 | package | what |
 |---|---|
+| `packages/contracts` | `@bridge/contracts` — the shapes every runtime trusts, verified in CI: zod schemas + production fixtures for orient, the MCP tool table, pairing, provisioning, asks, and the config file |
 | `packages/specs` | the contract: JSON Schemas, wire docs, TS types, consistency gate |
 | `packages/worker` | Cloudflare Worker + KB Durable Object: `/mcp`, `/ingest` (bearer), `/ws`, `/api/*` incl. machine-plane mirrors (`/api/kb-machine/*`), serves the webapp |
 | `packages/webapp` | the full web UI (browser-only — no shell forks) |

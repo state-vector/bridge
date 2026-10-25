@@ -715,6 +715,89 @@ fn find_session<'a>(
 
 // ---- bridge MCP client (JSON-RPC over POST /mcp) ----
 
+/// BR#2844: the orient response contract — the 14 keys every runner and
+/// session may rely on. Single source: packages/contracts/src/orient.ts,
+/// pinned to the recorded production fixture (packages/contracts/fixtures/
+/// orient.json) by the drift-alarm test at the bottom of this file. A
+/// renamed or missing key here used to zero the runner's work lists
+/// silently; the gate below fails the tick loudly and names the drift.
+const ORIENT_REQUIRED_KEYS: [&str; 14] = [
+    "board",
+    "build",
+    "counts",
+    "gauge_debt",
+    "instructions",
+    "my_roles",
+    "my_score",
+    "my_tasks",
+    "open_artefacts",
+    "pending_asks",
+    "project",
+    "steering",
+    "unclaimed_work",
+    "you",
+];
+
+fn orient_expected_kind(key: &str) -> &'static str {
+    match key {
+        "board" | "my_score" | "you" => "object",
+        "project" | "instructions" | "build" => "string",
+        _ => "array",
+    }
+}
+
+/// The runner-side half of the orient contract: every required key present,
+/// every key the runner relies on the right kind. Extra keys (the guidance
+/// `note`, future additions) are tolerated — the contract is the required
+/// core, and breaching it is a loud tick error, never a silent zero.
+fn orient_contract_error(orient: &serde_json::Value) -> Result<(), String> {
+    let obj = match orient.as_object() {
+        Some(o) => o,
+        None => {
+            return Err(format!(
+                "orient response is not an object (got {}) — hub contract drift (BR#2844, packages/contracts)",
+                if orient.is_null() { "null" } else if orient.is_array() { "array" } else { "scalar" }
+            ))
+        }
+    };
+    let mut problems: Vec<String> = Vec::new();
+    for key in ORIENT_REQUIRED_KEYS {
+        match obj.get(key) {
+            None => problems.push(format!("missing `{key}`")),
+            Some(v) => {
+                let ok = match orient_expected_kind(key) {
+                    "object" => v.is_object(),
+                    "string" => v.is_string(),
+                    _ => v.is_array(),
+                };
+                if !ok {
+                    problems.push(format!(
+                        "`{key}` should be an {kind} but is {kind_got}",
+                        kind = orient_expected_kind(key),
+                        kind_got = if v.is_null() {
+                            "null".to_string()
+                        } else if v.is_string() {
+                            "a string".to_string()
+                        } else if v.is_array() {
+                            "an array".to_string()
+                        } else {
+                            "an object".to_string()
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "orient response violates the contract (BR#2844, packages/contracts): {} — update packages/contracts + the fixture and redeploy the hub",
+            problems.join("; ")
+        ))
+    }
+}
+
 fn mcp_call(
     cfg: &DispatchConfig,
     id: &mut i64,
@@ -2901,6 +2984,10 @@ fn tick(
 
     // 4. orient — once per tick when we have capacity
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
+    // BR#2844: silent zeros die here. A drifted orient shape (the renamed-key
+    // incident that emptied the work lists) is now a loud tick error naming
+    // the drift, not an empty candidate list that looks like a quiet board.
+    orient_contract_error(&orient)?;
     let policy = orient
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -2920,6 +3007,9 @@ fn tick(
         .iter()
         .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
         .collect();
+    // BR#2844: a malformed item (missing id/title) is tolerated — one weird
+    // row must not zero the list — but it is never silent.
+    let mut malformed_my_tasks = 0usize;
     for t in open_mine {
         if in_flight.len() >= cfg.max_sessions {
             break;
@@ -2928,6 +3018,7 @@ fn tick(
             t.get("id").and_then(|v| v.as_str()),
             t.get("title").and_then(|v| v.as_str()),
         ) else {
+            malformed_my_tasks += 1;
             continue;
         };
         if in_flight.iter().any(|inf| inf.task_id == tid) {
@@ -3020,6 +3111,11 @@ fn tick(
             }
         }
     }
+    if malformed_my_tasks > 0 {
+        msgs.push(format!(
+            "WARN: {malformed_my_tasks} my_tasks item(s) missing id/title — hub contract drift (BR#2844, packages/contracts)"
+        ));
+    }
 
     // 6. claim new claimable tasks until the WIP limit is reached.
     // BR#2419: blocked tasks are NOT candidates — resuming them is an unblock
@@ -3046,6 +3142,9 @@ fn tick(
         let rb = if b.1.is_some() { 0 } else { 1 };
         ra.cmp(&rb)
     });
+    // BR#2844: same law as my_tasks — one malformed candidate never zeroes
+    // the dispatch surface, and it is never silent.
+    let mut malformed_candidates = 0usize;
     for (task, resume_sess) in candidates {
         if in_flight.len() >= cfg.max_sessions {
             break;
@@ -3054,6 +3153,7 @@ fn tick(
             task.get("id").and_then(|v| v.as_str()),
             task.get("title").and_then(|v| v.as_str()),
         ) else {
+            malformed_candidates += 1;
             continue;
         };
         if in_flight.iter().any(|inf| inf.task_id == tid)
@@ -3156,6 +3256,11 @@ fn tick(
         attempts.insert(tid.to_string(), Instant::now());
         snap_activity(snap, "dispatch", &msg);
         msgs.push(msg);
+    }
+    if malformed_candidates > 0 {
+        msgs.push(format!(
+            "WARN: {malformed_candidates} unclaimed_work item(s) missing id/title — hub contract drift (BR#2844, packages/contracts)"
+        ));
     }
 
     Ok(msgs)
@@ -3484,6 +3589,107 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orient_gate_matches_the_checked_in_production_fixture() {
+        // BR#2844: the fixture IS the recorded production shape
+        // (packages/contracts/fixtures/orient.json — do not re-record it).
+        // Renaming an orient key on either side without the other fails here,
+        // in CI, before it fails a runner silently.
+        let fx: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/fixtures/orient.json"
+        ))
+        .expect("orient fixture parses");
+        let recorded: Vec<&str> = fx
+            .get("keys_required")
+            .and_then(|v| v.as_array())
+            .expect("fixture keys_required")
+            .iter()
+            .filter_map(|k| k.as_str())
+            .collect();
+        let mut mine = ORIENT_REQUIRED_KEYS.to_vec();
+        mine.sort_unstable();
+        let mut recorded = recorded;
+        recorded.sort_unstable();
+        assert_eq!(
+            mine, recorded,
+            "ORIENT_REQUIRED_KEYS diverged from the recorded fixture — update packages/contracts (src/orient.ts + fixtures/orient.json) and this gate in the same PR"
+        );
+        // the collections the parser walks carry the keys it relies on
+        let shape = fx.get("shape").expect("fixture shape");
+        let item_keys = |coll: &str| -> Vec<String> {
+            shape
+                .pointer(&format!("/{coll}/item_keys"))
+                .and_then(|v| v.as_array())
+                .expect("item_keys recorded")
+                .iter()
+                .filter_map(|k| k.as_str())
+                .map(String::from)
+                .collect()
+        };
+        let my_tasks = item_keys("my_tasks");
+        for k in ["id", "title", "status", "tags"] {
+            assert!(
+                my_tasks.iter().any(|v| v == k),
+                "fixture my_tasks items must record `{k}` — the runner reads it (tags: role:* resume routing)"
+            );
+        }
+        let unclaimed = item_keys("unclaimed_work");
+        for k in ["id", "title", "status", "is_claimable", "needs_qualification"] {
+            assert!(
+                unclaimed.iter().any(|v| v == k),
+                "fixture unclaimed_work items must record `{k}` — the runner reads it"
+            );
+        }
+    }
+
+    #[test]
+    fn orient_gate_fails_loud_on_the_incident_drift_and_passes_the_contract() {
+        // the 14-key contract shape, exactly as the hub serializes it
+        let good = serde_json::json!({
+            "project": "Superpositional",
+            "instructions": "follow the bridge protocol card",
+            "board": { "mode": "none" },
+            "counts": [{ "type": "task", "status": "todo", "n": 1 }],
+            "open_artefacts": [],
+            "my_tasks": [{ "id": "BR#1", "title": "t", "status": "in_progress", "tags": ["impl"] }],
+            "unclaimed_work": [],
+            "steering": [],
+            "my_roles": [],
+            "pending_asks": [],
+            "gauge_debt": [],
+            "my_score": { "score": 30, "label": "poor", "grade": "C" },
+            "build": "0.3.5",
+            "you": { "agent": "a", "session": "s", "tags": [] },
+            "note": "extra keys are tolerated — the contract is the required core"
+        });
+        assert!(
+            orient_contract_error(&good).is_ok(),
+            "the contract shape must pass: {:?}",
+            orient_contract_error(&good)
+        );
+
+        // THE incident: a renamed key used to zero the work lists silently.
+        // Now it names the drift.
+        let mut drifted = good.clone();
+        let obj = drifted.as_object_mut().unwrap();
+        obj.remove("unclaimed_work");
+        obj.insert("unclaimedWork".into(), serde_json::json!([]));
+        let err = orient_contract_error(&drifted).unwrap_err();
+        assert!(err.contains("unclaimed_work"), "error must name the drifted key, got: {err}");
+
+        // a mistyped collection is a breach too (my_tasks as object)
+        let mut mistyped = good.clone();
+        mistyped
+            .as_object_mut()
+            .unwrap()
+            .insert("my_tasks".into(), serde_json::json!({}));
+        assert!(orient_contract_error(&mistyped).unwrap_err().contains("my_tasks"));
+
+        // a non-object response (an HTML error page, say) never parses as OK
+        assert!(orient_contract_error(&serde_json::json!("<html>")).is_err());
+        assert!(orient_contract_error(&serde_json::Value::Null).is_err());
+    }
 
     #[test]
     fn provisioning_without_a_vended_secret_demands_a_rotate_retry() {
