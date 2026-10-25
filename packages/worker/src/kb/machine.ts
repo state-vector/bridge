@@ -194,9 +194,14 @@ export const RULES: Rule[] = [
       i.to === "todo" &&
       !!i.owner &&
       i.owner !== i.actor &&
-      !OWNER_RELEASE_EXEMPT.test(i.actor),
+      !OWNER_RELEASE_EXEMPT.test(i.actor) &&
+      // PROVEN-UNBLOCK RELEASE (2026-10-25, Ray GO): a role:unblock duty that
+      // VERIFIED the card's exit condition met may release a PARKED card —
+      // scope: from-status blocked (a park, not a live claim) + the release
+      // note cites the proof. Live claims stay owner/human-only.
+      !(i.status === "blocked" && role(i) === "unblock" && !!noteOf(i)),
     guard: (i) =>
-      `task ${i.id} is claimed by ${i.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`,
+      `task ${i.id} is claimed by ${i.owner} — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead.`,
   },
   {
     name: "decision-acceptance-human",
@@ -374,11 +379,18 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
 
   // release to the pool: attempt stamp, churn escalate/redirect — decided, not improvised
   if (i.to === "todo") {
-    const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
+    // PROVEN-UNBLOCK RELEASE: an unblock duty releasing a parked card with
+    // proof is a FRESH START, not a churn attempt — the attempts counter
+    // resets so the release never trips escalate/redirect (the card is
+    // unblocking, not failing).
+    const provenUnblock = i.status === "blocked" && r === "unblock" && !!noteOf(i);
+    const nextAttempts = provenUnblock ? 0 : ((meta.attempt?.attempts as number) ?? 0) + 1;
     const silent = silentCycles(await c.recentEvents());
     const verdictDuty = r === "review" || r === "unblock";
     const lastReason = String(i.body?.note ?? "").trim() || meta.attempt?.last_reason;
-    const attempt = { by: i.actor, at: now, attempts: nextAttempts, last_reason: lastReason, last_will: meta.last_progress?.will };
+    const attempt = provenUnblock
+      ? undefined
+      : { by: i.actor, at: now, attempts: nextAttempts, last_reason: lastReason, last_will: meta.last_progress?.will };
     if (verdictDuty && (nextAttempts >= CHURN_ESCALATE_ATTEMPTS || silent >= SILENT_ESCALATE_CYCLES)) {
       // verdict duties may not block (the table refuses it) — repeated gate
       // rejections or silent churn escalate to a human instead
@@ -409,14 +421,18 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       effects.push({ kind: "release_redirect", attempts: nextAttempts, silent_cycles: silent });
     } else {
       ownerClear = true;
-      patch.attempt = {
-        by: i.actor,
-        at: now,
-        attempts: nextAttempts,
-        last_reason: meta.blocked?.reason ?? (String(i.body?.note ?? "").trim() || undefined),
-        last_will: meta.last_progress?.will,
-      };
-      if (!i.tags.includes("attempted")) tagsAdd.push("attempted");
+      if (!provenUnblock) {
+        patch.attempt = {
+          by: i.actor,
+          at: now,
+          attempts: nextAttempts,
+          last_reason: meta.blocked?.reason ?? (String(i.body?.note ?? "").trim() || undefined),
+          last_will: meta.last_progress?.will,
+        };
+        if (!i.tags.includes("attempted")) tagsAdd.push("attempted");
+      } else {
+        patch.attempt = undefined; // proven-unblock: fresh start, no attempt stamp
+      }
     }
   }
 

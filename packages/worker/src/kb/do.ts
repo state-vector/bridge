@@ -3352,6 +3352,42 @@ export class KnowledgeHub {
     let owner = row.owner;
     // claim only on fresh pickup or abandoned re-claim — a review bounce returns to the AUTHOR
     const bounceFromReview = row.status === "in_review";
+    // GHOST-BOUNCE CONVERSION (2026-10-25, Ray GO): a verify bounce hands the
+    // parent back to its impl owner — but if that owning session is DEAD (no
+    // heartbeat within the stall window), the bounce lands on a ghost and the
+    // PR ages into the conflict pile. Release to the pool IN THE SAME TICK:
+    // owner cleared, reason stamped, the card is dispatchable immediately.
+    // The reaper stays as backstop for the non-bounce stall cases.
+    let ghostBounce = false;
+    if (row.type === "task" && bounceFromReview && owner && owner !== actor && !/^(web|system:)/.test(owner)) {
+      // dead-by-construction: no auth_token for the owner label → it can never
+      // heartbeat again (revoked/never-provisioned). Otherwise liveness = the
+      // owner token's freshest session.
+      const ownerToken = this.one(
+        `SELECT id FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, owner, owner,
+      );
+      const ownerSession = ownerToken
+        ? this.one(
+            `SELECT last_seen_ts FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
+            ownerToken.id,
+          )
+        : null;
+      const staleMin = (() => {
+        const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+        return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+      })();
+      // liveness = EITHER real signal: the owner session's hub ping, or the
+      // task's own heartbeat (meta.last_progress.ts — what log_progress writes).
+      // A live owner does at least one of these within the stall window.
+      const lastProgressTs = Number(JSON.parse(row.meta ?? "{}").last_progress?.ts ?? 0);
+      const lastSignal = Math.max(Number(ownerSession?.last_seen_ts ?? 0), lastProgressTs);
+      const dead = !ownerToken || !lastSignal || (Date.now() - lastSignal > staleMin * 60_000);
+      if (dead) {
+        ghostBounce = true;
+        owner = "";
+        meta.bounce_released = { reason: "owning session dead at bounce — released to pool", at: Date.now() };
+      }
+    }
     // gateway attribution: a gateway-tagged token is infrastructure — it claims
     // on behalf of the agent it dispatched as (ADR BR#899). body.agent names
     // that agent; mcp.ts only forwards it when the token carries the "gateway"
@@ -3643,6 +3679,28 @@ export class KnowledgeHub {
         throw new Error(`link rejected: ${srcId} is a verify task — verify tasks are terminal-at-birth and cannot nest under ${parentRoles.includes("review") ? "another verify" : "an unblock"} task`);
       if (childRoles.includes("unblock") && (parentRoles.includes("unblock") || parentRoles.includes("review")))
         throw new Error(`link rejected: ${srcId} is an unblock task — unblock tasks are terminal-at-birth and cannot nest under another ephemeral task`);
+      // ONE-OPEN-VERIFY-CHILD INVARIANT (2026-10-25, Ray GO): linking a second
+      // open verify child under the same parent supersedes the older one
+      // (keep-newest) instead of stacking. The spawn path already reuses; this
+      // is the structural backstop for every other path that creates+links.
+      if (childRoles.includes("review") && !["done", "superseded"].includes(String((src as any).status))) {
+        const openSiblings = this.state.storage.sql.exec(
+          `SELECT c.id AS id, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.id != ?
+             AND c.roles LIKE '%"review"%' AND c.status IN ('todo','in_progress','blocked')
+           ORDER BY c.updated_ts ASC`,
+          dstId, srcId,
+        ).toArray() as any[];
+        for (const sib of openSiblings) {
+          const vm = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, sib.id)?.meta ?? "{}");
+          vm.superseded_reason = `${srcId} linked as the parent's verify round — older open verify child superseded (one round, N bounces)`;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET status = 'superseded', meta = ?, updated_ts = ? WHERE id = ?`,
+            JSON.stringify(vm), Date.now(), sib.id,
+          );
+          this.audit("system:invariant", "verify_superseded", sib.id, { parent: dstId, newer: srcId, reason: "one-open-verify-child" });
+        }
+      }
     }
     // nesting depth cap: child_of chains max 3 deep — references give structure,
     // not unbounded trees (verify recursion taught us this the hard way)
