@@ -1798,14 +1798,19 @@ ${detail?.body ?? ""}`);
       }
       /** The guilty chain for an alarm note (BR#3307, residue of BR#3287 spec
        *  item 4): resolve a sha to PR → task → verify verdict → agent session →
-       *  signer from the provenance index. Defensive — attribution must never
-       *  break the filing (the same downgrade philosophy as the bisect walk),
-       *  and absence is honest data, never a guess. */
+       *  signer from the provenance index. Never throws — attribution must not
+       *  break the filing (the same downgrade philosophy as the bisect walk) —
+       *  but a lookup failure is RECEIPTED on the audit trail (SP review round 1,
+       *  PR #198: the swallow was silent; silence is the one thing it must not be). */
       async guiltyChainRec(sha) {
         if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return null;
         try {
           return await this.provenanceBySha(sha);
-        } catch {
+        } catch (e) {
+          this.audit("hub:stop-the-line", "guilty_chain_error", null, {
+            sha: String(sha).slice(0, 9),
+            error: String(e.message ?? e).slice(0, 200)
+          });
           return null;
         }
       }
@@ -5751,7 +5756,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "66c0765944cf527a1e90df091178482876f7277c", built_at: "2026-10-25T12:19:43Z" };
+    module.exports = { commit: "9e229c500b05362610092e6cf827317ca49d75bf", built_at: "2026-10-25T12:26:26Z" };
   }
 });
 
