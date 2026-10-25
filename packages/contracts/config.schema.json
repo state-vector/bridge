@@ -112,6 +112,12 @@
         "additionalProperties": {}
       }
     },
+    "worktree_exempt_repos": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "models": {
       "type": "object",
       "propertyNames": {
@@ -148,7 +154,8 @@
     "max_sessions",
     "report_minutes",
     "isolate",
-    "backends"
+    "backends",
+    "worktree_exempt_repos"
   ],
   "additionalProperties": {}
 }

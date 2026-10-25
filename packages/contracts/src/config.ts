@@ -49,6 +49,11 @@ export const BridgeConfigSchema = z.looseObject({
   report_minutes: z.number().int().nullable(),
   isolate: z.boolean(),
   backends: z.record(z.string(), BackendConfigSchema),
+  // BR#3204: repos exempt from per-session worktree provisioning — always
+  // written (serde serializes the Vec even empty); the contract missed it
+  // when BR#3204 landed, and the store parity test reds the build (found
+  // completing the main-red base fix, BR#551 stop-the-line).
+  worktree_exempt_repos: z.array(z.string()),
   // legacy (accepted on load, folded into backends, never written once empty)
   models: z.record(z.string(), z.string()).optional(),
   agents: z.record(z.string(), z.string()).optional(),
