@@ -138,6 +138,8 @@ When an agent needs a human or a peer, `ask_agent` writes no side table — the 
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail) and resolve via `get_artefact` like any artefact — `answer_ask` takes the question node's BR# id; there are no separate `ASK-*` artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every open ask with its options as one-click buttons.
 
+Next to **Reframe** on every open ask (both surfaces: the ask band rows in Top and TaskDetail's AskSelfCard), a **Claim locally** button copies a ready-to-paste takeover prompt for a local interactive agent (e.g. an opencode/claude session on your machine): the target card (id, title, status, owner, part_of, github ref), the card body (acceptance/spec) plus the latest progress note, ask context when present (reason, options), and the full takeover protocol — orient with a unique session, verify state first-hand (work may be partially done), claim via transition, heartbeat ≤10 min, shared-checkout discipline (worktree off fresh origin/main, explicit-path staging, never `git add -A`), commit+sign as detached-cody (canonical invocation inline), finish = PR + in_review, verify separation, human legs escalate to you. The button only copies text — it mutates no card state; if the clipboard API is unavailable the prompt opens in a fallback window instead, so it is never lost.
+
 ## Pricing
 
 | | Self-hosted (OSS) | Hosted (coming soon) |
