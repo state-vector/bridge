@@ -51,30 +51,28 @@ jobs:
   deploy-check:
     name: Deploy drift alarm
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # the 10-min settle window (BR#3289) must fit under the job timeout:
+    # up to 600s of polling + checkout + probe overhead
+    timeout-minutes: 15
     needs: test
     # main pushes only: the alarm compares the LIVE hub (which deploys
     # main via CF Workers Builds) against the pushed SHA — on a PR event
     # github.sha is the PR head, which the live hub can never match
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # the settle-window alarm reads main's tip (gh api commits/main) so a
+    # superseded push goes green-by-tip; read-only is all it needs
+    permissions:
+      contents: read
     steps:
-      - name: Probe live hub __version vs pushed SHA
+      - uses: actions/checkout@v4
+      - name: Probe live hub __version vs pushed SHA (settle window)
+        # BR#3289: the hub deploys asynchronously, so a first-probe failure
+        # read "main is broken" on every push. The settle logic lives in the
+        # script: warn (non-failing) while the deploy is in flight, fail only
+        # when the window elapses with the hub stale or unreachable.
         env:
           HUB_URL: https://bridge.ray-013.workers.dev
-          EXPECTED: ${{ github.sha }}
-        run: |
-          for i in 1 2 3 4 5; do
-            sleep 60
-            LIVE=$(curl -sf --max-time 15 "$HUB_URL/__version" 2>/dev/null | jq -r '.commit // empty' 2>/dev/null)
-            if [ -n "$LIVE" ]; then break; fi
-            echo "probe $i: hub not answering __version yet, retrying"
-          done
-          if [ -z "$LIVE" ]; then
-            echo "::error::__version unreachable after 5 probes — the deploy may have stalled or the route broke"
-            exit 1
-          fi
-          if [ "$LIVE" != "$EXPECTED" ]; then
-            echo "::error::deploy drift — live hub is $LIVE, expected $EXPECTED. CF Builds stalled or bypassed?"
-            exit 1
-          fi
-          echo "live hub matches $EXPECTED ✓"
+          EXPECTED_SHA: ${{ github.sha }}
+          DEPLOY_DRIFT_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/deploy-drift-alarm.sh

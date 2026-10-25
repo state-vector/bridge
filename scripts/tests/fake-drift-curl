@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# scripts/tests/fake-drift-curl — stub `curl` for deploy-drift-alarm.test.sh.
+#
+# Serves canned hub __version responses in FAKE_HUB_RESPONSES order, one per
+# call — ":"-separated entries, the LAST entry serves forever. An entry is a
+# commit sha, or "unreachable" (curl exits 7, connection refused, so the
+# alarm sees a failed probe). The call counter lives in
+# $DRIFT_STUB_STATE/fake-drift-curl.count, so each test scenario gets a fresh
+# sequence. No network.
+set -uo pipefail
+
+responses="${FAKE_HUB_RESPONSES:-}"
+[ -n "$responses" ] || { echo "fake-drift-curl: FAKE_HUB_RESPONSES not set" >&2; exit 2; }
+state_dir="${DRIFT_STUB_STATE:?DRIFT_STUB_STATE not set}"
+
+count_file="${state_dir}/fake-drift-curl.count"
+n="$(cat "$count_file" 2>/dev/null || echo 0)"
+echo $((n + 1)) > "$count_file"
+
+IFS=':' read -r -a seq <<< "$responses"
+total=${#seq[@]}
+if [ "$n" -lt "$total" ]; then
+  entry="${seq[$n]}"
+else
+  entry="${seq[$((total - 1))]}"
+fi
+
+if [ "$entry" = "unreachable" ]; then
+  exit 7
+fi
+printf '{"commit":"%s","built_at":"2026-10-25T00:00:00Z"}\n' "$entry"

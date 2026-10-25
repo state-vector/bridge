@@ -340,6 +340,21 @@ that law, and BR#3008 makes it mechanical instead of discipline. Two halves, sam
   `p0` / `stop-the-line` / `gtm-blocker`. Fixing main is top-priority work the moment the
   line stops; work on branches (worktrees) continues — only the line stops.
 
+### The deploy drift alarm's settle window (BR#3289)
+
+The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in
+`scripts/deploy-drift-alarm.sh`) compares the live hub's `__version` commit against every main
+push. The hub deploys asynchronously (git push → CF Workers Builds), so a first-probe failure read
+"main is broken" on every push — 6+ false reds in 24h, each also tripping the `main-green gate`
+on the next PR. The alarm now settles first: while the hub still serves an older build it emits
+non-failing `::warning::` annotations for up to 10 minutes (`SETTLE_WINDOW_SECONDS`, default 600)
+and goes green the moment the hub serves the pushed SHA — or a newer main tip containing it (a
+faster merge superseding this push's deploy is not drift; drift is "deployed hub ≠ main tip").
+Only a window that elapses stale fails loudly — real drift (CF Builds stalled or bypassed),
+feeding the `main-green gate` and `stopTheLineSweep` exactly as before — and so does a hub that
+never answers. A failing main-tip lookup never turns a mismatch green (fail-closed). Guarded by
+`npm run test:deploy-drift-alarm`.
+
 ## The standing merge-queue sweep
 
 The gate blocks bad merges; the sweep executes good ones. Accepted decision BR#3033 made
