@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1490,6 +1490,14 @@ fn apply_identity(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(),
     Ok(())
 }
 
+/// Per-call sequence number for sign_check scratch dirs (BR#3373): keying a
+/// scratch dir by pid + profile name alone made every concurrent sign check
+/// in one process share ONE directory — parallel tests (and concurrent task
+/// dispatches in the runner) raced, and one side's cleanup deleted the other
+/// side's signature mid-check. The counter (plus wall-clock nanos, so a
+/// re-used pid can never resurrect a stale dir) gives each call its own dir.
+static SIGN_CHECK_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Validation leg (BR#3185): prove the applied identity can actually sign
 /// BEFORE dispatching — one scratch sign through the profile's own program
 /// and key (`ssh-keygen -Y sign`, the same invocation git uses for
@@ -1508,10 +1516,20 @@ fn sign_check(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), Str
             p.signing_key_path
         ));
     }
+    // Unique per call (BR#3373): pid + profile name alone collide across
+    // concurrent calls in one process, and the losing side's cleanup deletes
+    // the winning side's payload.sig between its write and its exists() check
+    // — a sound identity then "produced no signature". Seq + nanos separate
+    // every invocation.
     let tmp = std::env::temp_dir().join(format!(
-        "bridge-signcheck-{}-{}",
+        "bridge-signcheck-{}-{}-{}-{}",
         std::process::id(),
-        slugify(&p.name)
+        slugify(&p.name),
+        SIGN_CHECK_SEQ.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("sign-check scratch dir: {e}"))?;
     let payload = tmp.join("payload");
