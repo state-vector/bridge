@@ -2,14 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   classifyHeadChecks,
   decideMergeAction,
+  decidePrDisposition,
   isExemptCheckName,
   mergeSweepHumanLegTitle,
+  prEscalationAskTitle,
   type MainCheckRun,
+  type MergeAction,
   type MergeCandidateInput,
+  type PrDispositionInput,
 } from "../src/kb/core.ts";
 
 /**
- * Standing merge-queue sweeper (BR#3198) guards.
+ * Standing merge-queue sweeper (BR#3198) + PR disposition law (BR#3312)
+ * guards.
  *
  * Tier 1 here: the pure decision rules pinned case by case —
  *   - classifyHeadChecks: the head side of the 5c gate, with BR#2267
@@ -17,6 +22,10 @@ import {
  *   - decideMergeAction: the standing order's decision table (superseded
  *     first, then mergeable/clean, then signatures, then base green, then
  *     head green, then verify lineage, then merge);
+ *   - decidePrDisposition (BR#3315): the PR terminal-state law — card-terminal
+ *     closes first, then the merge leg, then the orphan clock, then the stale
+ *     clocks (escalate once, close on expired silence), then the bounce;
+ *   - prEscalationAskTitle: the deterministic bound escalation ask;
  *   - mergeSweepHumanLegTitle: deterministic ask title (rule 5c — ONE ask per
  *     class per episode, never one per PR).
  *
@@ -226,6 +235,268 @@ describe("mergeSweepHumanLegTitle (rule 5c — one class ask)", () => {
   it("stays within the 240-char ask contract and truncates cleanly", () => {
     const many = Array.from({ length: 20 }, (_, i) => `PR #${1000 + i} has unsigned commits — signing environment class`);
     const t = mergeSweepHumanLegTitle("state-vector/bridge", many);
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+  });
+});
+
+// ---------- tier 1d: decidePrDisposition (the PR terminal-state law, BR#3312) ----------
+//
+// Every open PR lands in exactly ONE disposition per pass: merged, closed with
+// a reason, or advancing with a clock. Rows pinned case by case below; the
+// order is the law's: card-terminal FIRST, then the existing merge leg, then
+// the orphan clock, then the stale clocks, then the existing bounce.
+
+const DAY = 86_400_000;
+const HOUR = 3_600_000;
+const NOW = 1_800_000_000_000;
+
+const disp = (over: Partial<PrDispositionInput> = {}): PrDispositionInput => ({
+  // default gate: a note (card not in_review) — the quiet pre-law arm
+  gate: { kind: "note", reason: "PR #7 head check RED: Test — card not in_review, no bounce; the linked session owns it" },
+  repo: "state-vector/bridge",
+  prNumber: 7,
+  now: NOW,
+  lastActivityTs: NOW - 1 * DAY, // fresh by default
+  cardId: "BR#123",
+  cardStatus: "in_progress",
+  cardAdvancing: true,
+  hasProvenance: true,
+  prCreatedAt: NOW - 10 * DAY,
+  cardTerminalNote: null,
+  escalatedAt: null,
+  escalationAskId: null,
+  activitySinceEscalation: false,
+  prStaleDays: 7,
+  prOrphanDays: 3,
+  prGraceHours: 48,
+  ...over,
+});
+
+const gateMerge = (head: string): MergeAction => ({
+  kind: "merge",
+  receipt: `PR #7 merged by the standing merge sweep (BR#3033): head ${head.slice(0, 9)} — 5c gate pass, verify accepted on head`,
+});
+const gateBounce = (defect: string): MergeAction => ({ kind: "bounce", defect });
+const gateSkip = (why: string): MergeAction => ({ kind: "skip", reason: why });
+const gateHumanLeg = (why: string): MergeAction => ({ kind: "human_leg", reason: why });
+
+describe("decidePrDisposition — card-terminal rows close immediately", () => {
+  it("superseded card closes immediately, citing the card (before any clock or gate)", () => {
+    const a = decidePrDisposition(disp({ cardStatus: "superseded", gate: gateMerge("abc123def"), cardTerminalNote: "replaced by BR#456" }));
+    expect(a.kind).toBe("close_superseded");
+    if (a.kind === "close_superseded") {
+      expect(a.reason).toContain("BR#123");
+      expect(a.reason).toContain("superseded");
+      expect(a.reason).toContain("replaced by BR#456"); // cites successor
+    }
+  });
+
+  it("a done card's PR now CLOSES with reason (the law supersedes the old quiet skip)", () => {
+    const a = decidePrDisposition(disp({ cardStatus: "done", gate: gateSkip("linked card already done — nothing to merge under it") }));
+    expect(a.kind).toBe("close_superseded");
+    if (a.kind === "close_superseded") expect(a.reason).toContain("done");
+  });
+
+  it("a rejected card's PR closes too", () => {
+    expect(decidePrDisposition(disp({ cardStatus: "rejected" })).kind).toBe("close_superseded");
+  });
+
+  it("card-terminal beats a fully-green MERGE gate (a terminal card's PR is a leftover vehicle, never cargo)", () => {
+    const a = decidePrDisposition(disp({ cardStatus: "superseded", gate: gateMerge("abc123def") }));
+    expect(a.kind).toBe("close_superseded");
+  });
+
+  it("card-terminal beats the orphan and stale clocks (one disposition, the first row wins)", () => {
+    const a = decidePrDisposition(disp({
+      cardStatus: "superseded",
+      lastActivityTs: NOW - 30 * DAY,
+      prCreatedAt: NOW - 30 * DAY,
+      cardAdvancing: false,
+    }));
+    expect(a.kind).toBe("close_superseded");
+  });
+});
+
+describe("decidePrDisposition — the existing legs pass through", () => {
+  it("gate MERGE wins over every clock (a green verified PR merges even if timestamps look stale)", () => {
+    const a = decidePrDisposition(disp({
+      gate: gateMerge("abc123def"),
+      lastActivityTs: NOW - 30 * DAY,
+      escalatedAt: NOW - 20 * DAY,
+      cardAdvancing: false,
+    }));
+    expect(a.kind).toBe("merge");
+    if (a.kind === "merge") expect(a.receipt).toContain("verify accepted");
+  });
+
+  it("gate BOUNCE stays the bounce (existing defect text), but only while within its clocks", () => {
+    const a = decidePrDisposition(disp({ gate: gateBounce("PR #7 unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue") }));
+    expect(a.kind).toBe("bounce");
+    if (a.kind === "bounce") expect(a.defect).toContain("CONFLICTING");
+  });
+
+  it("skip/human_leg gates pass through untouched when no clock row fires", () => {
+    expect(decidePrDisposition(disp({ gate: gateSkip("no accepted verify verdict covering head abc123456") })).kind).toBe("passthrough");
+    const hl = decidePrDisposition(disp({ gate: gateHumanLeg("PR #7 has 1 commit(s) not GitHub-verified — signing-environment class, never per-PR") }));
+    expect(hl.kind).toBe("passthrough");
+  });
+});
+
+describe("decidePrDisposition — the orphan clock (BR#3287 no-card signal)", () => {
+  it("orphan closes after orphan_days: no BR# ref, no provenance, past pr_orphan_days", () => {
+    const a = decidePrDisposition(disp({
+      cardId: null, cardStatus: null, hasProvenance: false, cardAdvancing: false,
+      prCreatedAt: NOW - 4 * DAY,
+    }));
+    expect(a.kind).toBe("close_orphan");
+    if (a.kind === "close_orphan") {
+      expect(a.reason).toContain("no bridge provenance");
+      expect(a.reason).toContain("re-open via a card");
+    }
+  });
+
+  it("a young orphan is left alone — the clock has not expired", () => {
+    const a = decidePrDisposition(disp({
+      cardId: null, cardStatus: null, hasProvenance: false, cardAdvancing: false,
+      prCreatedAt: NOW - 2 * DAY,
+    }));
+    expect(a.kind).toBe("passthrough");
+  });
+
+  it("a linked card is never an orphan, however old (provenance exists)", () => {
+    const a = decidePrDisposition(disp({ prCreatedAt: NOW - 40 * DAY, cardAdvancing: false, lastActivityTs: NOW - 1 * DAY }));
+    expect(a.kind).not.toBe("close_orphan");
+  });
+
+  it("the provenance index row (BR#3287) counts even when the BR# ref was edited away", () => {
+    const a = decidePrDisposition(disp({
+      cardId: null, cardStatus: null, hasProvenance: true,
+      prCreatedAt: NOW - 30 * DAY, lastActivityTs: NOW - 1 * DAY,
+    }));
+    expect(a.kind).not.toBe("close_orphan");
+  });
+
+  it("a dead card ref (card row gone) is orphan signal, not escalate signal", () => {
+    const a = decidePrDisposition(disp({
+      cardStatus: null, cardAdvancing: false, lastActivityTs: NOW - 8 * DAY,
+      prCreatedAt: NOW - 10 * DAY, hasProvenance: false, // the ref resolves to no row, no index entry
+    }));
+    expect(a.kind).toBe("close_orphan");
+  });
+
+  it("unknown creation date fails safe — no orphan close on missing data", () => {
+    const a = decidePrDisposition(disp({ cardId: null, cardStatus: null, hasProvenance: false, prCreatedAt: null, cardAdvancing: false }));
+    expect(a.kind).toBe("passthrough");
+  });
+});
+
+describe("decidePrDisposition — the stale clocks (escalate once, close on expired silence)", () => {
+  const staleBase = { lastActivityTs: NOW - 8 * DAY, cardAdvancing: false };
+
+  it("stale + card not advancing + no escalation yet -> ESCALATE once (the bound ask)", () => {
+    const a = decidePrDisposition(disp(staleBase));
+    expect(a.kind).toBe("escalate");
+    if (a.kind === "escalate") {
+      expect(a.question).toContain("PR #7");
+      expect(a.question).toContain("state-vector/bridge");
+      expect(a.question).toContain("BR#123");
+      expect(a.question).toContain("48h");
+      expect(a.question.endsWith("?")).toBe(true);
+      expect(a.question.length).toBeLessThanOrEqual(240);
+    }
+  });
+
+  it("stale + escalated + grace expired + owner silent -> CLOSE_STALE citing the ask id, last activity, revive path", () => {
+    const a = decidePrDisposition(disp({
+      ...staleBase,
+      escalatedAt: NOW - 49 * HOUR,
+      escalationAskId: "BR#3401",
+    }));
+    expect(a.kind).toBe("close_stale");
+    if (a.kind === "close_stale") {
+      expect(a.reason).toContain("BR#3401"); // the ask id
+      expect(a.reason).toContain("revive");
+      expect(a.reason).toContain("reopenable");
+    }
+  });
+
+  it("stale + escalated but grace still open -> no close (the clock is running, not expired)", () => {
+    const a = decidePrDisposition(disp({ ...staleBase, escalatedAt: NOW - 2 * HOUR }));
+    expect(a.kind).not.toBe("close_stale");
+    expect(a.kind).not.toBe("escalate"); // deduped — ONE ask per episode
+  });
+
+  it("stale + owner RESPONDED (activity after the escalation) -> does NOT close; the episode resets", () => {
+    const a = decidePrDisposition(disp({
+      ...staleBase,
+      escalatedAt: NOW - 3 * DAY,
+      lastActivityTs: NOW - 1 * DAY, // responded long after the escalation
+      activitySinceEscalation: true,
+    }));
+    expect(a.kind).not.toBe("close_stale");
+    expect(a.kind).not.toBe("escalate");
+  });
+
+  it("an ADVANCING card never closes its PR — even stale, even escalated, even expired", () => {
+    const a = decidePrDisposition(disp({
+      lastActivityTs: NOW - 8 * DAY,
+      cardAdvancing: true, // the card carries the liveness clock
+      escalatedAt: NOW - 10 * DAY,
+    }));
+    expect(a.kind).not.toBe("close_stale");
+    expect(a.kind).not.toBe("escalate");
+    expect(a.kind).not.toBe("close_orphan");
+  });
+
+  it("fresh activity (within pr_stale_days) never escalates and never closes", () => {
+    const a = decidePrDisposition(disp({ lastActivityTs: NOW - 6 * DAY - HOUR, cardAdvancing: false }));
+    expect(a.kind).toBe("passthrough");
+  });
+
+  it("the stale boundary is strict: exactly pr_stale_days old is NOT stale", () => {
+    const a = decidePrDisposition(disp({ lastActivityTs: NOW - 7 * DAY, cardAdvancing: false }));
+    expect(a.kind).toBe("passthrough");
+  });
+
+  it("unknown activity fails safe — no clock row fires on missing data", () => {
+    const a = decidePrDisposition(disp({ lastActivityTs: null, cardAdvancing: false }));
+    expect(a.kind).toBe("passthrough");
+  });
+
+  it("escalation needs a resolvable card to bind the ask — a stale dead-ref PR is not escalated", () => {
+    const a = decidePrDisposition(disp({
+      ...staleBase,
+      cardId: "BR#999", cardStatus: null, // ref in text, row gone
+      prCreatedAt: NOW - 2 * DAY, // young — orphan clock not expired yet
+    }));
+    expect(a.kind).not.toBe("escalate");
+  });
+
+  it("a stale PR past grace closes EVEN when the gate wants to bounce (the terminal path wins)", () => {
+    const a = decidePrDisposition(disp({
+      ...staleBase,
+      gate: gateBounce("PR #7 unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue"),
+      escalatedAt: NOW - 49 * HOUR,
+      escalationAskId: "BR#3402",
+    }));
+    expect(a.kind).toBe("close_stale");
+  });
+});
+
+describe("prEscalationAskTitle (the bound escalation ask)", () => {
+  it("is deterministic, names repo/PR/card/grace, ends in ?", () => {
+    const t = prEscalationAskTitle("state-vector/superpositional", 2325, "BR#2851", 48, 7);
+    expect(t).toContain("PR #2325");
+    expect(t).toContain("state-vector/superpositional");
+    expect(t).toContain("BR#2851");
+    expect(t).toContain("48h");
+    expect(t.endsWith("?")).toBe(true);
+    expect(t).toBe(prEscalationAskTitle("state-vector/superpositional", 2325, "BR#2851", 48, 7));
+  });
+
+  it("long repo names never break the 240-char ask contract", () => {
+    const t = prEscalationAskTitle("state-vector/a-very-long-repository-name-that-keeps-going", 12345, "BR#123456", 48, 7);
     expect(t.length).toBeLessThanOrEqual(240);
     expect(t.endsWith("?")).toBe(true);
   });

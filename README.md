@@ -379,6 +379,29 @@ oldest first:
 5. **Human-leg defects only** (signing-environment / external-mirror failures) → collected
    into ONE class ask per repo per episode, never one per PR (rule 5c).
 
+### PR disposition law (BR#3312)
+
+The sweep never skips a PR quietly: every open PR is adjudicated each pass by the pure
+`decidePrDisposition` function (`packages/worker/src/kb/core.ts`), isolated per-PR so one bad
+PR can't cost the others their disposition. PRs cannot be abandoned — merged, closed with a
+reason, escalated, or bounced. In precedence order:
+
+| Disposition | Fires when | Action |
+| --- | --- | --- |
+| `close_superseded` | linked card is superseded / done / rejected | comment + close `not_planned` (done cards close now too — the law supersedes the old quiet skip) |
+| `merge` | 5c gate green + accepted verify verdict | squash-merge — the gate outranks every clock below |
+| `close_orphan` | no provenance (no resolvable card row and no provenance-index row) and the PR is older than `pr_orphan_days` (default 3) | comment + close `not_planned` |
+| `escalate` | card resolvable, no PR activity for `pr_stale_days` (default 7), not escalated yet | one ask to the card owner, bound to the card |
+| `close_stale` | escalated, `pr_grace_hours` (default 48) expired, still no activity since the escalation | comment + close `not_planned`; the unclaimed card drops back to `todo` |
+| `bounce` | mechanical defect (conflicts / red base / red head) | card → `in_progress` with the exact defect named — the legacy bounce, now receipted |
+| passthrough | otherwise (note / skip / human-leg) | unchanged |
+
+Activity is `max(pr.updated_at, last commit)`; unknown timestamps fail safe — no clock fires on
+a PR we can't date. Escalation is deduped in settings (`pr_escalated_<repo>_<n>`) and cleared
+by an owner response. Kill switch: `pr_disposition_enabled` (default on) restores the
+pre-law passthrough. The decision table is pinned in `packages/worker/test/merge-sweep.test.ts`
+and the sweep wiring in the `mergeQueueSweep` DO drill (`packages/worker/test/stop-line.test.ts`).
+
 Identity: the sweep merges as **detached-cody** per BR#3181 — deploy `GH_TOKEN` must be the
 detached-cody credential, never rayh's personal credentials. Without it the sweep audits
 `no_identity` and merges nothing. `admin.merge_queue_sweep` drills it on demand; the pure

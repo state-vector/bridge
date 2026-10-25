@@ -61,9 +61,11 @@ import {
   classifyMainCheckRuns,
   classifyHeadChecks,
   decideMergeAction,
+  decidePrDisposition,
   mergeSweepHumanLegTitle,
   validateRelation,
   type MainCheckVerdict,
+  type PrDisposition,
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
 import { parseProvenanceSha, prCardRef, signerFromCommits, withinBackfillWindow } from "./provenance.ts";
@@ -988,6 +990,14 @@ export class KnowledgeHub {
       if (parsed && typeof parsed === "object") methods = parsed;
     } catch { methods = {}; }
 
+    // PR disposition law knobs (BR#3312/BR#3315): every open PR gets exactly
+    // one disposition per pass — merged, closed-with-reason, or advancing
+    // with a clock. Default ON; the clock rows fail safe on unknown data.
+    const prDispositionEnabled = /^(1|true|on|yes)$/i.test(this.settingValue("pr_disposition_enabled", "1"));
+    const prStaleDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_stale_days", "7"), 10) || 7));
+    const prOrphanDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_orphan_days", "3"), 10) || 3));
+    const prGraceHours = Math.max(1, Math.min(720, parseInt(this.settingValue("pr_grace_hours", "48"), 10) || 48));
+
     const ghGet = async (path: string): Promise<any> => {
       const res = await fetch(`${base}${path}`, {
         headers: {
@@ -1022,6 +1032,35 @@ export class KnowledgeHub {
       this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
     };
 
+    /** Terminal-state closure (BR#3312): never silent — the reason comment is
+     *  the receipt ON the PR (comment FIRST: a failed comment aborts the
+     *  close), then the card note. PRs are reopenable; the card keeps intent. */
+    const closeWithReason = async (repo: string, prNumber: number, reason: string, linked: string | null) => {
+      const comment = await fetch(`${base}/repos/${repo}/issues/${prNumber}/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "bridge-merge-sweep (BR#3315)",
+        },
+        body: JSON.stringify({ body: reason }),
+      });
+      if (!comment.ok) throw new Error(`close-reason comment POST -> HTTP ${comment.status}`);
+      const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "bridge-merge-sweep (BR#3315)",
+        },
+        body: JSON.stringify({ state: "closed", state_reason: "not_planned" }),
+      });
+      if (!close.ok) throw new Error(`close PATCH -> HTTP ${close.status}`);
+      if (linked) sweepNote(linked, `${reason.slice(0, 380)} — PR #${prNumber} closed by the merge sweep`);
+    };
+
     const results: any[] = [];
     for (const repo of repos) {
       const humanLegs: string[] = [];
@@ -1040,8 +1079,12 @@ export class KnowledgeHub {
           const prNumber = pr.number;
           try {
             const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
-            const linked = cardRef(`${pr.title ?? ""}\n${pr.body ?? ""}\n${detail.title ?? ""}\n${detail.body ?? ""}`);
-            const card = linked ? this.one(`SELECT id, status FROM artefacts WHERE id = ?`, linked) : null;
+            const prText = `${pr.title ?? ""}\n${pr.body ?? ""}\n${detail.title ?? ""}\n${detail.body ?? ""}`;
+            // provenance join (BR#3287): the head branch (bridge/BR-<id>) is the
+            // authoritative key; PR text is the fallback.
+            const linked = cardRef(prText)
+              ?? prCardRef(String(detail?.head?.ref ?? "").replace(/^refs\/heads\//, ""), prText);
+            const card = linked ? this.one(`SELECT id, status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, linked) : null;
             const cardStatus = card ? String(card.status) : null;
 
             // accepted verify lineage: decisions derived_from the linked card
@@ -1063,7 +1106,11 @@ export class KnowledgeHub {
             }
 
             const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
-            const commits = (commitsBody ?? []).map((c: any) => ({ sha: String(c?.sha ?? ""), verified: c?.commit?.verification?.verified === true }));
+            const commits = (commitsBody ?? []).map((c: any) => ({
+              sha: String(c?.sha ?? ""),
+              verified: c?.commit?.verification?.verified === true,
+              ts: Date.parse(String(c?.commit?.committer?.date ?? c?.commit?.author?.date ?? "")),
+            }));
             const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
             const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
 
@@ -1075,6 +1122,135 @@ export class KnowledgeHub {
               commits, headChecks, cardStatus,
               verifyAcceptedAny, verifyAcceptedOnHead,
             });
+
+            // ---- PR disposition law (BR#3312/BR#3315) --------------------
+            // activity = max(pr.updated_at, last commit ts): reviews/comments
+            // and force-pushes bump updated_at, so the PR's own liveness is
+            // the newest of the two.
+            const lastActivityTs = [
+              Date.parse(String(pr.updated_at ?? "")),
+              ...commits.map((c: any) => Number(c?.ts)),
+            ].filter(Number.isFinite).reduce<number | null>((m, t) => (m == null || t > m ? t : m), null);
+            const prCreatedRaw = Date.parse(String(pr.created_at ?? ""));
+            const prCreatedAt = Number.isFinite(prCreatedRaw) ? prCreatedRaw : null;
+
+            // card advancing = in flight with a clock: in_progress/in_review
+            // only while the card itself is recently updated (a dead session's
+            // card ages out of the shield), blocked only with a park stamped
+            // within the stale window (a live unblock condition).
+            let cardAdvancing = false;
+            let cardOwner: string | null = null;
+            let cardTerminalNote: string | null = null;
+            if (card) {
+              cardOwner = card.owner ? String(card.owner) : null;
+              const cmeta = JSON.parse(String(card.meta ?? "{}"));
+              const cardUpdated = Number(card.updated_ts ?? 0);
+              const windowMs = prStaleDays * 86_400_000;
+              if (cardStatus === "in_progress" || cardStatus === "in_review")
+                cardAdvancing = cardUpdated > 0 && now - cardUpdated <= windowMs;
+              else if (cardStatus === "blocked") {
+                const parkTs = Number(cmeta?.blocked?.ts ?? 0);
+                cardAdvancing = parkTs > 0 && now - parkTs <= windowMs;
+              }
+              cardTerminalNote = cmeta?.superseded_reason ? String(cmeta.superseded_reason) : null;
+            }
+
+            // provenance: a RESOLVABLE bridge record — the linked card row, or
+            // the BR#3287 index (a re-opened formerly-merged PR keeps its row).
+            // A BR#-text ref whose card row is gone is absence, not provenance.
+            const hasProvenance = card != null
+              || !!this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, prNumber);
+
+            // escalation episode state, deduped per PR (settings stamp with ts)
+            const escKey = `pr_escalated_${repo}_${prNumber}`;
+            let escalatedAt: number | null = null;
+            let escalationAskId: string | null = null;
+            const escRaw = this.settingValue(escKey, "");
+            if (escRaw) {
+              try {
+                const p = JSON.parse(escRaw);
+                escalatedAt = Number(p?.ts) || null;
+                escalationAskId = p?.ask_id ? String(p.ask_id) : null;
+              } catch { escalatedAt = Number(escRaw) || null; }
+            }
+            const activitySinceEscalation = escalatedAt != null && lastActivityTs != null && lastActivityTs > escalatedAt;
+            if (escalatedAt != null && activitySinceEscalation) {
+              // owner responded — the episode is resolved, the clock resets
+              this.state.storage.sql.exec(`DELETE FROM settings WHERE key = ?`, escKey);
+              if (linked) sweepNote(linked, `PR #${prNumber}: owner responded after the escalation — episode resolved, stale clock reset`);
+            }
+
+            let disposition: PrDisposition | null = null;
+            if (prDispositionEnabled) {
+              disposition = decidePrDisposition({
+                gate: action, repo, prNumber, now,
+                lastActivityTs, cardId: linked, cardStatus, cardAdvancing,
+                hasProvenance, prCreatedAt, cardTerminalNote,
+                escalatedAt, escalationAskId, activitySinceEscalation,
+                prStaleDays, prOrphanDays, prGraceHours,
+              });
+              if (disposition.kind === "close_superseded" && action.kind !== "close_superseded") {
+                // done/rejected card — the law closes what the gate skipped quietly
+                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber, cause: "card_terminal" });
+                continue;
+              }
+              if (disposition.kind === "close_orphan") {
+                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                results.push({ repo, pr: prNumber, kind: "close_orphan" });
+                continue;
+              }
+              if (disposition.kind === "close_stale") {
+                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                results.push({ repo, pr: prNumber, kind: "close_stale" });
+                // the card keeps the work's intent as unclaimed todo — PRs are
+                // reopenable, the deliverable outlives its vehicle
+                if (linked && card && !["done", "superseded", "rejected", "todo"].includes(cardStatus)) {
+                  try {
+                    await this.transition(
+                      { id: linked, to: "todo", note: `PR #${prNumber} closed by the merge sweep (stale) — work intent stays here as unclaimed todo; revive by re-opening or re-submitting a PR. (${disposition.reason.slice(0, 200)})` },
+                      "system:merge-sweep",
+                    );
+                  } catch (e) {
+                    this.audit("system:merge-sweep", "release_card_error", linked, { error: String((e as Error).message ?? e).slice(0, 200) });
+                  }
+                }
+                continue;
+              }
+              if (disposition.kind === "escalate" && linked && card) {
+                const to = cardOwner && isValidAskTarget(cardOwner) && !/^(web|system)/.test(cardOwner) ? cardOwner : "any";
+                const created = await this.askCreate(
+                  {
+                    to,
+                    urgency: "normal",
+                    question: disposition.question,
+                    details: [
+                      `**Merge-sweep escalation (terminal-state law BR#3312 — one bound ask per staleness episode).**`,
+                      ``,
+                      `- PR: https://github.com/${repo}/pull/${prNumber}`,
+                      `- card: ${linked} (${cardStatus ?? "no row"}${cardAdvancing ? ", advancing" : ", not advancing"})`,
+                      `- last PR activity: ${lastActivityTs != null ? new Date(lastActivityTs).toISOString() : "unknown"} (> ${prStaleDays}d ago)`,
+                      ``,
+                      `Do one of: **merge** (it is verified/merge-ready), **rebase** (freshen the head), or **close the PR with a reason** — within ${prGraceHours}h. On silence the sweep closes the PR with a reason citing this ask; the card keeps the work's intent as unclaimed todo and the PR is reopenable.`,
+                    ].join("\n"),
+                    reason: "merge-sweep escalation: PR stale past pr_stale_days with the card not advancing — one bound ask, then close-with-reason",
+                    options: ["Merging/rebasing now", "Closing with reason", "Release the card — not mine"],
+                    artefact_id: linked,
+                  },
+                  "system:merge-sweep",
+                );
+                this.state.storage.sql.exec(
+                  `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+                  escKey, JSON.stringify({ ts: now, ask_id: created.id }),
+                );
+                sweepNote(linked, `${disposition.reason} — escalation ${created.id} filed on ${to}`);
+                results.push({ repo, pr: prNumber, kind: "escalate", ask: created.id });
+                this.audit("system:merge-sweep", "escalate", linked, { repo, pr: prNumber, ask: created.id, to });
+                continue;
+              }
+              // merge | bounce | passthrough → the pre-law arms below (unchanged)
+            }
 
             if (action.kind === "merge") {
               const method = methods[repo] === "squash" ? "squash" : "merge";
@@ -1188,9 +1364,20 @@ export class KnowledgeHub {
 
     this.state.storage.sql.exec(
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
-      JSON.stringify({ ts: now, merged: results.filter((r) => r.kind === "merge").length, bounced: results.filter((r) => r.kind === "bounce").length, closed: results.filter((r) => r.kind === "close_superseded").length, human_legs: results.filter((r) => r.kind === "human_leg").length, skipped: results.filter((r) => r.kind === "skip").length, results: results.slice(0, 50) }),
+      JSON.stringify({
+        ts: now,
+        merged: results.filter((r) => r.kind === "merge").length,
+        bounced: results.filter((r) => r.kind === "bounce").length,
+        closed: results.filter((r) => r.kind === "close_superseded").length,
+        escalated: results.filter((r) => r.kind === "escalate").length,
+        closed_orphan: results.filter((r) => r.kind === "close_orphan").length,
+        closed_stale: results.filter((r) => r.kind === "close_stale").length,
+        human_legs: results.filter((r) => r.kind === "human_leg").length,
+        skipped: results.filter((r) => r.kind === "skip").length,
+        results: results.slice(0, 50),
+      }),
     );
-    const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "human_leg_ask"].includes(r.kind));
+    const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "close_orphan", "close_stale", "escalate", "human_leg_ask"].includes(r.kind));
     if (summary.length)
       this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
   }
@@ -3302,7 +3489,16 @@ export class KnowledgeHub {
       );
       if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
         if (row.status === "in_progress") {
-          await this.transition({ id: artefactId, to: "blocked", note: `blocked on ${to}: ${question.slice(0, 100)}` }, actor);
+          // blocked-on-ask (rule 6): the ask pauses the subject and the ANSWER
+          // auto-resumes it — the unblock condition IS the ask, so the gate's
+          // no-dead-end rule holds and askAnswer's resume leg finds it parked
+          // with a live path out (this flip previously hard-failed: the
+          // transition went out with a note but no unblock condition).
+          await this.transition({
+            id: artefactId, to: "blocked",
+            note: `blocked on ${to}: ${question.slice(0, 100)}`,
+            unblock_condition: `answer ask ${id}`,
+          }, actor);
           taskStatus = "blocked";
         }
       }

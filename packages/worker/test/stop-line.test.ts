@@ -136,12 +136,42 @@ const provScenario = { on: false, branch: "" };
 let drillCardId = "";
 let drillVerdictId = "";
 
-function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
+// merge-sweep disposition drill (BR#3315): open-PR list, per-PR detail/
+// commits, and the closure endpoints (reason comment + PATCH), all canned.
+// Timestamps are anchored per test (t0) and the sweep's `now` is driven into
+// the future to age the clocks; a PATCH closure drops the PR from the open
+// list the way GitHub would.
+const msScenario = {
+  pulls: [] as any[],
+  detail: new Map<string, any>(),
+  commits: new Map<string, any[]>(),
+  comments: [] as { pr: number; body: string }[],
+  closed: new Map<string, any>(),
+};
+const msReset = () => {
+  msScenario.pulls = [];
+  msScenario.detail = new Map();
+  msScenario.commits = new Map();
+  msScenario.comments = [];
+  msScenario.closed = new Map();
+};
+const msIso = (t: number) => new Date(t).toISOString();
+const msDay = 86_400_000;
+const msHour = 3_600_000;
+
+function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => Promise<void> {
   const json = (res: import("node:http").ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
   };
-  return (req, res) => {
+  const readBody = (req: import("node:http").IncomingMessage) =>
+    new Promise<string>((resolve) => {
+      let d = "";
+      req.on("data", (c: Buffer) => (d += c.toString()));
+      req.on("end", () => resolve(d));
+      req.on("error", () => resolve(d));
+    });
+  return async (req, res) => {
     const url = req.url ?? "/";
     if (url.startsWith("/rate-limited/")) return json(res, 403, { message: "rate limited" });
     const checkRuns = (sha: string) => {
@@ -219,6 +249,28 @@ function ghHandler(): (req: import("node:http").IncomingMessage, res: import("no
       return json(res, 200, [{ sha: PROV_HEAD, commit: { verification: { verified: true }, committer: { email: "297316395+detached-cody@users.noreply.github.com" } } }]);
     }
     if (req.method === "POST" && /\/repos\/state-vector\/bridge\/issues\/178\/labels/.test(url)) return json(res, 200, { ok: true });
+    // merge-sweep disposition drill (BR#3315): open-PR list + per-PR detail/
+    // commits + the closure endpoints, canned per scenario. Ordered after the
+    // provenance routes so PR #178's canned detail keeps resolving first.
+    if (/\/repos\/state-vector\/bridge\/pulls\?state=open/.test(url)) return json(res, 200, msScenario.pulls);
+    if (/\/repos\/state-vector\/superpositional\/pulls\?state=open/.test(url)) return json(res, 200, []); // the drill only populates the bridge repo
+    const msDetail = url.match(/\/repos\/state-vector\/bridge\/pulls\/(\d+)$/);
+    if (msDetail && msScenario.detail.has(msDetail[1])) return json(res, 200, msScenario.detail.get(msDetail[1]));
+    const msCommits = url.match(/\/repos\/state-vector\/bridge\/pulls\/(\d+)\/commits/);
+    if (msCommits && msScenario.commits.has(msCommits[1])) return json(res, 200, msScenario.commits.get(msCommits[1]));
+    if (req.method === "POST" && /\/repos\/state-vector\/bridge\/issues\/(\d+)\/comments$/.test(url)) {
+      const pr = Number(url.match(/issues\/(\d+)\/comments$/)![1]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      msScenario.comments.push({ pr, body: String(body.body ?? "") });
+      return json(res, 201, { id: msScenario.comments.length });
+    }
+    if (req.method === "PATCH" && /\/repos\/state-vector\/bridge\/issues\/(\d+)$/.test(url)) {
+      const pr = url.match(/issues\/(\d+)$/)![1];
+      const body = JSON.parse((await readBody(req)) || "{}");
+      msScenario.closed.set(pr, body);
+      msScenario.pulls = msScenario.pulls.filter((p) => String(p.number) !== pr); // GitHub: closed PRs leave the open list
+      return json(res, 200, { ok: true });
+    }
     json(res, 404, { message: `unexpected ${url}` });
   };
 }
@@ -479,5 +531,139 @@ describe("stopTheLineSweep episode tasks (real DO, canned GitHub — BR#3284)", 
     const live = await stopLineEpisodeTasks();
     expect(live.length).toBe(1); // unchanged — only the 2-episode task
     expect(live[0].title).toContain("222222222");
+  });
+});
+
+// ---------- tier 2c: the PR disposition drill (BR#3315 — terminal-state law) ----------
+// Same DO, same stub. Two open PRs on the bridge repo: #900 an ORPHAN (no BR#
+// ref anywhere, no provenance row) and #901 linked to a drill card whose
+// session died (PR stale, card stale). The sweep's `now` is driven forward to
+// age the clocks: pass 1 closes the orphan + files ONE bound escalation ask;
+// pass 2 dedupes; pass 3 closes the stale PR after the grace expires and
+// leaves the card as unclaimed todo.
+describe("mergeQueueSweep dispositions (real DO, canned GitHub — BR#3315)", () => {
+  it("orphan closes with reason; stale escalates ONCE (deduped), then closes after grace — card left as unclaimed todo", async () => {
+    msReset();
+    const t0 = Date.now();
+    // the stale-work card: in_progress, owned by a drill agent, last touched t0
+    const card = await kbJson("/create", {
+      type: "task", title: "IMPL: disposition drill — stale card", qualified: true, owner: "drill-impl-1",
+    });
+    expect(card.status).toBe(200);
+    const cardId = String(card.body.id);
+    const n = cardId.match(/\d+/)![0];
+    await kbJson("/transition", { id: cardId, to: "in_progress", actor: "drill-impl-1", note: "drill: working" });
+
+    msScenario.pulls = [
+      { number: 900, title: "chore: tidy the lint config", body: "", state: "open", created_at: msIso(t0 - 10 * msDay), updated_at: msIso(t0 - 10 * msDay) },
+      { number: 901, title: `BR#${n}: stale drill work`, body: "", state: "open", created_at: msIso(t0 - 10 * msDay), updated_at: msIso(t0 - 8 * msDay) },
+    ];
+    msScenario.detail.set("900", {
+      number: 900, title: "chore: tidy the lint config", state: "open",
+      created_at: msIso(t0 - 10 * msDay), updated_at: msIso(t0 - 10 * msDay),
+      mergeable: true, merge_state_status: "clean", head: { ref: "chore/lint", sha: "8".repeat(40) },
+    });
+    msScenario.detail.set("901", {
+      number: 901, title: `BR#${n}: stale drill work`, state: "open",
+      created_at: msIso(t0 - 10 * msDay), updated_at: msIso(t0 - 8 * msDay),
+      mergeable: true, merge_state_status: "clean", head: { ref: `bridge/BR-${n}`, sha: "9".repeat(40) },
+    });
+    msScenario.commits.set("900", [{ sha: "8".repeat(40), commit: { verification: { verified: true }, committer: { date: msIso(t0 - 10 * msDay) } } }]);
+    msScenario.commits.set("901", [{ sha: "9".repeat(40), commit: { verification: { verified: true }, committer: { date: msIso(t0 - 8 * msDay) } } }]);
+    await kbJson("/admin.settings_set", { settings: { merge_sweep_gh_api_base: ghOrigin } });
+
+    // pass 1: sweep "runs" 8.5 days later — the PRs are stale (10d/8d of
+    // silence), the card's in_progress stamp is 8.5d old (past the 7d window,
+    // so the dead session's card shields nothing)
+    const sweepNow = t0 + 8.5 * msDay;
+    const r1 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow });
+    expect(r1.status, `pass 1 failed: ${JSON.stringify(r1.body)}`).toBeLessThan(500);
+    expect(r1.body.error).toBeUndefined();
+    expect(r1.body.last_sweep.closed_orphan).toBe(1);
+    expect(r1.body.last_sweep.escalated).toBe(1);
+
+    // the orphan: closed WITH a reason comment, citing the revive path
+    expect(msScenario.closed.get("900")).toMatchObject({ state: "closed", state_reason: "not_planned" });
+    const orphanComment = msScenario.comments.find((c) => c.pr === 900);
+    expect(orphanComment?.body).toContain("no bridge provenance");
+    expect(orphanComment?.body).toContain("re-open via a card");
+
+    // the escalation: ONE bound ask, addressed to the card's owner
+    const askSearch = async () => {
+      const { body } = await kbJson("/search", { q: "merge sweep closes it with reason", limit: 50 });
+      return (body?.artefacts ?? []).filter((a: any) =>
+        a.type === "question" && a.meta?.ask?.artefact_id === cardId);
+    };
+    const asks1 = await askSearch();
+    expect(asks1.length).toBe(1);
+    expect(asks1[0].meta.ask.to).toBe("drill-impl-1");
+    expect(asks1[0].meta.ask.options.length).toBeGreaterThanOrEqual(2);
+    expect(String(asks1[0].title).endsWith("?")).toBe(true);
+    expect(String(asks1[0].title)).toContain(`PR #901`);
+    const askId = String(asks1[0].id);
+    // the card carries the receipt
+    const noted = (await kbJson("/get", { id: cardId })).body;
+    expect(String(noted.meta?.last_progress?.note)).toContain("escalation");
+
+    // pass 2 (same staleness episode): deduped — no second ask, no closure.
+    // (+20min clears the sweep's own 15min cadence stamp from pass 1)
+    const r2 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow + 20 * 60_000 });
+    expect(r2.body.error).toBeUndefined();
+    expect(r2.body.last_sweep.escalated).toBe(0);
+    expect(r2.body.last_sweep.closed_stale).toBe(0);
+    expect((await askSearch()).length).toBe(1);
+
+    // pass 3: the grace expires with no owner response → close_stale, citing
+    // the ask id + revive path; the card keeps the intent as unclaimed todo
+    const r3 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow + 49 * msHour });
+    expect(r3.status, `pass 3 failed: ${JSON.stringify(r3.body)}`).toBeLessThan(500);
+    expect(r3.body.error).toBeUndefined();
+    expect(r3.body.last_sweep.closed_stale).toBe(1);
+    expect(msScenario.closed.get("901")).toMatchObject({ state: "closed", state_reason: "not_planned" });
+    const staleComment = msScenario.comments.find((c) => c.pr === 901);
+    expect(staleComment?.body).toContain(askId); // cites the ask
+    expect(staleComment?.body).toContain("revive");
+    const after = (await kbJson("/get", { id: cardId })).body;
+    expect(after.status).toBe("todo"); // work intent kept, unclaimed
+    expect(after.owner ?? "").toBe("");
+  });
+
+  it("the orphan clock honours pr_orphan_days and pr_disposition_enabled=false restores the pre-law sweep", async () => {
+    msReset();
+    const t0 = Date.now();
+    // test 1 left merge_sweep_last_ts ~10.5d in the future — these sweeps run
+    // past it, and PR 902's clocks are anchored to the SWEEP now (a 2-day-old
+    // orphan at pass 1)
+    const sweepNow = t0 + 12 * msDay;
+    msScenario.pulls = [
+      { number: 902, title: "fix: random drive-by", body: "", state: "open", created_at: msIso(sweepNow - 2 * msDay), updated_at: msIso(sweepNow - 2 * msDay) },
+    ];
+    msScenario.detail.set("902", {
+      number: 902, title: "fix: random drive-by", state: "open",
+      created_at: msIso(sweepNow - 2 * msDay), updated_at: msIso(sweepNow - 2 * msDay),
+      mergeable: true, merge_state_status: "clean", head: { ref: "fix/drive-by", sha: "7".repeat(40) },
+    });
+    msScenario.commits.set("902", [{ sha: "7".repeat(40), commit: { verification: { verified: true }, committer: { date: msIso(sweepNow - 2 * msDay) } } }]);
+    const r1 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow });
+    expect(r1.body.error).toBeUndefined();
+    expect(r1.body.last_sweep.closed_orphan).toBe(0); // inside the 3d window
+    expect(msScenario.closed.get("902")).toBeUndefined();
+
+    // knob down to 1 day → the same PR is now past the window → closes
+    await kbJson("/admin.settings_set", { settings: { pr_orphan_days: 1 } });
+    const r2 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow + msDay });
+    expect(r2.body.error).toBeUndefined();
+    expect(r2.body.last_sweep.closed_orphan).toBe(1);
+    expect(msScenario.closed.get("902")).toMatchObject({ state: "closed" });
+    await kbJson("/admin.settings_set", { settings: { pr_orphan_days: 3 } });
+
+    // the kill switch: dispositions off → the orphan (re-listed) is untouched
+    msScenario.pulls = [{ number: 902, title: "fix: random drive-by", body: "", state: "open", created_at: msIso(sweepNow - 2 * msDay), updated_at: msIso(sweepNow - 2 * msDay) }];
+    await kbJson("/admin.settings_set", { settings: { pr_disposition_enabled: false } });
+    const r3 = await kbJson("/admin.merge_queue_sweep", { now: sweepNow + 2 * msDay });
+    expect(r3.body.error).toBeUndefined();
+    expect(r3.body.last_sweep.closed_orphan).toBe(0);
+    expect(msScenario.closed.size).toBe(1); // no NEW closure
+    await kbJson("/admin.settings_set", { settings: { pr_disposition_enabled: true } });
   });
 });

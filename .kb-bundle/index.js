@@ -422,7 +422,48 @@ function mergeSweepHumanLegTitle(repo, reasons) {
   if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
   return prefix + text2 + suffix;
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS;
+function decidePrDisposition(i) {
+  const iso = /* @__PURE__ */ __name((t) => new Date(t).toISOString(), "iso");
+  const staleMs = i.prStaleDays * 864e5;
+  if (i.cardStatus && TERMINAL_CARD_STATUSES.includes(i.cardStatus))
+    return {
+      kind: "close_superseded",
+      reason: `linked card ${i.cardId ?? "?"} is ${i.cardStatus}${i.cardTerminalNote ? ` \u2014 ${i.cardTerminalNote}` : ""} \u2014 the card's terminal state is this PR's terminal cause; revive via a successor card`
+    };
+  if (i.gate.kind === "close_superseded") return { kind: "close_superseded", reason: i.gate.reason };
+  if (i.gate.kind === "merge") return { kind: "merge", receipt: i.gate.receipt };
+  if (!i.hasProvenance && i.prCreatedAt != null && i.now - i.prCreatedAt > i.prOrphanDays * 864e5)
+    return {
+      kind: "close_orphan",
+      reason: `no bridge provenance \u2014 no BR# ref (title/body/branch), no provenance index row (BR#3287), and no resolvable card \u2014 after ${i.prOrphanDays}d (created ${iso(i.prCreatedAt)}); re-open via a card if this work matters`
+    };
+  const stale = i.lastActivityTs != null && i.now - i.lastActivityTs > staleMs;
+  if (stale && !i.cardAdvancing) {
+    if (i.escalatedAt == null && i.cardId != null && i.cardStatus != null)
+      return {
+        kind: "escalate",
+        question: prEscalationAskTitle(i.repo, i.prNumber, i.cardId, i.prGraceHours, i.prStaleDays),
+        reason: `no PR activity within ${i.prStaleDays}d (last ${iso(i.lastActivityTs)}) and the card not advancing \u2014 one bound ask: merge, rebase, or close with reason within ${i.prGraceHours}h`
+      };
+    if (!i.activitySinceEscalation && i.escalatedAt != null && i.now - i.escalatedAt > i.prGraceHours * 36e5)
+      return {
+        kind: "close_stale",
+        reason: `no activity since ${iso(i.lastActivityTs)} (> ${i.prStaleDays}d) and escalation ${i.escalationAskId ?? "(ask id no longer on record)"} unanswered for ${i.prGraceHours}h \u2014 closing with reason; revive: re-open this PR once the work resumes (PRs are reopenable, the card keeps the intent)`
+      };
+  }
+  if (i.gate.kind === "bounce") return { kind: "bounce", defect: i.gate.defect };
+  if (i.gate.kind === "human_leg") return { kind: "passthrough", reason: i.gate.reason };
+  return { kind: "passthrough", reason: i.gate.kind === "note" || i.gate.kind === "skip" ? i.gate.reason : "no disposition row fired" };
+}
+function prEscalationAskTitle(repo, prNumber, cardId, graceHours, staleDays) {
+  const prefix = `PR #${prNumber} (${repo}) on ${cardId} has been quiet ${staleDays}+ days \u2014 `;
+  const suffix = `?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text2 = `merge, rebase, or close it with reason within ${graceHours}h, or the merge sweep closes it with reason`;
+  if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + text2 + suffix;
+}
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS, TERMINAL_CARD_STATUSES;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -555,6 +596,9 @@ var init_core = __esm({
     __name(classifyHeadChecks, "classifyHeadChecks");
     __name(decideMergeAction, "decideMergeAction");
     __name(mergeSweepHumanLegTitle, "mergeSweepHumanLegTitle");
+    TERMINAL_CARD_STATUSES = ["superseded", "done", "rejected"];
+    __name(decidePrDisposition, "decidePrDisposition");
+    __name(prEscalationAskTitle, "prEscalationAskTitle");
   }
 });
 
@@ -1875,6 +1919,10 @@ ${detail?.body ?? ""}`);
         } catch {
           methods = {};
         }
+        const prDispositionEnabled = /^(1|true|on|yes)$/i.test(this.settingValue("pr_disposition_enabled", "1"));
+        const prStaleDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_stale_days", "7"), 10) || 7));
+        const prOrphanDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_orphan_days", "3"), 10) || 3));
+        const prGraceHours = Math.max(1, Math.min(720, parseInt(this.settingValue("pr_grace_hours", "48"), 10) || 48));
         const ghGet = /* @__PURE__ */ __name(async (path) => {
           const res = await fetch(`${base}${path}`, {
             headers: {
@@ -1904,6 +1952,31 @@ ${detail?.body ?? ""}`);
           this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
           this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
         }, "sweepNote");
+        const closeWithReason = /* @__PURE__ */ __name(async (repo, prNumber, reason, linked) => {
+          const comment = await fetch(`${base}/repos/${repo}/issues/${prNumber}/comments`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "user-agent": "bridge-merge-sweep (BR#3315)"
+            },
+            body: JSON.stringify({ body: reason })
+          });
+          if (!comment.ok) throw new Error(`close-reason comment POST -> HTTP ${comment.status}`);
+          const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "user-agent": "bridge-merge-sweep (BR#3315)"
+            },
+            body: JSON.stringify({ state: "closed", state_reason: "not_planned" })
+          });
+          if (!close.ok) throw new Error(`close PATCH -> HTTP ${close.status}`);
+          if (linked) sweepNote(linked, `${reason.slice(0, 380)} \u2014 PR #${prNumber} closed by the merge sweep`);
+        }, "closeWithReason");
         const results = [];
         for (const repo of repos) {
           const humanLegs = [];
@@ -1920,11 +1993,12 @@ ${detail?.body ?? ""}`);
               const prNumber = pr.number;
               try {
                 const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
-                const linked = cardRef(`${pr.title ?? ""}
+                const prText = `${pr.title ?? ""}
 ${pr.body ?? ""}
 ${detail.title ?? ""}
-${detail.body ?? ""}`);
-                const card = linked ? this.one(`SELECT id, status FROM artefacts WHERE id = ?`, linked) : null;
+${detail.body ?? ""}`;
+                const linked = cardRef(prText) ?? prCardRef(String(detail?.head?.ref ?? "").replace(/^refs\/heads\//, ""), prText);
+                const card = linked ? this.one(`SELECT id, status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, linked) : null;
                 const cardStatus = card ? String(card.status) : null;
                 let verifyAcceptedAny = false;
                 let verifyAcceptedOnHead = false;
@@ -1942,7 +2016,11 @@ ${detail.body ?? ""}`);
                   );
                 }
                 const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
-                const commits = (commitsBody ?? []).map((c) => ({ sha: String(c?.sha ?? ""), verified: c?.commit?.verification?.verified === true }));
+                const commits = (commitsBody ?? []).map((c) => ({
+                  sha: String(c?.sha ?? ""),
+                  verified: c?.commit?.verification?.verified === true,
+                  ts: Date.parse(String(c?.commit?.committer?.date ?? c?.commit?.author?.date ?? ""))
+                }));
                 const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
                 const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
                 const action = decideMergeAction({
@@ -1958,6 +2036,127 @@ ${detail.body ?? ""}`);
                   verifyAcceptedAny,
                   verifyAcceptedOnHead
                 });
+                const lastActivityTs = [
+                  Date.parse(String(pr.updated_at ?? "")),
+                  ...commits.map((c) => Number(c?.ts))
+                ].filter(Number.isFinite).reduce((m, t) => m == null || t > m ? t : m, null);
+                const prCreatedRaw = Date.parse(String(pr.created_at ?? ""));
+                const prCreatedAt = Number.isFinite(prCreatedRaw) ? prCreatedRaw : null;
+                let cardAdvancing = false;
+                let cardOwner = null;
+                let cardTerminalNote = null;
+                if (card) {
+                  cardOwner = card.owner ? String(card.owner) : null;
+                  const cmeta = JSON.parse(String(card.meta ?? "{}"));
+                  const cardUpdated = Number(card.updated_ts ?? 0);
+                  const windowMs = prStaleDays * 864e5;
+                  if (cardStatus === "in_progress" || cardStatus === "in_review")
+                    cardAdvancing = cardUpdated > 0 && now - cardUpdated <= windowMs;
+                  else if (cardStatus === "blocked") {
+                    const parkTs = Number(cmeta?.blocked?.ts ?? 0);
+                    cardAdvancing = parkTs > 0 && now - parkTs <= windowMs;
+                  }
+                  cardTerminalNote = cmeta?.superseded_reason ? String(cmeta.superseded_reason) : null;
+                }
+                const hasProvenance = card != null || !!this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, prNumber);
+                const escKey = `pr_escalated_${repo}_${prNumber}`;
+                let escalatedAt = null;
+                let escalationAskId = null;
+                const escRaw = this.settingValue(escKey, "");
+                if (escRaw) {
+                  try {
+                    const p = JSON.parse(escRaw);
+                    escalatedAt = Number(p?.ts) || null;
+                    escalationAskId = p?.ask_id ? String(p.ask_id) : null;
+                  } catch {
+                    escalatedAt = Number(escRaw) || null;
+                  }
+                }
+                const activitySinceEscalation = escalatedAt != null && lastActivityTs != null && lastActivityTs > escalatedAt;
+                if (escalatedAt != null && activitySinceEscalation) {
+                  this.state.storage.sql.exec(`DELETE FROM settings WHERE key = ?`, escKey);
+                  if (linked) sweepNote(linked, `PR #${prNumber}: owner responded after the escalation \u2014 episode resolved, stale clock reset`);
+                }
+                let disposition = null;
+                if (prDispositionEnabled) {
+                  disposition = decidePrDisposition({
+                    gate: action,
+                    repo,
+                    prNumber,
+                    now,
+                    lastActivityTs,
+                    cardId: linked,
+                    cardStatus,
+                    cardAdvancing,
+                    hasProvenance,
+                    prCreatedAt,
+                    cardTerminalNote,
+                    escalatedAt,
+                    escalationAskId,
+                    activitySinceEscalation,
+                    prStaleDays,
+                    prOrphanDays,
+                    prGraceHours
+                  });
+                  if (disposition.kind === "close_superseded" && action.kind !== "close_superseded") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                    this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber, cause: "card_terminal" });
+                    continue;
+                  }
+                  if (disposition.kind === "close_orphan") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_orphan" });
+                    continue;
+                  }
+                  if (disposition.kind === "close_stale") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_stale" });
+                    if (linked && card && !["done", "superseded", "rejected", "todo"].includes(cardStatus)) {
+                      try {
+                        await this.transition(
+                          { id: linked, to: "todo", note: `PR #${prNumber} closed by the merge sweep (stale) \u2014 work intent stays here as unclaimed todo; revive by re-opening or re-submitting a PR. (${disposition.reason.slice(0, 200)})` },
+                          "system:merge-sweep"
+                        );
+                      } catch (e) {
+                        this.audit("system:merge-sweep", "release_card_error", linked, { error: String(e.message ?? e).slice(0, 200) });
+                      }
+                    }
+                    continue;
+                  }
+                  if (disposition.kind === "escalate" && linked && card) {
+                    const to = cardOwner && isValidAskTarget(cardOwner) && !/^(web|system)/.test(cardOwner) ? cardOwner : "any";
+                    const created = await this.askCreate(
+                      {
+                        to,
+                        urgency: "normal",
+                        question: disposition.question,
+                        details: [
+                          `**Merge-sweep escalation (terminal-state law BR#3312 \u2014 one bound ask per staleness episode).**`,
+                          ``,
+                          `- PR: https://github.com/${repo}/pull/${prNumber}`,
+                          `- card: ${linked} (${cardStatus ?? "no row"}${cardAdvancing ? ", advancing" : ", not advancing"})`,
+                          `- last PR activity: ${lastActivityTs != null ? new Date(lastActivityTs).toISOString() : "unknown"} (> ${prStaleDays}d ago)`,
+                          ``,
+                          `Do one of: **merge** (it is verified/merge-ready), **rebase** (freshen the head), or **close the PR with a reason** \u2014 within ${prGraceHours}h. On silence the sweep closes the PR with a reason citing this ask; the card keeps the work's intent as unclaimed todo and the PR is reopenable.`
+                        ].join("\n"),
+                        reason: "merge-sweep escalation: PR stale past pr_stale_days with the card not advancing \u2014 one bound ask, then close-with-reason",
+                        options: ["Merging/rebasing now", "Closing with reason", "Release the card \u2014 not mine"],
+                        artefact_id: linked
+                      },
+                      "system:merge-sweep"
+                    );
+                    this.state.storage.sql.exec(
+                      `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+                      escKey,
+                      JSON.stringify({ ts: now, ask_id: created.id })
+                    );
+                    sweepNote(linked, `${disposition.reason} \u2014 escalation ${created.id} filed on ${to}`);
+                    results.push({ repo, pr: prNumber, kind: "escalate", ask: created.id });
+                    this.audit("system:merge-sweep", "escalate", linked, { repo, pr: prNumber, ask: created.id, to });
+                    continue;
+                  }
+                }
                 if (action.kind === "merge") {
                   const method = methods[repo] === "squash" ? "squash" : "merge";
                   const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
@@ -2065,9 +2264,20 @@ ${detail.body ?? ""}`);
         }
         this.state.storage.sql.exec(
           `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
-          JSON.stringify({ ts: now, merged: results.filter((r) => r.kind === "merge").length, bounced: results.filter((r) => r.kind === "bounce").length, closed: results.filter((r) => r.kind === "close_superseded").length, human_legs: results.filter((r) => r.kind === "human_leg").length, skipped: results.filter((r) => r.kind === "skip").length, results: results.slice(0, 50) })
+          JSON.stringify({
+            ts: now,
+            merged: results.filter((r) => r.kind === "merge").length,
+            bounced: results.filter((r) => r.kind === "bounce").length,
+            closed: results.filter((r) => r.kind === "close_superseded").length,
+            escalated: results.filter((r) => r.kind === "escalate").length,
+            closed_orphan: results.filter((r) => r.kind === "close_orphan").length,
+            closed_stale: results.filter((r) => r.kind === "close_stale").length,
+            human_legs: results.filter((r) => r.kind === "human_leg").length,
+            skipped: results.filter((r) => r.kind === "skip").length,
+            results: results.slice(0, 50)
+          })
         );
-        const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "human_leg_ask"].includes(r.kind));
+        const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "close_orphan", "close_stale", "escalate", "human_leg_ask"].includes(r.kind));
         if (summary.length)
           this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
       }
@@ -4137,7 +4347,12 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
           );
           if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
             if (row.status === "in_progress") {
-              await this.transition({ id: artefactId, to: "blocked", note: `blocked on ${to}: ${question.slice(0, 100)}` }, actor);
+              await this.transition({
+                id: artefactId,
+                to: "blocked",
+                note: `blocked on ${to}: ${question.slice(0, 100)}`,
+                unblock_condition: `answer ask ${id}`
+              }, actor);
               taskStatus = "blocked";
             }
           }
@@ -5775,7 +5990,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "a17109641faed72d58d9720af45d5cba0daa2cde", built_at: "2026-10-25T13:16:45Z" };
+    module.exports = { commit: "cddb121b436775723e3fdaceda102bea8a274e67", built_at: "2026-10-25T13:25:43Z" };
   }
 });
 
