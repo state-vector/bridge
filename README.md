@@ -470,6 +470,48 @@ the accepted verify verdict citing that head, the owning agent **session**, and 
 - Consumers: the red-main guilty-agent attribution loop (BR#3284), humans auditing who landed what,
   and any agent needing receipts. `admin.provenance_sweep` drills/backfills on demand.
 
+## The closure tier: flipped proxies, terminal legs, receipts (BR#3361)
+
+Work leaks at its END, not its middle: a card parked on a machine-checkable exit condition nobody
+re-checks (BR#3129 — the proxy flipped and sat ~20h), a done card whose final "close GH #N" leg has
+no owner (GH #2261), a done card claiming a close that never happened (BR#3220). The closure tier
+closes those leaks with four hub mechanisms:
+
+- **Unblock-proxy watch** (a): `unblockProxySweep` (paced by `unblock_proxy_sweep_minutes`, default
+  15, `0` = off) re-evaluates every blocked card's `unblock_condition` on each pass. The parser
+  (`packages/worker/src/kb/closure.ts`) extracts machine-checkable atoms — `pr_merged` (PR + url/number),
+  `br_pr_merged` (a "BR#N's fix PR on <repo> is MERGED" condition, resolved by head branch
+  `bridge/BR-<N>`), `issue_closed`, `br_done`, `run_success`, `pr_checks_green` — and cuts the
+  DUTY clauses ("then a fresh session closes…") so instruction text never parses as a precondition.
+  Conservatism law: machine-looking text that yields no atom stamps the verdict `unparseable`
+  (never auto-flips); atoms with no resolvable repo stamp `unresolvable`. When every atom verifies
+  TRUE live, the sweep auto-spawns the unblock duty with the receipts embedded — a trigger, never
+  an authority: the spawned duty re-verifies first-hand. The machine's caps still apply (≤1 open
+  unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
+- **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
+  section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
+  "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.
+  A rejected done auto-derives that child (`Close-leg duty: …`, flood-guarded per legs-shape) so
+  the very next attempt has an owner — no orphan terminal legs.
+- **Done-gate closure receipts** (c): the receipt contract is `state=closed + closing-comment id
+  (or the comment URL) + guard run id (or n/a)`. Intent language ("will close", "fully closed",
+  "close-guard blocked") is not a receipt. The done-time stamp (`meta.close_leg_audit`) is then
+  LIVE-verified by `closureAuditSweep` (`closure_audit_minutes`, default 30, `0` = off): issue
+  state, closing comment, guard run each checked against GitHub; a false claim (the BR#3220 class
+  — the board reported a closed issue that wasn't) files a `Correction: false closure receipt`
+  duty exactly once.
+- **Duplicate-executor fence** (d): orient exposes the executor lease (`executor_session`) on open
+  cards and my_tasks; a state-changing op by a named session other than the lease holder while the
+  holder is alive (<10m) is audited `system:fence / duplicate_executor` — observability, never a
+  block. Prompt law backs it: a lost claim race means you are not the executor; stand down
+  (rule 5d + protocol card 7). Hub/auto-spawned duties start session-less — the first real session
+  to claim them stamps the lease.
+
+Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts),
+`test/closure-sweep.test.ts` (real DO: flip → spawn → dedupe; rejected done → child → parent done;
+audit ok/false + correction; fence audit + lease). `admin.unblock_proxy_sweep` /
+`admin.closure_audit_sweep` drill on demand.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

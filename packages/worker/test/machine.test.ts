@@ -32,6 +32,8 @@ const baseCtx = (): RuleCtx => ({
   spawnGuard: () => null,
   openVerifyChild: () => null,
   openUnblockChild: () => null,
+  cardBody: () => "",
+  closeLegChildClosed: () => false,
   recentEvents: () => [],
 });
 
@@ -236,6 +238,7 @@ describe("loop regressions", () => {
         "claim-bars",
         "claim-separation-of-duties",
         "decision-acceptance-human",
+        "done-close-legs",
         "done-open-children",
         "done-unreviewed",
         "human-signoff-done",
@@ -266,6 +269,108 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "agent-x" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "web:ray" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
+  });
+});
+
+// ---------- BR#3361 (b)+(c): done-close-legs — terminal legs are owned ----------
+
+describe("done-close-legs (terminal close legs need receipts or a closed child)", () => {
+  const DONE_WHEN = [
+    "## Done when",
+    "- all review findings fixed and pushed",
+    "- close GH #2261 (the incident issue)",
+    "",
+    "## Contract",
+    "behave",
+  ].join("\n");
+
+  it("no close legs anywhere → the rule is silent (plain done unaffected)", async () => {
+    const msg = await check(
+      input({ status: "in_progress", to: "done", body: { note: "shipped", resolution: "all good" } }),
+      { ...baseCtx(), cardBody: () => "no legs here" },
+    );
+    expect(msg).toBeNull();
+  });
+
+  it("a leg in the Done-when with NO receipt → rejected with the receipt contract", async () => {
+    const msg = await check(
+      input({ status: "in_progress", to: "done", body: { note: "work complete, ready to close" } }),
+      { ...baseCtx(), cardBody: () => DONE_WHEN },
+    );
+    expect(msg).toContain("terminal close leg(s) not receipted");
+    expect(msg).toContain("#2261");
+    expect(msg).toContain("state=closed + closing-comment id");
+  });
+
+  it("a receipted done note passes (state=closed + comment id + guard run)", async () => {
+    const note = [
+      "done. Terminal legs executed:",
+      "- GH #2261: state=closed, closing comment 17623388240 (https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240), guard run 40198911366 guard=allow",
+    ].join("\n");
+    const msg = await check(
+      input({ status: "in_progress", to: "done", body: { note } }),
+      { ...baseCtx(), cardBody: () => DONE_WHEN },
+    );
+    expect(msg).toBeNull();
+  });
+
+  it("a bare-repo leg without repo slug takes a receipt too; intent-only language never counts", async () => {
+    // "closes BR#3337 done" is a board-card reference, NOT a GH leg — no leg,
+    // no rejection (the unblock-duty contract language must not manufacture legs)
+    const noLeg = await check(
+      input({ status: "in_progress", to: "done", body: { note: "fixes BR#3337 done — merges parent" } }),
+      baseCtx(),
+    );
+    expect(noLeg).toBeNull();
+
+    // "close-guard blocked GH#1" — mentions a close but state language absent
+    const legNoReceipt = await check(
+      input({ status: "in_progress", to: "done", body: { note: "closing the work now: close GH #50" } }),
+      baseCtx(),
+    );
+    expect(legNoReceipt).toContain("terminal close leg(s) not receipted");
+  });
+
+  it("a CLOSED close-duty child owns the leg — the receipt path is not the only path", async () => {
+    const ctx: RuleCtx = {
+      ...baseCtx(),
+      cardBody: () => DONE_WHEN,
+      closeLegChildClosed: (leg) => leg.number === 2261,
+    };
+    const msg = await check(input({ status: "in_progress", to: "done", body: { note: "executed via close-leg duty" } }), ctx);
+    expect(msg).toBeNull();
+    // …but a closed child for a DIFFERENT leg doesn't cover this one
+    const ctxWrongLeg: RuleCtx = {
+      ...baseCtx(),
+      cardBody: () => DONE_WHEN,
+      closeLegChildClosed: (leg) => leg.number === 9999,
+    };
+    const msg2 = await check(input({ status: "in_progress", to: "done", body: { note: "executed via close-leg duty" } }), ctxWrongLeg);
+    expect(msg2).toContain("terminal close leg(s) not receipted");
+  });
+
+  it("the executor's rejection message embeds legs as labels (the spawn path parses them back)", async () => {
+    const i = input({ status: "in_progress", to: "done", body: { note: "no receipts yet" } });
+    const v = await decide(i, { ...baseCtx(), cardBody: () => DONE_WHEN });
+    expect(v.ok).toBe(false);
+    if (v.ok === false) {
+      expect(v.code).toBe("guard-failed");
+      expect(v.rule).toBe("done-close-legs");
+      // spawnCloseLegDuty re-parses `not receipted: <list> —` — keep the shape
+      const listed = /not receipted: ([^—]+)—/.exec(v.message)?.[1] ?? "";
+      expect(listed).toContain("#2261");
+    }
+    // URL-form legs carry the repo slug in the label (the spawn path reads it)
+    const urlBody = [
+      "## Done when",
+      "- close https://github.com/state-vector/superpositional/issues/2261",
+    ].join("\n");
+    const v2 = await decide(i, { ...baseCtx(), cardBody: () => urlBody });
+    expect(v2.ok).toBe(false);
+    if (v2.ok === false) {
+      const listed2 = /not receipted: ([^—]+)—/.exec(v2.message)?.[1] ?? "";
+      expect(listed2).toContain("state-vector/superpositional#2261");
+    }
   });
 });
 
