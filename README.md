@@ -230,6 +230,17 @@ PR link, review verifies with receipts in a fresh session. Separation of duties,
 gates, and verify auto-spawn are enforced server-side in `packages/worker/src/kb/do.ts`,
 not by client convention.
 
+**Verify is the merge authority** (standing order BR#3033). The verify round enforces
+mergeability (main-green gate, checks green, GitHub-verified signatures), reviews substance,
+and — when both hold — **merges the PR itself**, citing the merge sha in its done receipts.
+There is no separate human merge gate for a verified PR. The cycle is: impl works → rebases
+→ pushes a mergeable PR → `in_review`; verify picks it up (rank 0), reviews substance AND
+mechanics; problems found → bounce back to impl with findings (`in_review → in_progress`,
+one round, N bounces — the same verify round re-enters, it never stacks); loop until verify
+merges and closes. Impl owns mergeability *preparation* (rebase before every in_review — a
+conflicting PR is the impl's defect, not the reviewer's); verify owns mergeability
+*enforcement* (confirm, then merge).
+
 - Hub defaults: `DEFAULT_ROLE_PLAYBOOKS` in `packages/worker/src/kb/core.ts`.
 - Per-hub overrides: admin settings → **Roles & playbooks** (`settings.roles.*`); clearing
   an override resets to the hub default.
