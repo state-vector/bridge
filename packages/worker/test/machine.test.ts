@@ -810,12 +810,31 @@ describe("claim-race classification (BR#3337)", () => {
   it("lifecycle-edge rejections classify as claim_race", () => {
     expect(breachClass("task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)")).toBe("claim_race");
     expect(breachClass("status 'in_review' is terminal for task")).toBe("claim_race");
-    // ownership rejections on a raced release are the same benign class
-    expect(breachClass("task BR#1 is claimed by other-gw — only the owner or a human can release it to the pool")).toBe("other");
+    // BR#3429: ownership-gate rejections on a raced release are the same
+    // benign class — a non-owner tried to release a claimed card, the gate
+    // refused, the loser skips (specimen BR#3427: 3 rule-9 release attempts
+    // on a runner-claimed card raised a breach card before this fix)
+    expect(breachClass("task BR#1 is claimed by other-gw — only the owner or a human can release it to the pool")).toBe("claim_race");
   });
 
   it("a claim-race storm never raises a breach card (the breaker does not count it)", () => {
     expect(detectBreaches(raceEvents(9), new Set())).toHaveLength(0);
+  });
+
+  // BR#3429: the ownership-gate shape (release-needs-ownership) folds as
+  // claim_race too — the exact rejection the BR#3427 specimen shows (3 rule-9
+  // release attempts on a runner-claimed card in 18 s raised a breach card).
+  const ownershipEvents = (n: number, task = "BR#3429A") =>
+    Array.from({ length: n }, (_, i) => ({
+      ts: 1_000_000 + i * 60_000,
+      task,
+      op: "transition_rejected",
+      reason:
+        "task BR#3372 is claimed by mac-modem-opencode — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]",
+    }));
+
+  it("ownership-gate rejections never raise a breach card either (BR#3429)", () => {
+    expect(detectBreaches(ownershipEvents(9), new Set())).toHaveLength(0);
   });
 
   it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
@@ -835,6 +854,11 @@ describe("claim-race classification (BR#3337)", () => {
     expect(mixedBreaches).toHaveLength(1);
     expect(mixedBreaches[0].klass).toBe("gate:done-unreviewed");
     expect(mixedBreaches[0].count).toBe(3);
+    // ownership-gate races contaminate no more than lifecycle-edge ones
+    const mixedOwnership = [...ownershipEvents(5, "BR#3337B"), ...genuine];
+    expect(detectBreaches(mixedOwnership, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
   });
 });
 
