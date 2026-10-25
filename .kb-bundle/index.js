@@ -128,8 +128,8 @@ function tokenWorkspace(secret) {
 function tagsSayGateway(tags) {
   return parseTags(tags).some((t) => t.toLowerCase() === "gateway");
 }
-function selfProvisionLabel(device_id) {
-  const raw = typeof device_id === "string" ? device_id : "";
+function selfProvisionLabel(host) {
+  const raw = typeof host === "string" ? host : "";
   const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
   return slug || "device";
 }
@@ -1811,7 +1811,6 @@ ${detail.body ?? ""}`);
         label TEXT NOT NULL UNIQUE,
         hash TEXT NOT NULL UNIQUE,
         tags TEXT NOT NULL DEFAULT '[]',
-        device_id TEXT,
         principal TEXT,
         transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
@@ -1859,7 +1858,6 @@ ${detail.body ?? ""}`);
         code TEXT PRIMARY KEY,
         device TEXT NOT NULL,
         type TEXT,
-        device_id TEXT,
         principal TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         ws TEXT,
@@ -1902,8 +1900,6 @@ ${detail.body ?? ""}`);
           `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
           `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
           `ALTER TABLE pairings ADD COLUMN type TEXT`,
-          `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
-          `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
           `ALTER TABLE pairings ADD COLUMN principal TEXT`,
           `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
           `ALTER TABLE sessions ADD COLUMN kind TEXT`,
@@ -4221,14 +4217,15 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const code = this.pairCode();
         const now = Date.now();
         const type = body.type === "agent" ? "agent" : "gateway";
-        const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
         const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         this.state.storage.sql.exec(
-          `INSERT INTO pairings (code, device, type, device_id, principal, status, created_ts) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          `INSERT INTO pairings (code, device, type, principal, status, created_ts) VALUES (?, ?, ?, ?, 'pending', ?)`,
+          // host is the DISPLAY name (BR#899: labels display, the device
+          // credential anchors); body.device fallback covers desktops predating
+          // the field rename
           code,
-          String(body.device ?? "device").slice(0, 80),
+          String(body.host ?? body.device ?? "device").slice(0, 80),
           type,
-          device_id,
           principal,
           now
         );
@@ -4251,7 +4248,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const ws = String(body.ws ?? "").trim();
         const label = String(body.label ?? "").trim();
         const login = String(body.login ?? "").toLowerCase();
-        const row = this.one(`SELECT code, created_ts, status, device, type, device_id, principal FROM pairings WHERE code = ?`, code);
+        const row = this.one(`SELECT code, created_ts, status, device, type, principal FROM pairings WHERE code = ?`, code);
         if (!row || row.status !== "pending") throw new Error("pairing code not pending");
         if (Date.now() - row.created_ts > _KnowledgeHub.PAIR_TTL_MS) {
           this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
@@ -4268,7 +4265,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const mintRes = await stub.fetch("https://kb/admin.mint", {
           method: "POST",
           headers: { "content-type": "application/json", "x-kb-admin": "1" },
-          body: JSON.stringify({ label, tags, device_id: row.device_id ?? null, principal: row.principal ?? null })
+          body: JSON.stringify({ label, tags, principal: row.principal ?? null })
         });
         const minted = await mintRes.json();
         if (!mintRes.ok || !minted.secret) {
@@ -4345,12 +4342,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const tags = JSON.stringify(["provisioned", `by:${caller}`]);
         try {
           this.state.storage.sql.exec(
-            `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
+            `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
             id,
             label,
             hash,
             tags,
-            body.device_id ?? null,
             body.principal ?? null,
             ts
           );
@@ -4456,10 +4452,10 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         if (label.includes("/") && !label.startsWith("_direct/")) {
           throw new Error("labels cannot contain '/' \u2014 only the reserved _direct/ root (directly connected agents) may");
         }
-        const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
+        const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         const secret = generateAuthToken();
         const hash = await hashAuthToken(secret);
-        let own = device_id ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id) : null;
+        let own = principal ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ?`, principal) : null;
         const byLabel = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE label = ?`, label);
         if (own && byLabel && own.id !== byLabel.id) {
           this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE id = ?`, byLabel.id);
@@ -4469,12 +4465,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         if (target) {
           const mintTags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
           this.state.storage.sql.exec(
-            `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, device_id = COALESCE(?, device_id), principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
+            `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
             hash,
             label,
             JSON.stringify(mintTags),
-            device_id,
-            body.principal ?? null,
+            principal,
             target.id
           );
           const ws2 = this.wsSlug();
@@ -4494,14 +4489,13 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const ts = Date.now();
         this.state.storage.sql.exec(
-          `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           id,
           label,
           hash,
           JSON.stringify(tags),
           transport,
-          device_id,
-          body.principal ?? null,
+          principal,
           ts
         );
         const ws = this.wsSlug();
@@ -5202,7 +5196,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "39b255f3edcd7bfe9fdaef4dcb4f4b14dcf0a269", built_at: "2026-10-25T10:53:10Z" };
+    module.exports = { commit: "04d8d18b4ddb93206e444d3d6ed51b6281ca6d71", built_at: "2026-10-25T11:19:43Z" };
   }
 });
 

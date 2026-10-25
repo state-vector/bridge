@@ -313,14 +313,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
-    let device = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "device".into());
-
-    let code = pair_start(&client, url, &device, ensure_principal_from_file().as_str())?;
+    let code = pair_start(&client, url, host_slug().as_str(), ensure_principal_from_file().as_str())?;
     eprintln!("[pair] open {url}/pair and enter code {code}");
     println!("[pair] open {url}/pair and enter code {code}");
 
@@ -346,15 +339,12 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
     }
 }
 
-/// Stable machine identity for re-pairing: IOPlatformUUID (survives hostname
-/// renames; unlike a MAC address it can't drift with hardware). The hub
-/// re-associates a re-pairing device with its existing token by this id —
-/// rotation, not a label collision. Fallback: hostname.
 /// Hostname slug — the LABEL source for the gateway token (BR#899 identity
-/// convention; Ray: gateway-ness is a tag, not a name prefix). The stable
-/// IOPlatformUUID (device_id) remains the internal rotation anchor and is
-/// never displayed.
-fn host_slug() -> String {
+/// convention; Ray: gateway-ness is a tag, not a name prefix). Display only:
+/// identity is anchored by the stored device credential (`principal`, the
+/// hub-vended, generate-once-never-change secret — BR#2711 §2), never by the
+/// hostname and never by an IOPlatformUUID (withdrawn).
+pub fn host_slug() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -366,12 +356,13 @@ fn host_slug() -> String {
 /// First half of the device flow: register this device, get the enter-code.
 /// This app IS a gateway — the pairing declares that class; the hub vends a
 /// gateway-class token on approval. The approver never chooses. The stable
-/// device id lets the hub re-associate re-pairings (rotate, not collide).
-pub fn pair_start(client: &reqwest::blocking::Client, url: &str, device: &str, principal: &str) -> Result<String, String> {
+/// device credential (principal) lets the hub re-associate re-pairings
+/// (rotate, not collide).
+pub fn pair_start(client: &reqwest::blocking::Client, url: &str, host: &str, principal: &str) -> Result<String, String> {
     let start: serde_json::Value = client
         .post(format!("{url}/api/pair/start"))
         .header("content-type", "application/json")
-        .body(json!({ "device": device, "type": "gateway", "principal": principal }).to_string())
+        .body(json!({ "host": host, "type": "gateway", "principal": principal }).to_string())
         .send()
         .map_err(|e| format!("bridge unreachable: {e}"))?
         .json()
@@ -499,7 +490,7 @@ fn apply_vended_credentials(
 /// human approval — hub-side the audit stamps op `self_provision` with the
 /// web-session actor. The secret goes straight to the OS keychain: it never
 /// touches the webview, the UI, or any log (only the workspace lands in the
-/// log line). Deterministic label + replace-by-device_id mean re-vending at
+/// log line). Deterministic label + replace-by-principal mean re-vending at
 /// every login rotates in place — same label, stable gateway_agents edges.
 pub fn self_provision(
     client: &reqwest::blocking::Client,
@@ -2687,7 +2678,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // token is an invalid credential state — per-agent provisioning is
     // impossible and every claim would carry the wrong identity class. Log
     // out automatically: clear the dead credential and await the next login
-    // (self-provision re-vends, replace-by-device_id — no human click beyond
+    // (self-provision re-vends, replace-by-principal — no human click beyond
     // the login). BR#2532: a WRONG-CLASS token is a forced sign-out — the
     // reason rides the snapshot as a structured notice (an upgrading desktop
     // gets a guided sign-in, not a silent logout). An EMPTY token is plain

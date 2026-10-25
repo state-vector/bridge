@@ -266,12 +266,12 @@ export function tagsSayGateway(tags: unknown): boolean {
  * token (Ray, 2026-10-23), never part of the name. The same machine always
  * lands on the same label, so re-vending at each login rotates the token in
  * place and the `gateway_agents` edges keyed by that label stay stable.
- * Non-alphanumerics collapse to single dashes; an empty/undashable id falls
+ * Non-alphanumerics collapse to single dashes; an empty/undashable host falls
  * back to "device" so the label is always valid under the mint label rules
  * (2-40 chars, [a-zA-Z0-9._/-]).
  */
-export function selfProvisionLabel(device_id: unknown): string {
-  const raw = typeof device_id === "string" ? device_id : "";
+export function selfProvisionLabel(host: unknown): string {
+  const raw = typeof host === "string" ? host : "";
   const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
