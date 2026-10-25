@@ -1,0 +1,29 @@
+{
+  "$comment": "BR#3185 — git commit/signing identity profiles, recorded contract. The runner's built-in `worker` class MUST match this fixture exactly (test: builtin_worker_identity_matches_contract). Fields are camelCase; the runner also accepts snake_case aliases on deserialize. Applying a profile writes repo-local git config only — never global config.",
+  "version": 1,
+  "classes": {
+    "worker": {
+      "name": "detached-cody",
+      "email": "297316395+detached-cody@users.noreply.github.com",
+      "signingKeyPath": "~/.ssh/sv-agents-signing.pub",
+      "signingProgram": "/usr/bin/ssh-keygen"
+    }
+  },
+  "provisioning": {
+    "writes": [
+      "user.name",
+      "user.email",
+      "user.signingkey",
+      "gpg.format=ssh",
+      "gpg.ssh.program",
+      "commit.gpgsign=true"
+    ],
+    "scope": "repo-local (worktree) only",
+    "validation": "scratch sign check through the profile's own program and key; a failed or hung sign check refuses the dispatch"
+  },
+  "precedence": [
+    "explicit identity block in the runner's config (agent config)",
+    "built-in worker class (detached-cody, BR#3181)",
+    "the host's global git config is never written by the runner"
+  ]
+}

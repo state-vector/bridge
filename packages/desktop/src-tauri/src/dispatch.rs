@@ -80,6 +80,10 @@ pub struct DispatchConfig {
     pub models: Option<std::collections::HashMap<String, String>>, // legacy: folded into backends on load
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<std::collections::HashMap<String, String>>, // legacy: folded into backends on load
+    /// Git commit/signing identity for dispatched sessions (BR#3185).
+    /// Omitted = the built-in `worker` class (builtin_worker_identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityProfile>,
 }
 
 /// Per-provider settings. Everything optional — a provider section can be
@@ -127,7 +131,76 @@ where D: serde::Deserializer<'de> {
     }
 }
 
+/// Git commit/signing identity for dispatched sessions (BR#3185). A
+/// first-class property of the runner config instead of ad-hoc `-c`
+/// overrides typed per session (the BR#3181 canonical invocation, made
+/// enforced). Serialized keys are camelCase per the recorded contract
+/// (packages/contracts/fixtures/identity-profiles.json); snake_case forms
+/// are accepted as aliases so hand-written configs of either shape load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IdentityProfile {
+    pub name: String,
+    pub email: String,
+    #[serde(rename = "signingKeyPath", alias = "signing_key_path")]
+    pub signing_key_path: String,
+    #[serde(
+        rename = "signingProgram",
+        alias = "signing_program",
+        default = "default_signing_program"
+    )]
+    pub signing_program: String,
+}
+
+fn default_signing_program() -> String {
+    "/usr/bin/ssh-keygen".into()
+}
+
+impl IdentityProfile {
+    /// The repo-local git config keys/values this profile writes at
+    /// worktree provisioning. Never touches global config: the shared
+    /// checkout (and the host's own commits) stay exactly as they were.
+    pub fn git_config(&self) -> [(&'static str, String); 6] {
+        [
+            ("user.name", self.name.clone()),
+            ("user.email", self.email.clone()),
+            ("user.signingkey", self.signing_key_path.clone()),
+            ("gpg.format", "ssh".into()),
+            ("gpg.ssh.program", self.signing_program.clone()),
+            ("commit.gpgsign", "true".into()),
+        ]
+    }
+}
+
+/// Built-in `worker` identity class (BR#3181 ruling, accepted): runner-
+/// dispatched agent sessions commit as detached-cody, signed with the
+/// sv-agents-signing key directly from file via plain ssh-keygen — no
+/// 1Password in the loop. Ray's personal signing path is never touched.
+/// Values mirror packages/contracts/fixtures/identity-profiles.json; the
+/// `builtin_worker_identity_matches_contract` test fails when they drift.
+pub fn builtin_worker_identity() -> IdentityProfile {
+    let home = std::env::var("HOME").unwrap_or_default();
+    IdentityProfile {
+        name: "detached-cody".into(),
+        email: "297316395+detached-cody@users.noreply.github.com".into(),
+        signing_key_path: format!("{home}/.ssh/sv-agents-signing.pub"),
+        signing_program: default_signing_program(),
+    }
+}
+
 impl DispatchConfig {
+    /// The git identity in force for this runner's dispatched sessions
+    /// (BR#3185). Precedence: an explicit `identity` config block (agent
+    /// config) wins; otherwise the built-in `worker` class applies — every
+    /// session the runner dispatches is a worker-class agent session (its
+    /// board attribution is the per-agent token provisioned under the
+    /// gateway; BR#2455's gateway/worker tag law is orthogonal to the git
+    /// committer identity). The profile is applied repo-locally in each
+    /// provisioned worktree — global git config is never written, so a
+    /// shared checkout keeps its own identity.
+    pub fn identity_profile(&self) -> IdentityProfile {
+        self.identity.clone().unwrap_or_else(builtin_worker_identity)
+    }
+
     /// Fold legacy flat fields (backends array + models/agents maps) into the
     /// backends dict. Idempotent; called from every load/resolve path.
     pub fn normalize(&mut self) {
@@ -256,6 +329,7 @@ impl DispatchConfig {
             agent_name: None,
             ws: None,
             gateway: None,
+            identity: None,
         })
     }
 
@@ -454,6 +528,7 @@ pub fn default_config() -> DispatchConfig {
         backends: Default::default(),
         models: None,
         agents: None,
+        identity: None,
     }
 }
 
@@ -1338,6 +1413,114 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
     cmd.output().map(|o| o.status.success()).unwrap_or(false).then_some(path)
 }
 
+/// Run a command with a hard deadline: kill on expiry and report. The sign
+/// check must never hang the dispatch loop (a misconfigured signingProgram —
+/// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
+/// not stall dispatch). ssh-keygen from file signs instantly; 15s is generous.
+fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
+    cmd.stdin(std::process::Stdio::null());
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait failed: {e}"));
+            }
+            Ok(None) => {
+                if started.elapsed() >= Duration::from_secs(secs) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "timed out after {secs}s — a signing program that blocks (locked agent, hung bridge) must fail loudly, never stall dispatch"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("try_wait failed: {e}")),
+        }
+    }
+}
+
+/// Write the identity profile into the repo-local git config (BR#3185).
+/// Idempotent; re-applied on resume. `git config` (no scope flag) writes at
+/// repo scope — for a linked worktree that is the owning clone's config,
+/// shared by that clone's worktrees; --global is never touched, so the
+/// host's own signing path stays exactly as it was.
+fn apply_identity(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), String> {
+    for (key, value) in p.git_config() {
+        let ok = Command::new("git")
+            .current_dir(worktree)
+            .args(["config", key, &value])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!("git config {key} failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Validation leg (BR#3185): prove the applied identity can actually sign
+/// BEFORE dispatching — one scratch sign through the profile's own program
+/// and key (`ssh-keygen -Y sign`, the same invocation git uses for
+/// gpg.format=ssh). A broken identity (missing key file, wrong program,
+/// locked agent) refuses the dispatch loudly here, killing the whole
+/// unsigned-PR bounce class at source. Refuses on hang too — a signing
+/// program that blocks must fail, never stall the dispatch loop.
+fn sign_check(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), String> {
+    // A detached worktree's private key sits beside its .pub sibling;
+    // ssh-keygen resolves the private half from the pub path's stem.
+    let _ = worktree;
+    let key = std::path::Path::new(&p.signing_key_path);
+    if !key.exists() {
+        return Err(format!(
+            "signing key not found: {} — provision the key or override the identity block in config",
+            p.signing_key_path
+        ));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "bridge-signcheck-{}-{}",
+        std::process::id(),
+        slugify(&p.name)
+    ));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("sign-check scratch dir: {e}"))?;
+    let payload = tmp.join("payload");
+    std::fs::write(&payload, "bridge: identity sign check (BR#3185)\n")
+        .map_err(|e| format!("sign-check payload: {e}"))?;
+    let out = run_with_timeout(
+        {
+            let mut c = Command::new(&p.signing_program);
+            c.args(["-Y", "sign", "-n", "git", "-f", &p.signing_key_path])
+                .arg(&payload);
+            c
+        },
+        15,
+    )
+    .map_err(|e| format!("sign check hung or failed: {e}"))?;
+    let sig = tmp.join("payload.sig");
+    let result = if !out.status.success() {
+        Err(format!(
+            "sign check failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    } else if !sig.exists() {
+        Err("sign check produced no signature".into())
+    } else {
+        Ok(())
+    };
+    // Scratch dir always cleaned — success or failure.
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
 /// Tear down a worktree: preserve any WIP onto `wip/<task>-<date>` first
 /// (the teardown sweep — losing tree state is the 10-24 incident), then
 /// deregister + remove it, and optionally drop the task branch.
@@ -1700,6 +1883,33 @@ fn spawn_opencode(
             snap_activity(snap, "error", &msg);
             return;
         }
+        // Identity leg (BR#3185): write the profile's repo-local git config and
+        // prove it can sign BEFORE dispatching. A failed sign check refuses the
+        // dispatch loudly — killing the unsigned-PR bounce class at source
+        // (BR#3042/BR#3134). Global git config is never touched: `git config`
+        // inside a linked worktree writes at repo scope into the runner's own
+        // clone (shared by that clone's worktrees) — the host checkout, the
+        // shared checkout, and the host's global config stay exactly as they were.
+        if let Some(wt) = &worktree {
+            let profile = cfg.identity_profile();
+            if let Err(e) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
+                let msg = format!(
+                    "ERROR: {tid}: identity profile failed — refusing to dispatch ({}). Fix the runner's identity config or provision the signing key.",
+                    e
+                );
+                eprintln!("[dispatch] {msg}");
+                snap_activity(snap, "error", &msg);
+                note_task(
+                    cfg,
+                    tid,
+                    &format!(
+                        "runner: identity profile failed — {} (task not dispatched; will retry next cycle)",
+                        e
+                    ),
+                );
+                return;
+            }
+        }
         worktree
     } else {
         None
@@ -1747,9 +1957,22 @@ fn spawn_opencode(
     } else {
         "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- Then follow the merge ladder: needs rebase → kick the task back to the pool (note it); base red in CI → block on a base-fix task (create or associate); mergeable + checks green + you agree → merge your own PR (`gh pr merge`) and cite the merge commit in the task.\n- An existing review that is unsatisfactory: sound-but-negative → pass feedback to the implementor, kick the task back; poor and rebuttable → raise a quality issue, merge anyway with a note; incomprehensible → escalate to the human via ask.\n- When finished, output a concise summary including the PR URL and the merge commit.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
     };
+    // Identity note (BR#3185): the dispatched session must know which git
+    // identity is in force — repo-local in this worktree, applied by the
+    // runner from the profile. Ad-hoc `-c` overrides drift the committer
+    // identity away from the class; the verify gate bounces that.
+    let identity = cfg.identity_profile();
+    let identity_note = if worktree.is_some() {
+        format!(
+            " Git identity for commits in this worktree is provisioned repo-locally by the runner from its identity profile (the built-in `worker` class unless overridden): commits as `{}` <{}>, signed with key `{}`. Do not override `user.name`, `user.email`, or `user.signingkey`; ad-hoc `-c` overrides drift the committer identity and the verify gate bounces that.",
+            identity.name, identity.email, identity.signing_key_path
+        )
+    } else {
+        String::new()
+    };
     let provisioning_line = if let Some(url) = &repo_url {
         if worktree.is_some() {
-            format!("- You are working in {run_dir} on branch `{branch}` (an isolated git worktree of {url}). On your first orient, pass worktree: \"{run_dir}\" so the board records where your tree lives (BR#3204).")
+            format!("- You are working in {run_dir} on branch `{branch}` (an isolated git worktree of {url}). On your first orient, pass worktree: \"{run_dir}\" so the board records where your tree lives (BR#3204).{identity_note}")
         } else {
             format!(
                 "- You are working in {run_dir} — the SHARED checkout of {url} (per-task worktrees are deliberately skipped for this dispatch: short, surgical changes only).\n  - Shared-checkout rules in force: verify by content, never `git add -A` (stage explicit paths), never switch branches mid-session, and re-read files before building on them — other sessions share this tree."
@@ -3105,6 +3328,213 @@ mod tests {
             .count()
             >= 2;
         assert!(keeps_named, "both auto-logout reasons must say what re-pairing keeps (hub URL + settings)");
+    }
+
+    // ---- BR#3185: identity profiles -----------------------------------------
+
+    /// The recorded contract (packages/contracts/fixtures/identity-profiles.json).
+    /// The built-in worker class must equal it exactly — drift here silently
+    /// re-brands every runner-dispatched commit.
+    const IDENTITY_PROFILES_FIXTURE: &str =
+        include_str!("../../../contracts/fixtures/identity-profiles.json");
+
+    #[test]
+    fn builtin_worker_identity_matches_contract_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(IDENTITY_PROFILES_FIXTURE).expect("identity-profiles fixture parses");
+        let worker = fixture
+            .pointer("/classes/worker")
+            .expect("fixture records the built-in worker class");
+        let profile = builtin_worker_identity();
+        assert_eq!(profile.name, worker["name"].as_str().unwrap(), "worker-class name drift");
+        assert_eq!(profile.email, worker["email"].as_str().unwrap(), "worker-class email drift");
+        assert_eq!(
+            profile.signing_program,
+            worker["signingProgram"].as_str().unwrap(),
+            "worker-class signing program drift"
+        );
+        // the fixture records ~-relative paths; the runner resolves them
+        // against $HOME at provisioning time
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            profile.signing_key_path,
+            worker["signingKeyPath"].as_str().unwrap().replace('~', &home),
+            "worker-class signing key drift"
+        );
+        // every key the fixture says provisioning writes is one git_config emits
+        for key in fixture
+            .pointer("/provisioning/writes")
+            .and_then(|w| w.as_array())
+            .expect("fixture lists the provisioning writes")
+        {
+            let key = key.as_str().unwrap().split('=').next().unwrap();
+            assert!(
+                profile.git_config().iter().any(|(k, _)| *k == key),
+                "fixture provisioning key `{key}` is not written by the profile"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_precedence_explicit_block_beats_builtin_worker_class() {
+        let explicit = IdentityProfile {
+            name: "ci-bot".into(),
+            email: "ci-bot@example.com".into(),
+            signing_key_path: "/keys/ci.pub".into(),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        };
+        let cfg = default_config();
+        assert_eq!(
+            cfg.identity_profile(),
+            builtin_worker_identity(),
+            "no explicit identity block = built-in worker class (BR#3181)"
+        );
+        let mut cfg = default_config();
+        cfg.identity = Some(explicit.clone());
+        assert_eq!(cfg.identity_profile(), explicit, "explicit identity block wins");
+    }
+
+    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bridge-identity-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp repo dir");
+        let ok = Command::new("git")
+            .current_dir(&dir)
+            .args(["init", "-q"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init must succeed for the identity test scratch repo");
+        dir
+    }
+
+    fn git_global_config_list() -> String {
+        Command::new("git")
+            .args(["config", "--global", "--list"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn apply_identity_writes_repo_local_config_and_leaves_global_alone() {
+        let repo = temp_git_repo("apply");
+        let profile = IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: "/keys/sv-agents-signing.pub".into(),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        };
+        let global_before = git_global_config_list();
+        apply_identity(&repo, &profile).expect("identity applied");
+        assert_eq!(
+            git_global_config_list(),
+            global_before,
+            "apply_identity must never write global git config"
+        );
+        // every profile key is readable from the repo's own config, with the
+        // exact value the profile carried
+        for (key, value) in profile.git_config() {
+            let got = Command::new("git")
+                .current_dir(&repo)
+                .args(["config", "--get", key])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            assert_eq!(got, value, "repo-local `{key}` must carry the profile value");
+        }
+        // idempotent: re-apply on resume neither errors nor corrupts
+        apply_identity(&repo, &profile).expect("re-apply idempotent");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn throwaway_signing_key(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bridge-signkey-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("key dir");
+        let key = dir.join("sv-agents-signing");
+        let ok = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+            .arg(&key)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "throwaway ed25519 keypair must generate");
+        dir.join("sv-agents-signing.pub")
+    }
+
+    #[test]
+    fn sign_check_proves_a_working_identity_can_sign() {
+        let key = throwaway_signing_key("good");
+        let profile = IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: key.to_string_lossy().to_string(),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        };
+        sign_check(key.parent().unwrap(), &profile)
+            .expect("a sound identity must pass the sign check");
+    }
+
+    #[test]
+    fn sign_check_refuses_a_missing_key() {
+        let profile = IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: format!("/nonexistent/bridge-signcheck-{}.pub", std::process::id()),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        };
+        let scratch = std::env::temp_dir();
+        let err = sign_check(&scratch, &profile).expect_err("missing key must refuse the dispatch");
+        assert!(
+            err.contains("signing key not found"),
+            "refusal must name the missing key: {err}"
+        );
+    }
+
+    #[test]
+    fn sign_check_refuses_a_program_that_cannot_sign() {
+        let key = throwaway_signing_key("badprog");
+        let scratch = key.parent().unwrap().to_path_buf();
+        let base = IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: key.to_string_lossy().to_string(),
+            signing_program: String::new(),
+        };
+        // (a) a program that exits non-zero
+        let mut p = base.clone();
+        p.signing_program = "/usr/bin/false".into();
+        let err = sign_check(&scratch, &p).expect_err("a failing program must refuse");
+        assert!(err.contains("sign check failed"), "refusal explains the failure: {err}");
+        // (b) a program that exits 0 but signs nothing — the sneaky class
+        let mut p = base;
+        p.signing_program = "/bin/echo".into();
+        let err = sign_check(&scratch, &p).expect_err("exit-0 without a signature must refuse");
+        assert!(
+            err.contains("no signature"),
+            "refusal names the missing signature: {err}"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_hung_program() {
+        // a program that blocks (the locked-1Password-agent class) must be
+        // killed at the budget, never stall dispatch
+        let mut hung = Command::new("sleep");
+        hung.arg("30");
+        let err = run_with_timeout(hung, 1).expect_err("a hung program must hit the deadline");
+        assert!(
+            err.contains("timed out after 1s"),
+            "timeout names the budget: {err}"
+        );
+        // a quick program still returns its real output through the same path
+        let mut quick = Command::new("echo");
+        quick.arg("bridge");
+        let out = run_with_timeout(quick, 5).expect("a quick program completes");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bridge");
     }
 }
 

@@ -219,6 +219,12 @@ export function ConnectView() {
                     {workers.length === 0 && <span className="muted-note">none</span>}
                     {workers.map((w) => (
                       <div key={w.id} title={`provisioned worker — last seen ${w.last_seen_ts ? rel(w.last_seen_ts) : "never"}`}>
+                        <Chip
+                          tone="scope"
+                          title="identity class: worker (BR#2455) — runner-provisioned; commits are signed by the runner's configured identity, built-in: detached-cody <297316395+detached-cody@users.noreply.github.com> (BR#3181/BR#3185)"
+                        >
+                          worker
+                        </Chip>{" "}
                         {w.label}{" "}{w.revoked_ts ? <span className="login-error">(revoked)</span> : <span className="ok">(active)</span>}
                       </div>
                     ))}
