@@ -691,6 +691,9 @@ fn doctor() -> bool {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok();
+    // model route check (BR#3055): fetched once, lazily — only when some
+    // backend pins a model and we have a token to authenticate with.
+    let mut served_models: Option<Result<Vec<String>, String>> = None;
     if let Some(client) = &client {
         match client.get(format!("{}/__version", cfg.url.trim_end_matches('/'))).send() {
             Ok(resp) if resp.status().is_success() => {
@@ -724,14 +727,63 @@ fn doctor() -> bool {
                 Err(e) => ok("token valid", &format!("probe failed: {e}"), &mut bad, false),
             }
         }
+        if model_to_check(&cfg).is_some() {
+            let url = format!("{}/v1/models", cfg.url.trim_end_matches('/'));
+            let probe = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", cfg.token))
+                .send();
+            served_models = Some(match probe {
+                Ok(r) if r.status().is_success() => {
+                    let ct = r
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("?")
+                        .to_string();
+                    match r.text() {
+                        Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(v) => Ok(extract_model_ids(&v)),
+                            Err(e) => {
+                                let head: String = body.chars().take(120).collect();
+                                Err(format!(
+                                    "hub /v1/models returned an unparseable body ({e}; content-type {ct}; starts with: {head:?})"
+                                ))
+                            }
+                        },
+                        Err(e) => Err(format!("hub /v1/models body unreadable ({e})")),
+                    }
+                }
+                Ok(r) => Err(format!("hub /v1/models returned {} — cannot confirm the model route", r.status())),
+                Err(e) => Err(format!("probe failed: {e}")),
+            });
+        }
     }
 
     // per-provider sections: model optional (unset = the CLI's own default
-    // config decides for opencode; kiro profiles pin provider+model)
+    // config decides for opencode; kiro profiles pin provider+model). A set
+    // model is checked against the hub proxy's /v1/models — a pinned id the
+    // proxy doesn't serve fails every dispatch downstream, so it's a named
+    // FAIL here, not green (BR#3055, BR#2843 spec item 3).
     let backends = &cfg.backends;
     for (b, section) in backends {
         match &section.model {
-            Some(m) if !m.trim().is_empty() => println!("  \x1b[32mok\x1b[0m   model[{b}] = {m}"),
+            Some(m) if !m.trim().is_empty() => match &served_models {
+                Some(Ok(ids)) if model_resolves(ids, m) => {
+                    println!("  \x1b[32mok\x1b[0m   model[{b}] = {m} (resolvable via the hub proxy /v1/models)")
+                }
+                Some(Ok(ids)) => {
+                    println!(
+                        "  \x1b[31mFAIL\x1b[0m  model[{b}] = {m} — not served by the hub proxy /v1/models ({} id(s) listed) — every dispatch pinned to it fails; fix \"backends.{b}.model\"",
+                        ids.len()
+                    );
+                    bad = true;
+                }
+                Some(Err(reason)) => {
+                    println!("  \x1b[33mwarn\x1b[0m  model[{b}] = {m} — {reason}");
+                }
+                None => println!("  \x1b[32mok\x1b[0m   model[{b}] = {m}"),
+            },
             _ => println!("  \x1b[33mwarn\x1b[0m  model[{b}] — not set; the CLI's own default config decides (set \"backends.{b}.model\" to pin spend)"),
         }
     }
@@ -841,6 +893,52 @@ fn doctor() -> bool {
         println!("\nready — `bridge run` to start, or `bridge service install` to run it under systemd");
     }
     bad
+}
+
+/// The model id the doctor should check against the hub proxy, if any: the
+/// first configured backend model that is actually set. Probe runs at most
+/// once per doctor invocation.
+fn model_to_check(cfg: &DispatchConfig) -> Option<String> {
+    cfg.backends
+        .values()
+        .filter_map(|s| s.model.clone())
+        .map(|m| m.trim().to_string())
+        .find(|m| !m.is_empty())
+}
+
+/// Model ids served by the hub proxy. OpenAI-compatible shape
+/// (`{"data":[{"id":...},...]}`); tolerates a bare `{"models":[...]}` array.
+fn extract_model_ids(v: &serde_json::Value) -> Vec<String> {
+    let from_entries = |arr: &[serde_json::Value]| -> Vec<String> {
+        arr.iter()
+            .filter_map(|m| {
+                m.as_str()
+                    .map(String::from)
+                    .or_else(|| m.get("id").and_then(|i| i.as_str()).map(String::from))
+            })
+            .collect()
+    };
+    if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
+        from_entries(data)
+    } else if let Some(models) = v.get("models").and_then(|d| d.as_array()) {
+        from_entries(models)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Does the proxy serve `configured`? Matches the full id exactly, or by the
+/// provider-stripped model part on both sides (`sp-gateway/glm` ≡ `glm`) —
+/// the proxy IS the provider, so its id listing may carry a namespace prefix
+/// the config omits (or vice versa).
+fn model_resolves(served: &[String], configured: &str) -> bool {
+    fn short(s: &str) -> &str {
+        s.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(s)
+    }
+    let configured = configured.trim();
+    served
+        .iter()
+        .any(|id| id.trim() == configured || short(id.trim()) == short(configured))
 }
 
 /// systemd user unit (linux): run forever, restart on failure, survive logout.
@@ -992,6 +1090,39 @@ mod tests {
         let sh = which("sh").unwrap();
         assert_eq!(which(sh.to_str().unwrap()).as_deref(), Some(sh.as_path()));
         assert_eq!(which("bridge-definitely-not-a-bin-2633"), None);
+    }
+
+    #[test]
+    fn model_resolves_matches_full_and_provider_stripped_ids() {
+        // BR#3055: a configured id must be recognised whether the proxy lists
+        // it verbatim or provider-qualified (and vice versa).
+        let served = vec![
+            "sp-gateway/glm-5.3-flash".to_string(),
+            "eu.amazon.nova-lite-v1:0".to_string(),
+        ];
+        assert!(model_resolves(&served, "sp-gateway/glm-5.3-flash")); // exact
+        assert!(model_resolves(&served, "glm-5.3-flash")); // config omits provider
+        assert!(model_resolves(&served, "eu.amazon.nova-lite-v1:0"));
+        assert!(!model_resolves(&served, "no-such-model")); // unresolvable → FAIL
+        assert!(!model_resolves(&[], "sp-gateway/glm-5.3-flash"));
+        // a DIFFERENT provider serving the same model name is still a match
+        // (the proxy routes it); only the model part must exist
+        assert!(model_resolves(&["other/glm-5.3-flash".to_string()], "sp-gateway/glm-5.3-flash"));
+    }
+
+    #[test]
+    fn extract_model_ids_reads_openai_shape_and_tolerates_variants() {
+        let openai: serde_json::Value = serde_json::json!({
+            "object": "list",
+            "data": [{"id": "sp-gateway/glm-5.3-flash"}, {"id": "glm-4.7"}]
+        });
+        assert_eq!(extract_model_ids(&openai).len(), 2);
+        let bare: serde_json::Value = serde_json::json!({ "models": ["glm-5.3-flash"] });
+        assert_eq!(extract_model_ids(&bare), vec!["glm-5.3-flash".to_string()]);
+        let empty: serde_json::Value = serde_json::json!({ "object": "list", "data": [] });
+        assert!(extract_model_ids(&empty).is_empty());
+        let junk: serde_json::Value = serde_json::json!({ "unexpected": true });
+        assert!(extract_model_ids(&junk).is_empty());
     }
 }
 
