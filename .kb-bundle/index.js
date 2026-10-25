@@ -153,6 +153,7 @@ function composeBootstrap(projectName, board) {
     `5. Status is your responsibility: claim \u2192 in_progress immediately; finish \u2192 in_review with the PR link in the note; stuck \u2192 blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict \u2014 bounce = action the findings; done = released. Gates are enforced \u2014 unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions \u2014 every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (PR, findings) and cite receipts in the note \u2014 a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `5c. VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident). Verification agents: BEFORE any substance check, confirm the PR is mechanically mergeable \u2014 gh pr view --json mergeable,mergeStateStatus,reviewDecision AND every commit signature isValid=true. mergeable=false / CONFLICTING / any unsigned or NO_USER commit \u2192 STOP: zero substance checks, and bounce the parent to in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push"). Never file a human ask for a mechanical defect, never report "verified, awaiting merge" for an unmergeable PR (false report \u2014 it has zero verified legs), and never treat "accept the unsigned commit" as an option (the ruleset forbids it by construction). The ONLY escalation to a human: a broken signing environment (key unavailable / NO_USER) \u2014 one ask describing the environment covers the whole class, never one per PR.`,
+    `5d. ONE EXECUTOR PER TASK: every in_progress task is owned by exactly one session (orient exposes executor_session on open cards \u2014 check it before you touch a card). If your claim transition loses the claim race (rejected: another session holds in_progress), you are NOT the executor \u2014 do not execute the work anyway, do not contribute state changes "in parallel", stand down and end your run. Concurrent executor sessions doing the same legs are how duplicate PRs and double closes happen (the BR#3348 class); the hub audits a state-changing op by a non-holder while the holder is alive (duplicate_executor), and repeated audited breaches are scored as divergent work.`,
     `6. Blocked on a decision \u2192 ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' \u2014 answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation \u2014 consensus among agents escalates to them for the last say.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
@@ -160,7 +161,7 @@ function composeBootstrap(projectName, board) {
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it \u2192 todo (retry) \u2014 that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every \u226410 min. 4. LONG OP: declare silence \u2014 grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} \u2014 a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts \u2014 mergeability first (2026-10-23 rule).`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every \u226410 min. 4. LONG OP: declare silence \u2014 grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} \u2014 a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts \u2014 mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor \u2014 you are not; end your run, never execute a task you don't own.`,
     `Scoring: orient returns my_score \u2014 it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1\u20138.`
   ];
   if (board.mode === "external") {
@@ -683,6 +684,164 @@ var init_provenance = __esm({
   }
 });
 
+// src/kb/closure.ts
+function cutDutyClauses(line) {
+  let cut = line;
+  for (const m of DUTY_MARKERS) {
+    const hit = m.exec(cut);
+    if (hit) cut = cut.slice(0, hit.index);
+  }
+  return cut;
+}
+function repoFromLine(line) {
+  const m = /github\.com\/([\w.-]+)\/([\w.-]+)/.exec(line);
+  return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
+}
+function numberFromPullUrl(line) {
+  const m = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/.exec(line);
+  return m ? Number(m[1]) : null;
+}
+function parseProxyCondition(text2) {
+  const atoms = [];
+  let unparseable = false;
+  const duty = cutDutyClauses(String(text2 ?? ""));
+  for (const rawLine of duty.split(/\r?\n|(?<=;)\s*/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const repo = repoFromLine(line);
+    let lineYielded = false;
+    if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+      const urlN = numberFromPullUrl(line);
+      const bare = /PR\s+#?(\d+)\b/.exec(line);
+      const prNumber = urlN ?? (bare ? Number(bare[1]) : null);
+      if (prNumber) {
+        atoms.push({ kind: "pr_merged", repo, number: prNumber, raw: line.trim().slice(0, 200) });
+        lineYielded = true;
+      }
+    }
+    if (!lineYielded) {
+      const br = /\bBR#(\d+)\b/.exec(line);
+      if (br && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+        atoms.push({ kind: "br_pr_merged", repo, brId: `BR#${br[1]}`, raw: line.trim().slice(0, 200) });
+        lineYielded = true;
+      }
+    }
+    const issueClosed = /(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/i.exec(line);
+    if (issueClosed) {
+      const n = Number(issueClosed[1]);
+      atoms.push({ kind: "issue_closed", repo, number: n, raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const brDone = /\bBR#(\d+)\s+(?:is\s+)?done\b/i.exec(line);
+    if (brDone) {
+      atoms.push({ kind: "br_done", repo: null, brId: `BR#${brDone[1]}`, raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const runOk = /\brun\s+(\d{6,})\b/.exec(line);
+    if (runOk && /\b(?:SUCCESS|success|green)\b/.test(line)) {
+      atoms.push({ kind: "run_success", repo, runId: runOk[1], raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const checks = /green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/i.exec(line);
+    if (checks) {
+      atoms.push({ kind: "pr_checks_green", repo, number: Number(checks[1]), raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
+  }
+  return { atoms, unparseable };
+}
+function parseCloseLegs(text2) {
+  const byRepo = /* @__PURE__ */ new Map();
+  const bare = /* @__PURE__ */ new Map();
+  for (const re of CLOSE_PATTERNS) {
+    re.lastIndex = 0;
+    for (const m of String(text2 ?? "").matchAll(re)) {
+      if (m[3] !== void 0) byRepo.set(Number(m[3]), { repo: `${m[1]}/${m[2]}`, number: Number(m[3]), raw: m[0] });
+      else bare.set(Number(m[1]), { repo: null, number: Number(m[1]), raw: m[0] });
+    }
+  }
+  for (const [n, leg] of bare) if (!byRepo.has(n)) byRepo.set(n, leg);
+  return [...byRepo.values()];
+}
+function doneWhenSection(bodyMd) {
+  const body = String(bodyMd ?? "");
+  const m = /^##\s*done\s*when\b.*$/im.exec(body);
+  if (!m) return "";
+  const rest = body.slice(m.index + m[0].length);
+  const next = /\n##\s/.exec(rest);
+  return next ? rest.slice(0, next.index) : rest;
+}
+function receiptWindow(note, leg) {
+  const windows = [];
+  const needle = String(leg.number);
+  for (const m of note.matchAll(new RegExp(`(?:issues/${needle}\\b|#\\s*${needle}\\b)`, "g"))) {
+    const at = m.index;
+    const post = note.slice(at, at + 600);
+    windows.push({ w: note.slice(Math.max(0, at - 120), at + 600), post });
+  }
+  if (!windows.length) windows.push({ w: note, post: note });
+  return windows;
+}
+function extractCommentId(w) {
+  return /issuecomment-(\d{6,})/.exec(w)?.[1] ?? /closing[- ](?:comment|id)\s*[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? /comment\s+(?:id\s*)?[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? null;
+}
+function extractGuardRun(w) {
+  return /guard\s*run\s*[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? /actions\/runs\/(\d{6,})/.exec(w)?.[1] ?? (/guard\s*=\s*allow|guard\s+run\s+[^.\n]{0,80}\ballow\b/i.test(w) ? "allow" : null) ?? (/guard\s*run\s*[:#]?\s*n\/a/i.test(w) ? "n/a" : null);
+}
+function parseClosureReceipt(note, leg) {
+  for (const { w, post } of receiptWindow(String(note ?? ""), leg)) {
+    const closed = /state\s*[=:]\s*["']?closed/i.test(w) || /closedAt\b/i.test(w) || /(?:^|[^a-z-])CLOSED\b/.test(w) || /issues\/\d+[#\s][^]{0,200}?\bstate\b[^\n]{0,24}closed/i.test(w);
+    if (!closed) continue;
+    return {
+      closed: true,
+      commentId: extractCommentId(post) ?? extractCommentId(w),
+      guardRun: extractGuardRun(post) ?? extractGuardRun(w)
+    };
+  }
+  return null;
+}
+function legLabel(leg) {
+  return `${leg.repo ?? "GH"}#${leg.number}`;
+}
+var LOOKS_MACHINE, DUTY_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT;
+var init_closure = __esm({
+  "src/kb/closure.ts"() {
+    LOOKS_MACHINE = /\b(?:PR\s?#|pull\/\d+|mergeCommit|MERGED|GH\s?#|GH#\d|issue\s?#?\d|BR#\d|run\s+\d{6,}|check\s+run|actions\/runs\/\d)/i;
+    DUTY_MARKERS = [
+      /\bthen\s+an?\s+\S+\s+session\b/i,
+      /\bthen\s+an?\s+agent\b/i,
+      /\bthen\s+transition\b/i,
+      /\bciting\b/i,
+      /\balternative\s+proxy\b/i,
+      /\bexit\s+condition\s+of\s+record\b/i
+    ];
+    __name(cutDutyClauses, "cutDutyClauses");
+    __name(repoFromLine, "repoFromLine");
+    __name(numberFromPullUrl, "numberFromPullUrl");
+    __name(parseProxyCondition, "parseProxyCondition");
+    CLOSE_PATTERNS = [
+      /\bclose(?:s|d)?\s+(?:the\s+)?(?:GH\s?#|GH#|issue\s+#)(\d+)/gi,
+      /\bclose(?:s|d)?\s+(?:the\s+)?#(\d+)\b/gi,
+      /\bclose(?:s|d)?\s+(?:the\s+)?(?:issue\s+)?https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)/gi,
+      // Receipt-shaped claims ARE close claims: "GH #2274 CLOSED/COMPLETED",
+      // "GH#2337 fully closed" (BR#3220's false note — lowercase, sloppy shape).
+      // Triggering the leg demand is the safe direction; the receipt parser above
+      // stays strict about what satisfies it.
+      /\b(?:GH\s?#|GH#|issue\s+#)(\d+)\s*(?:is\s+)?(?:now\s+)?(?:CLOSED|COMPLETED)\b/g,
+      /\b(?:GH\s?#|GH#|issue\s+#)(\d+)[^.\n]{0,24}?\bclosed\b/gi
+    ];
+    __name(parseCloseLegs, "parseCloseLegs");
+    __name(doneWhenSection, "doneWhenSection");
+    RECEIPT_CONTRACT = "state=closed + closing-comment id (or the comment URL) + guard run id (or n/a)";
+    __name(receiptWindow, "receiptWindow");
+    __name(extractCommentId, "extractCommentId");
+    __name(extractGuardRun, "extractGuardRun");
+    __name(parseClosureReceipt, "parseClosureReceipt");
+    __name(legLabel, "legLabel");
+  }
+});
+
 // src/kb/machine.ts
 function effectiveRole(roles) {
   if (roles.includes("review")) return "review";
@@ -900,6 +1059,7 @@ var VERDICT_ROLES, HUMAN_ACTOR, OWNER_RELEASE_EXEMPT, role, isTask, noteOf, hasE
 var init_machine = __esm({
   "src/kb/machine.ts"() {
     init_core();
+    init_closure();
     __name(effectiveRole, "effectiveRole");
     VERDICT_ROLES = ["review", "unblock"];
     HUMAN_ACTOR = /^web(:|$)|^human:/;
@@ -1033,6 +1193,30 @@ var init_machine = __esm({
           const open = await c.openChildren();
           return open > 0 ? `parent ${i.id} still has ${open} open child task(s) \u2014 finish or close them first (decomposition owns its children)` : null;
         }, "guard")
+      },
+      {
+        // BR#3361 (b)+(c): terminal close-leg ownership + the closure receipt.
+        // A done card whose Done-when (or done note) ends in "close GH #N" must
+        // either carry the receipt for every leg it claims, or own the leg with
+        // a CLOSED close-duty child. Retrying the done auto-derives the child
+        // (do.ts executes that on this rejection) — no orphan terminal legs.
+        name: "done-close-legs",
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done", "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
+          const note = noteOf(i);
+          const legs = parseCloseLegs(`${doneWhenSection(await c.cardBody())}
+${note}`);
+          if (!legs.length) return null;
+          const unowned = [];
+          for (const leg of legs) {
+            if (parseClosureReceipt(note, leg)?.closed) continue;
+            if (await c.closeLegChildClosed(leg)) continue;
+            unowned.push(leg);
+          }
+          if (!unowned.length) return null;
+          const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
+          return `terminal close leg(s) not receipted: ${labeled} \u2014 a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
+        }, "guard")
       }
     ];
     __name(decide, "decide");
@@ -1150,6 +1334,7 @@ var init_do = __esm({
     init_throughput();
     init_provenance();
     init_machine();
+    init_closure();
     init_rollup();
     STOP_LINE_SINK_ID = "BR#3124";
     KnowledgeHub = class _KnowledgeHub {
@@ -1434,6 +1619,16 @@ var init_do = __esm({
           rollup = await this.rootBlockerRollup(now);
         } catch (e) {
           this.audit("system:watchdog", "sweep_error", "root_blocker_rollup", { error: String(e.message ?? e).slice(0, 300) });
+        }
+        try {
+          await this.unblockProxySweep(now);
+        } catch (e) {
+          this.audit("hub:proxy-watch", "sweep_error", "unblock_proxy_sweep", { error: String(e.message ?? e).slice(0, 300) });
+        }
+        try {
+          await this.closureAuditSweep(now);
+        } catch (e) {
+          this.audit("hub:closure-audit", "sweep_error", "closure_audit_sweep", { error: String(e.message ?? e).slice(0, 300) });
         }
         const nextAlarm = await this.state.storage.getAlarm();
         this.state.storage.sql.exec(
@@ -1979,6 +2174,334 @@ ${detail?.body ?? ""}`);
           `session ${rec.session ?? "\u2014"}`,
           `signer ${rec.signer ?? "unknown"}`
         ].join(" \xB7 ");
+      }
+      // ---------- unblock-proxy watch (BR#3361a) ----------
+      // The BR#3129 class: a parked card's machine-checkable unblock_condition
+      // flipped TRUE (its PR merged) and NOBODY noticed for ~20h — unblock duties
+      // only re-ran when a human-dispatched sweep happened to look. This sweep
+      // re-evaluates machine-checkable proxies periodically and auto-spawns the
+      // unblock duty on the flip.
+      //
+      // Conservatism: the sweep is a TRIGGER, not an authority. It flips a card
+      // only when parseProxyCondition extracted atoms for the WHOLE condition and
+      // every atom evaluated TRUE against live state; anything it cannot fully
+      // read is stamped unparseable/unresolvable and never auto-flips. The
+      // spawned duty re-verifies first-hand (its contract says so).
+      //
+      // Settings: `unblock_proxy_sweep_minutes` (default 15, 0 = off),
+      // `unblock_proxy_gh_api_base` (default https://api.github.com — drills),
+      // `unblock_proxy_default_repo` (bare-number fallback for live checks).
+      proxyGhGet(base, token, setBackoff, now) {
+        return async (repo, path) => {
+          const headers = token ? { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "bridge-proxy-watch (BR#3361)" } : { "User-Agent": "bridge-proxy-watch (BR#3361)", "Accept": "application/vnd.github+json" };
+          const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
+          if (res.status === 403 || res.status === 429) {
+            setBackoff(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          return { ok: res.ok, status: res.status, body: res.ok ? await res.json() : null };
+        };
+      }
+      /** Live verdict for one proxy atom. `receipt` is the evidence line that
+       *  rides the spawned duty's body (and the per-card stamp). */
+      async evalProxyAtom(atom, io) {
+        const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
+        const brBranch = (atom.brId ?? "").replace("#", "-");
+        switch (atom.kind) {
+          case "br_done": {
+            const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, atom.brId);
+            if (!row) return { ok: false, receipt: `${atom.brId} not found on this board` };
+            const done = row.status === "done" || row.status === "superseded";
+            return { ok: done, receipt: `${atom.brId} status=${row.status}` };
+          }
+          case "pr_merged": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
+            if (!res.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
+            const merged = !!res.body?.merged_at;
+            return { ok: merged, receipt: merged ? `PR ${atom.repo}#${atom.number} MERGED at ${res.body.merged_at}` : `PR ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}, not merged` };
+          }
+          case "br_pr_merged": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/pulls?head=${atom.repo}:bridge/${brBranch}&state=all&per_page=20`);
+            if (!res.ok) return { ok: false, receipt: `PR lookup for ${atom.brId} HTTP ${res.status}` };
+            const pr = (Array.isArray(res.body) ? res.body : []).find((p) => String(p.head?.ref ?? "") === `bridge/${brBranch}`);
+            if (!pr) return { ok: false, receipt: `no PR with head branch bridge/${brBranch} (${atom.brId})` };
+            const merged = !!pr.merged_at;
+            return { ok: merged, receipt: merged ? `PR ${atom.repo}#${pr.number} for ${atom.brId} MERGED at ${pr.merged_at}` : `PR ${atom.repo}#${pr.number} for ${atom.brId} not merged` };
+          }
+          case "issue_closed": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/issues/${atom.number}`);
+            if (!res.ok) return { ok: false, receipt: `issue ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
+            const closed = res.body?.state === "closed";
+            return { ok: closed, receipt: `issue ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}` };
+          }
+          case "run_success": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/actions/runs/${atom.runId}`);
+            if (!res.ok) return { ok: false, receipt: `run ${atom.runId} lookup HTTP ${res.status}` };
+            const ok = res.body?.status === "completed" && res.body?.conclusion === "success";
+            return { ok, receipt: `run ${atom.runId} status=${res.body?.status ?? "?"} conclusion=${res.body?.conclusion ?? "?"}` };
+          }
+          case "pr_checks_green": {
+            if (!atom.repo) return unresolvable;
+            const pr = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
+            if (!pr.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${pr.status}` };
+            const sha = String(pr.body?.head?.sha ?? "");
+            if (!/^[0-9a-f]{40}$/.test(sha)) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} head sha unavailable` };
+            const runs = await io.ghGet(atom.repo, `/commits/${sha}/check-runs?per_page=100`);
+            if (!runs.ok) return { ok: false, receipt: `check-runs lookup HTTP ${runs.status}` };
+            const verdict = classifyMainCheckRuns(Array.isArray(runs.body?.check_runs) ? runs.body.check_runs : []).verdict;
+            return { ok: verdict === "green", receipt: `PR ${atom.repo}#${atom.number} head ${sha.slice(0, 9)} checks verdict=${verdict}` };
+          }
+        }
+      }
+      /** Stamp meta.proxy_check on a blocked card; audit ONLY when the verdict
+       *  changed (a stable false must not churn the Log every cycle). */
+      stampProxyCheck(id, meta, now, verdict, detail, prev, extra) {
+        meta.proxy_check = { at: now, verdict, ...detail ? { detail } : {}, ...extra ?? {} };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+        if (!prev || prev.verdict !== verdict) {
+          this.audit("hub:proxy-watch", "proxy_check", id, { verdict, detail: detail?.slice(0, 300) });
+        }
+      }
+      async unblockProxySweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("unblock_proxy_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("unblock_proxy_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('unblock_proxy_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const base = this.settingValue("unblock_proxy_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const token = this.env.GH_TOKEN;
+        const defaultRepo = this.settingValue("unblock_proxy_default_repo", "state-vector/superpositional");
+        const ghGet = this.proxyGhGet(base, token, setLast, now);
+        const rows = this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`
+        ).toArray();
+        for (const r of rows) {
+          try {
+            const meta = JSON.parse(r.meta ?? "{}");
+            const cond = String(meta.blocked?.unblock_condition ?? "").trim();
+            if (!cond) continue;
+            const prev = meta.proxy_check;
+            if (prev?.at && now - Number(prev.at) < periodMin * 6e4) continue;
+            const { atoms, unparseable } = parseProxyCondition(cond);
+            if (!atoms.length) {
+              this.stampProxyCheck(
+                r.id,
+                meta,
+                now,
+                unparseable ? "unparseable" : "no_atoms",
+                unparseable ? "condition mentions machine state but no atom parsed \u2014 never auto-flips" : null,
+                prev
+              );
+              continue;
+            }
+            const results = [];
+            for (const atom of atoms) results.push({ atom, ...await this.evalProxyAtom(atom, { ghGet, defaultRepo }) });
+            const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
+            if (unparseable || unresolvable) {
+              this.stampProxyCheck(
+                r.id,
+                meta,
+                now,
+                unparseable ? "unparseable" : "unresolvable",
+                "condition partially machine-checkable \u2014 the sweep never flips a card it cannot fully read",
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) }
+              );
+              continue;
+            }
+            if (!results.some((x) => x.ok)) {
+              this.stampProxyCheck(
+                r.id,
+                meta,
+                now,
+                "false",
+                null,
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) }
+              );
+              continue;
+            }
+            const openChild = this.one(
+              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+              r.id
+            );
+            const lastSpawn = meta.last_unblock_spawn;
+            const flooded = lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS && String(lastSpawn.exit ?? "") === cond;
+            if (openChild || flooded) {
+              this.stampProxyCheck(
+                r.id,
+                meta,
+                now,
+                "true",
+                null,
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" }
+              );
+              if (prev?.verdict !== "true") {
+                this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
+              }
+              continue;
+            }
+            const ts = Date.now();
+            const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
+            const atomLines = results.map((x) => `- "${x.atom.raw}" \u2192 ${x.receipt}`).join("\n");
+            const created = await this.create(
+              {
+                type: "task",
+                title: `Unblock: ${rootTitle.slice(0, 190)}`,
+                session: "",
+                // session-less spawn: the closer stamps it when they claim
+                body_md: `Unblock duty for ${r.id} \u2014 "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).
+
+Blocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.
+Exit condition: ${cond}
+
+MACHINE PROXY \u2014 the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):
+${atomLines}
+
+The predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first \u2014 this sweep is a trigger, not an authority), transition ${r.id} \u2192 in_progress with the resolution note, then close yourself done citing these receipts.
+
+Contract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
+                roles: ["unblock"]
+              },
+              "hub:proxy-watch"
+            );
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+              created.id,
+              r.id,
+              ts
+            );
+            meta.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
+            this.stampProxyCheck(
+              r.id,
+              meta,
+              now,
+              "true",
+              null,
+              prev,
+              { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: created.id }
+            );
+            this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, atoms: results.map((x) => x.receipt) });
+            this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE \u2014 unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
+          } catch (e) {
+            this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
+      }
+      // ---------- closure-receipt audit (BR#3361c) ----------
+      // The BR#3220 class: a DONE card reported "GH#2337 fully closed" while the
+      // issue was OPEN on GitHub — the board reported a closed issue that wasn't.
+      // The done gate (done-close-legs) makes receipts mandatory at done time;
+      // THIS sweep makes them TRUE: it live-verifies every receipted close leg
+      // (issue state + closing comment + guard run) after the done and files a
+      // correction duty on any false claim.
+      //
+      // Settings: `closure_audit_minutes` (default 30, 0 = off),
+      // `closure_audit_gh_api_base` (drills), `closure_audit_default_repo`
+      // (bare-number legs resolve here for live checks).
+      async closureAuditSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("closure_audit_minutes", "30"), 10) || 30));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("closure_audit_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('closure_audit_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const base = this.settingValue("closure_audit_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const token = this.env.GH_TOKEN;
+        const defaultRepo = this.settingValue("closure_audit_default_repo", "state-vector/superpositional");
+        const ghGet = this.proxyGhGet(base, token, setLast, now);
+        const rows = this.state.storage.sql.exec(
+          `SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'done'
+       AND json_extract(meta, '$.close_leg_audit.legs') IS NOT NULL
+       AND json_extract(meta, '$.close_leg_audit.checked_ts') IS NULL LIMIT 10`
+        ).toArray();
+        for (const r of rows) {
+          try {
+            const meta = JSON.parse(r.meta ?? "{}");
+            const audit = meta.close_leg_audit;
+            const checks = [];
+            let allOk = true;
+            for (const leg of audit.legs ?? []) {
+              const receipt = (audit.receipts ?? []).find((x) => x.number === leg.number) ?? {};
+              const repo = leg.repo ?? defaultRepo;
+              let issue = "not checked", comment = "no comment id in receipt", guard = "no guard run in receipt", ok = true;
+              const iss = await ghGet(repo, `/issues/${leg.number}`);
+              if (iss.ok) {
+                issue = `state=${iss.body?.state}`;
+                if (iss.body?.state !== "closed") {
+                  ok = false;
+                  allOk = false;
+                }
+              } else {
+                issue = `lookup HTTP ${iss.status}`;
+                ok = false;
+                allOk = false;
+              }
+              if (receipt.commentId && /^\d{6,}$/.test(String(receipt.commentId))) {
+                const c = await ghGet(repo, `/issues/${leg.number}/comments/${receipt.commentId}`);
+                comment = c.ok ? `comment ${receipt.commentId} exists` : `comment ${receipt.commentId} HTTP ${c.status}`;
+                if (!c.ok) {
+                  ok = false;
+                  allOk = false;
+                }
+              }
+              if (receipt.guardRun && /^\d{6,}$/.test(String(receipt.guardRun))) {
+                const g = await ghGet(repo, `/actions/runs/${receipt.guardRun}`);
+                guard = g.ok ? `guard run ${receipt.guardRun} exists (${g.body?.conclusion ?? "?"})` : `guard run ${receipt.guardRun} HTTP ${g.status}`;
+              }
+              checks.push({ repo, number: leg.number, issue, comment, guard, ok });
+            }
+            meta.close_leg_audit.checked_ts = now;
+            meta.close_leg_audit.verdict = allOk ? "ok" : "false";
+            meta.close_leg_audit.checks = checks;
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            if (allOk) {
+              this.audit("hub:closure-audit", "closure_receipt_ok", r.id, { checks: checks.map((c) => `${c.repo}#${c.number} ${c.issue} ${c.comment}`) });
+              continue;
+            }
+            const detail = checks.map((c) => `${c.repo}#${c.number}: ${c.issue}; ${c.comment}; ${c.guard}`).join(" | ");
+            this.audit("hub:closure-audit", "closure_receipt_false", r.id, { detail: detail.slice(0, 300) });
+            this.version(r.id, "hub:closure-audit", "note", `CLOSURE RECEIPT AUDIT \u2014 FALSE: ${detail.slice(0, 300)}`, { checks });
+            const stamp = meta.last_correction_spawn;
+            if (!(stamp && typeof stamp.at === "number" && now - stamp.at < UNBLOCK_FLOOD_MS)) {
+              const created = await this.create(
+                {
+                  type: "task",
+                  title: `Correction: false closure receipt on ${r.id}`,
+                  session: "",
+                  // session-less spawn: the closer stamps it when they claim
+                  body_md: `A done card's closure receipt failed the hub's live audit (BR#3361 \u2014 the BR#3220 class: the board reported a closed issue that wasn't).
+
+Card: ${r.id} (done, claims close legs with receipts)
+Audit: ${detail}
+
+Contract: (1) verify the live state of each leg first-hand (gh issue view). (2) If the issue is OPEN, the close never happened \u2014 execute the close per the card's grammar and correct the card record (a progress note correcting the false claim, citing the real receipt: state=closed + closing-comment id + guard run id). (3) If the issue IS closed and the receipt was merely stale/wrong-shaped, correct the record to the true receipt. (4) Close yourself done citing the corrected receipts.`,
+                  roles: ["unblock"]
+                },
+                "hub:closure-audit"
+              );
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+                created.id,
+                r.id,
+                Date.now()
+              );
+              meta.last_correction_spawn = { at: now, child: created.id };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+              this.audit("hub:closure-audit", "correction_spawned", r.id, { child: created.id });
+            }
+          } catch (e) {
+            this.audit("hub:closure-audit", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
       }
       async mergeQueueSweep(now) {
         const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
@@ -3167,6 +3690,8 @@ ${detail.body ?? ""}`;
             case "admin.stop_line_sweep":
             case "admin.merge_queue_sweep":
             case "admin.provenance_sweep":
+            case "admin.unblock_proxy_sweep":
+            case "admin.closure_audit_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -3188,6 +3713,16 @@ ${detail.body ?? ""}`;
                 const last = this.one(`SELECT value FROM settings WHERE key = 'provenance_last_ts'`);
                 const n = this.one(`SELECT COUNT(*) AS n FROM provenance`);
                 return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0), indexed: Number(n?.n ?? 0) });
+              }
+              if (op === "admin.unblock_proxy_sweep") {
+                await this.unblockProxySweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
+              if (op === "admin.closure_audit_sweep") {
+                await this.closureAuditSweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'closure_audit_last_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
               }
               return this.json(await this.settingsSet(body));
             default:
@@ -3715,9 +4250,80 @@ ${bodyMd.trim()}`.trim();
               await this.foldBreaches(id);
             } catch {
             }
+            if (String(e?.message ?? "").includes("[rule: done-close-legs]")) {
+              try {
+                await this.spawnCloseLegDuty(id, actor, String(e?.message ?? ""));
+              } catch (se) {
+                this.audit(actor, "close_leg_spawn_error", id, { error: String(se.message ?? se).slice(0, 300) });
+              }
+            }
           }
           throw e;
         }
+      }
+      /** BR#3361 (b): the close-duty child a rejected done auto-derives. One per
+       *  legs-shape per flood window; carries the receipt contract and the
+       *  close-then-complete-parent contract so the leg ends owned. The legs
+       *  come from the gate's own rejection message — the authoritative list. */
+      async spawnCloseLegDuty(parentId, actor, rejectionMessage) {
+        const row = this.one(`SELECT id, title, body_md, meta, status FROM artefacts WHERE id = ?`, parentId);
+        if (!row || row.status === "done") return;
+        const ts = Date.now();
+        const meta = JSON.parse(row.meta ?? "{}");
+        const listed = /not receipted: ([^—]+)—/.exec(rejectionMessage)?.[1] ?? "";
+        const legs = [...listed.matchAll(/(?:(?:([A-Za-z0-9-]+)\/([A-Za-z0-9.-]+))?#|#)(\d+)/g)].map((m) => ({
+          repo: m[1] && m[2] ? `${m[1]}/${m[2]}` : null,
+          number: Number(m[3]),
+          raw: m[0]
+        }));
+        if (!legs.length) return;
+        const stamp = meta.last_close_leg_spawn;
+        const shape = legs.map(legLabel).join(",");
+        if (stamp && typeof stamp.at === "number" && ts - stamp.at < UNBLOCK_FLOOD_MS && String(stamp.legs ?? "") === shape) return;
+        const live = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.roles LIKE '%"unblock"%' AND (c.title || ' ' || c.body_md) LIKE '%close-leg duty%' LIMIT 1`,
+          parentId
+        );
+        if (live) {
+          meta.last_close_leg_spawn = { at: ts, legs: shape, child: live.id };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+          return;
+        }
+        const rootTitle = String(row.title ?? "").replace(/^(?:Unblock:\s*)+/, "");
+        const legLines = legs.map((l) => `- close ${legLabel(l)}${l.repo ? ` (${l.repo})` : " (repo: resolve from the card's context \u2014 bare-number legs take the project's default paperwork repo)"}`).join("\n");
+        const created = await this.create(
+          {
+            type: "task",
+            title: `Close-leg duty: ${rootTitle.slice(0, 160)}`.slice(0, 200),
+            session: "",
+            // session-less spawn: the closer stamps it when they claim (a
+            // pre-attributed child would trip review-separation against the real closer)
+            body_md: `Terminal close-leg duty for ${parentId} \u2014 "${rootTitle}".
+
+The parent's done was gate-rejected by done-close-legs (BR#3361): its Done-when ends in a terminal GitHub close leg that was not receipted. The hub auto-derived this duty so the leg has an owner \u2014 no orphan terminal legs.
+
+Legs:
+${legLines}
+
+Every receipt must carry: ${RECEIPT_CONTRACT}.
+
+Contract: (1) verify live state first (gh issue view <N> --repo <repo> --json state). If the issue is already CLOSED, capture the receipt and close yourself done citing it. If it is OPEN: execute the close per the parent's grammar (bug-corpus scenario id, or scenario: none with justification), capture the receipt, close yourself done with the receipt in the note. (2) Then transition ${parentId} \u2192 done citing the receipt \u2014 the parent's gate accepts a receipted note or this closed child.`,
+            roles: ["unblock"]
+          },
+          actor
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          parentId,
+          ts
+        );
+        meta.last_close_leg_spawn = { at: ts, legs: shape, child: created.id };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+        this.audit(actor, "create", created.id, { type: "task", auto: "close_leg", parent: parentId, legs: shape });
+        this.version(parentId, actor, "note", `close leg(s) ${shape} unowned at done \u2014 auto-derived close-duty child ${created.id} (BR#3361)`, { child: created.id, legs: shape });
       }
       /** Lazy SQL-backed context for the machine rules — a guard only queries
        *  what it actually reads, so cheap transitions stay cheap. */
@@ -3772,6 +4378,23 @@ ${bodyMd.trim()}`.trim();
              AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
             id
           ), "openUnblockChild"),
+          // BR#3361: the task's own body (Done-when section source for the
+          // terminal close-leg gate)
+          cardBody: /* @__PURE__ */ __name(() => String(row.body_md ?? ""), "cardBody"),
+          // BR#3361 terminal-leg ownership: a CLOSED child that owns the leg —
+          // its title/body names both the close and the issue number
+          closeLegChildClosed: /* @__PURE__ */ __name((leg) => {
+            const hit = this.one(
+              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done'
+             AND (c.title || ' ' || c.body_md) LIKE '%close%'
+             AND (c.title || ' ' || c.body_md) LIKE ${"?"}
+             AND c.roles LIKE '%"unblock"%' LIMIT 1`,
+              id,
+              `%#${leg.number}%`
+            );
+            return !!hit;
+          }, "closeLegChildClosed"),
           // recent version-log rows (newest first) for the server-side silent-churn fold
           recentEvents: /* @__PURE__ */ __name(() => this.state.storage.sql.exec(
             `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
@@ -3853,6 +4476,36 @@ ${bodyMd.trim()}`.trim();
               "system:separation"
             );
           }
+        }
+        if (row.type === "task" && verdict.status === "done") {
+          const doneNote = String(body?.note ?? body?.resolution ?? body?.reason ?? "").trim();
+          const legs = parseCloseLegs(`${doneWhenSection(String(row.body_md ?? ""))}
+${doneNote}`);
+          if (legs.length) {
+            meta.close_leg_audit = {
+              ts,
+              legs: legs.map((l) => ({ repo: l.repo, number: l.number })),
+              receipts: legs.map((l) => ({ ...l, ...parseClosureReceipt(doneNote, l) ?? { closed: false, commentId: null, guardRun: null } })),
+              checked_ts: null
+            };
+          }
+        }
+        try {
+          const holder = JSON.parse(row.meta ?? "{}");
+          const actingSession = body.session ? await this.resolveSession(body, String(body.token_id ?? "")) : void 0;
+          const holderSession = holder.session;
+          if (row.type === "task" && row.status === "in_progress" && holderSession && actingSession && holderSession !== actingSession) {
+            const holderAlive = Math.max(holder.last_progress?.ts ?? 0, holder.session_alive_ts ?? 0, row.updated_ts ?? 0);
+            if (Date.now() - holderAlive <= 10 * 6e4) {
+              this.audit("system:fence", "duplicate_executor", id, {
+                holder: holderSession,
+                actor: actingSession,
+                from: row.status,
+                to
+              });
+            }
+          }
+        } catch {
         }
         this.state.storage.sql.exec(
           `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ? WHERE id = ?`,
@@ -3974,6 +4627,9 @@ MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge 
                 {
                   type: "task",
                   title: `Unblock: ${rootTitle.slice(0, 200)}`,
+                  session: "",
+                  // session-less spawn: the unblock contract is "then a
+                  // FRESH session" — a pre-attributed child would trip review-separation against the legitimate closer
                   body_md: `Unblock duty for ${id} \u2014 "${rootTitle}".
 
 Blocked why: ${fx.reason || "see parent"}.
@@ -4451,10 +5107,12 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
       }
       /** The session a write belongs to: explicit, else the token's most recent session. */
       async resolveSession(body, tokenId) {
-        if (body.session) {
-          await this.sessionTouch({ token_id: tokenId, session: body.session, worktree: body.worktree }).catch(() => {
+        if (body.session !== void 0) {
+          const named = String(body.session ?? "").trim();
+          if (!named) return void 0;
+          await this.sessionTouch({ token_id: tokenId, session: named, worktree: body.worktree }).catch(() => {
           });
-          return String(body.session);
+          return named;
         }
         const row = this.one(
           `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
@@ -4746,6 +5404,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
               t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 200);
             }
             if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
+            if (m.session && ["in_progress", "in_review"].includes(t.status)) t.executor_session = m.session;
             delete t.meta;
           }
           return t;
@@ -4770,7 +5429,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
         const settings = this.settingsMap();
         const projectName = settings.project_name || "Superpositional";
         const myTasks = this.state.storage.sql.exec(
-          `SELECT id, title, status FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+          `SELECT id, title, status, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
        AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '/'
             OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
             OR owner = ?)
@@ -4780,7 +5439,12 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
           label,
           label,
           body.principal ?? null
-        ).toArray();
+        ).toArray().map((t) => {
+          const m = JSON.parse(t.meta ?? "{}");
+          if (m.session) t.executor_session = m.session;
+          delete t.meta;
+          return t;
+        });
         const pool = this.state.storage.sql.exec(
           `SELECT id, type, title, tags, roles, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
@@ -5960,7 +6624,7 @@ var init_mcp = __esm({
   "src/mcp.ts"() {
     init_core();
     init_do();
-    BUILD = "0.3.5";
+    BUILD = "0.3.6";
     wsRouteCache = /* @__PURE__ */ new Map();
     __name(resolveTokenWs, "resolveTokenWs");
     __name(handleMcp, "handleMcp");
@@ -6174,7 +6838,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "57353098e15185093fcb30ebac5e37920861ed43", built_at: "2026-10-25T13:47:22Z" };
+    module.exports = { commit: "a82a27ee293123a418e76a4b39a3f0b6893a4bd0", built_at: "2026-10-25T15:19:33Z" };
   }
 });
 

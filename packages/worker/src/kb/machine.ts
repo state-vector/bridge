@@ -14,6 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition } from "./core";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -64,6 +65,11 @@ export interface RuleCtx {
   openVerifyChild(): { id: string } | null | Promise<{ id: string } | null>;
   /** newest OPEN role:unblock child (cap ≤1 per parent), or null */
   openUnblockChild(): { id: string } | null | Promise<{ id: string } | null>;
+  /** the task's own body_md (the Done-when section lives there) */
+  cardBody(): string | Promise<string>;
+  /** a CLOSED child task of this task that owns the given close leg (its
+   *  title/body names the close and the issue) — BR#3361 terminal-leg ownership */
+  closeLegChildClosed(leg: CloseLeg): boolean | Promise<boolean>;
   /** recent version-log rows (newest first) for the silent-churn fold */
   recentEvents(): { ts: number; actor: string; action: string; summary: string }[] | Promise<{ ts: number; actor: string; action: string; summary: string }[]>;
 }
@@ -315,6 +321,29 @@ export const RULES: Rule[] = [
       return open > 0
         ? `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children)`
         : null;
+    },
+  },
+  {
+    // BR#3361 (b)+(c): terminal close-leg ownership + the closure receipt.
+    // A done card whose Done-when (or done note) ends in "close GH #N" must
+    // either carry the receipt for every leg it claims, or own the leg with
+    // a CLOSED close-duty child. Retrying the done auto-derives the child
+    // (do.ts executes that on this rejection) — no orphan terminal legs.
+    name: "done-close-legs",
+    when: (i) => isTask(i) && i.to === "done",
+    guard: async (i, c) => {
+      const note = noteOf(i);
+      const legs = parseCloseLegs(`${doneWhenSection(await c.cardBody())}\n${note}`);
+      if (!legs.length) return null;
+      const unowned: CloseLeg[] = [];
+      for (const leg of legs) {
+        if (parseClosureReceipt(note, leg)?.closed) continue;
+        if (await c.closeLegChildClosed(leg)) continue;
+        unowned.push(leg);
+      }
+      if (!unowned.length) return null;
+      const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
+      return `terminal close leg(s) not receipted: ${labeled} — a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
     },
   },
 ];
