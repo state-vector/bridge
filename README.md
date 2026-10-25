@@ -357,6 +357,24 @@ detached-cody credential, never rayh's personal credentials. Without it the swee
 `no_identity` and merges nothing. `admin.merge_queue_sweep` drills it on demand; the pure
 decision rules are pinned in `packages/worker/test/merge-sweep.test.ts`.
 
+## PR provenance: who touched main, from bridge
+
+Every merge is attributable (BR#3287): the hub runs `provenanceSweep` (`packages/worker/src/kb/do.ts`,
+paced by `provenance_sweep_minutes`, default 15, `0` = off) over recent merged PRs on both repos
+(backfill window `provenance_backfill_days`, default 30) and records, per PR: merge sha, head sha,
+the linked task (head branch `bridge/BR-<id>` is the authoritative join key, PR text the fallback),
+the accepted verify verdict citing that head, the owning agent **session**, and the signer class
+(`detached-cody` / `signed` / `partially-signed` / `unsigned`).
+
+- **Storage of record is the board** (decision BR#3291): the task card carries `meta.provenance`
+  (rendered as a provenance strip in TaskDetail), the DO keeps a `provenance` index table, and
+  `GET /api/kb/provenance?sha=<7-40 hex>` resolves sha → PR → task → verdict → session. Unknown sha
+  = honest 404 "no bridge provenance"; merges with no bridge task are recorded as absence — itself a signal.
+- **GitHub mirror is derived and non-authoritative**: the sweep best-effort adds a `bridge:BR-<id>`
+  label; nothing machine-facing reads it back.
+- Consumers: the red-main guilty-agent attribution loop (BR#3284), humans auditing who landed what,
+  and any agent needing receipts. `admin.provenance_sweep` drills/backfills on demand.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)

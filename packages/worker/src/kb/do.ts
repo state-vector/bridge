@@ -66,6 +66,7 @@ import {
   type MainCheckVerdict,
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
+import { parseProvenanceSha, prCardRef, signerFromCommits, withinBackfillWindow } from "./provenance.ts";
 import {
   check as checkRules,
   invariants as checkInvariants,
@@ -365,6 +366,18 @@ export class KnowledgeHub {
     } catch (e) {
       try {
         this.audit("hub:stop-the-line", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+      } catch { /* next tick retries */ }
+    }
+
+    // (D) PR provenance indexing (BR#3287): sha → PR → task → verify-verdict
+    // → agent session, stamped on task cards (board-side storage of record
+    // per decision BR#3291). Isolated like its siblings — a GitHub outage or
+    // a bad PR payload must never take the watchdog down with it.
+    try {
+      await this.provenanceSweep(now);
+    } catch (e) {
+      try {
+        this.audit("hub:provenance", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
       } catch { /* next tick retries */ }
     }
 
@@ -717,14 +730,166 @@ export class KnowledgeHub {
   // "merge" | "squash", default bridge=merge / superpositional=squash),
   // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
   // `merge_sweep_gh_api_base` (drills/tests only).
+  /** PR provenance sweep (BR#3287): index recent merges — sha → PR → task →
+   *  verify-verdict → agent session — stamp task cards (meta.provenance,
+   *  board-side storage of record per decision BR#3291) and mirror
+   *  best-effort to GitHub (derived, never read back). Dedupe per (repo, pr)
+   *  via the provenance table; backfill window bounds the cold-start scan. */
+  private async provenanceSweep(now: number): Promise<void> {
+    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("provenance_sweep_minutes", "15"), 10) || 15));
+    if (periodMin === 0) return; // explicitly disabled
+    const last = Number(this.settingValue("provenance_last_ts", "0")) || 0;
+    if (now - last < periodMin * 60_000) return;
+    const setLast = (ts: number) =>
+      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('provenance_last_ts', ?)`, String(ts));
+    setLast(now); // pace BEFORE the fetch — a hung GitHub call must not tight-loop the tick
+
+    const token = this.env.GH_TOKEN;
+    if (!token) {
+      this.audit("hub:provenance", "no_identity", null, { note: "GH_TOKEN not configured — provenance sweep cannot read GitHub; skipping (endpoint + backfill resume when it returns)" });
+      return;
+    }
+    const base = this.settingValue("provenance_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+    let repos: string[] = [];
+    try {
+      const parsed = JSON.parse(this.settingValue("provenance_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+      if (Array.isArray(parsed)) repos = parsed.map(String);
+    } catch { repos = []; }
+    if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+    const backfillDays = Math.max(1, Math.min(365, parseInt(this.settingValue("provenance_backfill_days", "30"), 10) || 30));
+
+    const ghGet = async (path: string): Promise<any> => {
+      const res = await fetch(`${base}${path}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "user-agent": "bridge-provenance-sweep (BR#3287)",
+          "x-github-api-version": "2022-11-28",
+        },
+      });
+      if (res.status === 403 || res.status === 429) {
+        setLast(now + 60 * 60_000); // quota exhausted — back off a full window
+        throw new Error(`github rate limited (HTTP ${res.status})`);
+      }
+      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+      return res.json();
+    };
+
+    let indexed = 0;
+    for (const repo of repos) {
+      let pulls: any[] = [];
+      try {
+        pulls = await ghGet(`/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=50`) as any[];
+      } catch (e) {
+        this.audit("hub:provenance", "repo_error", null, { repo, error: String((e as Error).message ?? e).slice(0, 200) });
+        continue;
+      }
+      for (const pr of pulls) {
+        if (!pr?.merged_at || !pr?.merge_commit_sha || !pr?.number) continue;
+        const mergedAt = withinBackfillWindow(pr.merged_at, now, backfillDays);
+        if (mergedAt === null) continue;
+        const seen = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, pr.number);
+        if (seen) continue; // dedupe per (repo, pr) — provenance is immutable once stamped
+        try {
+          const detail = await ghGet(`/repos/${repo}/pulls/${pr.number}`);
+          const headSha = String(detail?.head?.sha ?? "");
+          const branch = String(detail?.head?.ref ?? "");
+          const cardRef = prCardRef(branch, `${pr.title ?? ""}\n${pr.body ?? ""}\n${detail?.title ?? ""}\n${detail?.body ?? ""}`);
+          const commitsBody = await ghGet(`/repos/${repo}/pulls/${pr.number}/commits?per_page=100`);
+          const commits = (commitsBody ?? []).map((c: any) => ({
+            verified: c?.commit?.verification?.verified === true,
+            committer_email: String(c?.commit?.committer?.email ?? ""),
+          }));
+          const signer = signerFromCommits(commits);
+          let taskId: string | null = cardRef;
+          let verdictId: string | null = null;
+          let session: string | null = null;
+          if (taskId && /^[0-9a-f]{40}$/.test(headSha)) {
+            // accepted verify lineage: decisions derived_from the linked card
+            // citing the head sha (same join the merge sweep uses)
+            const decisions = this.state.storage.sql.exec(
+              `SELECT d.id AS id, d.meta AS meta FROM relations r
+               JOIN artefacts d ON d.id = r.src_id
+               WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+              taskId,
+            ).toArray() as any[];
+            const onHead = decisions.find((d: any) =>
+              (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9)),
+            ) ?? decisions[0];
+            if (onHead) {
+              verdictId = String(onHead.id);
+              try { session = String(JSON.parse(onHead.meta ?? "{}")?.session ?? "") || null; } catch { session = null; }
+            }
+          }
+          this.state.storage.sql.exec(
+            `INSERT OR REPLACE INTO provenance (repo, pr, merge_sha, head_sha, task_id, verdict_id, session, signer, merged_at, stamped_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            repo, pr.number, String(pr.merge_commit_sha), headSha, taskId, verdictId, session, signer, mergedAt, Date.now(),
+          );
+          indexed++;
+          // board-side stamp: the card carries its own provenance (BR#3291)
+          if (taskId) {
+            const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+            if (row) {
+              const meta = JSON.parse(row.meta ?? "{}");
+              meta.provenance = {
+                pr: pr.number, repo, merge_sha: String(pr.merge_commit_sha).slice(0, 12), head_sha: headSha.slice(0, 12),
+                verdict_id: verdictId, session, signer, merged_at: mergedAt,
+              };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), taskId);
+              this.audit("hub:provenance", "stamped", taskId, { pr: pr.number, repo, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
+            }
+          } else {
+            // class-only record of absence — a merge with no bridge task is
+            // itself a signal (BR#3291: "no bridge provenance" is honest data)
+            this.audit("hub:provenance", "no_card", null, { repo, pr: pr.number, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
+          }
+          // derived GH mirror (BR#3291: non-authoritative, best-effort)
+          if (taskId) {
+            try {
+              await fetch(`${base}/repos/${repo}/issues/${pr.number}/labels`, {
+                method: "POST",
+                headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json" },
+                body: JSON.stringify({ labels: [`bridge:${taskId}`] }),
+              });
+            } catch { /* mirror is best-effort only */ }
+          }
+        } catch (e) {
+          this.audit("hub:provenance", "pr_error", null, { repo, pr: pr.number, error: String((e as Error).message ?? e).slice(0, 200) });
+        }
+      }
+    }
+    if (indexed) this.audit("hub:provenance", "indexed", null, { indexed, repos: repos.join(",") });
+  }
+
+  /** sha → PR → task → verify-verdict → agent session (BR#3287). Matches by
+   *  merge sha or head sha (7+ hex prefix). Returns null when nothing is
+   *  known — an honest "no bridge provenance" (404) rather than a guess. */
+  private async provenanceLookup(sp: URLSearchParams) {
+    const sha = parseProvenanceSha(sp);
+    const row = this.one(
+      `SELECT * FROM provenance WHERE merge_sha = ? OR merge_sha LIKE ? OR head_sha = ? OR head_sha LIKE ? LIMIT 1`,
+      sha, `${sha}%`, sha, `${sha}%`,
+    ) as any;
+    if (!row) return null;
+    const task = row.task_id ? this.one(`SELECT id, title, status, owner FROM artefacts WHERE id = ?`, row.task_id) as any : null;
+    return {
+      sha,
+      repo: row.repo, pr: row.pr,
+      merge_sha: row.merge_sha, head_sha: row.head_sha,
+      task: task ? { id: task.id, title: task.title, status: task.status, owner: task.owner } : null,
+      verdict_id: row.verdict_id, session: row.session, signer: row.signer,
+      merged_at: row.merged_at, stamped_at: row.stamped_at,
+    };
+  }
+
   private async mergeQueueSweep(now: number): Promise<void> {
     const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
     if (periodMin === 0) return; // explicitly disabled
     const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
     if (now - last < periodMin * 60_000) return;
     const setLast = (ts: number) =>
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts));
-    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
+      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts));    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
     setLast(now);
 
     const token = this.env.GH_TOKEN;
@@ -1255,6 +1420,22 @@ export class KnowledgeHub {
         vec BLOB NOT NULL,
         dim INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS provenance (
+        -- PR provenance (BR#3287): sha → PR → task → verify-verdict → agent
+        -- session. Board-side storage of record (decision BR#3291); this
+        -- table is the DO-local index the lookup endpoint reads.
+        repo TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        merge_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        task_id TEXT,
+        verdict_id TEXT,
+        session TEXT,
+        signer TEXT NOT NULL,
+        merged_at INTEGER NOT NULL,
+        stamped_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, pr)
+      );
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -1575,6 +1756,7 @@ export class KnowledgeHub {
           case "/board": return this.json(await this.board());
           case "/stats": return this.json(await this.stats());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
+          case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
           case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
           case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
         }
@@ -1655,6 +1837,7 @@ export class KnowledgeHub {
         case "admin.settings_set":
         case "admin.stop_line_sweep":
         case "admin.merge_queue_sweep":
+        case "admin.provenance_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -1676,6 +1859,15 @@ export class KnowledgeHub {
             await this.mergeQueueSweep(Number(body.now ?? Date.now()));
             const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
             return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
+          }
+          if (op === "admin.provenance_sweep") {
+            // drill/backfill path for PR provenance indexing (BR#3287):
+            // dedupe per (repo, pr) still applies; pass now=<future epoch ms>
+            // to bypass the cadence window and run immediately.
+            await this.provenanceSweep(Number(body.now ?? Date.now()));
+            const last = this.one(`SELECT value FROM settings WHERE key = 'provenance_last_ts'`);
+            const n = this.one(`SELECT COUNT(*) AS n FROM provenance`);
+            return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0), indexed: Number((n as any)?.n ?? 0) });
           }
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);

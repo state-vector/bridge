@@ -138,6 +138,7 @@ interface TaskMeta {
   awaiting_ask?: { ask_id?: string };
   kind?: string;
   github?: string;
+  provenance?: { repo: string; pr: number; merge_sha?: string; head_sha?: string; verdict_id?: string | null; session?: string | null; signer: string; merged_at?: number };
   [k: string]: unknown;
 }
 
@@ -303,6 +304,16 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
           <span key={k} className="fact-row"><dt>{k}</dt><dd>{v}</dd></span>
         ))}
       </dl>
+      {m.provenance && (
+        <div className="progress-note" title="PR provenance (BR#3287): merge → producing task → verify verdict → agent session. Board-side storage of record (BR#3291).">
+          <b>provenance:</b>{" "}
+          <a href={`https://github.com/${m.provenance.repo}/pull/${m.provenance.pr}`} target="_blank" rel="noreferrer" className="gw-mono">{m.provenance.repo}#{m.provenance.pr}</a>
+          {" · merged "}<span className="gw-mono">{m.provenance.merge_sha}</span>
+          {m.provenance.verdict_id && <> · verified <span className="gw-mono">{m.provenance.verdict_id}</span></>}
+          {m.provenance.session && <> · session <span className="gw-mono">{m.provenance.session}</span></>}
+          {" · signer "}<span className="gw-mono">{m.provenance.signer}</span>
+        </div>
+      )}
       {(task.tags ?? []).length > 0 && (
         <div className="task-tags">{(task.tags as string[]).map((t) => <Chip key={t} tone="scope">{t}</Chip>)}</div>
       )}
