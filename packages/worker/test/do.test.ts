@@ -228,3 +228,56 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     }
   });
 });
+
+describe("gauge carry-forward in log_progress (merge semantics)", () => {
+  it("(a) gauge-less post after a gauge-bearing post preserves gauges", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "gauge carry a", qualified: true });
+    // gauge-bearing post sets all four gauges
+    const r1 = await kbJson("/progress.log", {
+      id: t.id, actor: "test-agent-a", note: "progress with gauges",
+      completion_pct: 30, confidence_pct: 80, risk_pct: 10, context_pct: 40,
+    });
+    expect(r1.status).toBe(200);
+    expect(r1.body.completion_pct).toBe(30);
+    // gauge-less post (e.g. relay heartbeat) must not clobber them
+    const r2 = await kbJson("/progress.log", { id: t.id, actor: "test-agent-a", note: "progress without gauges" });
+    expect(r2.status).toBe(200);
+    expect(r2.body.completion_pct).toBeUndefined();
+    // persisted meta carries the gauges forward
+    const got = await kbJson("/get", { id: t.id });
+    expect(got.body.meta.last_progress.note).toBe("progress without gauges");
+    expect(got.body.meta.last_progress.completion_pct).toBe(30);
+    expect(got.body.meta.last_progress.confidence_pct).toBe(80);
+    expect(got.body.meta.last_progress.risk_pct).toBe(10);
+    expect(got.body.meta.last_progress.context_pct).toBe(40);
+  });
+
+  it("(b) a later gauge-bearing post updates them", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "gauge carry b", qualified: true });
+    await kbJson("/progress.log", {
+      id: t.id, actor: "test-agent-b", note: "start",
+      completion_pct: 10, confidence_pct: 50, risk_pct: 20, context_pct: 10,
+    });
+    // fresh gauge-bearing post wins
+    await kbJson("/progress.log", {
+      id: t.id, actor: "test-agent-b", note: "update gauges",
+      completion_pct: 50, confidence_pct: 90, risk_pct: 5, context_pct: 20,
+    });
+    const got = await kbJson("/get", { id: t.id });
+    expect(got.body.meta.last_progress.completion_pct).toBe(50);
+    expect(got.body.meta.last_progress.confidence_pct).toBe(90);
+    expect(got.body.meta.last_progress.risk_pct).toBe(5);
+    expect(got.body.meta.last_progress.context_pct).toBe(20);
+  });
+
+  it("(c) gauge-less first-ever post leaves fields absent (no fabrication)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "gauge carry c", qualified: true });
+    await kbJson("/progress.log", { id: t.id, actor: "test-agent-c", note: "first-ever no gauges" });
+    const got = await kbJson("/get", { id: t.id });
+    expect(got.body.meta.last_progress).toBeDefined();
+    expect(got.body.meta.last_progress.completion_pct).toBeUndefined();
+    expect(got.body.meta.last_progress.confidence_pct).toBeUndefined();
+    expect(got.body.meta.last_progress.risk_pct).toBeUndefined();
+    expect(got.body.meta.last_progress.context_pct).toBeUndefined();
+  });
+});

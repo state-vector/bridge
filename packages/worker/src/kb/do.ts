@@ -1313,7 +1313,12 @@ export class KnowledgeHub {
             const tm = JSON.parse(trow.meta ?? "{}");
             const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
             tm.verify_round = round;
-            tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+            const prevGauges = tm.last_progress ?? {};
+            tm.last_progress = {
+              note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now(),
+              completion_pct: prevGauges.completion_pct, confidence_pct: prevGauges.confidence_pct,
+              risk_pct: prevGauges.risk_pct, context_pct: prevGauges.context_pct,
+            };
             const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
             if (!alreadyRight) {
               // 3 identical rounds = the loop is stalled; park it for a human
@@ -1391,7 +1396,12 @@ export class KnowledgeHub {
       const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
       if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
-    tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+    const prevGauges = tmeta.last_progress ?? {};
+    tmeta.last_progress = {
+      note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session,
+      completion_pct: prevGauges.completion_pct, confidence_pct: prevGauges.confidence_pct,
+      risk_pct: prevGauges.risk_pct, context_pct: prevGauges.context_pct,
+    };
     delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2337,7 +2347,14 @@ export class KnowledgeHub {
     if (progressActor !== actor && this.isGatewayActor(actor)) {
       this.gatewayTouch(actor, progressActor); // gateway→agent edge (BR#2455)
     }
-    meta.last_progress = { note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
+    const prev = meta.last_progress ?? {};
+    meta.last_progress = {
+      note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session,
+      completion_pct:  completion_pct  ?? prev.completion_pct,
+      confidence_pct:  confidence_pct  ?? prev.confidence_pct,
+      risk_pct:        risk_pct        ?? prev.risk_pct,
+      context_pct:     context_pct     ?? prev.context_pct,
+    };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,

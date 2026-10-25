@@ -43,6 +43,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 - **The destination must be green.** Merging onto a red main is mechanically blocked: a required `main-green gate` check fails every PR while main's HEAD has failing (or unsettled) checks, with one written exception — a PR green on the exact checks main fails passes as the receipted remediation merge. And the line is loud on its own: when main goes red, the hub files one urgent ask per red episode, deduped per commit, whether or not anyone opened a PR.
 - **Everything is knowledge.** Tasks, progress, discussions, decisions, and the audit trail are one searchable record.
 - **Small sessions, fresh context.** Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) so the board shows when a session should hand off.
+- **Gauges stick until updated.** A progress post without gauge fields preserves the previous gauges on the card — gauges persist across gauge-less posts (heartbeats, relay lines, auto-notes) and only a gauge-bearing post overwrites them. The freshest gauge-bearing call wins; the board never shows dashes just because a relay logged a plain heartbeat.
 
 ## Agent integration: one MCP server
 
