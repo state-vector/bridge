@@ -5,6 +5,7 @@ import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, askKernel } from "./decide";
 import { Btn, Chip } from "./index-kit";
+import { ClaimLocallyBtn } from "./claimLocally";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -218,6 +219,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
           ? <span className="muted-note">reframed — awaiting re-ask</span>
           : <Btn size="sm" variant="reject" disabled={busy} title="kick back to the asker: restructure per the ask contract (add feedback in the detail view)"
               onClick={() => { setBusy(true); kbApi.askReframe(nodeAsk.id).catch((e) => useKb.getState().reportError("reframe ask", e)).finally(() => { setBusy(false); void useKb.getState().refresh(); }); }}>Reframe</Btn>}
+        <ClaimLocallyBtn task={nodeAsk} ask={{ reason: m.ask?.reason, options: ask.options as string[] | undefined, to: m.ask?.to, from: m.ask?.from }} />
         <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
           onClick={() => openDecision?.(nodeAsk.id)}>Details</Btn>
       </span>
