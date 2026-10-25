@@ -866,7 +866,10 @@ export class KnowledgeHub {
    *  merge sha or head sha (7+ hex prefix). Returns null when nothing is
    *  known — an honest "no bridge provenance" (404) rather than a guess. */
   private async provenanceLookup(sp: URLSearchParams) {
-    const sha = parseProvenanceSha(sp);
+    return this.provenanceBySha(parseProvenanceSha(sp));
+  }
+
+  private async provenanceBySha(sha: string) {
     const row = this.one(
       `SELECT * FROM provenance WHERE merge_sha = ? OR merge_sha LIKE ? OR head_sha = ? OR head_sha LIKE ? LIMIT 1`,
       sha, `${sha}%`, sha, `${sha}%`,
@@ -1778,6 +1781,7 @@ export class KnowledgeHub {
         case "get": return this.json(await this.get(String(body.id)));
         case "list": return this.json(await this.list(body));
         case "search": return this.json(await this.search(body));
+        case "provenance": { const rec = await this.provenanceBySha(parseProvenanceSha(new URLSearchParams({ sha: String((body as any)?.sha ?? "") }))); return rec ? this.json(rec) : this.json({ error: "no bridge provenance for this sha", sha: String((body as any)?.sha ?? "") }, 404); }
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
         case "enrich": return this.json(await this.enrich(body, actor));
         case "update": return this.json(await this.update(body, actor));

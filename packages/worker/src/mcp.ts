@@ -257,6 +257,8 @@ async function callTool(name: string, args: any, ctx: Ctx) {
     }
     case "search_knowledge":
       return text(JSON.stringify(await call("search", { q: args.q, type: args.type, limit: args.limit })));
+    case "provenance":
+      return text(JSON.stringify(await call("provenance", { sha: String(args.sha ?? "") })));
     case "get_artefact": {
       const a = await call("get", { id: args.id });
       const rel = await call("relations", { id: args.id });
@@ -496,6 +498,15 @@ const TOOLS = [
       type: "object",
       required: ["id"],
       properties: { id: { type: "string" }, limit: { type: "integer", maximum: 50 } },
+    },
+  },
+  {
+    name: "provenance",
+    description: "PR provenance (BR#3287): commit sha → PR → producing task → verify verdict → agent session → signer class. sha = the merge or head commit, 7-40 hex. Unknown sha returns an honest 'no bridge provenance' error (direct push / unindexed).",
+    inputSchema: {
+      type: "object",
+      required: ["sha"],
+      properties: { sha: { type: "string", description: "merge or head commit sha, 7-40 hex" } },
     },
   },
   {

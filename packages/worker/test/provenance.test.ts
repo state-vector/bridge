@@ -230,6 +230,18 @@ expect(byMerge.body.error ?? "").toBe("");
     expect(noCard.body.signer).toBe("signed");
   });
 
+  it("machine-plane op + MCP parity: POST /provenance returns the chain; errors contract", async () => {
+    const op = await kbJson("/provenance", { sha: MERGE_SHA.slice(0, 12) });
+    expect(op.status).toBe(200);
+    expect(op.body.pr).toBe(185);
+    expect(op.body.task).toBeTruthy();
+    const missing = await kbJson("/provenance", { sha: "f".repeat(40) });
+    expect(missing.status).toBe(404);
+    expect(String(missing.body.error)).toContain("no bridge provenance");
+    const bad = await kbJson("/provenance", { sha: "nope" });
+    expect(bad.status).toBe(400);
+  });
+
   it("lookup contract: bad sha → 400, unknown sha → 404", async () => {
     const bad = await kbJson("/provenance?sha=zzz");
     expect(bad.status).toBe(400);
