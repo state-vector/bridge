@@ -571,7 +571,12 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
 
     let render = |e: &serde_json::Value, json_out: bool| -> Option<String> {
         if json_out {
-            return Some(serde_json::to_string(e).unwrap_or_default());
+            // SP-review fix (PR #194): never silently render an empty line —
+            // a serialization failure is loud, named, non-zero.
+            return Some(serde_json::to_string(e).unwrap_or_else(|err| {
+                eprintln!("bridge logs: event serialization failed ({err}) — raw: {e}");
+                std::process::exit(1);
+            }));
         }
         let ts = e.get("ts")?.as_u64()?;
         let actor = e.get("actor")?.as_str().unwrap_or("?");
@@ -608,13 +613,20 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
         return;
     }
 
-    // follow mode: poll, track the last seq, print new events as they land
+    // follow mode: poll, track the last seq, print new events as they land.
+    // SP-review fix (PR #194): repeated hub failures must never become a
+    // silent infinite retry loop — 20 consecutive failures exit loudly with
+    // the last error, so an outage in a `systemctl` unit surfaces in the
+    // journal instead of hanging forever.
     let mut last_seq: u64 = 0;
+    let mut consecutive_failures: u32 = 0;
+    const MAX_CONSECUTIVE_FAILURES: u32 = 20;
     let poll_secs = std::time::Duration::from_secs(5);
     eprintln!("following the event log (Ctrl-C to stop) — polling {url} every 5s");
     loop {
         match fetch(last_seq) {
             Ok(body) => {
+                consecutive_failures = 0;
                 let events = body.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 for e in &events {
                     let seq = e.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -629,7 +641,14 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
                     }
                 }
             }
-            Err(e) => eprintln!("[logs] {e} — retrying in 5s"),
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    eprintln!("bridge logs: {MAX_CONSECUTIVE_FAILURES} consecutive hub failures — giving up. Last error: {e}");
+                    std::process::exit(1);
+                }
+                eprintln!("[logs] {e} — retrying ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})");
+            }
         }
         std::thread::sleep(poll_secs);
     }
