@@ -1506,11 +1506,19 @@ fn spawn_opencode(
     // your stdout lines to the board every poll, so your normal narration keeps
     // the task visibly alive; you do NOT need scheduled heartbeats. Explicit
     // report_minutes restores a fixed cadence for agents that narrate nothing.
+    // Gauges (BR#3225): the board and the agent score read completion /
+    // confidence / risk / context from log_progress fields. Stdout narration
+    // is relayed gauge-less (it keeps the task visibly alive; the server's
+    // gauge carry-forward preserves the last reported values — BR#3199), so
+    // the agent must set the gauges themselves via log_progress at milestones.
+    let gauge_line = " At each milestone, call log_progress with the gauges: completion_pct, confidence_pct, risk_pct, context_pct (0-100) — the board cannot prioritise or score gauge-less reports.";
     let heartbeat_line = match cfg.report_minutes {
         Some(mins) => format!(
-            "- HEARTBEAT: call log_progress via the bridge MCP every ~{mins} minutes — one line: what you just did + what you do next. The board is your only visible output; silence reads as abandonment and gets the task reassigned."
+            "- HEARTBEAT: call log_progress via the bridge MCP every ~{mins} minutes — one line: what you just did + what you do next, plus the gauges (completion_pct, confidence_pct, risk_pct, context_pct, 0-100). The board is your only visible output; silence reads as abandonment and gets the task reassigned."
         ),
-        None => "- REPORTING: report progress the way you would to a human user — when you complete a meaningful step, hit a finding, or change direction; not on a timer. The runner relays your output to the board automatically, so narrating your work in your normal output (brief, one line at natural milestones) is enough to keep the task visibly alive.".to_string(),
+        None => format!(
+            "- REPORTING: report progress the way you would to a human user — when you complete a meaningful step, hit a finding, or change direction; not on a timer. The runner relays your output to the board automatically, so narrating your work in your normal output (brief, one line at natural milestones) is enough to keep the task visibly alive.{gauge_line}"
+        ),
     };
     // PRs only for CODE work (BR#877: receipts must match the deliverable type):
     // verify/analysis/unblock tasks deliver on the BOARD (knowledge/progress
