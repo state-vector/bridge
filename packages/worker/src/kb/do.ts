@@ -4702,7 +4702,11 @@ export class KnowledgeHub {
       action_required: actionRequired.length || verificationNotices.length
         ? [...actionRequired, ...verificationNotices]
         : undefined,
-      gauge_debt: gaugeDebt.length ? gaugeDebt : undefined,
+      // BR#3463: ALWAYS emit — gauge_debt is a REQUIRED orient contract key
+      // (BR#2844); the conditional turned the healthy case (zero debt) into a
+      // contract violation (undefined drops from JSON.stringify → "missing
+      // gauge_debt" aborts every dispatch tick). Empty array = healthy board.
+      gauge_debt: gaugeDebt,
       my_score,
     };
   }
