@@ -358,3 +358,42 @@ describe("replay consistency (BR#3322, real storage)", () => {
     expect(fold.breaks).toBe(0);
   });
 });
+
+// ---------- BR#3337: claim races are retryable, never breach storms (real DO) ----------
+
+describe("claim-race storms through the real gate + breach door (BR#3337)", () => {
+  const breachCardsFor = async (taskId: string) => {
+    const { body } = await kbJson("/list", { type: "task", tag: "breach", limit: 200 });
+    return (body.artefacts ?? []).filter((a: any) => String(a.title).includes(taskId));
+  };
+
+  it("six rejected claim races on an in_progress card raise NO breach card", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "claim-race storm" });
+    const claim = await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-a-opencode" });
+    expect(claim.status).toBe(200);
+    // gateway-b races the claim six times — the lifecycle gate refuses
+    // in_progress → in_progress every time (the 2026-10-25 breaker-trip shape)
+    for (let i = 0; i < 6; i++) {
+      const r = await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-b-opencode" });
+      expect(r.status).toBe(400);
+      expect(String(r.body.error)).toContain("not allowed");
+    }
+    const mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(0);
+  });
+
+  it("a genuine gate storm still raises exactly one breach card (control)", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "genuine gate storm" });
+    await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-a-opencode" });
+    // review-needs-pr: three in_review attempts with no PR link in the note —
+    // a real gate, a real protocol violation, one breach card at threshold
+    for (let i = 0; i < 3; i++) {
+      const r = await kbJson("/transition", { id: card.id, to: "in_review", note: "handoff attempt without any receipt", actor: "gateway-a-opencode" });
+      expect(r.status).toBe(400);
+      expect(String(r.body.error)).toContain("PR link");
+    }
+    const mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1);
+    expect(String(mine[0].title)).toContain("gate:review-needs-pr");
+  });
+});

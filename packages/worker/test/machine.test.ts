@@ -689,6 +689,50 @@ describe("breach fold (dedupe by task+class)", () => {
   });
 });
 
+// ---------- BR#3337: claim races are retryable, never breaches ----------
+
+describe("claim-race classification (BR#3337)", () => {
+  // the exact rejection shape the lifecycle gate emits for a raced claim:
+  // a gateway attempted in_progress → in_progress on a card another session owns
+  const raceEvents = (n: number, task = "BR#3337A") =>
+    Array.from({ length: n }, (_, i) => ({
+      ts: 1_000_000 + i * 60_000,
+      task,
+      op: "transition_rejected",
+      reason: "task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)",
+    }));
+
+  it("lifecycle-edge rejections classify as claim_race", () => {
+    expect(breachClass("task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)")).toBe("claim_race");
+    expect(breachClass("status 'in_review' is terminal for task")).toBe("claim_race");
+    // ownership rejections on a raced release are the same benign class
+    expect(breachClass("task BR#1 is claimed by other-gw — only the owner or a human can release it to the pool")).toBe("other");
+  });
+
+  it("a claim-race storm never raises a breach card (the breaker does not count it)", () => {
+    expect(detectBreaches(raceEvents(9), new Set())).toHaveLength(0);
+  });
+
+  it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#3337B",
+      op: "transition_rejected",
+      reason: "task BR#3337B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const breaches = detectBreaches(genuine, new Set());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].klass).toBe("gate:done-unreviewed");
+    // a mixed storm: 5 races + 3 genuine rejections → exactly one breach, for
+    // the genuine class, with the race count untouched
+    const mixed = [...raceEvents(5, "BR#3337B"), ...genuine];
+    const mixedBreaches = detectBreaches(mixed, new Set());
+    expect(mixedBreaches).toHaveLength(1);
+    expect(mixedBreaches[0].klass).toBe("gate:done-unreviewed");
+    expect(mixedBreaches[0].count).toBe(3);
+  });
+});
+
 // ---------- seeded random walk: legal sequences preserve invariants ----------
 
 describe("random walk (seeded)", () => {

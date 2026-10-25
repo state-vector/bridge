@@ -857,6 +857,7 @@ function replayStatus(from, versions) {
 }
 function breachClass(reason) {
   const r = reason.toLowerCase();
+  if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
   if (r.includes("pr link")) return "gate:review-needs-pr";
   if (r.includes("unreviewed")) return "gate:done-unreviewed";
   if (r.includes("references no git repository")) return "gate:no-repo";
@@ -1046,11 +1047,92 @@ var init_machine = __esm({
       invariant: 1,
       replay: 1,
       "spawn-while-open": 1,
+      claim_race: Number.POSITIVE_INFINITY,
       default: BREACH_THRESHOLD
     };
     __name(breachClass, "breachClass");
     __name(classOf, "classOf");
     __name(detectBreaches, "detectBreaches");
+  }
+});
+
+// src/kb/rollup.ts
+function rootBlockerKey(b) {
+  if (!b) return null;
+  const cond = String(b.unblock_condition ?? "");
+  const reason = String(b.reason ?? "");
+  const m = PR_URL.exec(cond) ?? PR_URL.exec(reason);
+  if (m) {
+    const repo = `${m[1]}/${m[2]}`.toLowerCase();
+    return `pr:${repo}#${m[3]}`;
+  }
+  if (MAIN_RED.test(`${cond} ${reason}`.toLowerCase())) return "main-red";
+  return null;
+}
+function rootBlockerTitle(key, n) {
+  return `ROOT BLOCKER (${key}) \u2014 ${n} tasks queued (investigate \u2192 fix \u2192 one approval)`;
+}
+function rootBlockerBody(key, cards) {
+  const isMainRed = key === "main-red";
+  const doneWhen = isMainRed ? "main is ancestry-green again (CI green on main and every open PR rebased onto it)" : `the blocking PR (${key.slice(3)}) is merged`;
+  const list = cards.map((c) => `- ${c.id}${c.title ? ` \u2014 ${c.title}` : ""}`).join("\n");
+  return [
+    `Auto-created by the watchdog sweep: ${cards.length} blocked cards share one machine-detectable root cause (\`${key}\`).`,
+    isMainRed ? "Root cause class: never-merge-onto-red-main (BR#551) \u2014 main is red/broken/failing, so every fix PR queues behind restoring main." : "Root cause class: one unmerged PR that every queued card names as its unblock condition.",
+    "",
+    "## Queued cards",
+    list,
+    "",
+    "## Ask contract",
+    "Investigate \u2192 fix \u2192 ONE approval. Work the root cause here (not on the queued cards); when the fix needs a human sign-off, file a single ask that leads with the decision \u2014 summary (what happened), why_escalated (which gate/authority), decision (the choice, each option with its receipt condition). One approval unblocks every queued card; do not ask each card separately.",
+    "",
+    "## Done when",
+    `Root cause gone, with receipts: ${doneWhen}. Closing requires evidence (CI run URLs / merged-PR state) \u2014 the sweep never auto-closes this task, and a later cluster of the same root opens a NEW root instead of reusing this one.`
+  ].join("\n");
+}
+function planRootBlockers(cards, roots, minCluster = ROOT_BLOCKER_MIN_CLUSTER) {
+  const statusById = new Map(roots.map((r) => [r.id, r.status]));
+  const isOpenRoot = /* @__PURE__ */ __name((id) => !!id && statusById.has(id) && OPEN_STATUSES.has(statusById.get(id)), "isOpenRoot");
+  const openRootByKey = /* @__PURE__ */ new Map();
+  for (const r of roots) {
+    if (!isOpenRoot(r.id) || !r.root_key) continue;
+    if (!openRootByKey.has(r.root_key)) openRootByKey.set(r.root_key, r.id);
+  }
+  const clusters = /* @__PURE__ */ new Map();
+  const byId = /* @__PURE__ */ new Map();
+  for (const c of cards) {
+    byId.set(c.id, c);
+    const key = rootBlockerKey(c.blocked);
+    if (!key) continue;
+    let list = clusters.get(key);
+    if (!list) clusters.set(key, list = []);
+    list.push(c.id);
+  }
+  const plan = { creates: [], stamps: [] };
+  for (const key of [...clusters.keys()].sort()) {
+    const members = clusters.get(key);
+    if (members.length < minCluster) continue;
+    const openRoot = openRootByKey.get(key) ?? null;
+    if (!openRoot) plan.creates.push({ key, members });
+    for (const id of members) {
+      if (isOpenRoot(byId.get(id)?.root_blocker)) continue;
+      plan.stamps.push({ id, root_key: key, root: openRoot });
+    }
+  }
+  return plan;
+}
+var ROOT_BLOCKER_TAG, ROOT_BLOCKER_MIN_CLUSTER, PR_URL, MAIN_RED, OPEN_STATUSES;
+var init_rollup = __esm({
+  "src/kb/rollup.ts"() {
+    ROOT_BLOCKER_TAG = "blocker";
+    ROOT_BLOCKER_MIN_CLUSTER = 3;
+    PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/i;
+    MAIN_RED = /\bmain\b[^.;]{0,60}?\b(?:reds?|broken|failing)\b|\b(?:reds?|broken|failing)\b[^.;]{0,60}?\bmain\b/;
+    OPEN_STATUSES = /* @__PURE__ */ new Set(["todo", "in_progress", "in_review", "blocked"]);
+    __name(rootBlockerKey, "rootBlockerKey");
+    __name(rootBlockerTitle, "rootBlockerTitle");
+    __name(rootBlockerBody, "rootBlockerBody");
+    __name(planRootBlockers, "planRootBlockers");
   }
 });
 
@@ -1068,6 +1150,7 @@ var init_do = __esm({
     init_throughput();
     init_provenance();
     init_machine();
+    init_rollup();
     STOP_LINE_SINK_ID = "BR#3124";
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
@@ -1346,6 +1429,12 @@ var init_do = __esm({
           } catch {
           }
         }
+        let rollup;
+        try {
+          rollup = await this.rootBlockerRollup(now);
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", "root_blocker_rollup", { error: String(e.message ?? e).slice(0, 300) });
+        }
         const nextAlarm = await this.state.storage.getAlarm();
         this.state.storage.sql.exec(
           `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.last_tick', ?)`,
@@ -1367,7 +1456,7 @@ var init_do = __esm({
         const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
         this.state.storage.sql.exec(
           `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
-          JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks })
+          JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks, root_blocker_rollup: rollup ?? null })
         );
       }
       // ---------- destination-green stop-the-line sweep (BR#3008) ----------
@@ -2363,6 +2452,101 @@ ${detail.body ?? ""}`;
           return { artefact_id: v.artefact_id, ts: v.ts, actor: v.actor, ...d };
         });
         return { tasks, sessions, progress, series, agents: this.agentScores() };
+      }
+      /** Blocker rollup (BR#2645): cluster the blocked cards by machine root key
+       *  (rollup.ts) and execute the plan — create ONE boosted ROOT BLOCKER task
+       *  per qualifying cluster (≥3 members, no open root for the key), stamp the
+       *  queued cards (meta.root_blocker + child_of → board tree + boost cascade).
+       *  Idempotent: the plan only stamps cards whose pointer changed, so a re-run
+       *  creates no duplicates. Roots close only by agent/human with receipts;
+       *  done roots are never reused — a later cluster opens a fresh root. */
+      async rootBlockerRollup(now) {
+        const blockedRows = this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`
+        ).toArray();
+        const cards = blockedRows.map((r) => {
+          const meta = JSON.parse(r.meta ?? "{}");
+          return { id: r.id, title: r.title, blocked: meta.blocked ?? null, root_blocker: meta.root_blocker ?? null };
+        });
+        const rootRows = this.state.storage.sql.exec(
+          `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND tags LIKE ?`,
+          `%"${ROOT_BLOCKER_TAG}"%`
+        ).toArray();
+        const roots = rootRows.map((r) => ({ id: r.id, status: r.status, root_key: JSON.parse(r.meta ?? "{}").root_key ?? null }));
+        const plan = planRootBlockers(cards, roots);
+        const created = [];
+        if (plan.creates.length || plan.stamps.length) {
+          const keyToRoot = /* @__PURE__ */ new Map();
+          for (const c of plan.creates) {
+            try {
+              const members = cards.filter((x) => c.members.includes(x.id));
+              const res = await this.create(
+                {
+                  type: "task",
+                  title: rootBlockerTitle(c.key, c.members.length),
+                  body_md: rootBlockerBody(c.key, members),
+                  tags: [ROOT_BLOCKER_TAG],
+                  // the sweep HAS analysed the cluster — the root is ready for pickup
+                  qualified: true,
+                  meta: { root_key: c.key }
+                },
+                "system:watchdog"
+              );
+              if (res?.id) {
+                keyToRoot.set(c.key, res.id);
+                created.push(res.id);
+              }
+              this.audit("system:watchdog", "root_blocker_created", res?.id ?? null, { key: c.key, members: c.members });
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", `root_blocker:${c.key}`, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          let stamped = 0;
+          for (const s of plan.stamps) {
+            try {
+              const rootId = s.root ?? keyToRoot.get(s.root_key);
+              if (!rootId) continue;
+              const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, s.id);
+              if (!row) continue;
+              const meta = JSON.parse(row.meta ?? "{}");
+              if (meta.root_blocker === rootId) continue;
+              meta.root_blocker = rootId;
+              this.state.storage.sql.exec(
+                `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+                JSON.stringify(meta),
+                now,
+                s.id
+              );
+              const linked = this.one(
+                `SELECT 1 AS x FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`,
+                s.id,
+                rootId
+              );
+              if (!linked) {
+                try {
+                  await this.link({ src: s.id, relation: "child_of", dst: rootId }, "system:watchdog");
+                } catch (e) {
+                  this.audit("system:watchdog", "rollup_link_rejected", s.id, { root: rootId, error: String(e.message ?? e).slice(0, 200) });
+                }
+              }
+              stamped++;
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", s.id, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          for (const rootId of keyToRoot.values()) {
+            try {
+              await this.boost({ id: rootId, boost: true }, "system:watchdog");
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", `boost:${rootId}`, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          if (created.length || stamped) {
+            this.audit("system:watchdog", "root_blocker_rollup", null, { created, stamped });
+          }
+          return { created, stamped };
+        }
+        return { created: [], stamped: 0 };
       }
       /** Behaviour signals per agent over the trailing 7-day window, scored via scoreAgent().
        *  Cached per-isolate (30s TTL) — it fans out to several table scans per call and
@@ -5640,7 +5824,7 @@ async function seeAlso(a, rel, identity, call) {
   for (const e of rows) {
     const otherClaimed = e.owner && e.owner !== identity.label;
     const otherPublished = !e.owner && e.created_by && e.created_by !== identity.label;
-    if (e.type === "task" && OPEN_STATUSES.has(e.status) && (otherClaimed || otherPublished)) {
+    if (e.type === "task" && OPEN_STATUSES2.has(e.status) && (otherClaimed || otherPublished)) {
       e.coordination = true;
       e._rank = -1;
     } else if (e.type === "steering" || e.type === "goal") {
@@ -5771,7 +5955,7 @@ function json(obj, status = 200) {
     headers: { "content-type": "application/json", "cache-control": "no-store" }
   });
 }
-var BUILD, wsRouteCache, OPEN_STATUSES, shallow, text, err, TOOLS;
+var BUILD, wsRouteCache, OPEN_STATUSES2, shallow, text, err, TOOLS;
 var init_mcp = __esm({
   "src/mcp.ts"() {
     init_core();
@@ -5781,7 +5965,7 @@ var init_mcp = __esm({
     __name(resolveTokenWs, "resolveTokenWs");
     __name(handleMcp, "handleMcp");
     __name(kb, "kb");
-    OPEN_STATUSES = /* @__PURE__ */ new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
+    OPEN_STATUSES2 = /* @__PURE__ */ new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
     __name(seeAlso, "seeAlso");
     __name(callTool, "callTool");
     shallow = /* @__PURE__ */ __name((a) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts, created_by: a.created_by }), "shallow");
@@ -5990,7 +6174,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "cddb121b436775723e3fdaceda102bea8a274e67", built_at: "2026-10-25T13:25:43Z" };
+    module.exports = { commit: "57353098e15185093fcb30ebac5e37920861ed43", built_at: "2026-10-25T13:47:22Z" };
   }
 });
 

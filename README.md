@@ -47,7 +47,7 @@ Optional workspace scoping via `WORKSPACE_MEMBERS` (JSON map slug → GitHub log
 
 ## 3 · Run a runner (the gateway)
 
-The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board.
+The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board. Claim races are noise, not failures: before claiming, the runner re-reads the card and skips silently when another dispatcher won; a card still `in_progress` whose dispatched session died (no fresh session stamp or hub heartbeat for 10 minutes — the same bar the watchdog uses) has its stale claim released and is re-claimed fresh; and the dispatch circuit breaker counts only genuine agent-CLI failures (spawn, auth, guardrails, provisioning) — lifecycle rejections from races never count toward it.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
