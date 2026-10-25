@@ -299,3 +299,62 @@ describe("gauge carry-forward in log_progress (merge semantics)", () => {
     expect(got.body.meta.last_progress.context_pct).toBeUndefined();
   });
 });
+
+// ---------- BR#3322: replay consistency through the real write path ----------
+
+describe("replay consistency (BR#3322, real storage)", () => {
+  // /history is a GET-only route (the human-plane mirror); encodeURIComponent
+  // because ids carry '#' (BR#123) — raw in a URL it parses as the fragment
+  const hist = async (id: string) => {
+    const r = await kb(`/history?id=${encodeURIComponent(id)}&limit=200`);
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+
+  it("a normal transition chain folds to the stored status — no replay mismatch note, zero chain breaks", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "replay probe", qualified: true });
+    const claim = await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    expect(claim.status).toBe(200);
+    const rev = await kbJson("/transition", { id: t.id, to: "in_review", note: "PR https://github.com/x/y/pull/9" });
+    expect(rev.status).toBe(200);
+
+    const h = await hist(t.id);
+    expect(h.status).toBe(200);
+    const rows: any[] = h.body.versions ?? [];
+    // the replay check runs after every transition — a healthy chain must
+    // never leave a mismatch note behind
+    const mismatch = rows.filter((r) => String(r.summary ?? "").includes("REPLAY MISMATCH"));
+    expect(mismatch).toEqual([]);
+
+    // and the fold of the produced log equals the stored status — the API
+    // returns rows newest-first; the fold walks chronologically (replayCheck
+    // reverses the same way)
+    const { replayStatus } = await import("../src/kb/machine.ts");
+    const got = await kbJson("/get", { id: t.id });
+    const fold = replayStatus("", rows.slice().reverse().map((v) => ({ action: String(v.action), data: v.data ?? {} })));
+    expect(fold.status).toBe(got.body.status);
+    expect(fold.breaks).toBe(0);
+  });
+
+  it("transition rows chain one-to-one with transitions — no duplicate stamps (BR#3322)", async () => {
+    // the duplicate-stamp class (BR#3322): an effect row written AFTER the
+    // applied transition row with the same stale from broke the chain on
+    // every churn redirect. The invariant under test: one doTransition call
+    // → exactly ONE transition row; the log chains with zero breaks.
+    const { body: t } = await kbJson("/create", { type: "task", title: "effect stamp probe", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    await kbJson("/transition", { id: t.id, to: "in_review", note: "PR https://github.com/x/y/pull/10" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "bounce" });
+    const h = await hist(t.id);
+    const rows: any[] = h.body.versions ?? [];
+    const transitions = rows.filter((r) => r.action === "transition");
+    // 3 transition calls → exactly 3 transition rows (create + progress rows excluded)
+    expect(transitions.length).toBe(3);
+    // each recorded to chains chronologically (the API returns newest-first):
+    // todo → in_progress → in_review → in_progress
+    expect(transitions.slice().reverse().map((r) => r.data?.to)).toEqual(["in_progress", "in_review", "in_progress"]);
+    const { replayStatus } = await import("../src/kb/machine.ts");
+    const fold = replayStatus("", rows.slice().reverse().map((v) => ({ action: String(v.action), data: v.data ?? {} })));
+    expect(fold.ok).toBe(true);
+    expect(fold.breaks).toBe(0);
+  });
+});

@@ -535,15 +535,25 @@ describe("replay fold (BR#2419 item 6)", () => {
 
   it("folds a consistent log forward to the stored status", () => {
     const log = [t("todo", "in_progress"), t("in_progress", "in_review"), t("in_review", "done")];
-    expect(replayStatus("", log)).toEqual({ status: "done", ok: true });
+    expect(replayStatus("", log)).toEqual({ status: "done", ok: true, breaks: 0, tailBreak: false });
     // a fold that disagrees with the stored state is the mismatch breach class
     const fold = replayStatus("", log);
     expect(fold.status !== "in_review" && fold.ok).toBe(true); // stored in_review would mismatch
   });
 
-  it("flags a broken chain (forged / out-of-order history)", () => {
+  it("a gap re-anchors and the fold heals forward — the breach lives in fold-vs-stored, not in an abort", () => {
+    // (BR#3322) the early-return contract made ONE historical gap break the
+    // fold forever: every later transition re-fired the replay breach on a
+    // log that could never verify again. The fold now re-anchors at each gap
+    // (the log's own chain continues from the row's `to`) and reports the
+    // damage; the replay LAW (fold(events) == stored_state) is enforced by
+    // the caller comparing the healed fold with the stored status.
     const broken = [t("todo", "in_progress"), t("in_review", "done")]; // jump: in_progress ≠ in_review
-    expect(replayStatus("", broken)).toEqual({ status: "in_progress", ok: false });
+    const fold = replayStatus("", broken);
+    expect(fold.status).toBe("done"); // healed past the gap
+    expect(fold.ok).toBe(false); // chain integrity: the caller sees the gap
+    expect(fold.breaks).toBe(1);
+    expect(fold.tailBreak).toBe(true); // the gap is at the tail — fresh damage, audited
   });
 
   it("ignores non-transition events and tolerates subprocess self-loops", () => {
@@ -554,11 +564,46 @@ describe("replay fold (BR#2419 item 6)", () => {
       { action: "transition", data: { from: "in_progress", to: "in_progress", class: "subprocess" } }, // declared silence
       t("in_progress", "in_review"),
     ];
-    expect(replayStatus("", log)).toEqual({ status: "in_review", ok: true });
+    expect(replayStatus("", log)).toEqual({ status: "in_review", ok: true, breaks: 0, tailBreak: false });
   });
 
   it("an empty log folds to nothing — no false mismatch on fresh artefacts", () => {
-    expect(replayStatus("", [])).toEqual({ status: "", ok: true });
+    expect(replayStatus("", [])).toEqual({ status: "", ok: true, breaks: 0, tailBreak: false });
+  });
+
+  it("BR#3322 regression: a legacy silent mutation must not re-fire the breach on every later transition", () => {
+    // BR#903's Oct-20 shape: a verify round bounced in_review → in_progress
+    // without stamping a transition row; the next stamped row claims
+    // from=in_progress. The old fold aborted there forever (folded "in_review",
+    // ok:false on EVERY later transition — the breach card re-fired all day).
+    const log = [
+      t("todo", "in_progress"),
+      t("in_progress", "in_review"),
+      t("in_progress", "todo"), // from lies: the stored was in_review (silent bounce)
+      t("todo", "in_progress"), // later rows chain cleanly again
+      t("in_progress", "blocked"),
+    ];
+    const fold = replayStatus("", log);
+    expect(fold.status).toBe("blocked"); // heals to the log's own end state
+    expect(fold.ok).toBe(false);
+    expect(fold.breaks).toBe(1);
+    expect(fold.tailBreak).toBe(false); // damage is historical — no per-transition audit spam
+  });
+
+  it("BR#3322 regression: the churn-guard duplicate stamp (applied row + effect row) is one audible tail break", () => {
+    // do.ts release_redirect/escalate used to stamp a SECOND transition row
+    // with the stale pre-applied from, right after the applied row had
+    // already moved the chain — one guaranteed gap per churn redirect.
+    const log = [
+      t("todo", "in_progress"),
+      t("in_progress", "blocked"), // the applied transition (watchdog redirect)
+      t("in_progress", "blocked"), // the duplicate effect stamp with the stale from
+    ];
+    const fold = replayStatus("", log);
+    expect(fold.status).toBe("blocked");
+    expect(fold.breaks).toBe(1);
+    expect(fold.ok).toBe(false);
+    expect(fold.tailBreak).toBe(true); // fresh damage — audited the moment it lands
   });
 });
 

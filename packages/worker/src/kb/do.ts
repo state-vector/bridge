@@ -2796,12 +2796,17 @@ export class KnowledgeHub {
         }
         case "escalate": {
           this.audit("system:churn-guard", "escalated", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, duty: tRoles[0] ?? "unknown" });
-          this.version(id, "system:churn-guard", "transition", `escalated to human — verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { from: row.status, to: verdict.status });
+          // a NOTE, not a second transition row: the applied transition above
+          // already stamped the real from→to. A duplicate transition stamp
+          // with the stale pre-applied from broke the version-log chain and
+          // re-fired the replay breach on every later transition (BR#3322).
+          this.version(id, "system:churn-guard", "note", `escalated to human — verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
           break;
         }
         case "release_redirect": {
           this.audit("system:churn-guard", "release_redirected", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, from: row.status });
-          this.version(id, "system:churn-guard", "transition", `release redirected to blocked — ${fx.attempts} attempts without completion`, { from: row.status, to: "blocked" });
+          // same: the redirect IS the applied transition — explain it as a note
+          this.version(id, "system:churn-guard", "note", `release redirected to blocked — ${fx.attempts} attempts without completion`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
           break;
         }
       }
@@ -3115,10 +3120,18 @@ export class KnowledgeHub {
       return { action: String(v.action), data: d };
     });
     const fold = replayStatus("", events);
-    if (!fold.ok || (fold.status && fold.status !== row.status)) {
-      this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
-      this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (chain ok: ${fold.ok}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+    if (fold.status && fold.status !== row.status) {
+      // the law: fold(events) != stored_state is itself a breach (BR#2419 item 6)
+      this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
+      this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (${fold.breaks} chain break${fold.breaks === 1 ? "" : "s"}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
       try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
+    } else if (fold.tailBreak) {
+      // The newest transition row didn't chain (a stale/duplicate stamp or a
+      // silent status write just landed). The fold healed past it — but fresh
+      // damage is audited the moment it happens, while historical gaps
+      // (pre-gate rows, BR#3322) re-anchor silently instead of re-firing the
+      // breach on every transition forever.
+      this.audit("system:replay", "chain_break", id, { breaks: fold.breaks });
     }
   }
 
@@ -3414,7 +3427,9 @@ export class KnowledgeHub {
         `UPDATE artefacts SET meta = ?, status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
         JSON.stringify(m), now, now, id,
       );
-      this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { status: "done", answer: answer.slice(0, 200) });
+      // stamp the real from→to — a status change with no from/to is a silent
+      // mutation as far as the replay fold is concerned (BR#3322)
+      this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200) });
       let taskStatus: string | undefined;
       const subject = this.one(
         `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -3817,7 +3832,10 @@ export class KnowledgeHub {
           JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
         );
         this.audit("system:reaper", "loop_escalated", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-        this.version(t.id, "system:reaper", "transition", `rework loop escalated to human — ${attempts} attempts without completion`, { prev_owner: ownerLabel });
+        // a NOTE, not a transition row — the status does not change here; a
+        // transition stamp without from/to is invisible to the replay fold
+        // and masquerades as a move that never happened (BR#3322)
+        this.version(t.id, "system:reaper", "note", `rework loop escalated to human — ${attempts} attempts without completion`, { prev_owner: ownerLabel, attempts });
         out.push(
           `${t.id} "${t.title}" REWORK LOOP (${attempts} attempts) — escalated to a human instead of re-releasing. Blocked-for-human until reviewed.`,
         );
@@ -3830,7 +3848,11 @@ export class KnowledgeHub {
         JSON.stringify(tags), JSON.stringify(meta), now, now, t.id,
       );
       this.audit("system:reaper", "reassign", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-      this.version(t.id, "system:reaper", "transition", `reassigned — ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { prev_owner: ownerLabel });
+      // the reassign IS a status change (blocked → todo, the loop's WHERE
+      // clause pins `status = 'blocked'`) — stamp the real from/to so the
+      // replay fold can chain it (the from/to-less stamp was a silent
+      // mutation that broke every later fold — BR#3322's Oct-20 shape)
+      this.version(t.id, "system:reaper", "transition", `reassigned — ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { from: "blocked", to: "todo", prev_owner: ownerLabel });
       out.push(
         mine
           ? `${t.id} "${t.title}" was REASSIGNED: you ${idleDesc}.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) — partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.`
