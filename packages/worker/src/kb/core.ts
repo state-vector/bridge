@@ -372,7 +372,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
  * Cadence is selected by the token's `cadence:cron` tag; roles by `role:*` tags.
  */
 export const DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule — each run is one pass, not a conversation.
-1. MERGE SWEEP (standing order BR#3033): bounded to AT MOST 3 PRs per tick — then move on to tasks; an unbounded sweep starves the queue. Drain open PRs oldest first (dependency order): require (a) base main green, (b) PR checks green — external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four → merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress WITH gauges (completion/confidence/risk/context — a stats-less row hides on the board). Any failed leg → DO NOT merge: conflicts → mechanical rebase + re-push (it re-enters the order next tick); red substance checks → bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551).
+1. REBASE LEG (standing order BR#3033): the hub's deterministic merge-queue sweep (BR#3198) drains mergeable PRs every tick automatically — do NOT duplicate its merges or its bounces. Your role is the repair leg: a card bounced by the sweep (note: "unmergeable — CONFLICTING", "mergeStateStatus=...", or "head moved past the accepted verify verdict") is yours to claim: rebase onto current main, resolve conflicts mechanically (substance-preserving), re-sign as detached-cody per BR#3181, re-push with --force-with-lease — it re-enters the sweep next tick. A red substance check bounce means the implementation is wrong: claim, fix, re-enter.
 2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
 3. If you own in_progress tasks: log_progress on each (one line + sentiment — the heartbeat) WITH gauges (completion_pct/confidence_pct/risk_pct/context_pct — rows without gauges show no stats and the board can't prioritise them), then resume the oldest one.
 4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims — an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
@@ -723,4 +723,157 @@ export function stopLineAskTitle(sha: string, names: string[]): string {
   let namesText = names.join(", ");
   if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
   return prefix + namesText + suffix;
+}
+
+// ---------- merge-queue sweep (BR#3198) ----------
+// The deterministic executor of the BR#3033 standing merge order ("merge when
+// green" — the run-side complement of BR#3008's stop-the-line gate). Pure
+// decision functions here; the scheduled sweep that fetches GitHub state and
+// applies these verdicts lives in kb/do.ts. Pinned case by case in
+// packages/worker/test/merge-sweep.test.ts.
+
+/** BR#2267 externals — CI checks that never gate a merge (external Cloudflare
+ *  workers-builds mirrors, deploy previews). Matched as substrings, case
+ *  insensitively, against the check NAME. */
+export const MERGE_EXEMPT_CHECK_PATTERNS = [
+  "workers builds",
+  "workers-builds",
+  "cloudflare pages",
+  "cloudflare workers",
+  "deploy preview",
+  "codeql",
+] as const;
+
+export function isExemptCheckName(name: string): boolean {
+  const n = name.toLowerCase();
+  return MERGE_EXEMPT_CHECK_PATTERNS.some((p) => n.includes(p));
+}
+
+export type HeadCheckVerdict = {
+  verdict: "green" | "red" | "unsettled";
+  red: MainRedCheck[];
+  unsettled: string[];
+  /** externals that failed but are exempt — human-leg, never gating */
+  external: MainRedCheck[];
+  green: number;
+};
+
+/** The HEAD side of the 5c mechanical gate: same decision rule as
+ *  classifyMainCheckRuns, but exempt-external failures (BR#2267) are pulled
+ *  OUT of red and recorded as `external` — they are collected into the class
+ *  ask, never bounce a PR. */
+export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
+  const red: MainRedCheck[] = [];
+  const unsettled: string[] = [];
+  const external: MainRedCheck[] = [];
+  let green = 0;
+  for (const r of runs) {
+    if (r.conclusion == null) {
+      if (isExemptCheckName(r.name ?? "")) continue; // exempt externals in flight say nothing
+      unsettled.push(r.name ?? "");
+      continue;
+    }
+    if (isExemptCheckName(r.name ?? "")) {
+      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    else unsettled.push(r.name ?? "");
+  }
+  if (red.length) return { verdict: "red", red, unsettled, external, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
+  return { verdict: "green", red, unsettled, external, green };
+}
+
+export type MergeCandidateInput = {
+  prNumber: number;
+  prTitle: string;
+  /** full 40-hex head sha (the merge gate pins the verify lineage to it) */
+  headSha: string;
+  /** classifyMainCheckRuns verdict on the BASE (main) HEAD */
+  baseVerdict: "green" | "red" | "unsettled" | "empty";
+  /** GitHub pull API mergeable; null while GitHub computes it */
+  mergeable: boolean | null;
+  /** GitHub pull API mergeStateStatus */
+  mergeStateStatus: string | null;
+  /** commits of the PR: REST verification (verified=true = signed+valid) */
+  commits: { sha: string; verified: boolean }[];
+  headChecks: MainCheckRun[];
+  /** the linked BR# card's status, or null when the PR names no card */
+  cardStatus: string | null;
+  /** an ACCEPTED verify-verdict decision on the linked card cites this exact headSha */
+  verifyAcceptedOnHead: boolean;
+  /** the card has any accepted verify decision (any head) */
+  verifyAcceptedAny: boolean;
+};
+
+/** What the sweep should DO with one candidate. Mechanical defects bounce the
+ *  card when it is in_review (returning to its author); otherwise they are a
+ *  progress note — the sweep never steals a claim. */
+export type MergeAction =
+  | { kind: "merge"; receipt: string }
+  | { kind: "close_superseded"; reason: string }
+  | { kind: "bounce"; defect: string }
+  | { kind: "note"; reason: string }
+  | { kind: "skip"; reason: string }
+  | { kind: "human_leg"; reason: string };
+
+/** The 5c gate + verify lineage, as one decision table.
+ *  Order matters: superseded first, then the mechanical gate (mergeable /
+ *  state / signatures / base / head), then verify lineage, then merge. */
+export function decideMergeAction(i: MergeCandidateInput): MergeAction {
+  // superseded-check FIRST (BR#3034 queue norm): a superseded card's PR dies
+  // before any gate runs.
+  if (i.cardStatus === "superseded")
+    return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
+  if (i.cardStatus === "done")
+    return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+
+  const short = i.headSha.slice(0, 9);
+  // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23)
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability — not yet, skip this tick" };
+    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue` };
+  }
+  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter` };
+  // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
+  const unverified = i.commits.filter((c) => !c.verified);
+  if (unverified.length)
+    return { kind: "human_leg", reason: `PR #${i.prNumber} has ${unverified.length} commit(s) not GitHub-verified — signing-environment class, never per-PR` };
+  // (3) base green (BR#3009 destination-green; BR#3008's gate enforces it too)
+  if (i.baseVerdict !== "green")
+    return { kind: "skip", reason: `base main ${i.baseVerdict === "red" ? "RED" : "not green"} — the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert` };
+  // (4) head checks green (BR#2267 externals exempt)
+  const head = classifyHeadChecks(i.headChecks);
+  if (head.verdict === "red") {
+    const names = head.red.map((r) => r.name).join(", ");
+    return i.cardStatus === "in_review"
+      ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl` }
+      : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
+  }
+  if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) — not yet, skip this tick` };
+  // (5) verify lineage: an ACCEPTED verify verdict must cover THIS head.
+  //     Head moved past an accepted verdict → the sweep's own bounce
+  //     (re-verify on head change triggers the normal verify pool).
+  if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
+    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)` };
+  if (!i.verifyAcceptedOnHead)
+    return { kind: "skip", reason: `no accepted verify verdict covering head ${short} — the verify pool owns the verdict; the sweep merges only verified PRs` };
+  return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} — 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
+}
+
+/** Deterministic title for the human-leg class ask (rule 5c: ONE ask per
+ *  class per sweep episode, never one per PR). Deduped via askCreate's
+ *  identical-open-ask guard. Always ≤240 chars (the ask contract) and always
+ *  ends in "?" (also the contract). */
+export function mergeSweepHumanLegTitle(repo: string, reasons: string[]): string {
+  const prefix = `Merge sweep human legs on ${repo}: `;
+  const suffix = ` — fix the class?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text = reasons.join("; ");
+  if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + text + suffix;
 }

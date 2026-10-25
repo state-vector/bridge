@@ -59,6 +59,9 @@ import {
   sanitizeTags,
   stopLineAskTitle,
   classifyMainCheckRuns,
+  classifyHeadChecks,
+  decideMergeAction,
+  mergeSweepHumanLegTitle,
   validateRelation,
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
@@ -341,7 +344,19 @@ export class KnowledgeHub {
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
       });
     }
-    // (B) destination-green stop-the-line (BR#3008): one sweep on a slow
+    // (B) standing merge-queue sweep (BR#3198): the deterministic executor of
+    // the BR#3033 standing merge order — drains mergeable, verified, green
+    // PRs every tick, FIRST, before anything else claims attention. Isolated:
+    // a GitHub outage must never take the watchdog down with it.
+    try {
+      await this.mergeQueueSweep(now);
+    } catch (e) {
+      try {
+        this.audit("system:merge-sweep", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+      } catch { /* next tick retries */ }
+    }
+
+    // (C) destination-green stop-the-line (BR#3008): one sweep on a slow
     // cadence, failures isolated — an alarm-layer outage in GitHub's API must
     // never take the watchdog down with it.
     try {
@@ -496,6 +511,260 @@ export class KnowledgeHub {
       "hub:stop-the-line",
     );
     this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+  }
+
+  // ---------- standing merge-queue sweep (BR#3198) ----------
+  // The deterministic executor of the BR#3033 standing merge order ("merge
+  // when green") — the run-side complement of BR#3008's stop-the-line gate.
+  // Every tick (paced by `merge_sweep_minutes`, default 15, 0 = off), for each
+  // OPEN PR on both repos, oldest first:
+  //   superseded-check → 5c mechanical gate (mergeable + clean + every commit
+  //   GitHub-verified + base green + head checks green) + an ACCEPTED
+  //   verify-verdict decision covering the current head → merge (squash per
+  //   repo norm). Mechanical defects auto-bounce the linked card with the
+  //   exact defect; human-leg defects (externals, signing environment) are
+  //   collected into ONE class ask per repo per episode, never one per PR.
+  //
+  // Identity: merges as the token's identity — deploy GH_TOKEN as the
+  // detached-cody credential per BR#3181, never rayh's personal credentials.
+  // Settings: `merge_sweep_minutes` (default 15), `merge_sweep_repos` (JSON
+  // array, default both repos), `merge_sweep_methods` (JSON map repo →
+  // "merge" | "squash", default bridge=merge / superpositional=squash),
+  // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
+  // `merge_sweep_gh_api_base` (drills/tests only).
+  private async mergeQueueSweep(now: number): Promise<void> {
+    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
+    if (periodMin === 0) return; // explicitly disabled
+    const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
+    if (now - last < periodMin * 60_000) return;
+    const setLast = (ts: number) =>
+      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts));
+    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
+    setLast(now);
+
+    const token = this.env.GH_TOKEN;
+    if (!token) {
+      this.audit("hub:merge-sweep", "no_identity", null, { note: "GH_TOKEN not configured — the sweep cannot merge as detached-cody (BR#3181); skipping, never merging unauthenticated" });
+      return;
+    }
+    const base = this.settingValue("merge_sweep_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+    let repos: string[] = [];
+    try {
+      const parsed = JSON.parse(this.settingValue("merge_sweep_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+      if (Array.isArray(parsed)) repos = parsed.map(String);
+    } catch { repos = []; }
+    if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+    let methods: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(this.settingValue("merge_sweep_methods", JSON.stringify({ "state-vector/bridge": "merge", "state-vector/superpositional": "squash" })));
+      if (parsed && typeof parsed === "object") methods = parsed;
+    } catch { methods = {}; }
+
+    const ghGet = async (path: string): Promise<any> => {
+      const res = await fetch(`${base}${path}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "user-agent": "bridge-merge-sweep (BR#3198)",
+          "x-github-api-version": "2022-11-28",
+        },
+      });
+      if (res.status === 403 || res.status === 429) {
+        setLast(now + 60 * 60_000); // quota exhausted — back off a full window
+        throw new Error(`github rate limited (HTTP ${res.status})`);
+      }
+      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+      return res.json();
+    };
+
+    const cardRef = (text: string): string | null => {
+      const m = /BR#(\d+)/.exec(text ?? "");
+      return m ? `BR#${m[1]}` : null;
+    };
+
+    /** Append a progress note WITHOUT touching status or claims — receipts and
+     *  mechanical-defect notes on cards the sweep must not disturb. */
+    const sweepNote = (id: string, note: string) => {
+      const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+      if (!row) return;
+      const meta = JSON.parse(row.meta ?? "{}");
+      meta.last_progress = { note: note.slice(0, 500), sentiment: "neutral", actor: "system:merge-sweep", ts: Date.now() };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), id);
+      this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
+      this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
+    };
+
+    const results: any[] = [];
+    for (const repo of repos) {
+      const humanLegs: string[] = [];
+      try {
+        const pulls = await ghGet(`/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`) as any[];
+        // base-green precondition, once per repo per sweep
+        const head = await ghGet(`/repos/${repo}/commits/main`);
+        const baseSha = String(head?.sha ?? "");
+        let baseVerdict: "green" | "red" | "unsettled" | "empty" = "empty";
+        if (/^[0-9a-f]{40}$/.test(baseSha)) {
+          const runsBody = await ghGet(`/repos/${repo}/commits/${baseSha}/check-runs?per_page=100`);
+          baseVerdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []).verdict;
+        }
+
+        for (const pr of pulls) {
+          const prNumber = pr.number;
+          try {
+            const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
+            const linked = cardRef(`${pr.title ?? ""}\n${pr.body ?? ""}\n${detail.title ?? ""}\n${detail.body ?? ""}`);
+            const card = linked ? this.one(`SELECT id, status FROM artefacts WHERE id = ?`, linked) : null;
+            const cardStatus = card ? String(card.status) : null;
+
+            // accepted verify lineage: decisions derived_from the linked card
+            // whose body/meta cites the current head sha
+            let verifyAcceptedAny = false;
+            let verifyAcceptedOnHead = false;
+            const headSha = String(detail?.head?.sha ?? "");
+            if (linked && /^[0-9a-f]{40}$/.test(headSha)) {
+              const decisions = this.state.storage.sql.exec(
+                `SELECT d.body_md AS body_md, d.meta AS meta FROM relations r
+                 JOIN artefacts d ON d.id = r.src_id
+                 WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+                linked,
+              ).toArray() as any[];
+              verifyAcceptedAny = decisions.length > 0;
+              verifyAcceptedOnHead = decisions.some((d: any) =>
+                (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9)),
+              );
+            }
+
+            const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
+            const commits = (commitsBody ?? []).map((c: any) => ({ sha: String(c?.sha ?? ""), verified: c?.commit?.verification?.verified === true }));
+            const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
+            const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
+
+            const action = decideMergeAction({
+              prNumber, prTitle: String(detail?.title ?? pr.title ?? ""),
+              headSha, baseVerdict,
+              mergeable: detail?.mergeable ?? null,
+              mergeStateStatus: detail?.merge_state_status ?? null,
+              commits, headChecks, cardStatus,
+              verifyAcceptedAny, verifyAcceptedOnHead,
+            });
+
+            if (action.kind === "merge") {
+              const method = methods[repo] === "squash" ? "squash" : "merge";
+              const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
+                method: "PUT",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  accept: "application/vnd.github+json",
+                  "content-type": "application/json",
+                  "user-agent": "bridge-merge-sweep (BR#3198)",
+                },
+                body: JSON.stringify({ merge_method: method }),
+              });
+              if (mergeRes.ok) {
+                const merged = await mergeRes.json().catch(() => ({}));
+                const receipt = `${action.receipt} — mergeCommit ${String((merged as any)?.sha ?? "unknown").slice(0, 9)}`;
+                if (linked) sweepNote(linked, receipt);
+                results.push({ repo, pr: prNumber, kind: "merge", sha: String((merged as any)?.sha ?? "").slice(0, 9) });
+                this.audit("system:merge-sweep", "merge", linked, { repo, pr: prNumber, method, receipt: receipt.slice(0, 300) });
+              } else if (mergeRes.status === 405 || mergeRes.status === 409) {
+                // GitHub raced us: no longer mergeable — bounce like any mechanical defect
+                const defect = `PR #${prNumber} merge refused by GitHub (HTTP ${mergeRes.status}) — no longer mergeable/clean. Rebase, resolve, re-push, re-enter the queue`;
+                if (linked && cardStatus === "in_review") await this.transition({ id: linked, to: "in_progress", note: defect }, "system:merge-sweep");
+                else if (linked) sweepNote(linked, defect);
+                results.push({ repo, pr: prNumber, kind: "bounce", defect });
+              } else {
+                throw new Error(`merge PUT -> HTTP ${mergeRes.status}`);
+              }
+            } else if (action.kind === "close_superseded") {
+              const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+                method: "PATCH",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  accept: "application/vnd.github+json",
+                  "content-type": "application/json",
+                  "user-agent": "bridge-merge-sweep (BR#3198)",
+                },
+                body: JSON.stringify({ state: "closed", state_reason: "not_planned" }),
+              });
+              if (close.ok) {
+                if (linked) sweepNote(linked, `${action.reason} — PR #${prNumber} closed by the merge sweep (superseded-check first)`);
+                results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber });
+              } else throw new Error(`close PATCH -> HTTP ${close.status}`);
+            } else if (action.kind === "bounce") {
+              if (linked && cardStatus === "in_review") {
+                await this.transition({ id: linked, to: "in_progress", note: action.defect }, "system:merge-sweep");
+              } else if (linked) {
+                sweepNote(linked, action.defect);
+              }
+              results.push({ repo, pr: prNumber, kind: "bounce", defect: action.defect });
+              this.audit("system:merge-sweep", "bounce", linked, { repo, pr: prNumber, defect: action.defect.slice(0, 300) });
+            } else if (action.kind === "note") {
+              if (linked) sweepNote(linked, action.reason);
+              results.push({ repo, pr: prNumber, kind: "note" });
+            } else if (action.kind === "human_leg") {
+              humanLegs.push(action.reason);
+              results.push({ repo, pr: prNumber, kind: "human_leg" });
+            } else {
+              // skip: quiet, no note spam — but the audit trail keeps it honest
+              this.audit("system:merge-sweep", "skip", linked, { repo, pr: prNumber, reason: action.reason.slice(0, 300) });
+              results.push({ repo, pr: prNumber, kind: "skip", reason: action.reason.slice(0, 120) });
+            }
+          } catch (e) {
+            // one PR's failure must never stop the sweep — log and move on
+            this.audit("system:merge-sweep", "pr_error", null, { repo, pr: prNumber, error: String((e as Error).message ?? e).slice(0, 300) });
+            results.push({ repo, pr: prNumber, kind: "pr_error", error: String((e as Error).message ?? e).slice(0, 120) });
+          }
+        }
+
+        // human legs → ONE class ask per repo per episode (rule 5c), deduped
+        if (humanLegs.length) {
+          const sinkId = this.settingValue("merge_sweep_artefact_id", "BR#3198");
+          const title = mergeSweepHumanLegTitle(repo, humanLegs);
+          const dup = this.one(
+            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.type = 'question' AND c.title = ? LIMIT 1`,
+            sinkId, title.slice(0, 200),
+          );
+          if (dup) {
+            this.audit("system:merge-sweep", "human_leg_dupe", String(dup.id), { repo, legs: humanLegs.slice(0, 5) });
+          } else {
+            const created = await this.askCreate(
+              {
+                to: "rayh",
+                urgency: "normal",
+                question: title,
+                details: [
+                  `**Human-leg merge blockers (BR#3198 class ask — one ask per class, never per PR).**`,
+                  ``,
+                  ...humanLegs.map((r) => `- ${r}`),
+                  ``,
+                  `_These are the only defects the standing merge sweep (BR#3198) cannot resolve autonomously. Everything mechanical was bounced with the exact defect on the linked card._`,
+                ].join("\n"),
+                reason: "merge sweep collected human-leg defects into the single class ask per rule 5c",
+                options: ["Acknowledge — on it", "Redirect the class"],
+                artefact_id: sinkId,
+              },
+              "system:merge-sweep",
+            );
+            this.audit("system:merge-sweep", "human_leg_ask", String(created.id), { repo, legs: humanLegs.slice(0, 5) });
+            results.push({ repo, pr: null, kind: "human_leg_ask", ask: created.id });
+          }
+        }
+      } catch (e) {
+        this.audit("system:merge-sweep", "repo_error", null, { repo, error: String((e as Error).message ?? e).slice(0, 300) });
+        results.push({ repo, pr: null, kind: "repo_error", error: String((e as Error).message ?? e).slice(0, 120) });
+      }
+    }
+
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
+      JSON.stringify({ ts: now, merged: results.filter((r) => r.kind === "merge").length, bounced: results.filter((r) => r.kind === "bounce").length, closed: results.filter((r) => r.kind === "close_superseded").length, human_legs: results.filter((r) => r.kind === "human_leg").length, skipped: results.filter((r) => r.kind === "skip").length, results: results.slice(0, 50) }),
+    );
+    const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "human_leg_ask"].includes(r.kind));
+    if (summary.length)
+      this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
   }
 
   async eventsSince(since: number, limit: number) {
@@ -1203,6 +1472,7 @@ export class KnowledgeHub {
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.stop_line_sweep":
+        case "admin.merge_queue_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -1216,6 +1486,14 @@ export class KnowledgeHub {
             await this.stopTheLineSweep(Number(body.now ?? Date.now()));
             const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
             return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+          }
+          if (op === "admin.merge_queue_sweep") {
+            // bootstrap/dispatch path for the standing merge-queue sweep
+            // (BR#3198): pass now=<future epoch ms> to bypass the cadence
+            // window and run immediately; identity + dedupe rules apply.
+            await this.mergeQueueSweep(Number(body.now ?? Date.now()));
+            const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
+            return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
           }
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);

@@ -288,6 +288,31 @@ that law, and BR#3008 makes it mechanical instead of discipline. Two halves, sam
   main pages the board even when nobody opens a PR. `admin.stop_line_sweep` drills it on
   demand.
 
+## The standing merge-queue sweep
+
+The gate blocks bad merges; the sweep executes good ones. Accepted decision BR#3033 made
+"merge when green" standing law, and BR#3198 made it deterministic: the hub watchdog runs
+`mergeQueueSweep` (`packages/worker/src/kb/do.ts`) FIRST on every tick, paced by the
+`merge_sweep_minutes` setting (default 15, `0` = off), and for each open PR on both repos,
+oldest first:
+
+1. **Superseded-check first** — a PR whose linked card is superseded closes without review
+   (the BR#3034 queue norm).
+2. **The 5c mechanical gate** — `mergeable=true`, `mergeStateStatus` clean (or `unstable`
+   with only BR#2267 externals failing), every commit GitHub-verified, base (main) green,
+   head checks green. Mergeability is a precondition, not a finding.
+3. **All green + an accepted verify verdict on the current head** → merge (squash per repo
+   norm), merge receipt on the linked card. No human click.
+4. **Mechanical defect** (conflicts / red check / base red) → the linked card bounces to
+   `in_progress` with the exact defect named — one line per PR, never silent.
+5. **Human-leg defects only** (signing-environment / external-mirror failures) → collected
+   into ONE class ask per repo per episode, never one per PR (rule 5c).
+
+Identity: the sweep merges as **detached-cody** per BR#3181 — deploy `GH_TOKEN` must be the
+detached-cody credential, never rayh's personal credentials. Without it the sweep audits
+`no_identity` and merges nothing. `admin.merge_queue_sweep` drills it on demand; the pure
+decision rules are pinned in `packages/worker/test/merge-sweep.test.ts`.
+
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
