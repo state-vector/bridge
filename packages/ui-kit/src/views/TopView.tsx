@@ -87,6 +87,9 @@ interface TopRow {
   askPending?: string;
   statusTs?: number;
   lastSignal?: number;
+  /** PR provenance (BR#3287), stamped board-side by provenanceSweep —
+   *  rendered on in-flight rows as a PR link + verifier badge (BR#3307). */
+  prov?: { repo: string; pr: number; verdict_id?: string | null; session?: string | null; signer?: string };
 }
 
 /** Compact gateway strip: ONLY gateway identity sessions (dispatch-<gw>),
@@ -160,6 +163,13 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         askPending,
         statusTs: (t as any).status_ts,
         lastSignal: Math.max(p?.ts ?? 0, (t as any).updated_ts ?? 0),
+        prov: meta.provenance?.repo ? {
+          repo: meta.provenance.repo,
+          pr: meta.provenance.pr,
+          verdict_id: meta.provenance.verdict_id,
+          session: meta.provenance.session,
+          signer: meta.provenance.signer,
+        } : undefined,
       };
     });
     // the live unblock twin is itself in_progress → already in the set; force
@@ -282,6 +292,29 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             <span className={`kind-pill kp-${r.kind ?? "impl"}`} title="task kind">{r.kind ?? "impl"}</span>
             {r.goal ?? "—"}
             <TagChips tags={r.tags} />
+            {r.prov && (
+              <>
+                {" "}
+                <a
+                  className="top-prov"
+                  href={`https://github.com/${r.prov.repo}/pull/${r.prov.pr}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  title={`PR provenance (BR#3287): ${r.prov.repo}#${r.prov.pr}${r.prov.session ? ` · session ${r.prov.session}` : ""} · signer ${r.prov.signer ?? "unknown"}`}
+                >
+                  <Chip tone="scope">PR #{r.prov.pr}</Chip>
+                </a>
+                <Chip
+                  tone={r.prov.verdict_id ? "ok" : "warn"}
+                  title={r.prov.verdict_id
+                    ? `verified by ${r.prov.verdict_id}${r.prov.session ? ` (${r.prov.session})` : ""}`
+                    : "merged without an accepted verify verdict on the head sha"}
+                >
+                  {r.prov.verdict_id ? "verified" : "unverified"}
+                </Chip>
+              </>
+            )}
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">

@@ -127,6 +127,14 @@ let ghServer: import("node:http").Server;
 let ghOrigin = "";
 let sinkId = ""; // the drill sink card (set in beforeAll)
 let firstEpisodeTaskId = ""; // the f-episode task, superseded by the 2-episode task
+// BR#3307 guilty-chain drill: the provenance sweep shares this DO, so the
+// alarm-note chain can be proven end-to-end — PR 178 (the f-episode's
+// landing PR, merge sha ffff…) indexes with a drill card + accepted verdict
+// citing PROV_HEAD once provScenario.on flips.
+const PROV_HEAD = "a".repeat(40);
+const provScenario = { on: false, branch: "" };
+let drillCardId = "";
+let drillVerdictId = "";
 
 function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
   const json = (res: import("node:http").ServerResponse, status: number, body: unknown) => {
@@ -190,6 +198,27 @@ function ghHandler(): (req: import("node:http").IncomingMessage, res: import("no
         : "e".repeat(40);
       return json(res, 200, { sha: want });
     }
+    // provenance sweep routes (BR#3307 guilty-chain drill): one merged PR
+    // (the f-episode's landing PR #178, merge sha ffff…) with a bridge-card
+    // head branch — served only once provScenario.on flips, because the
+    // sweep dedupes per (repo, pr) and an early no-card index would stick.
+    // Gated on the bridge repo only so exactly one row indexes (the chain's
+    // PR link must be deterministic).
+    if (/\/repos\/state-vector\/bridge\/pulls\?state=closed/.test(url)) {
+      if (!provScenario.on) return json(res, 200, []);
+      return json(res, 200, [{ number: 178, title: "main-green gate + stopTheLineSweep (BR#3008)", state: "closed", merged_at: "2026-10-24T16:12:03Z", merge_commit_sha: "f".repeat(40) }]);
+    }
+    if (/\/repos\/state-vector\/bridge\/pulls\/178$/.test(url)) {
+      return json(res, 200, {
+        number: 178, title: "main-green gate + stopTheLineSweep (BR#3008)",
+        head: { ref: provScenario.branch, sha: PROV_HEAD },
+        merged_at: "2026-10-24T16:12:03Z", merge_commit_sha: "f".repeat(40),
+      });
+    }
+    if (/\/repos\/state-vector\/bridge\/pulls\/178\/commits/.test(url)) {
+      return json(res, 200, [{ sha: PROV_HEAD, commit: { verification: { verified: true }, committer: { email: "297316395+detached-cody@users.noreply.github.com" } } }]);
+    }
+    if (req.method === "POST" && /\/repos\/state-vector\/bridge\/issues\/178\/labels/.test(url)) return json(res, 200, { ok: true });
     json(res, 404, { message: `unexpected ${url}` });
   };
 }
@@ -214,6 +243,7 @@ beforeAll(async () => {
       modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")),
       modules: true,
       compatibilityDate: "2025-09-06",
+      bindings: { GH_TOKEN: "test-token" }, // the provenance sweep leg (BR#3307) reads it
       durableObjects: {
         HUB: { className: "FlowsHub", useSQLite: true },
         KB: { className: "KnowledgeHub", useSQLite: true },
@@ -242,12 +272,12 @@ afterAll(async () => {
   await new Promise<void>((resolve) => ghServer?.close(() => resolve()));
 });
 
-async function kbJson(path: string, body: unknown): Promise<{ status: number; body: any }> {
+async function kbJson(path: string, body?: unknown): Promise<{ status: number; body: any }> {
   const kb = (globalThis as any).__kb as (p: string, i?: RequestInit) => Promise<Response>;
   const r = await kb(path, {
-    method: "POST",
+    method: body === undefined ? "GET" : "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
@@ -278,6 +308,36 @@ async function stopLineEpisodeTasks(): Promise<any[]> {
 describe("stopTheLineSweep (real DO, canned GitHub)", () => {
   it("red main files ONE time-sensitive ask bound to the sink; a re-sweep on the same sha dedupes", async () => {
     await setScenario("f");
+    // BR#3307 guilty-chain seed: a drill card + an accepted verdict citing
+    // the provenance head, so PR 178 (the f-episode's landing PR, merge sha
+    // ffff…) indexes with the FULL chain before the alarm sweep runs
+    const card = await kbJson("/create", { type: "task", title: "IMPL: guilty-chain drill card" });
+    expect(card.status).toBe(200);
+    drillCardId = String(card.body.id);
+    provScenario.branch = `bridge/${drillCardId.replace("#", "-")}`;
+    const verdict = await kbJson("/create", {
+      type: "decision",
+      title: `verify verdict (guilty-chain drill) — head ${PROV_HEAD.slice(0, 9)} verified`,
+      body_md: `verified head ${PROV_HEAD} (drill)`,
+      // sessions stamp meta.session at create (resolveSession) — the same
+      // channel real verify verdicts carry their session on
+      session: "bridge-task-BR-3307-drill",
+    });
+    expect(verdict.status).toBe(200);
+    drillVerdictId = String(verdict.body.id);
+    await kbJson("/link", { src: drillVerdictId, relation: "derived_from", dst: drillCardId });
+    await kbJson("/transition", { id: drillVerdictId, to: "accepted", actor: "web:ray", note: `drill accept; head ${PROV_HEAD}` });
+    provScenario.on = true;
+    await kbJson("/admin.settings_set", { settings: { provenance_gh_api_base: ghOrigin } });
+    const provSweep = await kbJson("/admin.provenance_sweep", { now: Date.now() + 30_000 });
+    expect(provSweep.body.error).toBeUndefined();
+    const chain = await kbJson(`/provenance?sha=${"f".repeat(40)}`);
+    expect(chain.status).toBe(200);
+    expect(chain.body.task.id).toBe(drillCardId);
+    expect(chain.body.verdict_id).toBe(drillVerdictId);
+    expect(chain.body.session).toBe("bridge-task-BR-3307-drill");
+    expect(chain.body.signer).toBe("detached-cody");
+
     const first = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 600_000 });
     expect(first.status).toBeLessThan(500);
     expect(first.body.error).toBeUndefined();
@@ -286,6 +346,13 @@ describe("stopTheLineSweep (real DO, canned GitHub)", () => {
     expect(mine[0].meta?.ask?.urgency).toBe("time-sensitive");
     expect(mine[0].meta?.ask?.to).toBe("rayh");
     expect(mine[0].meta?.ask?.reason).toContain("destination-green");
+    // the guilty chain rides the page (BR#3307): PR · task · verdict ·
+    // session · signer, resolved from the provenance index above
+    const ask = (await kbJson("/get", { id: mine[0].id })).body;
+    expect(String(ask.body_md)).toContain("**Guilty chain:**");
+    expect(String(ask.body_md)).toContain(`task ${drillCardId}`);
+    expect(String(ask.body_md)).toContain(`verdict ${drillVerdictId}`);
+    expect(String(ask.body_md)).toContain("signer detached-cody");
 
     // same red sha again (ten PRs, two sweeps): still exactly one ask
     const second = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 1_200_000 });
@@ -358,6 +425,17 @@ describe("stopTheLineSweep episode tasks (real DO, canned GitHub — BR#3284)", 
     expect(t.meta?.stop_line?.first_failing_sha).toBe("f".repeat(40));
     expect(t.body_md).toContain("**First failing sha:** fffffffff");
     expect(t.body_md).toContain("pull/178");
+    // the guilty chain (BR#3307): the provenance index seeded in the tier-2a
+    // ask leg resolves the breaking merge to PR · task · verdict · session ·
+    // signer — recorded on the body AND in meta.stop_line.guilty_chain
+    expect(t.body_md).toContain("**Guilty chain:** PR [#178](https://github.com/state-vector/bridge/pull/178)");
+    expect(t.body_md).toContain(`task ${drillCardId}`);
+    expect(t.body_md).toContain(`verdict ${drillVerdictId}`);
+    expect(t.body_md).toContain("session bridge-task-BR-3307-drill");
+    expect(t.body_md).toContain("signer detached-cody");
+    expect(t.meta?.stop_line?.guilty_chain?.task_id).toBe(drillCardId);
+    expect(t.meta?.stop_line?.guilty_chain?.verdict_id).toBe(drillVerdictId);
+    expect(t.meta?.stop_line?.guilty_chain?.signer).toBe("detached-cody");
 
     // same red sha again (two sweeps, one episode): still exactly ONE live task
     const second = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 7_800_000 });
@@ -385,6 +463,10 @@ describe("stopTheLineSweep episode tasks (real DO, canned GitHub — BR#3284)", 
     expect(t2.meta?.stop_line?.first_failing_sha).toBe("2".repeat(40));
     expect(t2.body_md).toContain("**First failing sha:** 222222222");
     expect(t2.body_md).toContain("pull/191");
+    // the guilty chain is HONEST when unstamped (BR#3307): no provenance row
+    // for 222… — the fallback line, never a guessed attribution
+    expect(t2.body_md).toContain("**Guilty chain:** _no bridge provenance for 222222222 yet");
+    expect(t2.meta?.stop_line?.guilty_chain).toBeNull();
     // the remediation exception + done-when ride on every episode task
     expect(t2.body_md).toContain("green on the exact failing checks");
     expect(t2.body_md).toContain("ALL check-runs settled green (0 red, 0 unsettled)");
