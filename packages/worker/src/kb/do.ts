@@ -76,6 +76,7 @@ import {
   decide,
   invariants as checkInvariants,
   detectBreaches,
+  classOf,
   replayStatus,
   BREACH_WINDOW_MS,
   UNBLOCK_FLOOD_MS,
@@ -3857,7 +3858,13 @@ export class KnowledgeHub {
    *  task into breach cards. One OPEN card per (task, class) key —
    *  reoccurrences coalesce onto the open card, never spawn duplicates.
    *  Call sites: every transition_rejected, invariant_violation,
-   *  spawn_skipped and replay_mismatch lands here through the fold. */
+   *  spawn_skipped and replay_mismatch lands here through the fold.
+   *  BR#3443: a CLOSED card's events never re-fold either. Every card
+   *  carries a fold high-water in meta.breach_high_water — the newest event
+   *  ts its adjudication covered — and a key with any prior card only counts
+   *  events strictly above that mark, so closing a card can never re-arm
+   *  its key (specimen BR#3439: a duplicate raised from events that all
+   *  predated the predecessor card's close). */
   private async foldBreaches(taskId: string) {
     const since = Date.now() - BREACH_WINDOW_MS * 8; // look back several windows
     const rows = this.state.storage.sql.exec(
@@ -3867,24 +3874,45 @@ export class KnowledgeHub {
       taskId, since,
     ).toArray() as any[];
     if (!rows.length) return;
+    const events = rows.map((r) => {
+      let d: any = {};
+      try { d = JSON.parse(r.detail ?? "{}"); } catch { /* tolerate junk detail */ }
+      const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
+      return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
+    });
+    // BR#3443: load EVERY breach card on this task, open AND closed. Open
+    // cards suppress their key (reoccurrences coalesce onto them); every
+    // card's high-water fences off the events it already folded.
     const openKeys = new Set<string>();
+    const highWater = new Map<string, number>(); // key → newest already-folded event ts
+    const openCards = new Map<string, { id: string; meta: string; stamped: number }>();
     for (const b of this.state.storage.sql.exec(
-      `SELECT meta FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND meta LIKE ?`,
+      `SELECT id, status, meta, status_ts, created_ts FROM artefacts WHERE type = 'task' AND meta LIKE ?`,
       `%"breach_key":"${taskId}|%`,
     ).toArray() as any[]) {
       let m: any = {};
       try { m = JSON.parse(b.meta ?? "{}"); } catch { /* garbage meta is not a breach */ }
-      if (typeof m?.breach_key === "string") openKeys.add(m.breach_key);
+      const key = m?.breach_key;
+      if (typeof key !== "string") continue;
+      if (b.status === "done" || b.status === "superseded") {
+        // A closed card adjudicated everything up to the moment it closed:
+        // its raised group, plus every reoccurrence that coalesced while it
+        // was open. Stamped cards carry the exact mark; pre-BR#3443 cards
+        // fall back to their close time (then creation time). Anything
+        // strictly after the mark is genuinely new evidence.
+        const hw = Number(m?.breach_high_water ?? 0) || Number(b.status_ts ?? 0) || Number(b.created_ts ?? 0) || 0;
+        const prev = highWater.get(key);
+        if (prev === undefined || hw > prev) highWater.set(key, hw);
+      } else {
+        openKeys.add(key);
+        // An open card covered the group it was raised from (its creation
+        // for unstamped legacy cards); the pass below advances the stamp as
+        // reoccurrences coalesce.
+        const stamped = Number(m?.breach_high_water ?? 0) || Number(b.created_ts ?? 0) || 0;
+        openCards.set(key, { id: String(b.id), meta: String(b.meta ?? "{}"), stamped });
+      }
     }
-    const breaches = detectBreaches(
-      rows.map((r) => {
-        let d: any = {};
-        try { d = JSON.parse(r.detail ?? "{}"); } catch { /* tolerate junk detail */ }
-        const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
-        return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
-      }),
-      openKeys,
-    );
+    const breaches = detectBreaches(events, openKeys, { highWater });
     for (const b of breaches) {
       const created = await this.create(
         {
@@ -3897,11 +3925,30 @@ export class KnowledgeHub {
       );
       this.state.storage.sql.exec(
         `UPDATE artefacts SET meta = ? WHERE id = ?`,
-        JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count }),
+        JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count, breach_high_water: b.last_ts }),
         created.id,
       );
       this.audit("system:breach", "breach_raised", created.id, { key: b.key, task: taskId, klass: b.klass, count: b.count });
       this.version(created.id, "system:breach", "create", `breach card raised — ${b.klass} on ${taskId} (${b.count} events)`, { key: b.key, sample: b.sample });
+    }
+    // BR#3443: reoccurrences coalescing onto an OPEN card advance its
+    // high-water, so when the card later closes, its coalesced evidence
+    // stays folded instead of re-raising a duplicate.
+    const maxSeen = new Map<string, number>();
+    for (const e of events) {
+      const key = `${e.task}|${classOf(e)}`;
+      const ts = Number(e.ts);
+      if (!Number.isFinite(ts)) continue;
+      const cur = maxSeen.get(key);
+      if (cur === undefined || ts > cur) maxSeen.set(key, ts);
+    }
+    for (const [key, card] of openCards) {
+      const seen = maxSeen.get(key) ?? 0;
+      if (seen <= card.stamped) continue;
+      let m: any = {};
+      try { m = JSON.parse(card.meta); } catch { /* garbage meta — still stamp the high-water */ }
+      m.breach_high_water = seen;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), card.id);
     }
   }
 

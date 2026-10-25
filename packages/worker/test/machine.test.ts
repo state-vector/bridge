@@ -792,6 +792,50 @@ describe("breach fold (dedupe by task+class)", () => {
     expect(breachClass("runner: task references no git repository")).toBe("gate:no-repo");
     expect(breachClass("something novel")).toBe("other");
   });
+
+  // ---------- BR#3443: a closed card's events never re-fold (high-water) ----------
+  // Specimen BR#3439: raised 17:03:22.861Z from 6 events that ALL predate its
+  // predecessor BR#3427's close (16:30:45.674Z) — the fold had no memory of
+  // what it already folded, so closing a card re-armed its key.
+  it("BR#3443: events at or below a key's high-water never re-fold after the card closes", () => {
+    const reason = "moving to in_review requires the PR link in the note";
+    const events = [0, 1, 2].map((n) => ev(n, "BR#7", reason));
+    const raised = detectBreaches(events, new Set());
+    expect(raised).toHaveLength(1);
+    const highWater = new Map([[raised[0].key, raised[0].last_ts]]);
+    // the card closes; the next fold trigger re-scans the same lookback. The
+    // stale group must stay folded — one fresh event alone is below threshold.
+    const refold = detectBreaches([...events, ev(4, "BR#7", reason)], new Set(), { highWater });
+    expect(refold).toHaveLength(0);
+    // the boundary is inclusive: an event exactly AT the high-water is already folded
+    expect(detectBreaches([ev(2, "BR#7", reason)], new Set(), { highWater })).toHaveLength(0);
+  });
+
+  it("BR#3443: genuinely new events above the high-water still raise", () => {
+    const reason = "moving to in_review requires the PR link in the note";
+    const events = [0, 1, 2].map((n) => ev(n, "BR#8", reason));
+    const raised = detectBreaches(events, new Set());
+    expect(raised).toHaveLength(1);
+    const highWater = new Map([[raised[0].key, raised[0].last_ts]]);
+    // three events strictly after the closed card's high-water — a fresh
+    // pattern, not stale evidence — raises a new card
+    const fresh = [5, 6, 7].map((n) => ev(n, "BR#8", reason));
+    expect(detectBreaches([...events, ...fresh], new Set(), { highWater })).toHaveLength(1);
+  });
+
+  it("BR#3443: an open card still coalesces reoccurrences — the high-water never defeats the open-key rule", () => {
+    const reason = "moving to in_review requires the PR link in the note";
+    const events = [0, 1, 2].map((n) => ev(n, "BR#9", reason));
+    const raised = detectBreaches(events, new Set());
+    expect(raised).toHaveLength(1);
+    const key = raised[0].key;
+    const highWater = new Map([[key, raised[0].last_ts]]);
+    const openKeys = new Set([key]);
+    // reoccurrences above the open card's stamp coalesce onto it: one card,
+    // never a second, with or without the high-water in play
+    expect(detectBreaches([...events, ev(3, "BR#9", reason)], openKeys, { highWater })).toHaveLength(0);
+    expect(detectBreaches(events, openKeys)).toHaveLength(0);
+  });
 });
 
 // ---------- BR#3337: claim races are retryable, never breaches ----------
