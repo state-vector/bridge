@@ -838,7 +838,7 @@ export class KnowledgeHub {
       }
     }
     const sessions = this.state.storage.sql.exec(
-      `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
+      `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
     ).toArray();
     // open question children: the DERIVED source for awaiting_ask (phase 4 —
@@ -1106,6 +1106,7 @@ export class KnowledgeHub {
       `ALTER TABLE pairings ADD COLUMN principal TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
       `ALTER TABLE sessions ADD COLUMN kind TEXT`,
+      `ALTER TABLE sessions ADD COLUMN worktree TEXT`, // BR#3204: where the session's tree lives — board collision visibility
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -2726,7 +2727,7 @@ export class KnowledgeHub {
   /** The session a write belongs to: explicit, else the token's most recent session. */
   private async resolveSession(body: any, tokenId: string): Promise<string | undefined> {
     if (body.session) {
-      await this.sessionTouch({ token_id: tokenId, session: body.session }).catch(() => {});
+      await this.sessionTouch({ token_id: tokenId, session: body.session, worktree: body.worktree }).catch(() => {});
       return String(body.session);
     }
     const row = this.one(
@@ -2735,18 +2736,22 @@ export class KnowledgeHub {
     return row?.name ?? undefined;
   }
 
-  /** Register/refresh a session. Names are unique per auth token. */
+  /** Register/refresh a session. Names are unique per auth token.
+   *  `worktree` (BR#3204): where the session's git tree lives — surfaced on
+   *  orient so the board can spot two sessions sharing a checkout. */
   private async sessionTouch(body: any) {
     const token_id = String(body.token_id ?? "");
     const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
+    const worktree = String(body.worktree ?? "").trim().slice(0, 400) || null;
     const ts = Date.now();
     this.state.storage.sql.exec(
-      `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
-       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
-       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
-      token_id, name, token_id, ts, ts,
+      `INSERT INTO sessions (token_id, name, kind, worktree, first_seen_ts, last_seen_ts)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind),
+         worktree = COALESCE(excluded.worktree, sessions.worktree)`,
+      token_id, name, token_id, worktree, ts, ts,
     );
-    return { session: name };
+    return { session: name, worktree };
   }
 
   private async askCreate(body: any, actor: string) {

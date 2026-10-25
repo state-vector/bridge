@@ -133,7 +133,10 @@ Linux), and the device principal is write-once at `~/.bridge/principal`
                                        // number 1-60 = fixed heartbeat cadence, in minutes
   "poll_secs": 60,                     // how often the runner polls the board
   "timeout_mins": 30,                  // per-session kill switch
-  "isolate": true                      // per-task git worktrees + PR branch
+  "isolate": true,                     // per-task git worktrees + PR branch (default true)
+  "worktree_exempt_repos": []          // repos where per-task worktrees are skipped
+                                       // (webapp-only checkout class); env override:
+                                       // BRIDGE_WORKTREE_EXEMPT_REPOS (comma-separated)
 }
 ```
 

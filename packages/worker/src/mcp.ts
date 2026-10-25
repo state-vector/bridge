@@ -237,7 +237,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
   switch (name) {
     case "orient": {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
-      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName });
+      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName, worktree: args.worktree });
       const o = await call("orient", { label: identity.label, tags: identity.tags });
       const named = args.session ?? ctx.sessionName;
       const required: string[] = Array.isArray(o.action_required) ? o.action_required : [];
@@ -245,7 +245,7 @@ async function callTool(name: string, args: any, ctx: Ctx) {
         {
           ...o,
           build: BUILD,
-          you: { agent: identity.label, session: session.session, tags: identity.tags },
+          you: { agent: identity.label, session: session.session, worktree: session.worktree, tags: identity.tags },
           note: required.length
             ? `ACT NOW — handle each of these before anything else:\n${required.join("\n")}`
             : named
@@ -383,10 +383,13 @@ const err = (t: string) => ({ content: [{ type: "text", text: t }], isError: tru
 const TOOLS = [
   {
     name: "orient",
-    description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags.",
+    description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". When working in a provisioned git worktree, pass worktree: \"<path>\" so the board can see where your tree lives (BR#3204 collision visibility). Returns goals, open work, pending asks for you, project flags.",
     inputSchema: {
       type: "object",
-      properties: { session: { type: "string", description: "unique session name (per agent)" } },
+      properties: {
+        session: { type: "string", description: "unique session name (per agent)" },
+        worktree: { type: "string", description: "path of the git worktree this session works in (optional)" },
+      },
     },
   },
   {

@@ -256,6 +256,12 @@ fn run(cfg: Option<DispatchConfig>) {
                     report_minutes: std::env::var("BRIDGE_REPORT_MINUTES").ok().and_then(|v| v.parse().ok()),
                     max_sessions: v.max(1),
                     isolate: !matches!(std::env::var("BRIDGE_ISOLATE").as_deref(), Ok("0") | Ok("false") | Ok("no")),
+                    worktree_exempt_repos: std::env::var("BRIDGE_WORKTREE_EXEMPT_REPOS")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
                 },
             });
         }
