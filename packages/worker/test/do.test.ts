@@ -228,3 +228,75 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     }
   });
 });
+
+describe("log_progress gauge carry-forward (BR#3199)", () => {
+  const lastProgress = async (id: string) => {
+    const got = await kbJson("/get", { id });
+    const meta = typeof got.body.meta === "string" ? JSON.parse(got.body.meta) : got.body.meta;
+    return meta.last_progress;
+  };
+
+  it("(a) gauge-less post after a gauge-bearing post preserves gauges", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "BR3199 carry-forward", qualified: true });
+    await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    await kbJson("/progress.log", {
+      id: body.id, note: "gauge-bearing post",
+      completion_pct: 42, confidence_pct: 80, risk_pct: 10, context_pct: 50,
+    });
+    const after = await lastProgress(body.id);
+    expect(after.completion_pct).toBe(42);
+    expect(after.confidence_pct).toBe(80);
+    expect(after.risk_pct).toBe(10);
+    expect(after.context_pct).toBe(50);
+    // fresh per-call fields survive
+    expect(after.note).toBe("gauge-bearing post");
+
+    // the relay-clobber class: a gauge-less post must NOT null the gauges
+    await kbJson("/progress.log", { id: body.id, note: "relay heartbeat (no gauges)" });
+    const afterRelay = await lastProgress(body.id);
+    expect(afterRelay.completion_pct).toBe(42);
+    expect(afterRelay.confidence_pct).toBe(80);
+    expect(afterRelay.risk_pct).toBe(10);
+    expect(afterRelay.context_pct).toBe(50);
+    expect(afterRelay.note).toBe("relay heartbeat (no gauges)");
+  });
+
+  it("(b) a later gauge-bearing post updates them", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "BR3199 gauge update", qualified: true });
+    await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    await kbJson("/progress.log", {
+      id: body.id, note: "first gauge post",
+      completion_pct: 10, confidence_pct: 50, risk_pct: 50, context_pct: 20,
+    });
+    await kbJson("/progress.log", {
+      id: body.id, note: "second gauge post",
+      completion_pct: 90, confidence_pct: 95, risk_pct: 5, context_pct: 80,
+    });
+    const after = await lastProgress(body.id);
+    expect(after.completion_pct).toBe(90);
+    expect(after.confidence_pct).toBe(95);
+    expect(after.risk_pct).toBe(5);
+    expect(after.context_pct).toBe(80);
+    expect(after.note).toBe("second gauge post");
+    // partial update: only the posted gauge changes, the rest carry forward
+    await kbJson("/progress.log", { id: body.id, note: "partial", completion_pct: 95 });
+    const afterPartial = await lastProgress(body.id);
+    expect(afterPartial.completion_pct).toBe(95);
+    expect(afterPartial.confidence_pct).toBe(95);
+    expect(afterPartial.risk_pct).toBe(5);
+    expect(afterPartial.context_pct).toBe(80);
+  });
+
+  it("(c) gauge-less first-ever post leaves fields absent (no fabrication)", async () => {
+    const { body } = await kbJson("/create", { type: "task", title: "BR3199 no fabrication", qualified: true });
+    await kbJson("/transition", { id: body.id, to: "in_progress", note: "claim" });
+    await kbJson("/progress.log", { id: body.id, note: "first-ever, no gauges" });
+    const lp = await lastProgress(body.id);
+    expect(lp).toBeTruthy();
+    expect(lp.note).toBe("first-ever, no gauges");
+    expect(lp.completion_pct).toBeUndefined();
+    expect(lp.confidence_pct).toBeUndefined();
+    expect(lp.risk_pct).toBeUndefined();
+    expect(lp.context_pct).toBeUndefined();
+  });
+});

@@ -47,7 +47,7 @@ Optional workspace scoping via `WORKSPACE_MEMBERS` (JSON map slug → GitHub log
 
 ## 3 · Run a runner (the gateway)
 
-The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board.
+The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board. Progress posts merge: gauges persist across gauge-less progress posts (relay/automation heartbeats never wipe the owning agent's numbers), and the freshest gauge-bearing call wins.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash

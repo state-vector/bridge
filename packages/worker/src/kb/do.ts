@@ -1313,7 +1313,16 @@ export class KnowledgeHub {
             const tm = JSON.parse(trow.meta ?? "{}");
             const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
             tm.verify_round = round;
-            tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+            // gauge carry-forward (BR#3199): this auto-note carries no gauges —
+            // preserve the prior card gauges instead of clobbering them
+            const tmPrevProgress = tm.last_progress ?? {};
+            tm.last_progress = {
+              note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now(),
+              completion_pct: tmPrevProgress.completion_pct,
+              confidence_pct: tmPrevProgress.confidence_pct,
+              risk_pct: tmPrevProgress.risk_pct,
+              context_pct: tmPrevProgress.context_pct,
+            };
             const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
             if (!alreadyRight) {
               // 3 identical rounds = the loop is stalled; park it for a human
@@ -1391,7 +1400,16 @@ export class KnowledgeHub {
       const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
       if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
-    tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+    // gauge carry-forward (BR#3199): this sync note carries no gauges —
+    // preserve the prior card gauges instead of clobbering them
+    const tPrevProgress = tmeta.last_progress ?? {};
+    tmeta.last_progress = {
+      note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session,
+      completion_pct: tPrevProgress.completion_pct,
+      confidence_pct: tPrevProgress.confidence_pct,
+      risk_pct: tPrevProgress.risk_pct,
+      context_pct: tPrevProgress.context_pct,
+    };
     delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2337,7 +2355,19 @@ export class KnowledgeHub {
     if (progressActor !== actor && this.isGatewayActor(actor)) {
       this.gatewayTouch(actor, progressActor); // gateway→agent edge (BR#2455)
     }
-    meta.last_progress = { note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
+    // Gauge carry-forward (BR#3199): a call that omits a gauge field keeps the
+    // prior gauge — relay/automation posts without gauges must not clobber the
+    // owning agent's numbers (the BR#3197 TOP-board dashes class). note / will /
+    // ts / sentiment / actor stay per-call fresh; gauges persist until the
+    // owning agent posts them again (freshest gauge-bearing call wins).
+    const prevProgress = meta.last_progress ?? {};
+    meta.last_progress = {
+      note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session,
+      completion_pct: completion_pct ?? prevProgress.completion_pct,
+      confidence_pct: confidence_pct ?? prevProgress.confidence_pct,
+      risk_pct: risk_pct ?? prevProgress.risk_pct,
+      context_pct: context_pct ?? prevProgress.context_pct,
+    };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
