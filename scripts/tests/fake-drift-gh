@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# scripts/tests/fake-drift-gh — stub `gh` for deploy-drift-alarm.test.sh.
+#
+# Serves main's tip sha from FAKE_TIP_SHA, or exits 1 when FAKE_TIP_SHA is
+# unset (simulates a failed tip lookup — the alarm must fail closed on it).
+# No network, no token.
+set -uo pipefail
+
+if [ -n "${FAKE_TIP_SHA:-}" ]; then
+  echo "$FAKE_TIP_SHA"
+  exit 0
+fi
+echo "gh: (API) 404 Not Found" >&2
+exit 1
