@@ -5775,7 +5775,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "5e6f9329e0160fb4b2318cfbe4a2d1ccc0e309ab", built_at: "2026-10-25T13:07:51Z" };
+    module.exports = { commit: "a17109641faed72d58d9720af45d5cba0daa2cde", built_at: "2026-10-25T13:16:45Z" };
   }
 });
 
