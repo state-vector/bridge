@@ -1201,7 +1201,8 @@ var init_do = __esm({
         return rows;
       }
       computeAgentScores() {
-        const windowTs = Date.now() - 7 * 24 * 60 * 6e4;
+        const weekTs = Date.now() - 7 * 24 * 60 * 6e4;
+        const recentTs = Date.now() - 48 * 60 * 6e4;
         const tokens = this.state.storage.sql.exec(
           `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`
         ).toArray();
@@ -1217,7 +1218,7 @@ var init_do = __esm({
         for (const t of tokens) sig(t.label);
         for (const p of this.state.storage.sql.exec(
           `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
-          windowTs
+          weekTs
         ).toArray()) {
           const s = sig(p.actor);
           const d = JSON.parse(p.data ?? "{}");
@@ -1228,11 +1229,11 @@ var init_do = __esm({
         for (const r of this.state.storage.sql.exec(
           `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
        WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
-          windowTs
+          recentTs
         ).toArray()) sig(r.owner || "unknown").abandoned += r.n;
         for (const r of this.state.storage.sql.exec(
           `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`,
-          windowTs
+          recentTs
         ).toArray()) {
           const d = JSON.parse(r.detail ?? "{}");
           sig(d.prev_owner || "unknown").reassigned++;
@@ -1240,7 +1241,7 @@ var init_do = __esm({
         for (const r of this.state.storage.sql.exec(
           `SELECT owner, COUNT(*) AS n FROM artefacts
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
-          windowTs
+          weekTs
         ).toArray()) sig(r.owner).artefacts_created += r.n;
         for (const t of tokens) {
           const s = sig(t.label);
@@ -1251,14 +1252,14 @@ var init_do = __esm({
             `SELECT COUNT(*) AS n FROM asks WHERE status IN ('open','answered') AND from_label != ?
          AND created_ts >= ? AND to_target IN (${marks})`,
             t.label,
-            windowTs,
+            weekTs,
             ...targets
           )?.n ?? 0;
           s.asks_answered_on_time = this.one(
             `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
          AND answered_ts - created_ts <= ${30 * 6e4} AND created_ts >= ?`,
             t.label,
-            windowTs
+            weekTs
           )?.n ?? 0;
           if (tags.includes("role:review")) {
             s.verify_duty_backlog = this.one(
@@ -4688,7 +4689,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "c28dbd60764a05eae8bccf4b40d9afed2e425ea7", built_at: "2026-10-25T00:33:50Z" };
+    module.exports = { commit: "bef115b0e761a374ee5cf9872c482b8755d5e7ed", built_at: "2026-10-25T00:42:16Z" };
   }
 });
 
