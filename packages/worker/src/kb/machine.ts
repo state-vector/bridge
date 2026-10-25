@@ -536,21 +536,38 @@ export interface ReplayEvent {
   data: any;
 }
 
-/** Fold transition events forward from the log. `ok:false` means the chain
- *  itself is broken (an event's `from` didn't match the folded state —
- *  forged, deleted, or out-of-order history). */
-export function replayStatus(from: string, versions: ReplayEvent[]): { status: string; ok: boolean } {
+/** Fold transition events forward from the log. The fold RE-ANCHORS at every
+ *  chain gap (a row whose `from` doesn't match the folded state — a silent
+ *  status write, a stale/duplicate stamp, out-of-order history): the log's
+ *  own chain continues from the row's `to`, so one historical gap cannot
+ *  poison every future fold (BR#3322: the early-return contract made the
+ *  BR#903 pre-gate rows re-fire the replay breach on every transition,
+ *  forever). The gap count is the integrity signal; the replay LAW —
+ *  fold(events) == stored_state (BR#2419 item 6) — is enforced by the
+ *  caller comparing `status` with the stored status.
+ *  - `ok`: the log chained without any gap.
+ *  - `breaks`: how many gaps were re-anchored across.
+ *  - `tailBreak`: the LAST transition row is itself a gap — fresh damage,
+ *    worth an audit line the moment it lands. */
+export function replayStatus(from: string, versions: ReplayEvent[]): { status: string; ok: boolean; breaks: number; tailBreak: boolean } {
   let expected = from;
   let anchored = false;
+  let breaks = 0;
+  let tailBreak = false;
   for (const v of versions) {
     if (v.action !== "transition") continue;
     const to = v.data?.to;
     if (typeof to !== "string") continue;
-    if (anchored && v.data?.from !== expected) return { status: expected, ok: false };
-    expected = to;
+    if (anchored && v.data?.from !== expected) {
+      breaks++;
+      tailBreak = true; // provisional — a later row that chains clears it
+    } else {
+      tailBreak = false;
+    }
+    expected = to; // re-anchor: the log's own chain continues from here
     anchored = true;
   }
-  return { status: expected, ok: true };
+  return { status: expected, ok: breaks === 0, breaks, tailBreak };
 }
 
 // ---------- breach detection: fold over the audit stream, deduped ----------
