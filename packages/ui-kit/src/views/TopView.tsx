@@ -296,7 +296,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
               <>
                 {" "}
                 <a
-                  className="top-prov"
+                  className="topc-prov"
                   href={`https://github.com/${r.prov.repo}/pull/${r.prov.pr}`}
                   target="_blank"
                   rel="noreferrer"

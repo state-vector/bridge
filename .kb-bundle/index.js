@@ -1390,7 +1390,7 @@ var init_do = __esm({
         const names = verdict.red.map((r) => r.name);
         const title = stopLineAskTitle(sha, names);
         const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
-        const chainRec = await this.guiltyChainRec(sha);
+        const chain = await this.guiltyChain(sha);
         const dup = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
@@ -1407,7 +1407,7 @@ var init_do = __esm({
             `**Red checks on main ${sha.slice(0, 9)}:**`,
             ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
             ``,
-            `**Guilty chain:** ${this.guiltyChainLine(chainRec, sha)}`,
+            `**Guilty chain:** ${this.guiltyChainLine(chain, sha)}`,
             ``,
             `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
             ``,
@@ -1461,7 +1461,7 @@ var init_do = __esm({
           return;
         }
         const bisect = await this.stopLineBisect(ghGet, sha);
-        const chainRec = await this.guiltyChainRec(bisect.first_failing_sha);
+        const chain = await this.guiltyChain(bisect.first_failing_sha);
         const culprit = bisect.first_failing_sha ? bisect.first_failing_pr ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.` : `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 the PR that landed it could not be resolved (bisect walked ${bisect.walked} commit(s)); check merge history.` : `**First failing sha:** bisect unavailable (${bisect.note ?? "history walk failed"}) \u2014 check the run history of recent merges manually.`;
         const body = [
           `**STOP-THE-LINE episode task** \u2014 bridge main HEAD ${shortSha} is RED. Merges are mechanically halted by the \`main-green gate\` (accepted decision BR#3009, destination-green precondition). This task is the claimable priority item for putting the line back up. Work continues on branches (worktrees) \u2014 only the line stops.`,
@@ -1471,7 +1471,7 @@ var init_do = __esm({
           ``,
           culprit,
           ``,
-          `**Guilty chain:** ${this.guiltyChainLine(chainRec, bisect.first_failing_sha)}`,
+          `**Guilty chain:** ${this.guiltyChainLine(chain, bisect.first_failing_sha)}`,
           ``,
           `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation \u2014 precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
           ``,
@@ -1503,13 +1503,13 @@ var init_do = __esm({
                 first_failing_pr: bisect.first_failing_pr,
                 // the resolved guilty chain (BR#3307): null when the provenance
                 // sweep has not stamped the breaking merge yet — honest absence
-                guilty_chain: chainRec ? {
-                  repo: chainRec.repo,
-                  pr: chainRec.pr,
-                  task_id: chainRec.task?.id ?? null,
-                  verdict_id: chainRec.verdict_id,
-                  session: chainRec.session,
-                  signer: chainRec.signer
+                guilty_chain: chain.rec ? {
+                  repo: chain.rec.repo,
+                  pr: chain.rec.pr,
+                  task_id: chain.rec.task?.id ?? null,
+                  verdict_id: chain.rec.verdict_id,
+                  session: chain.rec.session,
+                  signer: chain.rec.signer
                 } : null,
                 sink_id: sinkId
               },
@@ -1796,31 +1796,41 @@ ${detail?.body ?? ""}`);
           stamped_at: row.stamped_at
         };
       }
-      /** The guilty chain for an alarm note (BR#3307, residue of BR#3287 spec
-       *  item 4): resolve a sha to PR → task → verify verdict → agent session →
-       *  signer from the provenance index. Never throws — attribution must not
-       *  break the filing (the same downgrade philosophy as the bisect walk) —
-       *  but a lookup failure is RECEIPTED on the audit trail (SP review round 1,
-       *  PR #198: the swallow was silent; silence is the one thing it must not be). */
-      async guiltyChainRec(sha) {
-        if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return null;
+      /** The guilty-chain outcome for an alarm note (BR#3307, residue of
+       *  BR#3287 spec item 4): explicitly typed — `rec` carries the resolved
+       *  PR → task → verify verdict → agent session → signer chain when the
+       *  provenance index has stamped the merge, and `error` is set ONLY when
+       *  the lookup itself failed. Never throws — attribution must not break
+       *  the filing (the same downgrade philosophy as the bisect walk) — but a
+       *  failure is never converted into success: the caller distinguishes it
+       *  (the note renders the error, not the honest-absence line) and the
+       *  audit trail receipts it (hub:stop-the-line/guilty_chain_error — SP
+       *  review round 1, PR #198: silence was the one thing it must not be). */
+      async guiltyChain(sha) {
+        if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return { rec: null };
         try {
-          return await this.provenanceBySha(sha);
+          return { rec: await this.provenanceBySha(sha) };
         } catch (e) {
+          const error = String(e.message ?? e).slice(0, 200);
           this.audit("hub:stop-the-line", "guilty_chain_error", null, {
             sha: String(sha).slice(0, 9),
-            error: String(e.message ?? e).slice(0, 200)
+            error
           });
-          return null;
+          return { rec: null, error };
         }
       }
       /** One markdown chain segment: `PR #N · task BR#X · verdict BR#Y ·
-       *  session s · signer class` — with an honest fallback line when the
-       *  provenance sweep has not stamped the merge yet. */
-      guiltyChainLine(rec, sha) {
-        if (!rec) {
+       *  session s · signer class` — with honest fallback lines: the provenance
+       *  sweep has not stamped the merge yet, or the lookup failed (withheld,
+       *  never guessed). */
+      guiltyChainLine(chain, sha) {
+        if (chain.error) {
+          return `_provenance lookup failed (${chain.error}) \u2014 the chain is withheld rather than guessed; receipted on the audit trail (hub:stop-the-line/guilty_chain_error)_`;
+        }
+        if (!chain.rec) {
           return `_no bridge provenance for ${sha ? sha.slice(0, 9) : "this sha"} yet \u2014 \`GET /api/kb/provenance?sha=\` returns the chain once the provenance sweep stamps the merge_`;
         }
+        const rec = chain.rec;
         const prUrl = `https://github.com/${rec.repo}/pull/${rec.pr}`;
         return [
           `PR [#${rec.pr}](${prUrl})`,
@@ -5756,7 +5766,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "9e229c500b05362610092e6cf827317ca49d75bf", built_at: "2026-10-25T12:26:26Z" };
+    module.exports = { commit: "9a7b824a129c0bceb979ac0dca9c9c94e9979382", built_at: "2026-10-25T12:37:56Z" };
   }
 });
 

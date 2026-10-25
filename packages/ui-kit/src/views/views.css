@@ -802,9 +802,9 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* PR provenance on Top rows (BR#3307): the PR link chip + verifier badge
    ride inline in the goal cell — plain link, chips never stretch it */
-.top-prov { text-decoration: none; }
-.top-prov .k-chip { white-space: nowrap; }
-.top-prov:hover .k-chip { text-decoration: underline; }
+.topc-prov { text-decoration: none; }
+.topc-prov .k-chip { white-space: nowrap; }
+.topc-prov:hover .k-chip { text-decoration: underline; }
 
 /* wide-width cell fixes (measured, headless probe 2026-10-24):
    goal + exit cells wrapped, form inputs constrained at any width */
