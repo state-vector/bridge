@@ -160,6 +160,7 @@ function composeBootstrap(projectName, board) {
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch \u2014 the docs are the interface, stale docs are a defect.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it \u2192 todo (retry) \u2014 that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
+    `Runner-claimed cards: you cannot release to the pool \u2014 the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask \u2014 a todo release will be rejected and audited.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
     `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every \u226410 min. 4. LONG OP: declare silence \u2014 grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} \u2014 a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts \u2014 mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor \u2014 you are not; end your run, never execute a task you don't own.`,
     `Scoring: orient returns my_score \u2014 it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1\u20138.`
@@ -1040,6 +1041,7 @@ function replayStatus(from, versions) {
 function breachClass(reason) {
   const r = reason.toLowerCase();
   if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
+  if (r.includes("only the owner or a human can release it")) return "claim_race";
   if (r.includes("pr link")) return "gate:review-needs-pr";
   if (r.includes("unreviewed")) return "gate:done-unreviewed";
   if (r.includes("references no git repository")) return "gate:no-repo";
@@ -6888,7 +6890,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "2dd0b42053ad32e7fc431f05a405ea022d004c46", built_at: "2026-10-25T15:33:35Z" };
+    module.exports = { commit: "d77f94f6cbca6d31da4f1bf3eb863ccb16a3146e", built_at: "2026-10-25T16:39:04Z" };
   }
 });
 

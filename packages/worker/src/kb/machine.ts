@@ -646,6 +646,11 @@ export function breachClass(reason: string): string {
   // `status 'x' is terminal for task`). Benign and self-healing: the loser
   // skips and the winner proceeds. Observable as claim_race, never a breach.
   if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
+  // BR#3429: ownership-gate rejections are claim races too — a non-owner
+  // (dispatched session vs runner-held claim) tried to release a claimed
+  // card. The gate refuses, the loser skips, the owner/human decides.
+  // Symmetric with the runner (dispatch.rs is_claim_race_error). Specimen: BR#3427.
+  if (r.includes("only the owner or a human can release it")) return "claim_race";
   if (r.includes("pr link")) return "gate:review-needs-pr";
   if (r.includes("unreviewed")) return "gate:done-unreviewed";
   if (r.includes("references no git repository")) return "gate:no-repo";
