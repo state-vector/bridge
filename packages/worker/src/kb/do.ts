@@ -68,9 +68,11 @@ import {
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
 import { parseProvenanceSha, prCardRef, signerFromCommits, withinBackfillWindow } from "./provenance.ts";
 import {
-  check as checkRules,
+  decide,
   invariants as checkInvariants,
-  churnRelease,
+  detectBreaches,
+  replayStatus,
+  BREACH_WINDOW_MS,
   RuleCtx,
 } from "./machine.ts";
 
@@ -2427,7 +2429,8 @@ export class KnowledgeHub {
   }
 
   /** Every rejected transition is audited (transition_rejected: actor, from, to,
-   *  reason) — gaming the gates is visible in the Log and costs behaviour score. */
+   *  reason) — gaming the gates is visible in the Log and costs behaviour score.
+   *  The rejection then goes through the breach door: storms raise ONE card. */
   private async transition(body: any, actor: string) {
     try {
       return await this.doTransition(body, actor);
@@ -2439,6 +2442,7 @@ export class KnowledgeHub {
         this.audit(actor, "transition_rejected", id, {
           from: cur?.status, to, reason: String((e as Error)?.message ?? e).slice(0, 300),
         });
+        try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
       }
       throw e;
     }
@@ -2473,24 +2477,63 @@ export class KnowledgeHub {
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
           id,
         )?.n ?? 0,
+      // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
+      spawnGuard: () => {
+        let cursor = id, depth = 0;
+        while (depth < 10) {
+          const p = this.one(
+            `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
+             WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
+          );
+          if (!p) return null;
+          depth++;
+          if (parseTags(p.roles).includes("review")) return `ancestor ${p.id} is a review task — verify-of-verify is blocked`;
+          if (depth >= 3) return `nesting depth ${depth} would exceed the child_of cap of 3`;
+          cursor = p.id;
+        }
+        return null;
+      },
+      // newest OPEN verify round (reuse candidate) — a re-handoff re-enters the
+      // same round instead of stacking a fresh card per bounce cycle
+      openVerifyChild: () =>
+        this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
+        ),
+      // at most ONE live unblock child per parent, ever (cap ≤1 open)
+      openUnblockChild: () =>
+        this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
+        ),
+      // recent version-log rows (newest first) for the server-side silent-churn fold
+      recentEvents: () =>
+        (this.state.storage.sql.exec(
+          `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+          id,
+        ).toArray() as any[]).map((r) => ({ ts: Number(r.ts), actor: String(r.actor), action: String(r.action), summary: String(r.summary ?? "") })),
     };
   }
 
   private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
-    let to = String(body.to ?? "");
+    const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
-    // ---- the law: one table, one checker (machine.ts). Every role/intent
-    // rule lives in RULES there; this is the only legality gate. ----
+    // ---- the law: one table, one executor (machine.ts). Legality AND every
+    // spawn/escalate/supersede decision come back as a typed Verdict
+    // (Applied | Rejection); this function persists and executes the effects,
+    // it never invents legality or decisions. ----
     const tTags: string[] = parseTags(row.tags);
     const tRoles: string[] = parseTags(row.roles);
-    const rejection = await checkRules(
-      { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+    const ts0 = Date.now();
+    const verdict = await decide(
+      { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
       this.ruleCtx(row, body, id, tTags),
     );
-    if (rejection) throw new Error(rejection);
-    // (remaining guard rules live in machine.ts RULES — BR#2420)
+    if (verdict.ok === false) throw new Error(`${verdict.message} [rule: ${verdict.rule}]`);
     // (B) subprocess class: a declared block on a long/handed-off op, with a
     // budget. The watchdog pauses until the budget lapses; past it the
     // subprocess = declared silence while STILL WORKING: the task stays
@@ -2500,7 +2543,7 @@ export class KnowledgeHub {
     // awaiting OTHER tasks/decisions.
     const isSubprocess = body.class === "subprocess";
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
-    const ts = Date.now();
+    const ts = ts0;
     const meta = JSON.parse(row.meta ?? "{}");
     if (isSubprocess && row.type === "task" && row.status === "in_progress") {
       const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
@@ -2514,8 +2557,16 @@ export class KnowledgeHub {
       this.version(id, actor, "transition", `subprocess declared — watchdog paused until +${bm}m — ${String(body.note ?? "").slice(0, 120)}`, { from: row.status, to: "in_progress", class: "subprocess" });
       return { id, status: "in_progress", subprocess: true };
     }
-    if (to === "blocked") {
-      meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+    // stamp the executor's meta_patch (value `undefined` deletes the key),
+    // then normalize the blocked record to the FINAL status — the churn
+    // redirect lands blocked with its own reason + unblock condition.
+    for (const [k, v] of Object.entries(verdict.meta_patch)) {
+      if (v === undefined) delete meta[k];
+      else meta[k] = v;
+    }
+    if (verdict.status === "blocked") {
+      if (!meta.blocked)
+        meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
       delete meta.subprocess; // a real block supersedes a declared subprocess window
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
@@ -2531,7 +2582,7 @@ export class KnowledgeHub {
     const attributedAgent = body.gateway && String(body.agent ?? "").trim()
       ? String(body.agent).trim().slice(0, 60)
       : undefined;
-    if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
+    if (row.type === "task" && verdict.status === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
       owner = attributedAgent ?? actor;
     }
     // identity phase 2: ownership references the stable principal when the
@@ -2554,63 +2605,13 @@ export class KnowledgeHub {
       const sess = await this.resolveSession(body, String(body.token_id ?? ""));
       if (sess) meta.session = String(sess).slice(0, 120);
     }
-    // retry / release: pushing a card back to todo releases the claim — it
-    // re-enters the unclaimed pool for any matching agent (or the cron sweep)
-    // to pick up fresh. Only the current owner or a human may release a claim —
-    // agents can't dump each other's work.
-    if (row.type === "task" && to === "todo") {
-      const isHuman = actor === "web" || actor.startsWith("web:") || actor.startsWith("human:");
-      const isSystem = /^system:/.test(actor);
-      if (row.owner && row.owner !== actor && !isHuman && !isSystem)
-        throw new Error(`task ${id} is claimed by ${row.owner} — only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
-      const nextAttempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
-      const verdictDuty = tRoles.includes("review") || tRoles.includes("unblock");
-      const churn = churnRelease(nextAttempts, verdictDuty, row.status);
-      if (churn === "escalate") {
-        // verdict duties may not block (machine.ts) — repeated gate rejections
-        // escalate to a human instead of redirecting into blocked + spawn.
-        owner = "";
-        meta.escalate = {
-          at: ts,
-          attempts: nextAttempts,
-          reason: `verdict duty released ${nextAttempts} times without completing — the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`,
-        };
-        meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-        this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tRoles[0] ?? "unknown" });
-        this.version(id, "system:churn-guard", "transition", `escalated to human — ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
-      } else if (churn === "redirect") {
-        // churn guard: the pool has re-run this task N times and a gate keeps
-        // rejecting the completion. Re-releasing just loops claim → dispatch →
-        // reject → release forever (104-attempt rows taught us this), and each
-        // hop refreshes the timestamps so the watchdog never fires. Redirect
-        // the release into an honest block: the reason and exit are on the
-        // card, a human or a competent agent resolves it.
-        to = "blocked";
-        meta.blocked = {
-          reason: `churn guard: released to the pool ${nextAttempts} times without completing — the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)})`,
-          unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
-          ts,
-        };
-        meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-        this.audit("system:churn-guard", "release_redirected", id, { attempts: nextAttempts, from: row.status });
-        this.version(id, "system:churn-guard", "transition", `release redirected to blocked — ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
-      } else {
-        owner = "";
-        // attempts live in meta.attempt only (roles_v1) — no system tag writes
-        meta.attempt = {
-          by: actor, at: ts,
-          attempts: nextAttempts,
-          last_reason: meta.blocked?.reason ?? (String(body.note ?? "").trim() || undefined),
-          last_will: meta.last_progress?.will,
-        };
-      }
-    }
-    // (verdict-done receipts + review separation live in machine.ts RULES)
+    // (release ownership, churn escalate/redirect and the attempt stamp are
+    // executor decisions now — machine.ts RULES + effects, BR#2420 F4)
     // separation of duties, mechanical: a session that completed the analysis
     // child cannot carry the parent into implementation. If the parent is
     // claimed by the same session, release it — impl requires a fresh claim
     // (fresh session). The claim gate will then allow it (evidence session ≠ new session).
-    if (row.type === "task" && to === "done" && tRoles.includes("analysis")) {
+    if (row.type === "task" && verdict.status === "done" && tRoles.includes("analysis")) {
       const parent = this.one(
         `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, id,
@@ -2626,16 +2627,18 @@ export class KnowledgeHub {
     }
     // (done open-children gate lives in machine.ts RULES — BR#2420)
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ? WHERE id = ?`, to, ts, JSON.stringify(meta), ts, owner, id,
+      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ? WHERE id = ?`,
+      verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), id,
     );
     // post-conditions on the single write path: violations are breaches (a
     // loud audited trail), never silent repairs.
-    const violations = checkInvariants({ type: row.type, status: to, roles: tRoles, tags: tTags, meta });
+    const violations = checkInvariants({ type: row.type, status: verdict.status, roles: tRoles, tags: tTags, meta });
     if (violations.length) {
-      this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
-      this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} → ${to}: ${violations.join("; ")}`, { violations });
+      this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to: verdict.status });
+      this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} → ${verdict.status}: ${violations.join("; ")}`, { violations });
+      try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
     }
-    if (to === "superseded" && body.replacement_id) {
+    if (verdict.status === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
       if (rep && rep.type === row.type)
         this.state.storage.sql.exec(
@@ -2644,18 +2647,17 @@ export class KnowledgeHub {
         );
     }
     this.audit(actor, "transition", id, {
-      from: row.status, to, note: body.note ?? "", sentiment,
+      from: row.status, to: verdict.status, note: body.note ?? "", sentiment,
       ...(attributedAgent ? { agent: attributedAgent } : {}),
-      ...(isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}),
     });
-    this.version(id, actor, "transition", `${row.status} → ${to}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
+    this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
     // verify-verdict decisions are actionable: the human's answer DOES the
     // thing, not just records it. Accepting a VERIFIED verdict closes the
     // verified task (the accepted decision satisfies its done-gate via the
     // supports link). Accepting a BOUNCE verdict bounces the task back to
     // work with the findings. Without this, verdicts pile up as prose and the
     // human's click changes nothing — 35 proposed decisions taught us that.
-    if (row.type === "decision" && to === "accepted") {
+    if (row.type === "decision" && verdict.status === "accepted") {
       const dm = meta ?? {};
       if (dm.decision_class === "verify-verdict") {
         const target = String(dm.task ?? dm.verify_target ?? "").trim();
@@ -2690,50 +2692,21 @@ export class KnowledgeHub {
         }
       }
     }
-    // verification duty: entering review auto-spawns the Verify task into the
-    // unclaimed pool. A verifier (any agent, fresh session) picks it up, checks
-    // receipts (PR/merge state), completes it, then closes the parent (done) or
-    // bounces it (in_progress with findings). The impl agent keeps the parent
-    // claim and waits — in_review is the blocked-until-verdict state.
+    // ---- execute the effects the executor decided (do.ts never decides) ----
     let verifyTaskId: string | undefined;
-    if (row.type === "task" && to === "in_review" && !tRoles.includes("review")) {
-      // recursion guard, enforced: reviews don't spawn verify-of-verify, and
-      // child_of chains are capped at 3. The verify round always names the
-      // ROOT task in its title — the chain lives in child_of, never "Verify: Verify: ...".
-      let guardHit: string | undefined;
-      let cursor = id, depth = 0;
-      while (depth < 10) {
-        const p = this.one(
-          `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
-           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
-        );
-        if (!p) break;
-        depth++;
-        if (parseTags(p.roles).includes("review")) { guardHit = `ancestor ${p.id} is a review task — verify-of-verify is blocked`; break; }
-        if (depth >= 3) { guardHit = `nesting depth ${depth} would exceed the child_of cap of 3`; break; }
-        cursor = p.id;
-      }
-      if (guardHit) {
-        this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: guardHit });
-      } else {
-        // reuse an OPEN verify round when one exists — a re-handoff re-enters
-        // the same round instead of stacking a fresh card per bounce cycle
-        const existing = this.one(
-          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
-        );
-        if (existing) {
-          verifyTaskId = existing.id;
-          this.audit("system:separation", "verify_reused", id, { verify: existing.id });
-        } else {
-          const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+    for (const fx of verdict.effects) {
+      switch (fx.kind) {
+        case "spawn_verify": {
+          // verification duty: entering review spawns the Verify task into the
+          // unclaimed pool. A verifier (any agent, fresh session) picks it up,
+          // checks receipts, completes it, then closes the parent (done) or
+          // bounces it (in_progress with findings).
           const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
           const created = await this.create(
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYOU ARE THE MERGE AUTHORITY — substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable → merge, no human gate).\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.\n\nMERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> — merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces — impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
+              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYOU ARE THE MERGE AUTHORITY — substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable → merge, no human gate).\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.\n\nMERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> — merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces — impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
               roles: ["review"],
             },
             actor,
@@ -2741,123 +2714,89 @@ export class KnowledgeHub {
           verifyTaskId = created.id;
           this.state.storage.sql.exec(
             `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-            verifyTaskId, id, ts,
+            created.id, id, ts,
           );
-          this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+          this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
+          break;
+        }
+        case "reuse_verify": {
+          verifyTaskId = fx.verify;
+          this.audit("system:separation", "verify_reused", id, { verify: fx.verify });
+          break;
+        }
+        case "skip_verify_spawn": {
+          this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: fx.reason });
+          try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
+          break;
+        }
+        case "spawn_unblock": {
+          // every blocked task gets an unblock child — the executor already
+          // ran the cap (≤1 open per parent) and the flood guard; this is the
+          // only spawn site and it only executes.
+          const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
+          const created = await this.create(
+            {
+              type: "task",
+              title: `Unblock: ${rootTitle.slice(0, 200)}`,
+              body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${fx.reason || "see parent"}.\nExit condition: ${fx.exit_condition || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
+              roles: ["unblock"],
+            },
+            actor,
+          );
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+            created.id, id, ts,
+          );
+          this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
+          meta.last_unblock_spawn = { at: ts, exit: fx.exit_condition };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+          break;
+        }
+        case "skip_unblock_spawn": {
+          this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
+          try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
+          break;
+        }
+        case "supersede_children": {
+          // children are ephemeral: when the parent moves on, their round
+          // closes. keep_newest keeps the newest verify child alive across a
+          // bounce — the bounce re-enters the SAME round (the churn that
+          // drowned the pool was 3-6 cards per parent).
+          const kids = this.state.storage.sql.exec(
+            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE ? ORDER BY c.updated_ts DESC`,
+            id, `%"${fx.tag}"%`,
+          ).toArray() as any[];
+          kids.forEach((v, i) => {
+            if (fx.keep_newest && i === 0) return;
+            const vm = JSON.parse(v.meta ?? "{}");
+            vm.superseded_reason = fx.cause;
+            this.state.storage.sql.exec(
+              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+              JSON.stringify(vm), ts, ts, v.id,
+            );
+            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: fx.cause });
+            this.version(v.id, "system:separation", "transition", fx.cause, { from: v.status, to: "superseded" });
+          });
+          break;
+        }
+        case "escalate": {
+          this.audit("system:churn-guard", "escalated", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, duty: tRoles[0] ?? "unknown" });
+          this.version(id, "system:churn-guard", "transition", `escalated to human — verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { from: row.status, to: verdict.status });
+          break;
+        }
+        case "release_redirect": {
+          this.audit("system:churn-guard", "release_redirected", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, from: row.status });
+          this.version(id, "system:churn-guard", "transition", `release redirected to blocked — ${fx.attempts} attempts without completion`, { from: row.status, to: "blocked" });
+          break;
         }
       }
     }
-    // unblock children are ephemeral: their whole job is to test the exit
-    // condition. The moment the parent moves — resumes from blocked, gets
-    // released to todo, done, or bounced — every open unblock child is
-    // superseded. Without this each block episode spawns a fresh child and
-    // the open ones accumulate (and then block the parent's own completion).
-    if (row.type === "task" && ["in_progress", "todo", "done"].includes(to)) {
-      const fromStatuses = ["todo", "in_progress", "blocked"];
-      for (const v of this.state.storage.sql.exec(
-        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`, id,
-      ).toArray() as any[]) {
-        const vm = JSON.parse(v.meta ?? "{}");
-        vm.superseded_reason = to === "in_progress"
-          ? `${id} resumed from blocked — unblock confirmed, child superseded`
-          : `${id} → ${to} — unblock round closed`;
-        this.state.storage.sql.exec(
-          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-          JSON.stringify(vm), ts, ts, v.id,
-        );
-        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-      }
-    }
-    // stale verification rounds: a done closes out ANY open Verify children.
-    // A BOUNCE (in_review → in_progress) keeps the NEWEST open Verify child
-    // alive and supersedes the rest — the bounce should re-enter the SAME
-    // verify round, not supersede-and-respawn (the churn that drowned the
-    // pool: 3-6 cards per parent, real claims starving behind them).
-    if (row.type === "task" && (to === "done" || (row.status === "in_review" && to === "in_progress"))) {
-      const isBounce = row.status === "in_review" && to === "in_progress";
-      const verifyChildren = this.state.storage.sql.exec(
-        `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC`, id,
-      ).toArray() as any[];
-      verifyChildren.forEach((v, i) => {
-        if (isBounce && i === 0) return; // newest survives the bounce — same round re-enters
-        const vm = JSON.parse(v.meta ?? "{}");
-        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — ${isBounce ? "older verification round superseded (newest kept for re-entry)" : "verification round closed"}`;
-        this.state.storage.sql.exec(
-          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-          JSON.stringify(vm), ts, ts, v.id,
-        );
-        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-      });
-      // same for open unblock children: one per block episode, superseded when
-      // the parent moves on (done or bounce) — never accumulating orphans
-      for (const v of this.state.storage.sql.exec(
-        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`, id,
-      ).toArray() as any[]) {
-        const vm = JSON.parse(v.meta ?? "{}");
-        vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} — unblock round closed`;
-        this.state.storage.sql.exec(
-          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-          JSON.stringify(vm), ts, ts, v.id,
-        );
-        this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-        this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-      }
-    }
-    // every blocked task gets an unblock child: a priority-ranked task whose
-    // contract is "verify whether the exit condition holds; if yes, resume the
-    // parent (in_progress with resolution); if no, record findings and close
-    // yourself". Ask-gated blocks are excluded — the ask answer auto-resumes
-    // them, and a spawned unblock task would race the answer.
-    if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tRoles.includes("unblock")) {
-      // at most ONE live unblock child per parent, ever: if any exists in an
-      // open state (todo/in_progress/blocked), reuse it — refresh its body
-      // with the current exit condition instead of spawning a duplicate.
-      const existing = this.one(
-        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%' LIMIT 1`, id,
-      );
-      if (existing) {
-        this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
-      } else if (
-        meta.last_unblock_spawn &&
-        ts - meta.last_unblock_spawn.at < 60 * 60_000 &&
-        String(meta.last_unblock_spawn.exit ?? "") === String(meta.blocked?.unblock_condition ?? "").trim()
-      ) {
-        // flood guard: a superseded round still counts while fresh and the exit
-        // condition is unchanged — the BR#909 class spawned one child per churn
-        // cycle (17 cards) because each cycle superseded the last.
-        this.audit(actor, "spawn_skipped", id, {
-          auto: "unblock",
-          reason: `unblock round issued ${Math.round((ts - meta.last_unblock_spawn.at) / 60_000)}m ago with the same exit condition — flood guard`,
-        });
-      } else {
-      const exitCond = String(meta.blocked?.unblock_condition ?? "").trim();
-      const blockWhy = String(meta.blocked?.reason ?? "").trim();
-      const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
-      const created = await this.create(
-        {
-          type: "task",
-          title: `Unblock: ${rootTitle.slice(0, 200)}`,
-          body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${blockWhy || "see parent"}.\nExit condition: ${exitCond || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
-          roles: ["unblock"],
-        },
-        actor,
-      );
-      this.state.storage.sql.exec(
-        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-        created.id, id, ts,
-      );
-      this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
-        meta.last_unblock_spawn = { at: ts, exit: exitCond };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
-      }
-    }
-    return { id, status: to, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
+    // replay consistency: fold the version log forward and compare with the
+    // stored state — fold(events) != stored_state is itself a breach
+    // (BR#2419 item 6).
+    try { await this.replayCheck(id); } catch { /* fail-soft: the log fold never blocks a legal write */ }
+    return { id, status: verdict.status, ...(sentiment ? { sentiment } : {}), verify_task: verifyTaskId };
   }
 
   private async link(body: any, actor: string) {
@@ -3088,6 +3027,86 @@ export class KnowledgeHub {
     };
   }
 
+  // ---------- the breach door: one fold, one open card per (task, class) ----------
+  /** The single breach door (BR#2419 item 6): fold recent audit events for a
+   *  task into breach cards. One OPEN card per (task, class) key —
+   *  reoccurrences coalesce onto the open card, never spawn duplicates.
+   *  Call sites: every transition_rejected, invariant_violation,
+   *  spawn_skipped and replay_mismatch lands here through the fold. */
+  private async foldBreaches(taskId: string) {
+    const since = Date.now() - BREACH_WINDOW_MS * 8; // look back several windows
+    const rows = this.state.storage.sql.exec(
+      `SELECT ts, op, detail FROM events WHERE artefact_id = ? AND ts > ?
+        AND op IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch')
+        ORDER BY seq ASC LIMIT 200`,
+      taskId, since,
+    ).toArray() as any[];
+    if (!rows.length) return;
+    const openKeys = new Set<string>();
+    for (const b of this.state.storage.sql.exec(
+      `SELECT meta FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND meta LIKE ?`,
+      `%"breach_key":"${taskId}|%`,
+    ).toArray() as any[]) {
+      let m: any = {};
+      try { m = JSON.parse(b.meta ?? "{}"); } catch { /* garbage meta is not a breach */ }
+      if (typeof m?.breach_key === "string") openKeys.add(m.breach_key);
+    }
+    const breaches = detectBreaches(
+      rows.map((r) => {
+        let d: any = {};
+        try { d = JSON.parse(r.detail ?? "{}"); } catch { /* tolerate junk detail */ }
+        const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
+        return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
+      }),
+      openKeys,
+    );
+    for (const b of breaches) {
+      const created = await this.create(
+        {
+          type: "task",
+          title: `Breach: ${b.klass} on ${taskId} — ${b.count} event${b.count === 1 ? "" : "s"}`,
+          body_md: `Structural breach detected server-side (fold over the audit stream).\n\n- class: ${b.klass}\n- task: ${taskId}\n- events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})\n- sample: ${b.sample}\n\nOne open card per (task, class) — reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
+          tags: ["breach", `breach:${b.klass}`],
+        },
+        "system:breach",
+      );
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ? WHERE id = ?`,
+        JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count }),
+        created.id,
+      );
+      this.audit("system:breach", "breach_raised", created.id, { key: b.key, task: taskId, klass: b.klass, count: b.count });
+      this.version(created.id, "system:breach", "create", `breach card raised — ${b.klass} on ${taskId} (${b.count} events)`, { key: b.key, sample: b.sample });
+    }
+  }
+
+  /** Replay consistency (BR#2419 item 6): fold the version log's transition
+   *  chain forward and compare with the stored status. A mismatch — or a
+   *  broken chain (an event's `from` doesn't match the folded state:
+   *  forged, deleted, or out-of-order history) — is a replay_mismatch event
+   *  through the breach door. */
+  private async replayCheck(id: string) {
+    const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, id);
+    if (!row) return;
+    const versions = (
+      this.state.storage.sql.exec(
+        `SELECT action, data FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 200`,
+        id,
+      ).toArray() as any[]
+    ).reverse();
+    if (!versions.length) return;
+    const events = versions.map((v) => {
+      let d: any = {};
+      try { d = JSON.parse(v.data ?? "{}"); } catch { /* tolerate junk rows */ }
+      return { action: String(v.action), data: d };
+    });
+    const fold = replayStatus("", events);
+    if (!fold.ok || (fold.status && fold.status !== row.status)) {
+      this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+      this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (chain ok: ${fold.ok}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+      try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
+    }
+  }
 
   private async getHistory(artefactId: string, limit = 100) {
     const rows = this.state.storage.sql.exec(
@@ -4494,3 +4513,11 @@ export class KnowledgeHub {
 
 // re-export for the worker entry's type-free JS import
 export { idSeq };
+
+/** Final tags to write: the executor's tags_add merged into the row's tags. */
+function tagsForWrite(verdict: Extract<Awaited<ReturnType<typeof decide>>, { ok: true }>, base: string[]): string[] {
+  if (!verdict.tags_add.length) return base;
+  const t = [...base];
+  for (const x of verdict.tags_add) if (!t.includes(x)) t.push(x);
+  return t;
+}

@@ -658,20 +658,112 @@ function metaOf(m) {
   }
   return m ?? {};
 }
-function churnRelease(nextAttempts, verdictDuty, fromStatus) {
-  if (verdictDuty && nextAttempts >= CHURN_ESCALATE_ATTEMPTS) return "escalate";
-  if (nextAttempts >= CHURN_REDIRECT_ATTEMPTS && fromStatus !== "blocked") return "redirect";
-  return "pass";
-}
-async function check(i, c) {
+async function decide(i, c) {
   const base = validateTransition(i.type, i.status, i.to);
-  if (base.ok === false) return base.reason;
-  for (const r of RULES) {
-    if (!r.when(i)) continue;
-    const err2 = await r.guard(i, c);
-    if (err2) return err2;
+  if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  for (const r2 of RULES) {
+    if (!r2.when(i)) continue;
+    const err2 = await r2.guard(i, c);
+    if (err2) return { ok: false, code: "guard-failed", rule: r2.name, message: err2 };
   }
-  return null;
+  if (i.type !== "task") return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: [] };
+  const now = i.now ?? Date.now();
+  const meta = metaOf(i.meta);
+  const r = role(i);
+  const patch = {};
+  const tagsAdd = [];
+  const effects = [];
+  let status = i.to;
+  let ownerClear = false;
+  if (i.to === "todo") {
+    const nextAttempts = (meta.attempt?.attempts ?? 0) + 1;
+    const silent = silentCycles(await c.recentEvents());
+    const verdictDuty = r === "review" || r === "unblock";
+    const lastReason = String(i.body?.note ?? "").trim() || meta.attempt?.last_reason;
+    const attempt = { by: i.actor, at: now, attempts: nextAttempts, last_reason: lastReason, last_will: meta.last_progress?.will };
+    if (verdictDuty && (nextAttempts >= CHURN_ESCALATE_ATTEMPTS || silent >= SILENT_ESCALATE_CYCLES)) {
+      const reason = silent >= SILENT_ESCALATE_CYCLES && nextAttempts < CHURN_ESCALATE_ATTEMPTS ? `verdict duty went silent ${silent} watchdog cycles with no agent output \u2014 server-side churn escalation (last: ${String(lastReason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope` : `verdict duty released ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(lastReason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`;
+      patch.escalate = { at: now, attempts: nextAttempts, silent_cycles: silent, reason };
+      patch.attempt = attempt;
+      ownerClear = true;
+      effects.push({ kind: "escalate", attempts: nextAttempts, silent_cycles: silent, reason });
+    } else if (!verdictDuty && i.status !== "blocked" && (nextAttempts >= CHURN_REDIRECT_ATTEMPTS || silent >= SILENT_REDIRECT_CYCLES)) {
+      const blockReason = silent >= SILENT_REDIRECT_CYCLES && nextAttempts < CHURN_REDIRECT_ATTEMPTS ? `churn guard: ${silent} consecutive zero-output watchdog cycles \u2014 silent churn, server-side escalated` : `churn guard: released to the pool ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(lastReason ?? "").slice(0, 200)})`;
+      status = "blocked";
+      patch.blocked = {
+        reason: blockReason,
+        unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
+        ts: now
+      };
+      patch.attempt = attempt;
+      effects.push({ kind: "release_redirect", attempts: nextAttempts, silent_cycles: silent });
+    } else {
+      ownerClear = true;
+      patch.attempt = {
+        by: i.actor,
+        at: now,
+        attempts: nextAttempts,
+        last_reason: meta.blocked?.reason ?? (String(i.body?.note ?? "").trim() || void 0),
+        last_will: meta.last_progress?.will
+      };
+      if (!i.tags.includes("attempted")) tagsAdd.push("attempted");
+    }
+  }
+  if ((i.to === "done" || i.to === "superseded") && meta.attempt && typeof meta.attempt === "object")
+    patch.attempt = { ...meta.attempt, attempts: 0 };
+  if (i.to === "in_review" && r !== "review") {
+    const guard = await c.spawnGuard();
+    if (guard) {
+      effects.push({ kind: "skip_verify_spawn", parent: i.id, reason: guard });
+    } else {
+      const open = await c.openVerifyChild();
+      if (open) effects.push({ kind: "reuse_verify", parent: i.id, verify: open.id });
+      else
+        effects.push({
+          kind: "spawn_verify",
+          parent: i.id,
+          pr: (String(i.body?.note ?? "").match(/https?:\/\/\S+/) || [])[0] ?? null
+        });
+    }
+  }
+  if (["in_progress", "todo", "done"].includes(i.to)) {
+    const cause = i.to === "in_progress" && i.status === "blocked" ? `${i.id} resumed from blocked \u2014 unblock confirmed, child superseded` : i.to === "in_progress" && i.status === "in_review" ? `${i.id} bounced \u2014 unblock round closed` : `${i.id} \u2192 ${i.to} \u2014 unblock round closed`;
+    effects.push({ kind: "supersede_children", parent: i.id, tag: "unblock", keep_newest: false, cause });
+  }
+  if (i.to === "done" || i.status === "in_review" && i.to === "in_progress") {
+    const isBounce = i.status === "in_review" && i.to === "in_progress";
+    effects.push({
+      kind: "supersede_children",
+      parent: i.id,
+      tag: "review",
+      keep_newest: isBounce,
+      cause: isBounce ? `${i.id} bounced \u2014 older verification rounds superseded (newest kept for re-entry)` : `${i.id} done \u2014 verification round closed`
+    });
+  }
+  if (i.to === "blocked" && r !== "unblock" && !meta.awaiting_ask && !i.body?.awaiting_ask_id && i.body?.class !== "subprocess") {
+    const open = await c.openUnblockChild();
+    if (open) {
+      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open.id} reused` });
+    } else {
+      const exit = String(i.body?.unblock_condition ?? "").trim();
+      const last = meta.last_unblock_spawn;
+      if (last && typeof last.at === "number" && now - last.at < UNBLOCK_FLOOD_MS && String(last.exit ?? "") === exit) {
+        effects.push({
+          kind: "skip_unblock_spawn",
+          parent: i.id,
+          reason: `unblock round issued ${Math.round((now - last.at) / 6e4)}m ago with the same exit condition \u2014 flood guard`
+        });
+      } else {
+        effects.push({
+          kind: "spawn_unblock",
+          parent: i.id,
+          reason: String(i.body?.note ?? i.body?.reason ?? "").trim(),
+          exit_condition: exit
+        });
+      }
+    }
+  }
+  return { ok: true, status, owner_clear: ownerClear, tags_add: tagsAdd, meta_patch: patch, effects };
 }
 function invariants(a) {
   const v = [];
@@ -690,13 +782,76 @@ function invariants(a) {
     v.push("question is in_progress \u2014 questions are answered, not claimed");
   return v;
 }
-var VERDICT_ROLES, HUMAN_ACTOR, role, isTask, noteOf, hasEvidenceLink, hasReceipts, CHURN_REDIRECT_ATTEMPTS, CHURN_ESCALATE_ATTEMPTS, RULES, BREACH_WINDOW_MS;
+function silentCycles(events) {
+  const asc = [...events].sort((a, b) => a.ts - b.ts);
+  let run = 0;
+  for (const e of asc) {
+    if (isAgentOutput(e)) run = 0;
+    else if (isWatchdogStall(e)) run++;
+  }
+  return run;
+}
+function replayStatus(from, versions) {
+  let expected = from;
+  let anchored = false;
+  for (const v of versions) {
+    if (v.action !== "transition") continue;
+    const to = v.data?.to;
+    if (typeof to !== "string") continue;
+    if (anchored && v.data?.from !== expected) return { status: expected, ok: false };
+    expected = to;
+    anchored = true;
+  }
+  return { status: expected, ok: true };
+}
+function breachClass(reason) {
+  const r = reason.toLowerCase();
+  if (r.includes("pr link")) return "gate:review-needs-pr";
+  if (r.includes("unreviewed")) return "gate:done-unreviewed";
+  if (r.includes("references no git repository")) return "gate:no-repo";
+  if (r.includes("without receipts")) return "gate:verdict-receipts";
+  if (r.includes("separation of duties")) return "gate:separation";
+  if (r.includes("open child")) return "gate:open-children";
+  if (r.includes("cannot block")) return "gate:verdict-no-blocked";
+  if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
+  return "other";
+}
+function classOf(e) {
+  if (e.op === "invariant_violation") return "invariant";
+  if (e.op === "spawn_skipped") return "spawn-while-open";
+  if (e.op === "replay_mismatch") return "replay";
+  return breachClass(e.reason);
+}
+function detectBreaches(events, openKeys, opts) {
+  const windowMs = opts?.windowMs ?? BREACH_WINDOW_MS;
+  const relevant = events.filter(
+    (e) => ["transition_rejected", "invariant_violation", "spawn_skipped", "replay_mismatch"].includes(e.op)
+  );
+  relevant.sort((a, b) => a.ts - b.ts);
+  const groups = /* @__PURE__ */ new Map();
+  for (const e of relevant) {
+    const klass = classOf(e);
+    const key = `${e.task}|${klass}`;
+    const g = groups.get(key);
+    if (g) {
+      if (e.ts - g.first_ts <= windowMs) {
+        g.count++;
+        g.last_ts = e.ts;
+      }
+    } else {
+      groups.set(key, { key, task: e.task, klass, count: 1, first_ts: e.ts, last_ts: e.ts, sample: e.reason.slice(0, 200) });
+    }
+  }
+  return [...groups.values()].filter((b) => b.count >= (BREACH_THRESHOLDS[b.klass] ?? BREACH_THRESHOLDS.default) && !openKeys.has(b.key));
+}
+var VERDICT_ROLES, HUMAN_ACTOR, OWNER_RELEASE_EXEMPT, role, isTask, noteOf, hasEvidenceLink, hasReceipts, CHURN_REDIRECT_ATTEMPTS, CHURN_ESCALATE_ATTEMPTS, SILENT_ESCALATE_CYCLES, SILENT_REDIRECT_CYCLES, UNBLOCK_FLOOD_MS, RULES, isAgentOutput, isWatchdogStall, BREACH_WINDOW_MS, BREACH_THRESHOLD, BREACH_THRESHOLDS;
 var init_machine = __esm({
   "src/kb/machine.ts"() {
     init_core();
     __name(effectiveRole, "effectiveRole");
     VERDICT_ROLES = ["review", "unblock"];
     HUMAN_ACTOR = /^web(:|$)|^human:/;
+    OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
     role = /* @__PURE__ */ __name((i) => effectiveRole(i.roles ?? []), "role");
     isTask = /* @__PURE__ */ __name((i) => i.type === "task", "isTask");
     noteOf = /* @__PURE__ */ __name((i) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim(), "noteOf");
@@ -705,7 +860,9 @@ var init_machine = __esm({
     __name(metaOf, "metaOf");
     CHURN_REDIRECT_ATTEMPTS = 5;
     CHURN_ESCALATE_ATTEMPTS = 3;
-    __name(churnRelease, "churnRelease");
+    SILENT_ESCALATE_CYCLES = 3;
+    SILENT_REDIRECT_CYCLES = 5;
+    UNBLOCK_FLOOD_MS = 60 * 6e4;
     RULES = [
       {
         name: "verdict-no-in_review",
@@ -717,6 +874,11 @@ var init_machine = __esm({
         when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id, "when"),
         // an ask-gate pauses the duty; it auto-resumes on the answer
         guard: /* @__PURE__ */ __name((i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`, "guard")
+      },
+      {
+        name: "release-needs-ownership",
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "todo" && !!i.owner && i.owner !== i.actor && !OWNER_RELEASE_EXEMPT.test(i.actor), "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is claimed by ${i.owner} \u2014 only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`, "guard")
       },
       {
         name: "decision-acceptance-human",
@@ -821,13 +983,33 @@ var init_machine = __esm({
         }, "guard")
       }
     ];
-    __name(check, "check");
+    __name(decide, "decide");
     __name(invariants, "invariants");
+    isAgentOutput = /* @__PURE__ */ __name((e) => !/^system:/.test(e.actor), "isAgentOutput");
+    isWatchdogStall = /* @__PURE__ */ __name((e) => /^system:/.test(e.actor) && /stall|releas|redirect/i.test(e.summary), "isWatchdogStall");
+    __name(silentCycles, "silentCycles");
+    __name(replayStatus, "replayStatus");
     BREACH_WINDOW_MS = 30 * 6e4;
+    BREACH_THRESHOLD = 3;
+    BREACH_THRESHOLDS = {
+      invariant: 1,
+      replay: 1,
+      "spawn-while-open": 1,
+      default: BREACH_THRESHOLD
+    };
+    __name(breachClass, "breachClass");
+    __name(classOf, "classOf");
+    __name(detectBreaches, "detectBreaches");
   }
 });
 
 // src/kb/do.ts
+function tagsForWrite(verdict, base) {
+  if (!verdict.tags_add.length) return base;
+  const t = [...base];
+  for (const x of verdict.tags_add) if (!t.includes(x)) t.push(x);
+  return t;
+}
 var STOP_LINE_SINK_ID, KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
@@ -3098,7 +3280,8 @@ ${bodyMd.trim()}`.trim();
         }
       }
       /** Every rejected transition is audited (transition_rejected: actor, from, to,
-       *  reason) — gaming the gates is visible in the Log and costs behaviour score. */
+       *  reason) — gaming the gates is visible in the Log and costs behaviour score.
+       *  The rejection then goes through the breach door: storms raise ONE card. */
       async transition(body, actor) {
         try {
           return await this.doTransition(body, actor);
@@ -3112,6 +3295,10 @@ ${bodyMd.trim()}`.trim();
               to,
               reason: String(e?.message ?? e).slice(0, 300)
             });
+            try {
+              await this.foldBreaches(id);
+            } catch {
+            }
           }
           throw e;
         }
@@ -3136,24 +3323,62 @@ ${bodyMd.trim()}`.trim();
             `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
             id
-          )?.n ?? 0, "openChildren")
+          )?.n ?? 0, "openChildren"),
+          // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
+          spawnGuard: /* @__PURE__ */ __name(() => {
+            let cursor = id, depth = 0;
+            while (depth < 10) {
+              const p = this.one(
+                `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
+             WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+                cursor
+              );
+              if (!p) return null;
+              depth++;
+              if (parseTags(p.roles).includes("review")) return `ancestor ${p.id} is a review task \u2014 verify-of-verify is blocked`;
+              if (depth >= 3) return `nesting depth ${depth} would exceed the child_of cap of 3`;
+              cursor = p.id;
+            }
+            return null;
+          }, "spawnGuard"),
+          // newest OPEN verify round (reuse candidate) — a re-handoff re-enters the
+          // same round instead of stacking a fresh card per bounce cycle
+          openVerifyChild: /* @__PURE__ */ __name(() => this.one(
+            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+            id
+          ), "openVerifyChild"),
+          // at most ONE live unblock child per parent, ever (cap ≤1 open)
+          openUnblockChild: /* @__PURE__ */ __name(() => this.one(
+            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+            id
+          ), "openUnblockChild"),
+          // recent version-log rows (newest first) for the server-side silent-churn fold
+          recentEvents: /* @__PURE__ */ __name(() => this.state.storage.sql.exec(
+            `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+            id
+          ).toArray().map((r) => ({ ts: Number(r.ts), actor: String(r.actor), action: String(r.action), summary: String(r.summary ?? "") })), "recentEvents")
         };
       }
       async doTransition(body, actor) {
         const id = String(body.id ?? "");
-        let to = String(body.to ?? "");
+        const to = String(body.to ?? "");
         const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
         if (!row) throw new Error(`no such artefact: ${id}`);
         const tTags = parseTags(row.tags);
         const tRoles = parseTags(row.roles);
-        const rejection = await check(
-          { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+        const ts0 = Date.now();
+        const verdict = await decide(
+          { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
           this.ruleCtx(row, body, id, tTags)
         );
-        if (rejection) throw new Error(rejection);
+        if (verdict.ok === false) throw new Error(`${verdict.message} [rule: ${verdict.rule}]`);
         const isSubprocess = body.class === "subprocess";
         const sentiment = isSentiment(body.sentiment) ? body.sentiment : void 0;
-        const ts = Date.now();
+        const ts = ts0;
         const meta = JSON.parse(row.meta ?? "{}");
         if (isSubprocess && row.type === "task" && row.status === "in_progress") {
           const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
@@ -3170,8 +3395,13 @@ ${bodyMd.trim()}`.trim();
           this.version(id, actor, "transition", `subprocess declared \u2014 watchdog paused until +${bm}m \u2014 ${String(body.note ?? "").slice(0, 120)}`, { from: row.status, to: "in_progress", class: "subprocess" });
           return { id, status: "in_progress", subprocess: true };
         }
-        if (to === "blocked") {
-          meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+        for (const [k, v] of Object.entries(verdict.meta_patch)) {
+          if (v === void 0) delete meta[k];
+          else meta[k] = v;
+        }
+        if (verdict.status === "blocked") {
+          if (!meta.blocked)
+            meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
           delete meta.subprocess;
         } else if (meta.blocked) {
           delete meta.blocked;
@@ -3179,7 +3409,7 @@ ${bodyMd.trim()}`.trim();
         let owner = row.owner;
         const bounceFromReview = row.status === "in_review";
         const attributedAgent = body.gateway && String(body.agent ?? "").trim() ? String(body.agent).trim().slice(0, 60) : void 0;
-        if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
+        if (row.type === "task" && verdict.status === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
           owner = attributedAgent ?? actor;
         }
         const actingPrincipal = typeof body.token_id === "string" && body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, body.token_id)?.principal : null;
@@ -3193,46 +3423,7 @@ ${bodyMd.trim()}`.trim();
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta.session = String(sess).slice(0, 120);
         }
-        if (row.type === "task" && to === "todo") {
-          const isHuman = actor === "web" || actor.startsWith("web:") || actor.startsWith("human:");
-          const isSystem = /^system:/.test(actor);
-          if (row.owner && row.owner !== actor && !isHuman && !isSystem)
-            throw new Error(`task ${id} is claimed by ${row.owner} \u2014 only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
-          const nextAttempts = (meta.attempt?.attempts ?? 0) + 1;
-          const verdictDuty = tRoles.includes("review") || tRoles.includes("unblock");
-          const churn = churnRelease(nextAttempts, verdictDuty, row.status);
-          if (churn === "escalate") {
-            owner = "";
-            meta.escalate = {
-              at: ts,
-              attempts: nextAttempts,
-              reason: `verdict duty released ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`
-            };
-            meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-            this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tRoles[0] ?? "unknown" });
-            this.version(id, "system:churn-guard", "transition", `escalated to human \u2014 ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
-          } else if (churn === "redirect") {
-            to = "blocked";
-            meta.blocked = {
-              reason: `churn guard: released to the pool ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(meta.attempt?.last_reason ?? "").slice(0, 200)})`,
-              unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
-              ts
-            };
-            meta.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta.attempt?.last_reason, last_will: meta.last_progress?.will };
-            this.audit("system:churn-guard", "release_redirected", id, { attempts: nextAttempts, from: row.status });
-            this.version(id, "system:churn-guard", "transition", `release redirected to blocked \u2014 ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
-          } else {
-            owner = "";
-            meta.attempt = {
-              by: actor,
-              at: ts,
-              attempts: nextAttempts,
-              last_reason: meta.blocked?.reason ?? (String(body.note ?? "").trim() || void 0),
-              last_will: meta.last_progress?.will
-            };
-          }
-        }
-        if (row.type === "task" && to === "done" && tRoles.includes("analysis")) {
+        if (row.type === "task" && verdict.status === "done" && tRoles.includes("analysis")) {
           const parent = this.one(
             `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
@@ -3248,20 +3439,25 @@ ${bodyMd.trim()}`.trim();
           }
         }
         this.state.storage.sql.exec(
-          `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ? WHERE id = ?`,
-          to,
+          `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ? WHERE id = ?`,
+          verdict.status,
           ts,
           JSON.stringify(meta),
           ts,
-          owner,
+          verdict.owner_clear ? "" : owner,
+          JSON.stringify(tagsForWrite(verdict, tTags)),
           id
         );
-        const violations = invariants({ type: row.type, status: to, roles: tRoles, tags: tTags, meta });
+        const violations = invariants({ type: row.type, status: verdict.status, roles: tRoles, tags: tTags, meta });
         if (violations.length) {
-          this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
-          this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} \u2192 ${to}: ${violations.join("; ")}`, { violations });
+          this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to: verdict.status });
+          this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} \u2192 ${verdict.status}: ${violations.join("; ")}`, { violations });
+          try {
+            await this.foldBreaches(id);
+          } catch {
+          }
         }
-        if (to === "superseded" && body.replacement_id) {
+        if (verdict.status === "superseded" && body.replacement_id) {
           const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
           if (rep && rep.type === row.type)
             this.state.storage.sql.exec(
@@ -3273,14 +3469,13 @@ ${bodyMd.trim()}`.trim();
         }
         this.audit(actor, "transition", id, {
           from: row.status,
-          to,
+          to: verdict.status,
           note: body.note ?? "",
           sentiment,
-          ...attributedAgent ? { agent: attributedAgent } : {},
-          ...isSubprocess ? { class: "subprocess", budget_minutes: meta.blocked.budget_minutes } : {}
+          ...attributedAgent ? { agent: attributedAgent } : {}
         });
-        this.version(id, actor, "transition", `${row.status} \u2192 ${to}${body.note ? ` \u2014 ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
-        if (row.type === "decision" && to === "accepted") {
+        this.version(id, actor, "transition", `${row.status} \u2192 ${verdict.status}${body.note ? ` \u2014 ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
+        if (row.type === "decision" && verdict.status === "accepted") {
           const dm = meta ?? {};
           if (dm.decision_class === "verify-verdict") {
             const target = String(dm.task ?? dm.verify_target ?? "").trim();
@@ -3309,41 +3504,9 @@ ${bodyMd.trim()}`.trim();
           }
         }
         let verifyTaskId;
-        if (row.type === "task" && to === "in_review" && !tRoles.includes("review")) {
-          let guardHit;
-          let cursor = id, depth = 0;
-          while (depth < 10) {
-            const p = this.one(
-              `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
-           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
-              cursor
-            );
-            if (!p) break;
-            depth++;
-            if (parseTags(p.roles).includes("review")) {
-              guardHit = `ancestor ${p.id} is a review task \u2014 verify-of-verify is blocked`;
-              break;
-            }
-            if (depth >= 3) {
-              guardHit = `nesting depth ${depth} would exceed the child_of cap of 3`;
-              break;
-            }
-            cursor = p.id;
-          }
-          if (guardHit) {
-            this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: guardHit });
-          } else {
-            const existing = this.one(
-              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
-              id
-            );
-            if (existing) {
-              verifyTaskId = existing.id;
-              this.audit("system:separation", "verify_reused", id, { verify: existing.id });
-            } else {
-              const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+        for (const fx of verdict.effects) {
+          switch (fx.kind) {
+            case "spawn_verify": {
               const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
               const created = await this.create(
                 {
@@ -3359,7 +3522,7 @@ VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 uns
 3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.
 4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.
 
-Then double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.
+Then double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.
 
 MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> \u2014 merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found \u2192 bounce the parent back to impl with findings (in_review \u2192 in_progress, one round, N bounces \u2014 impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
                   roles: ["review"]
@@ -3369,116 +3532,101 @@ MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge 
               verifyTaskId = created.id;
               this.state.storage.sql.exec(
                 `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-                verifyTaskId,
+                created.id,
                 id,
                 ts
               );
-              this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+              this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
+              break;
+            }
+            case "reuse_verify": {
+              verifyTaskId = fx.verify;
+              this.audit("system:separation", "verify_reused", id, { verify: fx.verify });
+              break;
+            }
+            case "skip_verify_spawn": {
+              this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: fx.reason });
+              try {
+                await this.foldBreaches(id);
+              } catch {
+              }
+              break;
+            }
+            case "spawn_unblock": {
+              const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
+              const created = await this.create(
+                {
+                  type: "task",
+                  title: `Unblock: ${rootTitle.slice(0, 200)}`,
+                  body_md: `Unblock duty for ${id} \u2014 "${rootTitle}".
+
+Blocked why: ${fx.reason || "see parent"}.
+Exit condition: ${fx.exit_condition || "none recorded \u2014 read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.
+
+Contract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
+                  roles: ["unblock"]
+                },
+                actor
+              );
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+                created.id,
+                id,
+                ts
+              );
+              this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
+              meta.last_unblock_spawn = { at: ts, exit: fx.exit_condition };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+              break;
+            }
+            case "skip_unblock_spawn": {
+              this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
+              try {
+                await this.foldBreaches(id);
+              } catch {
+              }
+              break;
+            }
+            case "supersede_children": {
+              const kids = this.state.storage.sql.exec(
+                `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE ? ORDER BY c.updated_ts DESC`,
+                id,
+                `%"${fx.tag}"%`
+              ).toArray();
+              kids.forEach((v, i) => {
+                if (fx.keep_newest && i === 0) return;
+                const vm = JSON.parse(v.meta ?? "{}");
+                vm.superseded_reason = fx.cause;
+                this.state.storage.sql.exec(
+                  `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+                  JSON.stringify(vm),
+                  ts,
+                  ts,
+                  v.id
+                );
+                this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: fx.cause });
+                this.version(v.id, "system:separation", "transition", fx.cause, { from: v.status, to: "superseded" });
+              });
+              break;
+            }
+            case "escalate": {
+              this.audit("system:churn-guard", "escalated", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, duty: tRoles[0] ?? "unknown" });
+              this.version(id, "system:churn-guard", "transition", `escalated to human \u2014 verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { from: row.status, to: verdict.status });
+              break;
+            }
+            case "release_redirect": {
+              this.audit("system:churn-guard", "release_redirected", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, from: row.status });
+              this.version(id, "system:churn-guard", "transition", `release redirected to blocked \u2014 ${fx.attempts} attempts without completion`, { from: row.status, to: "blocked" });
+              break;
             }
           }
         }
-        if (row.type === "task" && ["in_progress", "todo", "done"].includes(to)) {
-          const fromStatuses = ["todo", "in_progress", "blocked"];
-          for (const v of this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
-            id
-          ).toArray()) {
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = to === "in_progress" ? `${id} resumed from blocked \u2014 unblock confirmed, child superseded` : `${id} \u2192 ${to} \u2014 unblock round closed`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          }
+        try {
+          await this.replayCheck(id);
+        } catch {
         }
-        if (row.type === "task" && (to === "done" || row.status === "in_review" && to === "in_progress")) {
-          const isBounce = row.status === "in_review" && to === "in_progress";
-          const verifyChildren = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC`,
-            id
-          ).toArray();
-          verifyChildren.forEach((v, i) => {
-            if (isBounce && i === 0) return;
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} \u2014 ${isBounce ? "older verification round superseded (newest kept for re-entry)" : "verification round closed"}`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          });
-          for (const v of this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
-            id
-          ).toArray()) {
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} \u2014 unblock round closed`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          }
-        }
-        if (row.type === "task" && to === "blocked" && !meta.awaiting_ask && !tRoles.includes("unblock")) {
-          const existing = this.one(
-            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%' LIMIT 1`,
-            id
-          );
-          if (existing) {
-            this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
-          } else if (meta.last_unblock_spawn && ts - meta.last_unblock_spawn.at < 60 * 6e4 && String(meta.last_unblock_spawn.exit ?? "") === String(meta.blocked?.unblock_condition ?? "").trim()) {
-            this.audit(actor, "spawn_skipped", id, {
-              auto: "unblock",
-              reason: `unblock round issued ${Math.round((ts - meta.last_unblock_spawn.at) / 6e4)}m ago with the same exit condition \u2014 flood guard`
-            });
-          } else {
-            const exitCond = String(meta.blocked?.unblock_condition ?? "").trim();
-            const blockWhy = String(meta.blocked?.reason ?? "").trim();
-            const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
-            const created = await this.create(
-              {
-                type: "task",
-                title: `Unblock: ${rootTitle.slice(0, 200)}`,
-                body_md: `Unblock duty for ${id} \u2014 "${rootTitle}".
-
-Blocked why: ${blockWhy || "see parent"}.
-Exit condition: ${exitCond || "none recorded \u2014 read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.
-
-Contract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
-                roles: ["unblock"]
-              },
-              actor
-            );
-            this.state.storage.sql.exec(
-              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-              created.id,
-              id,
-              ts
-            );
-            this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
-            meta.last_unblock_spawn = { at: ts, exit: exitCond };
-            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
-          }
-        }
-        return { id, status: to, ...sentiment ? { sentiment } : {}, verify_task: verifyTaskId };
+        return { id, status: verdict.status, ...sentiment ? { sentiment } : {}, verify_task: verifyTaskId };
       }
       async link(body, actor) {
         const srcId = String(body.src ?? ""), rel = String(body.relation ?? ""), dstId = String(body.dst ?? "");
@@ -3718,6 +3866,103 @@ ${m.bootstrap_md}` : "") + scoreLine;
           grace_until: graceUntil,
           instructions
         };
+      }
+      // ---------- the breach door: one fold, one open card per (task, class) ----------
+      /** The single breach door (BR#2419 item 6): fold recent audit events for a
+       *  task into breach cards. One OPEN card per (task, class) key —
+       *  reoccurrences coalesce onto the open card, never spawn duplicates.
+       *  Call sites: every transition_rejected, invariant_violation,
+       *  spawn_skipped and replay_mismatch lands here through the fold. */
+      async foldBreaches(taskId) {
+        const since = Date.now() - BREACH_WINDOW_MS * 8;
+        const rows = this.state.storage.sql.exec(
+          `SELECT ts, op, detail FROM events WHERE artefact_id = ? AND ts > ?
+        AND op IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch')
+        ORDER BY seq ASC LIMIT 200`,
+          taskId,
+          since
+        ).toArray();
+        if (!rows.length) return;
+        const openKeys = /* @__PURE__ */ new Set();
+        for (const b of this.state.storage.sql.exec(
+          `SELECT meta FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND meta LIKE ?`,
+          `%"breach_key":"${taskId}|%`
+        ).toArray()) {
+          let m = {};
+          try {
+            m = JSON.parse(b.meta ?? "{}");
+          } catch {
+          }
+          if (typeof m?.breach_key === "string") openKeys.add(m.breach_key);
+        }
+        const breaches = detectBreaches(
+          rows.map((r) => {
+            let d = {};
+            try {
+              d = JSON.parse(r.detail ?? "{}");
+            } catch {
+            }
+            const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
+            return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
+          }),
+          openKeys
+        );
+        for (const b of breaches) {
+          const created = await this.create(
+            {
+              type: "task",
+              title: `Breach: ${b.klass} on ${taskId} \u2014 ${b.count} event${b.count === 1 ? "" : "s"}`,
+              body_md: `Structural breach detected server-side (fold over the audit stream).
+
+- class: ${b.klass}
+- task: ${taskId}
+- events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})
+- sample: ${b.sample}
+
+One open card per (task, class) \u2014 reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
+              tags: ["breach", `breach:${b.klass}`]
+            },
+            "system:breach"
+          );
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ? WHERE id = ?`,
+            JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count }),
+            created.id
+          );
+          this.audit("system:breach", "breach_raised", created.id, { key: b.key, task: taskId, klass: b.klass, count: b.count });
+          this.version(created.id, "system:breach", "create", `breach card raised \u2014 ${b.klass} on ${taskId} (${b.count} events)`, { key: b.key, sample: b.sample });
+        }
+      }
+      /** Replay consistency (BR#2419 item 6): fold the version log's transition
+       *  chain forward and compare with the stored status. A mismatch — or a
+       *  broken chain (an event's `from` doesn't match the folded state:
+       *  forged, deleted, or out-of-order history) — is a replay_mismatch event
+       *  through the breach door. */
+      async replayCheck(id) {
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, id);
+        if (!row) return;
+        const versions = this.state.storage.sql.exec(
+          `SELECT action, data FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 200`,
+          id
+        ).toArray().reverse();
+        if (!versions.length) return;
+        const events = versions.map((v) => {
+          let d = {};
+          try {
+            d = JSON.parse(v.data ?? "{}");
+          } catch {
+          }
+          return { action: String(v.action), data: d };
+        });
+        const fold = replayStatus("", events);
+        if (!fold.ok || fold.status && fold.status !== row.status) {
+          this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+          this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (chain ok: ${fold.ok}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+          try {
+            await this.foldBreaches(id);
+          } catch {
+          }
+        }
       }
       async getHistory(artefactId, limit = 100) {
         const rows = this.state.storage.sql.exec(
@@ -4995,6 +5240,7 @@ ${String(issue.body ?? "").slice(0, 2e3)}
         });
       }
     };
+    __name(tagsForWrite, "tagsForWrite");
   }
 });
 
@@ -5505,7 +5751,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "4ab28517d13f12aac10bc3d937ddbf600a92b028", built_at: "2026-10-25T12:16:43Z" };
+    module.exports = { commit: "66c0765944cf527a1e90df091178482876f7277c", built_at: "2026-10-25T12:19:43Z" };
   }
 });
 
@@ -9083,23 +9329,23 @@ async function calculateJwkThumbprint(jwk, digestAlgorithm) {
   let components;
   switch (jwk.kty) {
     case "EC":
-      check2(jwk.crv, '"crv" (Curve) Parameter');
-      check2(jwk.x, '"x" (X Coordinate) Parameter');
-      check2(jwk.y, '"y" (Y Coordinate) Parameter');
+      check(jwk.crv, '"crv" (Curve) Parameter');
+      check(jwk.x, '"x" (X Coordinate) Parameter');
+      check(jwk.y, '"y" (Y Coordinate) Parameter');
       components = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
       break;
     case "OKP":
-      check2(jwk.crv, '"crv" (Subtype of Key Pair) Parameter');
-      check2(jwk.x, '"x" (Public Key) Parameter');
+      check(jwk.crv, '"crv" (Subtype of Key Pair) Parameter');
+      check(jwk.x, '"x" (Public Key) Parameter');
       components = { crv: jwk.crv, kty: jwk.kty, x: jwk.x };
       break;
     case "RSA":
-      check2(jwk.e, '"e" (Exponent) Parameter');
-      check2(jwk.n, '"n" (Modulus) Parameter');
+      check(jwk.e, '"e" (Exponent) Parameter');
+      check(jwk.n, '"n" (Modulus) Parameter');
       components = { e: jwk.e, kty: jwk.kty, n: jwk.n };
       break;
     case "oct":
-      check2(jwk.k, '"k" (Key Value) Parameter');
+      check(jwk.k, '"k" (Key Value) Parameter');
       components = { k: jwk.k, kty: jwk.kty };
       break;
     default:
@@ -9113,7 +9359,7 @@ async function calculateJwkThumbprintUri(jwk, digestAlgorithm) {
   const thumbprint = await calculateJwkThumbprint(jwk, digestAlgorithm);
   return `urn:ietf:params:oauth:jwk-thumbprint:sha-${digestAlgorithm.slice(-3)}:${thumbprint}`;
 }
-var check2;
+var check;
 var init_thumbprint = __esm({
   "../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
     init_digest();
@@ -9121,7 +9367,7 @@ var init_thumbprint = __esm({
     init_errors();
     init_buffer_utils();
     init_is_object();
-    check2 = /* @__PURE__ */ __name((value, description) => {
+    check = /* @__PURE__ */ __name((value, description) => {
       if (typeof value !== "string" || !value) {
         throw new JWKInvalid(`${description} missing or invalid`);
       }
