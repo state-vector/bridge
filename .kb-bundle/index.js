@@ -357,7 +357,72 @@ function stopLineAskTitle(sha, names) {
   if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
   return prefix + namesText + suffix;
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS;
+function isExemptCheckName(name) {
+  const n = name.toLowerCase();
+  return MERGE_EXEMPT_CHECK_PATTERNS.some((p) => n.includes(p));
+}
+function classifyHeadChecks(runs) {
+  const red = [];
+  const unsettled = [];
+  const external = [];
+  let green = 0;
+  for (const r of runs) {
+    if (r.conclusion == null) {
+      if (isExemptCheckName(r.name ?? "")) continue;
+      unsettled.push(r.name ?? "");
+      continue;
+    }
+    if (isExemptCheckName(r.name ?? "")) {
+      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    else unsettled.push(r.name ?? "");
+  }
+  if (red.length) return { verdict: "red", red, unsettled, external, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
+  return { verdict: "green", red, unsettled, external, green };
+}
+function decideMergeAction(i) {
+  if (i.cardStatus === "superseded")
+    return { kind: "close_superseded", reason: "linked card is superseded \u2014 closing PR without review" };
+  if (i.cardStatus === "done")
+    return { kind: "skip", reason: "linked card already done \u2014 nothing to merge under it" };
+  const short = i.headSha.slice(0, 9);
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability \u2014 not yet, skip this tick" };
+    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable \u2014 CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue` };
+  }
+  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} \u2014 not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter` };
+  const unverified = i.commits.filter((c) => !c.verified);
+  if (unverified.length)
+    return { kind: "human_leg", reason: `PR #${i.prNumber} has ${unverified.length} commit(s) not GitHub-verified \u2014 signing-environment class, never per-PR` };
+  if (i.baseVerdict !== "green")
+    return { kind: "skip", reason: `base main ${i.baseVerdict === "red" ? "RED" : "not green"} \u2014 the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert` };
+  const head = classifyHeadChecks(i.headChecks);
+  if (head.verdict === "red") {
+    const names = head.red.map((r) => r.name).join(", ");
+    return i.cardStatus === "in_review" ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl` } : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} \u2014 card not in_review, no bounce; the linked session owns it` };
+  }
+  if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) \u2014 not yet, skip this tick` };
+  if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
+    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict \u2014 re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)` };
+  if (!i.verifyAcceptedOnHead)
+    return { kind: "skip", reason: `no accepted verify verdict covering head ${short} \u2014 the verify pool owns the verdict; the sweep merges only verified PRs` };
+  return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} \u2014 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
+}
+function mergeSweepHumanLegTitle(repo, reasons) {
+  const prefix = `Merge sweep human legs on ${repo}: `;
+  const suffix = ` \u2014 fix the class?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text2 = reasons.join("; ");
+  if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + text2 + suffix;
+}
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -432,11 +497,11 @@ var init_core = __esm({
     DEFAULT_PROJECT = "Superpositional";
     __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
-1. MERGE SWEEP (standing order BR#3033): bounded to AT MOST 3 PRs per tick \u2014 then move on to tasks; an unbounded sweep starves the queue. Drain open PRs oldest first (dependency order): require (a) base main green, (b) PR checks green \u2014 external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four \u2192 merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress WITH gauges (completion/confidence/risk/context \u2014 a stats-less row hides on the board). Any failed leg \u2192 DO NOT merge: conflicts \u2192 mechanical rebase + re-push (it re-enters the order next tick); red substance checks \u2192 bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551).
+1. REBASE LEG (standing order BR#3033): the hub's deterministic merge-queue sweep (BR#3198) drains mergeable PRs every tick automatically \u2014 do NOT duplicate its merges or its bounces. Your role is the repair leg: a card bounced by the sweep (note: "unmergeable \u2014 CONFLICTING", "mergeStateStatus=...", or "head moved past the accepted verify verdict") is yours to claim: rebase onto current main, resolve conflicts mechanically (substance-preserving), re-sign as detached-cody per BR#3181, re-push with --force-with-lease \u2014 it re-enters the sweep next tick. A red substance check bounce means the implementation is wrong: claim, fix, re-enter.
 2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
 3. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat) WITH gauges (completion_pct/confidence_pct/risk_pct/context_pct \u2014 rows without gauges show no stats and the board can't prioritise them), then resume the oldest one.
 4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-5. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note \u2014 and the PR itself must be MERGEABLE: rebase onto main before every in_review, keep checks green. A conflicting PR is YOUR defect, not the reviewer's \u2014 verify bounces it straight back). Blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
 6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
@@ -478,6 +543,18 @@ var init_core = __esm({
     ]);
     __name(classifyMainCheckRuns, "classifyMainCheckRuns");
     __name(stopLineAskTitle, "stopLineAskTitle");
+    MERGE_EXEMPT_CHECK_PATTERNS = [
+      "workers builds",
+      "workers-builds",
+      "cloudflare pages",
+      "cloudflare workers",
+      "deploy preview",
+      "codeql"
+    ];
+    __name(isExemptCheckName, "isExemptCheckName");
+    __name(classifyHeadChecks, "classifyHeadChecks");
+    __name(decideMergeAction, "decideMergeAction");
+    __name(mergeSweepHumanLegTitle, "mergeSweepHumanLegTitle");
   }
 });
 
@@ -977,6 +1054,14 @@ var init_do = __esm({
           });
         }
         try {
+          await this.mergeQueueSweep(now);
+        } catch (e) {
+          try {
+            this.audit("system:merge-sweep", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
+        try {
           await this.stopTheLineSweep(now);
         } catch (e) {
           try {
@@ -1016,15 +1101,23 @@ var init_do = __esm({
       //
       // Reads main's HEAD check runs from the public GitHub API (the repo is
       // public; no token lives in the worker), classifies with the same rule as
-      // the gate (classifyMainCheckRuns), and on RED files ONE urgent ask per red
-      // episode — deduped per main-HEAD sha via the deterministic ask title and
-      // askCreate's identical-open-ask guard, so ten PRs observing one red sha
-      // produce one ask, not ten.
+      // the gate (classifyMainCheckRuns), and on RED files — per red episode,
+      // deduped per main-HEAD sha, so ten PRs observing one red sha produce one
+      // of each, not ten:
+      //   1. ONE urgent ask per red episode into the BR#3124 sink — the
+      //      ATTENTION channel; and
+      //   2. ONE claimable P0 episode task (BR#3284) — the WORK channel: title
+      //      `STOP-THE-LINE: bridge main RED @ <short-sha> — fix main first`,
+      //      body carrying the red checks, the first-failing sha/PR (bisect
+      //      walk), the remediation exception and the done-when, boosted
+      //      (priority 0) so it tops the board's ranked queue. A new red sha
+      //      supersedes the prior open episode task.
       //
       // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
-      // `stop_line_artefact_id` (ask sink; the standing card the asks bind to),
-      // `stop_line_repo` (default state-vector/bridge), `stop_line_gh_api_base`
-      // (default https://api.github.com — point at a GHES/mock for drills).
+      // `stop_line_artefact_id` (ask sink; the standing card the asks and episode
+      // tasks bind to), `stop_line_repo` (default state-vector/bridge),
+      // `stop_line_gh_api_base` (default https://api.github.com — point at a
+      // GHES/mock for drills).
       settingValue(key, fallback) {
         const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
         if (!row) return fallback;
@@ -1080,31 +1173,432 @@ var init_do = __esm({
         );
         if (dup) {
           this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
+        } else {
+          const details = [
+            `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+            ``,
+            `**Red checks on main ${sha.slice(0, 9)}:**`,
+            ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+            ``,
+            `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+            ``,
+            `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR._`
+          ].join("\n");
+          const created = await this.askCreate(
+            {
+              to: "rayh",
+              urgency: "time-sensitive",
+              question: title,
+              details,
+              reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+              options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
+              artefact_id: sinkId
+            },
+            "hub:stop-the-line"
+          );
+          this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+        }
+        await this.stopLineEpisodeTask(sha, verdict, sinkId, ghGet);
+      }
+      // ---------- the P0 episode task (BR#3284) ----------
+      // The ask pages; the task claims. When main's HEAD is RED the sweep files,
+      // alongside the ask, ONE claimable P0 task per red episode:
+      //   - deduped per main-HEAD sha (same rule as the ask — one live episode
+      //     task at a time; a re-sweep of the same sha audits and skips);
+      //   - child_of the sink (BR#3124) — the episode family under one anchor;
+      //   - body: red check names + run links, the first failing sha (the merge
+      //     that broke the line — bisect walk below) + the PR that landed it,
+      //     the remediation-merge exception (BR#3009/BR#3010), and the done-when;
+      //   - priority is STRUCTURAL, not vibes: meta.boosted (the existing human-
+      //     boost mechanism — priority 0 in the pickup ranking, first on the
+      //     board's ranked queue) + the p0/stop-the-line/gtm-blocker tag chips;
+      //   - when a NEW red sha arrives, the prior OPEN episode task is superseded
+      //     (direct audited write, the same mechanical pattern the separation
+      //     guard and the smoke purge use — a system actor filing machinery, not
+      //     a session claiming; the supersedes relation + superseded_reason point
+      //     the old card's readers at the replacement).
+      async stopLineEpisodeTask(sha, verdict, sinkId, ghGet) {
+        const shortSha = sha.slice(0, 9);
+        const title = `STOP-THE-LINE: bridge main RED @ ${shortSha} \u2014 fix main first`;
+        const dup = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'task' AND c.title = ? LIMIT 1`,
+          sinkId,
+          title.slice(0, 200)
+        );
+        if (dup) {
+          this.audit("hub:stop-the-line", "already_tasked", String(dup.id), { sha: shortSha, red: verdict.red.map((r) => r.name) });
           return;
         }
-        const details = [
-          `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+        const bisect = await this.stopLineBisect(ghGet, sha);
+        const culprit = bisect.first_failing_sha ? bisect.first_failing_pr ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.` : `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 the PR that landed it could not be resolved (bisect walked ${bisect.walked} commit(s)); check merge history.` : `**First failing sha:** bisect unavailable (${bisect.note ?? "history walk failed"}) \u2014 check the run history of recent merges manually.`;
+        const body = [
+          `**STOP-THE-LINE episode task** \u2014 bridge main HEAD ${shortSha} is RED. Merges are mechanically halted by the \`main-green gate\` (accepted decision BR#3009, destination-green precondition). This task is the claimable priority item for putting the line back up. Work continues on branches (worktrees) \u2014 only the line stops.`,
           ``,
-          `**Red checks on main ${sha.slice(0, 9)}:**`,
+          `**Red checks on ${shortSha}:**`,
           ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
           ``,
-          `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+          culprit,
           ``,
-          `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR._`
+          `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation \u2014 precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
+          ``,
+          `**Done when:** main tip has ALL check-runs settled green (0 red, 0 unsettled) and the \`main-green gate\` reopens \u2014 close this task citing the green run receipts.`,
+          ``,
+          `_Filed once per red episode by the hub sweep (BR#3008 + BR#3284), deduped per main-HEAD sha. The ask in the sink (BR#3124) is the attention channel; this task is the work._`
         ].join("\n");
-        const created = await this.askCreate(
+        const created = await this.create(
           {
-            to: "rayh",
-            urgency: "time-sensitive",
-            question: title,
-            details,
-            reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
-            options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
-            artefact_id: sinkId
+            type: "task",
+            title,
+            body_md: body,
+            // sanitizeTags lowercases (board tags are canonically lowercase — the
+            // chip renders "p0"); role:impl declares the intended work kind for
+            // pickup per the task-publishing norm (Ray's impl cards carry it).
+            tags: ["stop-the-line", "p0", "gtm-blocker", "role:impl"],
+            // the sweep KNOWS the scope, culprit and done-when — it analyzed the
+            // episode as it filed it; publish claimable, not gate-throttled
+            qualified: true,
+            meta: {
+              purpose: "stop-the-line episode task",
+              stop_line: {
+                sha,
+                short_sha: shortSha,
+                red: verdict.red.map((r) => ({ name: r.name, conclusion: r.conclusion, url: r.url })),
+                green_checks: verdict.green,
+                unsettled: verdict.unsettled,
+                first_failing_sha: bisect.first_failing_sha ?? void 0,
+                first_failing_pr: bisect.first_failing_pr,
+                sink_id: sinkId
+              },
+              // priority 0 — the existing urgent handling: first on the board's
+              // ranked queue, top of the pickup ranking (same shape the human
+              // boost endpoint writes; audited once below as part of the filing)
+              boosted: Date.now()
+            }
           },
           "hub:stop-the-line"
         );
-        this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          sinkId,
+          Date.now()
+        );
+        const prior = this.one(
+          `SELECT id, status, meta FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND id != ?
+         AND title LIKE 'STOP-THE-LINE: bridge main RED @ %'
+       ORDER BY created_ts DESC LIMIT 1`,
+          created.id
+        );
+        if (prior) {
+          const ts = Date.now();
+          const pm = JSON.parse(prior.meta ?? "{}");
+          pm.superseded_reason = `new red main episode @ ${shortSha} \u2014 superseded by ${created.id} (one live episode task at a time)`;
+          pm.superseded_by = created.id;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+            JSON.stringify(pm),
+            ts,
+            ts,
+            prior.id
+          );
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+            created.id,
+            prior.id,
+            ts
+          );
+          this.version(prior.id, "hub:stop-the-line", "transition", `superseded \u2014 new red main episode ${shortSha} (${created.id})`, { from: prior.status, to: "superseded" });
+          this.audit("hub:stop-the-line", "episode_superseded", prior.id, { by: created.id, from: prior.status, new_sha: shortSha });
+        }
+        this.audit("hub:stop-the-line", "episode_task", String(created.id), {
+          sha: shortSha,
+          red: verdict.red.map((r) => r.name),
+          first_failing: bisect.first_failing_sha?.slice(0, 9) ?? "unresolved",
+          boosted: true
+        });
+      }
+      // ---------- episode attribution walk (bisect) ----------
+      // Walk main's recent history (newest → oldest, bounded) to the first
+      // failing sha: the newest commit back from HEAD whose parent settles green
+      // is the merge that broke the line. Unauthenticated GitHub quota is shared
+      // per egress IP, so the walk is CAPPED and any error downgrades to
+      // "bisect unavailable" on the card — a failed attribution never blocks the
+      // filing, and the settled-green boundary always stops the walk.
+      async stopLineBisect(ghGet, headSha) {
+        const WALK = 10;
+        try {
+          const listBody = await (await ghGet(`/commits?per_page=${WALK}`)).json();
+          const commits = (Array.isArray(listBody) ? listBody : []).map((c) => String(c?.sha ?? "")).filter((s) => /^[0-9a-f]{40}$/.test(s));
+          for (let i = 1; i < commits.length; i++) {
+            const runsBody = await (await ghGet(`/commits/${commits[i]}/check-runs?per_page=100`)).json();
+            const v = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
+            if (v.verdict !== "green") continue;
+            const firstFailing = commits[i - 1] || headSha;
+            let pr;
+            try {
+              const pullsBody = await (await ghGet(`/commits/${firstFailing}/pulls`)).json();
+              const pulls = Array.isArray(pullsBody) ? pullsBody : [];
+              const pick = pulls.find((p) => p?.merged_at) ?? pulls[0];
+              if (pick) pr = {
+                number: Number(pick.number),
+                title: String(pick.title ?? ""),
+                html_url: String(pick.html_url ?? ""),
+                merged_at: pick.merged_at ?? null
+              };
+            } catch {
+            }
+            return { first_failing_sha: firstFailing, first_failing_pr: pr, walked: i };
+          }
+          return { walked: commits.length, note: `no settled-green commit within ${WALK} commits of main` };
+        } catch (e) {
+          return { walked: 0, note: String(e.message ?? e).slice(0, 200) };
+        }
+      }
+      // ---------- standing merge-queue sweep (BR#3198) ----------
+      // The deterministic executor of the BR#3033 standing merge order ("merge
+      // when green") — the run-side complement of BR#3008's stop-the-line gate.
+      // Every tick (paced by `merge_sweep_minutes`, default 15, 0 = off), for each
+      // OPEN PR on both repos, oldest first:
+      //   superseded-check → 5c mechanical gate (mergeable + clean + every commit
+      //   GitHub-verified + base green + head checks green) + an ACCEPTED
+      //   verify-verdict decision covering the current head → merge (squash per
+      //   repo norm). Mechanical defects auto-bounce the linked card with the
+      //   exact defect; human-leg defects (externals, signing environment) are
+      //   collected into ONE class ask per repo per episode, never one per PR.
+      //
+      // Identity: merges as the token's identity — deploy GH_TOKEN as the
+      // detached-cody credential per BR#3181, never rayh's personal credentials.
+      // Settings: `merge_sweep_minutes` (default 15), `merge_sweep_repos` (JSON
+      // array, default both repos), `merge_sweep_methods` (JSON map repo →
+      // "merge" | "squash", default bridge=merge / superpositional=squash),
+      // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
+      // `merge_sweep_gh_api_base` (drills/tests only).
+      async mergeQueueSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const token = this.env.GH_TOKEN;
+        if (!token) {
+          this.audit("hub:merge-sweep", "no_identity", null, { note: "GH_TOKEN not configured \u2014 the sweep cannot merge as detached-cody (BR#3181); skipping, never merging unauthenticated" });
+          return;
+        }
+        const base = this.settingValue("merge_sweep_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        let repos = [];
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+          if (Array.isArray(parsed)) repos = parsed.map(String);
+        } catch {
+          repos = [];
+        }
+        if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+        let methods = {};
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_methods", JSON.stringify({ "state-vector/bridge": "merge", "state-vector/superpositional": "squash" })));
+          if (parsed && typeof parsed === "object") methods = parsed;
+        } catch {
+          methods = {};
+        }
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}${path}`, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "user-agent": "bridge-merge-sweep (BR#3198)",
+              "x-github-api-version": "2022-11-28"
+            }
+          });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res.json();
+        }, "ghGet");
+        const cardRef = /* @__PURE__ */ __name((text2) => {
+          const m = /BR#(\d+)/.exec(text2 ?? "");
+          return m ? `BR#${m[1]}` : null;
+        }, "cardRef");
+        const sweepNote = /* @__PURE__ */ __name((id, note) => {
+          const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+          if (!row) return;
+          const meta = JSON.parse(row.meta ?? "{}");
+          meta.last_progress = { note: note.slice(0, 500), sentiment: "neutral", actor: "system:merge-sweep", ts: Date.now() };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), id);
+          this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
+          this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
+        }, "sweepNote");
+        const results = [];
+        for (const repo of repos) {
+          const humanLegs = [];
+          try {
+            const pulls = await ghGet(`/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`);
+            const head = await ghGet(`/repos/${repo}/commits/main`);
+            const baseSha = String(head?.sha ?? "");
+            let baseVerdict = "empty";
+            if (/^[0-9a-f]{40}$/.test(baseSha)) {
+              const runsBody = await ghGet(`/repos/${repo}/commits/${baseSha}/check-runs?per_page=100`);
+              baseVerdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []).verdict;
+            }
+            for (const pr of pulls) {
+              const prNumber = pr.number;
+              try {
+                const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
+                const linked = cardRef(`${pr.title ?? ""}
+${pr.body ?? ""}
+${detail.title ?? ""}
+${detail.body ?? ""}`);
+                const card = linked ? this.one(`SELECT id, status FROM artefacts WHERE id = ?`, linked) : null;
+                const cardStatus = card ? String(card.status) : null;
+                let verifyAcceptedAny = false;
+                let verifyAcceptedOnHead = false;
+                const headSha = String(detail?.head?.sha ?? "");
+                if (linked && /^[0-9a-f]{40}$/.test(headSha)) {
+                  const decisions = this.state.storage.sql.exec(
+                    `SELECT d.body_md AS body_md, d.meta AS meta FROM relations r
+                 JOIN artefacts d ON d.id = r.src_id
+                 WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+                    linked
+                  ).toArray();
+                  verifyAcceptedAny = decisions.length > 0;
+                  verifyAcceptedOnHead = decisions.some(
+                    (d) => (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9))
+                  );
+                }
+                const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
+                const commits = (commitsBody ?? []).map((c) => ({ sha: String(c?.sha ?? ""), verified: c?.commit?.verification?.verified === true }));
+                const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
+                const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
+                const action = decideMergeAction({
+                  prNumber,
+                  prTitle: String(detail?.title ?? pr.title ?? ""),
+                  headSha,
+                  baseVerdict,
+                  mergeable: detail?.mergeable ?? null,
+                  mergeStateStatus: detail?.merge_state_status ?? null,
+                  commits,
+                  headChecks,
+                  cardStatus,
+                  verifyAcceptedAny,
+                  verifyAcceptedOnHead
+                });
+                if (action.kind === "merge") {
+                  const method = methods[repo] === "squash" ? "squash" : "merge";
+                  const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
+                    method: "PUT",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ merge_method: method })
+                  });
+                  if (mergeRes.ok) {
+                    const merged = await mergeRes.json().catch(() => ({}));
+                    const receipt = `${action.receipt} \u2014 mergeCommit ${String(merged?.sha ?? "unknown").slice(0, 9)}`;
+                    if (linked) sweepNote(linked, receipt);
+                    results.push({ repo, pr: prNumber, kind: "merge", sha: String(merged?.sha ?? "").slice(0, 9) });
+                    this.audit("system:merge-sweep", "merge", linked, { repo, pr: prNumber, method, receipt: receipt.slice(0, 300) });
+                  } else if (mergeRes.status === 405 || mergeRes.status === 409) {
+                    const defect = `PR #${prNumber} merge refused by GitHub (HTTP ${mergeRes.status}) \u2014 no longer mergeable/clean. Rebase, resolve, re-push, re-enter the queue`;
+                    if (linked && cardStatus === "in_review") await this.transition({ id: linked, to: "in_progress", note: defect }, "system:merge-sweep");
+                    else if (linked) sweepNote(linked, defect);
+                    results.push({ repo, pr: prNumber, kind: "bounce", defect });
+                  } else {
+                    throw new Error(`merge PUT -> HTTP ${mergeRes.status}`);
+                  }
+                } else if (action.kind === "close_superseded") {
+                  const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+                    method: "PATCH",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ state: "closed", state_reason: "not_planned" })
+                  });
+                  if (close.ok) {
+                    if (linked) sweepNote(linked, `${action.reason} \u2014 PR #${prNumber} closed by the merge sweep (superseded-check first)`);
+                    results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                    this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber });
+                  } else throw new Error(`close PATCH -> HTTP ${close.status}`);
+                } else if (action.kind === "bounce") {
+                  if (linked && cardStatus === "in_review") {
+                    await this.transition({ id: linked, to: "in_progress", note: action.defect }, "system:merge-sweep");
+                  } else if (linked) {
+                    sweepNote(linked, action.defect);
+                  }
+                  results.push({ repo, pr: prNumber, kind: "bounce", defect: action.defect });
+                  this.audit("system:merge-sweep", "bounce", linked, { repo, pr: prNumber, defect: action.defect.slice(0, 300) });
+                } else if (action.kind === "note") {
+                  if (linked) sweepNote(linked, action.reason);
+                  results.push({ repo, pr: prNumber, kind: "note" });
+                } else if (action.kind === "human_leg") {
+                  humanLegs.push(action.reason);
+                  results.push({ repo, pr: prNumber, kind: "human_leg" });
+                } else {
+                  this.audit("system:merge-sweep", "skip", linked, { repo, pr: prNumber, reason: action.reason.slice(0, 300) });
+                  results.push({ repo, pr: prNumber, kind: "skip", reason: action.reason.slice(0, 120) });
+                }
+              } catch (e) {
+                this.audit("system:merge-sweep", "pr_error", null, { repo, pr: prNumber, error: String(e.message ?? e).slice(0, 300) });
+                results.push({ repo, pr: prNumber, kind: "pr_error", error: String(e.message ?? e).slice(0, 120) });
+              }
+            }
+            if (humanLegs.length) {
+              const sinkId = this.settingValue("merge_sweep_artefact_id", "BR#3198");
+              const title = mergeSweepHumanLegTitle(repo, humanLegs);
+              const dup = this.one(
+                `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.type = 'question' AND c.title = ? LIMIT 1`,
+                sinkId,
+                title.slice(0, 200)
+              );
+              if (dup) {
+                this.audit("system:merge-sweep", "human_leg_dupe", String(dup.id), { repo, legs: humanLegs.slice(0, 5) });
+              } else {
+                const created = await this.askCreate(
+                  {
+                    to: "rayh",
+                    urgency: "normal",
+                    question: title,
+                    details: [
+                      `**Human-leg merge blockers (BR#3198 class ask \u2014 one ask per class, never per PR).**`,
+                      ``,
+                      ...humanLegs.map((r) => `- ${r}`),
+                      ``,
+                      `_These are the only defects the standing merge sweep (BR#3198) cannot resolve autonomously. Everything mechanical was bounced with the exact defect on the linked card._`
+                    ].join("\n"),
+                    reason: "merge sweep collected human-leg defects into the single class ask per rule 5c",
+                    options: ["Acknowledge \u2014 on it", "Redirect the class"],
+                    artefact_id: sinkId
+                  },
+                  "system:merge-sweep"
+                );
+                this.audit("system:merge-sweep", "human_leg_ask", String(created.id), { repo, legs: humanLegs.slice(0, 5) });
+                results.push({ repo, pr: null, kind: "human_leg_ask", ask: created.id });
+              }
+            }
+          } catch (e) {
+            this.audit("system:merge-sweep", "repo_error", null, { repo, error: String(e.message ?? e).slice(0, 300) });
+            results.push({ repo, pr: null, kind: "repo_error", error: String(e.message ?? e).slice(0, 120) });
+          }
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
+          JSON.stringify({ ts: now, merged: results.filter((r) => r.kind === "merge").length, bounced: results.filter((r) => r.kind === "bounce").length, closed: results.filter((r) => r.kind === "close_superseded").length, human_legs: results.filter((r) => r.kind === "human_leg").length, skipped: results.filter((r) => r.kind === "skip").length, results: results.slice(0, 50) })
+        );
+        const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "human_leg_ask"].includes(r.kind));
+        if (summary.length)
+          this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
       }
       async eventsSince(since, limit) {
         const rows = since > 0 ? this.state.storage.sql.exec(
@@ -1162,7 +1656,7 @@ var init_do = __esm({
           }
         }
         const sessions = this.state.storage.sql.exec(
-          `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
+          `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`
         ).toArray();
         const openAskChildren = this.state.storage.sql.exec(
@@ -1412,7 +1906,9 @@ var init_do = __esm({
           `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
           `ALTER TABLE pairings ADD COLUMN principal TEXT`,
           `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
-          `ALTER TABLE sessions ADD COLUMN kind TEXT`
+          `ALTER TABLE sessions ADD COLUMN kind TEXT`,
+          `ALTER TABLE sessions ADD COLUMN worktree TEXT`
+          // BR#3204: where the session's tree lives — board collision visibility
         ]) {
           try {
             this.state.storage.sql.exec(ddl);
@@ -1784,6 +2280,7 @@ var init_do = __esm({
             case "admin.settings_get":
             case "admin.settings_set":
             case "admin.stop_line_sweep":
+            case "admin.merge_queue_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -1794,6 +2291,11 @@ var init_do = __esm({
                 await this.stopTheLineSweep(Number(body.now ?? Date.now()));
                 const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
                 return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
+              if (op === "admin.merge_queue_sweep") {
+                await this.mergeQueueSweep(Number(body.now ?? Date.now()));
+                const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
+                return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
               }
               return this.json(await this.settingsSet(body));
             default:
@@ -2555,6 +3057,8 @@ ${bodyMd.trim()}`.trim();
                   title: `Verify: ${rootTitle.slice(0, 200)}`,
                   body_md: `Verification duty for ${id} \u2014 "${rootTitle}".
 
+YOU ARE THE MERGE AUTHORITY \u2014 substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable \u2192 merge, no human gate).
+
 VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):
 1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP \u2014 zero substance checks, NO ask to the human.
 2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").
@@ -2562,7 +3066,8 @@ VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 uns
 4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.
 
 Then double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.
-Complete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+
+MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> \u2014 merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found \u2192 bounce the parent back to impl with findings (in_review \u2192 in_progress, one round, N bounces \u2014 impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
                   roles: ["review"]
                 },
                 actor
@@ -2990,7 +3495,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
       /** The session a write belongs to: explicit, else the token's most recent session. */
       async resolveSession(body, tokenId) {
         if (body.session) {
-          await this.sessionTouch({ token_id: tokenId, session: body.session }).catch(() => {
+          await this.sessionTouch({ token_id: tokenId, session: body.session, worktree: body.worktree }).catch(() => {
           });
           return String(body.session);
         }
@@ -3000,22 +3505,27 @@ ${m.bootstrap_md}` : "") + scoreLine;
         );
         return row?.name ?? void 0;
       }
-      /** Register/refresh a session. Names are unique per auth token. */
+      /** Register/refresh a session. Names are unique per auth token.
+       *  `worktree` (BR#3204): where the session's git tree lives — surfaced on
+       *  orient so the board can spot two sessions sharing a checkout. */
       async sessionTouch(body) {
         const token_id = String(body.token_id ?? "");
         const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
+        const worktree = String(body.worktree ?? "").trim().slice(0, 400) || null;
         const ts = Date.now();
         this.state.storage.sql.exec(
-          `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
-       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
-       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
+          `INSERT INTO sessions (token_id, name, kind, worktree, first_seen_ts, last_seen_ts)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind),
+         worktree = COALESCE(excluded.worktree, sessions.worktree)`,
           token_id,
           name,
           token_id,
+          worktree,
           ts,
           ts
         );
-        return { session: name };
+        return { session: name, worktree };
       }
       async askCreate(body, actor) {
         const to = String(body.to ?? "any");
@@ -4375,7 +4885,7 @@ async function callTool(name, args, ctx) {
   else if (args.agent != null) args.agent = String(args.agent).trim().slice(0, 60);
   switch (name) {
     case "orient": {
-      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName });
+      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName, worktree: args.worktree });
       const o = await call("orient", { label: identity.label, tags: identity.tags });
       const named = args.session ?? ctx.sessionName;
       const required = Array.isArray(o.action_required) ? o.action_required : [];
@@ -4383,7 +4893,7 @@ async function callTool(name, args, ctx) {
         {
           ...o,
           build: BUILD,
-          you: { agent: identity.label, session: session.session, tags: identity.tags },
+          you: { agent: identity.label, session: session.session, worktree: session.worktree, tags: identity.tags },
           note: required.length ? `ACT NOW \u2014 handle each of these before anything else:
 ${required.join("\n")}` : named ? void 0 : 'you did not name this session \u2014 pass session: "<unique-name>" on orient next time'
         },
@@ -4501,10 +5011,13 @@ var init_mcp = __esm({
     TOOLS = [
       {
         name: "orient",
-        description: 'Session bootstrap + project overview. Always pass session: "<unique-name>". Returns goals, open work, pending asks for you, project flags.',
+        description: 'Session bootstrap + project overview. Always pass session: "<unique-name>". When working in a provisioned git worktree, pass worktree: "<path>" so the board can see where your tree lives (BR#3204 collision visibility). Returns goals, open work, pending asks for you, project flags.',
         inputSchema: {
           type: "object",
-          properties: { session: { type: "string", description: "unique session name (per agent)" } }
+          properties: {
+            session: { type: "string", description: "unique session name (per agent)" },
+            worktree: { type: "string", description: "path of the git worktree this session works in (optional)" }
+          }
         }
       },
       {
@@ -4689,7 +5202,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "bef115b0e761a374ee5cf9872c482b8755d5e7ed", built_at: "2026-10-25T00:42:16Z" };
+    module.exports = { commit: "39b255f3edcd7bfe9fdaef4dcb4f4b14dcf0a269", built_at: "2026-10-25T10:53:10Z" };
   }
 });
 

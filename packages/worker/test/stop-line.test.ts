@@ -18,7 +18,11 @@ import {
  *    canned GitHub responses (function-form outboundService breaks workerd
  *    startup here — use a named worker + a /__scenario control fetch),
  *    asserting ONE time-sensitive ask per red episode, deduped per
- *    main-HEAD sha, and nothing filed on green.
+ *    main-HEAD sha, and nothing filed on green — plus (BR#3284) the
+ *    claimable half: ONE P0 episode task per red episode alongside the ask,
+ *    deduped per sha, superseding the prior open episode task on a new red
+ *    sha, body documenting the remediation-merge exception, boosted
+ *    (priority 0) for the board's ranked queue.
  */
 
 // ---------- tier 1: the decision rule (pure) ----------
@@ -121,6 +125,8 @@ describe("stopLineAskTitle (one ask per red episode)", () => {
 let mf: Miniflare;
 let ghServer: import("node:http").Server;
 let ghOrigin = "";
+let sinkId = ""; // the drill sink card (set in beforeAll)
+let firstEpisodeTaskId = ""; // the f-episode task, superseded by the 2-episode task
 
 function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
   const json = (res: import("node:http").ServerResponse, status: number, body: unknown) => {
@@ -143,8 +149,34 @@ function ghHandler(): (req: import("node:http").IncomingMessage, res: import("no
           { id: 902, name: "CLI build (packages/cli)", status: "completed", conclusion: "success", html_url: "https://example/green/CLI" },
         ];
       }
+      if (sha.startsWith("00")) {
+        return [
+          { id: 903, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/green/Test" },
+        ];
+      }
       return [];
     };
+    // episode-attribution walk (BR#3284): recent-commits list (newest first)
+    // + associated PRs, keyed by the same scenario encoding the /commits/main
+    // mapping uses — f: [f(RED), 1(green)] · 2: [2(RED), 0(green)] — so the
+    // f-episode's bisect names the head merge itself and the 2-episode's
+    // names its own landing PR.
+    if (/\/repos\/[^/]+\/[^/]+\/commits\?/.test(url)) {
+      const shas = url.includes("scenario=f") ? ["f", "1", "0"]
+        : url.includes("scenario=2") ? ["2", "0"]
+        : ["1", "0"];
+      return json(res, 200, shas.map((k) => ({ sha: k.repeat(40), parents: [] })));
+    }
+    const pulls = url.match(/\/repos\/[^/]+\/[^/]+\/commits\/([0-9a-f]{40})\/pulls/);
+    if (pulls) {
+      if (pulls[1].startsWith("ff")) {
+        return json(res, 200, [{ number: 178, title: "main-green gate + stopTheLineSweep (BR#3008)", html_url: "https://github.com/state-vector/bridge/pull/178", merged_at: "2026-10-24T16:12:03Z" }]);
+      }
+      if (pulls[1].startsWith("22")) {
+        return json(res, 200, [{ number: 191, title: "verify is the merge authority (BR#3221)", html_url: "https://github.com/state-vector/bridge/pull/191", merged_at: "2026-10-25T19:41:12Z" }]);
+      }
+      return json(res, 200, []);
+    }
     const m = url.match(/\/repos\/[^/]+\/[^/]+\/commits\/([0-9a-f]{40})\/check-runs/);
     if (m) return json(res, 200, { total_count: checkRuns(m[1]).length, check_runs: checkRuns(m[1]) });
     if (/\/repos\/[^/]+\/[^/]+\/commits\/main/.test(url)) {
@@ -200,6 +232,7 @@ beforeAll(async () => {
     tags: ["alarm"],
   });
   if (sink.body.error) throw new Error(`sink create failed: ${sink.body.error}`);
+  sinkId = sink.body.id;
   const set = await kbJson("/admin.settings_set", { settings: { stop_line_artefact_id: sink.body.id } });
   if (set.body.error) throw new Error(`settings_set failed: ${set.body.error}`);
 });
@@ -232,6 +265,14 @@ async function stopLineAsks(): Promise<any[]> {
   // questions are a TYPE in the ask contract (the legacy `question` tag is
   // stripped on write) — filter on type, not tags
   return (body?.artefacts ?? []).filter((a: any) => a.type === "question");
+}
+
+// the claimable half (BR#3284): open episode tasks, newest first
+async function stopLineEpisodeTasks(): Promise<any[]> {
+  const { body } = await kbJson("/list", { type: "task", limit: 200 });
+  return (body?.artefacts ?? []).filter((a: any) =>
+    a.title?.startsWith("STOP-THE-LINE: bridge main RED @ ")
+    && !["done", "superseded"].includes(a.status));
 }
 
 describe("stopTheLineSweep (real DO, canned GitHub)", () => {
@@ -275,5 +316,86 @@ describe("stopTheLineSweep (real DO, canned GitHub)", () => {
     const last = Number(JSON.parse(body?.settings?.stop_line_last_sweep_ts ?? "0"));
     expect(last).toBeGreaterThanOrEqual(before); // backoff stamped into the future
     expect((await stopLineAsks()).filter((a) => a.title.includes("333333333")).length).toBe(0);
+  });
+});
+
+// ---------- tier 2b: the episode task drill (BR#3284 — the claimable half) ----------
+// The ask is ATTENTION; the episode task is the WORK. Same drill, same stub —
+// the walk routes serve f: [f(RED), 1(green), 0(green)] · 2: [2(RED), 0(green)],
+// so the f-episode's bisect names the head merge (PR #178) and the 2-episode's
+// names its own landing PR (PR #191).
+describe("stopTheLineSweep episode tasks (real DO, canned GitHub — BR#3284)", () => {
+  // the rate-limit leg above stamped a +60m backoff at ~+3.0M ms; these
+  // sweeps start past it and keep climbing so every call passes the cadence.
+  it("red main files ONE P0 episode task alongside the ask — boosted, child of the sink, deduped per sha", async () => {
+    await setScenario("f");
+    const first = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 7_200_000 });
+    expect(first.body.error).toBeUndefined();
+    const open = await stopLineEpisodeTasks();
+    expect(open.length).toBe(1);
+    const t = open[0];
+    firstEpisodeTaskId = t.id;
+    expect(t.title).toBe("STOP-THE-LINE: bridge main RED @ fffffffff — fix main first");
+    expect(t.status).toBe("todo");
+    // tags: the spec's set (sanitizeTags lowercases — the chip renders "p0")
+    expect(t.tags).toEqual(expect.arrayContaining(["stop-the-line", "p0", "gtm-blocker", "role:impl"]));
+    // priority is structural: meta.boosted = priority 0 in the pickup
+    // ranking + first on the board's ranked queue (existing urgent handling)
+    expect(t.meta?.boosted).toBeTruthy();
+    expect(t.meta?.stop_line?.short_sha).toBe("fffffffff");
+    expect(t.meta?.stop_line?.sink_id).toBe(sinkId);
+    // child_of the sink (BR#3124) — the episode family under one anchor
+    const rels = (await kbJson("/relations", { id: t.id })).body?.relations ?? [];
+    expect(rels).toContainEqual(expect.objectContaining({ relation: "child_of", artefact_id: sinkId, dir: "out" }));
+    // body: red checks with run links, the remediation-merge exception
+    // (BR#3009/BR#3010), and the done-when
+    expect(t.body_md).toContain("Test (failure) — https://example/red/Test");
+    expect(t.body_md).toContain("green on the exact failing checks");
+    expect(t.body_md).toContain("BR#3010");
+    expect(t.body_md).toContain("ALL check-runs settled green (0 red, 0 unsettled)");
+    // bisect: parent 1… settles green → the head merge itself broke the line;
+    // the landing PR is named with its link
+    expect(t.meta?.stop_line?.first_failing_sha).toBe("f".repeat(40));
+    expect(t.body_md).toContain("**First failing sha:** fffffffff");
+    expect(t.body_md).toContain("pull/178");
+
+    // same red sha again (two sweeps, one episode): still exactly ONE live task
+    const second = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 7_800_000 });
+    expect(second.body.error).toBeUndefined();
+    expect((await stopLineEpisodeTasks()).length).toBe(1);
+  });
+
+  it("a NEW red sha supersedes the prior episode task — one live episode task at a time", async () => {
+    await setScenario("2");
+    const r = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 8_400_000 });
+    expect(r.body.error).toBeUndefined();
+    const live = await stopLineEpisodeTasks();
+    expect(live.length).toBe(1);
+    const t2 = live[0];
+    expect(t2.title).toBe("STOP-THE-LINE: bridge main RED @ 222222222 — fix main first");
+    // the f-episode task is superseded and points its readers at the replacement
+    const old = (await kbJson("/get", { id: firstEpisodeTaskId })).body;
+    expect(old.status).toBe("superseded");
+    expect(old.meta?.superseded_by).toBe(t2.id);
+    expect(String(old.meta?.superseded_reason)).toContain("one live episode task at a time");
+    const rels = (await kbJson("/relations", { id: t2.id })).body?.relations ?? [];
+    expect(rels).toContainEqual(expect.objectContaining({ relation: "supersedes", artefact_id: firstEpisodeTaskId, dir: "out" }));
+    // bisect: 0… settles green immediately → the NEW merge itself broke the
+    // line; its landing PR (#191) is named
+    expect(t2.meta?.stop_line?.first_failing_sha).toBe("2".repeat(40));
+    expect(t2.body_md).toContain("**First failing sha:** 222222222");
+    expect(t2.body_md).toContain("pull/191");
+    // the remediation exception + done-when ride on every episode task
+    expect(t2.body_md).toContain("green on the exact failing checks");
+    expect(t2.body_md).toContain("ALL check-runs settled green (0 red, 0 unsettled)");
+  });
+
+  it("green main files no episode task (the line is up — nothing to fix)", async () => {
+    await setScenario("1");
+    const r = await kbJson("/admin.stop_line_sweep", { now: Date.now() + 9_000_000 });
+    expect(r.body.error).toBeUndefined();
+    const live = await stopLineEpisodeTasks();
+    expect(live.length).toBe(1); // unchanged — only the 2-episode task
+    expect(live[0].title).toContain("222222222");
   });
 });
