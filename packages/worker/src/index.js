@@ -194,6 +194,7 @@ export default {
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
           : sub === "metrics/throughput" ? "https://kb/metrics.throughput"
+          : sub === "provenance" ? "https://kb/provenance"
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
