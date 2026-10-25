@@ -299,3 +299,93 @@ describe("gauge carry-forward in log_progress (merge semantics)", () => {
     expect(got.body.meta.last_progress.context_pct).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fleet-liveness layer (2026-10-25, Ray GO): proven-unblock releases,
+// ghost-bounce conversion, one-open-verify-child invariant.
+// ---------------------------------------------------------------------------
+describe("fleet-liveness: proven-unblock / ghost-bounce / verify invariant", () => {
+  it("(A) an unblock duty holding proof releases a PARKED blocked card — even owner-locked", async () => {
+    // park a card blocked, owned by a dead session
+    const { body: t } = await kbJson("/create", { type: "task", title: "parked card A", owner: "dead-session-agent", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "blocked", note: "blocked on the signing proxy", unblock_condition: "a git commit with commit.gpgsign=true completes SIGNED in a scratch repo", actor: "test-owner" });
+    // an unblock duty (role:unblock token actor) with proof releases it
+    const r = await kbJson("/transition", {
+      id: t.id, to: "todo",
+      note: "proxy proven: scratch-repo commit %G? = G (BR#3181 file-sign path)",
+      actor: "unblock-duty-1",
+    });
+    expect(r.status, `release should pass: ${JSON.stringify(r.body)}`).toBe(200);
+    const got = await kbJson("/get", { id: t.id });
+    expect(got.body.status).toBe("todo");
+    expect(got.body.owner ?? "").toBe(""); // released to the pool
+  });
+
+  it("(A-negative) an unblock duty CANNOT release a live in_progress claim — scope stays parked-only", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "live claim A-neg", owner: "live-worker-1", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", actor: "live-worker-1", note: "working" });
+    const r = await kbJson("/transition", {
+      id: t.id, to: "todo", note: "not my work, releasing", actor: "unblock-duty-2",
+    });
+    expect(r.status).toBe(400); // still gated — agents can't dump live claims
+    const got = await kbJson("/get", { id: t.id });
+    expect(got.body.status).toBe("in_progress");
+  });
+
+  it("(B) a verify bounce releases the parent when the owning session is dead", async () => {
+    // impl opens a PR-era task, goes in_review — owner session 'ghost-impl-1'
+    const { body: t } = await kbJson("/create", { type: "task", title: "ghost bounce B", owner: "ghost-impl-1", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", actor: "ghost-impl-1", note: "working", session: "ghost-impl-1-sess" });
+    await kbJson("/transition", { id: t.id, to: "in_review", actor: "ghost-impl-1", note: "PR https://github.com/state-vector/bridge/pull/999" });
+    // verify bounces it — the owner session is NOT in the sessions table (dead)
+    const r = await kbJson("/transition", {
+      id: t.id, to: "in_progress", actor: "verify-agent-1",
+      note: "bounce: PR conflicts with main — rebase and re-push",
+    });
+    expect(r.status, `bounce should pass: ${JSON.stringify(r.body)}`).toBe(200);
+    const got = await kbJson("/get", { id: t.id });
+    // debug: dump state + recent events for the failing assertion
+    expect(got.body.status).toBe("in_progress");
+    expect(got.body.owner ?? "").toBe(""); // ghost owner released — pool-ready
+    expect(got.body.meta.bounce_released?.reason).toContain("dead");
+  });
+
+  it("(B-negative) a bounce does NOT release when the owning session is ALIVE", async () => {
+    // a real session for the owner (alive last_seen_ts)
+    const { body: tok } = await kbJson("/admin.mint", { label: "alive-impl-1", principal: "alive-impl-1" });
+    const { body: t } = await kbJson("/create", { type: "task", title: "alive bounce B-neg", owner: "alive-impl-1", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", actor: "alive-impl-1", note: "working", session: "alive-impl-1-sess", token_id: tok.id });
+    await kbJson("/progress.log", { id: t.id, actor: "alive-impl-1", note: "working — heartbeat", completion_pct: 40 });
+    await kbJson("/transition", { id: t.id, to: "in_review", actor: "alive-impl-1", note: "PR https://github.com/state-vector/bridge/pull/998" });
+    const r = await kbJson("/transition", {
+      id: t.id, to: "in_progress", actor: "verify-agent-2",
+      note: "bounce: findings — line 42 wrong",
+    });
+    expect(r.status).toBe(200);
+    const got = await kbJson("/get", { id: t.id });
+    const evs = await (await kb("/events?since=0&limit=100", {})).text();
+    console.log("BNEGROW:", JSON.stringify(got.body.owner), JSON.stringify(got.body.meta.bounce_released ?? null));
+    const evs2 = await (await kb("/events?since=0&limit=100", {})).text();
+    for (const e of (JSON.parse(evs2).events ?? [])) {
+      if (e.op === "ghost_eval") console.log("GEVAL:", JSON.stringify(e.detail), "artefact:", e.artefact_id);
+    }
+    // raw sessions dump via a debug transition (the DO has no SQL endpoint —
+    // read the sessions through the board payload's sessions projection)
+    const board = await (await kb("/board", {})).json();
+    console.log("SESSIONS:", JSON.stringify(board.sessions ?? board.sessionsList ?? "none-in-board"));
+    expect(got.body.status).toBe("in_progress");
+    expect(got.body.owner).toBe("alive-impl-1"); // stays with the living owner
+  });
+
+  it("(C) linking a second open verify child supersedes the older one (one round, N bounces)", async () => {
+    const { body: parent } = await kbJson("/create", { type: "task", title: "parent C", qualified: true });
+    const { body: v1 } = await kbJson("/create", { type: "task", title: "Verify: parent C r1", roles: ["review"] });
+    await kbJson("/link", { src: v1.id, relation: "child_of", dst: parent.id });
+    const { body: v2 } = await kbJson("/create", { type: "task", title: "Verify: parent C r2", roles: ["review"] });
+    await kbJson("/link", { src: v2.id, relation: "child_of", dst: parent.id });
+    const got1 = await kbJson("/get", { id: v1.id });
+    expect(got1.body.status).toBe("superseded"); // older round superseded
+    const got2 = await kbJson("/get", { id: v2.id });
+    expect(got2.body.status).toBe("todo"); // newest stays open
+  });
+});
