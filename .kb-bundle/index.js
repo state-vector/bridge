@@ -794,15 +794,22 @@ function silentCycles(events) {
 function replayStatus(from, versions) {
   let expected = from;
   let anchored = false;
+  let breaks = 0;
+  let tailBreak = false;
   for (const v of versions) {
     if (v.action !== "transition") continue;
     const to = v.data?.to;
     if (typeof to !== "string") continue;
-    if (anchored && v.data?.from !== expected) return { status: expected, ok: false };
+    if (anchored && v.data?.from !== expected) {
+      breaks++;
+      tailBreak = true;
+    } else {
+      tailBreak = false;
+    }
     expected = to;
     anchored = true;
   }
-  return { status: expected, ok: true };
+  return { status: expected, ok: breaks === 0, breaks, tailBreak };
 }
 function breachClass(reason) {
   const r = reason.toLowerCase();
@@ -3627,12 +3634,12 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
             }
             case "escalate": {
               this.audit("system:churn-guard", "escalated", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, duty: tRoles[0] ?? "unknown" });
-              this.version(id, "system:churn-guard", "transition", `escalated to human \u2014 verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { from: row.status, to: verdict.status });
+              this.version(id, "system:churn-guard", "note", `escalated to human \u2014 verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
               break;
             }
             case "release_redirect": {
               this.audit("system:churn-guard", "release_redirected", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, from: row.status });
-              this.version(id, "system:churn-guard", "transition", `release redirected to blocked \u2014 ${fx.attempts} attempts without completion`, { from: row.status, to: "blocked" });
+              this.version(id, "system:churn-guard", "note", `release redirected to blocked \u2014 ${fx.attempts} attempts without completion`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
               break;
             }
           }
@@ -3970,13 +3977,15 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
           return { action: String(v.action), data: d };
         });
         const fold = replayStatus("", events);
-        if (!fold.ok || fold.status && fold.status !== row.status) {
-          this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
-          this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (chain ok: ${fold.ok}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_ok: fold.ok });
+        if (fold.status && fold.status !== row.status) {
+          this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
+          this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (${fold.breaks} chain break${fold.breaks === 1 ? "" : "s"}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
           try {
             await this.foldBreaches(id);
           } catch {
           }
+        } else if (fold.tailBreak) {
+          this.audit("system:replay", "chain_break", id, { breaks: fold.breaks });
         }
       }
       async getHistory(artefactId, limit = 100) {
@@ -4253,7 +4262,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
             now,
             id
           );
-          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { status: "done", answer: answer.slice(0, 200) });
+          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200) });
           let taskStatus2;
           const subject = this.one(
             `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -4585,7 +4594,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
               t.id
             );
             this.audit("system:reaper", "loop_escalated", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-            this.version(t.id, "system:reaper", "transition", `rework loop escalated to human \u2014 ${attempts} attempts without completion`, { prev_owner: ownerLabel });
+            this.version(t.id, "system:reaper", "note", `rework loop escalated to human \u2014 ${attempts} attempts without completion`, { prev_owner: ownerLabel, attempts });
             out.push(
               `${t.id} "${t.title}" REWORK LOOP (${attempts} attempts) \u2014 escalated to a human instead of re-releasing. Blocked-for-human until reviewed.`
             );
@@ -4602,7 +4611,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
             t.id
           );
           this.audit("system:reaper", "reassign", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-          this.version(t.id, "system:reaper", "transition", `reassigned \u2014 ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { prev_owner: ownerLabel });
+          this.version(t.id, "system:reaper", "transition", `reassigned \u2014 ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { from: "blocked", to: "todo", prev_owner: ownerLabel });
           out.push(
             mine ? `${t.id} "${t.title}" was REASSIGNED: you ${idleDesc}.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) \u2014 partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.` : `${t.id} "${t.title}" was REASSIGNED: ${ownerLabel} ${idleDesc} (attempt ${attempts}) \u2014 back to unclaimed todo for any agent to pick up.`
           );
@@ -5766,7 +5775,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "5e6f9329e0160fb4b2318cfbe4a2d1ccc0e309ab", built_at: "2026-10-25T13:05:50Z" };
+    module.exports = { commit: "5e6f9329e0160fb4b2318cfbe4a2d1ccc0e309ab", built_at: "2026-10-25T13:07:51Z" };
   }
 });
 
