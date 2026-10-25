@@ -725,6 +725,41 @@ export function stopLineAskTitle(sha: string, names: string[]): string {
   return prefix + namesText + suffix;
 }
 
+/** Deterministic TASK title for one red episode — the claimable P0 work item
+ *  the sweep files alongside the ask (BR#3284). The ask is the attention
+ *  channel; this task is the priority item an impl agent claims. The sha
+ *  makes the title unique per episode: the dedupe key ("already tasked") and
+ *  the discriminator for superseding the prior open episode task. */
+export function stopLineEpisodeTaskTitle(sha: string): string {
+  return `STOP-THE-LINE: bridge main RED @ ${sha.slice(0, 9)} — fix main first`;
+}
+
+/** The first failing sha of the current red run, from the ancestry trail the
+ *  sweep walks backwards from main's red tip (tip-first entries). The breaking
+ *  commit is the DEEPEST consecutive red entry — and only trusted when the
+ *  walk RESOLVED on evidence: a non-red ancestor bounded the run (green
+ *  boundary seen), or main's root was reached. A trail truncated by the depth
+ *  window or a fetch error proves nothing about where the run started. */
+export function findBreakingSha(
+  trail: Array<{ sha: string; verdict: string }>,
+  resolved: boolean,
+): string | null {
+  let lastRed: string | null = null;
+  for (const t of trail) {
+    if (t.verdict !== "red") break;
+    lastRed = t.sha;
+  }
+  return lastRed && resolved ? lastRed : null;
+}
+
+/** The merge receipt in a commit message, when the breaking sha is a merge
+ *  commit: "Merge pull request #403 from ..." → #403. Squash merges and bare
+ *  pushes carry no such receipt — the caller then cites the sha alone. */
+export function mergeReceiptOf(message: string): { pr: number } | null {
+  const m = /Merge pull request #(\d+)\b/.exec(message ?? "");
+  return m ? { pr: Number(m[1]) } : null;
+}
+
 // ---------- merge-queue sweep (BR#3198) ----------
 // The deterministic executor of the BR#3033 standing merge order ("merge when
 // green" — the run-side complement of BR#3008's stop-the-line gate). Pure

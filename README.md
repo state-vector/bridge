@@ -314,6 +314,16 @@ that law, and BR#3008 makes it mechanical instead of discipline. Two halves, sam
   `ALARM SINK` board card, so ten PRs seeing one red main produce one ask, not ten. A red
   main pages the board even when nobody opens a PR. `admin.stop_line_sweep` drills it on
   demand.
+- **The P0 episode task (BR#3284)**: the ask is attention; fixing main is work. The same
+  sweep also files ONE claimable `STOP-THE-LINE: bridge main RED @ <sha> — fix main first`
+  task per red episode (deduped per sha, superseding the prior episode's task — one live
+  episode task at a time): tags `stop-the-line`/`P0`/`gtm-blocker`/`role:impl`, boosted
+  (priority 0 — top of the board and first in pickup), child of the `ALARM SINK` card.
+  Its body carries the red checks with run links, the first failing sha (a bounded bisect
+  of main's recent merge receipts, citing the PR that broke main when the walk resolves),
+  the done-when (`main tip all check-runs settled green (0 red, 0 unsettled) + gate
+  reopened`), and the remediation-merge exception contract (BR#3009/BR#3010). Work on
+  branches continues (worktrees) — only the line stops.
 
 ## The standing merge-queue sweep
 

@@ -58,6 +58,9 @@ import {
   selfProvisionLabel,
   sanitizeTags,
   stopLineAskTitle,
+  stopLineEpisodeTaskTitle,
+  findBreakingSha,
+  mergeReceiptOf,
   classifyMainCheckRuns,
   classifyHeadChecks,
   decideMergeAction,
@@ -407,7 +410,10 @@ export class KnowledgeHub {
   // the gate (classifyMainCheckRuns), and on RED files ONE urgent ask per red
   // episode — deduped per main-HEAD sha via the deterministic ask title and
   // askCreate's identical-open-ask guard, so ten PRs observing one red sha
-  // produce one ask, not ten.
+  // produce one ask, not ten. BR#3284: it ALSO files ONE claimable P0
+  // episode task per red episode (fileEpisodeTask), deduped and superseded
+  // by the same per-sha discipline — the ask is the attention channel, the
+  // task is the priority work item.
   //
   // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
   // `stop_line_artefact_id` (ask sink; the standing card the asks bind to),
@@ -472,6 +478,7 @@ export class KnowledgeHub {
 
     const names = verdict.red.map((r) => r.name);
     const title = stopLineAskTitle(sha, names);
+    const taskTitle = stopLineEpisodeTaskTitle(sha);
     const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
     // explicit open-ask check (same rule askCreate enforces) — keeps the
     // audit trail honest about skips. Questions are a TYPE in the ask
@@ -484,33 +491,175 @@ export class KnowledgeHub {
          AND c.type = 'question' AND c.title = ? LIMIT 1`,
       sinkId, title.slice(0, 200),
     );
-    if (dup) {
+    // the TASK is the claimable priority item (BR#3284): ONE per red episode,
+    // deduped per main-HEAD sha via the deterministic episode title — the same
+    // per-sha discipline the ask uses. The ask is the attention channel; the
+    // task is what an impl agent claims.
+    const taskDup = this.one(
+      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'task' AND c.title = ? LIMIT 1`,
+      sinkId, taskTitle,
+    );
+    if (dup && taskDup) {
       this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
       return;
     }
-    const details = [
-      `**STOP THE LINE — bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+    // task leg first (the priority item): if only the ask exists (older
+    // episode, or a failed task leg last cycle) it is filed now, and vice
+    // versa — the two channels self-heal independently.
+    if (!taskDup) {
+      const created = await this.fileEpisodeTask(ghGet, sha, verdict, names, taskTitle, sinkId);
+      // one live episode task at a time: a new red sha supersedes the prior
+      // open episode task(s) — the old fix-window is history, not work.
+      // System retirement follows the purgeSmoke pattern (direct write +
+      // version + audit): the task lifecycle has no superseded hop by design,
+      // so a system sweep retiring its own filed rows never impersonates an
+      // agent transition. The `supersedes` relation keeps the trail linked.
+      const priors = this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.title AS title, c.status AS status FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+           AND c.type = 'task' AND c.title LIKE 'STOP-THE-LINE: bridge main RED @ %' AND c.title != ?`,
+        sinkId, taskTitle,
+      ).toArray() as any[];
+      for (const prior of priors) {
+        const ts = Date.now();
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status = 'superseded', status_ts = ?, updated_ts = ? WHERE id = ?`,
+          ts, ts, prior.id,
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+          created.id, prior.id, ts,
+        );
+        this.version(prior.id, "hub:stop-the-line", "transition", `superseded — main moved to a new red episode @ ${sha.slice(0, 9)}; one live episode task at a time (${taskTitle})`, { from: prior.status, to: "superseded" });
+        this.audit("hub:stop-the-line", "episode_superseded", prior.id, { sha: sha.slice(0, 9), prior: prior.title, replacement: created.id });
+      }
+      this.audit("hub:stop-the-line", "episode_task", created.id, { sha: sha.slice(0, 9), red: names, breaking: created.breaking?.slice(0, 9) ?? null });
+    }
+    if (!dup) {
+      const details = [
+        `**STOP THE LINE — bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+        ``,
+        `**Red checks on main ${sha.slice(0, 9)}:**`,
+        ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
+        ``,
+        `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+        ``,
+        `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha — not per PR. The claimable P0 episode task is filed alongside this ask (BR#3284)._`,
+      ].join("\n");
+      const created = await this.askCreate(
+        {
+          to: "rayh",
+          urgency: "time-sensitive",
+          question: title,
+          details,
+          reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+          options: ["Acknowledge — on it", "Line stays stopped until green"],
+          artefact_id: sinkId,
+        },
+        "hub:stop-the-line",
+      );
+      this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+    }
+  }
+
+  /** The claimable half of a red-main episode (BR#3284): ONE P0 task per red
+   *  episode, child_of the sink, tags stop-the-line/P0/gtm-blocker/role:impl,
+   *  boosted (priority 0 — TopView top + pool pickup priority, the existing
+   *  boost() semantics). The body carries the red checks + run links, the
+   *  first failing sha (a bounded bisect of main's first-parent ancestry: walk
+   *  back until a non-red ancestor bounds the run, citing the merge receipt PR
+   *  when the breaking commit is a merge), the done-when, and the
+   *  remediation-merge exception contract (accepted BR#3009, precedent
+   *  BR#3010). Error-tolerant: an ancestor fetch failure yields a partial
+   *  trail and "not isolated" — never a throw, never a wrong first-failing
+   *  claim. */
+  private async fileEpisodeTask(
+    ghGet: (path: string) => Promise<Response>,
+    sha: string,
+    verdict: { red: Array<{ name: string; conclusion: string; url: string }> },
+    names: string[],
+    taskTitle: string,
+    sinkId: string,
+  ): Promise<{ id: string; breaking: string | null }> {
+    const messages = new Map<string, string>();
+    const trail: Array<{ sha: string; verdict: string }> = [{ sha, verdict: "red" }]; // the tip: classified red by the caller
+    let rootReached = false;
+    let greenBoundary = false;
+    let cursor = sha;
+    for (let step = 0; step < 8; step++) {
+      let parent = "";
+      let message = "";
+      try {
+        const commit: any = await (await ghGet(`/commits/${cursor}`)).json();
+        parent = String(commit?.parents?.[0]?.sha ?? "");
+        message = String(commit?.commit?.message ?? "");
+      } catch { break; } // partial trail — cite what we have, never fake a bisect
+      messages.set(cursor, message);
+      if (!parent) { rootReached = true; break; }
+      let runs: any;
+      try {
+        runs = await (await ghGet(`/commits/${parent}/check-runs?per_page=100`)).json();
+      } catch { break; }
+      const v = classifyMainCheckRuns(Array.isArray(runs?.check_runs) ? runs.check_runs : []);
+      trail.push({ sha: parent, verdict: v.verdict });
+      if (v.verdict !== "red") {
+        // only a GREEN ancestor bounds the red run — an unsettled/empty
+        // ancestor says nothing about where the red started
+        greenBoundary = v.verdict === "green";
+        break;
+      }
+      cursor = parent;
+    }
+    const resolved = greenBoundary || rootReached;
+    const breaking = findBreakingSha(trail, resolved);
+    const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
+    const short = sha.slice(0, 9);
+    let bisectLine: string;
+    if (breaking) {
+      const receipt = mergeReceiptOf(messages.get(breaking) ?? "");
+      const prLink = receipt ? ` — https://github.com/${repo}/pull/${receipt.pr} (#${receipt.pr})` : " (no merge receipt in the commit message — bare push or squash merge)";
+      bisectLine = `**First failing sha (bisect of main's recent merge receipts):** \`${breaking.slice(0, 9)}\`${prLink}`;
+    } else {
+      const deepest = trail[trail.length - 1]?.sha ?? sha;
+      bisectLine = `**First failing sha:** not isolated — the red run runs deeper than the 8-commit bisect window (deepest red examined: \`${deepest.slice(0, 9)}\`)`;
+    }
+    const body = [
+      `**STOP-THE-LINE — bridge main is RED @ ${short}.** This task is the claimable P0 work for this red episode (Ray, 2026-10-25: fixing main is the top priority); the paired urgent ask under ${sinkId} is the attention channel. The \`main-green gate\` required check has every PR merge mechanically halted until main is green.`,
       ``,
-      `**Red checks on main ${sha.slice(0, 9)}:**`,
+      `**Red checks on main ${short}:**`,
       ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
       ``,
-      `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+      bisectLine,
       ``,
-      `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha — not per PR._`,
+      `**Done when:** main tip all check-runs settled green (0 red, 0 unsettled) + gate reopened.`,
+      ``,
+      `**The one exception — the remediation merge (accepted BR#3009, precedent BR#3010):** a PR green on the exact failing checks may merge as the remediation while the line is stopped (receipted by the \`main-green gate\` carve-out; the alert/ask stands until the merge commit's checks come back green). Work on branches continues (worktrees) — only the line stops.`,
+      ``,
+      `_Filed once per red episode by the hub sweep (BR#3284), deduped per main-HEAD sha; a new red sha supersedes this task — one live episode task at a time._`,
     ].join("\n");
-    const created = await this.askCreate(
+    const created = await this.create(
       {
-        to: "rayh",
-        urgency: "time-sensitive",
-        question: title,
-        details,
-        reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
-        options: ["Acknowledge — on it", "Line stays stopped until green"],
-        artefact_id: sinkId,
+        type: "task",
+        title: taskTitle,
+        body_md: body,
+        tags: ["stop-the-line", "P0", "gtm-blocker", "role:impl"],
+        roles: ["impl"],
+        meta: {
+          // the existing priority-0 handling: TopView renders boosted first,
+          // the pickup ranking treats boosted as priority 0 (boost())
+          boosted: Date.now(),
+          stop_line: { sha, red: names, breaking_sha: breaking ?? undefined },
+        },
       },
       "hub:stop-the-line",
     );
-    this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+      created.id, sinkId, Date.now(),
+    );
+    return { id: created.id, breaking };
   }
 
   // ---------- standing merge-queue sweep (BR#3198) ----------

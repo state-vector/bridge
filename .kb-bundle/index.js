@@ -357,7 +357,87 @@ function stopLineAskTitle(sha, names) {
   if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
   return prefix + namesText + suffix;
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS;
+function stopLineEpisodeTaskTitle(sha) {
+  return `STOP-THE-LINE: bridge main RED @ ${sha.slice(0, 9)} \u2014 fix main first`;
+}
+function findBreakingSha(trail, resolved) {
+  let lastRed = null;
+  for (const t of trail) {
+    if (t.verdict !== "red") break;
+    lastRed = t.sha;
+  }
+  return lastRed && resolved ? lastRed : null;
+}
+function mergeReceiptOf(message2) {
+  const m = /Merge pull request #(\d+)\b/.exec(message2 ?? "");
+  return m ? { pr: Number(m[1]) } : null;
+}
+function isExemptCheckName(name) {
+  const n = name.toLowerCase();
+  return MERGE_EXEMPT_CHECK_PATTERNS.some((p) => n.includes(p));
+}
+function classifyHeadChecks(runs) {
+  const red = [];
+  const unsettled = [];
+  const external = [];
+  let green = 0;
+  for (const r of runs) {
+    if (r.conclusion == null) {
+      if (isExemptCheckName(r.name ?? "")) continue;
+      unsettled.push(r.name ?? "");
+      continue;
+    }
+    if (isExemptCheckName(r.name ?? "")) {
+      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    else unsettled.push(r.name ?? "");
+  }
+  if (red.length) return { verdict: "red", red, unsettled, external, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
+  return { verdict: "green", red, unsettled, external, green };
+}
+function decideMergeAction(i) {
+  if (i.cardStatus === "superseded")
+    return { kind: "close_superseded", reason: "linked card is superseded \u2014 closing PR without review" };
+  if (i.cardStatus === "done")
+    return { kind: "skip", reason: "linked card already done \u2014 nothing to merge under it" };
+  const short = i.headSha.slice(0, 9);
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability \u2014 not yet, skip this tick" };
+    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable \u2014 CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue` };
+  }
+  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} \u2014 not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter` };
+  const unverified = i.commits.filter((c) => !c.verified);
+  if (unverified.length)
+    return { kind: "human_leg", reason: `PR #${i.prNumber} has ${unverified.length} commit(s) not GitHub-verified \u2014 signing-environment class, never per-PR` };
+  if (i.baseVerdict !== "green")
+    return { kind: "skip", reason: `base main ${i.baseVerdict === "red" ? "RED" : "not green"} \u2014 the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert` };
+  const head = classifyHeadChecks(i.headChecks);
+  if (head.verdict === "red") {
+    const names = head.red.map((r) => r.name).join(", ");
+    return i.cardStatus === "in_review" ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl` } : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} \u2014 card not in_review, no bounce; the linked session owns it` };
+  }
+  if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) \u2014 not yet, skip this tick` };
+  if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
+    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict \u2014 re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)` };
+  if (!i.verifyAcceptedOnHead)
+    return { kind: "skip", reason: `no accepted verify verdict covering head ${short} \u2014 the verify pool owns the verdict; the sweep merges only verified PRs` };
+  return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} \u2014 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
+}
+function mergeSweepHumanLegTitle(repo, reasons) {
+  const prefix = `Merge sweep human legs on ${repo}: `;
+  const suffix = ` \u2014 fix the class?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text2 = reasons.join("; ");
+  if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + text2 + suffix;
+}
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -432,11 +512,11 @@ var init_core = __esm({
     DEFAULT_PROJECT = "Superpositional";
     __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
-1. MERGE SWEEP (standing order BR#3033): bounded to AT MOST 3 PRs per tick \u2014 then move on to tasks; an unbounded sweep starves the queue. Drain open PRs oldest first (dependency order): require (a) base main green, (b) PR checks green \u2014 external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four \u2192 merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress WITH gauges (completion/confidence/risk/context \u2014 a stats-less row hides on the board). Any failed leg \u2192 DO NOT merge: conflicts \u2192 mechanical rebase + re-push (it re-enters the order next tick); red substance checks \u2192 bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551).
+1. REBASE LEG (standing order BR#3033): the hub's deterministic merge-queue sweep (BR#3198) drains mergeable PRs every tick automatically \u2014 do NOT duplicate its merges or its bounces. Your role is the repair leg: a card bounced by the sweep (note: "unmergeable \u2014 CONFLICTING", "mergeStateStatus=...", or "head moved past the accepted verify verdict") is yours to claim: rebase onto current main, resolve conflicts mechanically (substance-preserving), re-sign as detached-cody per BR#3181, re-push with --force-with-lease \u2014 it re-enters the sweep next tick. A red substance check bounce means the implementation is wrong: claim, fix, re-enter.
 2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
 3. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat) WITH gauges (completion_pct/confidence_pct/risk_pct/context_pct \u2014 rows without gauges show no stats and the board can't prioritise them), then resume the oldest one.
 4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-5. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note \u2014 and the PR itself must be MERGEABLE: rebase onto main before every in_review, keep checks green. A conflicting PR is YOUR defect, not the reviewer's \u2014 verify bounces it straight back). Blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
 6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
@@ -478,6 +558,21 @@ var init_core = __esm({
     ]);
     __name(classifyMainCheckRuns, "classifyMainCheckRuns");
     __name(stopLineAskTitle, "stopLineAskTitle");
+    __name(stopLineEpisodeTaskTitle, "stopLineEpisodeTaskTitle");
+    __name(findBreakingSha, "findBreakingSha");
+    __name(mergeReceiptOf, "mergeReceiptOf");
+    MERGE_EXEMPT_CHECK_PATTERNS = [
+      "workers builds",
+      "workers-builds",
+      "cloudflare pages",
+      "cloudflare workers",
+      "deploy preview",
+      "codeql"
+    ];
+    __name(isExemptCheckName, "isExemptCheckName");
+    __name(classifyHeadChecks, "classifyHeadChecks");
+    __name(decideMergeAction, "decideMergeAction");
+    __name(mergeSweepHumanLegTitle, "mergeSweepHumanLegTitle");
   }
 });
 
@@ -977,6 +1072,14 @@ var init_do = __esm({
           });
         }
         try {
+          await this.mergeQueueSweep(now);
+        } catch (e) {
+          try {
+            this.audit("system:merge-sweep", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
+        try {
           await this.stopTheLineSweep(now);
         } catch (e) {
           try {
@@ -1019,7 +1122,10 @@ var init_do = __esm({
       // the gate (classifyMainCheckRuns), and on RED files ONE urgent ask per red
       // episode — deduped per main-HEAD sha via the deterministic ask title and
       // askCreate's identical-open-ask guard, so ten PRs observing one red sha
-      // produce one ask, not ten.
+      // produce one ask, not ten. BR#3284: it ALSO files ONE claimable P0
+      // episode task per red episode (fileEpisodeTask), deduped and superseded
+      // by the same per-sha discipline — the ask is the attention channel, the
+      // task is the priority work item.
       //
       // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
       // `stop_line_artefact_id` (ask sink; the standing card the asks bind to),
@@ -1070,6 +1176,7 @@ var init_do = __esm({
         }
         const names = verdict.red.map((r) => r.name);
         const title = stopLineAskTitle(sha, names);
+        const taskTitle = stopLineEpisodeTaskTitle(sha);
         const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
         const dup = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
@@ -1078,33 +1185,410 @@ var init_do = __esm({
           sinkId,
           title.slice(0, 200)
         );
-        if (dup) {
+        const taskDup = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'task' AND c.title = ? LIMIT 1`,
+          sinkId,
+          taskTitle
+        );
+        if (dup && taskDup) {
           this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
           return;
         }
-        const details = [
-          `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+        if (!taskDup) {
+          const created = await this.fileEpisodeTask(ghGet, sha, verdict, names, taskTitle, sinkId);
+          const priors = this.state.storage.sql.exec(
+            `SELECT c.id AS id, c.title AS title, c.status AS status FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+           AND c.type = 'task' AND c.title LIKE 'STOP-THE-LINE: bridge main RED @ %' AND c.title != ?`,
+            sinkId,
+            taskTitle
+          ).toArray();
+          for (const prior of priors) {
+            const ts = Date.now();
+            this.state.storage.sql.exec(
+              `UPDATE artefacts SET status = 'superseded', status_ts = ?, updated_ts = ? WHERE id = ?`,
+              ts,
+              ts,
+              prior.id
+            );
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+              created.id,
+              prior.id,
+              ts
+            );
+            this.version(prior.id, "hub:stop-the-line", "transition", `superseded \u2014 main moved to a new red episode @ ${sha.slice(0, 9)}; one live episode task at a time (${taskTitle})`, { from: prior.status, to: "superseded" });
+            this.audit("hub:stop-the-line", "episode_superseded", prior.id, { sha: sha.slice(0, 9), prior: prior.title, replacement: created.id });
+          }
+          this.audit("hub:stop-the-line", "episode_task", created.id, { sha: sha.slice(0, 9), red: names, breaking: created.breaking?.slice(0, 9) ?? null });
+        }
+        if (!dup) {
+          const details = [
+            `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+            ``,
+            `**Red checks on main ${sha.slice(0, 9)}:**`,
+            ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+            ``,
+            `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+            ``,
+            `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR. The claimable P0 episode task is filed alongside this ask (BR#3284)._`
+          ].join("\n");
+          const created = await this.askCreate(
+            {
+              to: "rayh",
+              urgency: "time-sensitive",
+              question: title,
+              details,
+              reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+              options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
+              artefact_id: sinkId
+            },
+            "hub:stop-the-line"
+          );
+          this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+        }
+      }
+      /** The claimable half of a red-main episode (BR#3284): ONE P0 task per red
+       *  episode, child_of the sink, tags stop-the-line/P0/gtm-blocker/role:impl,
+       *  boosted (priority 0 — TopView top + pool pickup priority, the existing
+       *  boost() semantics). The body carries the red checks + run links, the
+       *  first failing sha (a bounded bisect of main's first-parent ancestry: walk
+       *  back until a non-red ancestor bounds the run, citing the merge receipt PR
+       *  when the breaking commit is a merge), the done-when, and the
+       *  remediation-merge exception contract (accepted BR#3009, precedent
+       *  BR#3010). Error-tolerant: an ancestor fetch failure yields a partial
+       *  trail and "not isolated" — never a throw, never a wrong first-failing
+       *  claim. */
+      async fileEpisodeTask(ghGet, sha, verdict, names, taskTitle, sinkId) {
+        const messages = /* @__PURE__ */ new Map();
+        const trail = [{ sha, verdict: "red" }];
+        let rootReached = false;
+        let greenBoundary = false;
+        let cursor = sha;
+        for (let step = 0; step < 8; step++) {
+          let parent = "";
+          let message2 = "";
+          try {
+            const commit = await (await ghGet(`/commits/${cursor}`)).json();
+            parent = String(commit?.parents?.[0]?.sha ?? "");
+            message2 = String(commit?.commit?.message ?? "");
+          } catch {
+            break;
+          }
+          messages.set(cursor, message2);
+          if (!parent) {
+            rootReached = true;
+            break;
+          }
+          let runs;
+          try {
+            runs = await (await ghGet(`/commits/${parent}/check-runs?per_page=100`)).json();
+          } catch {
+            break;
+          }
+          const v = classifyMainCheckRuns(Array.isArray(runs?.check_runs) ? runs.check_runs : []);
+          trail.push({ sha: parent, verdict: v.verdict });
+          if (v.verdict !== "red") {
+            greenBoundary = v.verdict === "green";
+            break;
+          }
+          cursor = parent;
+        }
+        const resolved = greenBoundary || rootReached;
+        const breaking = findBreakingSha(trail, resolved);
+        const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
+        const short = sha.slice(0, 9);
+        let bisectLine;
+        if (breaking) {
+          const receipt = mergeReceiptOf(messages.get(breaking) ?? "");
+          const prLink = receipt ? ` \u2014 https://github.com/${repo}/pull/${receipt.pr} (#${receipt.pr})` : " (no merge receipt in the commit message \u2014 bare push or squash merge)";
+          bisectLine = `**First failing sha (bisect of main's recent merge receipts):** \`${breaking.slice(0, 9)}\`${prLink}`;
+        } else {
+          const deepest = trail[trail.length - 1]?.sha ?? sha;
+          bisectLine = `**First failing sha:** not isolated \u2014 the red run runs deeper than the 8-commit bisect window (deepest red examined: \`${deepest.slice(0, 9)}\`)`;
+        }
+        const body = [
+          `**STOP-THE-LINE \u2014 bridge main is RED @ ${short}.** This task is the claimable P0 work for this red episode (Ray, 2026-10-25: fixing main is the top priority); the paired urgent ask under ${sinkId} is the attention channel. The \`main-green gate\` required check has every PR merge mechanically halted until main is green.`,
           ``,
-          `**Red checks on main ${sha.slice(0, 9)}:**`,
+          `**Red checks on main ${short}:**`,
           ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
           ``,
-          `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+          bisectLine,
           ``,
-          `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR._`
+          `**Done when:** main tip all check-runs settled green (0 red, 0 unsettled) + gate reopened.`,
+          ``,
+          `**The one exception \u2014 the remediation merge (accepted BR#3009, precedent BR#3010):** a PR green on the exact failing checks may merge as the remediation while the line is stopped (receipted by the \`main-green gate\` carve-out; the alert/ask stands until the merge commit's checks come back green). Work on branches continues (worktrees) \u2014 only the line stops.`,
+          ``,
+          `_Filed once per red episode by the hub sweep (BR#3284), deduped per main-HEAD sha; a new red sha supersedes this task \u2014 one live episode task at a time._`
         ].join("\n");
-        const created = await this.askCreate(
+        const created = await this.create(
           {
-            to: "rayh",
-            urgency: "time-sensitive",
-            question: title,
-            details,
-            reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
-            options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
-            artefact_id: sinkId
+            type: "task",
+            title: taskTitle,
+            body_md: body,
+            tags: ["stop-the-line", "P0", "gtm-blocker", "role:impl"],
+            roles: ["impl"],
+            meta: {
+              // the existing priority-0 handling: TopView renders boosted first,
+              // the pickup ranking treats boosted as priority 0 (boost())
+              boosted: Date.now(),
+              stop_line: { sha, red: names, breaking_sha: breaking ?? void 0 }
+            }
           },
           "hub:stop-the-line"
         );
-        this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          sinkId,
+          Date.now()
+        );
+        return { id: created.id, breaking };
+      }
+      // ---------- standing merge-queue sweep (BR#3198) ----------
+      // The deterministic executor of the BR#3033 standing merge order ("merge
+      // when green") — the run-side complement of BR#3008's stop-the-line gate.
+      // Every tick (paced by `merge_sweep_minutes`, default 15, 0 = off), for each
+      // OPEN PR on both repos, oldest first:
+      //   superseded-check → 5c mechanical gate (mergeable + clean + every commit
+      //   GitHub-verified + base green + head checks green) + an ACCEPTED
+      //   verify-verdict decision covering the current head → merge (squash per
+      //   repo norm). Mechanical defects auto-bounce the linked card with the
+      //   exact defect; human-leg defects (externals, signing environment) are
+      //   collected into ONE class ask per repo per episode, never one per PR.
+      //
+      // Identity: merges as the token's identity — deploy GH_TOKEN as the
+      // detached-cody credential per BR#3181, never rayh's personal credentials.
+      // Settings: `merge_sweep_minutes` (default 15), `merge_sweep_repos` (JSON
+      // array, default both repos), `merge_sweep_methods` (JSON map repo →
+      // "merge" | "squash", default bridge=merge / superpositional=squash),
+      // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
+      // `merge_sweep_gh_api_base` (drills/tests only).
+      async mergeQueueSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const token = this.env.GH_TOKEN;
+        if (!token) {
+          this.audit("hub:merge-sweep", "no_identity", null, { note: "GH_TOKEN not configured \u2014 the sweep cannot merge as detached-cody (BR#3181); skipping, never merging unauthenticated" });
+          return;
+        }
+        const base = this.settingValue("merge_sweep_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        let repos = [];
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+          if (Array.isArray(parsed)) repos = parsed.map(String);
+        } catch {
+          repos = [];
+        }
+        if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+        let methods = {};
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_methods", JSON.stringify({ "state-vector/bridge": "merge", "state-vector/superpositional": "squash" })));
+          if (parsed && typeof parsed === "object") methods = parsed;
+        } catch {
+          methods = {};
+        }
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}${path}`, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "user-agent": "bridge-merge-sweep (BR#3198)",
+              "x-github-api-version": "2022-11-28"
+            }
+          });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res.json();
+        }, "ghGet");
+        const cardRef = /* @__PURE__ */ __name((text2) => {
+          const m = /BR#(\d+)/.exec(text2 ?? "");
+          return m ? `BR#${m[1]}` : null;
+        }, "cardRef");
+        const sweepNote = /* @__PURE__ */ __name((id, note) => {
+          const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+          if (!row) return;
+          const meta = JSON.parse(row.meta ?? "{}");
+          meta.last_progress = { note: note.slice(0, 500), sentiment: "neutral", actor: "system:merge-sweep", ts: Date.now() };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), id);
+          this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
+          this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
+        }, "sweepNote");
+        const results = [];
+        for (const repo of repos) {
+          const humanLegs = [];
+          try {
+            const pulls = await ghGet(`/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`);
+            const head = await ghGet(`/repos/${repo}/commits/main`);
+            const baseSha = String(head?.sha ?? "");
+            let baseVerdict = "empty";
+            if (/^[0-9a-f]{40}$/.test(baseSha)) {
+              const runsBody = await ghGet(`/repos/${repo}/commits/${baseSha}/check-runs?per_page=100`);
+              baseVerdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []).verdict;
+            }
+            for (const pr of pulls) {
+              const prNumber = pr.number;
+              try {
+                const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
+                const linked = cardRef(`${pr.title ?? ""}
+${pr.body ?? ""}
+${detail.title ?? ""}
+${detail.body ?? ""}`);
+                const card = linked ? this.one(`SELECT id, status FROM artefacts WHERE id = ?`, linked) : null;
+                const cardStatus = card ? String(card.status) : null;
+                let verifyAcceptedAny = false;
+                let verifyAcceptedOnHead = false;
+                const headSha = String(detail?.head?.sha ?? "");
+                if (linked && /^[0-9a-f]{40}$/.test(headSha)) {
+                  const decisions = this.state.storage.sql.exec(
+                    `SELECT d.body_md AS body_md, d.meta AS meta FROM relations r
+                 JOIN artefacts d ON d.id = r.src_id
+                 WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+                    linked
+                  ).toArray();
+                  verifyAcceptedAny = decisions.length > 0;
+                  verifyAcceptedOnHead = decisions.some(
+                    (d) => (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9))
+                  );
+                }
+                const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
+                const commits = (commitsBody ?? []).map((c) => ({ sha: String(c?.sha ?? ""), verified: c?.commit?.verification?.verified === true }));
+                const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
+                const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
+                const action = decideMergeAction({
+                  prNumber,
+                  prTitle: String(detail?.title ?? pr.title ?? ""),
+                  headSha,
+                  baseVerdict,
+                  mergeable: detail?.mergeable ?? null,
+                  mergeStateStatus: detail?.merge_state_status ?? null,
+                  commits,
+                  headChecks,
+                  cardStatus,
+                  verifyAcceptedAny,
+                  verifyAcceptedOnHead
+                });
+                if (action.kind === "merge") {
+                  const method = methods[repo] === "squash" ? "squash" : "merge";
+                  const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
+                    method: "PUT",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ merge_method: method })
+                  });
+                  if (mergeRes.ok) {
+                    const merged = await mergeRes.json().catch(() => ({}));
+                    const receipt = `${action.receipt} \u2014 mergeCommit ${String(merged?.sha ?? "unknown").slice(0, 9)}`;
+                    if (linked) sweepNote(linked, receipt);
+                    results.push({ repo, pr: prNumber, kind: "merge", sha: String(merged?.sha ?? "").slice(0, 9) });
+                    this.audit("system:merge-sweep", "merge", linked, { repo, pr: prNumber, method, receipt: receipt.slice(0, 300) });
+                  } else if (mergeRes.status === 405 || mergeRes.status === 409) {
+                    const defect = `PR #${prNumber} merge refused by GitHub (HTTP ${mergeRes.status}) \u2014 no longer mergeable/clean. Rebase, resolve, re-push, re-enter the queue`;
+                    if (linked && cardStatus === "in_review") await this.transition({ id: linked, to: "in_progress", note: defect }, "system:merge-sweep");
+                    else if (linked) sweepNote(linked, defect);
+                    results.push({ repo, pr: prNumber, kind: "bounce", defect });
+                  } else {
+                    throw new Error(`merge PUT -> HTTP ${mergeRes.status}`);
+                  }
+                } else if (action.kind === "close_superseded") {
+                  const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+                    method: "PATCH",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ state: "closed", state_reason: "not_planned" })
+                  });
+                  if (close.ok) {
+                    if (linked) sweepNote(linked, `${action.reason} \u2014 PR #${prNumber} closed by the merge sweep (superseded-check first)`);
+                    results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                    this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber });
+                  } else throw new Error(`close PATCH -> HTTP ${close.status}`);
+                } else if (action.kind === "bounce") {
+                  if (linked && cardStatus === "in_review") {
+                    await this.transition({ id: linked, to: "in_progress", note: action.defect }, "system:merge-sweep");
+                  } else if (linked) {
+                    sweepNote(linked, action.defect);
+                  }
+                  results.push({ repo, pr: prNumber, kind: "bounce", defect: action.defect });
+                  this.audit("system:merge-sweep", "bounce", linked, { repo, pr: prNumber, defect: action.defect.slice(0, 300) });
+                } else if (action.kind === "note") {
+                  if (linked) sweepNote(linked, action.reason);
+                  results.push({ repo, pr: prNumber, kind: "note" });
+                } else if (action.kind === "human_leg") {
+                  humanLegs.push(action.reason);
+                  results.push({ repo, pr: prNumber, kind: "human_leg" });
+                } else {
+                  this.audit("system:merge-sweep", "skip", linked, { repo, pr: prNumber, reason: action.reason.slice(0, 300) });
+                  results.push({ repo, pr: prNumber, kind: "skip", reason: action.reason.slice(0, 120) });
+                }
+              } catch (e) {
+                this.audit("system:merge-sweep", "pr_error", null, { repo, pr: prNumber, error: String(e.message ?? e).slice(0, 300) });
+                results.push({ repo, pr: prNumber, kind: "pr_error", error: String(e.message ?? e).slice(0, 120) });
+              }
+            }
+            if (humanLegs.length) {
+              const sinkId = this.settingValue("merge_sweep_artefact_id", "BR#3198");
+              const title = mergeSweepHumanLegTitle(repo, humanLegs);
+              const dup = this.one(
+                `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.type = 'question' AND c.title = ? LIMIT 1`,
+                sinkId,
+                title.slice(0, 200)
+              );
+              if (dup) {
+                this.audit("system:merge-sweep", "human_leg_dupe", String(dup.id), { repo, legs: humanLegs.slice(0, 5) });
+              } else {
+                const created = await this.askCreate(
+                  {
+                    to: "rayh",
+                    urgency: "normal",
+                    question: title,
+                    details: [
+                      `**Human-leg merge blockers (BR#3198 class ask \u2014 one ask per class, never per PR).**`,
+                      ``,
+                      ...humanLegs.map((r) => `- ${r}`),
+                      ``,
+                      `_These are the only defects the standing merge sweep (BR#3198) cannot resolve autonomously. Everything mechanical was bounced with the exact defect on the linked card._`
+                    ].join("\n"),
+                    reason: "merge sweep collected human-leg defects into the single class ask per rule 5c",
+                    options: ["Acknowledge \u2014 on it", "Redirect the class"],
+                    artefact_id: sinkId
+                  },
+                  "system:merge-sweep"
+                );
+                this.audit("system:merge-sweep", "human_leg_ask", String(created.id), { repo, legs: humanLegs.slice(0, 5) });
+                results.push({ repo, pr: null, kind: "human_leg_ask", ask: created.id });
+              }
+            }
+          } catch (e) {
+            this.audit("system:merge-sweep", "repo_error", null, { repo, error: String(e.message ?? e).slice(0, 300) });
+            results.push({ repo, pr: null, kind: "repo_error", error: String(e.message ?? e).slice(0, 120) });
+          }
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
+          JSON.stringify({ ts: now, merged: results.filter((r) => r.kind === "merge").length, bounced: results.filter((r) => r.kind === "bounce").length, closed: results.filter((r) => r.kind === "close_superseded").length, human_legs: results.filter((r) => r.kind === "human_leg").length, skipped: results.filter((r) => r.kind === "skip").length, results: results.slice(0, 50) })
+        );
+        const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "human_leg_ask"].includes(r.kind));
+        if (summary.length)
+          this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
       }
       async eventsSince(since, limit) {
         const rows = since > 0 ? this.state.storage.sql.exec(
@@ -1162,7 +1646,7 @@ var init_do = __esm({
           }
         }
         const sessions = this.state.storage.sql.exec(
-          `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
+          `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`
         ).toArray();
         const openAskChildren = this.state.storage.sql.exec(
@@ -1412,7 +1896,9 @@ var init_do = __esm({
           `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
           `ALTER TABLE pairings ADD COLUMN principal TEXT`,
           `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
-          `ALTER TABLE sessions ADD COLUMN kind TEXT`
+          `ALTER TABLE sessions ADD COLUMN kind TEXT`,
+          `ALTER TABLE sessions ADD COLUMN worktree TEXT`
+          // BR#3204: where the session's tree lives — board collision visibility
         ]) {
           try {
             this.state.storage.sql.exec(ddl);
@@ -1784,6 +2270,7 @@ var init_do = __esm({
             case "admin.settings_get":
             case "admin.settings_set":
             case "admin.stop_line_sweep":
+            case "admin.merge_queue_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -1794,6 +2281,11 @@ var init_do = __esm({
                 await this.stopTheLineSweep(Number(body.now ?? Date.now()));
                 const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
                 return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
+              if (op === "admin.merge_queue_sweep") {
+                await this.mergeQueueSweep(Number(body.now ?? Date.now()));
+                const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
+                return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
               }
               return this.json(await this.settingsSet(body));
             default:
@@ -2555,6 +3047,8 @@ ${bodyMd.trim()}`.trim();
                   title: `Verify: ${rootTitle.slice(0, 200)}`,
                   body_md: `Verification duty for ${id} \u2014 "${rootTitle}".
 
+YOU ARE THE MERGE AUTHORITY \u2014 substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable \u2192 merge, no human gate).
+
 VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):
 1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP \u2014 zero substance checks, NO ask to the human.
 2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").
@@ -2562,7 +3056,8 @@ VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 uns
 4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.
 
 Then double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.
-Complete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+
+MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> \u2014 merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found \u2192 bounce the parent back to impl with findings (in_review \u2192 in_progress, one round, N bounces \u2014 impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
                   roles: ["review"]
                 },
                 actor
@@ -2990,7 +3485,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
       /** The session a write belongs to: explicit, else the token's most recent session. */
       async resolveSession(body, tokenId) {
         if (body.session) {
-          await this.sessionTouch({ token_id: tokenId, session: body.session }).catch(() => {
+          await this.sessionTouch({ token_id: tokenId, session: body.session, worktree: body.worktree }).catch(() => {
           });
           return String(body.session);
         }
@@ -3000,22 +3495,27 @@ ${m.bootstrap_md}` : "") + scoreLine;
         );
         return row?.name ?? void 0;
       }
-      /** Register/refresh a session. Names are unique per auth token. */
+      /** Register/refresh a session. Names are unique per auth token.
+       *  `worktree` (BR#3204): where the session's git tree lives — surfaced on
+       *  orient so the board can spot two sessions sharing a checkout. */
       async sessionTouch(body) {
         const token_id = String(body.token_id ?? "");
         const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
+        const worktree = String(body.worktree ?? "").trim().slice(0, 400) || null;
         const ts = Date.now();
         this.state.storage.sql.exec(
-          `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
-       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
-       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
+          `INSERT INTO sessions (token_id, name, kind, worktree, first_seen_ts, last_seen_ts)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind),
+         worktree = COALESCE(excluded.worktree, sessions.worktree)`,
           token_id,
           name,
           token_id,
+          worktree,
           ts,
           ts
         );
-        return { session: name };
+        return { session: name, worktree };
       }
       async askCreate(body, actor) {
         const to = String(body.to ?? "any");
@@ -4375,7 +4875,7 @@ async function callTool(name, args, ctx) {
   else if (args.agent != null) args.agent = String(args.agent).trim().slice(0, 60);
   switch (name) {
     case "orient": {
-      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName });
+      const session = await call("session.touch", { token_id: identity.token_id, session: args.session ?? ctx.sessionName, worktree: args.worktree });
       const o = await call("orient", { label: identity.label, tags: identity.tags });
       const named = args.session ?? ctx.sessionName;
       const required = Array.isArray(o.action_required) ? o.action_required : [];
@@ -4383,7 +4883,7 @@ async function callTool(name, args, ctx) {
         {
           ...o,
           build: BUILD,
-          you: { agent: identity.label, session: session.session, tags: identity.tags },
+          you: { agent: identity.label, session: session.session, worktree: session.worktree, tags: identity.tags },
           note: required.length ? `ACT NOW \u2014 handle each of these before anything else:
 ${required.join("\n")}` : named ? void 0 : 'you did not name this session \u2014 pass session: "<unique-name>" on orient next time'
         },
@@ -4501,10 +5001,13 @@ var init_mcp = __esm({
     TOOLS = [
       {
         name: "orient",
-        description: 'Session bootstrap + project overview. Always pass session: "<unique-name>". Returns goals, open work, pending asks for you, project flags.',
+        description: 'Session bootstrap + project overview. Always pass session: "<unique-name>". When working in a provisioned git worktree, pass worktree: "<path>" so the board can see where your tree lives (BR#3204 collision visibility). Returns goals, open work, pending asks for you, project flags.',
         inputSchema: {
           type: "object",
-          properties: { session: { type: "string", description: "unique session name (per agent)" } }
+          properties: {
+            session: { type: "string", description: "unique session name (per agent)" },
+            worktree: { type: "string", description: "path of the git worktree this session works in (optional)" }
+          }
         }
       },
       {
@@ -4689,23 +5192,23 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "bef115b0e761a374ee5cf9872c482b8755d5e7ed", built_at: "2026-10-25T00:42:16Z" };
+    module.exports = { commit: "39b255f3edcd7bfe9fdaef4dcb4f4b14dcf0a269", built_at: "2026-10-25T11:10:10Z" };
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/webcrypto.js
+// ../../../../node_modules/jose/dist/browser/runtime/webcrypto.js
 var webcrypto_default, isCryptoKey;
 var init_webcrypto = __esm({
-  "../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
     webcrypto_default = crypto;
     isCryptoKey = /* @__PURE__ */ __name((key) => key instanceof CryptoKey, "isCryptoKey");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/digest.js
+// ../../../../node_modules/jose/dist/browser/runtime/digest.js
 var digest, digest_default;
 var init_digest = __esm({
-  "../../node_modules/jose/dist/browser/runtime/digest.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/digest.js"() {
     init_webcrypto();
     digest = /* @__PURE__ */ __name(async (algorithm, data) => {
       const subtleDigest = `SHA-${algorithm.slice(-3)}`;
@@ -4715,7 +5218,7 @@ var init_digest = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/buffer_utils.js
+// ../../../../node_modules/jose/dist/browser/lib/buffer_utils.js
 function concat(...buffers) {
   const size = buffers.reduce((acc, { length }) => acc + length, 0);
   const buf = new Uint8Array(size);
@@ -4765,7 +5268,7 @@ async function concatKdf(secret, bits, value) {
 }
 var encoder, decoder, MAX_INT32;
 var init_buffer_utils = __esm({
-  "../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
     init_digest();
     encoder = new TextEncoder();
     decoder = new TextDecoder();
@@ -4780,10 +5283,10 @@ var init_buffer_utils = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/base64url.js
+// ../../../../node_modules/jose/dist/browser/runtime/base64url.js
 var encodeBase64, encode, decodeBase64, decode;
 var init_base64url = __esm({
-  "../../node_modules/jose/dist/browser/runtime/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/base64url.js"() {
     init_buffer_utils();
     encodeBase64 = /* @__PURE__ */ __name((input) => {
       let unencoded = input;
@@ -4823,7 +5326,7 @@ var init_base64url = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/errors.js
+// ../../../../node_modules/jose/dist/browser/util/errors.js
 var errors_exports = {};
 __export(errors_exports, {
   JOSEAlgNotAllowed: () => JOSEAlgNotAllowed,
@@ -4844,7 +5347,7 @@ __export(errors_exports, {
 });
 var JOSEError, JWTClaimValidationFailed, JWTExpired, JOSEAlgNotAllowed, JOSENotSupported, JWEDecryptionFailed, JWEInvalid, JWSInvalid, JWTInvalid, JWKInvalid, JWKSInvalid, JWKSNoMatchingKey, JWKSMultipleMatchingKeys, JWKSTimeout, JWSSignatureVerificationFailed;
 var init_errors = __esm({
-  "../../node_modules/jose/dist/browser/util/errors.js"() {
+  "../../../../node_modules/jose/dist/browser/util/errors.js"() {
     JOSEError = class extends Error {
       static {
         __name(this, "JOSEError");
@@ -5006,16 +5509,16 @@ var init_errors = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/random.js
+// ../../../../node_modules/jose/dist/browser/runtime/random.js
 var random_default;
 var init_random = __esm({
-  "../../node_modules/jose/dist/browser/runtime/random.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/random.js"() {
     init_webcrypto();
     random_default = webcrypto_default.getRandomValues.bind(webcrypto_default);
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/iv.js
+// ../../../../node_modules/jose/dist/browser/lib/iv.js
 function bitLength(alg) {
   switch (alg) {
     case "A128GCM":
@@ -5035,7 +5538,7 @@ function bitLength(alg) {
 }
 var iv_default;
 var init_iv = __esm({
-  "../../node_modules/jose/dist/browser/lib/iv.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/iv.js"() {
     init_errors();
     init_random();
     __name(bitLength, "bitLength");
@@ -5043,10 +5546,10 @@ var init_iv = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_iv_length.js
+// ../../../../node_modules/jose/dist/browser/lib/check_iv_length.js
 var checkIvLength, check_iv_length_default;
 var init_check_iv_length = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
     init_errors();
     init_iv();
     checkIvLength = /* @__PURE__ */ __name((enc, iv) => {
@@ -5058,10 +5561,10 @@ var init_check_iv_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_cek_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js
 var checkCekLength, check_cek_length_default;
 var init_check_cek_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
     init_errors();
     checkCekLength = /* @__PURE__ */ __name((cek, expected) => {
       const actual = cek.byteLength << 3;
@@ -5073,10 +5576,10 @@ var init_check_cek_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
+// ../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
 var timingSafeEqual, timing_safe_equal_default;
 var init_timing_safe_equal = __esm({
-  "../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
     timingSafeEqual = /* @__PURE__ */ __name((a, b) => {
       if (!(a instanceof Uint8Array)) {
         throw new TypeError("First argument must be a buffer");
@@ -5099,7 +5602,7 @@ var init_timing_safe_equal = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/crypto_key.js
+// ../../../../node_modules/jose/dist/browser/lib/crypto_key.js
 function unusable(name, prop = "algorithm.name") {
   return new TypeError(`CryptoKey does not support this operation, its ${prop} must be ${name}`);
 }
@@ -5256,7 +5759,7 @@ function checkEncCryptoKey(key, alg, ...usages) {
   checkUsage(key, usages);
 }
 var init_crypto_key = __esm({
-  "../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
     __name(unusable, "unusable");
     __name(isAlgorithm, "isAlgorithm");
     __name(getHashLength, "getHashLength");
@@ -5267,7 +5770,7 @@ var init_crypto_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/invalid_key_input.js
+// ../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js
 function message(msg, actual, ...types2) {
   types2 = types2.filter(Boolean);
   if (types2.length > 2) {
@@ -5294,7 +5797,7 @@ function withAlg(alg, actual, ...types2) {
 }
 var invalid_key_input_default;
 var init_invalid_key_input = __esm({
-  "../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
     __name(message, "message");
     invalid_key_input_default = /* @__PURE__ */ __name((actual, ...types2) => {
       return message("Key must be ", actual, ...types2);
@@ -5303,10 +5806,10 @@ var init_invalid_key_input = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/is_key_like.js
+// ../../../../node_modules/jose/dist/browser/runtime/is_key_like.js
 var is_key_like_default, types;
 var init_is_key_like = __esm({
-  "../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
     init_webcrypto();
     is_key_like_default = /* @__PURE__ */ __name((key) => {
       if (isCryptoKey(key)) {
@@ -5318,7 +5821,7 @@ var init_is_key_like = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/decrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/decrypt.js
 async function cbcDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -5370,7 +5873,7 @@ async function gcmDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
 }
 var decrypt, decrypt_default;
 var init_decrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -5414,10 +5917,10 @@ var init_decrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_disjoint.js
+// ../../../../node_modules/jose/dist/browser/lib/is_disjoint.js
 var isDisjoint, is_disjoint_default;
 var init_is_disjoint = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
     isDisjoint = /* @__PURE__ */ __name((...headers) => {
       const sources = headers.filter(Boolean);
       if (sources.length === 0 || sources.length === 1) {
@@ -5443,7 +5946,7 @@ var init_is_disjoint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_object.js
+// ../../../../node_modules/jose/dist/browser/lib/is_object.js
 function isObjectLike(value) {
   return typeof value === "object" && value !== null;
 }
@@ -5461,16 +5964,16 @@ function isObject(input) {
   return Object.getPrototypeOf(input) === proto;
 }
 var init_is_object = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_object.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_object.js"() {
     __name(isObjectLike, "isObjectLike");
     __name(isObject, "isObject");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/bogus.js
+// ../../../../node_modules/jose/dist/browser/runtime/bogus.js
 var bogusWebCrypto, bogus_default;
 var init_bogus = __esm({
-  "../../node_modules/jose/dist/browser/runtime/bogus.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/bogus.js"() {
     bogusWebCrypto = [
       { hash: "SHA-256", name: "HMAC" },
       true,
@@ -5480,7 +5983,7 @@ var init_bogus = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/aeskw.js
+// ../../../../node_modules/jose/dist/browser/runtime/aeskw.js
 function checkKeySize(key, alg) {
   if (key.algorithm.length !== parseInt(alg.slice(1, 4), 10)) {
     throw new TypeError(`Invalid key size for alg: ${alg}`);
@@ -5498,7 +6001,7 @@ function getCryptoKey(key, alg, usage) {
 }
 var wrap, unwrap;
 var init_aeskw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
     init_bogus();
     init_webcrypto();
     init_crypto_key();
@@ -5521,7 +6024,7 @@ var init_aeskw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/ecdhes.js
+// ../../../../node_modules/jose/dist/browser/runtime/ecdhes.js
 async function deriveKey(publicKey, privateKey, algorithm, keyLength, apu = new Uint8Array(0), apv = new Uint8Array(0)) {
   if (!isCryptoKey(publicKey)) {
     throw new TypeError(invalid_key_input_default(publicKey, ...types));
@@ -5559,7 +6062,7 @@ function ecdhAllowed(key) {
   return ["P-256", "P-384", "P-521"].includes(key.algorithm.namedCurve) || key.algorithm.name === "X25519" || key.algorithm.name === "X448";
 }
 var init_ecdhes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
     init_buffer_utils();
     init_webcrypto();
     init_crypto_key();
@@ -5571,20 +6074,20 @@ var init_ecdhes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_p2s.js
+// ../../../../node_modules/jose/dist/browser/lib/check_p2s.js
 function checkP2s(p2s2) {
   if (!(p2s2 instanceof Uint8Array) || p2s2.length < 8) {
     throw new JWEInvalid("PBES2 Salt Input must be 8 or more octets");
   }
 }
 var init_check_p2s = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
     init_errors();
     __name(checkP2s, "checkP2s");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/pbes2kw.js
+// ../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js
 function getCryptoKey2(key, alg) {
   if (key instanceof Uint8Array) {
     return webcrypto_default.subtle.importKey("raw", key, "PBKDF2", false, ["deriveBits"]);
@@ -5620,7 +6123,7 @@ async function deriveKey2(p2s2, alg, p2c, key) {
 }
 var encrypt, decrypt2;
 var init_pbes2kw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
     init_random();
     init_buffer_utils();
     init_base64url();
@@ -5644,7 +6147,7 @@ var init_pbes2kw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
 function subtleRsaEs(alg) {
   switch (alg) {
     case "RSA-OAEP":
@@ -5657,16 +6160,16 @@ function subtleRsaEs(alg) {
   }
 }
 var init_subtle_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
     init_errors();
     __name(subtleRsaEs, "subtleRsaEs");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_key_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_key_length.js
 var check_key_length_default;
 var init_check_key_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
     check_key_length_default = /* @__PURE__ */ __name((alg, key) => {
       if (alg.startsWith("RS") || alg.startsWith("PS")) {
         const { modulusLength } = key.algorithm;
@@ -5678,10 +6181,10 @@ var init_check_key_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/rsaes.js
 var encrypt2, decrypt3;
 var init_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
     init_subtle_rsaes();
     init_bogus();
     init_webcrypto();
@@ -5722,7 +6225,7 @@ var init_rsaes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_jwk.js
+// ../../../../node_modules/jose/dist/browser/lib/is_jwk.js
 function isJWK(key) {
   return isObject(key) && typeof key.kty === "string";
 }
@@ -5736,7 +6239,7 @@ function isSecretJWK(key) {
   return isJWK(key) && key.kty === "oct" && typeof key.k === "string";
 }
 var init_is_jwk = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
     init_is_object();
     __name(isJWK, "isJWK");
     __name(isPrivateJWK, "isPrivateJWK");
@@ -5745,7 +6248,7 @@ var init_is_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
 function subtleMapping(jwk) {
   let algorithm;
   let keyUsages;
@@ -5834,7 +6337,7 @@ function subtleMapping(jwk) {
 }
 var parse, jwk_to_key_default;
 var init_jwk_to_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
     init_webcrypto();
     init_errors();
     __name(subtleMapping, "subtleMapping");
@@ -5857,10 +6360,10 @@ var init_jwk_to_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/normalize_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/normalize_key.js
 var exportKeyValue, privCache, pubCache, isKeyObject, importAndCache, normalizePublicKey, normalizePrivateKey, normalize_key_default;
 var init_normalize_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
     init_is_jwk();
     init_base64url();
     init_jwk_to_key();
@@ -5929,7 +6432,7 @@ var init_normalize_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/cek.js
+// ../../../../node_modules/jose/dist/browser/lib/cek.js
 function bitLength2(alg) {
   switch (alg) {
     case "A128GCM":
@@ -5949,7 +6452,7 @@ function bitLength2(alg) {
 }
 var cek_default;
 var init_cek = __esm({
-  "../../node_modules/jose/dist/browser/lib/cek.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/cek.js"() {
     init_errors();
     init_random();
     __name(bitLength2, "bitLength");
@@ -5957,10 +6460,10 @@ var init_cek = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/format_pem.js
+// ../../../../node_modules/jose/dist/browser/lib/format_pem.js
 var format_pem_default;
 var init_format_pem = __esm({
-  "../../node_modules/jose/dist/browser/lib/format_pem.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/format_pem.js"() {
     format_pem_default = /* @__PURE__ */ __name((b64, descriptor) => {
       const newlined = (b64.match(/.{1,64}/g) || []).join("\n");
       return `-----BEGIN ${descriptor}-----
@@ -5970,7 +6473,7 @@ ${newlined}
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/asn1.js
+// ../../../../node_modules/jose/dist/browser/runtime/asn1.js
 function getElement(seq) {
   const result = [];
   let next = 0;
@@ -6039,7 +6542,7 @@ function getSPKI(x509) {
 }
 var genericExport, toSPKI, toPKCS8, findOid, getNamedCurve2, genericImport, fromPKCS8, fromSPKI, fromX509;
 var init_asn1 = __esm({
-  "../../node_modules/jose/dist/browser/runtime/asn1.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/asn1.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -6181,7 +6684,7 @@ var init_asn1 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/import.js
+// ../../../../node_modules/jose/dist/browser/key/import.js
 async function importSPKI(spki, alg, options) {
   if (typeof spki !== "string" || spki.indexOf("-----BEGIN PUBLIC KEY-----") !== 0) {
     throw new TypeError('"spki" must be SPKI formatted string');
@@ -6223,7 +6726,7 @@ async function importJWK(jwk, alg) {
   }
 }
 var init_import = __esm({
-  "../../node_modules/jose/dist/browser/key/import.js"() {
+  "../../../../node_modules/jose/dist/browser/key/import.js"() {
     init_base64url();
     init_asn1();
     init_jwk_to_key();
@@ -6236,7 +6739,7 @@ var init_import = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_key_type.js
+// ../../../../node_modules/jose/dist/browser/lib/check_key_type.js
 function checkKeyType(allowJwk, alg, key, usage) {
   const symmetric = alg.startsWith("HS") || alg === "dir" || alg.startsWith("PBES2") || /^A\d{3}(?:GCM)?KW$/.test(alg);
   if (symmetric) {
@@ -6247,7 +6750,7 @@ function checkKeyType(allowJwk, alg, key, usage) {
 }
 var tag, jwkMatchesOp, symmetricTypeCheck, asymmetricTypeCheck, check_key_type_default, checkKeyTypeWithJwk;
 var init_check_key_type = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
     init_invalid_key_input();
     init_is_key_like();
     init_is_jwk();
@@ -6317,7 +6820,7 @@ var init_check_key_type = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/encrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/encrypt.js
 async function cbcEncrypt(enc, plaintext, cek, iv, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -6356,7 +6859,7 @@ async function gcmEncrypt(enc, plaintext, cek, iv, aad) {
 }
 var encrypt3, encrypt_default;
 var init_encrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -6400,7 +6903,7 @@ var init_encrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/aesgcmkw.js
+// ../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js
 async function wrap2(alg, key, cek, iv) {
   const jweAlgorithm = alg.slice(0, 7);
   const wrapped = await encrypt_default(jweAlgorithm, cek, key, iv, new Uint8Array(0));
@@ -6415,7 +6918,7 @@ async function unwrap2(alg, key, encryptedKey, iv, tag2) {
   return decrypt_default(jweAlgorithm, key, encryptedKey, iv, tag2, new Uint8Array(0));
 }
 var init_aesgcmkw = __esm({
-  "../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
     init_encrypt();
     init_decrypt();
     init_base64url();
@@ -6424,7 +6927,7 @@ var init_aesgcmkw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
 async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options) {
   check_key_type_default(alg, key, "decrypt");
   key = await normalize_key_default.normalizePrivateKey?.(key, alg) || key;
@@ -6538,7 +7041,7 @@ async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options)
 }
 var decrypt_key_management_default;
 var init_decrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -6556,7 +7059,7 @@ var init_decrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_crit.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_crit.js
 function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader, joseHeader) {
   if (joseHeader.crit !== void 0 && protectedHeader?.crit === void 0) {
     throw new Err('"crit" (Critical) Header Parameter MUST be integrity protected');
@@ -6588,17 +7091,17 @@ function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader,
 }
 var validate_crit_default;
 var init_validate_crit = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
     init_errors();
     __name(validateCrit, "validateCrit");
     validate_crit_default = validateCrit;
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_algorithms.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js
 var validateAlgorithms, validate_algorithms_default;
 var init_validate_algorithms = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
     validateAlgorithms = /* @__PURE__ */ __name((option, algorithms) => {
       if (algorithms !== void 0 && (!Array.isArray(algorithms) || algorithms.some((s) => typeof s !== "string"))) {
         throw new TypeError(`"${option}" option must be an array of strings`);
@@ -6612,7 +7115,7 @@ var init_validate_algorithms = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
 async function flattenedDecrypt(jwe, key, options) {
   if (!isObject(jwe)) {
     throw new JWEInvalid("Flattened JWE must be an object");
@@ -6755,7 +7258,7 @@ async function flattenedDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
     init_base64url();
     init_decrypt();
     init_errors();
@@ -6770,7 +7273,7 @@ var init_decrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
 async function compactDecrypt(jwe, key, options) {
   if (jwe instanceof Uint8Array) {
     jwe = decoder.decode(jwe);
@@ -6796,7 +7299,7 @@ async function compactDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
     init_decrypt2();
     init_errors();
     init_buffer_utils();
@@ -6804,7 +7307,7 @@ var init_decrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js
 async function generalDecrypt(jwe, key, options) {
   if (!isObject(jwe)) {
     throw new JWEInvalid("General JWE must be an object");
@@ -6833,7 +7336,7 @@ async function generalDecrypt(jwe, key, options) {
   throw new JWEDecryptionFailed();
 }
 var init_decrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
     init_decrypt2();
     init_errors();
     init_is_object();
@@ -6841,18 +7344,18 @@ var init_decrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/private_symbols.js
+// ../../../../node_modules/jose/dist/browser/lib/private_symbols.js
 var unprotected;
 var init_private_symbols = __esm({
-  "../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
     unprotected = /* @__PURE__ */ Symbol();
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
+// ../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
 var keyToJWK, key_to_jwk_default;
 var init_key_to_jwk = __esm({
-  "../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -6877,7 +7380,7 @@ var init_key_to_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/export.js
+// ../../../../node_modules/jose/dist/browser/key/export.js
 async function exportSPKI(key) {
   return toSPKI(key);
 }
@@ -6888,7 +7391,7 @@ async function exportJWK(key) {
   return key_to_jwk_default(key);
 }
 var init_export = __esm({
-  "../../node_modules/jose/dist/browser/key/export.js"() {
+  "../../../../node_modules/jose/dist/browser/key/export.js"() {
     init_asn1();
     init_asn1();
     init_key_to_jwk();
@@ -6898,7 +7401,7 @@ var init_export = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
 async function encryptKeyManagement(alg, enc, key, providedCek, providedParameters = {}) {
   let encryptedKey;
   let parameters;
@@ -6978,7 +7481,7 @@ async function encryptKeyManagement(alg, enc, key, providedCek, providedParamete
 }
 var encrypt_key_management_default;
 var init_encrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -6995,10 +7498,10 @@ var init_encrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
 var FlattenedEncrypt;
 var init_encrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
     init_base64url();
     init_private_symbols();
     init_encrypt();
@@ -7153,10 +7656,10 @@ var init_encrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js
 var IndividualRecipient, GeneralEncrypt;
 var init_encrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
     init_encrypt2();
     init_private_symbols();
     init_errors();
@@ -7325,7 +7828,7 @@ var init_encrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
 function subtleDsa(alg, algorithm) {
   const hash = `SHA-${alg.slice(-3)}`;
   switch (alg) {
@@ -7354,13 +7857,13 @@ function subtleDsa(alg, algorithm) {
   }
 }
 var init_subtle_dsa = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
     init_errors();
     __name(subtleDsa, "subtleDsa");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
 async function getCryptoKey3(alg, key, usage) {
   if (usage === "sign") {
     key = await normalize_key_default.normalizePrivateKey(key, alg);
@@ -7381,7 +7884,7 @@ async function getCryptoKey3(alg, key, usage) {
   throw new TypeError(invalid_key_input_default(key, ...types, "Uint8Array", "JSON Web Key"));
 }
 var init_get_sign_verify_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
     init_webcrypto();
     init_crypto_key();
     init_invalid_key_input();
@@ -7391,10 +7894,10 @@ var init_get_sign_verify_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/verify.js
+// ../../../../node_modules/jose/dist/browser/runtime/verify.js
 var verify, verify_default;
 var init_verify = __esm({
-  "../../node_modules/jose/dist/browser/runtime/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/verify.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -7413,7 +7916,7 @@ var init_verify = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/verify.js
 async function flattenedVerify(jws, key, options) {
   if (!isObject(jws)) {
     throw new JWSInvalid("Flattened JWS must be an object");
@@ -7519,7 +8022,7 @@ async function flattenedVerify(jws, key, options) {
   return result;
 }
 var init_verify2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
     init_base64url();
     init_verify();
     init_errors();
@@ -7535,7 +8038,7 @@ var init_verify2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/verify.js
 async function compactVerify(jws, key, options) {
   if (jws instanceof Uint8Array) {
     jws = decoder.decode(jws);
@@ -7555,7 +8058,7 @@ async function compactVerify(jws, key, options) {
   return result;
 }
 var init_verify3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
     init_verify2();
     init_errors();
     init_buffer_utils();
@@ -7563,7 +8066,7 @@ var init_verify3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/general/verify.js
 async function generalVerify(jws, key, options) {
   if (!isObject(jws)) {
     throw new JWSInvalid("General JWS must be an object");
@@ -7585,7 +8088,7 @@ async function generalVerify(jws, key, options) {
   throw new JWSSignatureVerificationFailed();
 }
 var init_verify4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/verify.js"() {
     init_verify2();
     init_errors();
     init_is_object();
@@ -7593,18 +8096,18 @@ var init_verify4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/epoch.js
+// ../../../../node_modules/jose/dist/browser/lib/epoch.js
 var epoch_default;
 var init_epoch = __esm({
-  "../../node_modules/jose/dist/browser/lib/epoch.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/epoch.js"() {
     epoch_default = /* @__PURE__ */ __name((date) => Math.floor(date.getTime() / 1e3), "default");
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/secs.js
+// ../../../../node_modules/jose/dist/browser/lib/secs.js
 var minute, hour, day, week, year, REGEX, secs_default;
 var init_secs = __esm({
-  "../../node_modules/jose/dist/browser/lib/secs.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/secs.js"() {
     minute = 60;
     hour = minute * 60;
     day = hour * 24;
@@ -7663,10 +8166,10 @@ var init_secs = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
+// ../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
 var normalizeTyp, checkAudiencePresence, jwt_claims_set_default;
 var init_jwt_claims_set = __esm({
-  "../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
     init_errors();
     init_buffer_utils();
     init_epoch();
@@ -7769,7 +8272,7 @@ var init_jwt_claims_set = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/verify.js
+// ../../../../node_modules/jose/dist/browser/jwt/verify.js
 async function jwtVerify(jwt, key, options) {
   const verified = await compactVerify(jwt, key, options);
   if (verified.protectedHeader.crit?.includes("b64") && verified.protectedHeader.b64 === false) {
@@ -7783,7 +8286,7 @@ async function jwtVerify(jwt, key, options) {
   return result;
 }
 var init_verify5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/verify.js"() {
     init_verify3();
     init_jwt_claims_set();
     init_errors();
@@ -7791,7 +8294,7 @@ var init_verify5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/decrypt.js
 async function jwtDecrypt(jwt, key, options) {
   const decrypted = await compactDecrypt(jwt, key, options);
   const payload = jwt_claims_set_default(decrypted.protectedHeader, decrypted.plaintext, options);
@@ -7812,7 +8315,7 @@ async function jwtDecrypt(jwt, key, options) {
   return result;
 }
 var init_decrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
     init_decrypt3();
     init_jwt_claims_set();
     init_errors();
@@ -7820,10 +8323,10 @@ var init_decrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
 var CompactEncrypt;
 var init_encrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
     init_encrypt2();
     CompactEncrypt = class {
       static {
@@ -7856,10 +8359,10 @@ var init_encrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/sign.js
+// ../../../../node_modules/jose/dist/browser/runtime/sign.js
 var sign, sign_default;
 var init_sign = __esm({
-  "../../node_modules/jose/dist/browser/runtime/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/sign.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -7874,10 +8377,10 @@ var init_sign = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/sign.js
 var FlattenedSign;
 var init_sign2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
     init_base64url();
     init_sign();
     init_is_disjoint();
@@ -7964,10 +8467,10 @@ var init_sign2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/sign.js
 var CompactSign;
 var init_sign3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
     init_sign2();
     CompactSign = class {
       static {
@@ -7991,10 +8494,10 @@ var init_sign3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/general/sign.js
 var IndividualSignature, GeneralSign;
 var init_sign4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/sign.js"() {
     init_sign2();
     init_errors();
     IndividualSignature = class {
@@ -8070,7 +8573,7 @@ var init_sign4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/produce.js
+// ../../../../node_modules/jose/dist/browser/jwt/produce.js
 function validateInput(label, input) {
   if (!Number.isFinite(input)) {
     throw new TypeError(`Invalid ${label} input`);
@@ -8079,7 +8582,7 @@ function validateInput(label, input) {
 }
 var ProduceJWT;
 var init_produce = __esm({
-  "../../node_modules/jose/dist/browser/jwt/produce.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/produce.js"() {
     init_epoch();
     init_is_object();
     init_secs();
@@ -8149,10 +8652,10 @@ var init_produce = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/sign.js
+// ../../../../node_modules/jose/dist/browser/jwt/sign.js
 var SignJWT;
 var init_sign5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/sign.js"() {
     init_sign3();
     init_errors();
     init_buffer_utils();
@@ -8177,10 +8680,10 @@ var init_sign5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/encrypt.js
 var EncryptJWT;
 var init_encrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
     init_encrypt4();
     init_buffer_utils();
     init_produce();
@@ -8255,7 +8758,7 @@ var init_encrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/thumbprint.js
+// ../../../../node_modules/jose/dist/browser/jwk/thumbprint.js
 async function calculateJwkThumbprint(jwk, digestAlgorithm) {
   if (!isObject(jwk)) {
     throw new TypeError("JWK must be an object");
@@ -8299,7 +8802,7 @@ async function calculateJwkThumbprintUri(jwk, digestAlgorithm) {
 }
 var check2;
 var init_thumbprint = __esm({
-  "../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
     init_digest();
     init_base64url();
     init_errors();
@@ -8315,7 +8818,7 @@ var init_thumbprint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/embedded.js
+// ../../../../node_modules/jose/dist/browser/jwk/embedded.js
 async function EmbeddedJWK(protectedHeader, token) {
   const joseHeader = {
     ...protectedHeader,
@@ -8331,7 +8834,7 @@ async function EmbeddedJWK(protectedHeader, token) {
   return key;
 }
 var init_embedded = __esm({
-  "../../node_modules/jose/dist/browser/jwk/embedded.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/embedded.js"() {
     init_import();
     init_is_object();
     init_errors();
@@ -8339,7 +8842,7 @@ var init_embedded = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/local.js
+// ../../../../node_modules/jose/dist/browser/jwks/local.js
 function getKtyFromAlg(alg) {
   switch (typeof alg === "string" && alg.slice(0, 2)) {
     case "RS":
@@ -8391,7 +8894,7 @@ function createLocalJWKSet(jwks) {
 }
 var LocalJWKSet;
 var init_local = __esm({
-  "../../node_modules/jose/dist/browser/jwks/local.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/local.js"() {
     init_import();
     init_errors();
     init_is_object();
@@ -8476,10 +8979,10 @@ var init_local = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
+// ../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
 var fetchJwks, fetch_jwks_default;
 var init_fetch_jwks = __esm({
-  "../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
     init_errors();
     fetchJwks = /* @__PURE__ */ __name(async (url, timeout, options) => {
       let controller;
@@ -8516,7 +9019,7 @@ var init_fetch_jwks = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/remote.js
+// ../../../../node_modules/jose/dist/browser/jwks/remote.js
 function isCloudflareWorkers() {
   return typeof WebSocketPair !== "undefined" || typeof navigator !== "undefined" && true || typeof EdgeRuntime !== "undefined" && EdgeRuntime === "vercel";
 }
@@ -8568,7 +9071,7 @@ function createRemoteJWKSet(url, options) {
 }
 var USER_AGENT, jwksCache, RemoteJWKSet, experimental_jwksCache;
 var init_remote = __esm({
-  "../../node_modules/jose/dist/browser/jwks/remote.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/remote.js"() {
     init_fetch_jwks();
     init_errors();
     init_local();
@@ -8653,10 +9156,10 @@ var init_remote = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/unsecured.js
+// ../../../../node_modules/jose/dist/browser/jwt/unsecured.js
 var UnsecuredJWT;
 var init_unsecured = __esm({
-  "../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
     init_base64url();
     init_buffer_utils();
     init_errors();
@@ -8694,7 +9197,7 @@ var init_unsecured = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/base64url.js
+// ../../../../node_modules/jose/dist/browser/util/base64url.js
 var base64url_exports2 = {};
 __export(base64url_exports2, {
   decode: () => decode2,
@@ -8702,14 +9205,14 @@ __export(base64url_exports2, {
 });
 var encode2, decode2;
 var init_base64url2 = __esm({
-  "../../node_modules/jose/dist/browser/util/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/util/base64url.js"() {
     init_base64url();
     encode2 = encode;
     decode2 = decode;
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_protected_header.js
+// ../../../../node_modules/jose/dist/browser/util/decode_protected_header.js
 function decodeProtectedHeader(token) {
   let protectedB64u;
   if (typeof token === "string") {
@@ -8739,7 +9242,7 @@ function decodeProtectedHeader(token) {
   }
 }
 var init_decode_protected_header = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -8747,7 +9250,7 @@ var init_decode_protected_header = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_jwt.js
+// ../../../../node_modules/jose/dist/browser/util/decode_jwt.js
 function decodeJwt(jwt) {
   if (typeof jwt !== "string")
     throw new JWTInvalid("JWTs must use Compact JWS serialization, JWT must be a string");
@@ -8775,7 +9278,7 @@ function decodeJwt(jwt) {
   return result;
 }
 var init_decode_jwt = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -8784,7 +9287,7 @@ var init_decode_jwt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/generate.js
+// ../../../../node_modules/jose/dist/browser/runtime/generate.js
 async function generateSecret(alg, options) {
   let length;
   let algorithm;
@@ -8926,7 +9429,7 @@ async function generateKeyPair(alg, options) {
   return webcrypto_default.subtle.generateKey(algorithm, options?.extractable ?? false, keyUsages);
 }
 var init_generate = __esm({
-  "../../node_modules/jose/dist/browser/runtime/generate.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/generate.js"() {
     init_webcrypto();
     init_errors();
     init_random();
@@ -8936,46 +9439,46 @@ var init_generate = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_key_pair.js
+// ../../../../node_modules/jose/dist/browser/key/generate_key_pair.js
 async function generateKeyPair2(alg, options) {
   return generateKeyPair(alg, options);
 }
 var init_generate_key_pair = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
     init_generate();
     __name(generateKeyPair2, "generateKeyPair");
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_secret.js
+// ../../../../node_modules/jose/dist/browser/key/generate_secret.js
 async function generateSecret2(alg, options) {
   return generateSecret(alg, options);
 }
 var init_generate_secret = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_secret.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_secret.js"() {
     init_generate();
     __name(generateSecret2, "generateSecret");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/runtime.js
+// ../../../../node_modules/jose/dist/browser/runtime/runtime.js
 var runtime_default;
 var init_runtime = __esm({
-  "../../node_modules/jose/dist/browser/runtime/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/runtime.js"() {
     runtime_default = "WebCryptoAPI";
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/runtime.js
+// ../../../../node_modules/jose/dist/browser/util/runtime.js
 var runtime_default2;
 var init_runtime2 = __esm({
-  "../../node_modules/jose/dist/browser/util/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/util/runtime.js"() {
     init_runtime();
     runtime_default2 = runtime_default;
   }
 });
 
-// ../../node_modules/jose/dist/browser/index.js
+// ../../../../node_modules/jose/dist/browser/index.js
 var browser_exports = {};
 __export(browser_exports, {
   CompactEncrypt: () => CompactEncrypt,
@@ -9018,7 +9521,7 @@ __export(browser_exports, {
   jwtVerify: () => jwtVerify
 });
 var init_browser = __esm({
-  "../../node_modules/jose/dist/browser/index.js"() {
+  "../../../../node_modules/jose/dist/browser/index.js"() {
     init_decrypt3();
     init_decrypt2();
     init_decrypt4();
