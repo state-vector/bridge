@@ -5,11 +5,13 @@
  * (minted on the admin page) — never call them "tokens" around LLMs, it's an
  * auth token. One auth token per agent client; sessions self-name uniquely
  * via `session` on orient.
+ *
+ * The tool surface lives in ./mcp-tools.ts — ONE table of
+ * { name, description, schema, handler } rows; the tools/list response and
+ * the tools/call dispatch are both generated from it (BR#2844). This file is
+ * protocol plumbing only: auth, workspace routing, JSON-RPC envelope.
  */
 import {
-  ARTEFACT_TYPES,
-  LIFECYCLES,
-  RELATIONS,
   composeBootstrap,
   DEFAULT_WS_SLUG,
   doWs,
@@ -20,9 +22,11 @@ import { KnowledgeHub } from "./kb/do.ts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
 export const BUILD = "0.3.6";
-
+import { BUILD, TOOL_TABLE, err, toolsList } from "./mcp-tools.ts";
 // per-isolate cache of token hash → workspace (best-effort; misses hit the registry DO)
 const wsRouteCache = new Map<string, string>();
+
+export { BUILD };
 
 /**
  * Workspace routing WITHOUT leaking the workspace in the token: agent tokens
@@ -135,12 +139,10 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
         result = {};
         break;
       case "tools/list":
-        result = { tools: TOOLS };
+        result = { tools: toolsList(TOOL_TABLE) };
         break;
       case "tools/call": {
-        const name = String(msg.params?.name ?? "");
-        const args = msg.params?.arguments ?? {};
-        result = await callTool(name, args, { call, identity, sessionName });
+        result = await callTool(String(msg.params?.name ?? ""), msg.params?.arguments ?? {}, { call, identity, sessionName });
         break;
       }
       default:
@@ -178,59 +180,14 @@ async function kb(hub: any, op: string, payload: object) {
   return out;
 }
 
-/**
- * Proactive discovery for get_artefact: merges typed relations, semantic
- * neighbours, and keyword hits on title+tags. Open tasks owned by OTHER
- * agents surface first (with a coordination flag) — "is anyone else working
- * on this?" answered without a second call.
- */
-const OPEN_STATUSES = new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
-async function seeAlso(a: any, rel: any, identity: Ctx["identity"], call: Ctx["call"]) {
-  const q = [a.title, ...(a.tags ?? [])].join(" ").slice(0, 300);
-  const [sem, kw] = await Promise.all([
-    call("related", { id: a.id, limit: 6 }).catch(() => ({ artefacts: [] })),
-    q.trim() ? call("search", { q, limit: 6 }).catch(() => ({ artefacts: [] })) : { artefacts: [] },
-  ]);
-  const byId = new Map<string, any>();
-  const put = (x: any, why: string, rank: number) => {
-    if (!x || x.id === a.id) return;
-    const e = byId.get(x.id) ?? { ...shallow(x), owner: x.owner, tags: x.tags, why: new Set<string>(), _rank: 0 };
-    e.why.add(why);
-    e._rank = Math.max(e._rank, rank);
-    byId.set(x.id, e);
-  };
-  for (const r of (rel as any).relations ?? []) {
-    const full = r.artefact_id ? await call("get", { id: r.artefact_id }).catch(() => null) : null;
-    put(full, r.relation, 0);
-  }
-  for (const x of (sem as any).artefacts ?? []) put(x, "similar", 1);
-  for (const x of (kw as any).artefacts ?? []) put(x, "keyword", 1);
-  const rows = [...byId.values()];
-  // priority: others' open work > questions/goals > everything else
-  for (const e of rows) {
-    const otherClaimed = e.owner && e.owner !== identity.label;
-    const otherPublished = !e.owner && e.created_by && e.created_by !== identity.label; // pooled todo: author attribution
-    if (e.type === "task" && OPEN_STATUSES.has(e.status) && (otherClaimed || otherPublished)) {
-      e.coordination = true;
-      e._rank = -1;
-    } else if (e.type === "steering" || e.type === "goal") {
-      e._rank = Math.min(e._rank, 2);
-    }
-  }
-  rows.sort((x, y) => x._rank - y._rank || y.updated_ts - x.updated_ts);
-  for (const e of rows) { delete e._rank; e.why = [...e.why]; }
-  return rows.slice(0, 8);
-}
-
 async function callTool(name: string, args: any, ctx: Ctx) {
-  const { call, identity } = ctx;
   // Gateway tokens (tagged "gateway") are infrastructure: they claim and
   // dispatch on behalf of the AGENT they dispatched as, and must never appear
   // as task owner (the MacBook-Pro-as-owner defect, ADR BR#899). The gateway
   // flag is DERIVED from the token, never accepted from client args — and a
   // plain agent token's `agent` field is stripped, so attribution cannot be
   // forged (BR#2455: the namespace law holds at the protocol boundary too).
-  const isGatewayToken = identity.tags.some((t) => t.toLowerCase() === "gateway");
+  const isGatewayToken = ctx.identity.tags.some((t) => t.toLowerCase() === "gateway");
   args.gateway = isGatewayToken;
   if (!isGatewayToken) delete args.agent;
   else if (args.agent != null) args.agent = String(args.agent).trim().slice(0, 60);
@@ -581,6 +538,14 @@ const TOOLS = [
   },
 ];
 
+
+  // THE dispatch: a lookup in the generated table, not a switch. A tool the
+  // table declares is handled; a handler the table lacks cannot exist (the
+  // type is total over ToolName) — the registry/divergence class dies here.
+  const def = (TOOL_TABLE as Record<string, { handler: (args: any, ctx: Ctx) => unknown }>)[name];
+  if (!def) return err(`unknown tool: ${name}`);
+  return await def.handler(args, ctx);
+}
 function json(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,

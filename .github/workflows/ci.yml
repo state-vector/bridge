@@ -17,8 +17,9 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - name: Worker unit tests (kb core) + webapp build + specs gate
+      - name: Worker unit tests (kb core) + contracts + webapp build + specs gate
         run: |
+          npm run test -w packages/contracts
           npm run test -w packages/worker
           npm run build -w @bridge/webapp
           npm run test -w @bridge/specs
