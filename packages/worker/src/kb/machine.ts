@@ -662,7 +662,11 @@ export function breachClass(reason: string): string {
   return "other";
 }
 
-function classOf(e: BreachEvent): string {
+/** Per-event breach class: the four op shapes are their own classes; a
+ *  transition_rejected is classified by its rejection reason (breachClass).
+ *  Exported for the fold (BR#3443) — the caller needs the same per-key
+ *  classification to advance open cards' high-water marks. */
+export function classOf(e: BreachEvent): string {
   if (e.op === "invariant_violation") return "invariant";
   if (e.op === "spawn_skipped") return "spawn-while-open";
   if (e.op === "replay_mismatch") return "replay";
@@ -671,13 +675,17 @@ function classOf(e: BreachEvent): string {
 
 /** Fold events into breaches: same (task, class) within the window is ONE
  *  breach once its threshold is crossed, and never re-raised while its key
- *  is open. Raising is the caller's guarded effect. */
+ *  is open. Raising is the caller's guarded effect. BR#3443: the caller can
+ *  also pass a per-key fold high-water — events at or below it were already
+ *  folded into a prior breach card (open coalescing + closed adjudication),
+ *  so a closed card's close never re-arms its key. */
 export function detectBreaches(
   events: BreachEvent[],
   openKeys: Set<string>,
-  opts?: { windowMs?: number },
+  opts?: { windowMs?: number; highWater?: Map<string, number> },
 ): Breach[] {
   const windowMs = opts?.windowMs ?? BREACH_WINDOW_MS;
+  const highWater = opts?.highWater;
   const relevant = events.filter((e) =>
     ["transition_rejected", "invariant_violation", "spawn_skipped", "replay_mismatch"].includes(e.op),
   );
@@ -686,6 +694,10 @@ export function detectBreaches(
   for (const e of relevant) {
     const klass = classOf(e);
     const key = `${e.task}|${klass}`;
+    // BR#3443: events at or below the key's high-water were already folded
+    // into a prior breach card — they never re-qualify on a later trigger.
+    const hw = highWater?.get(key);
+    if (hw !== undefined && e.ts <= hw) continue;
     const g = groups.get(key);
     if (g) {
       if (e.ts - g.first_ts <= windowMs) {

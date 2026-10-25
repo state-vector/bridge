@@ -1060,6 +1060,7 @@ function classOf(e) {
 }
 function detectBreaches(events, openKeys, opts) {
   const windowMs = opts?.windowMs ?? BREACH_WINDOW_MS;
+  const highWater = opts?.highWater;
   const relevant = events.filter(
     (e) => ["transition_rejected", "invariant_violation", "spawn_skipped", "replay_mismatch"].includes(e.op)
   );
@@ -1068,6 +1069,8 @@ function detectBreaches(events, openKeys, opts) {
   for (const e of relevant) {
     const klass = classOf(e);
     const key = `${e.task}|${klass}`;
+    const hw = highWater?.get(key);
+    if (hw !== void 0 && e.ts <= hw) continue;
     const g = groups.get(key);
     if (g) {
       if (e.ts - g.first_ts <= windowMs) {
@@ -4996,7 +4999,13 @@ ${m.bootstrap_md}` : "") + scoreLine;
        *  task into breach cards. One OPEN card per (task, class) key —
        *  reoccurrences coalesce onto the open card, never spawn duplicates.
        *  Call sites: every transition_rejected, invariant_violation,
-       *  spawn_skipped and replay_mismatch lands here through the fold. */
+       *  spawn_skipped and replay_mismatch lands here through the fold.
+       *  BR#3443: a CLOSED card's events never re-fold either. Every card
+       *  carries a fold high-water in meta.breach_high_water — the newest event
+       *  ts its adjudication covered — and a key with any prior card only counts
+       *  events strictly above that mark, so closing a card can never re-arm
+       *  its key (specimen BR#3439: a duplicate raised from events that all
+       *  predated the predecessor card's close). */
       async foldBreaches(taskId) {
         const since = Date.now() - BREACH_WINDOW_MS * 8;
         const rows = this.state.storage.sql.exec(
@@ -5007,9 +5016,20 @@ ${m.bootstrap_md}` : "") + scoreLine;
           since
         ).toArray();
         if (!rows.length) return;
+        const events = rows.map((r) => {
+          let d = {};
+          try {
+            d = JSON.parse(r.detail ?? "{}");
+          } catch {
+          }
+          const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
+          return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
+        });
         const openKeys = /* @__PURE__ */ new Set();
+        const highWater = /* @__PURE__ */ new Map();
+        const openCards = /* @__PURE__ */ new Map();
         for (const b of this.state.storage.sql.exec(
-          `SELECT meta FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND meta LIKE ?`,
+          `SELECT id, status, meta, status_ts, created_ts FROM artefacts WHERE type = 'task' AND meta LIKE ?`,
           `%"breach_key":"${taskId}|%`
         ).toArray()) {
           let m = {};
@@ -5017,20 +5037,19 @@ ${m.bootstrap_md}` : "") + scoreLine;
             m = JSON.parse(b.meta ?? "{}");
           } catch {
           }
-          if (typeof m?.breach_key === "string") openKeys.add(m.breach_key);
+          const key = m?.breach_key;
+          if (typeof key !== "string") continue;
+          if (b.status === "done" || b.status === "superseded") {
+            const hw = Number(m?.breach_high_water ?? 0) || Number(b.status_ts ?? 0) || Number(b.created_ts ?? 0) || 0;
+            const prev = highWater.get(key);
+            if (prev === void 0 || hw > prev) highWater.set(key, hw);
+          } else {
+            openKeys.add(key);
+            const stamped = Number(m?.breach_high_water ?? 0) || Number(b.created_ts ?? 0) || 0;
+            openCards.set(key, { id: String(b.id), meta: String(b.meta ?? "{}"), stamped });
+          }
         }
-        const breaches = detectBreaches(
-          rows.map((r) => {
-            let d = {};
-            try {
-              d = JSON.parse(r.detail ?? "{}");
-            } catch {
-            }
-            const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
-            return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
-          }),
-          openKeys
-        );
+        const breaches = detectBreaches(events, openKeys, { highWater });
         for (const b of breaches) {
           const created = await this.create(
             {
@@ -5050,11 +5069,30 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
           );
           this.state.storage.sql.exec(
             `UPDATE artefacts SET meta = ? WHERE id = ?`,
-            JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count }),
+            JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count, breach_high_water: b.last_ts }),
             created.id
           );
           this.audit("system:breach", "breach_raised", created.id, { key: b.key, task: taskId, klass: b.klass, count: b.count });
           this.version(created.id, "system:breach", "create", `breach card raised \u2014 ${b.klass} on ${taskId} (${b.count} events)`, { key: b.key, sample: b.sample });
+        }
+        const maxSeen = /* @__PURE__ */ new Map();
+        for (const e of events) {
+          const key = `${e.task}|${classOf(e)}`;
+          const ts = Number(e.ts);
+          if (!Number.isFinite(ts)) continue;
+          const cur = maxSeen.get(key);
+          if (cur === void 0 || ts > cur) maxSeen.set(key, ts);
+        }
+        for (const [key, card] of openCards) {
+          const seen = maxSeen.get(key) ?? 0;
+          if (seen <= card.stamped) continue;
+          let m = {};
+          try {
+            m = JSON.parse(card.meta);
+          } catch {
+          }
+          m.breach_high_water = seen;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), card.id);
         }
       }
       /** Replay consistency (BR#2419 item 6): fold the version log's transition
@@ -6890,7 +6928,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "d77f94f6cbca6d31da4f1bf3eb863ccb16a3146e", built_at: "2026-10-25T16:39:04Z" };
+    module.exports = { commit: "b653a021a467b39e0913fd0ac596bcd499241ea8", built_at: "2026-10-25T17:21:31Z" };
   }
 });
 

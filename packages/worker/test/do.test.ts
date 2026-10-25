@@ -397,3 +397,92 @@ describe("claim-race storms through the real gate + breach door (BR#3337)", () =
     expect(String(mine[0].title)).toContain("gate:review-needs-pr");
   });
 });
+
+// ---------- BR#3443: a closed breach card's events never re-fold ----------
+// Specimen BR#3439: raised 17:03:22.861Z by a benign fold trigger on BR#3372,
+// from 6 events that ALL predate the predecessor card BR#3427's close
+// (16:30:45.674Z) — the fold suppressed per key ONLY while a card is open, so
+// closing re-armed the key and the same adjudicated events re-qualified.
+describe("breach fold high-water: closed cards never re-raise stale events (BR#3443)", () => {
+  const breachCardsFor = async (taskId: string) => {
+    const { body } = await kbJson("/list", { type: "task", tag: "breach", limit: 200 });
+    return (body.artefacts ?? []).filter((a: any) => String(a.title).includes(taskId));
+  };
+
+  /** Close a breach card through the real gates: the done-unreviewed gate
+   *  demands review evidence (a done review-role child first), the lifecycle
+   *  demands a claim before done, and the close cites its investigation. */
+  const closeBreachCard = async (cardId: string) => {
+    const { body: child } = await kbJson("/create", { type: "task", title: `verify ${cardId}`, roles: ["review"] });
+    const linked = await kbJson("/link", { src: child.id, relation: "child_of", dst: cardId });
+    expect(linked.status).toBe(200);
+    const claim = await kbJson("/transition", { id: child.id, to: "in_progress", note: "claim verify duty", actor: "verifier-opencode" });
+    expect(claim.status).toBe(200);
+    const done = await kbJson("/transition", { id: child.id, to: "done", note: "verified PR https://github.com/state-vector/bridge/pull/0 — no-refold control", actor: "verifier-opencode" });
+    expect(done.status).toBe(200);
+    const take = await kbJson("/transition", { id: cardId, to: "in_progress", note: "claim breach investigation", actor: "investigator-opencode" });
+    expect(take.status).toBe(200);
+    const close = await kbJson("/transition", { id: cardId, to: "done", note: "investigated and adjudicated", actor: "investigator-opencode" });
+    expect(close.status).toBe(200);
+  };
+
+  const rejectOnce = async (id: string) => {
+    const r = await kbJson("/transition", { id, to: "in_review", note: "handoff attempt without any receipt", actor: "gateway-a-opencode" });
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("PR link");
+  };
+
+  it("(a) closing the card does not re-arm its key: stale events stay folded", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "high-water no-refold" });
+    await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-a-opencode" });
+    for (let i = 0; i < 3; i++) await rejectOnce(card.id); // raises the breach card at threshold
+    let mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1);
+    const first = mine[0];
+    await closeBreachCard(first.id);
+    // one more rejection inside the lookback — a fold trigger on stale
+    // evidence. Before the fix this re-raised the SAME group (specimen BR#3439).
+    await rejectOnce(card.id);
+    mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1); // the closed card only — no duplicate
+  });
+
+  it("(b) genuinely new events above the closed card's high-water still raise", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "high-water still raises fresh" });
+    await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-a-opencode" });
+    for (let i = 0; i < 3; i++) await rejectOnce(card.id);
+    let mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1);
+    await closeBreachCard(mine[0].id);
+    await rejectOnce(card.id); // fold trigger on stale evidence — stays folded
+    mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1);
+    // two more rejections: three events strictly ABOVE the closed card's
+    // high-water — a fresh pattern that must raise a new card
+    await rejectOnce(card.id);
+    await rejectOnce(card.id);
+    mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(2);
+  });
+
+  it("(c) reoccurrences coalesce onto the OPEN card and stay folded after it closes", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "high-water coalesce" });
+    await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gateway-a-opencode" });
+    for (let i = 0; i < 3; i++) await rejectOnce(card.id); // raises the card
+    // two reoccurrences coalesce onto the open card — never a second card
+    await rejectOnce(card.id);
+    await rejectOnce(card.id);
+    let mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1);
+    // the open card's high-water advanced past its raise: the coalesced
+    // reoccurrences are marked folded on the card itself
+    const { body: refreshed } = await kbJson("/get", { id: mine[0].id });
+    expect(Number(refreshed?.meta?.breach_high_water ?? 0)).toBeGreaterThan(Number(mine[0].created_ts ?? 0));
+    await closeBreachCard(mine[0].id);
+    // after close: the coalesced events are already folded; one more
+    // rejection (fold trigger) must NOT resurrect the covered group
+    await rejectOnce(card.id);
+    mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(1); // the closed card only
+  });
+});
