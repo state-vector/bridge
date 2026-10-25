@@ -612,7 +612,12 @@ export class KnowledgeHub {
   }
 
   private computeAgentScores(): Array<{ label: string } & AgentSignals & ReturnType<typeof scoreAgent>> {
-    const windowTs = Date.now() - 7 * 24 * 60 * 60_000;
+    // Scoring windows (BR#3226): positive behavioural signals accrue over a
+    // 7-day window; watchdog penalties (abandonment, reassignment) are
+    // point-in-time incidents that decay after 48h so a past incident does
+    // not poison current behaviour scores (e.g. the 2026-10-22 outage era).
+    const weekTs = Date.now() - 7 * 24 * 60 * 60_000;
+    const recentTs = Date.now() - 48 * 60 * 60_000;
     const tokens = this.state.storage.sql.exec(
       `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`,
     ).toArray() as any[];
@@ -628,7 +633,7 @@ export class KnowledgeHub {
     for (const t of tokens) sig(t.label); // agents with no activity still get a row
     for (const p of this.state.storage.sql.exec(
       `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
-      windowTs,
+      weekTs,
     ).toArray() as any[]) {
       const s = sig(p.actor);
       const d = JSON.parse(p.data ?? "{}");
@@ -639,10 +644,10 @@ export class KnowledgeHub {
     for (const r of this.state.storage.sql.exec(
       `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
        WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
-      windowTs,
+      recentTs,
     ).toArray() as any[]) sig(r.owner || "unknown").abandoned += r.n;
     for (const r of this.state.storage.sql.exec(
-      `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`, windowTs,
+      `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`, recentTs,
     ).toArray() as any[]) {
       const d = JSON.parse(r.detail ?? "{}");
       sig(d.prev_owner || "unknown").reassigned++;
@@ -650,7 +655,7 @@ export class KnowledgeHub {
     for (const r of this.state.storage.sql.exec(
       `SELECT owner, COUNT(*) AS n FROM artefacts
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
-      windowTs,
+      weekTs,
     ).toArray() as any[]) sig(r.owner).artefacts_created += r.n;
     for (const t of tokens) {
       const s = sig(t.label);
@@ -659,11 +664,11 @@ export class KnowledgeHub {
       const marks = targets.map(() => "?").join(",");
       s.asks_received = this.one(
         `SELECT COUNT(*) AS n FROM asks WHERE status IN ('open','answered') AND from_label != ?
-         AND created_ts >= ? AND to_target IN (${marks})`, t.label, windowTs, ...targets,
+         AND created_ts >= ? AND to_target IN (${marks})`, t.label, weekTs, ...targets,
       )?.n ?? 0;
       s.asks_answered_on_time = this.one(
         `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
-         AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, windowTs,
+         AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, weekTs,
       )?.n ?? 0;
       // verification duty backlog: role:review agents carry the pool's stalled
       // verify rounds — each one is an implementer parked in in_review.
@@ -1313,7 +1318,12 @@ export class KnowledgeHub {
             const tm = JSON.parse(trow.meta ?? "{}");
             const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
             tm.verify_round = round;
-            tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+            const prevGauges = tm.last_progress ?? {};
+            tm.last_progress = {
+              note: `verify round ${round}: verdict ${verdict} UNCHANGED — auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now(),
+              completion_pct: prevGauges.completion_pct, confidence_pct: prevGauges.confidence_pct,
+              risk_pct: prevGauges.risk_pct, context_pct: prevGauges.context_pct,
+            };
             const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
             if (!alreadyRight) {
               // 3 identical rounds = the loop is stalled; park it for a human
@@ -1391,7 +1401,12 @@ export class KnowledgeHub {
       const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
       if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started — progress artefact logged" }, actor);
     }
-    tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+    const prevGauges = tmeta.last_progress ?? {};
+    tmeta.last_progress = {
+      note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session,
+      completion_pct: prevGauges.completion_pct, confidence_pct: prevGauges.confidence_pct,
+      risk_pct: prevGauges.risk_pct, context_pct: prevGauges.context_pct,
+    };
     delete tmeta.grace_until; // an artefact heartbeat means the agent is active — grace over
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2337,7 +2352,14 @@ export class KnowledgeHub {
     if (progressActor !== actor && this.isGatewayActor(actor)) {
       this.gatewayTouch(actor, progressActor); // gateway→agent edge (BR#2455)
     }
-    meta.last_progress = { note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
+    const prev = meta.last_progress ?? {};
+    meta.last_progress = {
+      note, will: will || undefined, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session,
+      completion_pct:  completion_pct  ?? prev.completion_pct,
+      confidence_pct:  confidence_pct  ?? prev.confidence_pct,
+      risk_pct:        risk_pct        ?? prev.risk_pct,
+      context_pct:     context_pct     ?? prev.context_pct,
+    };
     if (session && !meta.session) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
