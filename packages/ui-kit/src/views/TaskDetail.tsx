@@ -6,6 +6,7 @@ import { md, AskOptions, askKernel } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
 import { useKb } from "../server/kbStore";
+import { ClaimLocallyBtn } from "./claimLocally";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -368,6 +369,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
             }}>Reframe this</Btn>
           </>
         )}
+        <ClaimLocallyBtn task={task} ask={{ reason: ask.reason, options: ask.options as string[] | undefined, to: ask.to, from: ask.from }} />
       </div>
       {err && <p className="k-err">{err}</p>}
     </div>

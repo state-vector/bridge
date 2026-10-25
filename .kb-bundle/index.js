@@ -432,11 +432,12 @@ var init_core = __esm({
     DEFAULT_PROJECT = "Superpositional";
     __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
-1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
-2. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
-3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
-5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
+1. MERGE SWEEP (standing order BR#3033): drain open PRs BEFORE claiming work. For each open PR in the deployment's repos, oldest first (dependency order): require (a) base main green, (b) PR checks green \u2014 external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four \u2192 merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress. Any failed leg \u2192 DO NOT merge: conflicts \u2192 mechanical rebase + re-push (it re-enters the order next tick); red substance checks \u2192 bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551). The pile of unmerged PRs is the fleet's debt \u2014 sweep it every tick.
+2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
+3. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
+4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
@@ -3796,18 +3797,32 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const secret = generateAuthToken();
         const hash = await hashAuthToken(secret);
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const tags = JSON.stringify(["provisioned", `by:${caller}`]);
-        this.state.storage.sql.exec(
-          `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-          id,
-          label,
-          hash,
-          tags,
-          body.device_id ?? null,
-          body.principal ?? null,
-          ts
-        );
+        try {
+          this.state.storage.sql.exec(
+            `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
+            id,
+            label,
+            hash,
+            tags,
+            body.device_id ?? null,
+            body.principal ?? null,
+            ts
+          );
+        } catch (e) {
+          if (!String(e).includes("UNIQUE")) throw e;
+          const racer = this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label);
+          if (!racer) throw e;
+          this.state.storage.sql.exec(
+            `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+            hash,
+            tags,
+            racer.id
+          );
+          id = racer.id;
+          this.audit(caller, "rotate", label, { replaced: true, raced: true });
+        }
         const ws = this.wsSlug();
         if (ws) {
           const reg = this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
@@ -3863,15 +3878,29 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         } else {
           vended = principal || generateAuthToken();
           id = `at_${crypto.randomUUID().slice(0, 8)}`;
-          this.state.storage.sql.exec(
-            `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
-            id,
-            label,
-            hash,
-            mintTags,
-            vended,
-            Date.now()
-          );
+          try {
+            this.state.storage.sql.exec(
+              `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+              id,
+              label,
+              hash,
+              mintTags,
+              vended,
+              Date.now()
+            );
+          } catch (e) {
+            if (!String(e).includes("UNIQUE")) throw e;
+            const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
+            if (!racer) throw e;
+            this.state.storage.sql.exec(
+              `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+              hash,
+              mintTags,
+              racer.id
+            );
+            id = racer.id;
+            if (racer.principal) vended = racer.principal;
+          }
           await register(hash);
         }
         this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own });
@@ -3918,7 +3947,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const tags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
         const transport = TRANSPORTS.includes(body.transport) ? body.transport : "mcp";
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const ts = Date.now();
         this.state.storage.sql.exec(
           `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -4626,23 +4655,23 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "e9807d2aeb02677164abdcfd4c700bdd09cc0d2c", built_at: "2026-10-24T18:35:57Z" };
+    module.exports = { commit: "73e45b80344a52ab3858090155c082a5b471669f", built_at: "2026-10-25T00:16:07Z" };
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/webcrypto.js
+// ../../../../node_modules/jose/dist/browser/runtime/webcrypto.js
 var webcrypto_default, isCryptoKey;
 var init_webcrypto = __esm({
-  "../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
     webcrypto_default = crypto;
     isCryptoKey = /* @__PURE__ */ __name((key) => key instanceof CryptoKey, "isCryptoKey");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/digest.js
+// ../../../../node_modules/jose/dist/browser/runtime/digest.js
 var digest, digest_default;
 var init_digest = __esm({
-  "../../node_modules/jose/dist/browser/runtime/digest.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/digest.js"() {
     init_webcrypto();
     digest = /* @__PURE__ */ __name(async (algorithm, data) => {
       const subtleDigest = `SHA-${algorithm.slice(-3)}`;
@@ -4652,7 +4681,7 @@ var init_digest = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/buffer_utils.js
+// ../../../../node_modules/jose/dist/browser/lib/buffer_utils.js
 function concat(...buffers) {
   const size = buffers.reduce((acc, { length }) => acc + length, 0);
   const buf = new Uint8Array(size);
@@ -4702,7 +4731,7 @@ async function concatKdf(secret, bits, value) {
 }
 var encoder, decoder, MAX_INT32;
 var init_buffer_utils = __esm({
-  "../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
     init_digest();
     encoder = new TextEncoder();
     decoder = new TextDecoder();
@@ -4717,10 +4746,10 @@ var init_buffer_utils = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/base64url.js
+// ../../../../node_modules/jose/dist/browser/runtime/base64url.js
 var encodeBase64, encode, decodeBase64, decode;
 var init_base64url = __esm({
-  "../../node_modules/jose/dist/browser/runtime/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/base64url.js"() {
     init_buffer_utils();
     encodeBase64 = /* @__PURE__ */ __name((input) => {
       let unencoded = input;
@@ -4760,7 +4789,7 @@ var init_base64url = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/errors.js
+// ../../../../node_modules/jose/dist/browser/util/errors.js
 var errors_exports = {};
 __export(errors_exports, {
   JOSEAlgNotAllowed: () => JOSEAlgNotAllowed,
@@ -4781,7 +4810,7 @@ __export(errors_exports, {
 });
 var JOSEError, JWTClaimValidationFailed, JWTExpired, JOSEAlgNotAllowed, JOSENotSupported, JWEDecryptionFailed, JWEInvalid, JWSInvalid, JWTInvalid, JWKInvalid, JWKSInvalid, JWKSNoMatchingKey, JWKSMultipleMatchingKeys, JWKSTimeout, JWSSignatureVerificationFailed;
 var init_errors = __esm({
-  "../../node_modules/jose/dist/browser/util/errors.js"() {
+  "../../../../node_modules/jose/dist/browser/util/errors.js"() {
     JOSEError = class extends Error {
       static {
         __name(this, "JOSEError");
@@ -4943,16 +4972,16 @@ var init_errors = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/random.js
+// ../../../../node_modules/jose/dist/browser/runtime/random.js
 var random_default;
 var init_random = __esm({
-  "../../node_modules/jose/dist/browser/runtime/random.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/random.js"() {
     init_webcrypto();
     random_default = webcrypto_default.getRandomValues.bind(webcrypto_default);
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/iv.js
+// ../../../../node_modules/jose/dist/browser/lib/iv.js
 function bitLength(alg) {
   switch (alg) {
     case "A128GCM":
@@ -4972,7 +5001,7 @@ function bitLength(alg) {
 }
 var iv_default;
 var init_iv = __esm({
-  "../../node_modules/jose/dist/browser/lib/iv.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/iv.js"() {
     init_errors();
     init_random();
     __name(bitLength, "bitLength");
@@ -4980,10 +5009,10 @@ var init_iv = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_iv_length.js
+// ../../../../node_modules/jose/dist/browser/lib/check_iv_length.js
 var checkIvLength, check_iv_length_default;
 var init_check_iv_length = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
     init_errors();
     init_iv();
     checkIvLength = /* @__PURE__ */ __name((enc, iv) => {
@@ -4995,10 +5024,10 @@ var init_check_iv_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_cek_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js
 var checkCekLength, check_cek_length_default;
 var init_check_cek_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
     init_errors();
     checkCekLength = /* @__PURE__ */ __name((cek, expected) => {
       const actual = cek.byteLength << 3;
@@ -5010,10 +5039,10 @@ var init_check_cek_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
+// ../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
 var timingSafeEqual, timing_safe_equal_default;
 var init_timing_safe_equal = __esm({
-  "../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
     timingSafeEqual = /* @__PURE__ */ __name((a, b) => {
       if (!(a instanceof Uint8Array)) {
         throw new TypeError("First argument must be a buffer");
@@ -5036,7 +5065,7 @@ var init_timing_safe_equal = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/crypto_key.js
+// ../../../../node_modules/jose/dist/browser/lib/crypto_key.js
 function unusable(name, prop = "algorithm.name") {
   return new TypeError(`CryptoKey does not support this operation, its ${prop} must be ${name}`);
 }
@@ -5193,7 +5222,7 @@ function checkEncCryptoKey(key, alg, ...usages) {
   checkUsage(key, usages);
 }
 var init_crypto_key = __esm({
-  "../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
     __name(unusable, "unusable");
     __name(isAlgorithm, "isAlgorithm");
     __name(getHashLength, "getHashLength");
@@ -5204,7 +5233,7 @@ var init_crypto_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/invalid_key_input.js
+// ../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js
 function message(msg, actual, ...types2) {
   types2 = types2.filter(Boolean);
   if (types2.length > 2) {
@@ -5231,7 +5260,7 @@ function withAlg(alg, actual, ...types2) {
 }
 var invalid_key_input_default;
 var init_invalid_key_input = __esm({
-  "../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
     __name(message, "message");
     invalid_key_input_default = /* @__PURE__ */ __name((actual, ...types2) => {
       return message("Key must be ", actual, ...types2);
@@ -5240,10 +5269,10 @@ var init_invalid_key_input = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/is_key_like.js
+// ../../../../node_modules/jose/dist/browser/runtime/is_key_like.js
 var is_key_like_default, types;
 var init_is_key_like = __esm({
-  "../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
     init_webcrypto();
     is_key_like_default = /* @__PURE__ */ __name((key) => {
       if (isCryptoKey(key)) {
@@ -5255,7 +5284,7 @@ var init_is_key_like = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/decrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/decrypt.js
 async function cbcDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -5307,7 +5336,7 @@ async function gcmDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
 }
 var decrypt, decrypt_default;
 var init_decrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -5351,10 +5380,10 @@ var init_decrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_disjoint.js
+// ../../../../node_modules/jose/dist/browser/lib/is_disjoint.js
 var isDisjoint, is_disjoint_default;
 var init_is_disjoint = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
     isDisjoint = /* @__PURE__ */ __name((...headers) => {
       const sources = headers.filter(Boolean);
       if (sources.length === 0 || sources.length === 1) {
@@ -5380,7 +5409,7 @@ var init_is_disjoint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_object.js
+// ../../../../node_modules/jose/dist/browser/lib/is_object.js
 function isObjectLike(value) {
   return typeof value === "object" && value !== null;
 }
@@ -5398,16 +5427,16 @@ function isObject(input) {
   return Object.getPrototypeOf(input) === proto;
 }
 var init_is_object = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_object.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_object.js"() {
     __name(isObjectLike, "isObjectLike");
     __name(isObject, "isObject");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/bogus.js
+// ../../../../node_modules/jose/dist/browser/runtime/bogus.js
 var bogusWebCrypto, bogus_default;
 var init_bogus = __esm({
-  "../../node_modules/jose/dist/browser/runtime/bogus.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/bogus.js"() {
     bogusWebCrypto = [
       { hash: "SHA-256", name: "HMAC" },
       true,
@@ -5417,7 +5446,7 @@ var init_bogus = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/aeskw.js
+// ../../../../node_modules/jose/dist/browser/runtime/aeskw.js
 function checkKeySize(key, alg) {
   if (key.algorithm.length !== parseInt(alg.slice(1, 4), 10)) {
     throw new TypeError(`Invalid key size for alg: ${alg}`);
@@ -5435,7 +5464,7 @@ function getCryptoKey(key, alg, usage) {
 }
 var wrap, unwrap;
 var init_aeskw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
     init_bogus();
     init_webcrypto();
     init_crypto_key();
@@ -5458,7 +5487,7 @@ var init_aeskw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/ecdhes.js
+// ../../../../node_modules/jose/dist/browser/runtime/ecdhes.js
 async function deriveKey(publicKey, privateKey, algorithm, keyLength, apu = new Uint8Array(0), apv = new Uint8Array(0)) {
   if (!isCryptoKey(publicKey)) {
     throw new TypeError(invalid_key_input_default(publicKey, ...types));
@@ -5496,7 +5525,7 @@ function ecdhAllowed(key) {
   return ["P-256", "P-384", "P-521"].includes(key.algorithm.namedCurve) || key.algorithm.name === "X25519" || key.algorithm.name === "X448";
 }
 var init_ecdhes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
     init_buffer_utils();
     init_webcrypto();
     init_crypto_key();
@@ -5508,20 +5537,20 @@ var init_ecdhes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_p2s.js
+// ../../../../node_modules/jose/dist/browser/lib/check_p2s.js
 function checkP2s(p2s2) {
   if (!(p2s2 instanceof Uint8Array) || p2s2.length < 8) {
     throw new JWEInvalid("PBES2 Salt Input must be 8 or more octets");
   }
 }
 var init_check_p2s = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
     init_errors();
     __name(checkP2s, "checkP2s");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/pbes2kw.js
+// ../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js
 function getCryptoKey2(key, alg) {
   if (key instanceof Uint8Array) {
     return webcrypto_default.subtle.importKey("raw", key, "PBKDF2", false, ["deriveBits"]);
@@ -5557,7 +5586,7 @@ async function deriveKey2(p2s2, alg, p2c, key) {
 }
 var encrypt, decrypt2;
 var init_pbes2kw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
     init_random();
     init_buffer_utils();
     init_base64url();
@@ -5581,7 +5610,7 @@ var init_pbes2kw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
 function subtleRsaEs(alg) {
   switch (alg) {
     case "RSA-OAEP":
@@ -5594,16 +5623,16 @@ function subtleRsaEs(alg) {
   }
 }
 var init_subtle_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
     init_errors();
     __name(subtleRsaEs, "subtleRsaEs");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_key_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_key_length.js
 var check_key_length_default;
 var init_check_key_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
     check_key_length_default = /* @__PURE__ */ __name((alg, key) => {
       if (alg.startsWith("RS") || alg.startsWith("PS")) {
         const { modulusLength } = key.algorithm;
@@ -5615,10 +5644,10 @@ var init_check_key_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/rsaes.js
 var encrypt2, decrypt3;
 var init_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
     init_subtle_rsaes();
     init_bogus();
     init_webcrypto();
@@ -5659,7 +5688,7 @@ var init_rsaes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_jwk.js
+// ../../../../node_modules/jose/dist/browser/lib/is_jwk.js
 function isJWK(key) {
   return isObject(key) && typeof key.kty === "string";
 }
@@ -5673,7 +5702,7 @@ function isSecretJWK(key) {
   return isJWK(key) && key.kty === "oct" && typeof key.k === "string";
 }
 var init_is_jwk = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
     init_is_object();
     __name(isJWK, "isJWK");
     __name(isPrivateJWK, "isPrivateJWK");
@@ -5682,7 +5711,7 @@ var init_is_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
 function subtleMapping(jwk) {
   let algorithm;
   let keyUsages;
@@ -5771,7 +5800,7 @@ function subtleMapping(jwk) {
 }
 var parse, jwk_to_key_default;
 var init_jwk_to_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
     init_webcrypto();
     init_errors();
     __name(subtleMapping, "subtleMapping");
@@ -5794,10 +5823,10 @@ var init_jwk_to_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/normalize_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/normalize_key.js
 var exportKeyValue, privCache, pubCache, isKeyObject, importAndCache, normalizePublicKey, normalizePrivateKey, normalize_key_default;
 var init_normalize_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
     init_is_jwk();
     init_base64url();
     init_jwk_to_key();
@@ -5866,7 +5895,7 @@ var init_normalize_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/cek.js
+// ../../../../node_modules/jose/dist/browser/lib/cek.js
 function bitLength2(alg) {
   switch (alg) {
     case "A128GCM":
@@ -5886,7 +5915,7 @@ function bitLength2(alg) {
 }
 var cek_default;
 var init_cek = __esm({
-  "../../node_modules/jose/dist/browser/lib/cek.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/cek.js"() {
     init_errors();
     init_random();
     __name(bitLength2, "bitLength");
@@ -5894,10 +5923,10 @@ var init_cek = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/format_pem.js
+// ../../../../node_modules/jose/dist/browser/lib/format_pem.js
 var format_pem_default;
 var init_format_pem = __esm({
-  "../../node_modules/jose/dist/browser/lib/format_pem.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/format_pem.js"() {
     format_pem_default = /* @__PURE__ */ __name((b64, descriptor) => {
       const newlined = (b64.match(/.{1,64}/g) || []).join("\n");
       return `-----BEGIN ${descriptor}-----
@@ -5907,7 +5936,7 @@ ${newlined}
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/asn1.js
+// ../../../../node_modules/jose/dist/browser/runtime/asn1.js
 function getElement(seq) {
   const result = [];
   let next = 0;
@@ -5976,7 +6005,7 @@ function getSPKI(x509) {
 }
 var genericExport, toSPKI, toPKCS8, findOid, getNamedCurve2, genericImport, fromPKCS8, fromSPKI, fromX509;
 var init_asn1 = __esm({
-  "../../node_modules/jose/dist/browser/runtime/asn1.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/asn1.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -6118,7 +6147,7 @@ var init_asn1 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/import.js
+// ../../../../node_modules/jose/dist/browser/key/import.js
 async function importSPKI(spki, alg, options) {
   if (typeof spki !== "string" || spki.indexOf("-----BEGIN PUBLIC KEY-----") !== 0) {
     throw new TypeError('"spki" must be SPKI formatted string');
@@ -6160,7 +6189,7 @@ async function importJWK(jwk, alg) {
   }
 }
 var init_import = __esm({
-  "../../node_modules/jose/dist/browser/key/import.js"() {
+  "../../../../node_modules/jose/dist/browser/key/import.js"() {
     init_base64url();
     init_asn1();
     init_jwk_to_key();
@@ -6173,7 +6202,7 @@ var init_import = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_key_type.js
+// ../../../../node_modules/jose/dist/browser/lib/check_key_type.js
 function checkKeyType(allowJwk, alg, key, usage) {
   const symmetric = alg.startsWith("HS") || alg === "dir" || alg.startsWith("PBES2") || /^A\d{3}(?:GCM)?KW$/.test(alg);
   if (symmetric) {
@@ -6184,7 +6213,7 @@ function checkKeyType(allowJwk, alg, key, usage) {
 }
 var tag, jwkMatchesOp, symmetricTypeCheck, asymmetricTypeCheck, check_key_type_default, checkKeyTypeWithJwk;
 var init_check_key_type = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
     init_invalid_key_input();
     init_is_key_like();
     init_is_jwk();
@@ -6254,7 +6283,7 @@ var init_check_key_type = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/encrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/encrypt.js
 async function cbcEncrypt(enc, plaintext, cek, iv, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -6293,7 +6322,7 @@ async function gcmEncrypt(enc, plaintext, cek, iv, aad) {
 }
 var encrypt3, encrypt_default;
 var init_encrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -6337,7 +6366,7 @@ var init_encrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/aesgcmkw.js
+// ../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js
 async function wrap2(alg, key, cek, iv) {
   const jweAlgorithm = alg.slice(0, 7);
   const wrapped = await encrypt_default(jweAlgorithm, cek, key, iv, new Uint8Array(0));
@@ -6352,7 +6381,7 @@ async function unwrap2(alg, key, encryptedKey, iv, tag2) {
   return decrypt_default(jweAlgorithm, key, encryptedKey, iv, tag2, new Uint8Array(0));
 }
 var init_aesgcmkw = __esm({
-  "../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
     init_encrypt();
     init_decrypt();
     init_base64url();
@@ -6361,7 +6390,7 @@ var init_aesgcmkw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
 async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options) {
   check_key_type_default(alg, key, "decrypt");
   key = await normalize_key_default.normalizePrivateKey?.(key, alg) || key;
@@ -6475,7 +6504,7 @@ async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options)
 }
 var decrypt_key_management_default;
 var init_decrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -6493,7 +6522,7 @@ var init_decrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_crit.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_crit.js
 function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader, joseHeader) {
   if (joseHeader.crit !== void 0 && protectedHeader?.crit === void 0) {
     throw new Err('"crit" (Critical) Header Parameter MUST be integrity protected');
@@ -6525,17 +6554,17 @@ function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader,
 }
 var validate_crit_default;
 var init_validate_crit = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
     init_errors();
     __name(validateCrit, "validateCrit");
     validate_crit_default = validateCrit;
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_algorithms.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js
 var validateAlgorithms, validate_algorithms_default;
 var init_validate_algorithms = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
     validateAlgorithms = /* @__PURE__ */ __name((option, algorithms) => {
       if (algorithms !== void 0 && (!Array.isArray(algorithms) || algorithms.some((s) => typeof s !== "string"))) {
         throw new TypeError(`"${option}" option must be an array of strings`);
@@ -6549,7 +6578,7 @@ var init_validate_algorithms = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
 async function flattenedDecrypt(jwe, key, options) {
   if (!isObject(jwe)) {
     throw new JWEInvalid("Flattened JWE must be an object");
@@ -6692,7 +6721,7 @@ async function flattenedDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
     init_base64url();
     init_decrypt();
     init_errors();
@@ -6707,7 +6736,7 @@ var init_decrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
 async function compactDecrypt(jwe, key, options) {
   if (jwe instanceof Uint8Array) {
     jwe = decoder.decode(jwe);
@@ -6733,7 +6762,7 @@ async function compactDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
     init_decrypt2();
     init_errors();
     init_buffer_utils();
@@ -6741,7 +6770,7 @@ var init_decrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js
 async function generalDecrypt(jwe, key, options) {
   if (!isObject(jwe)) {
     throw new JWEInvalid("General JWE must be an object");
@@ -6770,7 +6799,7 @@ async function generalDecrypt(jwe, key, options) {
   throw new JWEDecryptionFailed();
 }
 var init_decrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
     init_decrypt2();
     init_errors();
     init_is_object();
@@ -6778,18 +6807,18 @@ var init_decrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/private_symbols.js
+// ../../../../node_modules/jose/dist/browser/lib/private_symbols.js
 var unprotected;
 var init_private_symbols = __esm({
-  "../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
     unprotected = /* @__PURE__ */ Symbol();
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
+// ../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
 var keyToJWK, key_to_jwk_default;
 var init_key_to_jwk = __esm({
-  "../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -6814,7 +6843,7 @@ var init_key_to_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/export.js
+// ../../../../node_modules/jose/dist/browser/key/export.js
 async function exportSPKI(key) {
   return toSPKI(key);
 }
@@ -6825,7 +6854,7 @@ async function exportJWK(key) {
   return key_to_jwk_default(key);
 }
 var init_export = __esm({
-  "../../node_modules/jose/dist/browser/key/export.js"() {
+  "../../../../node_modules/jose/dist/browser/key/export.js"() {
     init_asn1();
     init_asn1();
     init_key_to_jwk();
@@ -6835,7 +6864,7 @@ var init_export = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
 async function encryptKeyManagement(alg, enc, key, providedCek, providedParameters = {}) {
   let encryptedKey;
   let parameters;
@@ -6915,7 +6944,7 @@ async function encryptKeyManagement(alg, enc, key, providedCek, providedParamete
 }
 var encrypt_key_management_default;
 var init_encrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -6932,10 +6961,10 @@ var init_encrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
 var FlattenedEncrypt;
 var init_encrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
     init_base64url();
     init_private_symbols();
     init_encrypt();
@@ -7090,10 +7119,10 @@ var init_encrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js
 var IndividualRecipient, GeneralEncrypt;
 var init_encrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
     init_encrypt2();
     init_private_symbols();
     init_errors();
@@ -7262,7 +7291,7 @@ var init_encrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
 function subtleDsa(alg, algorithm) {
   const hash = `SHA-${alg.slice(-3)}`;
   switch (alg) {
@@ -7291,13 +7320,13 @@ function subtleDsa(alg, algorithm) {
   }
 }
 var init_subtle_dsa = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
     init_errors();
     __name(subtleDsa, "subtleDsa");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
 async function getCryptoKey3(alg, key, usage) {
   if (usage === "sign") {
     key = await normalize_key_default.normalizePrivateKey(key, alg);
@@ -7318,7 +7347,7 @@ async function getCryptoKey3(alg, key, usage) {
   throw new TypeError(invalid_key_input_default(key, ...types, "Uint8Array", "JSON Web Key"));
 }
 var init_get_sign_verify_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
     init_webcrypto();
     init_crypto_key();
     init_invalid_key_input();
@@ -7328,10 +7357,10 @@ var init_get_sign_verify_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/verify.js
+// ../../../../node_modules/jose/dist/browser/runtime/verify.js
 var verify, verify_default;
 var init_verify = __esm({
-  "../../node_modules/jose/dist/browser/runtime/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/verify.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -7350,7 +7379,7 @@ var init_verify = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/verify.js
 async function flattenedVerify(jws, key, options) {
   if (!isObject(jws)) {
     throw new JWSInvalid("Flattened JWS must be an object");
@@ -7456,7 +7485,7 @@ async function flattenedVerify(jws, key, options) {
   return result;
 }
 var init_verify2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
     init_base64url();
     init_verify();
     init_errors();
@@ -7472,7 +7501,7 @@ var init_verify2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/verify.js
 async function compactVerify(jws, key, options) {
   if (jws instanceof Uint8Array) {
     jws = decoder.decode(jws);
@@ -7492,7 +7521,7 @@ async function compactVerify(jws, key, options) {
   return result;
 }
 var init_verify3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
     init_verify2();
     init_errors();
     init_buffer_utils();
@@ -7500,7 +7529,7 @@ var init_verify3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/general/verify.js
 async function generalVerify(jws, key, options) {
   if (!isObject(jws)) {
     throw new JWSInvalid("General JWS must be an object");
@@ -7522,7 +7551,7 @@ async function generalVerify(jws, key, options) {
   throw new JWSSignatureVerificationFailed();
 }
 var init_verify4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/verify.js"() {
     init_verify2();
     init_errors();
     init_is_object();
@@ -7530,18 +7559,18 @@ var init_verify4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/epoch.js
+// ../../../../node_modules/jose/dist/browser/lib/epoch.js
 var epoch_default;
 var init_epoch = __esm({
-  "../../node_modules/jose/dist/browser/lib/epoch.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/epoch.js"() {
     epoch_default = /* @__PURE__ */ __name((date) => Math.floor(date.getTime() / 1e3), "default");
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/secs.js
+// ../../../../node_modules/jose/dist/browser/lib/secs.js
 var minute, hour, day, week, year, REGEX, secs_default;
 var init_secs = __esm({
-  "../../node_modules/jose/dist/browser/lib/secs.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/secs.js"() {
     minute = 60;
     hour = minute * 60;
     day = hour * 24;
@@ -7600,10 +7629,10 @@ var init_secs = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
+// ../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
 var normalizeTyp, checkAudiencePresence, jwt_claims_set_default;
 var init_jwt_claims_set = __esm({
-  "../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
     init_errors();
     init_buffer_utils();
     init_epoch();
@@ -7706,7 +7735,7 @@ var init_jwt_claims_set = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/verify.js
+// ../../../../node_modules/jose/dist/browser/jwt/verify.js
 async function jwtVerify(jwt, key, options) {
   const verified = await compactVerify(jwt, key, options);
   if (verified.protectedHeader.crit?.includes("b64") && verified.protectedHeader.b64 === false) {
@@ -7720,7 +7749,7 @@ async function jwtVerify(jwt, key, options) {
   return result;
 }
 var init_verify5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/verify.js"() {
     init_verify3();
     init_jwt_claims_set();
     init_errors();
@@ -7728,7 +7757,7 @@ var init_verify5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/decrypt.js
 async function jwtDecrypt(jwt, key, options) {
   const decrypted = await compactDecrypt(jwt, key, options);
   const payload = jwt_claims_set_default(decrypted.protectedHeader, decrypted.plaintext, options);
@@ -7749,7 +7778,7 @@ async function jwtDecrypt(jwt, key, options) {
   return result;
 }
 var init_decrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
     init_decrypt3();
     init_jwt_claims_set();
     init_errors();
@@ -7757,10 +7786,10 @@ var init_decrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
 var CompactEncrypt;
 var init_encrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
     init_encrypt2();
     CompactEncrypt = class {
       static {
@@ -7793,10 +7822,10 @@ var init_encrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/sign.js
+// ../../../../node_modules/jose/dist/browser/runtime/sign.js
 var sign, sign_default;
 var init_sign = __esm({
-  "../../node_modules/jose/dist/browser/runtime/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/sign.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -7811,10 +7840,10 @@ var init_sign = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/sign.js
 var FlattenedSign;
 var init_sign2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
     init_base64url();
     init_sign();
     init_is_disjoint();
@@ -7901,10 +7930,10 @@ var init_sign2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/sign.js
 var CompactSign;
 var init_sign3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
     init_sign2();
     CompactSign = class {
       static {
@@ -7928,10 +7957,10 @@ var init_sign3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/general/sign.js
 var IndividualSignature, GeneralSign;
 var init_sign4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/sign.js"() {
     init_sign2();
     init_errors();
     IndividualSignature = class {
@@ -8007,7 +8036,7 @@ var init_sign4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/produce.js
+// ../../../../node_modules/jose/dist/browser/jwt/produce.js
 function validateInput(label, input) {
   if (!Number.isFinite(input)) {
     throw new TypeError(`Invalid ${label} input`);
@@ -8016,7 +8045,7 @@ function validateInput(label, input) {
 }
 var ProduceJWT;
 var init_produce = __esm({
-  "../../node_modules/jose/dist/browser/jwt/produce.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/produce.js"() {
     init_epoch();
     init_is_object();
     init_secs();
@@ -8086,10 +8115,10 @@ var init_produce = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/sign.js
+// ../../../../node_modules/jose/dist/browser/jwt/sign.js
 var SignJWT;
 var init_sign5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/sign.js"() {
     init_sign3();
     init_errors();
     init_buffer_utils();
@@ -8114,10 +8143,10 @@ var init_sign5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/encrypt.js
 var EncryptJWT;
 var init_encrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
     init_encrypt4();
     init_buffer_utils();
     init_produce();
@@ -8192,7 +8221,7 @@ var init_encrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/thumbprint.js
+// ../../../../node_modules/jose/dist/browser/jwk/thumbprint.js
 async function calculateJwkThumbprint(jwk, digestAlgorithm) {
   if (!isObject(jwk)) {
     throw new TypeError("JWK must be an object");
@@ -8236,7 +8265,7 @@ async function calculateJwkThumbprintUri(jwk, digestAlgorithm) {
 }
 var check2;
 var init_thumbprint = __esm({
-  "../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
     init_digest();
     init_base64url();
     init_errors();
@@ -8252,7 +8281,7 @@ var init_thumbprint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/embedded.js
+// ../../../../node_modules/jose/dist/browser/jwk/embedded.js
 async function EmbeddedJWK(protectedHeader, token) {
   const joseHeader = {
     ...protectedHeader,
@@ -8268,7 +8297,7 @@ async function EmbeddedJWK(protectedHeader, token) {
   return key;
 }
 var init_embedded = __esm({
-  "../../node_modules/jose/dist/browser/jwk/embedded.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/embedded.js"() {
     init_import();
     init_is_object();
     init_errors();
@@ -8276,7 +8305,7 @@ var init_embedded = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/local.js
+// ../../../../node_modules/jose/dist/browser/jwks/local.js
 function getKtyFromAlg(alg) {
   switch (typeof alg === "string" && alg.slice(0, 2)) {
     case "RS":
@@ -8328,7 +8357,7 @@ function createLocalJWKSet(jwks) {
 }
 var LocalJWKSet;
 var init_local = __esm({
-  "../../node_modules/jose/dist/browser/jwks/local.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/local.js"() {
     init_import();
     init_errors();
     init_is_object();
@@ -8413,10 +8442,10 @@ var init_local = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
+// ../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
 var fetchJwks, fetch_jwks_default;
 var init_fetch_jwks = __esm({
-  "../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
     init_errors();
     fetchJwks = /* @__PURE__ */ __name(async (url, timeout, options) => {
       let controller;
@@ -8453,7 +8482,7 @@ var init_fetch_jwks = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/remote.js
+// ../../../../node_modules/jose/dist/browser/jwks/remote.js
 function isCloudflareWorkers() {
   return typeof WebSocketPair !== "undefined" || typeof navigator !== "undefined" && true || typeof EdgeRuntime !== "undefined" && EdgeRuntime === "vercel";
 }
@@ -8505,7 +8534,7 @@ function createRemoteJWKSet(url, options) {
 }
 var USER_AGENT, jwksCache, RemoteJWKSet, experimental_jwksCache;
 var init_remote = __esm({
-  "../../node_modules/jose/dist/browser/jwks/remote.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/remote.js"() {
     init_fetch_jwks();
     init_errors();
     init_local();
@@ -8590,10 +8619,10 @@ var init_remote = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/unsecured.js
+// ../../../../node_modules/jose/dist/browser/jwt/unsecured.js
 var UnsecuredJWT;
 var init_unsecured = __esm({
-  "../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
     init_base64url();
     init_buffer_utils();
     init_errors();
@@ -8631,7 +8660,7 @@ var init_unsecured = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/base64url.js
+// ../../../../node_modules/jose/dist/browser/util/base64url.js
 var base64url_exports2 = {};
 __export(base64url_exports2, {
   decode: () => decode2,
@@ -8639,14 +8668,14 @@ __export(base64url_exports2, {
 });
 var encode2, decode2;
 var init_base64url2 = __esm({
-  "../../node_modules/jose/dist/browser/util/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/util/base64url.js"() {
     init_base64url();
     encode2 = encode;
     decode2 = decode;
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_protected_header.js
+// ../../../../node_modules/jose/dist/browser/util/decode_protected_header.js
 function decodeProtectedHeader(token) {
   let protectedB64u;
   if (typeof token === "string") {
@@ -8676,7 +8705,7 @@ function decodeProtectedHeader(token) {
   }
 }
 var init_decode_protected_header = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -8684,7 +8713,7 @@ var init_decode_protected_header = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_jwt.js
+// ../../../../node_modules/jose/dist/browser/util/decode_jwt.js
 function decodeJwt(jwt) {
   if (typeof jwt !== "string")
     throw new JWTInvalid("JWTs must use Compact JWS serialization, JWT must be a string");
@@ -8712,7 +8741,7 @@ function decodeJwt(jwt) {
   return result;
 }
 var init_decode_jwt = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -8721,7 +8750,7 @@ var init_decode_jwt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/generate.js
+// ../../../../node_modules/jose/dist/browser/runtime/generate.js
 async function generateSecret(alg, options) {
   let length;
   let algorithm;
@@ -8863,7 +8892,7 @@ async function generateKeyPair(alg, options) {
   return webcrypto_default.subtle.generateKey(algorithm, options?.extractable ?? false, keyUsages);
 }
 var init_generate = __esm({
-  "../../node_modules/jose/dist/browser/runtime/generate.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/generate.js"() {
     init_webcrypto();
     init_errors();
     init_random();
@@ -8873,46 +8902,46 @@ var init_generate = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_key_pair.js
+// ../../../../node_modules/jose/dist/browser/key/generate_key_pair.js
 async function generateKeyPair2(alg, options) {
   return generateKeyPair(alg, options);
 }
 var init_generate_key_pair = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
     init_generate();
     __name(generateKeyPair2, "generateKeyPair");
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_secret.js
+// ../../../../node_modules/jose/dist/browser/key/generate_secret.js
 async function generateSecret2(alg, options) {
   return generateSecret(alg, options);
 }
 var init_generate_secret = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_secret.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_secret.js"() {
     init_generate();
     __name(generateSecret2, "generateSecret");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/runtime.js
+// ../../../../node_modules/jose/dist/browser/runtime/runtime.js
 var runtime_default;
 var init_runtime = __esm({
-  "../../node_modules/jose/dist/browser/runtime/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/runtime.js"() {
     runtime_default = "WebCryptoAPI";
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/runtime.js
+// ../../../../node_modules/jose/dist/browser/util/runtime.js
 var runtime_default2;
 var init_runtime2 = __esm({
-  "../../node_modules/jose/dist/browser/util/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/util/runtime.js"() {
     init_runtime();
     runtime_default2 = runtime_default;
   }
 });
 
-// ../../node_modules/jose/dist/browser/index.js
+// ../../../../node_modules/jose/dist/browser/index.js
 var browser_exports = {};
 __export(browser_exports, {
   CompactEncrypt: () => CompactEncrypt,
@@ -8955,7 +8984,7 @@ __export(browser_exports, {
   jwtVerify: () => jwtVerify
 });
 var init_browser = __esm({
-  "../../node_modules/jose/dist/browser/index.js"() {
+  "../../../../node_modules/jose/dist/browser/index.js"() {
     init_decrypt3();
     init_decrypt2();
     init_decrypt4();
@@ -9475,7 +9504,7 @@ var index_default = {
       const auth2 = await checkAuth(request, env);
       if (auth2 instanceof Response) return auth2;
       const body = await request.json().catch(() => ({}));
-      body.actor = "web";
+      body.actor = `web:${auth2.login ?? "anon"}`;
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",
@@ -9506,7 +9535,7 @@ var index_default = {
       if (request.method === "POST") {
         if (sub === "ask_reframe" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -9515,7 +9544,7 @@ var index_default = {
         }
         if (sub === "purge_smoke" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -9525,7 +9554,7 @@ var index_default = {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = auth2.bearer ? "gateway" : "web";
+        body.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
         return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
