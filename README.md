@@ -400,6 +400,9 @@ the accepted verify verdict citing that head, the owning agent **session**, and 
   = honest 404 "no bridge provenance"; merges with no bridge task are recorded as absence — itself a signal.
   The verdict leg is honest too (BR#3307): when no accepted decision cites the head sha (human merges,
   older merges), `verdict_id` is recorded `null` — never an arbitrary stale verdict.
+- **Absence renders explicitly** (BR#3287 spec item 3): a Top row with nothing stamped carries a
+  muted "no bridge provenance" chip — untracked merge, non-bridge work, or not yet swept. Absence
+  is a rendered state, never silence.
 - **GitHub mirror is derived and non-authoritative**: the sweep best-effort adds a `bridge:BR-<id>`
   label; nothing machine-facing reads it back.
 - Consumers: the red-main guilty-agent attribution loop (BR#3284), humans auditing who landed what,
