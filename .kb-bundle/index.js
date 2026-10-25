@@ -432,11 +432,12 @@ var init_core = __esm({
     DEFAULT_PROJECT = "Superpositional";
     __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
-1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
-2. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
-3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
-5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
+1. MERGE SWEEP (standing order BR#3033): drain open PRs BEFORE claiming work. For each open PR in the deployment's repos, oldest first (dependency order): require (a) base main green, (b) PR checks green \u2014 external Cloudflare/workers-builds checks are exempt (BR#2267), (c) every commit GitHub-verified, (d) mergeable MERGEABLE/CLEAN (UNKNOWN = not yet, skip this tick). All four \u2192 merge and log the merge receipt (merge sha + run ids) on the linked BR# card via log_progress. Any failed leg \u2192 DO NOT merge: conflicts \u2192 mechanical rebase + re-push (it re-enters the order next tick); red substance checks \u2192 bounce the linked card to in_progress naming the failure; never merge onto red main (BR#551). The pile of unmerged PRs is the fleet's debt \u2014 sweep it every tick.
+2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
+3. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
+4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
@@ -1869,7 +1870,17 @@ var init_do = __esm({
                 const tm = JSON.parse(trow.meta ?? "{}");
                 const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
                 tm.verify_round = round;
-                tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED \u2014 auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+                const tmPrevProgress = tm.last_progress ?? {};
+                tm.last_progress = {
+                  note: `verify round ${round}: verdict ${verdict} UNCHANGED \u2014 auto-applied, no new decision card`,
+                  sentiment: "neutral",
+                  actor,
+                  ts: Date.now(),
+                  completion_pct: tmPrevProgress.completion_pct,
+                  confidence_pct: tmPrevProgress.confidence_pct,
+                  risk_pct: tmPrevProgress.risk_pct,
+                  context_pct: tmPrevProgress.context_pct
+                };
                 const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
                 if (!alreadyRight) {
                   if (round >= 3) {
@@ -1957,7 +1968,18 @@ ${bodyMd.trim()}`.trim();
           const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
           if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started \u2014 progress artefact logged" }, actor);
         }
-        tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+        const tPrevProgress = tmeta.last_progress ?? {};
+        tmeta.last_progress = {
+          note: title.slice(0, 200),
+          sentiment: "neutral",
+          actor,
+          ts: Date.now(),
+          session: tmeta.session,
+          completion_pct: tPrevProgress.completion_pct,
+          confidence_pct: tPrevProgress.confidence_pct,
+          risk_pct: tPrevProgress.risk_pct,
+          context_pct: tPrevProgress.context_pct
+        };
         delete tmeta.grace_until;
         this.state.storage.sql.exec(
           `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2862,7 +2884,19 @@ ${m.bootstrap_md}` : "") + scoreLine;
         if (progressActor !== actor && this.isGatewayActor(actor)) {
           this.gatewayTouch(actor, progressActor);
         }
-        meta.last_progress = { note, will: will || void 0, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta.session, completion_pct, confidence_pct, risk_pct, context_pct };
+        const prevProgress = meta.last_progress ?? {};
+        meta.last_progress = {
+          note,
+          will: will || void 0,
+          sentiment,
+          actor: progressActor,
+          ts: Date.now(),
+          session: session ?? meta.session,
+          completion_pct: completion_pct ?? prevProgress.completion_pct,
+          confidence_pct: confidence_pct ?? prevProgress.confidence_pct,
+          risk_pct: risk_pct ?? prevProgress.risk_pct,
+          context_pct: context_pct ?? prevProgress.context_pct
+        };
         if (session && !meta.session) meta.session = session;
         this.state.storage.sql.exec(
           `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -3796,18 +3830,32 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const secret = generateAuthToken();
         const hash = await hashAuthToken(secret);
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const tags = JSON.stringify(["provisioned", `by:${caller}`]);
-        this.state.storage.sql.exec(
-          `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-          id,
-          label,
-          hash,
-          tags,
-          body.device_id ?? null,
-          body.principal ?? null,
-          ts
-        );
+        try {
+          this.state.storage.sql.exec(
+            `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
+            id,
+            label,
+            hash,
+            tags,
+            body.device_id ?? null,
+            body.principal ?? null,
+            ts
+          );
+        } catch (e) {
+          if (!String(e).includes("UNIQUE")) throw e;
+          const racer = this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label);
+          if (!racer) throw e;
+          this.state.storage.sql.exec(
+            `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+            hash,
+            tags,
+            racer.id
+          );
+          id = racer.id;
+          this.audit(caller, "rotate", label, { replaced: true, raced: true });
+        }
         const ws = this.wsSlug();
         if (ws) {
           const reg = this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
@@ -3863,15 +3911,29 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         } else {
           vended = principal || generateAuthToken();
           id = `at_${crypto.randomUUID().slice(0, 8)}`;
-          this.state.storage.sql.exec(
-            `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
-            id,
-            label,
-            hash,
-            mintTags,
-            vended,
-            Date.now()
-          );
+          try {
+            this.state.storage.sql.exec(
+              `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+              id,
+              label,
+              hash,
+              mintTags,
+              vended,
+              Date.now()
+            );
+          } catch (e) {
+            if (!String(e).includes("UNIQUE")) throw e;
+            const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
+            if (!racer) throw e;
+            this.state.storage.sql.exec(
+              `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+              hash,
+              mintTags,
+              racer.id
+            );
+            id = racer.id;
+            if (racer.principal) vended = racer.principal;
+          }
           await register(hash);
         }
         this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own });
@@ -3918,7 +3980,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const tags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
         const transport = TRANSPORTS.includes(body.transport) ? body.transport : "mcp";
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const ts = Date.now();
         this.state.storage.sql.exec(
           `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -4626,7 +4688,7 @@ var init_mcp = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "e9807d2aeb02677164abdcfd4c700bdd09cc0d2c", built_at: "2026-10-24T18:35:57Z" };
+    module.exports = { commit: "6d6f2eca6e336088c12f79995dffde378cedaf06", built_at: "2026-10-25T00:08:05Z" };
   }
 });
 
@@ -9475,7 +9537,7 @@ var index_default = {
       const auth2 = await checkAuth(request, env);
       if (auth2 instanceof Response) return auth2;
       const body = await request.json().catch(() => ({}));
-      body.actor = "web";
+      body.actor = `web:${auth2.login ?? "anon"}`;
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",
@@ -9506,7 +9568,7 @@ var index_default = {
       if (request.method === "POST") {
         if (sub === "ask_reframe" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -9515,7 +9577,7 @@ var index_default = {
         }
         if (sub === "purge_smoke" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -9525,7 +9587,7 @@ var index_default = {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = auth2.bearer ? "gateway" : "web";
+        body.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
         return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
