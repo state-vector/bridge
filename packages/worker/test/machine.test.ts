@@ -605,6 +605,21 @@ describe("replay fold (BR#2419 item 6)", () => {
     expect(fold.ok).toBe(false);
     expect(fold.tailBreak).toBe(true); // fresh damage — audited the moment it lands
   });
+
+  it("a later clean row clears the provisional tailBreak — only the newest row counts (BR#3322)", () => {
+    const log = [
+      t("todo", "in_progress"),
+      t("in_progress", "blocked"),
+      t("in_progress", "blocked"), // stale duplicate stamp at the tail
+    ];
+    expect(replayStatus("", log).tailBreak).toBe(true);
+    // the next clean write chains from the healed state — the fresh damage
+    // ages into the historical noise floor after one good stamp
+    const healed = replayStatus("", [...log, t("blocked", "todo")]);
+    expect(healed.tailBreak).toBe(false);
+    expect(healed.status).toBe("todo");
+    expect(healed.breaks).toBe(1);
+  });
 });
 
 // ---------- breach detection fold ----------
