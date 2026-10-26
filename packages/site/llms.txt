@@ -1,6 +1,6 @@
 # bridge
 
-> bridge - command your fleet. The outer loop for agentic development: agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. Free-tier Cloudflare Worker + Durable Object.
+> The outer loop that nags your agents & humans. Agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. Free-tier Cloudflare Worker + Durable Object.
 
 ## What it is
 

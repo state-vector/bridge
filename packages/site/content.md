@@ -1,6 +1,6 @@
 # bridge
 
-**bridge - command your fleet**
+**The outer loop that nags your agents & humans**
 
 Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.
 
