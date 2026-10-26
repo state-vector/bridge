@@ -1230,20 +1230,26 @@ export type CarryRecord = {
  *  stamped → … → head. A break anywhere is uncovered — fail-closed, the
  *  verdict must be re-rendered at the new head. Prefix-compatible: a 9-hex
  *  stamp covers the full 40-hex it prefixes, never the reverse. */
-export function verdictCoversHead(meta: any, headSha: string): boolean {
-  const pr = meta?.pr ?? {};
-  const stamped = String(pr.head_sha_at_acceptance ?? "").toLowerCase();
-  const target = String(headSha ?? "").toLowerCase();
+function headCoveredBy(stamped: string, carry: unknown, target: string): boolean {
   if (!/^[0-9a-f]{7,40}$/.test(stamped) || !/^[0-9a-f]{7,40}$/.test(target)) return false;
   let cur = stamped;
   if (target.startsWith(cur) || cur.startsWith(target)) return true;
-  for (const c of Array.isArray(pr.carry) ? pr.carry : []) {
+  for (const c of Array.isArray(carry) ? carry : []) {
     const from = String(c?.from_head ?? "").toLowerCase();
     const to = String(c?.to_head ?? "").toLowerCase();
     if (from !== cur || !/^[0-9a-f]{7,40}$/.test(to)) return false;
     cur = to;
   }
   return target.startsWith(cur) || cur.startsWith(target);
+}
+
+export function verdictCoversHead(meta: any, headSha: string): boolean {
+  const pr = meta?.pr ?? {};
+  return headCoveredBy(
+    String(pr.head_sha_at_acceptance ?? "").toLowerCase(),
+    pr.carry,
+    String(headSha ?? "").toLowerCase(),
+  );
 }
 
 /** Append a carry link to the chain (pure; the caller persists meta). */
@@ -1253,6 +1259,99 @@ export function carryAppend(meta: any, rec: CarryRecord): any {
   pr.carry = [...(Array.isArray(pr.carry) ? pr.carry : []), rec];
   m.pr = pr;
   return m;
+}
+
+// ---- multi-PR legs (BR#3659: card-per-PR is a LIE for multi-PR parents) ----
+
+/** One leg of a queued card: one cited PR with its accepted-at head.
+ *  `meta.prs` holds every leg; `meta.pr` stays the FIRST leg (backward
+ *  compat — the executor, the derived-queue filter and older readers read
+ *  meta.pr). A leg carries its own carry chain (machine-clean head moves
+ *  carry per leg, never across legs). */
+export type TrainLeg = {
+  repo: string;
+  number: number;
+  head_sha_at_acceptance?: string;
+  base?: string;
+  carry?: CarryRecord[];
+};
+
+/** The card's legs: meta.prs when stamped (multi-PR), else the legacy
+ *  meta.pr single leg. Empty when neither exists. */
+export function trainLegs(meta: any): TrainLeg[] {
+  if (Array.isArray(meta?.prs) && meta.prs.length) {
+    return meta.prs.map((l: any) => ({
+      repo: String(l?.repo ?? meta?.pr?.repo ?? ""),
+      number: Number(l?.number ?? 0),
+      ...(l?.head_sha_at_acceptance !== undefined ? { head_sha_at_acceptance: String(l.head_sha_at_acceptance) } : {}),
+      ...(l?.base !== undefined ? { base: String(l.base) } : {}),
+      ...(Array.isArray(l?.carry) ? { carry: l.carry } : {}),
+    }));
+  }
+  if (meta?.pr && typeof meta.pr === "object") {
+    return [{
+      repo: String(meta.pr.repo ?? ""),
+      number: Number(meta.pr.number ?? 0),
+      ...(meta.pr.head_sha_at_acceptance !== undefined ? { head_sha_at_acceptance: String(meta.pr.head_sha_at_acceptance) } : {}),
+      ...(meta.pr.base !== undefined ? { base: String(meta.pr.base) } : {}),
+      ...(Array.isArray(meta.pr.carry) ? { carry: meta.pr.carry } : {}),
+    }];
+  }
+  return [];
+}
+
+/** Is this leg landed? The per-leg map (meta.merge_train.legs — multi-PR)
+ *  or the legacy card-level landed stamp (pre-3659: state "landed" is only
+ *  ever written when the whole card closed). */
+export function trainLegLanded(meta: any, leg: TrainLeg): boolean {
+  const mt = meta?.merge_train ?? {};
+  if (mt.legs && mt.legs[String(leg.number)]?.state === "landed") return true;
+  return mt.state === "landed";
+}
+
+/** The legs that still keep the card queued — optionally scoped to one
+ *  repo (a card rides exactly the lanes that own one of its UNLANDED legs). */
+export function trainLegsRemaining(meta: any, repo?: string): TrainLeg[] {
+  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && !trainLegLanded(meta, l));
+}
+
+/** Does this queued card ride the given repo's lane? True when at least one
+ *  of its UNLANDED legs belongs to that repo. (BR#3659: replaces the old
+ *  lane filter that read meta.merge_train.repo — a field nothing ever set,
+ *  so every queued card matched every lane.) */
+export function trainCardMatchesLane(meta: any, repo: string): boolean {
+  return trainLegsRemaining(meta, repo).length > 0;
+}
+
+/** Does an accepted verdict cover this LEG's head? Same law as
+ *  verdictCoversHead, reading the leg's own stamp + carry chain — a
+ *  multi-PR card's legs verify independently (BR#3659). */
+export function verdictCoversHeadLeg(leg: TrainLeg | undefined, headSha: string): boolean {
+  if (!leg) return false;
+  return headCoveredBy(
+    String(leg.head_sha_at_acceptance ?? "").toLowerCase(),
+    leg.carry,
+    String(headSha ?? "").toLowerCase(),
+  );
+}
+
+/** Append a carry link to ONE leg's chain (pure; the caller persists meta).
+ *  The matching meta.prs entry AND meta.pr (when it is the same PR — legacy
+ *  readers read meta.pr) both move, so no reader sees a half-carry. */
+export function carryAppendLeg(meta: any, number: number, rec: CarryRecord): any {
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  const withCarry = (leg: any) => ({ ...leg, carry: [...(Array.isArray(leg.carry) ? leg.carry : []), rec] });
+  if (Array.isArray(m.prs)) m.prs = m.prs.map((l: any) => (Number(l?.number) === number ? withCarry(l) : l));
+  if (Number(m.pr?.number) === number) m.pr = withCarry(m.pr);
+  return m;
+}
+
+/** The blocked reason while a queued card waits on its remaining legs —
+ *  honest naming (BR#3659 defect 1: the multi-PR card that closed after
+ *  leg 1 lied "done" instead of saying what is still out). */
+export function trainQueueRemainingReason(meta: any): string {
+  const remaining = trainLegsRemaining(meta);
+  return `merge-train: queued — waiting on ${remaining.length} leg(s): ${remaining.map((l) => `${l.repo || "?"}#${l.number}`).join(", ")}`;
 }
 
 // ---- awaiting-CI phase (BR#3516 §2) ----
@@ -1330,6 +1429,10 @@ export type TrainGateInput = {
   /** commits of the PR: REST verification (verified=true = signed+valid) */
   commits: { sha: string; verified: boolean }[];
   headChecks: MainCheckRun[];
+  /** BR#3659: which leg of the card's PR list this gate drives (1-based
+   *  position in meta.prs) — the gate checks THAT leg's stamp, and the
+   *  merge receipt cites the leg, not just the PR. */
+  legNumber?: number;
 };
 
 /** The per-candidate gate the executor runs before merging (BR#3516 §2),
@@ -1337,17 +1440,22 @@ export type TrainGateInput = {
  *  base-green · mergeable=MERGEABLE with bound-wait through null · every
  *  commit GitHub-verified · head checks green (BR#2267 externals exempt).
  *  Composes the standing decideMergeAction; the train layer adds the
- *  carry law the sweep never had. */
+ *  carry law the sweep never had. BR#3659: coverage is judged per LEG —
+ *  a multi-PR card's legs verify independently, and an uncovered leg
+ *  bounces naming ITS stamp. */
 export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (i.cardStatus === "superseded")
     return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
   if (i.cardStatus === "done")
     return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
-  if (!verdictCoversHead(i.cardMeta, i.headSha)) {
-    const stamped = String(i.cardMeta?.pr?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
+  const legs = trainLegs(i.cardMeta);
+  const legNumber = Math.max(1, Math.floor(i.legNumber ?? 1));
+  const leg = legs.length ? legs[legNumber - 1] : undefined;
+  if (!verdictCoversHeadLeg(leg, i.headSha)) {
+    const stamped = String(leg?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
     return {
       kind: "bounce",
-      defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+      defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${legNumber} stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
     };
   }
   const gate = decideMergeAction({
@@ -1366,7 +1474,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (gate.kind === "merge")
     return {
       kind: "merge",
-      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516): head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green`,
+      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green`,
     };
   return gate;
 }
@@ -1408,15 +1516,119 @@ export function trainStopAskTitle(lane: { repo: string; base: string }, sha: str
 }
 
 /** The machine-proxy close note for train:landed — cites the merge commit
- *  (mergeCommit non-null) and main green, per the done-when's machine proxy. */
-export function trainLandedCloseNote(input: { repo: string; prNumber: number; mergeSha: string; gateway: string; greenRunUrl?: string | null }): string {
+ *  (mergeCommit non-null) and main green, per the done-when's machine proxy.
+ *  BR#3659: a multi-PR card's FINAL close cites EVERY leg's merge commit. */
+export function trainLandedCloseNote(input: { repo: string; prNumber: number; mergeSha: string; gateway: string; greenRunUrl?: string | null; legs?: { repo: string; number: number; mergeSha: string }[] }): string {
+  const legList = (input.legs ?? []).filter((l) => l.number > 0);
+  const merged =
+    legList.length > 1
+      ? `all ${legList.length} queued PRs merged — ${legList
+          .map((l) => `[#${l.number}](https://github.com/${l.repo || input.repo}/pull/${l.number}) as ${l.mergeSha.slice(0, 9)}`)
+          .join(", ")}`
+      : `PR [#${input.prNumber}](https://github.com/${input.repo}/pull/${input.prNumber}) merged as ${input.mergeSha.slice(0, 9)}`;
   return [
-    `landed via the serialized merge train (BR#3516) — PR [#${input.prNumber}](https://github.com/${input.repo}/pull/${input.prNumber}) merged as ${input.mergeSha.slice(0, 9)} by gateway ${input.gateway}; machine proxy held: mergeCommit non-null AND required main workflows green${input.greenRunUrl ? ` (${input.greenRunUrl})` : ""}.`,
+    `landed via the serialized merge train (BR#3516) — ${merged} by gateway ${input.gateway}; machine proxy held: mergeCommit non-null AND required main workflows green${input.greenRunUrl ? ` (${input.greenRunUrl})` : ""}.`,
     `merge commit: https://github.com/${input.repo}/commit/${input.mergeSha}`,
   ].join("\n");
 }
 
 /** The verify template's accept instruction — the head sha the verifier must
  *  record in the close note so the hub can stamp head_sha_at_acceptance
- *  without any hub-side GitHub call. */
-export const TRAIN_HEAD_STAMP_RE = /(?:^|\s)head[=:\s]+([0-9a-f]{7,40})(?=\s|$)/i;
+ *  without any hub-side GitHub call. The lookahead is punctuation-tolerant:
+ *  "head <sha>;" / "head <sha>)." all terminate the stamp (BR#3659 parser). */
+export const TRAIN_HEAD_STAMP_RE = /(?:^|\s)head[=:\s]+([0-9a-f]{7,40})(?=[\s;.,)]|$)/i;
+const TRAIN_HEAD_STAMP_RE_G = /(?:^|\s)head[=:\s]+([0-9a-f]{7,40})(?=[\s;.,)]|$)/gi;
+
+/** Every PR URL in a verify close note (BR#3659: a multi-PR parent cites one
+ *  URL per leg — the hub stamps ALL of them, not just the first). */
+export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
+
+export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
+
+/** Parse a verify close note into PR legs. Single-PR notes keep the
+ *  pre-3659 binding exactly: the note's FIRST `head <sha>` pairs with its
+ *  one /pull/ URL, wherever each sits. Multi-PR notes (BR#3659) pair by
+ *  ADJACENCY, line by line, separator-aware: a head binds to the PR it
+ *  immediately follows ("PR n head X" — the documented convention), else to
+ *  the PR it immediately precedes ("head X — PR n"); adjacent means
+ *  neighbouring tokens on the line with no clause break between them (`;`
+ *  or a newline separates — a head after ";" is the NEXT clause's), so
+ *  packed single-line notes never cross-pair ("PR 1 head A; PR 2 head B"
+ *  and "head A — PR 1; head B — PR 2" both bind each PR its own head), and
+ *  a stray head is never stolen across an intervening PR. A PR with no head
+ *  on its line takes the first head BELOW it before the next PR (the
+ *  "- PR n\n  head <sha>" list layout). Anything unpaired stays unbound —
+ *  the queue arm fail-closes on it. Never a silent cross-pairing. */
+export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
+  const t = String(text ?? "");
+  const prs: { repo: string; number: number; index: number; end: number }[] = [];
+  for (const m of t.matchAll(TRAIN_PR_URL_RE))
+    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  if (!prs.length) return [];
+  const heads: { sha: string; index: number; end: number; used: boolean }[] = [];
+  for (const m of t.matchAll(TRAIN_HEAD_STAMP_RE_G))
+    heads.push({ sha: m[1], index: m.index ?? 0, end: (m.index ?? 0) + m[0].length, used: false });
+  const paired: (number | null)[] = prs.map(() => null); // pr i → head j
+  if (prs.length === 1) paired[0] = heads.length ? 0 : null;
+  else {
+    // line index for every char position (close notes are small; linear is fine)
+    const lineStarts: number[] = [];
+    for (let i = 0; i < t.length; i++) if (i === 0 || t[i - 1] === "\n") lineStarts.push(i);
+    const lineOf = (idx: number): number => {
+      let line = 0;
+      for (const s of lineStarts) { if (s <= idx) line++; else break; }
+      return line - 1;
+    };
+    // pass 1 — same-line ADJACENCY pairing, separator-aware: a head binds to
+    // the PR it immediately follows ("PR n head X" — the documented
+    // convention), else to the PR it immediately precedes ("head X — PR n").
+    // "Adjacent" = neighbouring tokens on the line AND the between-text does
+    // not start a new clause (`;` or a newline separates — a head after ";"
+    // belongs to the NEXT clause's PR, never the previous one), so packed
+    // single-line notes ("PR 11 head B; PR 12 head C") and dash-led notes
+    // ("head B — PR 11; head C — PR 12") both bind each PR to its own head,
+    // and "PR 11; PR 12 head C" leaves PR 11 unbound rather than stealing a
+    // head across the intervening PR.
+    type Tok = { kind: "pr" | "head"; i: number; index: number; end: number };
+    const lines = new Map<number, Tok[]>();
+    prs.forEach((p, pi) => {
+      const l = lineOf(p.index);
+      lines.set(l, [...(lines.get(l) ?? []), { kind: "pr", i: pi, index: p.index, end: p.end }]);
+    });
+    heads.forEach((h, hi) => {
+      const l = lineOf(h.index);
+      lines.set(l, [...(lines.get(l) ?? []), { kind: "head", i: hi, index: h.index, end: h.end }]);
+    });
+    for (const seq of lines.values()) {
+      seq.sort((a, b) => a.index - b.index);
+      const joins = (k: number) => k >= 0 && k + 1 < seq.length && !/[;\n]/.test(t.slice(seq[k].end, seq[k + 1].index));
+      // pass 1a — PR → the head it immediately precedes
+      for (let k = 0; k + 1 < seq.length; k++) {
+        const a = seq[k], b = seq[k + 1];
+        if (joins(k) && a.kind === "pr" && b.kind === "head" && paired[a.i] === null && !heads[b.i].used) {
+          paired[a.i] = b.i; heads[b.i].used = true;
+        }
+      }
+      // pass 1b — head → the PR it immediately precedes
+      for (let k = 0; k + 1 < seq.length; k++) {
+        const a = seq[k], b = seq[k + 1];
+        if (joins(k) && a.kind === "head" && b.kind === "pr" && paired[b.i] === null && !heads[a.i].used) {
+          paired[b.i] = a.i; heads[a.i].used = true;
+        }
+      }
+    }
+    // pass 2 — a PR with no head on its line takes the first unused head
+    // BELOW it, before the next PR (the "- PR n\n  head <sha>" list layout)
+    for (let pi = 0; pi < prs.length; pi++) {
+      if (paired[pi] !== null) continue;
+      const nextPrIdx = prs.slice(pi + 1).find((q) => q.index >= 0)?.index ?? Infinity;
+      const below = heads.find((h) => !h.used && h.index > prs[pi].index && h.index < nextPrIdx);
+      if (below) { paired[pi] = heads.indexOf(below); below.used = true; }
+    }
+  }
+  return prs.map((p, i) => ({
+    repo: p.repo,
+    number: p.number,
+    ...(paired[i] !== null ? { head_sha_at_acceptance: heads[paired[i] as number].sha } : {}),
+  }));
+}

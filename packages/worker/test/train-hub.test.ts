@@ -279,4 +279,143 @@ describe("merge train DO drill (real bundled worker)", () => {
     // and no lane was even created for this repo — nothing was leased
     expect((await kbJson("/train.status", { repo })).body.lanes.length).toBe(0);
   });
+
+  it("BR#3659 defect 1: a two-leg card closes only when the LAST leg lands — after leg 1 it stays queued naming the leg still out", async () => {
+    const repo = "state-vector/lane-legs";
+    const H1 = "1".repeat(40), H2 = "2".repeat(40), M1 = "3".repeat(40), M2 = "4".repeat(40);
+    // the close cites BOTH PRs, one `head <sha>` after each (the multi-PR
+    // convention — proximity-paired by the hub parser)
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: two-leg drill", session: "" });
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: two-leg ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    const closed = await kbJson("/transition", {
+      id: verifyId, to: "done", actor: "drill-verifier",
+      note: `accepted both legs — PR https://github.com/${repo}/pull/2701 head ${H1}; PR https://github.com/${repo}/pull/2702 head ${H2}`,
+    });
+    expect(closed.status, `verify close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    let c = (await kbJson("/get", { id: implId })).body;
+    // BOTH legs stamped; meta.pr stays the FIRST leg (legacy readers)
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.merge_train?.state).toBe("queued");
+    expect(c.meta?.merge_train?.legs_total).toBe(2);
+    expect(c.meta?.prs?.map((l: any) => l.number)).toEqual([2701, 2702]);
+    expect(c.meta?.prs?.map((l: any) => l.head_sha_at_acceptance)).toEqual([H1, H2]);
+    expect(c.meta?.pr?.number).toBe(2701);
+
+    await acquire(repo, "gw-legs", { required_workflows: ["Test"] });
+    // leg 1 merges → awaiting-CI → green ⇒ landed, but the CARD stays queued
+    const m1 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-legs", pr: 2701, merge_sha: M1, head_sha: H1, task_id: implId });
+    expect(m1.body.error ?? "", `train:merged leg 1 failed: ${JSON.stringify(m1.body)}`).toBe("");
+    const landed1 = await kbJson("/train.ci", { repo, base: "main", actor: "gw-legs", sha: M1, checks: [check(31, "Test", "success")] });
+    expect(landed1.body.decided).toBe("landed");
+    expect(landed1.body.remaining).toEqual([2702]);
+    c = (await kbJson("/get", { id: implId })).body;
+    // NOT closed after leg 1 (the pre-3659 hub false-closed here — defect 1)
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.merge_train?.legs?.["2701"]?.state).toBe("landed");
+    // leg 2 has no map entry yet — it has not even merged (its awaiting-ci
+    // stamp only arrives with train:merged)
+    expect(c.meta?.merge_train?.legs?.["2702"]).toBeUndefined();
+    expect(c.meta?.merge_train?.remaining).toBe(1);
+    // the blocked reason honestly names the leg still out
+    expect(String(c.meta?.blocked?.reason)).toContain("2702");
+    // the lane went IDLE (currently cleared) — the train can pick leg 2 next tick
+    expect((await laneSnap(repo)).currently).toBeNull();
+
+    // leg 2 merges → green ⇒ the LAST leg lands → the card finally closes,
+    // citing EVERY leg's merge commit (never a leg-1-only lie)
+    const m2 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-legs", pr: 2702, merge_sha: M2, head_sha: H2, task_id: implId });
+    expect(m2.body.error ?? "", `train:merged leg 2 failed: ${JSON.stringify(m2.body)}`).toBe("");
+    const landed2 = await kbJson("/train.ci", { repo, base: "main", actor: "gw-legs", sha: M2, checks: [check(32, "Test", "success")] });
+    expect(landed2.body.decided).toBe("landed");
+    c = (await kbJson("/get", { id: implId })).body;
+    expect(c.status).toBe("done");
+    expect(c.meta?.merge_train?.state).toBe("landed");
+    expect(c.meta?.merge_train?.legs?.["2701"]?.state).toBe("landed");
+    expect(c.meta?.merge_train?.legs?.["2702"]?.state).toBe("landed");
+    const h = JSON.stringify(await (await kbJson("/get_history", { id: implId, limit: 10 })).body);
+    expect(h).toContain("all 2 queued PRs merged");
+    expect(h).toContain("#2701");
+    expect(h).toContain("#2702");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-legs" });
+  });
+
+  it("BR#3659 defect 2: a verify close on a BOUNCED card (in_progress) does NOT re-queue it — the bounce stands", async () => {
+    const repo = "state-vector/lane-bounceguard";
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: bounce-guard drill", session: "" });
+    const implId = String(impl.body.id);
+    // bounced: in_progress (the state train:bounced lands the card in) —
+    // session: "" = anonymous, so the gateway-action never attributes the
+    // impl card to the verify session (review-separation would refuse the close)
+    await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "merge-train bounce — PR #2801 conflicts with base" });
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: bounce-guard ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    // the verifier closes done citing the PR + head receipts — the pre-3659
+    // hub re-queued the bounced parent on exactly this close (defect 2)
+    const closed = await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `bounced PR https://github.com/${repo}/pull/2801 head ${"e".repeat(40)} — findings filed on the parent` });
+    expect(closed.status).toBeLessThan(400);
+    const c = (await kbJson("/get", { id: implId })).body;
+    // the bounce SURVIVED: no hijack to blocked merge-train: queued
+    expect(c.status).toBe("in_progress");
+    expect(c.meta?.merge_train?.state).toBeUndefined();
+    expect(c.meta?.pr).toBeUndefined();
+    // and no lane was created — nothing was queued
+    expect((await kbJson("/train.status", { repo })).body.lanes.length).toBe(0);
+  });
+
+  it("BR#3659: a multi-PR close with a missing head does NOT queue — every cited PR needs its head", async () => {
+    const repo = "state-vector/lane-partial";
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: partial-bind drill", session: "" });
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: partial-bind ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    // PR 2902 cited without a head — the gate could never pass that leg
+    await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `PR https://github.com/${repo}/pull/2901 head ${"f".repeat(40)}; PR https://github.com/${repo}/pull/2902` });
+    const c = (await kbJson("/get", { id: implId })).body;
+    expect(c.meta?.merge_train?.state).toBe("unbound");
+    expect(c.meta?.merge_train?.unbound).toEqual([2902]);
+    expect(c.status).not.toBe("blocked");
+    expect((await kbJson("/train.status", { repo })).body.lanes.length).toBe(0);
+  });
+
+  it("BR#3659: a re-verify close folds onto the existing legs — the cited leg's head refreshes, the others survive", async () => {
+    const repo = "state-vector/lane-refold";
+    const H1 = "1".repeat(40), H2 = "2".repeat(40), H1b = "3".repeat(40);
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: refold drill", session: "" });
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: refold ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `PR https://github.com/${repo}/pull/3001 head ${H1}; PR https://github.com/${repo}/pull/3002 head ${H2}` });
+    let c = (await kbJson("/get", { id: implId })).body;
+    expect(c.meta?.prs?.length).toBe(2);
+    // bounce → fix → re-enter review → a FRESH verify duty accepts the new head
+    // (impl-side actions are anonymous — never the verify session; the hub's
+    // own queue/landed transitions are anonymous too, so meta.session stays
+    // unset and the re-verify cannot be refused as self-review)
+    await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "merge-train bounce — conflict resolved" });
+    await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: `re-entered review — PR https://github.com/${repo}/pull/3001` });
+    const verify2 = await kbJson("/create", { type: "task", title: `VERIFY: refold 2 ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verify2Id = String(verify2.body.id);
+    await kbJson("/link", { src: verify2Id, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verify2Id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    const closed2 = await kbJson("/transition", { id: verify2Id, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3001 head ${H1b}` });
+    expect(closed2.status, `re-verify close failed: ${JSON.stringify(closed2.body)}`).toBeLessThan(400);
+    c = (await kbJson("/get", { id: implId })).body;
+    // leg 1's head refreshed; leg 2's stamp SURVIVED — the card still has both legs
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.prs).toEqual([
+      { repo, number: 3001, head_sha_at_acceptance: H1b },
+      { repo, number: 3002, head_sha_at_acceptance: H2 },
+    ]);
+    expect(c.meta?.merge_train?.legs_total).toBe(2);
+  });
 });
