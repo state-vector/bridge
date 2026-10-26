@@ -2127,11 +2127,60 @@ fn note_task(cfg: &DispatchConfig, tid: &str, did: &str) {
 
 /// Release this runner's own claim (in_progress → todo) with a note. BR#2419:
 /// the runner may release its own claims — that is the only card move it makes
-/// besides claiming.
-fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) {
+/// besides claiming. BR#3611: the note is EVIDENCE — post it only when the
+/// release actually happened. A claim-race rejection (the ownership gate
+/// refused: another dispatcher owns the card) is skipped silently — the
+/// re-claim race path already logs it, and a note here would be a phantom
+/// receipt (BR#3372 seqs 131165/131238/131307: the board recorded releases
+/// that were rejected). Any other failure gets an honest failure note naming
+/// the error — never a success note for a release that didn't happen.
+/// The outcome of a release attempt. Returned so callers that must branch on
+/// it (the stale-claim flow's re-claim leg, BR#3823) CAN — review finding on
+/// PR #220: the old signature returned () and a caller could not distinguish
+/// a real release from a refused one. Note/honesty semantics unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    /// the card was released to the pool (note posted)
+    Released,
+    /// the gate refused as a claim race — benign, self-healing, silent
+    ClaimRace,
+    /// the release FAILED for a real reason (failure note posted)
+    Failed(String),
+}
+
+fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) -> ReleaseOutcome {
     let mut id = 0i64;
-    let _ = mcp_call_task(cfg, &mut id, "transition", json!({ "id": tid, "to": "todo" }), &tid);
-    note_task(cfg, tid, did);
+    let res = mcp_call_task(cfg, &mut id, "transition", json!({ "id": tid, "to": "todo" }), &tid);
+    let outcome = release_outcome(&res);
+    match release_note(&res, did) {
+        Some(note) => note_task(cfg, tid, &note),
+        None => eprintln!(
+            "[dispatch] {tid}: release raced (gate refused, card not released) — no note posted (BR#3611)"
+        ),
+    }
+    outcome
+}
+
+fn release_outcome(res: &Result<serde_json::Value, String>) -> ReleaseOutcome {
+    match res {
+        Ok(_) => ReleaseOutcome::Released,
+        Err(e) if is_claim_race_error(e) => ReleaseOutcome::ClaimRace,
+        Err(e) => ReleaseOutcome::Failed(truncate(e, 200)),
+    }
+}
+
+/// The note release_claim should post for a release outcome, or None to stay
+/// silent. Ok → the caller's note (the release really happened); a claim-race
+/// rejection → None (benign, self-healing — never a phantom success note);
+/// any other error → the caller's note prefixed with the honest failure.
+fn release_note(res: &Result<serde_json::Value, String>, did: &str) -> Option<String> {
+    match release_outcome(res) {
+        ReleaseOutcome::Released => Some(did.to_string()),
+        ReleaseOutcome::ClaimRace => None,
+        ReleaseOutcome::Failed(e) => {
+            Some(format!("{did} — RELEASE FAILED (card NOT released): {e}"))
+        }
+    }
 }
 
 // ---- BR#3337: claim races are retryable noise, never dispatch failures ----
@@ -2170,7 +2219,9 @@ fn claim_liveness(
 /// Classify a claim-transition rejection. Lifecycle-edge rejections
 /// (`task: 'in_progress' → 'in_progress' not allowed (allowed: …)`,
 /// `status 'x' is terminal for task`) and ownership rejections
-/// (`task BR#N is claimed by X — only the owner or a human can release it`)
+/// (`task BR#N is claimed by X — only the owner, a human, or an unblock duty
+/// holding proof of the met exit condition can release it…`; the structural
+/// pair "claimed by" + "only the owner" matches every wording — BR#3611)
 /// are claim races: the card moved under us between orient and claim, or
 /// another dispatcher holds it. Retryable next tick, never a dispatch failure.
 fn is_claim_race_error(e: &str) -> bool {
@@ -2186,12 +2237,17 @@ fn is_claim_race_error(e: &str) -> bool {
 /// on healthy hosts (2026-10-25 incident: 6 races = "6 consecutive dispatch
 /// failures (other)" while the same host dispatched other tasks fine).
 fn claim_race_run(stdout: &str, stderr: &str) -> bool {
-    const SIGS: [&str; 3] = [
-        "not allowed (allowed:",
-        "only the owner or a human can release it",
-        "is claimed by",
-    ];
-    SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
+    // BR#3611: no sentence literals — PR #210's guard-message edit broke the
+    // hub's literal match (breachClass, specimen BR#3610). The single-atom
+    // sigs below are stable fragments; the ownership shape is the same
+    // structural pair is_claim_race_error uses ("claimed by" + "only the
+    // owner", present in every wording of the release-needs-ownership guard).
+    const SIGS: [&str; 2] = ["not allowed (allowed:", "is claimed by"];
+    if SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s)) {
+        return true;
+    }
+    let ownership = |t: &str| t.contains("claimed by") && t.contains("only the owner");
+    ownership(stdout) || ownership(stderr)
 }
 
 fn spawn_opencode(
@@ -4547,12 +4603,69 @@ mod tests {
             "task: 'in_progress' → 'in_progress' not allowed (allowed: in_review, done, blocked, todo)"
         ));
         assert!(is_claim_race_error("status 'in_review' is terminal for task"));
+        // BR#208 wording
         assert!(is_claim_race_error(
             "task BR#3328 is claimed by other-gateway-opencode — only the owner or a human can release it to the pool"
+        ));
+        // BR#3611: the PR #210 proven-unblock wording (8a1acbd) broke the hub's
+        // literal classifier (specimen BR#3610) — the structural pair must
+        // receive every wording of the release-needs-ownership guard
+        assert!(is_claim_race_error(
+            "task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]"
         ));
         // genuine failures keep their class
         assert!(!is_claim_race_error("bridge unreachable: connection refused"));
         assert!(!is_claim_race_error("mcp error -32603: internal"));
+    }
+
+    #[test]
+    fn claim_race_run_matches_every_ownership_wording_br3611() {
+        // the SIG list must stay wording-proof (BR#3611): the ownership shape
+        // is the structural pair, present in every wording of the guard
+        assert!(claim_race_run(
+            "task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it.",
+            ""
+        ));
+        assert!(claim_race_run(
+            "",
+            "task BR#1 is claimed by x — only the owner or a human can release it to the pool"
+        ));
+        assert!(!claim_race_run("spawn ok", "exit 0"));
+    }
+
+    #[test]
+    fn release_note_posts_only_on_a_real_release_br3611() {
+        let did = "runner: stale claim released — session died";
+        // success → the caller's note (the release really happened); the
+        // outcome is ALSO exposed to callers that must branch on it (PR #220
+        // review finding — the old () signature hid release failures)
+        assert_eq!(
+            release_outcome(&Ok(json!({ "id": "BR#1", "status": "todo" }))),
+            ReleaseOutcome::Released
+        );
+        assert_eq!(
+            release_note(&Ok(json!({ "id": "BR#1", "status": "todo" })), did).unwrap(),
+            did
+        );
+        // claim-race rejection (the ownership gate refused) → NO note — a note
+        // here was a phantom receipt (BR#3372 seqs 131165/131238/131307: the
+        // board recorded releases that were rejected)
+        let race = "ERROR: task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]".to_string();
+        assert_eq!(
+            release_outcome(&Err(race.clone())),
+            ReleaseOutcome::ClaimRace
+        );
+        assert!(release_note(&Err(race), did).is_none());
+        // any other error → an honest failure note naming the error, never a
+        // success note; the outcome names the failure for branching callers
+        let failed = release_note(
+            &Err("bridge unreachable: connection refused".to_string()),
+            did,
+        )
+        .unwrap();
+        assert!(failed.contains("RELEASE FAILED"));
+        assert!(failed.contains("card NOT released"));
+        assert!(failed.contains("bridge unreachable"));
     }
 
     #[test]

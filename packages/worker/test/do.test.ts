@@ -426,6 +426,54 @@ describe("claim-race storms through the real gate + breach door (BR#3337)", () =
   });
 });
 
+// ---------- BR#3611: gateway-attributed claims — self-release allowed, cross-gateway gated, wording-proof fold ----------
+
+describe("gateway-attributed claims through the real gate + breach door (BR#3611)", () => {
+  const breachCardsFor = async (taskId: string) => {
+    const { body } = await kbJson("/list", { type: "task", tag: "breach", limit: 200 });
+    return (body.artefacts ?? []).filter((a: any) => String(a.title).includes(taskId));
+  };
+
+  it("a gateway releases its OWN attributed claim; a cross-gateway release is refused and folds as claim_race", async () => {
+    const { body: card } = await kbJson("/create", { type: "task", title: "gateway attributed claim br3611" });
+    // claim attributed: the gateway's raw actor claims, owner = attributedAgent
+    // (do.ts claim path: owner = attributedAgent ?? actor)
+    const claim = await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim",
+      actor: "gateway-h", gateway: true, agent: "gateway-h-opencode",
+    });
+    expect(claim.status).toBe(200);
+    const held = await kbJson("/get", { id: card.id });
+    expect(held.body.owner).toBe("gateway-h-opencode"); // attribution, not the raw actor
+
+    // self-release: same gateway, same attributed agent — before BR#3611 the
+    // gate structurally refused this (owner ≠ raw actor by construction) and
+    // the runner's stale-claim path never succeeded live
+    const self = await kbJson("/transition", {
+      id: card.id, to: "todo", note: "rule-9: my own attributed claim, session died",
+      actor: "gateway-h", gateway: true, agent: "gateway-h-opencode",
+    });
+    expect(self.status).toBe(200);
+
+    // re-claim, then a CROSS-gateway release: the gate refuses it (claim-race
+    // semantics — the exact BR#3610 trigger shape, ip-172 vs a mac-modem-held
+    // claim) with the PR #210 proven-unblock wording, and the fold classifies
+    // it claim_race → NO breach card at the default threshold
+    await kbJson("/transition", { id: card.id, to: "in_progress", note: "re-claim", actor: "gateway-h", gateway: true, agent: "gateway-h-opencode" });
+    for (let i = 0; i < 4; i++) {
+      const r = await kbJson("/transition", {
+        id: card.id, to: "todo", note: "not mine, releasing",
+        actor: "other-gw", gateway: true, agent: "other-gw-opencode",
+      });
+      expect(r.status).toBe(400);
+      expect(String(r.body.error)).toContain("is claimed by");
+      expect(String(r.body.error)).toContain("only the owner");
+    }
+    const mine = await breachCardsFor(card.id);
+    expect(mine).toHaveLength(0);
+  });
+});
+
 // ---------- BR#3443: a closed breach card's events never re-fold ----------
 // Specimen BR#3439: raised 17:03:22.861Z by a benign fold trigger on BR#3372,
 // from 6 events that ALL predate the predecessor card BR#3427's close
