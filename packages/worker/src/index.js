@@ -280,9 +280,20 @@ export default {
         if (url.pathname === "/api/pair/start" && request.method === "POST") {
           // forward the device-declared class — dropping it here defaulted
           // every pairing to agent and vended the wrong token class
+          // BR#3787: forward host + principal too. Dropping host defaulted
+          // every CLI pairing to the label "device" (the collision pool
+          // behind the fleet 401 ping-pong); dropping principal left
+          // pairings.principal null so the mint could never match the
+          // device's own row and always fell to the label.
+          const host = String(body.host ?? body.device ?? "").trim();
+          if (!host) {
+            return json({ error: "pair/start must carry the device host — update the bridge CLI/desktop (a nameless device cannot be paired safely, BR#3787)" }, 400);
+          }
           return json(await wsCall(env, "ws.pair.start", {
-            device: String(body.device ?? "device"),
+            device: host,
+            host,
             type: body.type === "agent" ? "agent" : "gateway",
+            principal: typeof body.principal === "string" ? body.principal : "",
           }));
         }
         if (url.pathname === "/api/pair/poll" && request.method === "POST") {
@@ -308,6 +319,38 @@ export default {
         return new Response("not found", { status: 404 });
       } catch (e) {
         return json({ error: String((e).message ?? e) }, 400);
+      }
+    }
+
+    // BR#3787 layer 2 — agent-plane token repair: a device holding its
+    // principal re-vends its OWN row's token without the human plane
+    // (headless gateways self-heal — no session, no re-pair). The principal
+    // IS the credential; matching is principal-only, never label. The
+    // registry resolves which workspace owns the principal; the repair
+    // itself runs in that workspace's DO.
+    if (url.pathname === "/api/token/repair" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const principal = typeof body.principal === "string" ? body.principal.trim() : "";
+      if (!principal) return json({ error: "repair requires the device principal" }, 400);
+      try {
+        const reg = await wsCall(env, "ws.token_lookup_principal", { principal });
+        if (!reg?.ws) {
+          return json({ error: "no live token for this principal — re-pair required (principal unknown, revoked, or reset)" }, 404);
+        }
+        const r = await env.KB.get(env.KB.idFromName(doWs(reg.ws))).fetch("https://kb/token.repair", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ principal, host: String(body.host ?? "") }),
+        });
+        const out = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const msg = String(out.error ?? "token repair failed");
+          const status = /rate limit/i.test(msg) ? 429 : 409;
+          return json({ error: msg }, status);
+        }
+        return json(out);
+      } catch (e) {
+        return json({ error: String(e?.message ?? e) }, 502);
       }
     }
 

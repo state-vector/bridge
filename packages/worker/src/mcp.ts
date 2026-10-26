@@ -90,7 +90,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
 
   // identity: registry auth token (bkw_…) or the legacy shared ingest token
-  let identity: { token_id: string; label: string; tags: string[]; principal: string | null };
+  let identity: { token_id: string; label: string; tags: string[]; principal: string | null; token_epoch?: number; token_stale?: boolean };
   try {
     if (bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)) {
       identity = { token_id: "shared", label: "shared", tags: [], principal: null };
@@ -159,12 +159,19 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     }
   }
 
-  return json({ jsonrpc: "2.0", id: msg.id ?? null, result });
+  // BR#3787 — the token's epoch rides every response: the gateway compares
+  // it to the epoch it vended and re-vends proactively on mismatch
+  // (negotiated catch-up), instead of discovering a rotation by 401.
+  const epochHeader: Record<string, string> = identity.token_epoch
+    ? { "x-bridge-token-epoch": String(identity.token_epoch) }
+    : {};
+  if (identity.token_stale) epochHeader["x-bridge-token-stale"] = "1";
+  return json({ jsonrpc: "2.0", id: msg.id ?? null, result }, 200, epochHeader);
 }
 
 interface Ctx {
   call: (op: string, payload: object) => Promise<any>;
-  identity: { token_id: string; label: string; tags: string[]; principal: string | null };
+  identity: { token_id: string; label: string; tags: string[]; principal: string | null; token_epoch?: number; token_stale?: boolean };
   sessionName: string;
 }
 
@@ -197,10 +204,10 @@ async function callTool(name: string, args: any, ctx: Ctx) {
   if (!def) return err(`unknown tool: ${name}`);
   return await def.handler(args, ctx);
 }
-function json(obj: unknown, status = 200) {
+function json(obj: unknown, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
+    headers: { "content-type": "application/json", "cache-control": "no-store", ...extraHeaders },
   });
 }
 
