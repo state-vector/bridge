@@ -75,6 +75,13 @@
   }
   .top .gh:hover { border-color: #b8b8c0; }
   .top .gh img { height: 20px; }
+  .top .signin {
+    display: inline-flex; align-items: center; text-decoration: none;
+    padding: .25rem .7rem; margin-right: .5rem;
+    border: 1px solid var(--green); border-radius: 8px; background: transparent;
+    color: var(--green); font-weight: 600; font-family: var(--mono);
+  }
+  .top .signin:hover { filter: brightness(1.2); }
   @media (prefers-color-scheme: dark) {
     .top .gh { border-color: #2a2a32; background: #1a1a20; }
     .top .gh:hover { border-color: #4a4a54; }
@@ -106,6 +113,7 @@
 
 <header class="top">
   <span class="brand" style="font-family: var(--mono); color: var(--green); font-weight: 600;">bridge - command your agent fleet<span class="cursor" aria-hidden="true"></span></span>
+  <a class="signin" href="https://hub.fleetbridge.run/login" title="sign in to the shared hub">Sign in</a>
   <a class="gh" href="https://github.com/state-vector/bridge" title="star bridge on GitHub">
     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
     <span>GitHub</span>
@@ -129,8 +137,8 @@
 
 <h2>Install</h2>
 <pre><code><span style="color: var(--green);">$</span> curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
-<span style="color: var(--green);">$</span> bridge pair https://your-hub.workers.dev</code></pre>
-<p>That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to <code>opencode</code> sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.</p>
+<span style="color: var(--green);">$</span> bridge pair https://hub.fleetbridge.run</code></pre>
+<p>That is the whole runner. It pairs with the shared hub at <code>hub.fleetbridge.run</code> — the same host you <a href="https://hub.fleetbridge.run/login">sign in</a> to with GitHub. Self-hosting your own hub instead? Deploy it per the <a href="https://github.com/state-vector/bridge#readme">README</a> and pair <code>https://your-hub.workers.dev</code>. Once paired it claims tasks and dispatches them to <code>opencode</code> sessions on your machine, in isolated git worktrees, one PR per task. Results come back to the board for review.</p>
 
 <h2>Three surfaces, one hub</h2>
 <table>

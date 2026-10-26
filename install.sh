@@ -102,8 +102,10 @@ cat <<EOF
   1. Check your setup (config, models, agent CLIs, git):
        $INSTALL_DIR/$BIN doctor
 
-  2. Pair with your hub (prints a code; approve it in the web UI):
-       $INSTALL_DIR/$BIN pair https://your-hub.workers.dev
+  2. Pair with a hub (prints a code; approve it in the web UI). The shared
+     hub is https://hub.fleetbridge.run — sign in with GitHub there; self-
+     hosters pair their own URL instead:
+       $INSTALL_DIR/$BIN pair https://hub.fleetbridge.run
 
   3. Set a model per agent in ~/.bridge/config.json ("models") — the runner
      refuses to dispatch without one. `bridge doctor` tells you if it's right.

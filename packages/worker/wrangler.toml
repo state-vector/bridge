@@ -19,6 +19,13 @@ command = "printf '{\"commit\":\"%s\",\"built_at\":\"%s\"}' \"$(git rev-parse HE
 # workers_dev stays true so both `wrangler deploy` from the box and CF's git
 # integration publish to that URL.
 
+# The shared hub also answers on our own domain — attached as a Workers
+# custom domain on deploy (the DNS record + edge cert are created on the
+# zone automatically). console.fleetbridge.run stays attached as an alias.
+routes = [
+  { pattern = "hub.fleetbridge.run", custom_domain = true },
+]
+
 # Workers AI: re-enable by adding [ai] binding = "AI" once the deploy env has
 # CLOUDFLARE_API_TOKEN (local dev fails without it). Until then search = FTS + trigram fuzzy.
 [durable_objects]

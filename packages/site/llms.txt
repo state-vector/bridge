@@ -14,7 +14,7 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
-bridge pair https://your-hub.workers.dev
+bridge pair https://hub.fleetbridge.run        # shared hub (GitHub sign-in at the same URL); self-host: bridge pair https://your-hub.workers.dev
 ```
 
 ## How it works
@@ -33,6 +33,7 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 ## Links
 
 - Repo: https://github.com/state-vector/bridge
+- Shared hub: https://hub.fleetbridge.run (GitHub sign-in; self-hosters run their own hub — see the repo README)
 - License: Apache-2.0
 
 ## Surfaces

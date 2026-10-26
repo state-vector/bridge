@@ -14,8 +14,10 @@ It is not a kanban tool and not an agent framework. It is the layer between them
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
-bridge pair https://your-hub.workers.dev
+bridge pair https://hub.fleetbridge.run
 ```
+
+That pairs with the shared hub — the same host you sign in to with GitHub (`https://hub.fleetbridge.run/login`). Self-hosting instead? Deploy your own hub per the README and pair `https://your-hub.workers.dev`.
 
 That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions on your machine, in isolated git worktrees (auto-provisioned per task, with any uncommitted work preserved to a `wip/` branch on teardown), one PR per task. Results come back to the board for review. Pairing vends a device credential exactly once (hub-generated, stored at `~/.bridge/principal`, never regenerated); re-pairing rotates the gateway token in place against that credential — the hostname is a display label only.
 

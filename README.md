@@ -2,6 +2,8 @@
 
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
+**Just want to use it?** The shared hub is live at `https://hub.fleetbridge.run` — sign in with GitHub at the same URL and `bridge pair https://hub.fleetbridge.run`; no deploy needed. The rest of this README is for self-hosting.
+
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
 ## What you need
