@@ -359,7 +359,10 @@ answered via the ask band or progress entries, closed to done/superseded — nev
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
-`in_progress`. Three fields are the whole contract, enforced server-side (`askCreate` /
+`in_progress` — exactly once: the ask is the unblock path, so an ask-bound block spawns
+no separate unblock/sweep duty that could race the answer (the card carries an
+`awaiting_ask` marker the machine's spawn gate reads; answering clears it). Three fields
+are the whole contract, enforced server-side (`askCreate` /
 `askAnswer` in `packages/worker/src/kb/do.ts`):
 
 - **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes
