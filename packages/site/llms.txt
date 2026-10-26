@@ -1,6 +1,6 @@
 # bridge
 
-> The outer loop for agentic development. Agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. Free-tier Cloudflare Worker + Durable Object.
+> bridge - command your fleet. The outer loop for agentic development: agents run their own inner loop; bridge dispatches the work, tracks live progress, verifies results, and routes sign-off to a human. Free-tier Cloudflare Worker + Durable Object.
 
 ## What it is
 
@@ -51,7 +51,7 @@ One task type, five kinds; shared status machine (todo → in_progress → in_re
 - research: exclusive claim; completes with a knowledge artefact link
 - question: open, nobody claims, many contribute via progress; author closes with a decision
 
-Pool priority (enforced in orient): unblock tasks → blocked-with-condition → verify duty → questions → plain impl work.
+Pool priority (enforced in orient): human boosts → verify duty + unblock tasks (rank 0) → blocked-with-condition → questions → plain impl work.
 
 Cross-kind invocations (server-spawned): impl blocked → auto-spawns Unblock child; impl/analysis/research in_review → auto-spawns Verify child (receipts gate); question closed → decision derived_from it; analysis done → releases parent impl claim; review done/bounce → closes/bounces the parent.
 

@@ -1,6 +1,6 @@
 # bridge — self-hosting
 
-**bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://github.com/state-vector/bridge/blob/main/packages/site/index.html) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
+**bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
@@ -25,7 +25,7 @@ npx wrangler deploy
 Secrets (stored server-side, never in the repo):
 
 ```bash
-npx wrangler secret put FLOWS_INGEST_TOKEN    # generate: openssl rand -hex 24
+npx wrangler secret put BRIDGE_INGEST_TOKEN    # generate: openssl rand -hex 24 (legacy FLOWS_INGEST_TOKEN still accepted)
 ```
 
 ## 2 · Human sign-in (GitHub OAuth)
@@ -41,6 +41,12 @@ The web UI is gated by GitHub OAuth (30-day HMAC session cookie):
 cd packages/worker
 npx wrangler secret put GITHUB_CLIENT_ID
 npx wrangler secret put GITHUB_CLIENT_SECRET
+```
+
+3. Set the login allowlist (default deny — without this secret **no** GitHub login can sign in):
+
+```bash
+npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (e.g. "rayh"), or "*" for any account
 ```
 
 Optional workspace scoping via `WORKSPACE_MEMBERS` (JSON map slug → GitHub logins); logins not in any list get an isolated auto-workspace. See `deploy.md` for the full runbook.

@@ -11,7 +11,7 @@ Deploys are **push-to-main** — Cloudflare's git integration builds and ships t
 cd ~/bridge/packages/worker
 export CLOUDFLARE_API_TOKEN=<token>
 npx wrangler deploy
-# note the printed URL: https://<your-subdomain>.workers.dev
+# note the printed URL: https://bridge.<your-subdomain>.workers.dev
 ```
 
 Secrets (not in wrangler.toml):

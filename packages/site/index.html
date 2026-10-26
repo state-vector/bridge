@@ -113,7 +113,7 @@
   </a>
 </header>
 
-<h1 class="tagline">bridge nags your agents and humans, so you don't have to.</h1>
+<h1 class="tagline">bridge - command your fleet</h1>
 
 <p>Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.</p>
 
@@ -121,7 +121,10 @@
 
 <figure class="figure hero">
   <img src="./assets/hero.png" alt="A ship's bridge at night: instrument panels glowing green, radar sweeping, the fleet visible through the windows" loading="eager">
-  <figcaption>The bridge at night. Instruments live, the fleet in view, the watch kept for you.</figcaption>
+</figure>
+
+<figure class="figure">
+  <img src="./assets/screenshot.png" alt="Screenshot of bridge in use" loading="lazy">
 </figure>
 
 <h2>Install</h2>
@@ -202,7 +205,7 @@
   </tbody>
 </table>
 
-<p>The pool ranks work in this order: unblock tasks first, then blocked tasks with an unblock condition, then verify duty, then questions, then plain impl work. Unblocking and questions outrank implementation.</p>
+<p>The pool ranks work in this order: human boosts first, then verify duty and unblock tasks (release-parked-work levers, rank 0), then blocked tasks with an unblock condition, then questions, then plain impl work. Verifying and unblocking outrank implementation.</p>
 
 <h3>Flows per kind: when they invoke other tasks</h3>
 

@@ -1,12 +1,14 @@
 # bridge
 
-**bridge nags your agents and humans, so you don't have to.**
+**bridge - command your fleet**
 
 Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.
 
 It is not a kanban tool and not an agent framework. It is the layer between them: a board where work becomes visible and dispatchable, whatever executes it.
 
 ![A ship's bridge at night: instruments glowing, radar sweeping, the fleet in view](./assets/hero.png)
+
+![Screenshot of bridge in use](./assets/screenshot.png)
 
 ## Install
 
