@@ -359,16 +359,29 @@ fallback window instead, so it is never lost.
 ## Destination-green: the stop-the-line gate
 
 Merges must not land while the destination branch is red — accepted decision BR#3009 makes
-that law, and BR#3008 makes it mechanical instead of discipline. Two halves, same rule:
+that law, and BR#3008 makes it mechanical instead of discipline. Three halves, same rule:
 
 - **The block**: every PR runs the required `main-green gate` check
   (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
   check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
   (or a check still running, or no check runs at all) fails the gate and GitHub refuses
-  the merge via the `main: main-green gate required` ruleset. The newest run per check
-  judges; a cancelled run says nothing. The one exception is written into the gate: a PR
-  green on the *exact* checks main fails passes with a printed **REMEDIATION CARVE-OUT**
-  receipt — BR#3009's remediation-merge path, expressible and receipted, not a loophole.
+  the merge via the `main: main-green gate + substance checks required` ruleset. The
+  newest run per check judges; a cancelled run says nothing. The one exception is written
+  into the gate: a PR green on the *exact* checks main fails passes with a printed
+  **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
+  receipted, not a loophole.
+- **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
+  hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
+  head while main was green; main went red and the #211 hotfix followed). The same ruleset
+  now also requires `Test` and `CLI build (packages/cli)` green on the PR's own head, with
+  `strict_required_status_checks_policy` on: the checks must come from the latest head, so
+  a stale green never counts. A red-head PR cannot merge even while main is green — the
+  sweep's red-head bounce (`decideMergeAction`) and every human/verify merge now obey the
+  same law: two reds never merge. Deliberately NOT required: the `Superpositional` review
+  (a failing review is a quality issue and merge-allowed — a required check would deadlock
+  against it) and the BR#2267 externals (Workers builds / deploy previews never gate). The
+  bypass actor is unchanged — rayh alone keeps `bypass_mode=always`: the human retains the
+  loud escape hatch; machines do not. Proven end-to-end by probe PRs #216 and #217.
 - **The alert**: the hub watchdog sweep (`stopTheLineSweep` in
   `packages/worker/src/kb/do.ts`, paced by the `stop_line_sweep_minutes` setting, default
   5 min, `0` = off) reads the same public API and, when main is RED, files ONE
