@@ -158,6 +158,8 @@ import {
   AWAIT_GRAMMAR_DOC,
   isSelfAwait,
   type AwaitEvent,
+  proxySpawnReceipts,
+  sameProxyReceipts,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -1099,7 +1101,26 @@ export class KnowledgeHub {
           continue;
         }
 
-        // machine atoms: typed await wins (trusted); legacy text parses and
+        // machine atoms: classify the TEXT first (BR#3668). A human-gated
+        // condition — explicit human-gate markers in the text of record
+        // ("Human-only", "no machine atom can flip this", "web/admin",
+        // "owner/web-only") — is unparseable BY DESIGN: the only exit is a
+        // human click. Never atomized, never flipped, and never migrated to
+        // an ask (the marker names the human leg already engaged — the
+        // BR#3358 family law is one ask per class). A machine-shaped
+        // await_event on such a park (stamped by the pre-BR#3668 text
+        // derivation, e.g. BR#3358's {event:"br_done",id:"BR#3361"})
+        // contradicts the card's own markers and is ignored for flip
+        // purposes. The typed HUMAN legs (ask/time, handled above) still
+        // flip: a human-gated card legitimately awaits its human.
+        const parsed = parseProxyCondition(cond);
+        if (parsed.humanGated) {
+          this.stampProxyCheck(r.id, meta, now, "unparseable",
+            `human-gated by design ("${parsed.humanGate}") — the only exit is a human action; never atomized, never flipped, never re-fired (BR#3668)`, prev);
+          continue;
+        }
+
+        // typed machine await wins (trusted); legacy text parses and
         // SELF-MIGRATES to the typed shape (one clean atom → await_event).
         let atoms: ProxyAtom[];
         let unparseable: boolean;
@@ -1107,7 +1128,6 @@ export class KnowledgeHub {
           atoms = [awaitEventToAtom(aw)!];
           unparseable = false;
         } else {
-          const parsed = parseProxyCondition(cond);
           atoms = parsed.atoms;
           unparseable = parsed.unparseable;
           const derived = awaitEventFromAtoms(atoms);
@@ -1559,6 +1579,30 @@ export class KnowledgeHub {
       }
       return;
     }
+    // BR#3668 stale-true dedup: re-fire only on a CHANGED receipt. The last
+    // duty this parent spawned carries the receipt set its spawn was fired
+    // on (the body's "MACHINE PROXY … receipts:" block); if the fresh
+    // evaluation produced the identical set, the atom is steady-true — it
+    // never flipped, and a re-spawn is pure churn (the BR#3358 family: one
+    // stand-down duty per sweep cycle, each live-verifying the same
+    // non-flip). Only sweep-spawned duties carry the block, so a park-time
+    // round or close-leg duty as the newest child never dedups; and the
+    // guard sits AFTER the flood window, so a genuine flip that arrives
+    // after the window spawns exactly once (the BR#3129 story).
+    const lastChild = this.one(
+      `SELECT c.id AS id, c.body_md AS body FROM relations rel JOIN artefacts c ON c.id = rel.src_id
+       WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND c.roles LIKE '%"unblock"%'
+       ORDER BY c.created_ts DESC LIMIT 1`, r.id,
+    );
+    const firedReceipts = lastChild ? proxySpawnReceipts(String(lastChild.body ?? "")) : [];
+    if (lastChild && firedReceipts.length && sameProxyReceipts(firedReceipts, receiptLines)) {
+      this.stampProxyCheck(r.id, meta, now, "true", null, prev,
+        { spawned: lastChild.id, spawn_skipped: `receipt-identical to the ${lastChild.id} spawn — steady-true atom, no changed receipt since last fire (BR#3668 dedup)` });
+      if (prev?.verdict !== "true") {
+        this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: lastChild.id, reason: "stale-true dedup (BR#3668): identical receipts" });
+      }
+      return;
+    }
     const ts = Date.now();
     // BR#2893 spawner cap: UNBLOCK_SPAWN_CAP rounds ever → stop + escalate once.
     if (this.unblockSpawnCapped(r, meta, "hub:proxy-watch", ts)) {
@@ -1581,8 +1625,8 @@ export class KnowledgeHub {
       `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
       created.id, r.id, ts,
     );
-    meta.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
-    this.stampProxyCheck(r.id, meta, now, "true", null, prev, { spawned: created.id });
+    meta.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500), receipts: receiptLines };
+    this.stampProxyCheck(r.id, meta, now, "true", null, prev, { spawned: created.id, receipts: receiptLines });
     this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, receipts: receiptLines });
     this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE — unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
   }
