@@ -233,7 +233,8 @@ pub fn kb_request(method: &str, path: &str, body: Option<Value>) -> Result<Value
     }
     let resp = req.send().map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().unwrap_or(Value::Null);
+    let body = resp.text().map_err(|e| format!("network: {e}"))?;
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     if status.as_u16() == 401 {
         // session expired/revoked server-side — drop it so the next probe
         // reports signed-out (misconfig announces itself, fail-closed)
@@ -243,7 +244,12 @@ pub fn kb_request(method: &str, path: &str, body: Option<Value>) -> Result<Value
     if !status.is_success() {
         return Err(format!("hub {}: {}", status.as_u16(), err_text(&v)));
     }
-    Ok(v)
+    // A 2xx whose body is not JSON is a FAILURE, not a null success: the
+    // unwrap_or(Value::Null) this replaces manufactured Ok(null), which the
+    // shell resolved into the UI as a null board ("board refresh: null")
+    // while masking the real cause (deploy window, edge hiccup).
+    serde_json::from_str::<Value>(&body)
+        .map_err(|e| format!("hub {}: unparseable body: {e}", status.as_u16()))
 }
 
 fn err_text(v: &Value) -> String {

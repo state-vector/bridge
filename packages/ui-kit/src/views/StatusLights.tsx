@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { rel } from "../server/views";
 import { ConnDot } from "../ConnDot";
@@ -12,6 +12,15 @@ export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open"
   const awaitingHuman = useKb((s) => s.awaitingHuman);
   const lastError = useKb((s) => s.lastError);
   const [open, setOpen] = useState(false);
+
+  // the error's age must keep moving even when nothing else updates the
+  // store (the stale-error case: hub unreachable → no events → no renders)
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!lastError) return;
+    const t = setInterval(() => setTick((x) => x + 1), 30_000);
+    return () => clearInterval(t);
+  }, [lastError]);
 
   const derived = useMemo(() => {
     const now = Date.now();
@@ -51,8 +60,9 @@ export function StatusLights({ bridgeConn, gatewaysFrom }: { bridgeConn?: "open"
         <div className="lights-pop" onClick={() => setOpen(false)}>
           <div className="ask-chips"><b>status</b></div>
           {lastError && (
-            <div className="light-row st-err" title={new Date(lastError.ts).toLocaleTimeString()}>
+            <div className="light-row st-err" title={new Date(lastError.ts).toLocaleString()}>
               ⚠ {lastError.context}: {lastError.message}
+              <span className="light-meta">· {rel(lastError.ts)} ago</span>
             </div>
           )}
           <div className="light-row"><ConnDot state={bridgeConn ?? kbState} className="conn" /> hub {bridgeConn ? `(${bridgeConn})` : ""}</div>

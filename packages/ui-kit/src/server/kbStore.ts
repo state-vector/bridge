@@ -118,7 +118,7 @@ export const useKb = create<KbState>((set, get) => ({
   reset: () => {
     stopWs?.();
     stopWs = null;
-    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], gatewayAgents: [], settings: {}, initialThread: null });
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], gatewayAgents: [], settings: {}, initialThread: null, lastError: null });
   },
 
   refresh: async () => {
@@ -131,6 +131,10 @@ export const useKb = create<KbState>((set, get) => ({
         const merged = [...ev.events.slice().reverse(), ...s.events.filter((e) => !ev.events.some((n) => n.seq === e.seq))];
         set({ events: merged.slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.last_seq) });
       }
+      // a success clears its own context's stale error — without this the ⚠
+      // is a fossil from the last transient failure (deploy window, edge
+      // hiccup) that never goes away
+      if (get().lastError?.context === "board refresh") set({ lastError: null });
     } catch (e) {
       escalateAuth(e);
       if (!(e instanceof KbAuthError)) get().reportError("board refresh", e);
@@ -142,6 +146,7 @@ export const useKb = create<KbState>((set, get) => ({
       const t = await kbApi.tokens();
       const s = await kbApi.settings();
       set({ tokens: t.tokens, sessions: t.sessions, gatewayAgents: t.gateway_agents ?? [], settings: s.settings ?? {} });
+      if (get().lastError?.context === "admin refresh") set({ lastError: null });
     } catch (e) {
       escalateAuth(e);
       if (!(e instanceof KbAuthError)) get().reportError("admin refresh", e);
