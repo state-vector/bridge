@@ -282,3 +282,111 @@ export function parseClosureReceipt(note: string, leg: CloseLeg): ClosureReceipt
 export function legLabel(leg: CloseLeg): string {
   return `${leg.repo ?? "GH"}#${leg.number}`;
 }
+
+// ---------- 4. typed await events (BR#3578) ----------
+//
+// A blocked card MUST await something. The free-text unblock_condition was
+// the "blocked forever" hole: prose stamps unparseable and never auto-flips.
+// The law: every blocked transition carries a TYPED await event from a
+// closed grammar — a machine-checkable upstream event, an open ask (the
+// human leg, active in For Me), or a timer. Free text stays as optional
+// human-friendly annotation, DERIVED from the structured event when absent.
+
+export type AwaitEvent =
+  | { event: "pr_merged"; repo: string; n: number }
+  | { event: "br_pr_merged"; id: string }
+  | { event: "issue_closed"; repo: string; n: number }
+  | { event: "br_done"; id: string }
+  | { event: "run_success"; repo: string; run_id?: string; newer_than?: string }
+  | { event: "pr_checks_green"; repo: string; n: number }
+  | { event: "ask"; ask_id: string }
+  | { event: "time"; until_ts: number };
+
+export const AWAIT_EVENT_KINDS = [
+  "pr_merged", "br_pr_merged", "issue_closed", "br_done",
+  "run_success", "pr_checks_green", "ask", "time",
+] as const;
+
+export const AWAIT_GRAMMAR_DOC =
+  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+
+/** Closed-set validation. Returns the normalised event or null (fail-closed). */
+export function validateAwaitEvent(v: unknown): AwaitEvent | null {
+  if (typeof v !== "object" || v === null) return null;
+  const e = v as Record<string, unknown>;
+  const kind = String(e.event ?? "");
+  const repo = typeof e.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(e.repo) ? e.repo : null;
+  const num = (x: unknown) => typeof x === "number" && Number.isInteger(x) && x > 0;
+  const id = (x: unknown) => typeof x === "string" && /^BR#\d+$/.test(x) ? x : null;
+  switch (kind) {
+    case "pr_merged":
+    case "issue_closed":
+    case "pr_checks_green":
+      return repo && num(e.n)
+        ? ({ event: kind, repo, n: e.n } as AwaitEvent)
+        : null;
+    case "br_pr_merged":
+    case "br_done":
+      return id(e.id) ? ({ event: kind, id: e.id } as AwaitEvent) : null;
+    case "run_success": {
+      if (!repo) return null;
+      const rid = typeof e.run_id === "string" && /^\d{6,}$/.test(e.run_id) ? e.run_id : undefined;
+      const nt = typeof e.newer_than === "string" && /^\d{6,}$/.test(e.newer_than) ? e.newer_than : undefined;
+      return rid || nt ? { event: "run_success", repo, run_id: rid, newer_than: nt } : null;
+    }
+    case "ask":
+      return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
+    case "time":
+      return typeof e.until_ts === "number" && Number.isFinite(e.until_ts) && e.until_ts > 0
+        ? { event: "time", until_ts: e.until_ts }
+        : null;
+    default:
+      return null;
+  }
+}
+
+/** Typed event → the sweep's ProxyAtom (ask/time evaluate on their own). */
+export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
+  switch (e.event) {
+    case "pr_merged": return { kind: "pr_merged", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
+    case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "br_done": return { kind: "br_done", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
+    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
+    case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "ask": case "time": return null;
+  }
+}
+
+/** Human-friendly condition text, derived from the structured event. */
+export function describeAwaitEvent(e: AwaitEvent): string {
+  switch (e.event) {
+    case "pr_merged": return `PR ${e.repo}#${e.n} merged (mergeCommit non-null)`;
+    case "br_pr_merged": return `${e.id}'s fix PR (head branch bridge/${e.id.slice(3)}) merged`;
+    case "issue_closed": return `GH issue ${e.repo}#${e.n} closed`;
+    case "br_done": return `${e.id} done`;
+    case "run_success":
+      return e.run_id
+        ? `GitHub run ${e.repo}/${e.run_id} conclusion=success`
+        : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
+    case "pr_checks_green": return `all checks green on PR ${e.repo}#${e.n}`;
+    case "ask": return `ask ${e.ask_id} answered`;
+    case "time": return `timer elapsed (until_ts ${e.until_ts})`;
+  }
+}
+
+/** Migration shim: a legacy text condition that parses cleanly to exactly
+ *  one machine atom becomes the typed event for it. Multiple atoms or
+ *  unparseable text stays text (the sweep's ask-migration handles the rest). */
+export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
+  if (atoms.length !== 1) return null;
+  const a = atoms[0];
+  switch (a.kind) {
+    case "pr_merged": return a.repo && a.number ? { event: "pr_merged", repo: a.repo, n: a.number } : null;
+    case "br_pr_merged": return a.brId ? { event: "br_pr_merged", id: a.brId } : null;
+    case "issue_closed": return a.repo && a.number ? { event: "issue_closed", repo: a.repo, n: a.number } : null;
+    case "br_done": return a.brId ? { event: "br_done", id: a.brId } : null;
+    case "run_success": return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
+    case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
+  }
+}

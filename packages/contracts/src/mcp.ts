@@ -88,6 +88,10 @@ export const TOOL_ARG_SCHEMAS = {
     to: z.string(),
     note: z.string().optional(),
     unblock_condition: z.string().optional(),
+    /** BR#3578 typed await — closed grammar validated in worker closure.ts;
+     *  machine event | open ask | timer. Free text (unblock_condition) is
+     *  optional human annotation derived from this when absent. */
+    await_event: z.record(z.string(), z.unknown()).optional(),
     class: z.enum(["subprocess"]).optional(),
     budget_minutes: z.number().int().max(1440).optional(),
     replacement_id: z.string().optional(),

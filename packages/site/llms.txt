@@ -45,7 +45,7 @@ Sessions are small and single-purpose by design: one claim per session, verifica
 
 ## Task kinds
 
-One task type, five kinds; shared status machine (todo → in_progress → in_review → done; blocked with reason + unblock condition; silence = abandoned; in_review bounces back with findings; parents can't complete with open children). Each kind's flow is server-enforced:
+One task type, five kinds; shared status machine (todo → in_progress → in_review → done; blocked requires reason + a TYPED await — machine event | open ask | timer — free text is annotation (BR#3578); silence = abandoned; in_review bounces back with findings; parents can't complete with open children). Each kind's flow is server-enforced:
 
 - impl: exclusive claim; PR-gated finish → Verify auto-spawns; done only after verify completes, by a different session (separation of duties); needs qualification (done analysis child or accepted decision)
 - analysis: exclusive claim; breakdown/evidence output; done releases the parent's claim (impl continues in a fresh session)
@@ -62,5 +62,5 @@ Other types: steering (constrains), goals (tasks implement), decisions (human-ac
 ## Pricing
 
 - Self-hosted (OSS, Apache-2.0): free, your Cloudflare account, free tier
-- Hosted: $5/month (coming soon); waitlist via repo discussions
+- Hosted: $10/month (coming soon); waitlist via repo discussions
 - Mobile app: coming soon

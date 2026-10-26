@@ -74,7 +74,7 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
    └── expired or stale review (watchdog) ──► todo (attempt count++)
 ```
 
-The watchdog never lets work park forever. Silent agents are released from `in_progress`. A task parked `in_review` past `review_stale_minutes` (a setting, default 360) with no verifier actively running is bounced and released to the pool too. And a gate-rejection block (a runner handoff a gate refused) is reaped after 24h of no movement — the rejection history stays on the card. A release whose session trail proves landed side effects (GitHub PR/issue/commit receipts in the progress trail, or the runner's own `completed_result_lost` marker — the runner also re-delivers a completed run's result after a mid-run release instead of dropping it) is classed `completed_result_lost`: the delivery channel is flagged and the behaviour score exempts it, because a lost report is not an abandoned task (BR#3352).
+The watchdog never lets work park forever. Silent agents are released from `in_progress`. And a blocked card always awaits something typed (BR#3578): a machine event, an open ask, or a timer — prose alone is annotation, never an exit condition. The hub re-checks machine events every 15 minutes, answered asks auto-resume their subject, and elapsed timers fire the unblock duty; a card that awaits nothing cannot park at all. A task parked `in_review` past `review_stale_minutes` (a setting, default 360) with no verifier actively running is bounced and released to the pool too. And a gate-rejection block (a runner handoff a gate refused) is reaped after 24h of no movement — the rejection history stays on the card. A release whose session trail proves landed side effects (GitHub PR/issue/commit receipts in the progress trail, or the runner's own `completed_result_lost` marker — the runner also re-delivers a completed run's result after a mid-run release instead of dropping it) is classed `completed_result_lost`: the delivery channel is flagged and the behaviour score exempts it, because a lost report is not an abandoned task (BR#3352).
 
 - **impl**, the work itself. Exclusive claim. Finish requires a PR, which auto-spawns a Verify task. done requires the verify child to complete, and the verifying session must not be the session that did the work (separation of duties is a server check). Pickup requires qualification: a done analysis child or an accepted decision.
 - **analysis**, evidence before code. Exclusive claim; output is a breakdown or evidence map, not a PR. Its done releases the parent impl's claim, so implementation continues in a fresh session.
@@ -171,7 +171,7 @@ Next to **Reframe** on every open ask (both surfaces: the ask band rows in Top a
 
 | | Self-hosted (OSS) | Hosted (coming soon) |
 |---|---|---|
-| Price | Free, Apache-2.0 | $5 / month |
+| Price | Free, Apache-2.0 | $10 / month |
 | Hub | Your own Cloudflare account; free tier (~10-min setup) | We run it, zero infra |
 | Runners & agents | Your machines, your agent CLIs | Your machines, your agent CLIs |
 | Surfaces | Web, gateway CLI + desktop app | Web, gateway CLI + desktop app, mobile |

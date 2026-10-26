@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition } from "./core";
-import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, type CloseLeg } from "./closure";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -288,14 +288,31 @@ export const RULES: Rule[] = [
         : `bouncing back from review requires the reviewer's findings (note) — "no" without reasons is not an answer`,
   },
   {
-    name: "blocked-needs-path",
+    // BR#3578: a blocked card must AWAIT something typed — a machine event,
+    // an open ask, or a timer. Machine-managed parks (subprocess budgets,
+    // merge-train leases) carry their own trip-wires. Free text alone is
+    // optional annotation, never the exit condition.
+    name: "blocked-needs-typed-await",
     when: (i) => i.to === "blocked",
     guard: (i) => {
       const reason = String(i.body?.note ?? i.body?.reason ?? "").trim();
-      const unblock = String(i.body?.unblock_condition ?? "").trim();
-      return reason && unblock
-        ? null
-        : "moving to blocked requires BOTH a reason (note) and an unblock condition — a blocked card without an unblock path is a dead end";
+      if (!reason) return "moving to blocked requires a reason (note)";
+      if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
+      if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
+      if (i.body?.await_event !== undefined) {
+        return validateAwaitEvent(i.body.await_event)
+          ? null
+          : `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+      }
+      // compat shim: legacy text conditions that parse cleanly to ONE atom
+      // are derived typed events at write time; unparseable/no-atom text is
+      // exactly the "blocked forever" class the law kills.
+      const text = String(i.body?.unblock_condition ?? "").trim();
+      if (text) {
+        const { atoms, unparseable } = parseProxyCondition(text);
+        if (!unparseable && awaitEventFromAtoms(atoms)) return null;
+      }
+      return `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578)`;
     },
   },
   {

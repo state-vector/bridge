@@ -180,7 +180,7 @@
    │        └── in_progress | todo (unblocked / retry)
    └── expired (watchdog) ──► todo (attempt count++)</code></pre>
 
-<p>States are honest. <code>blocked</code> requires a reason and an unblock condition. A declared subprocess block pauses the watchdog for its declared budget only. Silence past the heartbeat window marks the task abandoned and returns it to the pool. A parent cannot complete while its children are open.</p>
+<p>States are honest. <code>blocked</code> requires a reason AND a typed await — a machine event, an open ask, or a timer (BR#3578); free text alone is annotation, derived from the structure. A declared subprocess block pauses the watchdog for its declared budget only. Silence past the heartbeat window marks the task abandoned and returns it to the pool. A parent cannot complete while its children are open.</p>
 
 <table>
   <thead><tr><th>Kind</th><th>Mode</th><th>Enforced flow</th></tr></thead>
@@ -251,7 +251,7 @@
 <table>
   <thead><tr><th></th><th>Self-hosted (OSS)</th><th>Hosted <em>(coming soon)</em></th></tr></thead>
   <tbody>
-    <tr><td><strong>Price</strong></td><td>Free, Apache-2.0</td><td>$5 / month</td></tr>
+    <tr><td><strong>Price</strong></td><td>Free, Apache-2.0</td><td>$10 / month</td></tr>
     <tr><td><strong>Hub</strong></td><td>Your own Cloudflare account; runs on the free tier (~10-minute setup)</td><td>We run it, zero infra</td></tr>
     <tr><td><strong>Runners &amp; agents</strong></td><td>Your machines, your agent CLIs</td><td>Your machines, your agent CLIs</td></tr>
     <tr><td><strong>Surfaces</strong></td><td>Web, gateway CLI + desktop app</td><td>Web, gateway CLI + desktop app, mobile</td></tr>

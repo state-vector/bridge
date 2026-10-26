@@ -5,6 +5,10 @@ import {
   parseCloseLegs,
   parseClosureReceipt,
   parseProxyCondition,
+  validateAwaitEvent,
+  awaitEventFromAtoms,
+  awaitEventToAtom,
+  describeAwaitEvent,
 } from "../src/kb/closure.ts";
 
 /**
@@ -156,5 +160,51 @@ describe("doneWhenSection (the Done-when contract the gate reads)", () => {
 
   it("no Done-when section → empty (a card that declares no terminal legs is not gate-enforced)", () => {
     expect(doneWhenSection("## Why this task exists\n\npaperwork execution only")).toBe("");
+  });
+});
+
+// ---------- BR#3578: the typed await grammar ----------
+describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
+  it("accepts every registered event shape", () => {
+    expect(validateAwaitEvent({ event: "pr_merged", repo: "state-vector/bridge", n: 12 })).toEqual({ event: "pr_merged", repo: "state-vector/bridge", n: 12 });
+    expect(validateAwaitEvent({ event: "br_pr_merged", id: "BR#2327" })).toEqual({ event: "br_pr_merged", id: "BR#2327" });
+    expect(validateAwaitEvent({ event: "issue_closed", repo: "state-vector/bridge", n: 2261 })).toEqual({ event: "issue_closed", repo: "state-vector/bridge", n: 2261 });
+    expect(validateAwaitEvent({ event: "br_done", id: "BR#3372" })).toEqual({ event: "br_done", id: "BR#3372" });
+    expect(validateAwaitEvent({ event: "run_success", repo: "state-vector/superpositional", newer_than: "40254898149" })).toEqual({ event: "run_success", repo: "state-vector/superpositional", run_id: undefined, newer_than: "40254898149" });
+    expect(validateAwaitEvent({ event: "pr_checks_green", repo: "state-vector/bridge", n: 218 })).toEqual({ event: "pr_checks_green", repo: "state-vector/bridge", n: 218 });
+    expect(validateAwaitEvent({ event: "ask", ask_id: "BR#3531" })).toEqual({ event: "ask", ask_id: "BR#3531" });
+    expect(validateAwaitEvent({ event: "time", until_ts: 1793000000000 })).toEqual({ event: "time", until_ts: 1793000000000 });
+  });
+
+  it("fail-closed: unknown kinds, bad shapes and free text never pass", () => {
+    expect(validateAwaitEvent(null)).toBeNull();
+    expect(validateAwaitEvent("PR #84 merged")).toBeNull(); // free text is NOT an event
+    expect(validateAwaitEvent({ event: "custom_thing", x: 1 })).toBeNull(); // closed set
+    expect(validateAwaitEvent({ event: "pr_merged", repo: "no-slash", n: 1 })).toBeNull(); // repo must be a slug
+    expect(validateAwaitEvent({ event: "br_done", id: "2327" })).toBeNull(); // ids are BR#-prefixed
+    expect(validateAwaitEvent({ event: "time", until_ts: "tomorrow" })).toBeNull();
+  });
+
+  it("awaitEventFromAtoms migrates exactly ONE clean atom (the sweep's self-migration shim)", () => {
+    const a = parseProxyCondition("Machine proxy: PR https://github.com/state-vector/superpositional/pull/2327 mergeCommit non-null");
+    expect(awaitEventFromAtoms(a.atoms)).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2327 });
+    expect(awaitEventFromAtoms(parseProxyCondition("BR#3372 done").atoms)).toEqual({ event: "br_done", id: "BR#3372" });
+    expect(awaitEventFromAtoms(parseProxyCondition("PR #2327 mergeCommit non-null").atoms)).toBeNull(); // no repo slug → unresolvable, stays text → ask migration
+    expect(awaitEventFromAtoms([])).toBeNull(); // nothing machine-checkable → stays text → ask migration
+    // multi-atom conjunctions are NOT single events — no silent partial reads
+    const two = parseProxyCondition("PR #2327 merged; BR#3372 done");
+    expect(awaitEventFromAtoms(two.atoms)).toBeNull();
+  });
+
+  it("describeAwaitEvent renders human-friendly annotation from the structure", () => {
+    expect(describeAwaitEvent({ event: "pr_merged", repo: "state-vector/bridge", n: 84 })).toBe("PR state-vector/bridge#84 merged (mergeCommit non-null)");
+    expect(describeAwaitEvent({ event: "ask", ask_id: "BR#3531" })).toBe("ask BR#3531 answered");
+    expect(describeAwaitEvent({ event: "time", until_ts: 123 })).toBe("timer elapsed (until_ts 123)");
+  });
+
+  it("ask/time events map to no atom (they evaluate on their own, first-class)", () => {
+    expect(awaitEventToAtom({ event: "ask", ask_id: "BR#1" })).toBeNull();
+    expect(awaitEventToAtom({ event: "time", until_ts: 1 })).toBeNull();
+    expect(awaitEventToAtom({ event: "pr_merged", repo: "a/b", n: 2 })?.kind).toBe("pr_merged");
   });
 });

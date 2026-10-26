@@ -133,10 +133,20 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     });
     expect(parkDone.status, `park round done failed: ${JSON.stringify(parkDone.body)}`).toBe(200);
 
-    // P2: machine-looking text that yields NO atom — honest unparseable
+    // P2 (BR#3578): machine-looking text that yields NO atom can no longer
+    // PARK — the door refuses free text alone; a typed await_event is
+    // required, and it is stored on the card. Text may ride as annotation.
     const p2 = await kbJson("/create", { type: "task", title: "IMPL: unparseable drill", qualified: true, session: "drill-exec-p2" });
     const p2id = String(p2.body.id);
-    await block(p2id, "drill-exec-p2", "GH#2274 pending re-close", "parked");
+    const p2Reject = await block(p2id, "drill-exec-p2", "GH#2274 pending re-close", "parked");
+    expect(p2Reject.status, `text-only park must be refused: ${JSON.stringify(p2Reject.body)}`).toBe(400);
+    expect(String(p2Reject.body.error)).toContain("blocked-needs-typed-await");
+    const p2Park = await kbJson("/transition", {
+      id: p2id, to: "blocked", actor: "drill-exec-p2", session: "drill-exec-p2", note: "parked",
+      unblock_condition: "GH#2274 pending re-close",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2400 },
+    });
+    expect(p2Park.status, `typed park failed: ${JSON.stringify(p2Park.body)}`).toBe(200);
 
     // P3: well-formed pr_merged atom — the hub cannot read it either
     const p3 = await kbJson("/create", { type: "task", title: "IMPL: gh-atom drill", qualified: true, session: "drill-exec-p3" });
@@ -160,10 +170,12 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
       expect(now.meta?.proxy_check?.spawned).toBeUndefined();
     }
 
-    // P2 stamped honestly unparseable — stamped, never flipped, no duty
+    // P2: the typed await is stored (annotation rides along); the sweep
+    // stamps it unresolvable like every other GitHub-state atom
     const p2Now = await taskById(p2id);
-    expect(p2Now.meta?.proxy_check?.verdict).toBe("unparseable");
-    expect(p2Now.meta?.proxy_check?.detail).toContain("never auto-flips");
+    expect(p2Now.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2400 });
+    expect(p2Now.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p2Now.meta?.proxy_check?.spawned).toBeUndefined();
 
     // a second sweep re-stamps the same verdicts (per-card pacing, no churn
     // audits, no duties of any kind from the sweep)
@@ -253,6 +265,7 @@ describe("duplicate-executor fence (real DO)", () => {
     const moved = await kbJson("/transition", {
       id: eId, to: "blocked", actor: "drill-exec-b", session: "drill-exec-b",
       note: "awaiting direction", unblock_condition: "direction from the parent",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2400 },
     });
     expect(moved.status).toBe(200);
 

@@ -105,6 +105,10 @@ import {
   doneWhenSection,
   legLabel,
   RECEIPT_CONTRACT,
+  validateAwaitEvent,
+  awaitEventFromAtoms,
+  awaitEventToAtom,
+  describeAwaitEvent,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -625,14 +629,79 @@ export class KnowledgeHub {
     for (const r of rows) {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
-        const cond = String(meta.blocked?.unblock_condition ?? "").trim();
+        const bmeta = meta.blocked ?? {};
+        // BR#3578: the typed await (validated at the door) is trusted and
+        // evaluated FIRST; the free text is annotation + legacy fallback.
+        const aw = validateAwaitEvent(bmeta.await_event) ?? null;
+        const cond = String(bmeta.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : "");
         if (!cond) continue;
         const prev = meta.proxy_check;
         if (prev?.at && now - Number(prev.at) < periodMin * 60_000) continue; // per-card pacing
-        const { atoms, unparseable } = parseProxyCondition(cond);
+
+        // typed legs: ask/time are first-class — an answered ask or an
+        // elapsed timer flips exactly like a machine atom (spawn the duty;
+        // the duty re-verifies first-hand).
+        if (aw && (aw.event === "ask" || aw.event === "time")) {
+          const fired = aw.event === "time"
+            ? now >= aw.until_ts
+            : (() => {
+                const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
+                return !a || a.status === "done" || a.status === "superseded";
+              })();
+          if (!fired) {
+            this.stampProxyCheck(r.id, meta, now, "waiting",
+              aw.event === "time" ? `timer until ${new Date(aw.until_ts).toISOString()}` : `awaiting ask ${aw.ask_id}`, prev);
+            continue;
+          }
+          const receipt = aw.event === "time"
+            ? `timer elapsed (until_ts ${aw.until_ts}, checked ${new Date(now).toISOString()})`
+            : `ask ${aw.ask_id} answered/closed`;
+          await this.spawnProxyDuty(r, meta, now, prev, cond, [`${describeAwaitEvent(aw)} → ${receipt}`]);
+          continue;
+        }
+
+        // machine atoms: typed await wins (trusted); legacy text parses and
+        // SELF-MIGRATES to the typed shape (one clean atom → await_event).
+        let atoms: ProxyAtom[];
+        let unparseable: boolean;
+        if (aw) {
+          atoms = [awaitEventToAtom(aw)!];
+          unparseable = false;
+        } else {
+          const parsed = parseProxyCondition(cond);
+          atoms = parsed.atoms;
+          unparseable = parsed.unparseable;
+          const derived = awaitEventFromAtoms(atoms);
+          if (derived) {
+            meta.blocked = { ...(meta.blocked ?? {}), await_event: derived };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+          }
+        }
         if (!atoms.length) {
+          // BR#3578 migration: a legacy blocked card awaiting NOTHING (no
+          // typed event, no atoms, no bound ask) becomes an ACTIVE ask to the
+          // human — once per card, never once per sweep. Cards whose
+          // root_blocker is still open skip: the root owns the human leg.
+          const rooted = meta.root_blocker
+            ? this.one(`SELECT status FROM artefacts WHERE id = ?`, String(meta.root_blocker))
+            : null;
+          if (!meta.awaiting_ask?.ask_id && !bmeta.await_migration_ask
+              && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
+            const ask = await this.askCreate({
+              to: "ray",
+              question: `Blocked card ${r.id} awaits nothing the machine can read — re-scope it, or release it back to the pool?`,
+              reason: "the exit condition is prose the hub cannot parse (BR#3578 migration): parked cards awaiting nothing are impossible now — this one needs a human ruling",
+              options: ["RE-SCOPE — I'll rewrite the exit condition", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
+              details: `"${r.title}" is parked ${unparseable ? "on machine-looking text that parsed to no atom" : "text-only"}: "${cond.slice(0, 240)}". Under BR#3578 every blocked card awaits a typed event, an open ask, or a timer — give this one one, or release it.`,
+              artefact_id: r.id,
+            }, "hub:proxy-watch").catch(() => null);
+            if (ask) {
+              meta.blocked = { ...(meta.blocked ?? {}), await_migration_ask: ask.id };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            }
+          }
           this.stampProxyCheck(r.id, meta, now, unparseable ? "unparseable" : "no_atoms",
-            unparseable ? "condition mentions machine state but no atom parsed — never auto-flips" : null, prev);
+            unparseable ? "condition mentions machine state but no atom parsed — never auto-flips (migrated to an ask)" : "no machine atoms — migrated to an ask", prev);
           continue;
         }
         const results: { atom: ProxyAtom; ok: boolean; receipt: string }[] = [];
@@ -650,56 +719,64 @@ export class KnowledgeHub {
             { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
           continue;
         }
-        // the flip: spawn the unblock duty (the machine's caps still apply —
-        // ≤1 open unblock child, flood guard on identical exit conditions)
-        const openChild = this.one(
-          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`, r.id,
-        );
-        const lastSpawn = meta.last_unblock_spawn;
-        // same flood law as the machine's own spawn (machine.ts): only the
-        // SAME exit condition within the window floods — a block-time round
-        // with this exact condition is already on the case; a later flip
-        // past the window spawns a fresh round (the BR#3129 story: the flip
-        // came ~20h after the park-time round)
-        const flooded =
-          lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS &&
-          String(lastSpawn.exit ?? "") === cond;
-        if (openChild || flooded) {
-          this.stampProxyCheck(r.id, meta, now, "true", null, prev,
-            { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" });
-          if (prev?.verdict !== "true") {
-            this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
-          }
-          continue;
-        }
-        const ts = Date.now();
-        const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
-        const atomLines = results.map((x) => `- "${x.atom.raw}" → ${x.receipt}`).join("\n");
-        const created = await this.create(
-          {
-            type: "task",
-            title: `Unblock: ${rootTitle.slice(0, 190)}`,
-            session: "", // session-less spawn: the closer stamps it when they claim
-            body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts.\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
-            roles: ["unblock"],
-          },
-          "hub:proxy-watch",
-        );
-        this.state.storage.sql.exec(
-          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-          created.id, r.id, ts,
-        );
-        meta.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
-        this.stampProxyCheck(r.id, meta, now, "true", null, prev,
-          { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: created.id });
-        this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, atoms: results.map((x) => x.receipt) });
-        this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE — unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
+        // the flip: spawn the unblock duty (the machine's caps still apply)
+        await this.spawnProxyDuty(r, meta, now, prev, cond, results.map((x) => `"${x.atom.raw}" → ${x.receipt}`));
       } catch (e) {
         this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 300) });
       }
     }
+  }
+
+  /** BR#3361a / BR#3578: the flip — the exit condition held TRUE; spawn the
+   *  unblock duty with the receipts embedded. Shared by atom flips and
+   *  ask/time timer fires. Machine caps still apply: ≤1 open unblock child,
+   *  flood guard on identical exit conditions. */
+  private async spawnProxyDuty(
+    r: any, meta: any, now: number, prev: any, cond: string, receiptLines: string[],
+  ): Promise<void> {
+    const openChild = this.one(
+      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`, r.id,
+    );
+    const lastSpawn = meta.last_unblock_spawn;
+    // same flood law as the machine's own spawn (machine.ts): only the
+    // SAME exit condition within the window floods — a block-time round
+    // with this exact condition is already on the case; a later flip
+    // past the window spawns a fresh round (the BR#3129 story: the flip
+    // came ~20h after the park-time round)
+    const flooded =
+      lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS &&
+      String(lastSpawn.exit ?? "") === cond;
+    if (openChild || flooded) {
+      this.stampProxyCheck(r.id, meta, now, "true", null, prev,
+        { spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" });
+      if (prev?.verdict !== "true") {
+        this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
+      }
+      return;
+    }
+    const ts = Date.now();
+    const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
+    const atomLines = receiptLines.map((l) => `- ${l}`).join("\n");
+    const created = await this.create(
+      {
+        type: "task",
+        title: `Unblock: ${rootTitle.slice(0, 190)}`,
+        session: "", // session-less spawn: the closer stamps it when they claim
+        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts.\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — do NOT respawn an unblock task, do not leave yourself open.`,
+        roles: ["unblock"],
+      },
+      "hub:proxy-watch",
+    );
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+      created.id, r.id, ts,
+    );
+    meta.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
+    this.stampProxyCheck(r.id, meta, now, "true", null, prev, { spawned: created.id });
+    this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, receipts: receiptLines });
+    this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE — unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
   }
 
 
@@ -1679,13 +1756,26 @@ export class KnowledgeHub {
             };
             const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
             if (!alreadyRight) {
-              // 3 identical rounds = the loop is stalled; park it for a human
+              // 3 identical rounds = the loop is stalled; park it for a human.
+              // BR#3578: the human leg is an ACTIVE ask (For Me, one click),
+              // not prose buried on the card.
               if (round >= 3) {
-                await this.transition({
-                  id: trow.id, to: "blocked",
-                  note: `verify loop stalled — ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
-                  unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
-                }, "system:verifier");
+                const stallAsk = await this.askCreate({
+                  to: "ray",
+                  question: `Verify loop stalled on ${trow.id} (${round} identical ${verdict} rounds) — cancel the loop or keep it parked?`,
+                  reason: "the verifier keeps proposing the identical verdict; auto-apply made no progress — the loop needs a human ruling",
+                  options: ["CANCEL — transition the loop to todo for re-scoping", "KEEP PARKED — I'll clear the blocker myself", "SUPERSEDE — drop the stalled round"],
+                  details: `Verify loop stalled: ${round} rounds with identical verdict (${verdict}), each auto-applied with no progress. Read the verify history on ${trow.id} before answering.`,
+                  artefact_id: trow.id,
+                }, "system:verifier").catch(() => null);
+                if (stallAsk?.task_status !== "blocked") {
+                  await this.transition({
+                    id: trow.id, to: "blocked",
+                    note: `verify loop stalled — ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
+                    unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
+                    ...(stallAsk ? { await_event: { event: "ask", ask_id: stallAsk.id } } : {}),
+                  }, "system:verifier");
+                }
               } else {
                 await this.transition({
                   id: trow.id, to: verdict === "bounce" ? "in_progress" : "done",
@@ -2316,8 +2406,19 @@ export class KnowledgeHub {
       else meta[k] = v;
     }
     if (verdict.status === "blocked") {
-      if (!meta.blocked)
-        meta.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+      if (!meta.blocked) {
+        // BR#3578: store the TYPED await (the guard validated one exists or
+        // exempted a machine-managed park). Free text is optional annotation,
+        // derived from the structured event when absent.
+        const aw = validateAwaitEvent(body.await_event)
+          ?? awaitEventFromAtoms(parseProxyCondition(String(body.unblock_condition ?? "")).atoms);
+        meta.blocked = {
+          reason: String(body.note ?? body.reason ?? "").trim(),
+          unblock_condition: String(body.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : ""),
+          ts,
+          ...(aw ? { await_event: aw } : {}),
+        };
+      }
       delete meta.subprocess; // a real block supersedes a declared subprocess window
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
@@ -3247,6 +3348,7 @@ export class KnowledgeHub {
             id: artefactId, to: "blocked",
             note: `blocked on ${to}: ${question.slice(0, 100)}`,
             unblock_condition: `answer ask ${id}`,
+            await_event: { event: "ask", ask_id: id },
           }, actor);
           taskStatus = "blocked";
         }
@@ -3777,6 +3879,27 @@ export class KnowledgeHub {
       // Re-releasing just runs the same cycle again. Park it blocked-for-human:
       // only a human (web/human actor) may release it from here on.
       if (attempts >= 5) {
+        // BR#3578: the human leg is an ACTIVE ask (For Me, one click), not
+        // prose on a parked card. reapAbandoned stays sync — the ask files as
+        // a promise; askCreate auto-blocks the in_progress subject with the
+        // typed ask event, and the .then leg stamps awaiting_ask + the typed
+        // await onto the card once the ask id exists.
+        void this.askCreate({
+          to: "ray",
+          question: `Rework loop on ${t.id} — re-scope it, or release it back to the pool?`,
+          reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) — re-running repeats the claim→stall cycle`,
+          options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
+          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue.`,
+          artefact_id: t.id,
+        }, "system:reaper")
+          .then((loopAsk) => {
+            const fresh = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id = ?`, t.id)?.meta ?? "{}"));
+            fresh.blocked = { ...(fresh.blocked ?? {}), await_event: { event: "ask", ask_id: loopAsk.id } };
+            fresh.awaiting_ask = { ...(fresh.awaiting_ask ?? {}), ask_id: loopAsk.id, ts: Date.now() };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(fresh), t.id);
+            this.audit("system:reaper", "loop_ask_filed", t.id, { ask_id: loopAsk.id, attempts });
+          })
+          .catch(() => { /* ask filing failed — the escalation record below still parks it for human review */ });
         meta.blocked = {
           reason: `rework loop detected — ${attempts} dispatch attempts without completion (last release reason: ${reason.slice(0, 160)}). Re-running again would repeat the cycle; escalated to a human.`,
           unblock_condition: "human: review the attempt history (get_history) — either fix what keeps failing, re-scope the task, or transition it todo yourself to deliberately continue",

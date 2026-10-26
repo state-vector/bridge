@@ -135,10 +135,13 @@ describe("transition matrix (task: role × from × to)", () => {
     expect(await check(ask, baseCtx())).toBeNull();
   });
 
-  it("impl blocked requires reason AND unblock condition; blocked release requires resolution", async () => {
-    expect(await check(input({ status: "in_progress", to: "blocked", body: { note: "why" } }), baseCtx())).toContain("BOTH a reason");
+  it("impl blocked requires a reason AND a typed await (BR#3578); blocked release requires resolution", async () => {
+    expect(await check(input({ status: "in_progress", to: "blocked", body: { note: "why" } }), baseCtx())).toContain("typed await_event");
     expect(
       await check(input({ status: "in_progress", to: "blocked", body: { note: "why", unblock_condition: "when X" } }), baseCtx()),
+    ).toContain("typed await_event"); // free text alone is annotation, never an exit condition
+    expect(
+      await check(input({ status: "in_progress", to: "blocked", body: { note: "why", await_event: { event: "pr_merged", repo: "a/b", n: 9 } } }), baseCtx()),
     ).toBeNull();
     expect(await check(input({ status: "blocked", to: "in_progress", body: {} }), baseCtx())).toContain("requires a resolution");
   });
@@ -224,17 +227,31 @@ describe("loop regressions", () => {
     expect(msg).toContain("verdict duties cannot block");
   });
 
-  it("BR#909 shape: impl blocking WITH direction is legal; unblock child on verdict duty is refused at link-time elsewhere", async () => {
+  it("BR#3578 shape: impl blocking WITH a typed await is legal; prose alone is refused at the door", async () => {
     expect(
-      await check(input({ status: "in_progress", to: "blocked", body: { note: "needs direction", unblock_condition: "wire X per design" } }), baseCtx()),
+      await check(input({ status: "in_progress", to: "blocked", body: { note: "needs direction", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 84 } } }), baseCtx()),
     ).toBeNull();
+    // bound ask = the active human leg
+    expect(
+      await check(input({ status: "in_progress", to: "blocked", body: { note: "needs direction", awaiting_ask_id: "BR#3531" } }), baseCtx()),
+    ).toBeNull();
+    // machine-managed parks carry their own trip-wires
+    expect(
+      await check(input({ status: "in_progress", to: "blocked", body: { note: "train lease", merge_train: true } }), baseCtx()),
+    ).toBeNull();
+    // free text alone is annotation, never an exit condition — refused
+    const prose = await check(input({ status: "in_progress", to: "blocked", body: { note: "needs direction", unblock_condition: "wire X per design" } }), baseCtx());
+    expect(prose).toBeTruthy();
+    // malformed typed event is refused too (closed set)
+    const malformed = await check(input({ status: "in_progress", to: "blocked", body: { note: "needs direction", await_event: { event: "vibes" } } }), baseCtx());
+    expect(malformed).toBeTruthy();
   });
 
   it("every rule has a name and the set is stable (table drift alarm)", () => {
     expect(RULES.map((r) => r.name).sort()).toEqual(
       [
         "bounce-needs-findings",
-        "blocked-needs-path",
+        "blocked-needs-typed-await",
         "claim-bars",
         "claim-separation-of-duties",
         "decision-acceptance-human",
@@ -405,7 +422,7 @@ describe("executor contract: Applied(effects) | Rejection{code,rule,message}", (
     expect(v.ok).toBe(false);
     if (v.ok === false) expect(v.rule).toBe("verdict-done-needs-receipts");
     // a review task blocked without any note: verdict-no-blocked (the carve-out rule)
-    // sits before blocked-needs-path — the loop class dies at the FIRST gate
+    // sits before blocked-needs-typed-await — the loop class dies at the FIRST gate
     const v2 = await decide(input({ status: "in_progress", to: "blocked", roles: ["review"], body: {} }), baseCtx());
     expect(v2.ok).toBe(false);
     if (v2.ok === false) expect(v2.rule).toBe("verdict-no-blocked");
@@ -453,24 +470,22 @@ describe("effects decided executor-side (F4)", () => {
   });
 
   it("blocked spawns an unblock child with the exit condition; cap and flood guard skip it", async () => {
-    const v = ok(
-      await decide(input({ status: "in_progress", to: "blocked", body: { note: "why", unblock_condition: "when X lands" } }), baseCtx()),
-    );
-    expect(v.effects).toEqual([{ kind: "spawn_unblock", parent: "BR#1", reason: "why", exit_condition: "when X lands" }]);
+    const typedBlock = (extra: Record<string, unknown> = {}) => ({
+      status: "in_progress", to: "blocked",
+      body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/9 merged", ...extra },
+    });
+    const v = ok(await decide(input(typedBlock()), baseCtx()));
+    expect(v.effects).toEqual([{ kind: "spawn_unblock", parent: "BR#1", reason: "why", exit_condition: "PR https://github.com/a/b/pull/9 merged" }]);
 
     const capped = baseCtx();
     capped.openUnblockChild = () => ({ id: "BR#50" });
-    const v2 = ok(
-      await decide(input({ status: "in_progress", to: "blocked", body: { note: "why", unblock_condition: "when X lands" } }), capped),
-    );
+    const v2 = ok(await decide(input(typedBlock()), capped));
     expect(v2.effects).toEqual([{ kind: "skip_unblock_spawn", parent: "BR#1", reason: "existing unblock child BR#50 reused" }]);
 
-    const flooded = input({
-      status: "in_progress",
-      to: "blocked",
-      body: { note: "why", unblock_condition: "when X lands" },
-      meta: { last_unblock_spawn: { at: 1_000_000 - 10 * 60_000, exit: "when X lands" } }, // 10m ago, same exit
-    });
+    const flooded = input(typedBlock({
+      unblock_condition: "PR https://github.com/a/b/pull/9 merged",
+    }));
+    flooded.meta = { last_unblock_spawn: { at: 1_000_000 - 10 * 60_000, exit: "PR https://github.com/a/b/pull/9 merged" } }; // 10m ago, same exit
     const v3 = ok(await decide(flooded, baseCtx()));
     expect(v3.effects[0].kind).toBe("skip_unblock_spawn");
     expect((v3.effects[0] as any).reason).toContain("flood guard");
@@ -479,8 +494,8 @@ describe("effects decided executor-side (F4)", () => {
     const freshExit = input({
       status: "in_progress",
       to: "blocked",
-      body: { note: "why", unblock_condition: "when Y lands" },
-      meta: { last_unblock_spawn: { at: 1_000_000 - 10 * 60_000, exit: "when X lands" } },
+      body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/10 merged" },
+      meta: { last_unblock_spawn: { at: 1_000_000 - 10 * 60_000, exit: "PR https://github.com/a/b/pull/9 merged" } },
     });
     expect(ok(await decide(freshExit, baseCtx())).effects[0].kind).toBe("spawn_unblock");
   });
