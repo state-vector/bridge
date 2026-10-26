@@ -404,12 +404,14 @@ async function driveLane(lane) {
     await renew();
     sh("git", ["fetch", "--quiet", "origin", base]);
     const behind = spawnSync("git", ["merge-base", "--is-ancestor", `origin/${base}`, headSha], { cwd: WORKDIR, encoding: "utf8" }).status !== 0;
-    // BR#3659: the behind-check reads THIS leg's accepted-at head, not the
-    // card-level first-leg stamp — each leg carries its own verdict.
-    if (behind && headSha === String(leg.head_sha_at_acceptance ?? "").toLowerCase()) {
-      // base advanced past a verdict-covered head: update-branch is the
-      // MACHINE-clean rebase — if it lands, the verdict carries (BR#3516 §5);
-      // if it conflicts, that's human-resolved — bounce with the file list.
+    // BR#3727: the gate pre-clears behind ONLY for a verdict-covered head
+    // (an uncovered head bounced before composing), so base advanced under a
+    // covered head means the §5 carry owns the move: update-branch is the
+    // MACHINE-clean rebase — the verdict carries (BR#3516 §5); if it
+    // conflicts, that's human-resolved — bounce with the file list. The
+    // covered head may be this leg's accepted-at stamp or a contiguous
+    // carry chain — coverage is the gate's judgment, not a sha compare.
+    if (behind) {
       const tm = trialMerge(base, headSha);
       if (!tm.clean) {
         await mcp("train_event", { repo, base, kind: "bounced", pr, task_id: head.id, head_sha: headSha, conflict_files: tm.files, reason: `base ${base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry` });
@@ -419,11 +421,21 @@ async function driveLane(lane) {
       }
       sh("gh", ["pr", "update-branch", String(pr), "--repo", repo]);
       const updated = await prFacts(repo, pr);
-      log(key, `machine update-branch clean: ${headSha.slice(0, 9)} → ${updated.headRefOid.slice(0, 9)} (verdict carries)`);
+      log(key, `machine update-branch clean: ${headSha.slice(0, 9)} → ${updated.headRefOid.slice(0, 9)} (verdict carries, BR#3516 §5)`);
       facts.headRefOid = updated.headRefOid;
       facts.mergeable = updated.mergeable;
       facts.mergeStateStatus = updated.mergeStateStatus;
       if (facts.mergeable !== true) { log(key, "mergeability recomputing after update-branch — next tick"); await releaseIfIdle(); return; }
+      const mss = String(facts.mergeStateStatus ?? "").toLowerCase();
+      if (mss && mss !== "clean" && mss !== "unstable") {
+        // strict branch protection re-runs the required checks on the new
+        // head — blocked/pending there is the clock, not a defect (BR#3727);
+        // the gate waits on it next tick and merges when green. Merging now
+        // would just be refused (checks not settled on the new head).
+        log(key, `post-update mergeStateStatus=${mss} — required checks re-running on the new head; next tick`);
+        await releaseIfIdle();
+        return;
+      }
     }
     sh("gh", ["pr", "merge", String(pr), "--repo", repo, METHOD_FLAG[METHOD]]);
     const merged = await prFacts(repo, pr);

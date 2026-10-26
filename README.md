@@ -526,6 +526,17 @@ machine-clean carry chain:
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
   a fresh verify accepts the new head.
+- **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727)**: behind is
+  exactly "base advanced, branch still mergeable" — the state the carry law was written
+  for, which the shared `decideMergeAction` (clean/unstable, untouched) bounces because
+  the sweep has no update-branch authority. The train gate pre-clears it so the
+  executor reaches its own `gh pr update-branch`: behind + a verdict-covered head + a
+  clean trial merge → machine-clean update, verdict CARRIES, and the train merges when
+  the new head's checks settle. Conflicts still bounce with the file list. The tick
+  right after an update-branch reads `blocked` while strict branch protection re-runs
+  the required checks on the new head — pending, not a defect: the gate WAITS on it
+  (red head checks note; blocked with green checks — protection wants reviews — still
+  bounces honestly).
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects

@@ -3,6 +3,7 @@ import {
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
+  decideMergeAction,
   decideTrainGate,
   leaseDecide,
   mergeTrainQueue,
@@ -686,11 +687,93 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     if (conflict.kind === "bounce") expect(conflict.defect).toContain("CONFLICTING against base");
     // UNKNOWN → null → skip this tick (never a bounce)
     expect(decideTrainGate(gh("UNKNOWN", "UNKNOWN")).kind).toBe("skip");
-    // uppercase states read back lowercase-named: BEHIND bounces NAMING behind
-    const behind = decideTrainGate(gh("MERGEABLE", "BEHIND"));
-    expect(behind.kind).toBe("bounce");
-    if (behind.kind === "bounce") expect(behind.defect).toContain("mergeStateStatus=behind");
+    // uppercase behind PRE-CLEARS at the train gate (BR#3727 — the §5 carry
+    // is reachable; supersedes this block's original "BEHIND bounces naming
+    // behind" pin: the shared decideMergeAction still bounces behind, and
+    // the BR#3727 describe below pins that).
+    expect(decideTrainGate(gh("MERGEABLE", "BEHIND")).kind).toBe("merge");
     // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
     expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
+  });
+});
+
+
+// ---------- BR#3727: BEHIND pre-clears at the TRAIN gate — the §5 carry is reachable ----------
+
+describe("decideTrainGate BEHIND (BR#3727 — supersedes the BR#3714 'BEHIND bounces naming behind' expectation)", () => {
+  const HEAD = "a".repeat(40);
+  const green = (id: number): MainCheckRun => ({ id, name: "Test", status: "completed", conclusion: "success", html_url: `https://example/${id}` });
+  const pending = (id: number): MainCheckRun => ({ id, name: "Test", status: "in_progress", conclusion: null, html_url: `https://example/${id}` });
+  const clean = (over: Partial<Parameters<typeof decideTrainGate>[0]> = {}): Parameters<typeof decideTrainGate>[0] => ({
+    prNumber: 222,
+    headSha: HEAD,
+    cardMeta: { pr: { head_sha_at_acceptance: HEAD.slice(0, 9) } },
+    cardStatus: "blocked",
+    baseVerdict: "green",
+    mergeable: true,
+    mergeStateStatus: "behind",
+    commits: [{ sha: HEAD, verified: true }],
+    headChecks: [green(1)],
+    ...over,
+  });
+
+  it("THE REPRO: mergeable + behind (base advanced, branch still mergeable — PR #222's live state) reaches the merge leg; the receipt names the §5 carry", () => {
+    const d = decideTrainGate(clean());
+    expect(d.kind).toBe("merge");
+    if (d.kind === "merge") {
+      expect(d.receipt).toContain("behind pre-cleared");
+      expect(d.receipt).toContain("BR#3516 §5");
+      expect(d.receipt).toContain(HEAD.slice(0, 9));
+    }
+    // gh's raw UPPERCASE enum pre-clears too (gate shape-tolerant either way
+    // #3714's fact-boundary normalizer lands)
+    expect(decideTrainGate(clean({ mergeStateStatus: "BEHIND" })).kind).toBe("merge");
+  });
+
+  it("behind loosens NOTHING else — unverified commits still human_leg, red base still refuses, an uncovered head still bounces", () => {
+    expect(decideTrainGate(clean({ commits: [{ sha: HEAD, verified: false }] })).kind).toBe("human_leg");
+    expect(decideTrainGate(clean({ baseVerdict: "red" })).kind).toBe("skip");
+    const uncovered = decideTrainGate(clean({ headSha: "d".repeat(40) }));
+    expect(uncovered.kind).toBe("bounce");
+    if (uncovered.kind === "bounce") expect(uncovered.defect).toContain("not covered by the accepted verdict");
+  });
+
+  it("the SHARED law still bounces behind — only the train gate widens (the sweep has no update-branch authority)", () => {
+    const d = decideMergeAction({
+      prNumber: 222,
+      prTitle: "",
+      headSha: HEAD,
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "behind",
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [green(1)],
+      cardStatus: "in_review",
+      verifyAcceptedOnHead: true,
+      verifyAcceptedAny: true,
+    });
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.defect).toContain("mergeStateStatus=behind");
+  });
+
+  it("blocked with PENDING head checks waits — the tick right after update-branch (strict protection re-runs the required checks on the new head)", () => {
+    const d = decideTrainGate(clean({ mergeStateStatus: "blocked", headChecks: [pending(1)] }));
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") {
+      expect(d.reason).toContain("mergeStateStatus=blocked");
+      expect(d.reason).toContain("re-running");
+    }
+  });
+
+  it("blocked with RED head checks notes — card queued (not in_review), the linked session owns it", () => {
+    const red = decideTrainGate(clean({ mergeStateStatus: "blocked", headChecks: [{ id: 1, name: "Test", status: "completed", conclusion: "failure", html_url: "https://example/1" }] }));
+    expect(red.kind).toBe("note");
+    if (red.kind === "note") expect(red.reason).toContain("head check RED");
+  });
+
+  it("blocked with GREEN head checks still bounces — protection wants something checks can't give (reviews/settings)", () => {
+    const d = decideTrainGate(clean({ mergeStateStatus: "blocked" }));
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.defect).toContain("mergeStateStatus=blocked");
   });
 });
