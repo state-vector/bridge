@@ -1,14 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
   carryAppend,
+  carryAppendLeg,
   classifyRequiredRuns,
   decideTrainGate,
   leaseDecide,
   mergeTrainQueue,
   trainBounceBrief,
+  trainCardMatchesLane,
   trainLandedCloseNote,
+  trainLegLanded,
+  trainLegs,
+  trainLegsRemaining,
+  trainParseNoteLegs,
+  trainQueueRemainingReason,
   trainStopAskTitle,
   verdictCoversHead,
+  verdictCoversHeadLeg,
   TRAIN_CI_BOUND_MULTIPLIER,
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_HEAD_STAMP_RE,
@@ -366,5 +374,248 @@ describe("train event copy", () => {
     expect(TRAIN_HEAD_STAMP_RE.exec("forehead abc123def")).toBeNull();
     expect(TRAIN_HEAD_STAMP_RE.exec("heads abc123def")).toBeNull();
     expect(TRAIN_HEAD_STAMP_RE.exec("verified, no stamp here")).toBeNull();
+  });
+});
+
+// ---------- BR#3659: the close-note leg parser ----------
+
+describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
+  const u = (repo: string, n: number) => `https://github.com/${repo}/pull/${n}`;
+  it("single-PR notes bind the note's FIRST head wherever it sits (the pre-3659 convention, unchanged)", () => {
+    const R = "state-vector/bridge";
+    const h = "a".repeat(40);
+    // head after the PR — the documented convention
+    expect(trainParseNoteLegs(`verified head ${h} — PR ${u(R, 7)}`)).toEqual([
+      { repo: R, number: 7, head_sha_at_acceptance: h },
+    ]);
+    // head BEFORE the PR, same note — the first head pairs with the one URL
+    expect(trainParseNoteLegs(`verified head ${h} (drill) — PR ${u(R, 7)}`)).toEqual([
+      { repo: R, number: 7, head_sha_at_acceptance: h },
+    ]);
+    // punctuation terminates the stamp (the widened lookahead)
+    expect(trainParseNoteLegs(`verified head ${h.slice(0, 9)}; PR ${u(R, 7)}`)).toEqual([
+      { repo: R, number: 7, head_sha_at_acceptance: h.slice(0, 9) },
+    ]);
+  });
+  it("multi-PR notes pair each PR with its NEAREST head (line by line — either order binds)", () => {
+    const R = "state-vector/bridge";
+    const b = "b".repeat(40), c = "c".repeat(40);
+    const expectLegs = [
+      { repo: R, number: 11, head_sha_at_acceptance: b },
+      { repo: R, number: 12, head_sha_at_acceptance: c },
+    ];
+    // head after each PR (the documented convention)
+    expect(trainParseNoteLegs(`accepted both legs — PR ${u(R, 11)} head ${b}; PR ${u(R, 12)} head ${c}`)).toEqual(expectLegs);
+    // head before each PR, same line — proximity binds them correctly, no cross-pair
+    expect(trainParseNoteLegs(`head ${b} — PR ${u(R, 11)}; head ${c} — PR ${u(R, 12)}`)).toEqual(expectLegs);
+    // the list layout: the head on the line BELOW its PR
+    expect(trainParseNoteLegs(`- PR ${u(R, 11)}\n  head ${b}\n- PR ${u(R, 12)}\n  head ${c}`)).toEqual(expectLegs);
+    // a PR whose receipt was never cited stays unbound — fail-closed, no guessing
+    expect(trainParseNoteLegs(`PR ${u(R, 11)} head ${b}; PR ${u(R, 12)}`)).toEqual([
+      { repo: R, number: 11, head_sha_at_acceptance: b },
+      { repo: R, number: 12 },
+    ]);
+    // a stray head is never stolen by the wrong PR: the nearer PR binds it
+    expect(trainParseNoteLegs(`PR ${u(R, 11)}; PR ${u(R, 12)} head ${c}`)).toEqual([
+      { repo: R, number: 11 },
+      { repo: R, number: 12, head_sha_at_acceptance: c },
+    ]);
+  });
+  it("multi-repo legs parse with their own repo", () => {
+    expect(trainParseNoteLegs(`PR ${u("o/r1", 3)} head ${"a".repeat(7)}; PR ${u("o/r2", 4)} head ${"b".repeat(7)}`)).toEqual([
+      { repo: "o/r1", number: 3, head_sha_at_acceptance: "a".repeat(7) },
+      { repo: "o/r2", number: 4, head_sha_at_acceptance: "b".repeat(7) },
+    ]);
+  });
+  it("no PR reference parses empty", () => {
+    expect(trainParseNoteLegs("verified head abc123def, no PR cited")).toEqual([]);
+  });
+});
+
+// ---------- BR#3659: the leg model ----------
+
+describe("trainLegs / trainLegLanded / trainLegsRemaining (the leg model)", () => {
+  const meta2 = {
+    pr: { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(40) },
+    prs: [
+      { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(40) },
+      { repo: "o/r", number: 2, head_sha_at_acceptance: "b".repeat(40) },
+    ],
+    merge_train: { state: "queued", pr: 1, legs: { "1": { state: "landed", merge_sha: "m1" } } },
+  };
+  it("meta.prs is the leg list; meta.pr alone is the pre-3659 single-leg fallback", () => {
+    expect(trainLegs(meta2).map((l) => l.number)).toEqual([1, 2]);
+    expect(trainLegs({ pr: { repo: "o/r", number: 9, head_sha_at_acceptance: "z".repeat(40) } }).map((l) => l.number)).toEqual([9]);
+    expect(trainLegs({})).toEqual([]);
+  });
+  it("a leg is landed via the per-leg map, or the legacy card-level landed stamp", () => {
+    expect(trainLegLanded(meta2, trainLegs(meta2)[0])).toBe(true);
+    expect(trainLegLanded(meta2, trainLegs(meta2)[1])).toBe(false);
+    const legacy = { pr: { repo: "o/r", number: 7 }, merge_train: { state: "landed", pr: 7 } };
+    expect(trainLegLanded(legacy, trainLegs(legacy)[0])).toBe(true);
+    expect(trainLegLanded({}, { repo: "o/r", number: 7 })).toBe(false);
+  });
+  it("remaining legs are what keep the card queued — repo-scoped for the lane", () => {
+    expect(trainLegsRemaining(meta2).map((l) => l.number)).toEqual([2]);
+    expect(trainLegsRemaining(meta2, "o/r").map((l) => l.number)).toEqual([2]);
+    const two = { prs: [{ repo: "o/r1", number: 1 }, { repo: "o/r2", number: 2 }] };
+    expect(trainLegsRemaining(two, "o/r1").map((l) => l.number)).toEqual([1]);
+    expect(trainLegsRemaining(two, "o/r2").map((l) => l.number)).toEqual([2]);
+    // all landed → nothing remains (the card must not keep riding any lane)
+    const done = { prs: [{ repo: "o/r", number: 1 }], merge_train: { state: "landed" } };
+    expect(trainLegsRemaining(done)).toEqual([]);
+  });
+  it("a card rides exactly the lanes owning one of its UNLANDED legs (BR#3659 lane filter)", () => {
+    expect(trainCardMatchesLane(meta2, "o/r")).toBe(true);
+    // repo 1's legs are all landed: the card left THAT lane, still rides r2's
+    const r2Only = {
+      prs: [
+        { repo: "o/r1", number: 1, head_sha_at_acceptance: "a".repeat(40) },
+        { repo: "o/r2", number: 2, head_sha_at_acceptance: "b".repeat(40) },
+      ],
+      merge_train: { legs: { "1": { state: "landed", merge_sha: "m1" } } },
+    };
+    expect(trainCardMatchesLane(r2Only, "o/r1")).toBe(false);
+    expect(trainCardMatchesLane(r2Only, "o/r2")).toBe(true);
+  });
+});
+
+// ---------- BR#3659: per-leg carry ----------
+
+describe("verdictCoversHeadLeg / carryAppendLeg (per-leg carry — BR#3659)", () => {
+  const legs = [
+    { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(9) },
+    { repo: "o/r", number: 2, head_sha_at_acceptance: "b".repeat(40) },
+  ];
+  it("each leg is judged by ITS own stamp — one leg's coverage never covers the other", () => {
+    expect(verdictCoversHeadLeg(legs[0], "a".repeat(40))).toBe(true); // 9-hex stamp prefixes the full 40
+    expect(verdictCoversHeadLeg(legs[0], "b".repeat(40))).toBe(false); // never cross-leg
+    expect(verdictCoversHeadLeg(legs[1], "b".repeat(40))).toBe(true);
+    expect(verdictCoversHeadLeg(undefined, "a".repeat(40))).toBe(false);
+  });
+  it("a leg's carry chain covers the chain's head, fail-closed", () => {
+    const leg = {
+      repo: "o/r", number: 3, head_sha_at_acceptance: "a".repeat(40),
+      carry: [{ from_head: "a".repeat(40), to_head: "c".repeat(40), prior_verdict_id: "v1", carried_ts: 1, via: "update-branch" as const }],
+    };
+    expect(verdictCoversHeadLeg(leg, "c".repeat(40))).toBe(true);
+    expect(verdictCoversHeadLeg(leg, "d".repeat(40))).toBe(false);
+  });
+  it("carryAppendLeg is pure — appends to the matching leg (and meta.pr when it is that leg), others untouched", () => {
+    const meta: any = {
+      pr: { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(9) },
+      prs: [
+        { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(9) },
+        { repo: "o/r", number: 2, head_sha_at_acceptance: "b".repeat(40) },
+      ],
+    };
+    const rec = { from_head: "a".repeat(9), to_head: "e".repeat(40), prior_verdict_id: "v2", carried_ts: 2, via: "update-branch" as const };
+    const next = carryAppendLeg(meta, 1, rec);
+    expect(next).not.toBe(meta);
+    expect(meta.prs[0].carry).toBeUndefined(); // the caller's meta is never mutated
+    expect(next.prs[0].carry).toEqual([rec]);
+    expect(next.prs[1].carry).toBeUndefined();
+    expect(next.pr.carry).toEqual([rec]); // legacy mirror — meta.pr IS leg 1
+    // a leg that is NOT meta.pr never leaks its carry onto meta.pr
+    const next2 = carryAppendLeg(meta, 2, rec);
+    expect(next2.prs[1].carry).toEqual([rec]);
+    expect(next2.pr.carry).toBeUndefined();
+  });
+});
+
+// ---------- BR#3659: honest queue reason + the multi-leg landed close ----------
+
+describe("the remaining-legs queue reason + the multi-leg landed close note (BR#3659)", () => {
+  it("the reason names the legs still out and keeps the merge-train: prefix (the derive sees only that prefix)", () => {
+    const meta = {
+      prs: [{ repo: "o/r", number: 1 }, { repo: "o/r2", number: 2 }],
+      merge_train: { legs: { "1": { state: "landed", merge_sha: "m1" } } },
+    };
+    const reason = trainQueueRemainingReason(meta);
+    expect(reason.startsWith("merge-train: queued")).toBe(true);
+    expect(reason).toContain("o/r2#2");
+    expect(reason).not.toContain("#1");
+  });
+  it("trainLandedCloseNote cites EVERY leg on the final close; a single leg reads exactly as before", () => {
+    const note = trainLandedCloseNote({
+      repo: "o/r", prNumber: 2, mergeSha: "4".repeat(40), gateway: "gw",
+      legs: [{ repo: "o/r", number: 1, mergeSha: "3".repeat(40) }, { repo: "o/r", number: 2, mergeSha: "4".repeat(40) }],
+    });
+    expect(note).toContain("all 2 queued PRs merged");
+    expect(note).toContain("#1");
+    expect(note).toContain("#2");
+    expect(note).toContain("machine proxy held: mergeCommit non-null AND required main workflows green");
+    const single = trainLandedCloseNote({ repo: "o/r", prNumber: 5, mergeSha: "5".repeat(40), gateway: "gw" });
+    expect(single).toContain("PR [#5](https://github.com/o/r/pull/5) merged as 555555555");
+  });
+});
+
+// ---------- BR#3659: the gate is per-leg ----------
+
+describe("decideTrainGate legs (BR#3659 — the gate is per-leg)", () => {
+  const H1 = "1".repeat(40), H2 = "2".repeat(40);
+  const twoLegs = {
+    pr: { repo: "o/r", number: 11, head_sha_at_acceptance: H1.slice(0, 9) },
+    prs: [
+      { repo: "o/r", number: 11, head_sha_at_acceptance: H1.slice(0, 9) },
+      { repo: "o/r", number: 12, head_sha_at_acceptance: H2.slice(0, 9) },
+    ],
+  };
+  const green = (id: number): MainCheckRun => ({ id, name: "Test", status: "completed", conclusion: "success", html_url: `https://example/${id}` });
+  const gate = (legNumber: number, over: Partial<Parameters<typeof decideTrainGate>[0]> = {}) =>
+    decideTrainGate({
+      prNumber: legNumber === 1 ? 11 : 12,
+      headSha: legNumber === 1 ? H1 : H2,
+      cardMeta: twoLegs,
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "clean",
+      commits: [{ sha: legNumber === 1 ? H1 : H2, verified: true }],
+      headChecks: [green(1)],
+      legNumber,
+      ...over,
+    });
+  it("a leg covered by its own stamp merges; an uncovered leg bounces naming ITS stamp", () => {
+    expect(gate(1).kind).toBe("merge");
+    expect(gate(2).kind).toBe("merge");
+    const bounce = gate(2, { headSha: "d".repeat(40) });
+    expect(bounce.kind).toBe("bounce");
+    if (bounce.kind === "bounce") {
+      expect(bounce.defect).toContain("leg 2 stamped 222222222");
+      expect(bounce.defect).not.toContain("111111111");
+    }
+  });
+  it("a leg with NO stamp bounces fail-closed, naming the leg", () => {
+    const noStamp = {
+      pr: { repo: "o/r", number: 11 },
+      prs: [{ repo: "o/r", number: 11 }, { repo: "o/r", number: 12, head_sha_at_acceptance: H2.slice(0, 9) }],
+    };
+    const d = gate(1, { cardMeta: noStamp });
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.defect).toContain("leg 1 stamped (no stamp)");
+  });
+  it("the merge receipt cites the leg position (multi-leg provenance, never a leg-1-only lie)", () => {
+    const d = gate(2);
+    expect(d.kind).toBe("merge");
+    if (d.kind === "merge") {
+      expect(d.receipt).toContain("leg 2/2");
+      expect(d.receipt).toContain("serialized merge train (BR#3516)");
+      expect(d.receipt).toContain(H2.slice(0, 9));
+    }
+  });
+  it("a legacy single-leg card (meta.pr only) gates exactly as before — legNumber defaults to 1", () => {
+    const legacy = decideTrainGate({
+      prNumber: 42,
+      headSha: H1,
+      cardMeta: { pr: { repo: "o/r", number: 42, head_sha_at_acceptance: H1.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "clean",
+      commits: [{ sha: H1, verified: true }],
+      headChecks: [green(1)],
+    });
+    expect(legacy.kind).toBe("merge");
   });
 });

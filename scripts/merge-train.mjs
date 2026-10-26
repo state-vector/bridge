@@ -12,6 +12,8 @@
  * Loop (one tick): preflight → train_status → per lane: CAS-lease →
  * reconcile from live GitHub (never trust a prior holder's picture) →
  * awaiting-CI poll (train_ci; hub lands/stops/pends) → else queue[0] →
+ * the card's first UNLANDED leg on this lane (BR#3659: multi-PR parents
+ * ride leg by leg; a card closes only when its LAST leg lands) →
  * decideTrainGate (imported from packages/worker/src/kb/core.ts — ONE gate
  * implementation, unit-pinned in test/merge-train.test.ts) → act:
  * merge (gh) → train:merged → next tick polls CI on the merge commit.
@@ -44,6 +46,8 @@ import {
   classifyMainCheckRuns,
   decideTrainGate,
   mergeSweepHumanLegTitle,
+  trainLegs,
+  trainLegLanded,
   TRAIN_CI_BOUND_MULTIPLIER,
   TRAIN_CI_TYPICAL_MINUTES,
 } from "../packages/worker/src/kb/core.ts";
@@ -269,10 +273,40 @@ async function driveLane(lane) {
     const head = lane.queue[0];
     const card = await mcp("get_artefact", { id: head.id });
     const cardMeta = card?.meta ?? {};
-    const prRef = cardMeta.pr ?? {};
-    const pr = Number(prRef.number ?? 0);
-    if (!pr || !prRef.repo) {
-      log(key, `queue head ${head.id} carries no PR stamp — skipping (verify convention violation; see hub audit)`);
+    // BR#3659: the card is a LIST of legs (meta.prs; meta.pr stays the first
+    // for legacy readers). THIS lane drives the first UNLANDED leg whose
+    // repo is this lane's — a multi-repo card appears in each of its lanes
+    // until that repo's legs are done.
+    const legs = trainLegs(cardMeta);
+    const laneLegs = legs
+      .map((leg, i) => ({ leg, legNumber: i + 1 }))
+      .filter(({ leg }) => leg.repo === repo && !trainLegLanded(cardMeta, leg));
+    if (!laneLegs.length) {
+      // no unlanded leg on this lane. Crash-window reconcile: every leg
+      // landed but the card never closed (executor died between the last
+      // merge and train:landed) — re-stamp the last leg so the hub's landed
+      // flow runs; otherwise just move on (another lane owns the rest).
+      const allLanded = legs.length > 0 && legs.every((l) => trainLegLanded(cardMeta, l));
+      const lastLanded = [...legs].reverse().find((l) => trainLegLanded(cardMeta, l));
+      if (allLanded && lastLanded?.repo === repo && (card.status ?? "") === "blocked") {
+        await renew();
+        await mcp("train_event", {
+          repo, base, kind: "merged", pr: lastLanded.number,
+          merge_sha: cardMeta.merge_train?.legs?.[String(lastLanded.number)]?.merge_sha ?? cardMeta.merge_train?.merge_sha ?? undefined,
+          task_id: head.id, signer: HOLDER,
+          reason: "reconcile: all legs landed but the card never closed (crash between merge and landed) — re-stamped",
+        });
+        log(key, `reconcile: card ${head.id} all legs landed — re-stamped PR #${lastLanded.number} for the landed close`);
+      } else {
+        log(key, `card ${head.id} has no unlanded leg on this lane (${legs.length} leg(s) cited) — moving on`);
+      }
+      await releaseIfIdle();
+      return;
+    }
+    const { leg, legNumber } = laneLegs[0];
+    const pr = Number(leg.number ?? 0);
+    if (!pr || !leg.repo) {
+      log(key, `queue head ${head.id} leg ${legNumber} carries no PR stamp — skipping (verify convention violation; see hub audit)`);
       await releaseIfIdle();
       return;
     }
@@ -303,6 +337,7 @@ async function driveLane(lane) {
       mergeStateStatus: facts.mergeStateStatus ?? null,
       commits: prCommits(repo, pr),
       headChecks: checkRuns(repo, headSha),
+      legNumber,
     });
     log(key, `queue[0] PR #${pr} (${head.id}): gate → ${gate.kind}${gate.defect ? ` — ${gate.defect}` : gate.reason ? ` — ${gate.reason}` : ""}`);
 
@@ -356,7 +391,9 @@ async function driveLane(lane) {
     await renew();
     sh("git", ["fetch", "--quiet", "origin", base]);
     const behind = spawnSync("git", ["merge-base", "--is-ancestor", `origin/${base}`, headSha], { cwd: WORKDIR, encoding: "utf8" }).status !== 0;
-    if (behind && headSha === String(cardMeta.pr?.head_sha_at_acceptance ?? "").toLowerCase()) {
+    // BR#3659: the behind-check reads THIS leg's accepted-at head, not the
+    // card-level first-leg stamp — each leg carries its own verdict.
+    if (behind && headSha === String(leg.head_sha_at_acceptance ?? "").toLowerCase()) {
       // base advanced past a verdict-covered head: update-branch is the
       // MACHINE-clean rebase — if it lands, the verdict carries (BR#3516 §5);
       // if it conflicts, that's human-resolved — bounce with the file list.

@@ -306,6 +306,19 @@ never stacks); loop until the train merges and closes. Impl owns mergeability
 the reviewer's); the train owns mergeability *enforcement* (a conflicting, red or unsigned
 PR is bounced with the exact defect — never merged silently).
 
+**One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
+cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
+head <sha>` — and the hub queues one **leg** per PR (`meta.prs`; pairing is
+line-adjacency based: a head after `;` belongs to the next clause's PR, never the
+previous one, and a cited PR without its head fails the queue closed with the card
+stamped `unbound`). A single-PR close keeps the pre-3659 shape (the note's one URL
+binds its first `head <sha>` wherever it sits). The card closes only when its **last**
+leg lands — after a partial landing it stays queued with an honest reason naming the
+legs still out, and the train drives the next leg on a later tick. A bounced card is
+NOT re-queued by a stale verify close (the bounce stands until the card re-enters
+review and a **fresh** verify duty accepts the new head) — the close-note scrubbing
+workaround from BR#3651 is obsolete.
+
 - Hub defaults: `DEFAULT_ROLE_PLAYBOOKS` in `packages/worker/src/kb/core.ts`.
 - Per-hub overrides: admin settings → **Roles & playbooks** (`settings.roles.*`); clearing
   an override resets to the hub default.
@@ -469,7 +482,8 @@ one.
 
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
-lands, stops or pends) → else queue[0] → `decideTrainGate` → act: merge (`gh`) →
+lands, stops or pends) → else the queue head's **first unlanded leg on this lane**
+(BR#3659: a multi-PR card rides leg by leg) → `decideTrainGate` → act: merge (`gh`) →
 `train:merged` → next tick polls CI on the merge commit.
 
 ### Lanes, leases, queues
@@ -511,6 +525,13 @@ machine-clean carry chain:
   round enforces (rule 5c), now executed by the train. Human-leg defects
   (signing-environment, external mirrors) file ONE class ask per episode, never one per
   PR.
+- **Multi-PR cards are legs, gated per leg (BR#3659)**: a card queued with several PRs
+  is a list of legs (`meta.prs`; `meta.pr` stays the first leg for legacy readers).
+  Coverage is judged per leg (`verdictCoversHeadLeg` — one leg's stamp/carry never
+  covers another), the gate bounce names ITS leg's stamp, and the card appears in
+  exactly the lanes that own one of its UNLANDED legs. A partial landing keeps the card
+  queued (`merge-train: queued — waiting on N leg(s): repo#n, …`); the final close
+  cites every leg's merge commit.
 
 ### The ops (MCP + HTTP)
 
