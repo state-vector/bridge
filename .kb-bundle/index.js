@@ -128,8 +128,8 @@ function tokenWorkspace(secret) {
 function tagsSayGateway(tags) {
   return parseTags(tags).some((t) => t.toLowerCase() === "gateway");
 }
-function selfProvisionLabel(device_id) {
-  const raw = typeof device_id === "string" ? device_id : "";
+function selfProvisionLabel(host) {
+  const raw = typeof host === "string" ? host : "";
   const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
   return slug || "device";
 }
@@ -153,14 +153,16 @@ function composeBootstrap(projectName, board) {
     `5. Status is your responsibility: claim \u2192 in_progress immediately; finish \u2192 in_review with the PR link in the note; stuck \u2192 blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict \u2014 bounce = action the findings; done = released. Gates are enforced \u2014 unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions \u2014 every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (PR, findings) and cite receipts in the note \u2014 a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `5c. VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident). Verification agents: BEFORE any substance check, confirm the PR is mechanically mergeable \u2014 gh pr view --json mergeable,mergeStateStatus,reviewDecision AND every commit signature isValid=true. mergeable=false / CONFLICTING / any unsigned or NO_USER commit \u2192 STOP: zero substance checks, and bounce the parent to in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push"). Never file a human ask for a mechanical defect, never report "verified, awaiting merge" for an unmergeable PR (false report \u2014 it has zero verified legs), and never treat "accept the unsigned commit" as an option (the ruleset forbids it by construction). The ONLY escalation to a human: a broken signing environment (key unavailable / NO_USER) \u2014 one ask describing the environment covers the whole class, never one per PR.`,
+    `5d. ONE EXECUTOR PER TASK: every in_progress task is owned by exactly one session (orient exposes executor_session on open cards \u2014 check it before you touch a card). If your claim transition loses the claim race (rejected: another session holds in_progress), you are NOT the executor \u2014 do not execute the work anyway, do not contribute state changes "in parallel", stand down and end your run. Concurrent executor sessions doing the same legs are how duplicate PRs and double closes happen (the BR#3348 class); the hub audits a state-changing op by a non-holder while the holder is alive (duplicate_executor), and repeated audited breaches are scored as divergent work.`,
     `6. Blocked on a decision \u2192 ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' \u2014 answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation \u2014 consensus among agents escalates to them for the last say.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch \u2014 the docs are the interface, stale docs are a defect.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it \u2192 todo (retry) \u2014 that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
+    `Runner-claimed cards: you cannot release to the pool \u2014 the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask \u2014 a todo release will be rejected and audited.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every \u226410 min. 4. LONG OP: declare silence \u2014 grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} \u2014 a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts \u2014 mergeability first (2026-10-23 rule).`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every \u226410 min. 4. LONG OP: declare silence \u2014 grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} \u2014 a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts \u2014 mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor \u2014 you are not; end your run, never execute a task you don't own.`,
     `Scoring: orient returns my_score \u2014 it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1\u20138.`
   ];
   if (board.mode === "external") {
@@ -290,9 +292,26 @@ function trigramVec(text2, dim = TRIGRAM_DIM) {
   const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0));
   return norm ? v.map((x) => x / norm) : v;
 }
+function detectResultTrail(input2) {
+  const notes = [String(input2.last_progress_note ?? ""), ...(input2.recent_notes ?? []).map(String)];
+  const marker = notes.some((n) => n.includes("completed_result_lost"));
+  const receipt_url = notes.map((n) => n.match(GH_RECEIPT_RE)).find((m) => m)?.[0] ?? null;
+  const commit_urls = marker ? [] : [...new Set(notes.flatMap((n) => n.match(GH_COMMIT_RE) ?? []))].slice(0, 5);
+  if (!marker && !receipt_url && commit_urls.length === 0) return null;
+  const worktree = String(input2.worktree ?? "").trim() || null;
+  const session = String(input2.session ?? "").trim() || null;
+  return { receipt_url, commit_urls, worktree, session };
+}
+function describeResultTrail(t) {
+  const bits = [];
+  if (t.receipt_url) bits.push(`receipt ${t.receipt_url}`);
+  if (t.commit_urls.length) bits.push(`${t.commit_urls.length} commit receipt(s)`);
+  if (t.worktree) bits.push(`worktree ${t.worktree}`);
+  return bits.join(", ") || "side effects present";
+}
 function scoreAgent(raw) {
   const s = { ...raw };
-  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
+  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "result_lost", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
     if (typeof s[k] !== "number" || Number.isNaN(s[k])) s[k] = 0;
   let score = 50;
   const hints = [];
@@ -300,6 +319,8 @@ function scoreAgent(raw) {
   score -= Math.min(25, s.abandoned * 10);
   if (s.abandoned > 0)
     hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked \u2014 send log_progress every \u226410m`);
+  if (s.result_lost > 0)
+    hints.push(`${s.result_lost} completed run(s) had their result lost in delivery (completed_result_lost) \u2014 a delivery-channel incident, not abandonment; the side effects landed`);
   score -= Math.min(30, s.reassigned * 15);
   if (s.reassigned > 0)
     hints.push(`${s.reassigned} task(s) were taken from you after going silent post-abandonment \u2014 reclaim abandoned work or it is reassigned to other agents`);
@@ -320,7 +341,150 @@ function scoreAgent(raw) {
   const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
   return { score, grade, hints };
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM;
+function classifyMainCheckRuns(runs) {
+  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0 };
+  const byName = /* @__PURE__ */ new Map();
+  for (const r of runs) {
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const red = [];
+  const unsettled = [];
+  let green = 0;
+  for (const [name, list] of byName) {
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge || judge.conclusion == null) {
+      unsettled.push(judge ? name : `${name} (only cancelled runs)`);
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+      red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    } else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") {
+      green += 1;
+    } else {
+      unsettled.push(`${name} (unknown conclusion: ${judge.conclusion})`);
+    }
+  }
+  if (red.length) return { verdict: "red", red, unsettled, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
+  return { verdict: "green", red, unsettled, green };
+}
+function stopLineAskTitle(sha, names) {
+  const prefix = `STOP THE LINE: bridge main ${sha.slice(0, 9)} is RED (`;
+  const suffix = `) \u2014 merges halted until green. Acknowledge?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let namesText = names.join(", ");
+  if (namesText.length > budget) namesText = namesText.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + namesText + suffix;
+}
+function isExemptCheckName(name) {
+  const n = name.toLowerCase();
+  return MERGE_EXEMPT_CHECK_PATTERNS.some((p) => n.includes(p));
+}
+function classifyHeadChecks(runs) {
+  const red = [];
+  const unsettled = [];
+  const external = [];
+  let green = 0;
+  for (const r of runs) {
+    if (r.conclusion == null) {
+      if (isExemptCheckName(r.name ?? "")) continue;
+      unsettled.push(r.name ?? "");
+      continue;
+    }
+    if (isExemptCheckName(r.name ?? "")) {
+      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    else unsettled.push(r.name ?? "");
+  }
+  if (red.length) return { verdict: "red", red, unsettled, external, green };
+  if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
+  return { verdict: "green", red, unsettled, external, green };
+}
+function decideMergeAction(i) {
+  if (i.cardStatus === "superseded")
+    return { kind: "close_superseded", reason: "linked card is superseded \u2014 closing PR without review" };
+  if (i.cardStatus === "done")
+    return { kind: "skip", reason: "linked card already done \u2014 nothing to merge under it" };
+  const short = i.headSha.slice(0, 9);
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability \u2014 not yet, skip this tick" };
+    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable \u2014 CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue` };
+  }
+  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} \u2014 not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter` };
+  const unverified = i.commits.filter((c) => !c.verified);
+  if (unverified.length)
+    return { kind: "human_leg", reason: `PR #${i.prNumber} has ${unverified.length} commit(s) not GitHub-verified \u2014 signing-environment class, never per-PR` };
+  if (i.baseVerdict !== "green")
+    return { kind: "skip", reason: `base main ${i.baseVerdict === "red" ? "RED" : "not green"} \u2014 the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert` };
+  const head = classifyHeadChecks(i.headChecks);
+  if (head.verdict === "red") {
+    const names = head.red.map((r) => r.name).join(", ");
+    return i.cardStatus === "in_review" ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl` } : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} \u2014 card not in_review, no bounce; the linked session owns it` };
+  }
+  if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) \u2014 not yet, skip this tick` };
+  if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
+    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict \u2014 re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)` };
+  if (!i.verifyAcceptedOnHead)
+    return { kind: "skip", reason: `no accepted verify verdict covering head ${short} \u2014 the verify pool owns the verdict; the sweep merges only verified PRs` };
+  return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} \u2014 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
+}
+function mergeSweepHumanLegTitle(repo, reasons) {
+  const prefix = `Merge sweep human legs on ${repo}: `;
+  const suffix = ` \u2014 fix the class?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text2 = reasons.join("; ");
+  if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + text2 + suffix;
+}
+function decidePrDisposition(i) {
+  const iso = /* @__PURE__ */ __name((t) => new Date(t).toISOString(), "iso");
+  const staleMs = i.prStaleDays * 864e5;
+  if (i.cardStatus && TERMINAL_CARD_STATUSES.includes(i.cardStatus))
+    return {
+      kind: "close_superseded",
+      reason: `linked card ${i.cardId ?? "?"} is ${i.cardStatus}${i.cardTerminalNote ? ` \u2014 ${i.cardTerminalNote}` : ""} \u2014 the card's terminal state is this PR's terminal cause; revive via a successor card`
+    };
+  if (i.gate.kind === "close_superseded") return { kind: "close_superseded", reason: i.gate.reason };
+  if (i.gate.kind === "merge") return { kind: "merge", receipt: i.gate.receipt };
+  if (!i.hasProvenance && i.prCreatedAt != null && i.now - i.prCreatedAt > i.prOrphanDays * 864e5)
+    return {
+      kind: "close_orphan",
+      reason: `no bridge provenance \u2014 no BR# ref (title/body/branch), no provenance index row (BR#3287), and no resolvable card \u2014 after ${i.prOrphanDays}d (created ${iso(i.prCreatedAt)}); re-open via a card if this work matters`
+    };
+  const stale = i.lastActivityTs != null && i.now - i.lastActivityTs > staleMs;
+  if (stale && !i.cardAdvancing) {
+    if (i.escalatedAt == null && i.cardId != null && i.cardStatus != null)
+      return {
+        kind: "escalate",
+        question: prEscalationAskTitle(i.repo, i.prNumber, i.cardId, i.prGraceHours, i.prStaleDays),
+        reason: `no PR activity within ${i.prStaleDays}d (last ${iso(i.lastActivityTs)}) and the card not advancing \u2014 one bound ask: merge, rebase, or close with reason within ${i.prGraceHours}h`
+      };
+    if (!i.activitySinceEscalation && i.escalatedAt != null && i.now - i.escalatedAt > i.prGraceHours * 36e5)
+      return {
+        kind: "close_stale",
+        reason: `no activity since ${iso(i.lastActivityTs)} (> ${i.prStaleDays}d) and escalation ${i.escalationAskId ?? "(ask id no longer on record)"} unanswered for ${i.prGraceHours}h \u2014 closing with reason; revive: re-open this PR once the work resumes (PRs are reopenable, the card keeps the intent)`
+      };
+  }
+  if (i.gate.kind === "bounce") return { kind: "bounce", defect: i.gate.defect };
+  if (i.gate.kind === "human_leg") return { kind: "passthrough", reason: i.gate.reason };
+  return { kind: "passthrough", reason: i.gate.kind === "note" || i.gate.kind === "skip" ? i.gate.reason : "no disposition row fired" };
+}
+function prEscalationAskTitle(repo, prNumber, cardId, graceHours, staleDays) {
+  const prefix = `PR #${prNumber} (${repo}) on ${cardId} has been quiet ${staleDays}+ days \u2014 `;
+  const suffix = `?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text2 = `merge, rebase, or close it with reason within ${graceHours}h, or the merge sweep closes it with reason`;
+  if (text2.length > budget) text2 = text2.slice(0, Math.max(0, budget - 1)).trimEnd() + "\u2026";
+  return prefix + text2 + suffix;
+}
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, MERGE_EXEMPT_CHECK_PATTERNS, TERMINAL_CARD_STATUSES;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -395,11 +559,12 @@ var init_core = __esm({
     DEFAULT_PROJECT = "Superpositional";
     __name(composeBootstrap, "composeBootstrap");
     DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule \u2014 each run is one pass, not a conversation.
-1. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
-2. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat), then resume the oldest one.
-3. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
-4. Finish cleanly or hand back: in_review when complete (PR link in the note); blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
-5. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
+1. REBASE LEG (standing order BR#3033): the hub's deterministic merge-queue sweep (BR#3198) drains mergeable PRs every tick automatically \u2014 do NOT duplicate its merges or its bounces. Your role is the repair leg: a card bounced by the sweep (note: "unmergeable \u2014 CONFLICTING", "mergeStateStatus=...", or "head moved past the accepted verify verdict") is yours to claim: rebase onto current main, resolve conflicts mechanically (substance-preserving), re-sign as detached-cody per BR#3181, re-push with --force-with-lease \u2014 it re-enters the sweep next tick. A red substance check bounce means the implementation is wrong: claim, fix, re-enter.
+2. Answer your asks first (asks + answer_ask): an answer unblocks whoever is waiting, and open asks pause their watchdog.
+3. If you own in_progress tasks: log_progress on each (one line + sentiment \u2014 the heartbeat) WITH gauges (completion_pct/confidence_pct/risk_pct/context_pct \u2014 rows without gauges show no stats and the board can't prioritise them), then resume the oldest one.
+4. Otherwise claim ONE task from unclaimed_work that matches your role tags: transition it to in_progress. Claiming sets you as owner; you own it end-to-end. VERIFY-FIRST: verify duties (children of in_review tasks) and unblock duties outrank new impl claims \u2014 an in_review task parks its owner until a fresh session rules on it; clear those before starting new work.
+5. Finish cleanly or hand back: in_review when complete (PR link in the note \u2014 and the PR itself must be MERGEABLE: rebase onto main before every in_review, keep checks green. A conflicting PR is YOUR defect, not the reviewer's \u2014 verify bounces it straight back). Blocked with BOTH a reason and an unblock condition, then ask_agent, when a decision is needed; transition to todo (retry) when you cannot make real progress this tick.
+6. Nothing claimable this tick: exit quietly. No filler artefacts, no noise.`;
     DEFAULT_ROLE_PLAYBOOKS = {
       analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
@@ -431,7 +596,34 @@ var init_core = __esm({
     __name(scaffoldBody, "scaffoldBody");
     TRIGRAM_DIM = 256;
     __name(trigramVec, "trigramVec");
+    GH_RECEIPT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|issues)\/\d+/;
+    GH_COMMIT_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{7,40}/g;
+    __name(detectResultTrail, "detectResultTrail");
+    __name(describeResultTrail, "describeResultTrail");
     __name(scoreAgent, "scoreAgent");
+    MAIN_RED_CONCLUSIONS = /* @__PURE__ */ new Set([
+      "failure",
+      "timed_out",
+      "action_required",
+      "startup_failure"
+    ]);
+    __name(classifyMainCheckRuns, "classifyMainCheckRuns");
+    __name(stopLineAskTitle, "stopLineAskTitle");
+    MERGE_EXEMPT_CHECK_PATTERNS = [
+      "workers builds",
+      "workers-builds",
+      "cloudflare pages",
+      "cloudflare workers",
+      "deploy preview",
+      "codeql"
+    ];
+    __name(isExemptCheckName, "isExemptCheckName");
+    __name(classifyHeadChecks, "classifyHeadChecks");
+    __name(decideMergeAction, "decideMergeAction");
+    __name(mergeSweepHumanLegTitle, "mergeSweepHumanLegTitle");
+    TERMINAL_CARD_STATUSES = ["superseded", "done", "rejected"];
+    __name(decidePrDisposition, "decidePrDisposition");
+    __name(prEscalationAskTitle, "prEscalationAskTitle");
   }
 });
 
@@ -481,6 +673,199 @@ var init_throughput = __esm({
   }
 });
 
+// src/kb/provenance.ts
+function prCardRef(branch, text2) {
+  const br = /(?:^|[/\-_])BR-?(\d{1,6})(?:[/\-_]|$)/i.exec(branch ?? "");
+  if (br) return `BR#${br[1]}`;
+  const tx = /BR#(\d{1,6})/.exec(text2 ?? "");
+  return tx ? `BR#${tx[1]}` : null;
+}
+function signerFromCommits(commits) {
+  if (!commits.length) return "unknown";
+  if (commits.some((c) => c.verified && /detached-cody|297316395\+/.test(c.committer_email ?? ""))) return "detached-cody";
+  if (commits.every((c) => c.verified)) return "signed";
+  if (commits.some((c) => c.verified)) return "partially-signed";
+  return "unsigned";
+}
+function parseProvenanceSha(sp) {
+  const sha = String(sp.get("sha") ?? "").trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(sha)) throw new Error("provenance lookup needs ?sha=<7-40 hex chars>");
+  return sha;
+}
+function withinBackfillWindow(mergedAtIso, now, backfillDays) {
+  if (!mergedAtIso) return null;
+  const t = Date.parse(mergedAtIso);
+  if (!Number.isFinite(t)) return null;
+  if (t < now - backfillDays * 864e5) return null;
+  return t;
+}
+var init_provenance = __esm({
+  "src/kb/provenance.ts"() {
+    __name(prCardRef, "prCardRef");
+    __name(signerFromCommits, "signerFromCommits");
+    __name(parseProvenanceSha, "parseProvenanceSha");
+    __name(withinBackfillWindow, "withinBackfillWindow");
+  }
+});
+
+// src/kb/closure.ts
+function cutDutyClauses(line) {
+  let cut = line;
+  for (const m of DUTY_MARKERS) {
+    const hit = m.exec(cut);
+    if (hit) cut = cut.slice(0, hit.index);
+  }
+  return cut;
+}
+function repoFromLine(line) {
+  const m = /github\.com\/([\w.-]+)\/([\w.-]+)/.exec(line);
+  return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
+}
+function numberFromPullUrl(line) {
+  const m = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/.exec(line);
+  return m ? Number(m[1]) : null;
+}
+function parseProxyCondition(text2) {
+  const atoms = [];
+  let unparseable = false;
+  const duty = cutDutyClauses(String(text2 ?? ""));
+  for (const rawLine of duty.split(/\r?\n|(?<=;)\s*/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const repo = repoFromLine(line);
+    let lineYielded = false;
+    if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+      const urlN = numberFromPullUrl(line);
+      const bare = /PR\s+#?(\d+)\b/.exec(line);
+      const prNumber = urlN ?? (bare ? Number(bare[1]) : null);
+      if (prNumber) {
+        atoms.push({ kind: "pr_merged", repo, number: prNumber, raw: line.trim().slice(0, 200) });
+        lineYielded = true;
+      }
+    }
+    if (!lineYielded) {
+      const br = /\bBR#(\d+)\b/.exec(line);
+      if (br && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+        atoms.push({ kind: "br_pr_merged", repo, brId: `BR#${br[1]}`, raw: line.trim().slice(0, 200) });
+        lineYielded = true;
+      }
+    }
+    const issueClosed = /(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/i.exec(line);
+    if (issueClosed) {
+      const n = Number(issueClosed[1]);
+      atoms.push({ kind: "issue_closed", repo, number: n, raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const brDone = /\bBR#(\d+)\s+(?:is\s+)?done\b/i.exec(line);
+    if (brDone) {
+      atoms.push({ kind: "br_done", repo: null, brId: `BR#${brDone[1]}`, raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const runOk = /\brun\s+(\d{6,})\b/.exec(line);
+    if (runOk && /\b(?:SUCCESS|success|green)\b/.test(line)) {
+      atoms.push({ kind: "run_success", repo, runId: runOk[1], raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    const checks = /green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/i.exec(line);
+    if (checks) {
+      atoms.push({ kind: "pr_checks_green", repo, number: Number(checks[1]), raw: line.trim().slice(0, 200) });
+      lineYielded = true;
+    }
+    if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
+  }
+  return { atoms, unparseable };
+}
+function parseCloseLegs(text2) {
+  const byRepo = /* @__PURE__ */ new Map();
+  const bare = /* @__PURE__ */ new Map();
+  for (const re of CLOSE_PATTERNS) {
+    re.lastIndex = 0;
+    for (const m of String(text2 ?? "").matchAll(re)) {
+      if (m[3] !== void 0) byRepo.set(Number(m[3]), { repo: `${m[1]}/${m[2]}`, number: Number(m[3]), raw: m[0] });
+      else bare.set(Number(m[1]), { repo: null, number: Number(m[1]), raw: m[0] });
+    }
+  }
+  for (const [n, leg] of bare) if (!byRepo.has(n)) byRepo.set(n, leg);
+  return [...byRepo.values()];
+}
+function doneWhenSection(bodyMd) {
+  const body = String(bodyMd ?? "");
+  const m = /^##\s*done\s*when\b.*$/im.exec(body);
+  if (!m) return "";
+  const rest = body.slice(m.index + m[0].length);
+  const next = /\n##\s/.exec(rest);
+  return next ? rest.slice(0, next.index) : rest;
+}
+function receiptWindow(note, leg) {
+  const windows = [];
+  const needle = String(leg.number);
+  for (const m of note.matchAll(new RegExp(`(?:issues/${needle}\\b|#\\s*${needle}\\b)`, "g"))) {
+    const at = m.index;
+    const post = note.slice(at, at + 600);
+    windows.push({ w: note.slice(Math.max(0, at - 120), at + 600), post });
+  }
+  if (!windows.length) windows.push({ w: note, post: note });
+  return windows;
+}
+function extractCommentId(w) {
+  return /issuecomment-(\d{6,})/.exec(w)?.[1] ?? /closing[- ](?:comment|id)\s*[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? /comment\s+(?:id\s*)?[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? null;
+}
+function extractGuardRun(w) {
+  return /guard\s*run\s*[:#]?\s*(\d{6,})/i.exec(w)?.[1] ?? /actions\/runs\/(\d{6,})/.exec(w)?.[1] ?? (/guard\s*=\s*allow|guard\s+run\s+[^.\n]{0,80}\ballow\b/i.test(w) ? "allow" : null) ?? (/guard\s*run\s*[:#]?\s*n\/a/i.test(w) ? "n/a" : null);
+}
+function parseClosureReceipt(note, leg) {
+  for (const { w, post } of receiptWindow(String(note ?? ""), leg)) {
+    const closed = /state\s*[=:]\s*["']?closed/i.test(w) || /closedAt\b/i.test(w) || /(?:^|[^a-z-])CLOSED\b/.test(w) || /issues\/\d+[#\s][^]{0,200}?\bstate\b[^\n]{0,24}closed/i.test(w);
+    if (!closed) continue;
+    return {
+      closed: true,
+      commentId: extractCommentId(post) ?? extractCommentId(w),
+      guardRun: extractGuardRun(post) ?? extractGuardRun(w)
+    };
+  }
+  return null;
+}
+function legLabel(leg) {
+  return `${leg.repo ?? "GH"}#${leg.number}`;
+}
+var LOOKS_MACHINE, DUTY_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT;
+var init_closure = __esm({
+  "src/kb/closure.ts"() {
+    LOOKS_MACHINE = /\b(?:PR\s?#|pull\/\d+|mergeCommit|MERGED|GH\s?#|GH#\d|issue\s?#?\d|BR#\d|run\s+\d{6,}|check\s+run|actions\/runs\/\d)/i;
+    DUTY_MARKERS = [
+      /\bthen\s+an?\s+\S+\s+session\b/i,
+      /\bthen\s+an?\s+agent\b/i,
+      /\bthen\s+transition\b/i,
+      /\bciting\b/i,
+      /\balternative\s+proxy\b/i,
+      /\bexit\s+condition\s+of\s+record\b/i
+    ];
+    __name(cutDutyClauses, "cutDutyClauses");
+    __name(repoFromLine, "repoFromLine");
+    __name(numberFromPullUrl, "numberFromPullUrl");
+    __name(parseProxyCondition, "parseProxyCondition");
+    CLOSE_PATTERNS = [
+      /\bclose(?:s|d)?\s+(?:the\s+)?(?:GH\s?#|GH#|issue\s+#)(\d+)/gi,
+      /\bclose(?:s|d)?\s+(?:the\s+)?#(\d+)\b/gi,
+      /\bclose(?:s|d)?\s+(?:the\s+)?(?:issue\s+)?https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)/gi,
+      // Receipt-shaped claims ARE close claims: "GH #2274 CLOSED/COMPLETED",
+      // "GH#2337 fully closed" (BR#3220's false note — lowercase, sloppy shape).
+      // Triggering the leg demand is the safe direction; the receipt parser above
+      // stays strict about what satisfies it.
+      /\b(?:GH\s?#|GH#|issue\s+#)(\d+)\s*(?:is\s+)?(?:now\s+)?(?:CLOSED|COMPLETED)\b/g,
+      /\b(?:GH\s?#|GH#|issue\s+#)(\d+)[^.\n]{0,24}?\bclosed\b/gi
+    ];
+    __name(parseCloseLegs, "parseCloseLegs");
+    __name(doneWhenSection, "doneWhenSection");
+    RECEIPT_CONTRACT = "state=closed + closing-comment id (or the comment URL) + guard run id (or n/a)";
+    __name(receiptWindow, "receiptWindow");
+    __name(extractCommentId, "extractCommentId");
+    __name(extractGuardRun, "extractGuardRun");
+    __name(parseClosureReceipt, "parseClosureReceipt");
+    __name(legLabel, "legLabel");
+  }
+});
+
 // src/kb/machine.ts
 function effectiveRole(roles) {
   if (roles.includes("review")) return "review";
@@ -500,20 +885,117 @@ function metaOf(m) {
   }
   return m ?? {};
 }
-function churnRelease(nextAttempts, verdictDuty, fromStatus) {
-  if (verdictDuty && nextAttempts >= CHURN_ESCALATE_ATTEMPTS) return "escalate";
-  if (nextAttempts >= CHURN_REDIRECT_ATTEMPTS && fromStatus !== "blocked") return "redirect";
-  return "pass";
-}
-async function check(i, c) {
+async function decide(i, c) {
   const base = validateTransition(i.type, i.status, i.to);
-  if (base.ok === false) return base.reason;
-  for (const r of RULES) {
-    if (!r.when(i)) continue;
-    const err2 = await r.guard(i, c);
-    if (err2) return err2;
+  if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  for (const r2 of RULES) {
+    if (!r2.when(i)) continue;
+    const err2 = await r2.guard(i, c);
+    if (err2) return { ok: false, code: "guard-failed", rule: r2.name, message: err2 };
   }
-  return null;
+  if (i.type !== "task") return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: [] };
+  const now = i.now ?? Date.now();
+  const meta3 = metaOf(i.meta);
+  const r = role(i);
+  const patch = {};
+  const tagsAdd = [];
+  const effects = [];
+  let status = i.to;
+  let ownerClear = false;
+  if (i.to === "todo") {
+    const provenUnblock = i.status === "blocked" && r === "unblock" && !!noteOf(i);
+    const nextAttempts = provenUnblock ? 0 : (meta3.attempt?.attempts ?? 0) + 1;
+    const silent = silentCycles(await c.recentEvents());
+    const verdictDuty = r === "review" || r === "unblock";
+    const lastReason = String(i.body?.note ?? "").trim() || meta3.attempt?.last_reason;
+    const attempt = provenUnblock ? void 0 : { by: i.actor, at: now, attempts: nextAttempts, last_reason: lastReason, last_will: meta3.last_progress?.will };
+    if (verdictDuty && (nextAttempts >= CHURN_ESCALATE_ATTEMPTS || silent >= SILENT_ESCALATE_CYCLES)) {
+      const reason = silent >= SILENT_ESCALATE_CYCLES && nextAttempts < CHURN_ESCALATE_ATTEMPTS ? `verdict duty went silent ${silent} watchdog cycles with no agent output \u2014 server-side churn escalation (last: ${String(lastReason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope` : `verdict duty released ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(lastReason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`;
+      patch.escalate = { at: now, attempts: nextAttempts, silent_cycles: silent, reason };
+      patch.attempt = attempt;
+      ownerClear = true;
+      effects.push({ kind: "escalate", attempts: nextAttempts, silent_cycles: silent, reason });
+    } else if (!verdictDuty && i.status !== "blocked" && (nextAttempts >= CHURN_REDIRECT_ATTEMPTS || silent >= SILENT_REDIRECT_CYCLES)) {
+      const blockReason = silent >= SILENT_REDIRECT_CYCLES && nextAttempts < CHURN_REDIRECT_ATTEMPTS ? `churn guard: ${silent} consecutive zero-output watchdog cycles \u2014 silent churn, server-side escalated` : `churn guard: released to the pool ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(lastReason ?? "").slice(0, 200)})`;
+      status = "blocked";
+      patch.blocked = {
+        reason: blockReason,
+        unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
+        ts: now
+      };
+      patch.attempt = attempt;
+      effects.push({ kind: "release_redirect", attempts: nextAttempts, silent_cycles: silent });
+    } else {
+      ownerClear = true;
+      if (!provenUnblock) {
+        patch.attempt = {
+          by: i.actor,
+          at: now,
+          attempts: nextAttempts,
+          last_reason: meta3.blocked?.reason ?? (String(i.body?.note ?? "").trim() || void 0),
+          last_will: meta3.last_progress?.will
+        };
+        if (!i.tags.includes("attempted")) tagsAdd.push("attempted");
+      } else {
+        patch.attempt = void 0;
+      }
+    }
+  }
+  if ((i.to === "done" || i.to === "superseded") && meta3.attempt && typeof meta3.attempt === "object")
+    patch.attempt = { ...meta3.attempt, attempts: 0 };
+  if (i.to === "in_review" && r !== "review") {
+    const guard = await c.spawnGuard();
+    if (guard) {
+      effects.push({ kind: "skip_verify_spawn", parent: i.id, reason: guard });
+    } else {
+      const open2 = await c.openVerifyChild();
+      if (open2) effects.push({ kind: "reuse_verify", parent: i.id, verify: open2.id });
+      else
+        effects.push({
+          kind: "spawn_verify",
+          parent: i.id,
+          pr: (String(i.body?.note ?? "").match(/https?:\/\/\S+/) || [])[0] ?? null
+        });
+    }
+  }
+  if (["in_progress", "todo", "done"].includes(i.to)) {
+    const cause = i.to === "in_progress" && i.status === "blocked" ? `${i.id} resumed from blocked \u2014 unblock confirmed, child superseded` : i.to === "in_progress" && i.status === "in_review" ? `${i.id} bounced \u2014 unblock round closed` : `${i.id} \u2192 ${i.to} \u2014 unblock round closed`;
+    effects.push({ kind: "supersede_children", parent: i.id, tag: "unblock", keep_newest: false, cause });
+  }
+  if (i.to === "done" || i.status === "in_review" && i.to === "in_progress") {
+    const isBounce = i.status === "in_review" && i.to === "in_progress";
+    effects.push({
+      kind: "supersede_children",
+      parent: i.id,
+      tag: "review",
+      keep_newest: isBounce,
+      cause: isBounce ? `${i.id} bounced \u2014 older verification rounds superseded (newest kept for re-entry)` : `${i.id} done \u2014 verification round closed`
+    });
+  }
+  if (i.to === "blocked" && r !== "unblock" && !meta3.awaiting_ask && !i.body?.awaiting_ask_id && i.body?.class !== "subprocess") {
+    const open2 = await c.openUnblockChild();
+    if (open2) {
+      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open2.id} reused` });
+    } else {
+      const exit = String(i.body?.unblock_condition ?? "").trim();
+      const last = meta3.last_unblock_spawn;
+      if (last && typeof last.at === "number" && now - last.at < UNBLOCK_FLOOD_MS && String(last.exit ?? "") === exit) {
+        effects.push({
+          kind: "skip_unblock_spawn",
+          parent: i.id,
+          reason: `unblock round issued ${Math.round((now - last.at) / 6e4)}m ago with the same exit condition \u2014 flood guard`
+        });
+      } else {
+        effects.push({
+          kind: "spawn_unblock",
+          parent: i.id,
+          reason: String(i.body?.note ?? i.body?.reason ?? "").trim(),
+          exit_condition: exit
+        });
+      }
+    }
+  }
+  return { ok: true, status, owner_clear: ownerClear, tags_add: tagsAdd, meta_patch: patch, effects };
 }
 function invariants(a) {
   const v = [];
@@ -532,13 +1014,89 @@ function invariants(a) {
     v.push("question is in_progress \u2014 questions are answered, not claimed");
   return v;
 }
-var VERDICT_ROLES, HUMAN_ACTOR, role, isTask, noteOf, hasEvidenceLink, hasReceipts, CHURN_REDIRECT_ATTEMPTS, CHURN_ESCALATE_ATTEMPTS, RULES, BREACH_WINDOW_MS;
+function silentCycles(events) {
+  const asc = [...events].sort((a, b) => a.ts - b.ts);
+  let run = 0;
+  for (const e of asc) {
+    if (isAgentOutput(e)) run = 0;
+    else if (isWatchdogStall(e)) run++;
+  }
+  return run;
+}
+function replayStatus(from, versions) {
+  let expected = from;
+  let anchored = false;
+  let breaks = 0;
+  let tailBreak = false;
+  for (const v of versions) {
+    if (v.action !== "transition") continue;
+    const to = v.data?.to;
+    if (typeof to !== "string") continue;
+    if (anchored && v.data?.from !== expected) {
+      breaks++;
+      tailBreak = true;
+    } else {
+      tailBreak = false;
+    }
+    expected = to;
+    anchored = true;
+  }
+  return { status: expected, ok: breaks === 0, breaks, tailBreak };
+}
+function breachClass(reason) {
+  const r = reason.toLowerCase();
+  if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
+  if (r.includes("only the owner or a human can release it")) return "claim_race";
+  if (r.includes("pr link")) return "gate:review-needs-pr";
+  if (r.includes("unreviewed")) return "gate:done-unreviewed";
+  if (r.includes("references no git repository")) return "gate:no-repo";
+  if (r.includes("without receipts")) return "gate:verdict-receipts";
+  if (r.includes("separation of duties")) return "gate:separation";
+  if (r.includes("open child")) return "gate:open-children";
+  if (r.includes("cannot block")) return "gate:verdict-no-blocked";
+  if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
+  return "other";
+}
+function classOf(e) {
+  if (e.op === "invariant_violation") return "invariant";
+  if (e.op === "spawn_skipped") return "spawn-while-open";
+  if (e.op === "replay_mismatch") return "replay";
+  return breachClass(e.reason);
+}
+function detectBreaches(events, openKeys, opts) {
+  const windowMs = opts?.windowMs ?? BREACH_WINDOW_MS;
+  const highWater = opts?.highWater;
+  const relevant = events.filter(
+    (e) => ["transition_rejected", "invariant_violation", "spawn_skipped", "replay_mismatch"].includes(e.op)
+  );
+  relevant.sort((a, b) => a.ts - b.ts);
+  const groups = /* @__PURE__ */ new Map();
+  for (const e of relevant) {
+    const klass = classOf(e);
+    const key = `${e.task}|${klass}`;
+    const hw = highWater?.get(key);
+    if (hw !== void 0 && e.ts <= hw) continue;
+    const g = groups.get(key);
+    if (g) {
+      if (e.ts - g.first_ts <= windowMs) {
+        g.count++;
+        g.last_ts = e.ts;
+      }
+    } else {
+      groups.set(key, { key, task: e.task, klass, count: 1, first_ts: e.ts, last_ts: e.ts, sample: e.reason.slice(0, 200) });
+    }
+  }
+  return [...groups.values()].filter((b) => b.count >= (BREACH_THRESHOLDS[b.klass] ?? BREACH_THRESHOLDS.default) && !openKeys.has(b.key));
+}
+var VERDICT_ROLES, HUMAN_ACTOR, OWNER_RELEASE_EXEMPT, role, isTask, noteOf, hasEvidenceLink, hasReceipts, CHURN_REDIRECT_ATTEMPTS, CHURN_ESCALATE_ATTEMPTS, SILENT_ESCALATE_CYCLES, SILENT_REDIRECT_CYCLES, UNBLOCK_FLOOD_MS, RULES, isAgentOutput, isWatchdogStall, BREACH_WINDOW_MS, BREACH_THRESHOLD, BREACH_THRESHOLDS;
 var init_machine = __esm({
   "src/kb/machine.ts"() {
     init_core();
+    init_closure();
     __name(effectiveRole, "effectiveRole");
     VERDICT_ROLES = ["review", "unblock"];
     HUMAN_ACTOR = /^web(:|$)|^human:/;
+    OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
     role = /* @__PURE__ */ __name((i) => effectiveRole(i.roles ?? []), "role");
     isTask = /* @__PURE__ */ __name((i) => i.type === "task", "isTask");
     noteOf = /* @__PURE__ */ __name((i) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim(), "noteOf");
@@ -547,7 +1105,9 @@ var init_machine = __esm({
     __name(metaOf, "metaOf");
     CHURN_REDIRECT_ATTEMPTS = 5;
     CHURN_ESCALATE_ATTEMPTS = 3;
-    __name(churnRelease, "churnRelease");
+    SILENT_ESCALATE_CYCLES = 3;
+    SILENT_REDIRECT_CYCLES = 5;
+    UNBLOCK_FLOOD_MS = 60 * 6e4;
     RULES = [
       {
         name: "verdict-no-in_review",
@@ -559,6 +1119,15 @@ var init_machine = __esm({
         when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id, "when"),
         // an ask-gate pauses the duty; it auto-resumes on the answer
         guard: /* @__PURE__ */ __name((i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task \u2014 verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`, "guard")
+      },
+      {
+        name: "release-needs-ownership",
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "todo" && !!i.owner && i.owner !== i.actor && !OWNER_RELEASE_EXEMPT.test(i.actor) && // PROVEN-UNBLOCK RELEASE (2026-10-25, Ray GO): a role:unblock duty that
+        // VERIFIED the card's exit condition met may release a PARKED card —
+        // scope: from-status blocked (a park, not a live claim) + the release
+        // note cites the proof. Live claims stay owner/human-only.
+        !(i.status === "blocked" && role(i) === "unblock" && !!noteOf(i)), "when"),
+        guard: /* @__PURE__ */ __name((i) => `task ${i.id} is claimed by ${i.owner} \u2014 only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead.`, "guard")
       },
       {
         name: "decision-acceptance-human",
@@ -661,21 +1230,150 @@ var init_machine = __esm({
           const open2 = await c.openChildren();
           return open2 > 0 ? `parent ${i.id} still has ${open2} open child task(s) \u2014 finish or close them first (decomposition owns its children)` : null;
         }, "guard")
+      },
+      {
+        // BR#3361 (b)+(c): terminal close-leg ownership + the closure receipt.
+        // A done card whose Done-when (or done note) ends in "close GH #N" must
+        // either carry the receipt for every leg it claims, or own the leg with
+        // a CLOSED close-duty child. Retrying the done auto-derives the child
+        // (do.ts executes that on this rejection) — no orphan terminal legs.
+        name: "done-close-legs",
+        when: /* @__PURE__ */ __name((i) => isTask(i) && i.to === "done", "when"),
+        guard: /* @__PURE__ */ __name(async (i, c) => {
+          const note = noteOf(i);
+          const legs = parseCloseLegs(`${doneWhenSection(await c.cardBody())}
+${note}`);
+          if (!legs.length) return null;
+          const unowned = [];
+          for (const leg of legs) {
+            if (parseClosureReceipt(note, leg)?.closed) continue;
+            if (await c.closeLegChildClosed(leg)) continue;
+            unowned.push(leg);
+          }
+          if (!unowned.length) return null;
+          const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
+          return `terminal close leg(s) not receipted: ${labeled} \u2014 a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
+        }, "guard")
       }
     ];
-    __name(check, "check");
+    __name(decide, "decide");
     __name(invariants, "invariants");
+    isAgentOutput = /* @__PURE__ */ __name((e) => !/^system:/.test(e.actor), "isAgentOutput");
+    isWatchdogStall = /* @__PURE__ */ __name((e) => /^system:/.test(e.actor) && /stall|releas|redirect/i.test(e.summary), "isWatchdogStall");
+    __name(silentCycles, "silentCycles");
+    __name(replayStatus, "replayStatus");
     BREACH_WINDOW_MS = 30 * 6e4;
+    BREACH_THRESHOLD = 3;
+    BREACH_THRESHOLDS = {
+      invariant: 1,
+      replay: 1,
+      "spawn-while-open": 1,
+      claim_race: Number.POSITIVE_INFINITY,
+      default: BREACH_THRESHOLD
+    };
+    __name(breachClass, "breachClass");
+    __name(classOf, "classOf");
+    __name(detectBreaches, "detectBreaches");
+  }
+});
+
+// src/kb/rollup.ts
+function rootBlockerKey(b) {
+  if (!b) return null;
+  const cond = String(b.unblock_condition ?? "");
+  const reason = String(b.reason ?? "");
+  const m = PR_URL.exec(cond) ?? PR_URL.exec(reason);
+  if (m) {
+    const repo = `${m[1]}/${m[2]}`.toLowerCase();
+    return `pr:${repo}#${m[3]}`;
+  }
+  if (MAIN_RED.test(`${cond} ${reason}`.toLowerCase())) return "main-red";
+  return null;
+}
+function rootBlockerTitle(key, n) {
+  return `ROOT BLOCKER (${key}) \u2014 ${n} tasks queued (investigate \u2192 fix \u2192 one approval)`;
+}
+function rootBlockerBody(key, cards) {
+  const isMainRed = key === "main-red";
+  const doneWhen = isMainRed ? "main is ancestry-green again (CI green on main and every open PR rebased onto it)" : `the blocking PR (${key.slice(3)}) is merged`;
+  const list = cards.map((c) => `- ${c.id}${c.title ? ` \u2014 ${c.title}` : ""}`).join("\n");
+  return [
+    `Auto-created by the watchdog sweep: ${cards.length} blocked cards share one machine-detectable root cause (\`${key}\`).`,
+    isMainRed ? "Root cause class: never-merge-onto-red-main (BR#551) \u2014 main is red/broken/failing, so every fix PR queues behind restoring main." : "Root cause class: one unmerged PR that every queued card names as its unblock condition.",
+    "",
+    "## Queued cards",
+    list,
+    "",
+    "## Ask contract",
+    "Investigate \u2192 fix \u2192 ONE approval. Work the root cause here (not on the queued cards); when the fix needs a human sign-off, file a single ask that leads with the decision \u2014 summary (what happened), why_escalated (which gate/authority), decision (the choice, each option with its receipt condition). One approval unblocks every queued card; do not ask each card separately.",
+    "",
+    "## Done when",
+    `Root cause gone, with receipts: ${doneWhen}. Closing requires evidence (CI run URLs / merged-PR state) \u2014 the sweep never auto-closes this task, and a later cluster of the same root opens a NEW root instead of reusing this one.`
+  ].join("\n");
+}
+function planRootBlockers(cards, roots, minCluster = ROOT_BLOCKER_MIN_CLUSTER) {
+  const statusById = new Map(roots.map((r) => [r.id, r.status]));
+  const isOpenRoot = /* @__PURE__ */ __name((id) => !!id && statusById.has(id) && OPEN_STATUSES.has(statusById.get(id)), "isOpenRoot");
+  const openRootByKey = /* @__PURE__ */ new Map();
+  for (const r of roots) {
+    if (!isOpenRoot(r.id) || !r.root_key) continue;
+    if (!openRootByKey.has(r.root_key)) openRootByKey.set(r.root_key, r.id);
+  }
+  const clusters = /* @__PURE__ */ new Map();
+  const byId = /* @__PURE__ */ new Map();
+  for (const c of cards) {
+    byId.set(c.id, c);
+    const key = rootBlockerKey(c.blocked);
+    if (!key) continue;
+    let list = clusters.get(key);
+    if (!list) clusters.set(key, list = []);
+    list.push(c.id);
+  }
+  const plan = { creates: [], stamps: [] };
+  for (const key of [...clusters.keys()].sort()) {
+    const members2 = clusters.get(key);
+    if (members2.length < minCluster) continue;
+    const openRoot = openRootByKey.get(key) ?? null;
+    if (!openRoot) plan.creates.push({ key, members: members2 });
+    for (const id of members2) {
+      if (isOpenRoot(byId.get(id)?.root_blocker)) continue;
+      plan.stamps.push({ id, root_key: key, root: openRoot });
+    }
+  }
+  return plan;
+}
+var ROOT_BLOCKER_TAG, ROOT_BLOCKER_MIN_CLUSTER, PR_URL, MAIN_RED, OPEN_STATUSES;
+var init_rollup = __esm({
+  "src/kb/rollup.ts"() {
+    ROOT_BLOCKER_TAG = "blocker";
+    ROOT_BLOCKER_MIN_CLUSTER = 3;
+    PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/i;
+    MAIN_RED = /\bmain\b[^.;]{0,60}?\b(?:reds?|broken|failing)\b|\b(?:reds?|broken|failing)\b[^.;]{0,60}?\bmain\b/;
+    OPEN_STATUSES = /* @__PURE__ */ new Set(["todo", "in_progress", "in_review", "blocked"]);
+    __name(rootBlockerKey, "rootBlockerKey");
+    __name(rootBlockerTitle, "rootBlockerTitle");
+    __name(rootBlockerBody, "rootBlockerBody");
+    __name(planRootBlockers, "planRootBlockers");
   }
 });
 
 // src/kb/do.ts
-var KnowledgeHub;
+function tagsForWrite(verdict, base) {
+  if (!verdict.tags_add.length) return base;
+  const t = [...base];
+  for (const x of verdict.tags_add) if (!t.includes(x)) t.push(x);
+  return t;
+}
+var STOP_LINE_SINK_ID, KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
     init_core();
     init_throughput();
+    init_provenance();
     init_machine();
+    init_closure();
+    init_rollup();
+    STOP_LINE_SINK_ID = "BR#3124";
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
         this.state = state;
@@ -835,10 +1533,26 @@ var init_do = __esm({
             if (openAsk) continue;
             const will = meta3.last_progress?.will ? `; was about to: ${String(meta3.last_progress.will).slice(0, 120)}` : "";
             const lapsedSub = meta3.subprocess ? ` (declared subprocess window of ${meta3.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+            let trail = null;
+            try {
+              const notes = this.state.storage.sql.exec(
+                `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
+                r.id
+              ).toArray().map((x) => String(x.summary ?? ""));
+              const sess = meta3.session ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta3.session)) : null;
+              trail = detectResultTrail({
+                last_progress_note: meta3.last_progress?.note,
+                recent_notes: notes,
+                worktree: sess?.worktree ?? null,
+                session: meta3.session ?? null
+              });
+            } catch {
+            }
             await this.transition({
               id: r.id,
               to: "todo",
-              note: `stalled \u2014 no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`
+              note: trail ? `stalled \u2014 no update for >${staleMin}m; completed_result_lost \u2014 ${describeResultTrail(trail)}; result never reached the hub \u2014 released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}` : `stalled \u2014 no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+              ...trail ? { result_class: "completed_result_lost" } : {}
             }, "system:watchdog");
           } catch (e) {
             this.audit("system:watchdog", "sweep_error", r.id, { error: String(e.message ?? e) });
@@ -929,6 +1643,46 @@ var init_do = __esm({
             age_min: mins
           });
         }
+        try {
+          await this.mergeQueueSweep(now);
+        } catch (e) {
+          try {
+            this.audit("system:merge-sweep", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
+        try {
+          await this.stopTheLineSweep(now);
+        } catch (e) {
+          try {
+            this.audit("hub:stop-the-line", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
+        try {
+          await this.provenanceSweep(now);
+        } catch (e) {
+          try {
+            this.audit("hub:provenance", "sweep_error", null, { error: String(e.message ?? e).slice(0, 300) });
+          } catch {
+          }
+        }
+        let rollup;
+        try {
+          rollup = await this.rootBlockerRollup(now);
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", "root_blocker_rollup", { error: String(e.message ?? e).slice(0, 300) });
+        }
+        try {
+          await this.unblockProxySweep(now);
+        } catch (e) {
+          this.audit("hub:proxy-watch", "sweep_error", "unblock_proxy_sweep", { error: String(e.message ?? e).slice(0, 300) });
+        }
+        try {
+          await this.closureAuditSweep(now);
+        } catch (e) {
+          this.audit("hub:closure-audit", "sweep_error", "closure_audit_sweep", { error: String(e.message ?? e).slice(0, 300) });
+        }
         const nextAlarm = await this.state.storage.getAlarm();
         this.state.storage.sql.exec(
           `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.last_tick', ?)`,
@@ -950,8 +1704,1247 @@ var init_do = __esm({
         const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
         this.state.storage.sql.exec(
           `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
-          JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks })
+          JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks, root_blocker_rollup: rollup ?? null })
         );
+      }
+      // ---------- destination-green stop-the-line sweep (BR#3008) ----------
+      // The loud half of BR#3009's destination-green precondition. The mechanical
+      // half is the required `main-green gate` check (workflow +
+      // scripts/main-green-gate.sh); this sweep pages the board when the line is
+      // stopped EVEN IF nobody opens a PR — a red main must be loud on its own.
+      //
+      // Reads main's HEAD check runs from the public GitHub API (the repo is
+      // public; no token lives in the worker), classifies with the same rule as
+      // the gate (classifyMainCheckRuns), and on RED files — per red episode,
+      // deduped per main-HEAD sha, so ten PRs observing one red sha produce one
+      // of each, not ten:
+      //   1. ONE urgent ask per red episode into the BR#3124 sink — the
+      //      ATTENTION channel; and
+      //   2. ONE claimable P0 episode task (BR#3284) — the WORK channel: title
+      //      `STOP-THE-LINE: bridge main RED @ <short-sha> — fix main first`,
+      //      body carrying the red checks, the first-failing sha/PR (bisect
+      //      walk), the remediation exception and the done-when, boosted
+      //      (priority 0) so it tops the board's ranked queue. A new red sha
+      //      supersedes the prior open episode task.
+      //
+      // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
+      // `stop_line_artefact_id` (ask sink; the standing card the asks and episode
+      // tasks bind to), `stop_line_repo` (default state-vector/bridge),
+      // `stop_line_gh_api_base` (default https://api.github.com — point at a
+      // GHES/mock for drills).
+      settingValue(key, fallback) {
+        const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
+        if (!row) return fallback;
+        const raw = String(row.value);
+        try {
+          const v = JSON.parse(raw);
+          if (typeof v === "string" || typeof v === "number") return String(v);
+        } catch {
+        }
+        return raw;
+      }
+      async stopTheLineSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("stop_line_sweep_minutes", "5"), 10) || 5));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("stop_line_last_sweep_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('stop_line_last_sweep_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
+        const base = this.settingValue("stop_line_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const headers = { "User-Agent": "bridge-stop-the-line-sweep", "Accept": "application/vnd.github+json" };
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status}) \u2014 backed off 60m`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res;
+        }, "ghGet");
+        const head = await (await ghGet("/commits/main")).json();
+        const sha = String(head?.sha ?? "");
+        if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`commits/main returned no sha`);
+        const runsBody = await (await ghGet(`/commits/${sha}/check-runs?per_page=100`)).json();
+        const verdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
+        if (verdict.verdict === "green") {
+          this.audit("hub:stop-the-line", "green", null, { sha: sha.slice(0, 9), green: verdict.green });
+          return;
+        }
+        if (verdict.verdict !== "red") {
+          this.audit("hub:stop-the-line", "quiet", null, { sha: sha.slice(0, 9), verdict: verdict.verdict, unsettled: verdict.unsettled.slice(0, 5) });
+          return;
+        }
+        const names = verdict.red.map((r) => r.name);
+        const title = stopLineAskTitle(sha, names);
+        const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
+        const chain = await this.guiltyChain(sha);
+        const dup = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND c.title = ? LIMIT 1`,
+          sinkId,
+          title.slice(0, 200)
+        );
+        if (dup) {
+          this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
+        } else {
+          const details = [
+            `**STOP THE LINE \u2014 bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
+            ``,
+            `**Red checks on main ${sha.slice(0, 9)}:**`,
+            ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+            ``,
+            `**Guilty chain:** ${this.guiltyChainLine(chain, sha)}`,
+            ``,
+            `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
+            ``,
+            `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha \u2014 not per PR._`
+          ].join("\n");
+          const created = await this.askCreate(
+            {
+              to: "rayh",
+              urgency: "time-sensitive",
+              question: title,
+              details,
+              reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
+              options: ["Acknowledge \u2014 on it", "Line stays stopped until green"],
+              artefact_id: sinkId
+            },
+            "hub:stop-the-line"
+          );
+          this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
+        }
+        await this.stopLineEpisodeTask(sha, verdict, sinkId, ghGet);
+      }
+      // ---------- the P0 episode task (BR#3284) ----------
+      // The ask pages; the task claims. When main's HEAD is RED the sweep files,
+      // alongside the ask, ONE claimable P0 task per red episode:
+      //   - deduped per main-HEAD sha (same rule as the ask — one live episode
+      //     task at a time; a re-sweep of the same sha audits and skips);
+      //   - child_of the sink (BR#3124) — the episode family under one anchor;
+      //   - body: red check names + run links, the first failing sha (the merge
+      //     that broke the line — bisect walk below) + the PR that landed it,
+      //     the remediation-merge exception (BR#3009/BR#3010), and the done-when;
+      //   - priority is STRUCTURAL, not vibes: meta.boosted (the existing human-
+      //     boost mechanism — priority 0 in the pickup ranking, first on the
+      //     board's ranked queue) + the p0/stop-the-line/gtm-blocker tag chips;
+      //   - when a NEW red sha arrives, the prior OPEN episode task is superseded
+      //     (direct audited write, the same mechanical pattern the separation
+      //     guard and the smoke purge use — a system actor filing machinery, not
+      //     a session claiming; the supersedes relation + superseded_reason point
+      //     the old card's readers at the replacement).
+      async stopLineEpisodeTask(sha, verdict, sinkId, ghGet) {
+        const shortSha = sha.slice(0, 9);
+        const title = `STOP-THE-LINE: bridge main RED @ ${shortSha} \u2014 fix main first`;
+        const dup = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'task' AND c.title = ? LIMIT 1`,
+          sinkId,
+          title.slice(0, 200)
+        );
+        if (dup) {
+          this.audit("hub:stop-the-line", "already_tasked", String(dup.id), { sha: shortSha, red: verdict.red.map((r) => r.name) });
+          return;
+        }
+        const bisect = await this.stopLineBisect(ghGet, sha);
+        const chain = await this.guiltyChain(bisect.first_failing_sha);
+        const culprit = bisect.first_failing_sha ? bisect.first_failing_pr ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.` : `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} \u2014 the PR that landed it could not be resolved (bisect walked ${bisect.walked} commit(s)); check merge history.` : `**First failing sha:** bisect unavailable (${bisect.note ?? "history walk failed"}) \u2014 check the run history of recent merges manually.`;
+        const body = [
+          `**STOP-THE-LINE episode task** \u2014 bridge main HEAD ${shortSha} is RED. Merges are mechanically halted by the \`main-green gate\` (accepted decision BR#3009, destination-green precondition). This task is the claimable priority item for putting the line back up. Work continues on branches (worktrees) \u2014 only the line stops.`,
+          ``,
+          `**Red checks on ${shortSha}:**`,
+          ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) \u2014 ${r.url || "run URL unavailable"}`),
+          ``,
+          culprit,
+          ``,
+          `**Guilty chain:** ${this.guiltyChainLine(chain, bisect.first_failing_sha)}`,
+          ``,
+          `**The one exception \u2014 the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation \u2014 precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
+          ``,
+          `**Done when:** main tip has ALL check-runs settled green (0 red, 0 unsettled) and the \`main-green gate\` reopens \u2014 close this task citing the green run receipts.`,
+          ``,
+          `_Filed once per red episode by the hub sweep (BR#3008 + BR#3284), deduped per main-HEAD sha. The ask in the sink (BR#3124) is the attention channel; this task is the work._`
+        ].join("\n");
+        const created = await this.create(
+          {
+            type: "task",
+            title,
+            body_md: body,
+            // sanitizeTags lowercases (board tags are canonically lowercase — the
+            // chip renders "p0"); role:impl declares the intended work kind for
+            // pickup per the task-publishing norm (Ray's impl cards carry it).
+            tags: ["stop-the-line", "p0", "gtm-blocker", "role:impl"],
+            // the sweep KNOWS the scope, culprit and done-when — it analyzed the
+            // episode as it filed it; publish claimable, not gate-throttled
+            qualified: true,
+            meta: {
+              purpose: "stop-the-line episode task",
+              stop_line: {
+                sha,
+                short_sha: shortSha,
+                red: verdict.red.map((r) => ({ name: r.name, conclusion: r.conclusion, url: r.url })),
+                green_checks: verdict.green,
+                unsettled: verdict.unsettled,
+                first_failing_sha: bisect.first_failing_sha ?? void 0,
+                first_failing_pr: bisect.first_failing_pr,
+                // the resolved guilty chain (BR#3307): null when the provenance
+                // sweep has not stamped the breaking merge yet — honest absence
+                guilty_chain: chain.rec ? {
+                  repo: chain.rec.repo,
+                  pr: chain.rec.pr,
+                  task_id: chain.rec.task?.id ?? null,
+                  verdict_id: chain.rec.verdict_id,
+                  session: chain.rec.session,
+                  signer: chain.rec.signer
+                } : null,
+                sink_id: sinkId
+              },
+              // priority 0 — the existing urgent handling: first on the board's
+              // ranked queue, top of the pickup ranking (same shape the human
+              // boost endpoint writes; audited once below as part of the filing)
+              boosted: Date.now()
+            }
+          },
+          "hub:stop-the-line"
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          sinkId,
+          Date.now()
+        );
+        const prior = this.one(
+          `SELECT id, status, meta FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND id != ?
+         AND title LIKE 'STOP-THE-LINE: bridge main RED @ %'
+       ORDER BY created_ts DESC LIMIT 1`,
+          created.id
+        );
+        if (prior) {
+          const ts = Date.now();
+          const pm = JSON.parse(prior.meta ?? "{}");
+          pm.superseded_reason = `new red main episode @ ${shortSha} \u2014 superseded by ${created.id} (one live episode task at a time)`;
+          pm.superseded_by = created.id;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+            JSON.stringify(pm),
+            ts,
+            ts,
+            prior.id
+          );
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+            created.id,
+            prior.id,
+            ts
+          );
+          this.version(prior.id, "hub:stop-the-line", "transition", `superseded \u2014 new red main episode ${shortSha} (${created.id})`, { from: prior.status, to: "superseded" });
+          this.audit("hub:stop-the-line", "episode_superseded", prior.id, { by: created.id, from: prior.status, new_sha: shortSha });
+        }
+        this.audit("hub:stop-the-line", "episode_task", String(created.id), {
+          sha: shortSha,
+          red: verdict.red.map((r) => r.name),
+          first_failing: bisect.first_failing_sha?.slice(0, 9) ?? "unresolved",
+          boosted: true
+        });
+      }
+      // ---------- episode attribution walk (bisect) ----------
+      // Walk main's recent history (newest → oldest, bounded) to the first
+      // failing sha: the newest commit back from HEAD whose parent settles green
+      // is the merge that broke the line. Unauthenticated GitHub quota is shared
+      // per egress IP, so the walk is CAPPED and any error downgrades to
+      // "bisect unavailable" on the card — a failed attribution never blocks the
+      // filing, and the settled-green boundary always stops the walk.
+      async stopLineBisect(ghGet, headSha) {
+        const WALK = 10;
+        try {
+          const listBody = await (await ghGet(`/commits?per_page=${WALK}`)).json();
+          const commits = (Array.isArray(listBody) ? listBody : []).map((c) => String(c?.sha ?? "")).filter((s) => /^[0-9a-f]{40}$/.test(s));
+          for (let i = 1; i < commits.length; i++) {
+            const runsBody = await (await ghGet(`/commits/${commits[i]}/check-runs?per_page=100`)).json();
+            const v = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
+            if (v.verdict !== "green") continue;
+            const firstFailing = commits[i - 1] || headSha;
+            let pr;
+            try {
+              const pullsBody = await (await ghGet(`/commits/${firstFailing}/pulls`)).json();
+              const pulls = Array.isArray(pullsBody) ? pullsBody : [];
+              const pick2 = pulls.find((p) => p?.merged_at) ?? pulls[0];
+              if (pick2) pr = {
+                number: Number(pick2.number),
+                title: String(pick2.title ?? ""),
+                html_url: String(pick2.html_url ?? ""),
+                merged_at: pick2.merged_at ?? null
+              };
+            } catch {
+            }
+            return { first_failing_sha: firstFailing, first_failing_pr: pr, walked: i };
+          }
+          return { walked: commits.length, note: `no settled-green commit within ${WALK} commits of main` };
+        } catch (e) {
+          return { walked: 0, note: String(e.message ?? e).slice(0, 200) };
+        }
+      }
+      // ---------- standing merge-queue sweep (BR#3198) ----------
+      // The deterministic executor of the BR#3033 standing merge order ("merge
+      // when green") — the run-side complement of BR#3008's stop-the-line gate.
+      // Every tick (paced by `merge_sweep_minutes`, default 15, 0 = off), for each
+      // OPEN PR on both repos, oldest first:
+      //   superseded-check → 5c mechanical gate (mergeable + clean + every commit
+      //   GitHub-verified + base green + head checks green) + an ACCEPTED
+      //   verify-verdict decision covering the current head → merge (squash per
+      //   repo norm). Mechanical defects auto-bounce the linked card with the
+      //   exact defect; human-leg defects (externals, signing environment) are
+      //   collected into ONE class ask per repo per episode, never one per PR.
+      //
+      // Identity: merges as the token's identity — deploy GH_TOKEN as the
+      // detached-cody credential per BR#3181, never rayh's personal credentials.
+      // Settings: `merge_sweep_minutes` (default 15), `merge_sweep_repos` (JSON
+      // array, default both repos), `merge_sweep_methods` (JSON map repo →
+      // "merge" | "squash", default bridge=merge / superpositional=squash),
+      // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
+      // `merge_sweep_gh_api_base` (drills/tests only).
+      /** PR provenance sweep (BR#3287): index recent merges — sha → PR → task →
+       *  verify-verdict → agent session — stamp task cards (meta.provenance,
+       *  board-side storage of record per decision BR#3291) and mirror
+       *  best-effort to GitHub (derived, never read back). Dedupe per (repo, pr)
+       *  via the provenance table; backfill window bounds the cold-start scan. */
+      async provenanceSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("provenance_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("provenance_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('provenance_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const token = this.env.GH_TOKEN;
+        if (!token) {
+          this.audit("hub:provenance", "no_identity", null, { note: "GH_TOKEN not configured \u2014 provenance sweep cannot read GitHub; skipping (endpoint + backfill resume when it returns)" });
+          return;
+        }
+        const base = this.settingValue("provenance_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        let repos = [];
+        try {
+          const parsed = JSON.parse(this.settingValue("provenance_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+          if (Array.isArray(parsed)) repos = parsed.map(String);
+        } catch {
+          repos = [];
+        }
+        if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+        const backfillDays = Math.max(1, Math.min(365, parseInt(this.settingValue("provenance_backfill_days", "30"), 10) || 30));
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}${path}`, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "user-agent": "bridge-provenance-sweep (BR#3287)",
+              "x-github-api-version": "2022-11-28"
+            }
+          });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res.json();
+        }, "ghGet");
+        let indexed = 0;
+        for (const repo of repos) {
+          let pulls = [];
+          try {
+            pulls = await ghGet(`/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=50`);
+          } catch (e) {
+            this.audit("hub:provenance", "repo_error", null, { repo, error: String(e.message ?? e).slice(0, 200) });
+            continue;
+          }
+          for (const pr of pulls) {
+            if (!pr?.merged_at || !pr?.merge_commit_sha || !pr?.number) continue;
+            const mergedAt = withinBackfillWindow(pr.merged_at, now, backfillDays);
+            if (mergedAt === null) continue;
+            const seen = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, pr.number);
+            if (seen) continue;
+            try {
+              const detail = await ghGet(`/repos/${repo}/pulls/${pr.number}`);
+              const headSha = String(detail?.head?.sha ?? "");
+              const branch = String(detail?.head?.ref ?? "");
+              const cardRef = prCardRef(branch, `${pr.title ?? ""}
+${pr.body ?? ""}
+${detail?.title ?? ""}
+${detail?.body ?? ""}`);
+              const commitsBody = await ghGet(`/repos/${repo}/pulls/${pr.number}/commits?per_page=100`);
+              const commits = (commitsBody ?? []).map((c) => ({
+                verified: c?.commit?.verification?.verified === true,
+                committer_email: String(c?.commit?.committer?.email ?? "")
+              }));
+              const signer = signerFromCommits(commits);
+              let taskId = cardRef;
+              let verdictId = null;
+              let session = null;
+              if (taskId && /^[0-9a-f]{40}$/.test(headSha)) {
+                const decisions = this.state.storage.sql.exec(
+                  `SELECT d.id AS id, d.body_md AS body_md, d.meta AS meta FROM relations r
+               JOIN artefacts d ON d.id = r.src_id
+               WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+                  taskId
+                ).toArray();
+                const onHead = decisions.find(
+                  (d) => (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9))
+                );
+                if (onHead) {
+                  verdictId = String(onHead.id);
+                  try {
+                    session = String(JSON.parse(onHead.meta ?? "{}")?.session ?? "") || null;
+                  } catch {
+                    session = null;
+                  }
+                }
+              }
+              this.state.storage.sql.exec(
+                `INSERT OR REPLACE INTO provenance (repo, pr, merge_sha, head_sha, task_id, verdict_id, session, signer, merged_at, stamped_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                repo,
+                pr.number,
+                String(pr.merge_commit_sha),
+                headSha,
+                taskId,
+                verdictId,
+                session,
+                signer,
+                mergedAt,
+                Date.now()
+              );
+              indexed++;
+              if (taskId) {
+                const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+                if (row) {
+                  const meta3 = JSON.parse(row.meta ?? "{}");
+                  meta3.provenance = {
+                    pr: pr.number,
+                    repo,
+                    merge_sha: String(pr.merge_commit_sha).slice(0, 12),
+                    head_sha: headSha.slice(0, 12),
+                    verdict_id: verdictId,
+                    session,
+                    signer,
+                    merged_at: mergedAt
+                  };
+                  this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta3), Date.now(), taskId);
+                  this.audit("hub:provenance", "stamped", taskId, { pr: pr.number, repo, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
+                }
+              } else {
+                this.audit("hub:provenance", "no_card", null, { repo, pr: pr.number, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
+              }
+              if (taskId) {
+                try {
+                  await fetch(`${base}/repos/${repo}/issues/${pr.number}/labels`, {
+                    method: "POST",
+                    headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json" },
+                    // label format per README/spec: bridge:BR-<id> (BR#3307 — the
+                    // raw card id renders "bridge:BR#3287"; normalize the #)
+                    body: JSON.stringify({ labels: [`bridge:${taskId.replace("#", "-")}`] })
+                  });
+                } catch {
+                }
+              }
+            } catch (e) {
+              this.audit("hub:provenance", "pr_error", null, { repo, pr: pr.number, error: String(e.message ?? e).slice(0, 200) });
+            }
+          }
+        }
+        if (indexed) this.audit("hub:provenance", "indexed", null, { indexed, repos: repos.join(",") });
+      }
+      /** sha → PR → task → verify-verdict → agent session (BR#3287). Matches by
+       *  merge sha or head sha (7+ hex prefix). Returns null when nothing is
+       *  known — an honest "no bridge provenance" (404) rather than a guess. */
+      async provenanceLookup(sp) {
+        return this.provenanceBySha(parseProvenanceSha(sp));
+      }
+      async provenanceBySha(sha) {
+        const row = this.one(
+          `SELECT * FROM provenance WHERE merge_sha = ? OR merge_sha LIKE ? OR head_sha = ? OR head_sha LIKE ? LIMIT 1`,
+          sha,
+          `${sha}%`,
+          sha,
+          `${sha}%`
+        );
+        if (!row) return null;
+        const task = row.task_id ? this.one(`SELECT id, title, status, owner FROM artefacts WHERE id = ?`, row.task_id) : null;
+        return {
+          sha,
+          repo: row.repo,
+          pr: row.pr,
+          merge_sha: row.merge_sha,
+          head_sha: row.head_sha,
+          task: task ? { id: task.id, title: task.title, status: task.status, owner: task.owner } : null,
+          verdict_id: row.verdict_id,
+          session: row.session,
+          signer: row.signer,
+          merged_at: row.merged_at,
+          stamped_at: row.stamped_at
+        };
+      }
+      /** The guilty-chain outcome for an alarm note (BR#3307, residue of
+       *  BR#3287 spec item 4): explicitly typed — `rec` carries the resolved
+       *  PR → task → verify verdict → agent session → signer chain when the
+       *  provenance index has stamped the merge, and `error` is set ONLY when
+       *  the lookup itself failed. Never throws — attribution must not break
+       *  the filing (the same downgrade philosophy as the bisect walk) — but a
+       *  failure is never converted into success: the caller distinguishes it
+       *  (the note renders the error, not the honest-absence line) and the
+       *  audit trail receipts it (hub:stop-the-line/guilty_chain_error — SP
+       *  review round 1, PR #198: silence was the one thing it must not be). */
+      async guiltyChain(sha) {
+        if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return { rec: null };
+        try {
+          return { rec: await this.provenanceBySha(sha) };
+        } catch (e) {
+          const error62 = String(e.message ?? e).slice(0, 200);
+          this.audit("hub:stop-the-line", "guilty_chain_error", null, {
+            sha: String(sha).slice(0, 9),
+            error: error62
+          });
+          return { rec: null, error: error62 };
+        }
+      }
+      /** One markdown chain segment: `PR #N · task BR#X · verdict BR#Y ·
+       *  session s · signer class` — with honest fallback lines: the provenance
+       *  sweep has not stamped the merge yet, or the lookup failed (withheld,
+       *  never guessed). */
+      guiltyChainLine(chain, sha) {
+        if (chain.error) {
+          return `_provenance lookup failed (${chain.error}) \u2014 the chain is withheld rather than guessed; receipted on the audit trail (hub:stop-the-line/guilty_chain_error)_`;
+        }
+        if (!chain.rec) {
+          return `_no bridge provenance for ${sha ? sha.slice(0, 9) : "this sha"} yet \u2014 \`GET /api/kb/provenance?sha=\` returns the chain once the provenance sweep stamps the merge_`;
+        }
+        const rec = chain.rec;
+        const prUrl = `https://github.com/${rec.repo}/pull/${rec.pr}`;
+        return [
+          `PR [#${rec.pr}](${prUrl})`,
+          `task ${rec.task?.id ?? "none (no bridge card)"}`,
+          `verdict ${rec.verdict_id ?? "none (unverified merge)"}`,
+          `session ${rec.session ?? "\u2014"}`,
+          `signer ${rec.signer ?? "unknown"}`
+        ].join(" \xB7 ");
+      }
+      // ---------- unblock-proxy watch (BR#3361a) ----------
+      // The BR#3129 class: a parked card's machine-checkable unblock_condition
+      // flipped TRUE (its PR merged) and NOBODY noticed for ~20h — unblock duties
+      // only re-ran when a human-dispatched sweep happened to look. This sweep
+      // re-evaluates machine-checkable proxies periodically and auto-spawns the
+      // unblock duty on the flip.
+      //
+      // Conservatism: the sweep is a TRIGGER, not an authority. It flips a card
+      // only when parseProxyCondition extracted atoms for the WHOLE condition and
+      // every atom evaluated TRUE against live state; anything it cannot fully
+      // read is stamped unparseable/unresolvable and never auto-flips. The
+      // spawned duty re-verifies first-hand (its contract says so).
+      //
+      // Settings: `unblock_proxy_sweep_minutes` (default 15, 0 = off),
+      // `unblock_proxy_gh_api_base` (default https://api.github.com — drills),
+      // `unblock_proxy_default_repo` (bare-number fallback for live checks).
+      proxyGhGet(base, token, setBackoff, now) {
+        return async (repo, path) => {
+          const headers = token ? { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "bridge-proxy-watch (BR#3361)" } : { "User-Agent": "bridge-proxy-watch (BR#3361)", "Accept": "application/vnd.github+json" };
+          const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
+          if (res.status === 403 || res.status === 429) {
+            setBackoff(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          return { ok: res.ok, status: res.status, body: res.ok ? await res.json() : null };
+        };
+      }
+      /** Live verdict for one proxy atom. `receipt` is the evidence line that
+       *  rides the spawned duty's body (and the per-card stamp). */
+      async evalProxyAtom(atom, io) {
+        const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
+        const brBranch = (atom.brId ?? "").replace("#", "-");
+        switch (atom.kind) {
+          case "br_done": {
+            const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, atom.brId);
+            if (!row) return { ok: false, receipt: `${atom.brId} not found on this board` };
+            const done = row.status === "done" || row.status === "superseded";
+            return { ok: done, receipt: `${atom.brId} status=${row.status}` };
+          }
+          case "pr_merged": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
+            if (!res.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
+            const merged = !!res.body?.merged_at;
+            return { ok: merged, receipt: merged ? `PR ${atom.repo}#${atom.number} MERGED at ${res.body.merged_at}` : `PR ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}, not merged` };
+          }
+          case "br_pr_merged": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/pulls?head=${atom.repo}:bridge/${brBranch}&state=all&per_page=20`);
+            if (!res.ok) return { ok: false, receipt: `PR lookup for ${atom.brId} HTTP ${res.status}` };
+            const pr = (Array.isArray(res.body) ? res.body : []).find((p) => String(p.head?.ref ?? "") === `bridge/${brBranch}`);
+            if (!pr) return { ok: false, receipt: `no PR with head branch bridge/${brBranch} (${atom.brId})` };
+            const merged = !!pr.merged_at;
+            return { ok: merged, receipt: merged ? `PR ${atom.repo}#${pr.number} for ${atom.brId} MERGED at ${pr.merged_at}` : `PR ${atom.repo}#${pr.number} for ${atom.brId} not merged` };
+          }
+          case "issue_closed": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/issues/${atom.number}`);
+            if (!res.ok) return { ok: false, receipt: `issue ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
+            const closed = res.body?.state === "closed";
+            return { ok: closed, receipt: `issue ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}` };
+          }
+          case "run_success": {
+            if (!atom.repo) return unresolvable;
+            const res = await io.ghGet(atom.repo, `/actions/runs/${atom.runId}`);
+            if (!res.ok) return { ok: false, receipt: `run ${atom.runId} lookup HTTP ${res.status}` };
+            const ok = res.body?.status === "completed" && res.body?.conclusion === "success";
+            return { ok, receipt: `run ${atom.runId} status=${res.body?.status ?? "?"} conclusion=${res.body?.conclusion ?? "?"}` };
+          }
+          case "pr_checks_green": {
+            if (!atom.repo) return unresolvable;
+            const pr = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
+            if (!pr.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${pr.status}` };
+            const sha = String(pr.body?.head?.sha ?? "");
+            if (!/^[0-9a-f]{40}$/.test(sha)) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} head sha unavailable` };
+            const runs = await io.ghGet(atom.repo, `/commits/${sha}/check-runs?per_page=100`);
+            if (!runs.ok) return { ok: false, receipt: `check-runs lookup HTTP ${runs.status}` };
+            const verdict = classifyMainCheckRuns(Array.isArray(runs.body?.check_runs) ? runs.body.check_runs : []).verdict;
+            return { ok: verdict === "green", receipt: `PR ${atom.repo}#${atom.number} head ${sha.slice(0, 9)} checks verdict=${verdict}` };
+          }
+        }
+      }
+      /** Stamp meta.proxy_check on a blocked card; audit ONLY when the verdict
+       *  changed (a stable false must not churn the Log every cycle). */
+      stampProxyCheck(id, meta3, now, verdict, detail, prev, extra) {
+        meta3.proxy_check = { at: now, verdict, ...detail ? { detail } : {}, ...extra ?? {} };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), id);
+        if (!prev || prev.verdict !== verdict) {
+          this.audit("hub:proxy-watch", "proxy_check", id, { verdict, detail: detail?.slice(0, 300) });
+        }
+      }
+      async unblockProxySweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("unblock_proxy_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("unblock_proxy_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('unblock_proxy_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const base = this.settingValue("unblock_proxy_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const token = this.env.GH_TOKEN;
+        const defaultRepo = this.settingValue("unblock_proxy_default_repo", "state-vector/superpositional");
+        const ghGet = this.proxyGhGet(base, token, setLast, now);
+        const rows = this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`
+        ).toArray();
+        for (const r of rows) {
+          try {
+            const meta3 = JSON.parse(r.meta ?? "{}");
+            const cond = String(meta3.blocked?.unblock_condition ?? "").trim();
+            if (!cond) continue;
+            const prev = meta3.proxy_check;
+            if (prev?.at && now - Number(prev.at) < periodMin * 6e4) continue;
+            const { atoms, unparseable } = parseProxyCondition(cond);
+            if (!atoms.length) {
+              this.stampProxyCheck(
+                r.id,
+                meta3,
+                now,
+                unparseable ? "unparseable" : "no_atoms",
+                unparseable ? "condition mentions machine state but no atom parsed \u2014 never auto-flips" : null,
+                prev
+              );
+              continue;
+            }
+            const results = [];
+            for (const atom of atoms) results.push({ atom, ...await this.evalProxyAtom(atom, { ghGet, defaultRepo }) });
+            const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
+            if (unparseable || unresolvable) {
+              this.stampProxyCheck(
+                r.id,
+                meta3,
+                now,
+                unparseable ? "unparseable" : "unresolvable",
+                "condition partially machine-checkable \u2014 the sweep never flips a card it cannot fully read",
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) }
+              );
+              continue;
+            }
+            if (!results.some((x) => x.ok)) {
+              this.stampProxyCheck(
+                r.id,
+                meta3,
+                now,
+                "false",
+                null,
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) }
+              );
+              continue;
+            }
+            const openChild = this.one(
+              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+              r.id
+            );
+            const lastSpawn = meta3.last_unblock_spawn;
+            const flooded = lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS && String(lastSpawn.exit ?? "") === cond;
+            if (openChild || flooded) {
+              this.stampProxyCheck(
+                r.id,
+                meta3,
+                now,
+                "true",
+                null,
+                prev,
+                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" }
+              );
+              if (prev?.verdict !== "true") {
+                this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
+              }
+              continue;
+            }
+            const ts = Date.now();
+            const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
+            const atomLines = results.map((x) => `- "${x.atom.raw}" \u2192 ${x.receipt}`).join("\n");
+            const created = await this.create(
+              {
+                type: "task",
+                title: `Unblock: ${rootTitle.slice(0, 190)}`,
+                session: "",
+                // session-less spawn: the closer stamps it when they claim
+                body_md: `Unblock duty for ${r.id} \u2014 "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).
+
+Blocked why: ${String(meta3.blocked?.reason ?? "").trim() || "see parent"}.
+Exit condition: ${cond}
+
+MACHINE PROXY \u2014 the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):
+${atomLines}
+
+The predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first \u2014 this sweep is a trigger, not an authority), transition ${r.id} \u2192 in_progress with the resolution note, then close yourself done citing these receipts.
+
+Contract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
+                roles: ["unblock"]
+              },
+              "hub:proxy-watch"
+            );
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+              created.id,
+              r.id,
+              ts
+            );
+            meta3.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
+            this.stampProxyCheck(
+              r.id,
+              meta3,
+              now,
+              "true",
+              null,
+              prev,
+              { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: created.id }
+            );
+            this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, atoms: results.map((x) => x.receipt) });
+            this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE \u2014 unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
+          } catch (e) {
+            this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
+      }
+      // ---------- closure-receipt audit (BR#3361c) ----------
+      // The BR#3220 class: a DONE card reported "GH#2337 fully closed" while the
+      // issue was OPEN on GitHub — the board reported a closed issue that wasn't.
+      // The done gate (done-close-legs) makes receipts mandatory at done time;
+      // THIS sweep makes them TRUE: it live-verifies every receipted close leg
+      // (issue state + closing comment + guard run) after the done and files a
+      // correction duty on any false claim.
+      //
+      // Settings: `closure_audit_minutes` (default 30, 0 = off),
+      // `closure_audit_gh_api_base` (drills), `closure_audit_default_repo`
+      // (bare-number legs resolve here for live checks).
+      async closureAuditSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("closure_audit_minutes", "30"), 10) || 30));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("closure_audit_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('closure_audit_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const base = this.settingValue("closure_audit_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        const token = this.env.GH_TOKEN;
+        const defaultRepo = this.settingValue("closure_audit_default_repo", "state-vector/superpositional");
+        const ghGet = this.proxyGhGet(base, token, setLast, now);
+        const rows = this.state.storage.sql.exec(
+          `SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'done'
+       AND json_extract(meta, '$.close_leg_audit.legs') IS NOT NULL
+       AND json_extract(meta, '$.close_leg_audit.checked_ts') IS NULL LIMIT 10`
+        ).toArray();
+        for (const r of rows) {
+          try {
+            const meta3 = JSON.parse(r.meta ?? "{}");
+            const audit = meta3.close_leg_audit;
+            const checks = [];
+            let allOk = true;
+            for (const leg of audit.legs ?? []) {
+              const receipt = (audit.receipts ?? []).find((x) => x.number === leg.number) ?? {};
+              const repo = leg.repo ?? defaultRepo;
+              let issue2 = "not checked", comment = "no comment id in receipt", guard = "no guard run in receipt", ok = true;
+              const iss = await ghGet(repo, `/issues/${leg.number}`);
+              if (iss.ok) {
+                issue2 = `state=${iss.body?.state}`;
+                if (iss.body?.state !== "closed") {
+                  ok = false;
+                  allOk = false;
+                }
+              } else {
+                issue2 = `lookup HTTP ${iss.status}`;
+                ok = false;
+                allOk = false;
+              }
+              if (receipt.commentId && /^\d{6,}$/.test(String(receipt.commentId))) {
+                const c = await ghGet(repo, `/issues/${leg.number}/comments/${receipt.commentId}`);
+                comment = c.ok ? `comment ${receipt.commentId} exists` : `comment ${receipt.commentId} HTTP ${c.status}`;
+                if (!c.ok) {
+                  ok = false;
+                  allOk = false;
+                }
+              }
+              if (receipt.guardRun && /^\d{6,}$/.test(String(receipt.guardRun))) {
+                const g = await ghGet(repo, `/actions/runs/${receipt.guardRun}`);
+                guard = g.ok ? `guard run ${receipt.guardRun} exists (${g.body?.conclusion ?? "?"})` : `guard run ${receipt.guardRun} HTTP ${g.status}`;
+              }
+              checks.push({ repo, number: leg.number, issue: issue2, comment, guard, ok });
+            }
+            meta3.close_leg_audit.checked_ts = now;
+            meta3.close_leg_audit.verdict = allOk ? "ok" : "false";
+            meta3.close_leg_audit.checks = checks;
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), r.id);
+            if (allOk) {
+              this.audit("hub:closure-audit", "closure_receipt_ok", r.id, { checks: checks.map((c) => `${c.repo}#${c.number} ${c.issue} ${c.comment}`) });
+              continue;
+            }
+            const detail = checks.map((c) => `${c.repo}#${c.number}: ${c.issue}; ${c.comment}; ${c.guard}`).join(" | ");
+            this.audit("hub:closure-audit", "closure_receipt_false", r.id, { detail: detail.slice(0, 300) });
+            this.version(r.id, "hub:closure-audit", "note", `CLOSURE RECEIPT AUDIT \u2014 FALSE: ${detail.slice(0, 300)}`, { checks });
+            const stamp = meta3.last_correction_spawn;
+            if (!(stamp && typeof stamp.at === "number" && now - stamp.at < UNBLOCK_FLOOD_MS)) {
+              const created = await this.create(
+                {
+                  type: "task",
+                  title: `Correction: false closure receipt on ${r.id}`,
+                  session: "",
+                  // session-less spawn: the closer stamps it when they claim
+                  body_md: `A done card's closure receipt failed the hub's live audit (BR#3361 \u2014 the BR#3220 class: the board reported a closed issue that wasn't).
+
+Card: ${r.id} (done, claims close legs with receipts)
+Audit: ${detail}
+
+Contract: (1) verify the live state of each leg first-hand (gh issue view). (2) If the issue is OPEN, the close never happened \u2014 execute the close per the card's grammar and correct the card record (a progress note correcting the false claim, citing the real receipt: state=closed + closing-comment id + guard run id). (3) If the issue IS closed and the receipt was merely stale/wrong-shaped, correct the record to the true receipt. (4) Close yourself done citing the corrected receipts.`,
+                  roles: ["unblock"]
+                },
+                "hub:closure-audit"
+              );
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+                created.id,
+                r.id,
+                Date.now()
+              );
+              meta3.last_correction_spawn = { at: now, child: created.id };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), r.id);
+              this.audit("hub:closure-audit", "correction_spawned", r.id, { child: created.id });
+            }
+          } catch (e) {
+            this.audit("hub:closure-audit", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
+      }
+      async mergeQueueSweep(now) {
+        const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
+        if (periodMin === 0) return;
+        const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
+        if (now - last < periodMin * 6e4) return;
+        const setLast = /* @__PURE__ */ __name((ts) => this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts)), "setLast");
+        setLast(now);
+        const token = this.env.GH_TOKEN;
+        if (!token) {
+          this.audit("hub:merge-sweep", "no_identity", null, { note: "GH_TOKEN not configured \u2014 the sweep cannot merge as detached-cody (BR#3181); skipping, never merging unauthenticated" });
+          return;
+        }
+        const base = this.settingValue("merge_sweep_gh_api_base", "https://api.github.com").replace(/\/$/, "");
+        let repos = [];
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
+          if (Array.isArray(parsed)) repos = parsed.map(String);
+        } catch {
+          repos = [];
+        }
+        if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
+        let methods = {};
+        try {
+          const parsed = JSON.parse(this.settingValue("merge_sweep_methods", JSON.stringify({ "state-vector/bridge": "merge", "state-vector/superpositional": "squash" })));
+          if (parsed && typeof parsed === "object") methods = parsed;
+        } catch {
+          methods = {};
+        }
+        const prDispositionEnabled = /^(1|true|on|yes)$/i.test(this.settingValue("pr_disposition_enabled", "1"));
+        const prStaleDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_stale_days", "7"), 10) || 7));
+        const prOrphanDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_orphan_days", "3"), 10) || 3));
+        const prGraceHours = Math.max(1, Math.min(720, parseInt(this.settingValue("pr_grace_hours", "48"), 10) || 48));
+        const ghGet = /* @__PURE__ */ __name(async (path) => {
+          const res = await fetch(`${base}${path}`, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "user-agent": "bridge-merge-sweep (BR#3198)",
+              "x-github-api-version": "2022-11-28"
+            }
+          });
+          if (res.status === 403 || res.status === 429) {
+            setLast(now + 60 * 6e4);
+            throw new Error(`github rate limited (HTTP ${res.status})`);
+          }
+          if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
+          return res.json();
+        }, "ghGet");
+        const cardRef = /* @__PURE__ */ __name((text2) => {
+          const m = /BR#(\d+)/.exec(text2 ?? "");
+          return m ? `BR#${m[1]}` : null;
+        }, "cardRef");
+        const sweepNote = /* @__PURE__ */ __name((id, note) => {
+          const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+          if (!row) return;
+          const meta3 = JSON.parse(row.meta ?? "{}");
+          meta3.last_progress = { note: note.slice(0, 500), sentiment: "neutral", actor: "system:merge-sweep", ts: Date.now() };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta3), Date.now(), id);
+          this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
+          this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
+        }, "sweepNote");
+        const closeWithReason = /* @__PURE__ */ __name(async (repo, prNumber, reason, linked) => {
+          const comment = await fetch(`${base}/repos/${repo}/issues/${prNumber}/comments`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "user-agent": "bridge-merge-sweep (BR#3315)"
+            },
+            body: JSON.stringify({ body: reason })
+          });
+          if (!comment.ok) throw new Error(`close-reason comment POST -> HTTP ${comment.status}`);
+          const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "user-agent": "bridge-merge-sweep (BR#3315)"
+            },
+            body: JSON.stringify({ state: "closed", state_reason: "not_planned" })
+          });
+          if (!close.ok) throw new Error(`close PATCH -> HTTP ${close.status}`);
+          if (linked) sweepNote(linked, `${reason.slice(0, 380)} \u2014 PR #${prNumber} closed by the merge sweep`);
+        }, "closeWithReason");
+        const results = [];
+        for (const repo of repos) {
+          const humanLegs = [];
+          try {
+            const pulls = await ghGet(`/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`);
+            const head = await ghGet(`/repos/${repo}/commits/main`);
+            const baseSha = String(head?.sha ?? "");
+            let baseVerdict = "empty";
+            if (/^[0-9a-f]{40}$/.test(baseSha)) {
+              const runsBody = await ghGet(`/repos/${repo}/commits/${baseSha}/check-runs?per_page=100`);
+              baseVerdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []).verdict;
+            }
+            for (const pr of pulls) {
+              const prNumber = pr.number;
+              try {
+                const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
+                const prText = `${pr.title ?? ""}
+${pr.body ?? ""}
+${detail.title ?? ""}
+${detail.body ?? ""}`;
+                const linked = cardRef(prText) ?? prCardRef(String(detail?.head?.ref ?? "").replace(/^refs\/heads\//, ""), prText);
+                const card = linked ? this.one(`SELECT id, status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, linked) : null;
+                const cardStatus = card ? String(card.status) : null;
+                let verifyAcceptedAny = false;
+                let verifyAcceptedOnHead = false;
+                const headSha = String(detail?.head?.sha ?? "");
+                if (linked && /^[0-9a-f]{40}$/.test(headSha)) {
+                  const decisions = this.state.storage.sql.exec(
+                    `SELECT d.body_md AS body_md, d.meta AS meta FROM relations r
+                 JOIN artefacts d ON d.id = r.src_id
+                 WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
+                    linked
+                  ).toArray();
+                  verifyAcceptedAny = decisions.length > 0;
+                  verifyAcceptedOnHead = decisions.some(
+                    (d) => (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9))
+                  );
+                }
+                const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
+                const commits = (commitsBody ?? []).map((c) => ({
+                  sha: String(c?.sha ?? ""),
+                  verified: c?.commit?.verification?.verified === true,
+                  ts: Date.parse(String(c?.commit?.committer?.date ?? c?.commit?.author?.date ?? ""))
+                }));
+                const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
+                const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
+                const action = decideMergeAction({
+                  prNumber,
+                  prTitle: String(detail?.title ?? pr.title ?? ""),
+                  headSha,
+                  baseVerdict,
+                  mergeable: detail?.mergeable ?? null,
+                  mergeStateStatus: detail?.merge_state_status ?? null,
+                  commits,
+                  headChecks,
+                  cardStatus,
+                  verifyAcceptedAny,
+                  verifyAcceptedOnHead
+                });
+                const lastActivityTs = [
+                  Date.parse(String(pr.updated_at ?? "")),
+                  ...commits.map((c) => Number(c?.ts))
+                ].filter(Number.isFinite).reduce((m, t) => m == null || t > m ? t : m, null);
+                const prCreatedRaw = Date.parse(String(pr.created_at ?? ""));
+                const prCreatedAt = Number.isFinite(prCreatedRaw) ? prCreatedRaw : null;
+                let cardAdvancing = false;
+                let cardOwner = null;
+                let cardTerminalNote = null;
+                if (card) {
+                  cardOwner = card.owner ? String(card.owner) : null;
+                  const cmeta = JSON.parse(String(card.meta ?? "{}"));
+                  const cardUpdated = Number(card.updated_ts ?? 0);
+                  const windowMs = prStaleDays * 864e5;
+                  if (cardStatus === "in_progress" || cardStatus === "in_review")
+                    cardAdvancing = cardUpdated > 0 && now - cardUpdated <= windowMs;
+                  else if (cardStatus === "blocked") {
+                    const parkTs = Number(cmeta?.blocked?.ts ?? 0);
+                    cardAdvancing = parkTs > 0 && now - parkTs <= windowMs;
+                  }
+                  cardTerminalNote = cmeta?.superseded_reason ? String(cmeta.superseded_reason) : null;
+                }
+                const hasProvenance = card != null || !!this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, prNumber);
+                const escKey = `pr_escalated_${repo}_${prNumber}`;
+                let escalatedAt = null;
+                let escalationAskId = null;
+                const escRaw = this.settingValue(escKey, "");
+                if (escRaw) {
+                  try {
+                    const p = JSON.parse(escRaw);
+                    escalatedAt = Number(p?.ts) || null;
+                    escalationAskId = p?.ask_id ? String(p.ask_id) : null;
+                  } catch {
+                    escalatedAt = Number(escRaw) || null;
+                  }
+                }
+                const activitySinceEscalation = escalatedAt != null && lastActivityTs != null && lastActivityTs > escalatedAt;
+                if (escalatedAt != null && activitySinceEscalation) {
+                  this.state.storage.sql.exec(`DELETE FROM settings WHERE key = ?`, escKey);
+                  if (linked) sweepNote(linked, `PR #${prNumber}: owner responded after the escalation \u2014 episode resolved, stale clock reset`);
+                }
+                let disposition = null;
+                if (prDispositionEnabled) {
+                  disposition = decidePrDisposition({
+                    gate: action,
+                    repo,
+                    prNumber,
+                    now,
+                    lastActivityTs,
+                    cardId: linked,
+                    cardStatus,
+                    cardAdvancing,
+                    hasProvenance,
+                    prCreatedAt,
+                    cardTerminalNote,
+                    escalatedAt,
+                    escalationAskId,
+                    activitySinceEscalation,
+                    prStaleDays,
+                    prOrphanDays,
+                    prGraceHours
+                  });
+                  if (disposition.kind === "close_superseded" && action.kind !== "close_superseded") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                    this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber, cause: "card_terminal" });
+                    continue;
+                  }
+                  if (disposition.kind === "close_orphan") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_orphan" });
+                    continue;
+                  }
+                  if (disposition.kind === "close_stale") {
+                    await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
+                    results.push({ repo, pr: prNumber, kind: "close_stale" });
+                    if (linked && card && !["done", "superseded", "rejected", "todo"].includes(cardStatus)) {
+                      try {
+                        await this.transition(
+                          { id: linked, to: "todo", note: `PR #${prNumber} closed by the merge sweep (stale) \u2014 work intent stays here as unclaimed todo; revive by re-opening or re-submitting a PR. (${disposition.reason.slice(0, 200)})` },
+                          "system:merge-sweep"
+                        );
+                      } catch (e) {
+                        this.audit("system:merge-sweep", "release_card_error", linked, { error: String(e.message ?? e).slice(0, 200) });
+                      }
+                    }
+                    continue;
+                  }
+                  if (disposition.kind === "escalate" && linked && card) {
+                    const to = cardOwner && isValidAskTarget(cardOwner) && !/^(web|system)/.test(cardOwner) ? cardOwner : "any";
+                    const created = await this.askCreate(
+                      {
+                        to,
+                        urgency: "normal",
+                        question: disposition.question,
+                        details: [
+                          `**Merge-sweep escalation (terminal-state law BR#3312 \u2014 one bound ask per staleness episode).**`,
+                          ``,
+                          `- PR: https://github.com/${repo}/pull/${prNumber}`,
+                          `- card: ${linked} (${cardStatus ?? "no row"}${cardAdvancing ? ", advancing" : ", not advancing"})`,
+                          `- last PR activity: ${lastActivityTs != null ? new Date(lastActivityTs).toISOString() : "unknown"} (> ${prStaleDays}d ago)`,
+                          ``,
+                          `Do one of: **merge** (it is verified/merge-ready), **rebase** (freshen the head), or **close the PR with a reason** \u2014 within ${prGraceHours}h. On silence the sweep closes the PR with a reason citing this ask; the card keeps the work's intent as unclaimed todo and the PR is reopenable.`
+                        ].join("\n"),
+                        reason: "merge-sweep escalation: PR stale past pr_stale_days with the card not advancing \u2014 one bound ask, then close-with-reason",
+                        options: ["Merging/rebasing now", "Closing with reason", "Release the card \u2014 not mine"],
+                        artefact_id: linked
+                      },
+                      "system:merge-sweep"
+                    );
+                    this.state.storage.sql.exec(
+                      `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+                      escKey,
+                      JSON.stringify({ ts: now, ask_id: created.id })
+                    );
+                    sweepNote(linked, `${disposition.reason} \u2014 escalation ${created.id} filed on ${to}`);
+                    results.push({ repo, pr: prNumber, kind: "escalate", ask: created.id });
+                    this.audit("system:merge-sweep", "escalate", linked, { repo, pr: prNumber, ask: created.id, to });
+                    continue;
+                  }
+                }
+                if (action.kind === "merge") {
+                  const method = methods[repo] === "squash" ? "squash" : "merge";
+                  const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
+                    method: "PUT",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ merge_method: method })
+                  });
+                  if (mergeRes.ok) {
+                    const merged = await mergeRes.json().catch(() => ({}));
+                    const receipt = `${action.receipt} \u2014 mergeCommit ${String(merged?.sha ?? "unknown").slice(0, 9)}`;
+                    if (linked) sweepNote(linked, receipt);
+                    results.push({ repo, pr: prNumber, kind: "merge", sha: String(merged?.sha ?? "").slice(0, 9) });
+                    this.audit("system:merge-sweep", "merge", linked, { repo, pr: prNumber, method, receipt: receipt.slice(0, 300) });
+                  } else if (mergeRes.status === 405 || mergeRes.status === 409) {
+                    const defect = `PR #${prNumber} merge refused by GitHub (HTTP ${mergeRes.status}) \u2014 no longer mergeable/clean. Rebase, resolve, re-push, re-enter the queue`;
+                    if (linked && cardStatus === "in_review") await this.transition({ id: linked, to: "in_progress", note: defect }, "system:merge-sweep");
+                    else if (linked) sweepNote(linked, defect);
+                    results.push({ repo, pr: prNumber, kind: "bounce", defect });
+                  } else {
+                    throw new Error(`merge PUT -> HTTP ${mergeRes.status}`);
+                  }
+                } else if (action.kind === "close_superseded") {
+                  const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
+                    method: "PATCH",
+                    headers: {
+                      authorization: `Bearer ${token}`,
+                      accept: "application/vnd.github+json",
+                      "content-type": "application/json",
+                      "user-agent": "bridge-merge-sweep (BR#3198)"
+                    },
+                    body: JSON.stringify({ state: "closed", state_reason: "not_planned" })
+                  });
+                  if (close.ok) {
+                    if (linked) sweepNote(linked, `${action.reason} \u2014 PR #${prNumber} closed by the merge sweep (superseded-check first)`);
+                    results.push({ repo, pr: prNumber, kind: "close_superseded" });
+                    this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber });
+                  } else throw new Error(`close PATCH -> HTTP ${close.status}`);
+                } else if (action.kind === "bounce") {
+                  if (linked && cardStatus === "in_review") {
+                    await this.transition({ id: linked, to: "in_progress", note: action.defect }, "system:merge-sweep");
+                  } else if (linked) {
+                    sweepNote(linked, action.defect);
+                  }
+                  results.push({ repo, pr: prNumber, kind: "bounce", defect: action.defect });
+                  this.audit("system:merge-sweep", "bounce", linked, { repo, pr: prNumber, defect: action.defect.slice(0, 300) });
+                } else if (action.kind === "note") {
+                  if (linked) sweepNote(linked, action.reason);
+                  results.push({ repo, pr: prNumber, kind: "note" });
+                } else if (action.kind === "human_leg") {
+                  humanLegs.push(action.reason);
+                  results.push({ repo, pr: prNumber, kind: "human_leg" });
+                } else {
+                  this.audit("system:merge-sweep", "skip", linked, { repo, pr: prNumber, reason: action.reason.slice(0, 300) });
+                  results.push({ repo, pr: prNumber, kind: "skip", reason: action.reason.slice(0, 120) });
+                }
+              } catch (e) {
+                this.audit("system:merge-sweep", "pr_error", null, { repo, pr: prNumber, error: String(e.message ?? e).slice(0, 300) });
+                results.push({ repo, pr: prNumber, kind: "pr_error", error: String(e.message ?? e).slice(0, 120) });
+              }
+            }
+            if (humanLegs.length) {
+              const sinkId = this.settingValue("merge_sweep_artefact_id", "BR#3198");
+              const title = mergeSweepHumanLegTitle(repo, humanLegs);
+              const dup = this.one(
+                `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.type = 'question' AND c.title = ? LIMIT 1`,
+                sinkId,
+                title.slice(0, 200)
+              );
+              if (dup) {
+                this.audit("system:merge-sweep", "human_leg_dupe", String(dup.id), { repo, legs: humanLegs.slice(0, 5) });
+              } else {
+                const created = await this.askCreate(
+                  {
+                    to: "rayh",
+                    urgency: "normal",
+                    question: title,
+                    details: [
+                      `**Human-leg merge blockers (BR#3198 class ask \u2014 one ask per class, never per PR).**`,
+                      ``,
+                      ...humanLegs.map((r) => `- ${r}`),
+                      ``,
+                      `_These are the only defects the standing merge sweep (BR#3198) cannot resolve autonomously. Everything mechanical was bounced with the exact defect on the linked card._`
+                    ].join("\n"),
+                    reason: "merge sweep collected human-leg defects into the single class ask per rule 5c",
+                    options: ["Acknowledge \u2014 on it", "Redirect the class"],
+                    artefact_id: sinkId
+                  },
+                  "system:merge-sweep"
+                );
+                this.audit("system:merge-sweep", "human_leg_ask", String(created.id), { repo, legs: humanLegs.slice(0, 5) });
+                results.push({ repo, pr: null, kind: "human_leg_ask", ask: created.id });
+              }
+            }
+          } catch (e) {
+            this.audit("system:merge-sweep", "repo_error", null, { repo, error: String(e.message ?? e).slice(0, 300) });
+            results.push({ repo, pr: null, kind: "repo_error", error: String(e.message ?? e).slice(0, 120) });
+          }
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
+          JSON.stringify({
+            ts: now,
+            merged: results.filter((r) => r.kind === "merge").length,
+            bounced: results.filter((r) => r.kind === "bounce").length,
+            closed: results.filter((r) => r.kind === "close_superseded").length,
+            escalated: results.filter((r) => r.kind === "escalate").length,
+            closed_orphan: results.filter((r) => r.kind === "close_orphan").length,
+            closed_stale: results.filter((r) => r.kind === "close_stale").length,
+            human_legs: results.filter((r) => r.kind === "human_leg").length,
+            skipped: results.filter((r) => r.kind === "skip").length,
+            results: results.slice(0, 50)
+          })
+        );
+        const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "close_orphan", "close_stale", "escalate", "human_leg_ask"].includes(r.kind));
+        if (summary.length)
+          this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
       }
       async eventsSince(since, limit) {
         const rows = since > 0 ? this.state.storage.sql.exec(
@@ -1009,7 +3002,7 @@ var init_do = __esm({
           }
         }
         const sessions = this.state.storage.sql.exec(
-          `SELECT s.token_id, s.name, s.first_seen_ts, s.last_seen_ts, t.label
+          `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`
         ).toArray();
         const openAskChildren = this.state.storage.sql.exec(
@@ -1036,6 +3029,101 @@ var init_do = __esm({
         });
         return { tasks, sessions, progress, series, agents: this.agentScores() };
       }
+      /** Blocker rollup (BR#2645): cluster the blocked cards by machine root key
+       *  (rollup.ts) and execute the plan — create ONE boosted ROOT BLOCKER task
+       *  per qualifying cluster (≥3 members, no open root for the key), stamp the
+       *  queued cards (meta.root_blocker + child_of → board tree + boost cascade).
+       *  Idempotent: the plan only stamps cards whose pointer changed, so a re-run
+       *  creates no duplicates. Roots close only by agent/human with receipts;
+       *  done roots are never reused — a later cluster opens a fresh root. */
+      async rootBlockerRollup(now) {
+        const blockedRows = this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`
+        ).toArray();
+        const cards = blockedRows.map((r) => {
+          const meta3 = JSON.parse(r.meta ?? "{}");
+          return { id: r.id, title: r.title, blocked: meta3.blocked ?? null, root_blocker: meta3.root_blocker ?? null };
+        });
+        const rootRows = this.state.storage.sql.exec(
+          `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND tags LIKE ?`,
+          `%"${ROOT_BLOCKER_TAG}"%`
+        ).toArray();
+        const roots = rootRows.map((r) => ({ id: r.id, status: r.status, root_key: JSON.parse(r.meta ?? "{}").root_key ?? null }));
+        const plan = planRootBlockers(cards, roots);
+        const created = [];
+        if (plan.creates.length || plan.stamps.length) {
+          const keyToRoot = /* @__PURE__ */ new Map();
+          for (const c of plan.creates) {
+            try {
+              const members2 = cards.filter((x) => c.members.includes(x.id));
+              const res = await this.create(
+                {
+                  type: "task",
+                  title: rootBlockerTitle(c.key, c.members.length),
+                  body_md: rootBlockerBody(c.key, members2),
+                  tags: [ROOT_BLOCKER_TAG],
+                  // the sweep HAS analysed the cluster — the root is ready for pickup
+                  qualified: true,
+                  meta: { root_key: c.key }
+                },
+                "system:watchdog"
+              );
+              if (res?.id) {
+                keyToRoot.set(c.key, res.id);
+                created.push(res.id);
+              }
+              this.audit("system:watchdog", "root_blocker_created", res?.id ?? null, { key: c.key, members: c.members });
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", `root_blocker:${c.key}`, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          let stamped = 0;
+          for (const s of plan.stamps) {
+            try {
+              const rootId = s.root ?? keyToRoot.get(s.root_key);
+              if (!rootId) continue;
+              const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, s.id);
+              if (!row) continue;
+              const meta3 = JSON.parse(row.meta ?? "{}");
+              if (meta3.root_blocker === rootId) continue;
+              meta3.root_blocker = rootId;
+              this.state.storage.sql.exec(
+                `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+                JSON.stringify(meta3),
+                now,
+                s.id
+              );
+              const linked = this.one(
+                `SELECT 1 AS x FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`,
+                s.id,
+                rootId
+              );
+              if (!linked) {
+                try {
+                  await this.link({ src: s.id, relation: "child_of", dst: rootId }, "system:watchdog");
+                } catch (e) {
+                  this.audit("system:watchdog", "rollup_link_rejected", s.id, { root: rootId, error: String(e.message ?? e).slice(0, 200) });
+                }
+              }
+              stamped++;
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", s.id, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          for (const rootId of keyToRoot.values()) {
+            try {
+              await this.boost({ id: rootId, boost: true }, "system:watchdog");
+            } catch (e) {
+              this.audit("system:watchdog", "sweep_error", `boost:${rootId}`, { error: String(e.message ?? e).slice(0, 300) });
+            }
+          }
+          if (created.length || stamped) {
+            this.audit("system:watchdog", "root_blocker_rollup", null, { created, stamped });
+          }
+          return { created, stamped };
+        }
+        return { created: [], stamped: 0 };
+      }
       /** Behaviour signals per agent over the trailing 7-day window, scored via scoreAgent().
        *  Cached per-isolate (30s TTL) — it fans out to several table scans per call and
        *  runs on every board/orient/log_progress; uncached it eats the DO row-read quota. */
@@ -1048,7 +3136,8 @@ var init_do = __esm({
         return rows;
       }
       computeAgentScores() {
-        const windowTs = Date.now() - 7 * 24 * 60 * 6e4;
+        const weekTs = Date.now() - 7 * 24 * 60 * 6e4;
+        const recentTs = Date.now() - 48 * 60 * 6e4;
         const tokens = this.state.storage.sql.exec(
           `SELECT label, tags FROM auth_tokens WHERE revoked_ts IS NULL`
         ).toArray();
@@ -1056,7 +3145,7 @@ var init_do = __esm({
         const sig = /* @__PURE__ */ __name((label) => {
           let s = signals.get(label);
           if (!s) {
-            s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
+            s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
             signals.set(label, s);
           }
           return s;
@@ -1064,7 +3153,7 @@ var init_do = __esm({
         for (const t of tokens) sig(t.label);
         for (const p of this.state.storage.sql.exec(
           `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
-          windowTs
+          weekTs
         ).toArray()) {
           const s = sig(p.actor);
           const d = JSON.parse(p.data ?? "{}");
@@ -1073,13 +3162,23 @@ var init_do = __esm({
           if (String(d.note ?? "").trim().length < 10) s.thin_notes++;
         }
         for (const r of this.state.storage.sql.exec(
-          `SELECT a.owner AS owner, COUNT(*) AS n FROM events e JOIN artefacts a ON a.id = e.artefact_id
-       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ? GROUP BY a.owner`,
-          windowTs
-        ).toArray()) sig(r.owner || "unknown").abandoned += r.n;
+          `SELECT a.owner AS owner, e.detail AS detail FROM events e JOIN artefacts a ON a.id = e.artefact_id
+       WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ?`,
+          recentTs
+        ).toArray()) {
+          const s = sig(r.owner || "unknown");
+          let d = {};
+          try {
+            d = JSON.parse(r.detail ?? "{}");
+          } catch {
+            d = {};
+          }
+          if (d?.result_class === "completed_result_lost") s.result_lost++;
+          else s.abandoned++;
+        }
         for (const r of this.state.storage.sql.exec(
           `SELECT detail FROM events WHERE op = 'reassign' AND ts >= ?`,
-          windowTs
+          recentTs
         ).toArray()) {
           const d = JSON.parse(r.detail ?? "{}");
           sig(d.prev_owner || "unknown").reassigned++;
@@ -1087,7 +3186,7 @@ var init_do = __esm({
         for (const r of this.state.storage.sql.exec(
           `SELECT owner, COUNT(*) AS n FROM artefacts
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
-          windowTs
+          weekTs
         ).toArray()) sig(r.owner).artefacts_created += r.n;
         for (const t of tokens) {
           const s = sig(t.label);
@@ -1098,14 +3197,14 @@ var init_do = __esm({
             `SELECT COUNT(*) AS n FROM asks WHERE status IN ('open','answered') AND from_label != ?
          AND created_ts >= ? AND to_target IN (${marks})`,
             t.label,
-            windowTs,
+            weekTs,
             ...targets
           )?.n ?? 0;
           s.asks_answered_on_time = this.one(
             `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
          AND answered_ts - created_ts <= ${30 * 6e4} AND created_ts >= ?`,
             t.label,
-            windowTs
+            weekTs
           )?.n ?? 0;
           if (tags.includes("role:review")) {
             s.verify_duty_backlog = this.one(
@@ -1163,7 +3262,6 @@ var init_do = __esm({
         label TEXT NOT NULL UNIQUE,
         hash TEXT NOT NULL UNIQUE,
         tags TEXT NOT NULL DEFAULT '[]',
-        device_id TEXT,
         principal TEXT,
         transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
@@ -1211,7 +3309,6 @@ var init_do = __esm({
         code TEXT PRIMARY KEY,
         device TEXT NOT NULL,
         type TEXT,
-        device_id TEXT,
         principal TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         ws TEXT,
@@ -1226,6 +3323,22 @@ var init_do = __esm({
         artefact_id TEXT PRIMARY KEY,
         vec BLOB NOT NULL,
         dim INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS provenance (
+        -- PR provenance (BR#3287): sha \u2192 PR \u2192 task \u2192 verify-verdict \u2192 agent
+        -- session. Board-side storage of record (decision BR#3291); this
+        -- table is the DO-local index the lookup endpoint reads.
+        repo TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        merge_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        task_id TEXT,
+        verdict_id TEXT,
+        session TEXT,
+        signer TEXT NOT NULL,
+        merged_at INTEGER NOT NULL,
+        stamped_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, pr)
       );
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
@@ -1254,11 +3367,11 @@ var init_do = __esm({
           `ALTER TABLE artefacts ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
           `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
           `ALTER TABLE pairings ADD COLUMN type TEXT`,
-          `ALTER TABLE pairings ADD COLUMN device_id TEXT`,
-          `ALTER TABLE auth_tokens ADD COLUMN device_id TEXT`,
           `ALTER TABLE pairings ADD COLUMN principal TEXT`,
           `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
-          `ALTER TABLE sessions ADD COLUMN kind TEXT`
+          `ALTER TABLE sessions ADD COLUMN kind TEXT`,
+          `ALTER TABLE sessions ADD COLUMN worktree TEXT`
+          // BR#3204: where the session's tree lives — board collision visibility
         ]) {
           try {
             this.state.storage.sql.exec(ddl);
@@ -1511,6 +3624,10 @@ var init_do = __esm({
                 return this.json(await this.stats());
               case "/metrics.throughput":
                 return this.json(await this.metricsThroughput(url2.searchParams));
+              case "/provenance": {
+                const b = await this.provenanceLookup(url2.searchParams);
+                return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404);
+              }
               case "/history":
                 return this.json(await this.getHistory(String(url2.searchParams.get("id")), Math.min(Number(url2.searchParams.get("limit") ?? 100), 200)));
               case "/ask": {
@@ -1539,6 +3656,10 @@ var init_do = __esm({
               return this.json(await this.list(body));
             case "search":
               return this.json(await this.search(body));
+            case "provenance": {
+              const rec = await this.provenanceBySha(parseProvenanceSha(new URLSearchParams({ sha: String(body?.sha ?? "") })));
+              return rec ? this.json(rec) : this.json({ error: "no bridge provenance for this sha", sha: String(body?.sha ?? "") }, 404);
+            }
             case "related":
               return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
             case "enrich":
@@ -1629,12 +3750,43 @@ var init_do = __esm({
             case "admin.token_tags":
             case "admin.settings_get":
             case "admin.settings_set":
+            case "admin.stop_line_sweep":
+            case "admin.merge_queue_sweep":
+            case "admin.provenance_sweep":
+            case "admin.unblock_proxy_sweep":
+            case "admin.closure_audit_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
               if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
               if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
               if (op === "admin.settings_get") return this.json(await this.settingsGet());
+              if (op === "admin.stop_line_sweep") {
+                await this.stopTheLineSweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
+              if (op === "admin.merge_queue_sweep") {
+                await this.mergeQueueSweep(Number(body.now ?? Date.now()));
+                const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
+                return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
+              }
+              if (op === "admin.provenance_sweep") {
+                await this.provenanceSweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'provenance_last_ts'`);
+                const n = this.one(`SELECT COUNT(*) AS n FROM provenance`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0), indexed: Number(n?.n ?? 0) });
+              }
+              if (op === "admin.unblock_proxy_sweep") {
+                await this.unblockProxySweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
+              if (op === "admin.closure_audit_sweep") {
+                await this.closureAuditSweep(Number(body.now ?? Date.now()));
+                const last = this.one(`SELECT value FROM settings WHERE key = 'closure_audit_last_ts'`);
+                return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+              }
               return this.json(await this.settingsSet(body));
             default:
               return this.json({ error: `unknown op ${op}` }, 404);
@@ -1711,7 +3863,17 @@ var init_do = __esm({
                 const tm = JSON.parse(trow.meta ?? "{}");
                 const round = Number(createMeta.round ?? tm.verify_round ?? 0) + 1;
                 tm.verify_round = round;
-                tm.last_progress = { note: `verify round ${round}: verdict ${verdict} UNCHANGED \u2014 auto-applied, no new decision card`, sentiment: "neutral", actor, ts: Date.now() };
+                const prevGauges = tm.last_progress ?? {};
+                tm.last_progress = {
+                  note: `verify round ${round}: verdict ${verdict} UNCHANGED \u2014 auto-applied, no new decision card`,
+                  sentiment: "neutral",
+                  actor,
+                  ts: Date.now(),
+                  completion_pct: prevGauges.completion_pct,
+                  confidence_pct: prevGauges.confidence_pct,
+                  risk_pct: prevGauges.risk_pct,
+                  context_pct: prevGauges.context_pct
+                };
                 const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
                 if (!alreadyRight) {
                   if (round >= 3) {
@@ -1765,6 +3927,10 @@ ${bodyMd.trim()}`.trim();
         }
         this.audit(actor, "create", id, { type, title });
         this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [], roles });
+        if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+          const target = String(createMeta.task ?? createMeta.verify_target ?? "").trim();
+          if (target) await this.supersedeStaleVerdicts(target, id, `superseded by ${id} \u2014 newer verdict for same target`);
+        }
         await this.embedArtefact(id, title, bodyMd);
         if (this.env.GH_TOKEN) {
           const ref = issueRef(title);
@@ -1777,6 +3943,34 @@ ${bodyMd.trim()}`.trim();
         }
         if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
         return { id, type, status };
+      }
+      /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
+       *  taking over a target supersedes every OTHER still-proposed verify-verdict
+       *  for that target: older rounds of the same verify effort, and create-race
+       *  stragglers. BR#1782's dedup covered identical repeats at create; this
+       *  covers "a newer verdict exists" — without it, accepting the latest
+       *  resurfaces an older round as the new "latest" and the For Me card
+       *  regrows as if the human's click did nothing. All sweep transitions act
+       *  as "system:verdictsweep" so the act-time prong (doTransition) never
+       *  cascades onto the takeover verdict itself. */
+      async supersedeStaleVerdicts(target, exceptId, reason) {
+        const stale = this.state.storage.sql.exec(
+          `SELECT id FROM artefacts WHERE type = 'decision' AND status = 'proposed'
+       AND json_extract(meta, '$.decision_class') = 'verify-verdict'
+       AND (json_extract(meta, '$.task') = ? OR json_extract(meta, '$.verify_target') = ?)
+       AND id != ?`,
+          target,
+          target,
+          exceptId
+        ).toArray();
+        for (const s of stale) {
+          try {
+            await this.transition({ id: s.id, to: "superseded", note: reason, replacement_id: exceptId }, "system:verdictsweep");
+            this.audit("system:verdictsweep", "verdict_superseded", s.id, { target, by: exceptId });
+          } catch (e) {
+            this.audit("system:verdictsweep", "verdict_sweep_failed", s.id, { target, by: exceptId, error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
       }
       /** A progress artefact (meta.task → task id) doubles as a heartbeat on that task:
        *  auto-starts todo tasks, re-claims watchdog-abandoned ones, and bumps last_progress.
@@ -1799,7 +3993,18 @@ ${bodyMd.trim()}`.trim();
           const q = isQualifier ? { ok: true } : this.qualifyCheck(t, "analysis");
           if (q.ok && t.type !== "question") await this.transition({ id: t.id, to: "in_progress", note: "started \u2014 progress artefact logged" }, actor);
         }
-        tmeta.last_progress = { note: title.slice(0, 200), sentiment: "neutral", actor, ts: Date.now(), session: tmeta.session };
+        const prevGauges = tmeta.last_progress ?? {};
+        tmeta.last_progress = {
+          note: title.slice(0, 200),
+          sentiment: "neutral",
+          actor,
+          ts: Date.now(),
+          session: tmeta.session,
+          completion_pct: prevGauges.completion_pct,
+          confidence_pct: prevGauges.confidence_pct,
+          risk_pct: prevGauges.risk_pct,
+          context_pct: prevGauges.context_pct
+        };
         delete tmeta.grace_until;
         this.state.storage.sql.exec(
           `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2121,7 +4326,8 @@ ${bodyMd.trim()}`.trim();
         }
       }
       /** Every rejected transition is audited (transition_rejected: actor, from, to,
-       *  reason) — gaming the gates is visible in the Log and costs behaviour score. */
+       *  reason) — gaming the gates is visible in the Log and costs behaviour score.
+       *  The rejection then goes through the breach door: storms raise ONE card. */
       async transition(body, actor) {
         try {
           return await this.doTransition(body, actor);
@@ -2135,9 +4341,84 @@ ${bodyMd.trim()}`.trim();
               to,
               reason: String(e?.message ?? e).slice(0, 300)
             });
+            try {
+              await this.foldBreaches(id);
+            } catch {
+            }
+            if (String(e?.message ?? "").includes("[rule: done-close-legs]")) {
+              try {
+                await this.spawnCloseLegDuty(id, actor, String(e?.message ?? ""));
+              } catch (se) {
+                this.audit(actor, "close_leg_spawn_error", id, { error: String(se.message ?? se).slice(0, 300) });
+              }
+            }
           }
           throw e;
         }
+      }
+      /** BR#3361 (b): the close-duty child a rejected done auto-derives. One per
+       *  legs-shape per flood window; carries the receipt contract and the
+       *  close-then-complete-parent contract so the leg ends owned. The legs
+       *  come from the gate's own rejection message — the authoritative list. */
+      async spawnCloseLegDuty(parentId, actor, rejectionMessage) {
+        const row = this.one(`SELECT id, title, body_md, meta, status FROM artefacts WHERE id = ?`, parentId);
+        if (!row || row.status === "done") return;
+        const ts = Date.now();
+        const meta3 = JSON.parse(row.meta ?? "{}");
+        const listed = /not receipted: ([^—]+)—/.exec(rejectionMessage)?.[1] ?? "";
+        const legs = [...listed.matchAll(/(?:(?:([A-Za-z0-9-]+)\/([A-Za-z0-9.-]+))?#|#)(\d+)/g)].map((m) => ({
+          repo: m[1] && m[2] ? `${m[1]}/${m[2]}` : null,
+          number: Number(m[3]),
+          raw: m[0]
+        }));
+        if (!legs.length) return;
+        const stamp = meta3.last_close_leg_spawn;
+        const shape = legs.map(legLabel).join(",");
+        if (stamp && typeof stamp.at === "number" && ts - stamp.at < UNBLOCK_FLOOD_MS && String(stamp.legs ?? "") === shape) return;
+        const live = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.roles LIKE '%"unblock"%' AND (c.title || ' ' || c.body_md) LIKE '%close-leg duty%' LIMIT 1`,
+          parentId
+        );
+        if (live) {
+          meta3.last_close_leg_spawn = { at: ts, legs: shape, child: live.id };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), parentId);
+          return;
+        }
+        const rootTitle = String(row.title ?? "").replace(/^(?:Unblock:\s*)+/, "");
+        const legLines = legs.map((l) => `- close ${legLabel(l)}${l.repo ? ` (${l.repo})` : " (repo: resolve from the card's context \u2014 bare-number legs take the project's default paperwork repo)"}`).join("\n");
+        const created = await this.create(
+          {
+            type: "task",
+            title: `Close-leg duty: ${rootTitle.slice(0, 160)}`.slice(0, 200),
+            session: "",
+            // session-less spawn: the closer stamps it when they claim (a
+            // pre-attributed child would trip review-separation against the real closer)
+            body_md: `Terminal close-leg duty for ${parentId} \u2014 "${rootTitle}".
+
+The parent's done was gate-rejected by done-close-legs (BR#3361): its Done-when ends in a terminal GitHub close leg that was not receipted. The hub auto-derived this duty so the leg has an owner \u2014 no orphan terminal legs.
+
+Legs:
+${legLines}
+
+Every receipt must carry: ${RECEIPT_CONTRACT}.
+
+Contract: (1) verify live state first (gh issue view <N> --repo <repo> --json state). If the issue is already CLOSED, capture the receipt and close yourself done citing it. If it is OPEN: execute the close per the parent's grammar (bug-corpus scenario id, or scenario: none with justification), capture the receipt, close yourself done with the receipt in the note. (2) Then transition ${parentId} \u2192 done citing the receipt \u2014 the parent's gate accepts a receipted note or this closed child.`,
+            roles: ["unblock"]
+          },
+          actor
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          parentId,
+          ts
+        );
+        meta3.last_close_leg_spawn = { at: ts, legs: shape, child: created.id };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), parentId);
+        this.audit(actor, "create", created.id, { type: "task", auto: "close_leg", parent: parentId, legs: shape });
+        this.version(parentId, actor, "note", `close leg(s) ${shape} unowned at done \u2014 auto-derived close-duty child ${created.id} (BR#3361)`, { child: created.id, legs: shape });
       }
       /** Lazy SQL-backed context for the machine rules — a guard only queries
        *  what it actually reads, so cheap transitions stay cheap. */
@@ -2159,24 +4440,79 @@ ${bodyMd.trim()}`.trim();
             `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
             id
-          )?.n ?? 0, "openChildren")
+          )?.n ?? 0, "openChildren"),
+          // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
+          spawnGuard: /* @__PURE__ */ __name(() => {
+            let cursor = id, depth = 0;
+            while (depth < 10) {
+              const p = this.one(
+                `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
+             WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+                cursor
+              );
+              if (!p) return null;
+              depth++;
+              if (parseTags(p.roles).includes("review")) return `ancestor ${p.id} is a review task \u2014 verify-of-verify is blocked`;
+              if (depth >= 3) return `nesting depth ${depth} would exceed the child_of cap of 3`;
+              cursor = p.id;
+            }
+            return null;
+          }, "spawnGuard"),
+          // newest OPEN verify round (reuse candidate) — a re-handoff re-enters the
+          // same round instead of stacking a fresh card per bounce cycle
+          openVerifyChild: /* @__PURE__ */ __name(() => this.one(
+            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+            id
+          ), "openVerifyChild"),
+          // at most ONE live unblock child per parent, ever (cap ≤1 open)
+          openUnblockChild: /* @__PURE__ */ __name(() => this.one(
+            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+            id
+          ), "openUnblockChild"),
+          // BR#3361: the task's own body (Done-when section source for the
+          // terminal close-leg gate)
+          cardBody: /* @__PURE__ */ __name(() => String(row.body_md ?? ""), "cardBody"),
+          // BR#3361 terminal-leg ownership: a CLOSED child that owns the leg —
+          // its title/body names both the close and the issue number
+          closeLegChildClosed: /* @__PURE__ */ __name((leg) => {
+            const hit = this.one(
+              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done'
+             AND (c.title || ' ' || c.body_md) LIKE '%close%'
+             AND (c.title || ' ' || c.body_md) LIKE ${"?"}
+             AND c.roles LIKE '%"unblock"%' LIMIT 1`,
+              id,
+              `%#${leg.number}%`
+            );
+            return !!hit;
+          }, "closeLegChildClosed"),
+          // recent version-log rows (newest first) for the server-side silent-churn fold
+          recentEvents: /* @__PURE__ */ __name(() => this.state.storage.sql.exec(
+            `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+            id
+          ).toArray().map((r) => ({ ts: Number(r.ts), actor: String(r.actor), action: String(r.action), summary: String(r.summary ?? "") })), "recentEvents")
         };
       }
       async doTransition(body, actor) {
         const id = String(body.id ?? "");
-        let to = String(body.to ?? "");
+        const to = String(body.to ?? "");
         const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
         if (!row) throw new Error(`no such artefact: ${id}`);
         const tTags = parseTags(row.tags);
         const tRoles = parseTags(row.roles);
-        const rejection = await check(
-          { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body },
+        const ts0 = Date.now();
+        const verdict = await decide(
+          { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
           this.ruleCtx(row, body, id, tTags)
         );
-        if (rejection) throw new Error(rejection);
+        if (verdict.ok === false) throw new Error(`${verdict.message} [rule: ${verdict.rule}]`);
         const isSubprocess = body.class === "subprocess";
         const sentiment = isSentiment(body.sentiment) ? body.sentiment : void 0;
-        const ts = Date.now();
+        const ts = ts0;
         const meta3 = JSON.parse(row.meta ?? "{}");
         if (isSubprocess && row.type === "task" && row.status === "in_progress") {
           const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
@@ -2193,16 +4529,45 @@ ${bodyMd.trim()}`.trim();
           this.version(id, actor, "transition", `subprocess declared \u2014 watchdog paused until +${bm}m \u2014 ${String(body.note ?? "").slice(0, 120)}`, { from: row.status, to: "in_progress", class: "subprocess" });
           return { id, status: "in_progress", subprocess: true };
         }
-        if (to === "blocked") {
-          meta3.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+        for (const [k, v] of Object.entries(verdict.meta_patch)) {
+          if (v === void 0) delete meta3[k];
+          else meta3[k] = v;
+        }
+        if (verdict.status === "blocked") {
+          if (!meta3.blocked)
+            meta3.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
           delete meta3.subprocess;
         } else if (meta3.blocked) {
           delete meta3.blocked;
         }
         let owner = row.owner;
         const bounceFromReview = row.status === "in_review";
+        let ghostBounce = false;
+        if (row.type === "task" && bounceFromReview && owner && owner !== actor && !/^(web|system:)/.test(owner)) {
+          const ownerToken = this.one(
+            `SELECT id FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`,
+            owner,
+            owner
+          );
+          const ownerSession = ownerToken ? this.one(
+            `SELECT last_seen_ts FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
+            ownerToken.id
+          ) : null;
+          const staleMin = (() => {
+            const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+            return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+          })();
+          const lastProgressTs = Number(JSON.parse(row.meta ?? "{}").last_progress?.ts ?? 0);
+          const lastSignal = Math.max(Number(ownerSession?.last_seen_ts ?? 0), lastProgressTs);
+          const dead = !ownerToken || !lastSignal || Date.now() - lastSignal > staleMin * 6e4;
+          if (dead) {
+            ghostBounce = true;
+            owner = "";
+            meta3.bounce_released = { reason: "owning session dead at bounce \u2014 released to pool", at: Date.now() };
+          }
+        }
         const attributedAgent = body.gateway && String(body.agent ?? "").trim() ? String(body.agent).trim().slice(0, 60) : void 0;
-        if (row.type === "task" && to === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
+        if (row.type === "task" && verdict.status === "in_progress" && !bounceFromReview && !/^system:/.test(actor) && owner !== actor) {
           owner = attributedAgent ?? actor;
         }
         const actingPrincipal = typeof body.token_id === "string" && body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, body.token_id)?.principal : null;
@@ -2216,46 +4581,7 @@ ${bodyMd.trim()}`.trim();
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta3.session = String(sess).slice(0, 120);
         }
-        if (row.type === "task" && to === "todo") {
-          const isHuman = actor === "web" || actor.startsWith("web:") || actor.startsWith("human:");
-          const isSystem = /^system:/.test(actor);
-          if (row.owner && row.owner !== actor && !isHuman && !isSystem)
-            throw new Error(`task ${id} is claimed by ${row.owner} \u2014 only the owner or a human can release it to the pool. If the work overlaps yours, coordinate via ask_agent instead.`);
-          const nextAttempts = (meta3.attempt?.attempts ?? 0) + 1;
-          const verdictDuty = tRoles.includes("review") || tRoles.includes("unblock");
-          const churn = churnRelease(nextAttempts, verdictDuty, row.status);
-          if (churn === "escalate") {
-            owner = "";
-            meta3.escalate = {
-              at: ts,
-              attempts: nextAttempts,
-              reason: `verdict duty released ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(meta3.attempt?.last_reason ?? "").slice(0, 200)}). Human: review get_history, fix the recurring failure, or re-scope`
-            };
-            meta3.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta3.attempt?.last_reason, last_will: meta3.last_progress?.will };
-            this.audit("system:churn-guard", "escalated", id, { attempts: nextAttempts, duty: tRoles[0] ?? "unknown" });
-            this.version(id, "system:churn-guard", "transition", `escalated to human \u2014 ${nextAttempts} releases without completing (verdict duties cannot block)`, { from: row.status, to: "todo" });
-          } else if (churn === "redirect") {
-            to = "blocked";
-            meta3.blocked = {
-              reason: `churn guard: released to the pool ${nextAttempts} times without completing \u2014 the same gate keeps rejecting the handoff (last: ${String(meta3.attempt?.last_reason ?? "").slice(0, 200)})`,
-              unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
-              ts
-            };
-            meta3.attempt = { by: actor, at: ts, attempts: nextAttempts, last_reason: String(body.note ?? "").trim() || meta3.attempt?.last_reason, last_will: meta3.last_progress?.will };
-            this.audit("system:churn-guard", "release_redirected", id, { attempts: nextAttempts, from: row.status });
-            this.version(id, "system:churn-guard", "transition", `release redirected to blocked \u2014 ${nextAttempts} attempts without completion`, { from: row.status, to: "blocked" });
-          } else {
-            owner = "";
-            meta3.attempt = {
-              by: actor,
-              at: ts,
-              attempts: nextAttempts,
-              last_reason: meta3.blocked?.reason ?? (String(body.note ?? "").trim() || void 0),
-              last_will: meta3.last_progress?.will
-            };
-          }
-        }
-        if (row.type === "task" && to === "done" && tRoles.includes("analysis")) {
+        if (row.type === "task" && verdict.status === "done" && tRoles.includes("analysis")) {
           const parent = this.one(
             `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
@@ -2270,21 +4596,56 @@ ${bodyMd.trim()}`.trim();
             );
           }
         }
+        if (row.type === "task" && verdict.status === "done") {
+          const doneNote = String(body?.note ?? body?.resolution ?? body?.reason ?? "").trim();
+          const legs = parseCloseLegs(`${doneWhenSection(String(row.body_md ?? ""))}
+${doneNote}`);
+          if (legs.length) {
+            meta3.close_leg_audit = {
+              ts,
+              legs: legs.map((l) => ({ repo: l.repo, number: l.number })),
+              receipts: legs.map((l) => ({ ...l, ...parseClosureReceipt(doneNote, l) ?? { closed: false, commentId: null, guardRun: null } })),
+              checked_ts: null
+            };
+          }
+        }
+        try {
+          const holder = JSON.parse(row.meta ?? "{}");
+          const actingSession = body.session ? await this.resolveSession(body, String(body.token_id ?? "")) : void 0;
+          const holderSession = holder.session;
+          if (row.type === "task" && row.status === "in_progress" && holderSession && actingSession && holderSession !== actingSession) {
+            const holderAlive = Math.max(holder.last_progress?.ts ?? 0, holder.session_alive_ts ?? 0, row.updated_ts ?? 0);
+            if (Date.now() - holderAlive <= 10 * 6e4) {
+              this.audit("system:fence", "duplicate_executor", id, {
+                holder: holderSession,
+                actor: actingSession,
+                from: row.status,
+                to
+              });
+            }
+          }
+        } catch {
+        }
         this.state.storage.sql.exec(
-          `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ? WHERE id = ?`,
-          to,
+          `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ? WHERE id = ?`,
+          verdict.status,
           ts,
           JSON.stringify(meta3),
           ts,
-          owner,
+          verdict.owner_clear ? "" : owner,
+          JSON.stringify(tagsForWrite(verdict, tTags)),
           id
         );
-        const violations = invariants({ type: row.type, status: to, roles: tRoles, tags: tTags, meta: meta3 });
+        const violations = invariants({ type: row.type, status: verdict.status, roles: tRoles, tags: tTags, meta: meta3 });
         if (violations.length) {
-          this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to });
-          this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} \u2192 ${to}: ${violations.join("; ")}`, { violations });
+          this.audit("system:invariants", "invariant_violation", id, { violations, from: row.status, to: verdict.status });
+          this.version(id, "system:invariants", "note", `INVARIANT VIOLATION after ${row.status} \u2192 ${verdict.status}: ${violations.join("; ")}`, { violations });
+          try {
+            await this.foldBreaches(id);
+          } catch {
+          }
         }
-        if (to === "superseded" && body.replacement_id) {
+        if (verdict.status === "superseded" && body.replacement_id) {
           const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
           if (rep && rep.type === row.type)
             this.state.storage.sql.exec(
@@ -2296,14 +4657,14 @@ ${bodyMd.trim()}`.trim();
         }
         this.audit(actor, "transition", id, {
           from: row.status,
-          to,
+          to: verdict.status,
           note: body.note ?? "",
           sentiment,
           ...attributedAgent ? { agent: attributedAgent } : {},
-          ...isSubprocess ? { class: "subprocess", budget_minutes: meta3.blocked.budget_minutes } : {}
+          ...body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}
         });
-        this.version(id, actor, "transition", `${row.status} \u2192 ${to}${body.note ? ` \u2014 ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to, note: body.note ?? "" });
-        if (row.type === "decision" && to === "accepted") {
+        this.version(id, actor, "transition", `${row.status} \u2192 ${verdict.status}${body.note ? ` \u2014 ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
+        if (row.type === "decision" && verdict.status === "accepted") {
           const dm = meta3 ?? {};
           if (dm.decision_class === "verify-verdict") {
             const target = String(dm.task ?? dm.verify_target ?? "").trim();
@@ -2331,42 +4692,17 @@ ${bodyMd.trim()}`.trim();
             }
           }
         }
-        let verifyTaskId;
-        if (row.type === "task" && to === "in_review" && !tRoles.includes("review")) {
-          let guardHit;
-          let cursor = id, depth = 0;
-          while (depth < 10) {
-            const p = this.one(
-              `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
-           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
-              cursor
-            );
-            if (!p) break;
-            depth++;
-            if (parseTags(p.roles).includes("review")) {
-              guardHit = `ancestor ${p.id} is a review task \u2014 verify-of-verify is blocked`;
-              break;
-            }
-            if (depth >= 3) {
-              guardHit = `nesting depth ${depth} would exceed the child_of cap of 3`;
-              break;
-            }
-            cursor = p.id;
+        if (row.type === "decision" && (verdict.status === "accepted" || verdict.status === "superseded") && actor !== "system:verdictsweep") {
+          const dm = meta3 ?? {};
+          if (dm.decision_class === "verify-verdict") {
+            const target = String(dm.task ?? dm.verify_target ?? "").trim();
+            if (target) await this.supersedeStaleVerdicts(target, id, `superseded by human action on ${id} \u2014 one actionable verdict per target (BR#3457)`);
           }
-          if (guardHit) {
-            this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: guardHit });
-          } else {
-            const existing = this.one(
-              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`,
-              id
-            );
-            if (existing) {
-              verifyTaskId = existing.id;
-              this.audit("system:separation", "verify_reused", id, { verify: existing.id });
-            } else {
-              const pr = (String(body.note ?? "").match(/https?:\/\/\S+/) || [])[0];
+        }
+        let verifyTaskId;
+        for (const fx of verdict.effects) {
+          switch (fx.kind) {
+            case "spawn_verify": {
               const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
               const created = await this.create(
                 {
@@ -2374,14 +4710,17 @@ ${bodyMd.trim()}`.trim();
                   title: `Verify: ${rootTitle.slice(0, 200)}`,
                   body_md: `Verification duty for ${id} \u2014 "${rootTitle}".
 
+YOU ARE THE MERGE AUTHORITY \u2014 substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable \u2192 merge, no human gate).
+
 VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):
 1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP \u2014 zero substance checks, NO ask to the human.
 2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").
 3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.
 4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.
 
-Then double-check, don't reimplement: confirm the receipts (PR: ${pr ?? "see note"}, merge state, findings) and that the work matches the task.
-Complete with receipts in the note, then close ${id} (done) or bounce it (in_progress with findings).`,
+Then double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.
+
+MERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> \u2014 merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found \u2192 bounce the parent back to impl with findings (in_review \u2192 in_progress, one round, N bounces \u2014 impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
                   roles: ["review"]
                 },
                 actor
@@ -2389,116 +4728,104 @@ Complete with receipts in the note, then close ${id} (done) or bounce it (in_pro
               verifyTaskId = created.id;
               this.state.storage.sql.exec(
                 `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-                verifyTaskId,
+                created.id,
                 id,
                 ts
               );
-              this.audit(actor, "create", verifyTaskId, { type: "task", auto: "verification", parent: id });
+              this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
+              break;
+            }
+            case "reuse_verify": {
+              verifyTaskId = fx.verify;
+              this.audit("system:separation", "verify_reused", id, { verify: fx.verify });
+              break;
+            }
+            case "skip_verify_spawn": {
+              this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: fx.reason });
+              try {
+                await this.foldBreaches(id);
+              } catch {
+              }
+              break;
+            }
+            case "spawn_unblock": {
+              const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
+              const created = await this.create(
+                {
+                  type: "task",
+                  title: `Unblock: ${rootTitle.slice(0, 200)}`,
+                  session: "",
+                  // session-less spawn: the unblock contract is "then a
+                  // FRESH session" — a pre-attributed child would trip review-separation against the legitimate closer
+                  body_md: `Unblock duty for ${id} \u2014 "${rootTitle}".
+
+Blocked why: ${fx.reason || "see parent"}.
+Exit condition: ${fx.exit_condition || "none recorded \u2014 read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.
+
+Contract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
+                  roles: ["unblock"]
+                },
+                actor
+              );
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+                created.id,
+                id,
+                ts
+              );
+              this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
+              meta3.last_unblock_spawn = { at: ts, exit: fx.exit_condition };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), id);
+              break;
+            }
+            case "skip_unblock_spawn": {
+              this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
+              try {
+                await this.foldBreaches(id);
+              } catch {
+              }
+              break;
+            }
+            case "supersede_children": {
+              const kids = this.state.storage.sql.exec(
+                `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE ? ORDER BY c.updated_ts DESC`,
+                id,
+                `%"${fx.tag}"%`
+              ).toArray();
+              kids.forEach((v, i) => {
+                if (fx.keep_newest && i === 0) return;
+                const vm = JSON.parse(v.meta ?? "{}");
+                vm.superseded_reason = fx.cause;
+                this.state.storage.sql.exec(
+                  `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+                  JSON.stringify(vm),
+                  ts,
+                  ts,
+                  v.id
+                );
+                this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: fx.cause });
+                this.version(v.id, "system:separation", "transition", fx.cause, { from: v.status, to: "superseded" });
+              });
+              break;
+            }
+            case "escalate": {
+              this.audit("system:churn-guard", "escalated", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, duty: tRoles[0] ?? "unknown" });
+              this.version(id, "system:churn-guard", "note", `escalated to human \u2014 verdict duties cannot block (attempts ${fx.attempts}, silent cycles ${fx.silent_cycles})`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
+              break;
+            }
+            case "release_redirect": {
+              this.audit("system:churn-guard", "release_redirected", id, { attempts: fx.attempts, silent_cycles: fx.silent_cycles, from: row.status });
+              this.version(id, "system:churn-guard", "note", `release redirected to blocked \u2014 ${fx.attempts} attempts without completion`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
+              break;
             }
           }
         }
-        if (row.type === "task" && ["in_progress", "todo", "done"].includes(to)) {
-          const fromStatuses = ["todo", "in_progress", "blocked"];
-          for (const v of this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
-            id
-          ).toArray()) {
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = to === "in_progress" ? `${id} resumed from blocked \u2014 unblock confirmed, child superseded` : `${id} \u2192 ${to} \u2014 unblock round closed`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          }
+        try {
+          await this.replayCheck(id);
+        } catch {
         }
-        if (row.type === "task" && (to === "done" || row.status === "in_review" && to === "in_progress")) {
-          const isBounce = row.status === "in_review" && to === "in_progress";
-          const verifyChildren = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC`,
-            id
-          ).toArray();
-          verifyChildren.forEach((v, i) => {
-            if (isBounce && i === 0) return;
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} \u2014 ${isBounce ? "older verification round superseded (newest kept for re-entry)" : "verification round closed"}`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          });
-          for (const v of this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
-            id
-          ).toArray()) {
-            const vm = JSON.parse(v.meta ?? "{}");
-            vm.superseded_reason = `${id} ${to === "done" ? "done" : "bounced"} \u2014 unblock round closed`;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm),
-              ts,
-              ts,
-              v.id
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: vm.superseded_reason });
-            this.version(v.id, "system:separation", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
-          }
-        }
-        if (row.type === "task" && to === "blocked" && !meta3.awaiting_ask && !tRoles.includes("unblock")) {
-          const existing = this.one(
-            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%' LIMIT 1`,
-            id
-          );
-          if (existing) {
-            this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: `existing unblock child ${existing.id} reused` });
-          } else if (meta3.last_unblock_spawn && ts - meta3.last_unblock_spawn.at < 60 * 6e4 && String(meta3.last_unblock_spawn.exit ?? "") === String(meta3.blocked?.unblock_condition ?? "").trim()) {
-            this.audit(actor, "spawn_skipped", id, {
-              auto: "unblock",
-              reason: `unblock round issued ${Math.round((ts - meta3.last_unblock_spawn.at) / 6e4)}m ago with the same exit condition \u2014 flood guard`
-            });
-          } else {
-            const exitCond = String(meta3.blocked?.unblock_condition ?? "").trim();
-            const blockWhy = String(meta3.blocked?.reason ?? "").trim();
-            const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
-            const created = await this.create(
-              {
-                type: "task",
-                title: `Unblock: ${rootTitle.slice(0, 200)}`,
-                body_md: `Unblock duty for ${id} \u2014 "${rootTitle}".
-
-Blocked why: ${blockWhy || "see parent"}.
-Exit condition: ${exitCond || "none recorded \u2014 read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.
-
-Contract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it. If it does not: record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
-                roles: ["unblock"]
-              },
-              actor
-            );
-            this.state.storage.sql.exec(
-              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-              created.id,
-              id,
-              ts
-            );
-            this.audit(actor, "create", created.id, { type: "task", auto: "unblock", parent: id });
-            meta3.last_unblock_spawn = { at: ts, exit: exitCond };
-            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), id);
-          }
-        }
-        return { id, status: to, ...sentiment ? { sentiment } : {}, verify_task: verifyTaskId };
+        return { id, status: verdict.status, ...sentiment ? { sentiment } : {}, verify_task: verifyTaskId };
       }
       async link(body, actor) {
         const srcId = String(body.src ?? ""), rel = String(body.relation ?? ""), dstId = String(body.dst ?? "");
@@ -2515,6 +4842,27 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
             throw new Error(`link rejected: ${srcId} is a verify task \u2014 verify tasks are terminal-at-birth and cannot nest under ${parentRoles.includes("review") ? "another verify" : "an unblock"} task`);
           if (childRoles.includes("unblock") && (parentRoles.includes("unblock") || parentRoles.includes("review")))
             throw new Error(`link rejected: ${srcId} is an unblock task \u2014 unblock tasks are terminal-at-birth and cannot nest under another ephemeral task`);
+          if (childRoles.includes("review") && !["done", "superseded"].includes(String(src.status))) {
+            const openSiblings = this.state.storage.sql.exec(
+              `SELECT c.id AS id, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.id != ?
+             AND c.roles LIKE '%"review"%' AND c.status IN ('todo','in_progress','blocked')
+           ORDER BY c.updated_ts ASC`,
+              dstId,
+              srcId
+            ).toArray();
+            for (const sib of openSiblings) {
+              const vm = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, sib.id)?.meta ?? "{}");
+              vm.superseded_reason = `${srcId} linked as the parent's verify round \u2014 older open verify child superseded (one round, N bounces)`;
+              this.state.storage.sql.exec(
+                `UPDATE artefacts SET status = 'superseded', meta = ?, updated_ts = ? WHERE id = ?`,
+                JSON.stringify(vm),
+                Date.now(),
+                sib.id
+              );
+              this.audit("system:invariant", "verify_superseded", sib.id, { parent: dstId, newer: srcId, reason: "one-open-verify-child" });
+            }
+          }
         }
         if (rel === "child_of") {
           let cursor = dstId, depth = 0, hit;
@@ -2704,7 +5052,19 @@ ${m.bootstrap_md}` : "") + scoreLine;
         if (progressActor !== actor && this.isGatewayActor(actor)) {
           this.gatewayTouch(actor, progressActor);
         }
-        meta3.last_progress = { note, will: will || void 0, sentiment, actor: progressActor, ts: Date.now(), session: session ?? meta3.session, completion_pct, confidence_pct, risk_pct, context_pct };
+        const prev = meta3.last_progress ?? {};
+        meta3.last_progress = {
+          note,
+          will: will || void 0,
+          sentiment,
+          actor: progressActor,
+          ts: Date.now(),
+          session: session ?? meta3.session,
+          completion_pct: completion_pct ?? prev.completion_pct,
+          confidence_pct: confidence_pct ?? prev.confidence_pct,
+          risk_pct: risk_pct ?? prev.risk_pct,
+          context_pct: context_pct ?? prev.context_pct
+        };
         if (session && !meta3.session) meta3.session = session;
         this.state.storage.sql.exec(
           `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
@@ -2726,6 +5086,140 @@ ${m.bootstrap_md}` : "") + scoreLine;
           grace_until: graceUntil,
           instructions
         };
+      }
+      // ---------- the breach door: one fold, one open card per (task, class) ----------
+      /** The single breach door (BR#2419 item 6): fold recent audit events for a
+       *  task into breach cards. One OPEN card per (task, class) key —
+       *  reoccurrences coalesce onto the open card, never spawn duplicates.
+       *  Call sites: every transition_rejected, invariant_violation,
+       *  spawn_skipped and replay_mismatch lands here through the fold.
+       *  BR#3443: a CLOSED card's events never re-fold either. Every card
+       *  carries a fold high-water in meta.breach_high_water — the newest event
+       *  ts its adjudication covered — and a key with any prior card only counts
+       *  events strictly above that mark, so closing a card can never re-arm
+       *  its key (specimen BR#3439: a duplicate raised from events that all
+       *  predated the predecessor card's close). */
+      async foldBreaches(taskId) {
+        const since = Date.now() - BREACH_WINDOW_MS * 8;
+        const rows = this.state.storage.sql.exec(
+          `SELECT ts, op, detail FROM events WHERE artefact_id = ? AND ts > ?
+        AND op IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch')
+        ORDER BY seq ASC LIMIT 200`,
+          taskId,
+          since
+        ).toArray();
+        if (!rows.length) return;
+        const events = rows.map((r) => {
+          let d = {};
+          try {
+            d = JSON.parse(r.detail ?? "{}");
+          } catch {
+          }
+          const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
+          return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
+        });
+        const openKeys = /* @__PURE__ */ new Set();
+        const highWater = /* @__PURE__ */ new Map();
+        const openCards = /* @__PURE__ */ new Map();
+        for (const b of this.state.storage.sql.exec(
+          `SELECT id, status, meta, status_ts, created_ts FROM artefacts WHERE type = 'task' AND meta LIKE ?`,
+          `%"breach_key":"${taskId}|%`
+        ).toArray()) {
+          let m = {};
+          try {
+            m = JSON.parse(b.meta ?? "{}");
+          } catch {
+          }
+          const key = m?.breach_key;
+          if (typeof key !== "string") continue;
+          if (b.status === "done" || b.status === "superseded") {
+            const hw = Number(m?.breach_high_water ?? 0) || Number(b.status_ts ?? 0) || Number(b.created_ts ?? 0) || 0;
+            const prev = highWater.get(key);
+            if (prev === void 0 || hw > prev) highWater.set(key, hw);
+          } else {
+            openKeys.add(key);
+            const stamped = Number(m?.breach_high_water ?? 0) || Number(b.created_ts ?? 0) || 0;
+            openCards.set(key, { id: String(b.id), meta: String(b.meta ?? "{}"), stamped });
+          }
+        }
+        const breaches = detectBreaches(events, openKeys, { highWater });
+        for (const b of breaches) {
+          const created = await this.create(
+            {
+              type: "task",
+              title: `Breach: ${b.klass} on ${taskId} \u2014 ${b.count} event${b.count === 1 ? "" : "s"}`,
+              body_md: `Structural breach detected server-side (fold over the audit stream).
+
+- class: ${b.klass}
+- task: ${taskId}
+- events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})
+- sample: ${b.sample}
+
+One open card per (task, class) \u2014 reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
+              tags: ["breach", `breach:${b.klass}`]
+            },
+            "system:breach"
+          );
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ? WHERE id = ?`,
+            JSON.stringify({ breach_key: b.key, breach_task: taskId, breach_class: b.klass, breach_count: b.count, breach_high_water: b.last_ts }),
+            created.id
+          );
+          this.audit("system:breach", "breach_raised", created.id, { key: b.key, task: taskId, klass: b.klass, count: b.count });
+          this.version(created.id, "system:breach", "create", `breach card raised \u2014 ${b.klass} on ${taskId} (${b.count} events)`, { key: b.key, sample: b.sample });
+        }
+        const maxSeen = /* @__PURE__ */ new Map();
+        for (const e of events) {
+          const key = `${e.task}|${classOf(e)}`;
+          const ts = Number(e.ts);
+          if (!Number.isFinite(ts)) continue;
+          const cur = maxSeen.get(key);
+          if (cur === void 0 || ts > cur) maxSeen.set(key, ts);
+        }
+        for (const [key, card] of openCards) {
+          const seen = maxSeen.get(key) ?? 0;
+          if (seen <= card.stamped) continue;
+          let m = {};
+          try {
+            m = JSON.parse(card.meta);
+          } catch {
+          }
+          m.breach_high_water = seen;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), card.id);
+        }
+      }
+      /** Replay consistency (BR#2419 item 6): fold the version log's transition
+       *  chain forward and compare with the stored status. A mismatch — or a
+       *  broken chain (an event's `from` doesn't match the folded state:
+       *  forged, deleted, or out-of-order history) — is a replay_mismatch event
+       *  through the breach door. */
+      async replayCheck(id) {
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, id);
+        if (!row) return;
+        const versions = this.state.storage.sql.exec(
+          `SELECT action, data FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 200`,
+          id
+        ).toArray().reverse();
+        if (!versions.length) return;
+        const events = versions.map((v) => {
+          let d = {};
+          try {
+            d = JSON.parse(v.data ?? "{}");
+          } catch {
+          }
+          return { action: String(v.action), data: d };
+        });
+        const fold = replayStatus("", events);
+        if (fold.status && fold.status !== row.status) {
+          this.audit("system:replay", "replay_mismatch", id, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
+          this.version(id, "system:replay", "note", `REPLAY MISMATCH: version log folds to '${fold.status}' (${fold.breaks} chain break${fold.breaks === 1 ? "" : "s"}) but stored status is '${row.status}'`, { stored: row.status, folded: fold.status, chain_breaks: fold.breaks });
+          try {
+            await this.foldBreaches(id);
+          } catch {
+          }
+        } else if (fold.tailBreak) {
+          this.audit("system:replay", "chain_break", id, { breaks: fold.breaks });
+        }
       }
       async getHistory(artefactId, limit = 100) {
         const rows = this.state.storage.sql.exec(
@@ -2796,10 +5290,12 @@ ${m.bootstrap_md}` : "") + scoreLine;
       }
       /** The session a write belongs to: explicit, else the token's most recent session. */
       async resolveSession(body, tokenId) {
-        if (body.session) {
-          await this.sessionTouch({ token_id: tokenId, session: body.session }).catch(() => {
+        if (body.session !== void 0) {
+          const named = String(body.session ?? "").trim();
+          if (!named) return void 0;
+          await this.sessionTouch({ token_id: tokenId, session: named, worktree: body.worktree }).catch(() => {
           });
-          return String(body.session);
+          return named;
         }
         const row = this.one(
           `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
@@ -2807,22 +5303,27 @@ ${m.bootstrap_md}` : "") + scoreLine;
         );
         return row?.name ?? void 0;
       }
-      /** Register/refresh a session. Names are unique per auth token. */
+      /** Register/refresh a session. Names are unique per auth token.
+       *  `worktree` (BR#3204): where the session's git tree lives — surfaced on
+       *  orient so the board can spot two sessions sharing a checkout. */
       async sessionTouch(body) {
         const token_id = String(body.token_id ?? "");
         const name = String(body.session ?? "").trim().slice(0, 80) || `session-${Math.random().toString(36).slice(2, 6)}`;
+        const worktree = String(body.worktree ?? "").trim().slice(0, 400) || null;
         const ts = Date.now();
         this.state.storage.sql.exec(
-          `INSERT INTO sessions (token_id, name, kind, first_seen_ts, last_seen_ts)
-       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?)
-       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind)`,
+          `INSERT INTO sessions (token_id, name, kind, worktree, first_seen_ts, last_seen_ts)
+       VALUES (?, ?, (SELECT CASE WHEN tags LIKE '%gateway%' THEN 'gateway' END FROM auth_tokens WHERE id = ?), ?, ?, ?)
+       ON CONFLICT(token_id, name) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, kind = COALESCE(kind, excluded.kind),
+         worktree = COALESCE(excluded.worktree, sessions.worktree)`,
           token_id,
           name,
           token_id,
+          worktree,
           ts,
           ts
         );
-        return { session: name };
+        return { session: name, worktree };
       }
       async askCreate(body, actor) {
         const to = String(body.to ?? "any");
@@ -2837,7 +5338,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
         const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
         const options = [...new Set((Array.isArray(body.options) ? body.options : []).map((o) => typeof o === "string" ? o : String(o?.label ?? o?.text ?? o?.value ?? o?.title ?? "")).map((x) => x.trim()).filter((x) => x && !/\[object\s*object\]/i.test(x)).map((x) => x.slice(0, 200)))].slice(0, 8);
         if (options.length < 2) throw new Error("asks require 2-8 answer options \u2014 give the human one-click answers (options: ['GO', 'NO-GO'])");
-        const urgency = isSentiment(body.urgency) ? String(body.urgency) : "normal";
+        const urgency = body.urgency === "time-sensitive" ? "time-sensitive" : "normal";
         if (artefactId) {
           const dup = this.one(
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
@@ -2871,7 +5372,12 @@ ${m.bootstrap_md}` : "") + scoreLine;
           );
           if (row.type === "task" && (row.status === "in_progress" || row.status === "blocked")) {
             if (row.status === "in_progress") {
-              await this.transition({ id: artefactId, to: "blocked", note: `blocked on ${to}: ${question.slice(0, 100)}` }, actor);
+              await this.transition({
+                id: artefactId,
+                to: "blocked",
+                note: `blocked on ${to}: ${question.slice(0, 100)}`,
+                unblock_condition: `answer ask ${id}`
+              }, actor);
               taskStatus = "blocked";
             }
           }
@@ -2996,7 +5502,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
             now,
             id
           );
-          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { status: "done", answer: answer.slice(0, 200) });
+          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node2.status, to: "done", answer: answer.slice(0, 200) });
           let taskStatus2;
           const subject = this.one(
             `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -3081,6 +5587,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
               t.unblock_condition = (m.blocked.unblock_condition ?? "").slice(0, 200);
             }
             if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
+            if (m.session && ["in_progress", "in_review"].includes(t.status)) t.executor_session = m.session;
             delete t.meta;
           }
           return t;
@@ -3239,7 +5746,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
         const gaugeDebtNote = gaugeDebt.length ? `
 
 GAUGE DEBT \u2014 these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) \u2014 the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.` : "";
-        const my_score = this.agentScores().find((a) => a.label === label) ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
+        const my_score = this.agentScores().find((a) => a.label === label) ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
         const scoreDirective = `
 
 YOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it \u2014 it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") : "No deductions \u2014 keep heartbeats \u226410m, finish with receipts, answer asks fast."}`;
@@ -3262,7 +5769,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
           my_roles: tags.filter((t) => t.startsWith("role:")),
           pending_asks: pendingAsks,
           action_required: actionRequired.length || verificationNotices.length ? [...actionRequired, ...verificationNotices] : void 0,
-          gauge_debt: gaugeDebt.length ? gaugeDebt : void 0,
+          // BR#3463: ALWAYS emit — gauge_debt is a REQUIRED orient contract key
+          // (BR#2844); the conditional turned the healthy case (zero debt) into a
+          // contract violation (undefined drops from JSON.stringify → "missing
+          // gauge_debt" aborts every dispatch tick). Empty array = healthy board.
+          gauge_debt: gaugeDebt,
           my_score
         };
       }
@@ -3328,7 +5839,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
               t.id
             );
             this.audit("system:reaper", "loop_escalated", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-            this.version(t.id, "system:reaper", "transition", `rework loop escalated to human \u2014 ${attempts} attempts without completion`, { prev_owner: ownerLabel });
+            this.version(t.id, "system:reaper", "note", `rework loop escalated to human \u2014 ${attempts} attempts without completion`, { prev_owner: ownerLabel, attempts });
             out.push(
               `${t.id} "${t.title}" REWORK LOOP (${attempts} attempts) \u2014 escalated to a human instead of re-releasing. Blocked-for-human until reviewed.`
             );
@@ -3345,7 +5856,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
             t.id
           );
           this.audit("system:reaper", "reassign", t.id, { prev_owner: ownerLabel, attempts, idle_ms: idleFor });
-          this.version(t.id, "system:reaper", "transition", `reassigned \u2014 ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { prev_owner: ownerLabel });
+          this.version(t.id, "system:reaper", "transition", `reassigned \u2014 ${ownerLabel} ${idleDesc} (attempt ${attempts})`, { from: "blocked", to: "todo", prev_owner: ownerLabel });
           out.push(
             mine ? `${t.id} "${t.title}" was REASSIGNED: you ${idleDesc}.${wasDoing} Your score is penalised. It is now unclaimed todo, tagged "attempted" (attempt ${attempts}) \u2014 partial work may exist. Do not blindly restart it: search_knowledge + get_artefact first.` : `${t.id} "${t.title}" was REASSIGNED: ${ownerLabel} ${idleDesc} (attempt ${attempts}) \u2014 back to unclaimed todo for any agent to pick up.`
           );
@@ -3518,14 +6029,15 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const code = this.pairCode();
         const now = Date.now();
         const type = body.type === "agent" ? "agent" : "gateway";
-        const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
         const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         this.state.storage.sql.exec(
-          `INSERT INTO pairings (code, device, type, device_id, principal, status, created_ts) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          `INSERT INTO pairings (code, device, type, principal, status, created_ts) VALUES (?, ?, ?, ?, 'pending', ?)`,
+          // host is the DISPLAY name (BR#899: labels display, the device
+          // credential anchors); body.device fallback covers desktops predating
+          // the field rename
           code,
-          String(body.device ?? "device").slice(0, 80),
+          String(body.host ?? body.device ?? "device").slice(0, 80),
           type,
-          device_id,
           principal,
           now
         );
@@ -3548,7 +6060,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const ws = String(body.ws ?? "").trim();
         const label = String(body.label ?? "").trim();
         const login = String(body.login ?? "").toLowerCase();
-        const row = this.one(`SELECT code, created_ts, status, device, type, device_id, principal FROM pairings WHERE code = ?`, code);
+        const row = this.one(`SELECT code, created_ts, status, device, type, principal FROM pairings WHERE code = ?`, code);
         if (!row || row.status !== "pending") throw new Error("pairing code not pending");
         if (Date.now() - row.created_ts > _KnowledgeHub.PAIR_TTL_MS) {
           this.state.storage.sql.exec(`DELETE FROM pairings WHERE code = ?`, code);
@@ -3565,7 +6077,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const mintRes = await stub.fetch("https://kb/admin.mint", {
           method: "POST",
           headers: { "content-type": "application/json", "x-kb-admin": "1" },
-          body: JSON.stringify({ label, tags, device_id: row.device_id ?? null, principal: row.principal ?? null })
+          body: JSON.stringify({ label, tags, principal: row.principal ?? null })
         });
         const minted = await mintRes.json();
         if (!mintRes.ok || !minted.secret) {
@@ -3638,18 +6150,31 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const secret = generateAuthToken();
         const hash2 = await hashAuthToken(secret);
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const tags = JSON.stringify(["provisioned", `by:${caller}`]);
-        this.state.storage.sql.exec(
-          `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?)`,
-          id,
-          label,
-          hash2,
-          tags,
-          body.device_id ?? null,
-          body.principal ?? null,
-          ts
-        );
+        try {
+          this.state.storage.sql.exec(
+            `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+            id,
+            label,
+            hash2,
+            tags,
+            body.principal ?? null,
+            ts
+          );
+        } catch (e) {
+          if (!String(e).includes("UNIQUE")) throw e;
+          const racer = this.one(`SELECT id FROM auth_tokens WHERE label = ?`, label);
+          if (!racer) throw e;
+          this.state.storage.sql.exec(
+            `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+            hash2,
+            tags,
+            racer.id
+          );
+          id = racer.id;
+          this.audit(caller, "rotate", label, { replaced: true, raced: true });
+        }
         const ws = this.wsSlug();
         if (ws) {
           const reg = this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
@@ -3705,15 +6230,29 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         } else {
           vended = principal || generateAuthToken();
           id = `at_${crypto.randomUUID().slice(0, 8)}`;
-          this.state.storage.sql.exec(
-            `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
-            id,
-            label,
-            hash2,
-            mintTags,
-            vended,
-            Date.now()
-          );
+          try {
+            this.state.storage.sql.exec(
+              `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+              id,
+              label,
+              hash2,
+              mintTags,
+              vended,
+              Date.now()
+            );
+          } catch (e) {
+            if (!String(e).includes("UNIQUE")) throw e;
+            const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
+            if (!racer) throw e;
+            this.state.storage.sql.exec(
+              `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+              hash2,
+              mintTags,
+              racer.id
+            );
+            id = racer.id;
+            if (racer.principal) vended = racer.principal;
+          }
           await register(hash2);
         }
         this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own2 });
@@ -3725,10 +6264,10 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         if (label.includes("/") && !label.startsWith("_direct/")) {
           throw new Error("labels cannot contain '/' \u2014 only the reserved _direct/ root (directly connected agents) may");
         }
-        const device_id = typeof body.device_id === "string" && body.device_id.trim() ? body.device_id.trim().slice(0, 80) : null;
+        const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         const secret = generateAuthToken();
         const hash2 = await hashAuthToken(secret);
-        let own2 = device_id ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE device_id = ?`, device_id) : null;
+        let own2 = principal ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ?`, principal) : null;
         const byLabel = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE label = ?`, label);
         if (own2 && byLabel && own2.id !== byLabel.id) {
           this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE id = ?`, byLabel.id);
@@ -3738,12 +6277,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         if (target) {
           const mintTags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
           this.state.storage.sql.exec(
-            `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, device_id = COALESCE(?, device_id), principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
+            `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
             hash2,
             label,
             JSON.stringify(mintTags),
-            device_id,
-            body.principal ?? null,
+            principal,
             target.id
           );
           const ws2 = this.wsSlug();
@@ -3760,17 +6298,16 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         }
         const tags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
         const transport = TRANSPORTS.includes(body.transport) ? body.transport : "mcp";
-        const id = `at_${crypto.randomUUID().slice(0, 8)}`;
+        let id = `at_${crypto.randomUUID().slice(0, 8)}`;
         const ts = Date.now();
         this.state.storage.sql.exec(
-          `INSERT INTO auth_tokens (id, label, hash, tags, transport, device_id, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           id,
           label,
           hash2,
           JSON.stringify(tags),
           transport,
-          device_id,
-          body.principal ?? null,
+          principal,
           ts
         );
         const ws = this.wsSlug();
@@ -3972,6 +6509,7 @@ ${String(issue2.body ?? "").slice(0, 2e3)}
         });
       }
     };
+    __name(tagsForWrite, "tagsForWrite");
   }
 });
 
@@ -8684,7 +11222,7 @@ function isRecursive(inst, stack, resolve) {
     return PROVEN;
   stack.add(inst);
   let result = NONE;
-  const check4 = /* @__PURE__ */ __name((child) => {
+  const check3 = /* @__PURE__ */ __name((child) => {
     if (result !== PROVEN && child?._zod) {
       const answer = isRecursive(child, stack, resolve);
       if (answer > result)
@@ -8713,32 +11251,32 @@ function isRecursive(inst, stack, resolve) {
     case "object": {
       const raw = rawShape(def);
       merge2(raw ? shape(raw, true) : ASSUMED);
-      check4(def.catchall);
+      check3(def.catchall);
       break;
     }
     case "array":
-      check4(def.element);
+      check3(def.element);
       break;
     case "tuple":
       for (const el of def.items)
-        check4(el);
-      check4(def.rest);
+        check3(el);
+      check3(def.rest);
       break;
     case "record":
     case "map":
-      check4(def.keyType);
-      check4(def.valueType);
+      check3(def.keyType);
+      check3(def.valueType);
       break;
     case "set":
-      check4(def.valueType);
+      check3(def.valueType);
       break;
     case "union":
       for (const el of def.options)
-        check4(el);
+        check3(el);
       break;
     case "intersection":
-      check4(def.left);
-      check4(def.right);
+      check3(def.left);
+      check3(def.right);
       break;
     case "optional":
     case "nullable":
@@ -8749,15 +11287,15 @@ function isRecursive(inst, stack, resolve) {
     case "nonoptional":
     case "promise":
     case "success":
-      check4(def.innerType);
+      check3(def.innerType);
       break;
     case "pipe":
-      check4(def.in);
-      check4(def.out);
+      check3(def.in);
+      check3(def.out);
       break;
     case "function":
-      check4(def.input);
-      check4(def.output);
+      check3(def.input);
+      check3(def.output);
       break;
     // `$ZodLazy` caches its inner on the def, so a resolved edge is followed exactly
     case "lazy": {
@@ -8798,10 +11336,10 @@ function isRecursive(inst, stack, resolve) {
         if (!value || typeof value !== "object")
           continue;
         if (value._zod)
-          check4(value);
+          check3(value);
         else if (Array.isArray(value))
           for (const el of value)
-            check4(el);
+            check3(el);
       }
     }
   }
@@ -17334,8 +19872,8 @@ function generateChecks(doc, ctx, schema, accessor) {
   if (!schemaChecks || schemaChecks.length === 0)
     return accessor;
   let currentAccessor = accessor;
-  for (const check4 of schemaChecks) {
-    const def = check4._zod.def;
+  for (const check3 of schemaChecks) {
+    const def = check3._zod.def;
     if (def.when && !WHEN_DEFAULTED_CHECKS.has(def.check)) {
       throw new ZodCompileUnsupportedError(`check with a custom "when" condition`);
     }
@@ -17383,7 +19921,7 @@ function generateChecks(doc, ctx, schema, accessor) {
         currentAccessor = generateStringFormatCheck(doc, ctx, def, currentAccessor);
         break;
       case "custom":
-        currentAccessor = generateCustomRefineCheck(doc, ctx, check4, currentAccessor);
+        currentAccessor = generateCustomRefineCheck(doc, ctx, check3, currentAccessor);
         break;
       case "bigint_format":
         generateBigIntFormatCheck(doc, def, currentAccessor);
@@ -17399,7 +19937,7 @@ function generateChecks(doc, ctx, schema, accessor) {
         break;
       case "overwrite": {
         const newAccessor = newVar(ctx);
-        generateOverwriteCheck(doc, ctx, check4, currentAccessor, newAccessor);
+        generateOverwriteCheck(doc, ctx, check3, currentAccessor, newAccessor);
         currentAccessor = newAccessor;
         break;
       }
@@ -17522,8 +20060,8 @@ function generatePropertyCheck(doc, ctx, def, accessor) {
   const propAccessor = `${accessor}[${JSON.stringify(def.property)}]`;
   generateCheck(doc, ctx, def.schema, propAccessor);
 }
-function generateOverwriteCheck(doc, ctx, check4, currentAccessor, newAccessor) {
-  const tx = check4._zod.def.tx;
+function generateOverwriteCheck(doc, ctx, check3, currentAccessor, newAccessor) {
+  const tx = check3._zod.def.tx;
   if (!tx) {
     throw new ZodCompileUnsupportedError("overwrite check without a transform function");
   }
@@ -17539,8 +20077,8 @@ function throwAsync() {
 function pushIssue(issue2) {
   this.issues.push(issue2);
 }
-function generateCustomRefineCheck(doc, ctx, check4, accessor) {
-  const def = check4._zod.def;
+function generateCustomRefineCheck(doc, ctx, check3, accessor) {
+  const def = check3._zod.def;
   if (def.fn) {
     if (isAsyncFunction(def.fn)) {
       throw new ZodCompileAsyncError("z.compile: async .refine() predicates are not supported");
@@ -17553,11 +20091,11 @@ function generateCustomRefineCheck(doc, ctx, check4, accessor) {
     doc.write(`if (!${resVar}) return INVALID;`);
     return accessor;
   }
-  if (check4._zod.check) {
-    if (isAsyncFunction(check4._zod.check)) {
+  if (check3._zod.check) {
+    if (isAsyncFunction(check3._zod.check)) {
       throw new ZodCompileAsyncError("z.compile: async .superRefine() / check functions are not supported");
     }
-    const checkFn = check4._zod.check;
+    const checkFn = check3._zod.check;
     const helperFn = /* @__PURE__ */ __name((value) => {
       const fakePayload = { value, issues: [], addIssue: pushIssue };
       const result = checkFn(fakePayload);
@@ -18153,8 +20691,8 @@ function generateNullableCheck(doc, ctx, schema, accessor, buildsValue = true) {
   return outputVar;
 }
 function generateSizeGate(doc, schema, size) {
-  for (const [max, check4] of sizeCaps(schema._zod.def.checks)) {
-    doc.write(`if (${size} > ${numericOperand(max, check4._zod.def.check)}) return INVALID;`);
+  for (const [max, check3] of sizeCaps(schema._zod.def.checks)) {
+    doc.write(`if (${size} > ${numericOperand(max, check3._zod.def.check)}) return INVALID;`);
   }
 }
 function generateArrayCheck(doc, ctx, schema, accessor, buildsValue = true) {
@@ -22002,7 +24540,7 @@ __export(schemas_exports2, {
   bigint: () => bigint2,
   boolean: () => boolean2,
   catch: () => _catch2,
-  check: () => check2,
+  check: () => check,
   cidrv4: () => cidrv42,
   cidrv6: () => cidrv62,
   codec: () => codec,
@@ -22533,7 +25071,7 @@ function _function(params) {
     output: params?.output ?? unknown()
   });
 }
-function check2(fn) {
+function check(fn) {
   const ch = new $ZodCheck({
     check: "custom"
     // ...util.normalizeParams(params),
@@ -22627,8 +25165,8 @@ var init_schemas2 = __esm({
         reg.add(this, meta3);
         return this;
       },
-      refine(check4, params) {
-        return this.check(refine(check4, params));
+      refine(check3, params) {
+        return this.check(refine(check3, params));
       },
       superRefine(refinement, params) {
         return this.check(superRefine(refinement, params));
@@ -23643,7 +26181,7 @@ var init_schemas2 = __esm({
       ZodType.init(inst, def);
       inst._zod.processJSONSchema = (ctx, json4, params) => customProcessor(inst, ctx, json4, params);
     });
-    __name(check2, "check");
+    __name(check, "check");
     __name(custom, "custom");
     __name(refine, "refine");
     __name(superRefine, "superRefine");
@@ -24855,7 +27393,7 @@ __export(external_exports, {
   bigint: () => bigint2,
   boolean: () => boolean2,
   catch: () => _catch2,
-  check: () => check2,
+  check: () => check,
   cidrv4: () => cidrv42,
   cidrv6: () => cidrv62,
   clone: () => clone,
@@ -25381,6 +27919,11 @@ var init_config = __esm({
       report_minutes: external_exports.number().int().nullable(),
       isolate: external_exports.boolean(),
       backends: external_exports.record(external_exports.string(), BackendConfigSchema),
+      // BR#3204: repos exempt from per-session worktree provisioning — always
+      // written (serde serializes the Vec even empty); the contract missed it
+      // when BR#3204 landed, and the store parity test reds the build (found
+      // completing the main-red base fix, BR#551 stop-the-line).
+      worktree_exempt_repos: external_exports.array(external_exports.string()),
       // legacy (accepted on load, folded into backends, never written once empty)
       models: external_exports.record(external_exports.string(), external_exports.string()).optional(),
       agents: external_exports.record(external_exports.string(), external_exports.string()).optional()
@@ -25428,7 +27971,7 @@ async function seeAlso(a, rel, identity, call) {
   for (const e of rows) {
     const otherClaimed = e.owner && e.owner !== identity.label;
     const otherPublished = !e.owner && e.created_by && e.created_by !== identity.label;
-    if (e.type === "task" && OPEN_STATUSES.has(e.status) && (otherClaimed || otherPublished)) {
+    if (e.type === "task" && OPEN_STATUSES2.has(e.status) && (otherClaimed || otherPublished)) {
       e.coordination = true;
       e._rank = -1;
     } else if (e.type === "steering" || e.type === "goal") {
@@ -25442,7 +27985,7 @@ async function seeAlso(a, rel, identity, call) {
   }
   return rows.slice(0, 8);
 }
-var BUILD, toolsList, text, err, OPEN_STATUSES, shallow, TOOL_TABLE;
+var BUILD, toolsList, text, err, OPEN_STATUSES2, shallow, TOOL_TABLE;
 var init_mcp_tools = __esm({
   "src/mcp-tools.ts"() {
     init_core();
@@ -25451,7 +27994,7 @@ var init_mcp_tools = __esm({
     toolsList = /* @__PURE__ */ __name((table) => mcpToolsList(table), "toolsList");
     text = /* @__PURE__ */ __name((t) => ({ content: [{ type: "text", text: t }] }), "text");
     err = /* @__PURE__ */ __name((t) => ({ content: [{ type: "text", text: t }], isError: true }), "err");
-    OPEN_STATUSES = /* @__PURE__ */ new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
+    OPEN_STATUSES2 = /* @__PURE__ */ new Set(["todo", "in_progress", "blocked", "draft", "proposed", "active", "open"]);
     shallow = /* @__PURE__ */ __name((a) => ({ id: a.id, type: a.type, title: a.title, status: a.status, updated_ts: a.updated_ts, created_by: a.created_by }), "shallow");
     __name(seeAlso, "seeAlso");
     TOOL_TABLE = defineToolTable({
@@ -25759,7 +28302,7 @@ var init_mcp2 = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "1ae2ffb3c08108eb18a1b29c2ae82aa3fa414bff", built_at: "2026-10-24T15:30:24Z" };
+    module.exports = { commit: "120cdfaccd00f3d3cd05c4c05183cab18469fc7d", built_at: "2026-10-26T01:01:39Z" };
   }
 });
 
@@ -29337,23 +31880,23 @@ async function calculateJwkThumbprint(jwk, digestAlgorithm) {
   let components;
   switch (jwk.kty) {
     case "EC":
-      check3(jwk.crv, '"crv" (Curve) Parameter');
-      check3(jwk.x, '"x" (X Coordinate) Parameter');
-      check3(jwk.y, '"y" (Y Coordinate) Parameter');
+      check2(jwk.crv, '"crv" (Curve) Parameter');
+      check2(jwk.x, '"x" (X Coordinate) Parameter');
+      check2(jwk.y, '"y" (Y Coordinate) Parameter');
       components = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
       break;
     case "OKP":
-      check3(jwk.crv, '"crv" (Subtype of Key Pair) Parameter');
-      check3(jwk.x, '"x" (Public Key) Parameter');
+      check2(jwk.crv, '"crv" (Subtype of Key Pair) Parameter');
+      check2(jwk.x, '"x" (Public Key) Parameter');
       components = { crv: jwk.crv, kty: jwk.kty, x: jwk.x };
       break;
     case "RSA":
-      check3(jwk.e, '"e" (Exponent) Parameter');
-      check3(jwk.n, '"n" (Modulus) Parameter');
+      check2(jwk.e, '"e" (Exponent) Parameter');
+      check2(jwk.n, '"n" (Modulus) Parameter');
       components = { e: jwk.e, kty: jwk.kty, n: jwk.n };
       break;
     case "oct":
-      check3(jwk.k, '"k" (Key Value) Parameter');
+      check2(jwk.k, '"k" (Key Value) Parameter');
       components = { k: jwk.k, kty: jwk.kty };
       break;
     default:
@@ -29367,7 +31910,7 @@ async function calculateJwkThumbprintUri(jwk, digestAlgorithm) {
   const thumbprint = await calculateJwkThumbprint(jwk, digestAlgorithm);
   return `urn:ietf:params:oauth:jwk-thumbprint:sha-${digestAlgorithm.slice(-3)}:${thumbprint}`;
 }
-var check3;
+var check2;
 var init_thumbprint = __esm({
   "../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
     init_digest();
@@ -29375,7 +31918,7 @@ var init_thumbprint = __esm({
     init_errors3();
     init_buffer_utils();
     init_is_object();
-    check3 = /* @__PURE__ */ __name((value, description) => {
+    check2 = /* @__PURE__ */ __name((value, description) => {
       if (typeof value !== "string" || !value) {
         throw new JWKInvalid(`${description} missing or invalid`);
       }
@@ -30608,7 +33151,7 @@ var index_default = {
       const auth2 = await checkAuth(request, env);
       if (auth2 instanceof Response) return auth2;
       const body = await request.json().catch(() => ({}));
-      body.actor = "web";
+      body.actor = `web:${auth2.login ?? "anon"}`;
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       return env.KB.get(kbId).fetch("https://kb/self.provision", {
         method: "POST",
@@ -30632,14 +33175,14 @@ var index_default = {
       const kbId = env.KB.idFromName(doWs(auth2.ws));
       const sub = url2.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
-        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "metrics/throughput" ? "https://kb/metrics.throughput" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
+        const kbUrl = sub === "board" ? "https://kb/board" : sub === "events" ? "https://kb/events" : sub === "artefacts" ? "https://kb/artefacts" : sub === "artefact" ? "https://kb/artefact" : sub === "search" ? "https://kb/search" : sub === "stats" ? "https://kb/stats" : sub === "related" ? "https://kb/related" : sub === "history" ? "https://kb/history" : sub === "ask" ? "https://kb/ask" : sub === "metrics/throughput" ? "https://kb/metrics.throughput" : sub === "provenance" ? "https://kb/provenance" : sub === "bootstrap" ? "https://kb/bootstrap" : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
         return kbCors(await env.KB.get(kbId).fetch(kbUrl + url2.search, request));
       }
       if (request.method === "POST") {
         if (sub === "ask_reframe" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -30648,7 +33191,7 @@ var index_default = {
         }
         if (sub === "purge_smoke" && request.method === "POST") {
           const body2 = await request.json().catch(() => ({}));
-          body2.actor = auth2.bearer ? "gateway" : "web";
+          body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -30658,8 +33201,9 @@ var index_default = {
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
-        body.actor = auth2.bearer ? "gateway" : "web";
-        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
+        body.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
+        const doOp = { progress: "progress.log" }[op] ?? op;
+        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${doOp.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body)
