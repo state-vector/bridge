@@ -277,3 +277,48 @@ describe("duplicate-executor fence (real DO)", () => {
     expect(fence[0].detail).toMatchObject({ holder: "drill-exec-a", actor: "drill-exec-b", from: "in_progress", to: "blocked" });
   });
 });
+
+// ---------- ask inbox routing (the cody inbox dump) ----------
+
+describe("askInbox addressee routing (real DO)", () => {
+  it("an agent's inbox carries only asks addressed to it: any | label | label@session | tag:<capability> — never human-directed asks", async () => {
+    // three asks: one to the human, one to any agent, one to a capability tag
+    const toHuman = await kbJson("/ask.create", {
+      to: "ray", question: "Human ruling drill?",
+      reason: "drill — human-directed ask must never land in an agent inbox",
+      options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(toHuman.status, JSON.stringify(toHuman.body)).toBe(200);
+    const toAny = await kbJson("/ask.create", {
+      to: "any", question: "Any agent drill?",
+      reason: "drill", options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(toAny.status).toBe(200);
+    const toTag = await kbJson("/ask.create", {
+      to: "tag:datadog-access", question: "Capability tag drill?",
+      reason: "drill", options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(toTag.status).toBe(200);
+
+    // a fresh token's inbox (the cody class: label only, no matching tags)
+    const mine = await kbJson("/ask.inbox", { label: "_direct/cody" });
+    expect(mine.status).toBe(200);
+    const ids = (mine.body?.inbox ?? []).map((x: any) => x.id);
+    expect(ids).toContain(String(toAny.body.id)); // any = everyone's
+    expect(ids).not.toContain(String(toHuman.body.id)); // human-directed — never an agent's
+    expect(ids).not.toContain(String(toTag.body.id)); // tag not mine
+
+    // tag routing: an agent carrying the tag sees the tagged ask
+    const tagged = await kbJson("/ask.inbox", { label: "drill-dd-agent", tags: ["datadog-access"] });
+    expect((tagged.body?.inbox ?? []).map((x: any) => x.id)).toContain(String(toTag.body.id));
+
+    // label@session routing: session-scoped ask reaches the label
+    const toSession = await kbJson("/ask.create", {
+      to: "drill-dd-agent@dispatch-42", question: "Session-scoped drill?",
+      reason: "drill", options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(toSession.status).toBe(200);
+    const mine2 = await kbJson("/ask.inbox", { label: "drill-dd-agent" });
+    expect((mine2.body?.inbox ?? []).map((x: any) => x.id)).toContain(String(toSession.body.id));
+  });
+});

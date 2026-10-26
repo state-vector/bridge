@@ -3366,6 +3366,15 @@ export class KnowledgeHub {
        WHERE type = 'question' AND status IN ('todo','in_progress','blocked')
        ORDER BY created_ts DESC LIMIT 50`,
     ).toArray() as any[];
+    // BR#3578 follow-up (the cody inbox dump): the addressee filter used to
+    // end in `|| true` (a debug leftover) — EVERY open ask landed in EVERY
+    // agent's inbox, so a freshly-minted token inherited all ~57 human-
+    // directed migration asks as its own and its score hint mis-fired. An
+    // ask is yours iff it targets `any`, your exact label, your
+    // label@session, or one of your capability tags (`tag:<t>`). Human-
+    // directed asks (`ray`, `human`, a GitHub login) surface on the human
+    // planes (For Me / ask band), never in agent inboxes.
+    const tags: string[] = Array.isArray(body.tags) ? body.tags.map(String) : [];
     const inbox = nodes
       .map((n) => {
         const m = JSON.parse(n.meta ?? "{}");
@@ -3374,7 +3383,12 @@ export class KnowledgeHub {
         if (m.ask.reframe) out.reframe = m.ask.reframe;
         return out;
       })
-      .filter((x): x is any => !!x && (x.to_target === "any" || x.to_target === label || true));
+      .filter((x): x is any => !!x && (
+        x.to_target === "any" ||
+        x.to_target === label ||
+        String(x.to_target).startsWith(`${label}@`) ||
+        tags.some((t) => x.to_target === `tag:${t}`)
+      ));
     const open = this.state.storage.sql.exec(
       `SELECT id, from_label, to_target, question, created_ts FROM asks
        WHERE status = 'open' AND from_label != ? ORDER BY created_ts DESC LIMIT 50`,
