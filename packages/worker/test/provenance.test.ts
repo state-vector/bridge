@@ -10,10 +10,11 @@ import { parseProvenanceSha, prCardRef, signerFromCommits, withinBackfillWindow 
  * signer classification (BR#3181 classes), sha param validation, backfill
  * window.
  *
- * Tier 2: the real DO drill (bundled worker, canned GitHub, same rig recipe
- * as stop-line.test.ts): stamp → provenance table + task meta.provenance +
- * endpoint chain; dedupe per (repo, pr); class-only record for merges with
- * no bridge card.
+ * Tier 2: the real DO drill (bundled worker): the stamp rides the TRAIN now
+ * (BR#3516 — the executor's train:merged event is the only provenance writer;
+ * the hub holds no VCS credentials, so there is no canned-GitHub leg here):
+ * chain on the endpoint + the card · upsert per (repo, pr) · class-only rows
+ * for card-less merges · verdict-honesty (no closed verify duty ⇒ null).
  */
 
 // ---------- tier 1: pure helpers ----------
@@ -88,79 +89,21 @@ describe("withinBackfillWindow", () => {
   });
 });
 
-// ---------- tier 2: the real DO drill (bundled worker, canned GitHub) ----------
+// ---------- tier 2: the real DO drill (bundled worker; the stamp rides the
+// TRAIN now — BR#3516: the executor's train:merged event is the only provenance
+// writer, the hub holds no VCS credentials) ----------
 
 let mf: Miniflare;
-let ghServer: import("node:http").Server;
-let ghOrigin = "";
 
 const HEAD_SHA = "c61b4869aad07eccdc738200f004d2dbe0a2bf66";
 const MERGE_SHA = "c28dbd60764a05eae8bccf4b40d9afed2e425ea7";
 const NOCARD_MERGE = "b".repeat(40);
-// the verdict-honesty drill (BR#3307): PR 188 has a bridge card + an ACCEPTED
-// decision, but the decision cites an OLDER head (stale) — the sweep must
-// record verdict_id null (honest unverified), never the stale verdict
+// the verdict-honesty drill: a card whose verify duty never closed — the chain
+// must record verdict_id/session null (honest unverified), never a guess
 const HEAD2 = "d".repeat(40);
 const MERGE2 = "9".repeat(40);
-const STALE_SHA = "8".repeat(40);
-// the drill card's real id is assigned at create-time; the stub serves the
-// branch/title from this scenario so the join key (BR-<id>) is honest.
-const scenario = { branch: "bridge/BR-3218", refText: "BR#3218" };
-const scenario2 = { on: false, branch: "" };
-// captured mirror-label POST bodies — the label format guard (BR#3307)
-const labelsSeen: string[] = [];
 
-function ghHandler(): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void {
-  const json = (res: import("node:http").ServerResponse, status: number, body: unknown) => {
-    res.writeHead(status, { "content-type": "application/json" });
-    res.end(JSON.stringify(body));
-  };
-  const detail = (n: number, ref: string, title: string, body: string, headSha = HEAD_SHA, mergeSha?: string) => ({
-    number: n, title, body,
-    head: { ref, sha: headSha },
-    merged_at: "2026-10-25T00:35:00Z",
-    merge_commit_sha: mergeSha ?? (n === 185 ? MERGE_SHA : NOCARD_MERGE),
-  });
-  const commits = (cody: boolean) => [
-    { sha: HEAD_SHA, commit: { verification: { verified: true }, committer: { email: cody ? "297316395+detached-cody@users.noreply.github.com" : "ray@wirestorm.net" } } },
-  ];
-  return (req, res) => {
-    const url = req.url ?? "/";
-    if (req.method === "POST" && /\/issues\/\d+\/labels/.test(url)) {
-      // capture the derived mirror labels (BR#3307 format guard), best-effort
-      let raw = "";
-      req.on("data", (c) => { raw += String(c); });
-      req.on("end", () => {
-        try { labelsSeen.push(...(JSON.parse(raw)?.labels ?? [])); } catch { /* mirror capture is best-effort */ }
-        json(res, 200, { ok: true });
-      });
-      return;
-    }
-    if (/\/pulls\?state=closed/.test(url)) {
-      const list: any[] = [
-        { number: 185, title: `board: drill (${scenario.refText})`, state: "closed", merged_at: "2026-10-25T00:35:00Z", merge_commit_sha: MERGE_SHA },
-        { number: 186, title: "chore: no card here", state: "closed", merged_at: "2026-10-25T00:40:00Z", merge_commit_sha: NOCARD_MERGE },
-        { number: 187, title: "closed without merging", state: "closed", merged_at: null, merge_commit_sha: null },
-      ];
-      // PR 188 is served only once its drill card exists — the sweep dedupes
-      // per (repo, pr), so an early no-card index would stick forever
-      if (scenario2.on) {
-        list.push({ number: 188, title: "feat: verdict-honesty drill (BR#3307)", state: "closed", merged_at: "2026-10-25T00:45:00Z", merge_commit_sha: MERGE2 });
-      }
-      return json(res, 200, list);
-    }
-    let m = url.match(/\/pulls\/(\d+)$/);
-    if (m) {
-      const n = Number(m[1]);
-      if (n === 188) return json(res, 200, detail(188, scenario2.branch, "feat: verdict-honesty drill (BR#3307)", "leg of BR#3307", HEAD2, MERGE2));
-      return json(res, 200, n === 185 ? detail(185, scenario.branch, `board: drill (${scenario.refText})`, scenario.refText)
-        : detail(186, "chore/random", "chore: no card here", "nothing"));
-    }
-    m = url.match(/\/pulls\/(\d+)\/commits/);
-    if (m) return json(res, 200, commits(Number(m[1]) === 185));
-    json(res, 404, { message: `unexpected ${url}` });
-  };
-}
+const REPO = "state-vector/bridge";
 
 beforeAll(async () => {
   // same rig recipe as kb-throughput.test.ts: realpath + modulesRoot + useSQLite
@@ -168,10 +111,6 @@ beforeAll(async () => {
   if (!existsSync(bundle)) {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (before vitest)");
   }
-  const { createServer } = await import("node:http");
-  ghServer = createServer(ghHandler());
-  await new Promise<void>((resolve) => ghServer.listen(0, "127.0.0.1", resolve));
-  ghOrigin = `http://127.0.0.1:${(ghServer.address() as any).port}`;
   mf = new Miniflare({
     workers: [{
       name: "main",
@@ -180,7 +119,6 @@ beforeAll(async () => {
       modules: true,
       compatibilityDate: "2025-09-06",
       durableObjects: { KB: { className: "KnowledgeHub", useSQLite: true } },
-      bindings: { GH_TOKEN: "test-token" },
     }],
   });
   kbNs = await mf.getDurableObjectNamespace("KB");
@@ -188,7 +126,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await mf.dispose();
-  await new Promise<void>((resolve) => ghServer.close(() => resolve()));
 });
 
 let kbNs: any;
@@ -202,38 +139,69 @@ const kbJson = async (path: string, body?: unknown): Promise<{ status: number; b
   return { status: res.status, body: await res.json() as any };
 };
 
-describe("provenance DO drill (BR#3287)", () => {
-  it("indexes merged PRs, stamps the card, and the endpoint returns the chain", async () => {
-    // the producing card + an accepted verify verdict citing the head sha —
-    // the citation lives in the BODY (BR#3307: the sweep matches on body/meta,
-    // and the old decisions[0] fallback used to mask a title-only citation)
-    const task = await kbJson("/create", { type: "task", title: "IMPL: Claim locally (drill)" });
+/** The drill's delivery chain: impl card (+ optional CLOSED verify duty child
+ *  carrying the session), lease acquired, train:merged posted — exactly what
+ *  the executor does after `gh pr merge`. */
+async function stampViaTrain(opts: {
+  pr: number;
+  mergeSha: string;
+  headSha?: string;
+  taskId?: string | null;
+  makeChain?: boolean;
+  session?: string;
+  signer?: string;
+}): Promise<{ taskId: string | null; verifyId: string | null }> {
+  let taskId = opts.taskId ?? null;
+  let verifyId: string | null = null;
+  if (opts.makeChain && !taskId) {
+    const task = await kbJson("/create", { type: "task", title: "IMPL: train provenance drill", session: "" });
     expect(task.status).toBe(200);
-    const taskId = task.body.id;
-    scenario.branch = `bridge/${taskId.replace("#", "-")}`;
-    scenario.refText = taskId;
-    const verdict = await kbJson("/create", {
-      type: "decision",
-      title: `verify verdict (drill) — head ${HEAD_SHA.slice(0, 9)} verified`,
-      body_md: `verified head ${HEAD_SHA} (drill citation)`,
+    taskId = String(task.body.id);
+  }
+  if (opts.makeChain && taskId) {
+    // the verify convention (BR#3516 §1): a review-role duty closes done,
+    // citing the head it verified + the PR (the receipt the receipts rule
+    // demands — and the PR ref the accept hook parses), its session riding
+    // meta.session
+    const verify = await kbJson("/create", {
+      type: "task", title: `VERIFY: provenance drill ${taskId}`, roles: ["review"],
+      session: opts.session ?? "bridge-task-BR-drill-verify",
     });
-    expect(verdict.status).toBe(200);
-    await kbJson("/link", { src: verdict.body.id, relation: "derived_from", dst: taskId });
-    await kbJson("/transition", { id: verdict.body.id, to: "accepted", actor: "web:ray", note: `drill accept (human actor per the acceptance gate); head ${HEAD_SHA}` });
-    await kbJson("/admin.settings_set", { settings: { provenance_gh_api_base: ghOrigin } });
+    expect(verify.status).toBe(200);
+    verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: taskId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "drill: verifying" });
+    const closed = await kbJson("/transition", {
+      id: verifyId, to: "done", actor: "drill-verifier",
+      note: `verified head ${opts.headSha ?? HEAD_SHA} (drill) — PR https://github.com/${REPO}/pull/${opts.pr}`,
+    });
+    expect(closed.status, `verify close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+  }
+  const lease = await kbJson("/train.lease", { repo: REPO, base: "main", action: "acquire", actor: "drill-executor" });
+  expect(lease.body.error ?? "").toBe("");
+  const ev = await kbJson("/train.event", {
+    repo: REPO, base: "main", kind: "merged", actor: "drill-executor",
+    pr: opts.pr, merge_sha: opts.mergeSha, head_sha: opts.headSha,
+    task_id: taskId ?? undefined, signer: opts.signer ?? "merge-train-executor",
+  });
+  expect(ev.body.error ?? "", `train:merged failed: ${JSON.stringify(ev.body)}`).toBe("");
+  await kbJson("/train.lease", { repo: REPO, base: "main", action: "release", actor: "drill-executor" });
+  return { taskId, verifyId };
+}
 
-    const sweep = await kbJson("/admin.provenance_sweep", { now: Date.now() + 600_000 });
-    expect(sweep.status).toBe(200);
-    expect(sweep.body.ok).toBe(true);
+describe("provenance DO drill (BR#3287 via the train, BR#3516)", () => {
+  it("train:merged stamps the chain; the endpoint returns task · verdict · session · signer", async () => {
+    const { taskId, verifyId } = await stampViaTrain({ pr: 185, mergeSha: MERGE_SHA, headSha: HEAD_SHA, makeChain: true, session: "bridge-task-BR-drill-verify" });
 
     // endpoint: by merge sha → full chain
     const byMerge = await kbJson(`/provenance?sha=${MERGE_SHA.slice(0, 12)}`);
     expect(byMerge.status).toBe(200);
-expect(byMerge.body.error ?? "").toBe("");
+    expect(byMerge.body.error ?? "").toBe("");
     expect(byMerge.body.pr).toBe(185);
     expect(byMerge.body.task.id).toBe(taskId);
-    expect(byMerge.body.verdict_id).toBe(verdict.body.id);
-    expect(byMerge.body.signer).toBe("detached-cody");
+    expect(byMerge.body.verdict_id).toBe(verifyId);
+    expect(byMerge.body.session).toBe("bridge-task-BR-drill-verify");
+    expect(byMerge.body.signer).toBe("merge-train-executor");
 
     // by head sha → same record
     const byHead = await kbJson(`/provenance?sha=${HEAD_SHA.slice(0, 9)}`);
@@ -241,24 +209,29 @@ expect(byMerge.body.error ?? "").toBe("");
     expect(byHead.body.pr).toBe(185);
 
     // the card carries its own provenance (board-side storage of record)
-    const card = await kbJson(`/artefact?id=${encodeURIComponent(taskId)}`);
+    const card = await kbJson(`/artefact?id=${encodeURIComponent(String(taskId))}`);
     expect(card.body.meta.provenance.pr).toBe(185);
-    expect(card.body.meta.provenance.signer).toBe("detached-cody");
-    void card;
+    expect(card.body.meta.provenance.signer).toBe("merge-train-executor");
+    expect(card.body.meta.provenance.verdict_id).toBe(verifyId);
   });
 
-  it("dedupes per (repo, pr) and records class-only provenance for card-less merges", async () => {
-    const before = await kbJson("/admin.provenance_sweep", { now: Date.now() + 1_200_000 });
-    expect(before.status).toBe(200);
-    const count = Number(before.body.indexed);
-    // second sweep of the same data: nothing new (immutable once stamped)
-    const after = await kbJson("/admin.provenance_sweep", { now: Date.now() + 1_800_000 });
-    expect(Number(after.body.indexed)).toBe(count);
-    expect(count).toBeGreaterThanOrEqual(1); // PR 186 (no card) still indexed
-    const noCard = await kbJson(`/provenance?sha=${"b".repeat(40)}`);
-    expect(noCard.status).toBe(200);
-    expect(noCard.body.task).toBeNull();
-    expect(noCard.body.signer).toBe("signed");
+  it("restamps per (repo, pr) immutably and records class-only provenance for card-less merges", async () => {
+    // re-post the same (repo, pr): the row upserts, never duplicates
+    const before = await kbJson(`/provenance?sha=${MERGE_SHA.slice(0, 12)}`);
+    await stampViaTrain({ pr: 185, mergeSha: MERGE_SHA, headSha: HEAD_SHA, taskId: String(before.body.task.id) });
+    const after = await kbJson(`/provenance?sha=${MERGE_SHA.slice(0, 12)}`);
+    expect(after.status).toBe(200);
+    expect(after.body.task.id).toBe(before.body.task.id);
+    expect(after.body.pr).toBe(185);
+
+    // card-less merge (executor crashed the chain, or a drive-by PR): the
+    // row still lands — class-only provenance, task null, honest signer
+    const noCard = await stampViaTrain({ pr: 186, mergeSha: NOCARD_MERGE, signer: "signed" });
+    expect(noCard.taskId).toBeNull();
+    const row = await kbJson(`/provenance?sha=${NOCARD_MERGE.slice(0, 12)}`);
+    expect(row.status).toBe(200);
+    expect(row.body.task).toBeNull();
+    expect(row.body.signer).toBe("signed");
   });
 
   it("machine-plane op + MCP parity: POST /provenance returns the chain; errors contract", async () => {
@@ -273,48 +246,25 @@ expect(byMerge.body.error ?? "").toBe("");
     expect(bad.status).toBe(400);
   });
 
-  it("BR#3307 residue: no accepted decision on the head sha → verdict_id null (never a stale verdict); mirror label is bridge:BR-<id>", async () => {
-    // card2 + an accepted decision citing an OLDER head (the stale verdict
-    // the old decisions[0] fallback would have attached)
+  it("BR#3307 residue: a card whose verify duty never closed → verdict_id null (never a guess)", async () => {
+    // the card exists but NO closed review child — the chain has no verdict
+    // leg, and the train records exactly that (honest unverified)
     const card2 = await kbJson("/create", { type: "task", title: "IMPL: verdict-honesty drill (BR#3307)" });
     expect(card2.status).toBe(200);
-    scenario2.branch = `bridge/${String(card2.body.id).replace("#", "-")}`;
-    scenario2.on = true;
-    const stale = await kbJson("/create", {
-      type: "decision",
-      title: `verify verdict (stale drill) — head ${STALE_SHA.slice(0, 9)} verified`,
-      // the citation names ONLY the stale head — never HEAD2 (the sha must
-      // not appear anywhere in body/meta, or the citation match fires)
-      body_md: `verified head ${STALE_SHA} — an OLDER merge; this verdict must not vouch for a head it does not cite`,
-      session: "bridge-task-BR-3307-stale",
-    });
-    expect(stale.status).toBe(200);
-    await kbJson("/link", { src: stale.body.id, relation: "derived_from", dst: card2.body.id });
-    await kbJson("/transition", { id: stale.body.id, to: "accepted", actor: "web:ray", note: `drill accept for the OLD head ${STALE_SHA}` });
-
-    const sweep = await kbJson("/admin.provenance_sweep", { now: Date.now() + 3_000_000 });
-    expect(sweep.status).toBe(200);
-    expect(sweep.body.error).toBeUndefined();
-    // PR 188 is the only unseen merge → the table grew by exactly it
+    const { taskId } = await stampViaTrain({ pr: 188, mergeSha: MERGE2, headSha: HEAD2, taskId: String(card2.body.id) });
     const rec = await kbJson(`/provenance?sha=${MERGE2}`);
     expect(rec.status).toBe(200);
-    expect(rec.body.task.id).toBe(card2.body.id);
-    // the honest contract: no decision cites head d… → verdict null, session null
+    expect(rec.body.task.id).toBe(taskId);
     expect(rec.body.verdict_id).toBeNull();
     expect(rec.body.session).toBeNull();
-    expect(rec.body.signer).toBe("signed");
     // by head sha → the same honest record
     const byHead = await kbJson(`/provenance?sha=${HEAD2.slice(0, 9)}`);
     expect(byHead.status).toBe(200);
     expect(byHead.body.verdict_id).toBeNull();
-    // the card stamp is honest too (no stale verdict on the chain)
+    // the card stamp is honest too (no verdict leg on the chain)
     const card = await kbJson(`/artefact?id=${encodeURIComponent(String(card2.body.id))}`);
     expect(card.body.meta.provenance.verdict_id).toBeNull();
     expect(card.body.meta.provenance.session).toBeNull();
-    // the derived mirror label carries the documented bridge:BR-<id> form —
-    // never the raw card id ("bridge:BR#3307")
-    expect(labelsSeen).toContain(`bridge:${String(card2.body.id).replace("#", "-")}`);
-    expect(labelsSeen).not.toContain(`bridge:${card2.body.id}`);
   });
 
   it("lookup contract: bad sha → 400, unknown sha → 404", async () => {

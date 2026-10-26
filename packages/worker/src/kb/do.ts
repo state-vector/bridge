@@ -10,7 +10,6 @@
  * Ops: create | get | list | search | update | transition | link | stats
  */
 import {
-  issueRef,
   scaffoldBody,
   EMBED_MODEL,
   TRIGRAM_DIM,
@@ -60,18 +59,35 @@ import {
   resolveRolePlaybook,
   selfProvisionLabel,
   sanitizeTags,
-  stopLineAskTitle,
-  classifyMainCheckRuns,
-  classifyHeadChecks,
-  decideMergeAction,
-  decidePrDisposition,
-  mergeSweepHumanLegTitle,
   validateRelation,
-  type MainCheckVerdict,
-  type PrDisposition,
+  // serialized merge train (BR#3516)
+  MERGE_TRAIN_QUEUED_REASON,
+  MERGE_TRAIN_REASON_PREFIX,
+  TRAIN_LEASE_TTL_MS,
+  TRAIN_CI_TYPICAL_MINUTES,
+  TRAIN_CI_BOUND_MULTIPLIER,
+  TRAIN_HEAD_STAMP_RE,
+  laneKey,
+  laneCardTitle,
+  laneCardBody,
+  laneOfMeta,
+  type LaneSpec,
+  leaseDecide,
+  mergeTrainQueue,
+  verdictCoversHead,
+  carryAppend,
+  classifyRequiredRuns,
+  decideTrainGate,
+  trainBounceBrief,
+  trainStopAskTitle,
+  trainLandedCloseNote,
+  type TrainLease,
+  type LeaseAction,
+  type MainCheckRun,
+  type RequiredRunsVerdict,
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
-import { parseProvenanceSha, prCardRef, signerFromCommits, withinBackfillWindow } from "./provenance.ts";
+import { parseProvenanceSha } from "./provenance.ts";
 import {
   decide,
   invariants as checkInvariants,
@@ -93,11 +109,12 @@ import {
   type ProxyAtom,
 } from "./closure.ts";
 
-/** The standing ask sink for the destination-green stop-the-line sweep
- *  (BR#3008) — asks bind to it, so askCreate's identical-open-ask guard can
- *  dedupe per red episode. Override with the `stop_line_artefact_id` setting
- *  if the sink card is ever re-issued. */
-const STOP_LINE_SINK_ID = "BR#3124";
+/** The standing ask sink for the merge train's stop-the-line alarms
+ *  (BR#3516 §6) — asks bind to it, so askCreate's identical-open-ask guard
+ *  can dedupe per red episode (one ask per class, never one per PR). Same
+ *  sink the destination-green sweep used (BR#3124, infrastructure). Override
+ *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
+const TRAIN_ALARM_SINK_ID = "BR#3124";
 
 import {
   ROOT_BLOCKER_TAG,
@@ -397,40 +414,13 @@ export class KnowledgeHub {
         parent: v.parent_id, parent_owner: v.parent_owner ?? "", age_min: mins,
       });
     }
-    // (B) standing merge-queue sweep (BR#3198): the deterministic executor of
-    // the BR#3033 standing merge order — drains mergeable, verified, green
-    // PRs every tick, FIRST, before anything else claims attention. Isolated:
-    // a GitHub outage must never take the watchdog down with it.
-    try {
-      await this.mergeQueueSweep(now);
-    } catch (e) {
-      try {
-        this.audit("system:merge-sweep", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
-      } catch { /* next tick retries */ }
-    }
-
-    // (C) destination-green stop-the-line (BR#3008): one sweep on a slow
-    // cadence, failures isolated — an alarm-layer outage in GitHub's API must
-    // never take the watchdog down with it.
-    try {
-      await this.stopTheLineSweep(now);
-    } catch (e) {
-      try {
-        this.audit("hub:stop-the-line", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
-      } catch { /* next tick retries */ }
-    }
-
-    // (D) PR provenance indexing (BR#3287): sha → PR → task → verify-verdict
-    // → agent session, stamped on task cards (board-side storage of record
-    // per decision BR#3291). Isolated like its siblings — a GitHub outage or
-    // a bad PR payload must never take the watchdog down with it.
-    try {
-      await this.provenanceSweep(now);
-    } catch (e) {
-      try {
-        this.audit("hub:provenance", "sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
-      } catch { /* next tick retries */ }
-    }
+    // (B/C/D/G — the hub's GitHub sweeps — DELETED with the hub's credentials
+    // (BR#3516 §1/§8): the merge-queue sweep is re-homed as the opportunistic
+    // edge executor (scripts/merge-train.mjs, worker-local creds, doctor-
+    // defended); stop-the-line reads move into the executor's awaiting-CI
+    // poll; provenance is stamped ledger-native by train events; the closure
+    // audit was GitHub-reading. The hub keeps its credential-free monitoring
+    // job below: lane lease staleness.)
 
     // (E) blocker rollup: blocked cards sharing one machine-detectable root
     // cause (one unmerged PR; red main — BR#551) collapse into ONE boosted
@@ -453,12 +443,17 @@ export class KnowledgeHub {
       this.audit("hub:proxy-watch", "sweep_error", "unblock_proxy_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
     }
 
-    // (G) closure-receipt audit (BR#3361c): done cards' receipted close legs
-    // live-verified after the done; false claims get a correction duty. Isolated.
+    // (G) train-watch (BR#3516): the hub's credential-free half of the merge
+    // train — lane lease staleness. A lease past its expiry with no live
+    // heartbeat means the executor died/went to sleep: the lane card shows
+    // `blocked: awaiting an available gateway` (honest — merges happen when
+    // machines are on) and the lapsed lease is cleared so the next gateway
+    // reconciles from live GitHub and acquires. The executor-side gates make
+    // the reconcile safe; the hub never talks to GitHub to check this.
     try {
-      await this.closureAuditSweep(now);
+      await this.trainWatchSweep(now);
     } catch (e) {
-      this.audit("hub:closure-audit", "sweep_error", "closure_audit_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
+      this.audit("system:merge-train", "sweep_error", "train_watch", { error: String((e as Error).message ?? e).slice(0, 300) });
     }
 
     // observability: the board can answer "is the watchdog alive?" via
@@ -490,31 +485,6 @@ export class KnowledgeHub {
     );
   }
 
-  // ---------- destination-green stop-the-line sweep (BR#3008) ----------
-  // The loud half of BR#3009's destination-green precondition. The mechanical
-  // half is the required `main-green gate` check (workflow +
-  // scripts/main-green-gate.sh); this sweep pages the board when the line is
-  // stopped EVEN IF nobody opens a PR — a red main must be loud on its own.
-  //
-  // Reads main's HEAD check runs from the public GitHub API (the repo is
-  // public; no token lives in the worker), classifies with the same rule as
-  // the gate (classifyMainCheckRuns), and on RED files — per red episode,
-  // deduped per main-HEAD sha, so ten PRs observing one red sha produce one
-  // of each, not ten:
-  //   1. ONE urgent ask per red episode into the BR#3124 sink — the
-  //      ATTENTION channel; and
-  //   2. ONE claimable P0 episode task (BR#3284) — the WORK channel: title
-  //      `STOP-THE-LINE: bridge main RED @ <short-sha> — fix main first`,
-  //      body carrying the red checks, the first-failing sha/PR (bisect
-  //      walk), the remediation exception and the done-when, boosted
-  //      (priority 0) so it tops the board's ranked queue. A new red sha
-  //      supersedes the prior open episode task.
-  //
-  // Settings: `stop_line_sweep_minutes` (default 5, 0 = off),
-  // `stop_line_artefact_id` (ask sink; the standing card the asks and episode
-  // tasks bind to), `stop_line_repo` (default state-vector/bridge),
-  // `stop_line_gh_api_base` (default https://api.github.com — point at a
-  // GHES/mock for drills).
   private settingValue(key: string, fallback: string): string {
     const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
     if (!row) return fallback;
@@ -528,447 +498,6 @@ export class KnowledgeHub {
     return raw;
   }
 
-  private async stopTheLineSweep(now: number): Promise<void> {
-    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("stop_line_sweep_minutes", "5"), 10) || 5));
-    if (periodMin === 0) return; // explicitly disabled
-    const last = Number(this.settingValue("stop_line_last_sweep_ts", "0")) || 0;
-    if (now - last < periodMin * 60_000) return;
-    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the alarm
-    const setLast = (ts: number) =>
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('stop_line_last_sweep_ts', ?)`, String(ts));
-    setLast(now);
-
-    const repo = this.settingValue("stop_line_repo", "state-vector/bridge");
-    const base = this.settingValue("stop_line_gh_api_base", "https://api.github.com").replace(/\/$/, "");
-    const headers = { "User-Agent": "bridge-stop-the-line-sweep", "Accept": "application/vnd.github+json" };
-    const ghGet = async (path: string): Promise<Response> => {
-      const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
-      if (res.status === 403 || res.status === 429) {
-        // unauthenticated GitHub quota is per egress IP and shared — back off
-        // a full quota window rather than hammering; a skipped cycle only
-        // delays an alert, it can never fake a green.
-        setLast(now + 60 * 60_000);
-        throw new Error(`github rate limited (HTTP ${res.status}) — backed off 60m`);
-      }
-      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
-      return res;
-    };
-
-    const head = await (await ghGet("/commits/main")).json() as any;
-    const sha = String(head?.sha ?? "");
-    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`commits/main returned no sha`);
-    const runsBody = await (await ghGet(`/commits/${sha}/check-runs?per_page=100`)).json() as any;
-    const verdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
-
-    if (verdict.verdict === "green") {
-      this.audit("hub:stop-the-line", "green", null, { sha: sha.slice(0, 9), green: verdict.green });
-      return;
-    }
-    if (verdict.verdict !== "red") {
-      // unsettled/empty: CI still running (or nothing ran) — the gate blocks
-      // merges on its own; here we only wait. A red line pages, a running
-      // line does not.
-      this.audit("hub:stop-the-line", "quiet", null, { sha: sha.slice(0, 9), verdict: verdict.verdict, unsettled: verdict.unsettled.slice(0, 5) });
-      return;
-    }
-
-    const names = verdict.red.map((r) => r.name);
-    const title = stopLineAskTitle(sha, names);
-    const sinkId = this.settingValue("stop_line_artefact_id", STOP_LINE_SINK_ID);
-    // the guilty chain rides the page (BR#3307, residue of BR#3287 spec
-    // item 4): the ask names not just the red checks but the attributed
-    // merge — PR · task · verdict · session · signer — from the provenance
-    // index; honest absence when the sweep has not stamped it yet
-    const chain = await this.guiltyChain(sha);
-    // explicit open-ask check (same rule askCreate enforces) — keeps the
-    // audit trail honest about skips. Questions are a TYPE in the ask
-    // contract (the legacy `question` tag is stripped on write), so match
-    // on type — a tag match would never fire and every re-sweep would fall
-    // through to askCreate's guard and 400 instead of deduping quietly.
-    const dup = this.one(
-      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question' AND c.title = ? LIMIT 1`,
-      sinkId, title.slice(0, 200),
-    );
-    if (dup) {
-      this.audit("hub:stop-the-line", "already_alerted", String(dup.id), { sha: sha.slice(0, 9), red: names });
-    } else {
-      const details = [
-        `**STOP THE LINE — bridge main is RED.** Destination-green precondition (accepted decision BR#3009): merges halt until main is green. The \`main-green gate\` required check blocks every PR merge mechanically; this ask is the loud half.`,
-        ``,
-        `**Red checks on main ${sha.slice(0, 9)}:**`,
-        ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
-        ``,
-        `**Guilty chain:** ${this.guiltyChainLine(chain, sha)}`,
-        ``,
-        `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation. The alert stands until the merge commit's checks come back green.`,
-        ``,
-        `_Filed once per red episode by the hub sweep (BR#3008), deduped per main-HEAD sha — not per PR._`,
-      ].join("\n");
-      const created = await this.askCreate(
-        {
-          to: "rayh",
-          urgency: "time-sensitive",
-          question: title,
-          details,
-          reason: "destination-green precondition (accepted BR#3009): main's HEAD has failing checks; every merge onto main is mechanically blocked until green",
-          options: ["Acknowledge — on it", "Line stays stopped until green"],
-          artefact_id: sinkId,
-        },
-        "hub:stop-the-line",
-      );
-      this.audit("hub:stop-the-line", "alert", String(created.id), { sha: sha.slice(0, 9), red: names });
-    }
-    // the claimable half (BR#3284): the ask above is ATTENTION; the episode
-    // task is the WORK — one P0 task per red episode, deduped per sha,
-    // superseding the prior open episode task when a new red sha arrives.
-    await this.stopLineEpisodeTask(sha, verdict, sinkId, ghGet);
-  }
-
-  // ---------- the P0 episode task (BR#3284) ----------
-  // The ask pages; the task claims. When main's HEAD is RED the sweep files,
-  // alongside the ask, ONE claimable P0 task per red episode:
-  //   - deduped per main-HEAD sha (same rule as the ask — one live episode
-  //     task at a time; a re-sweep of the same sha audits and skips);
-  //   - child_of the sink (BR#3124) — the episode family under one anchor;
-  //   - body: red check names + run links, the first failing sha (the merge
-  //     that broke the line — bisect walk below) + the PR that landed it,
-  //     the remediation-merge exception (BR#3009/BR#3010), and the done-when;
-  //   - priority is STRUCTURAL, not vibes: meta.boosted (the existing human-
-  //     boost mechanism — priority 0 in the pickup ranking, first on the
-  //     board's ranked queue) + the p0/stop-the-line/gtm-blocker tag chips;
-  //   - when a NEW red sha arrives, the prior OPEN episode task is superseded
-  //     (direct audited write, the same mechanical pattern the separation
-  //     guard and the smoke purge use — a system actor filing machinery, not
-  //     a session claiming; the supersedes relation + superseded_reason point
-  //     the old card's readers at the replacement).
-  private async stopLineEpisodeTask(
-    sha: string,
-    verdict: MainCheckVerdict,
-    sinkId: string,
-    ghGet: (path: string) => Promise<Response>,
-  ): Promise<void> {
-    const shortSha = sha.slice(0, 9);
-    const title = `STOP-THE-LINE: bridge main RED @ ${shortSha} — fix main first`;
-    // dedupe: exactly one LIVE episode task per red episode (per main-HEAD sha)
-    const dup = this.one(
-      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'task' AND c.title = ? LIMIT 1`,
-      sinkId, title.slice(0, 200),
-    );
-    if (dup) {
-      this.audit("hub:stop-the-line", "already_tasked", String(dup.id), { sha: shortSha, red: verdict.red.map((r) => r.name) });
-      return;
-    }
-
-    // attribution: which merge broke the line? One bounded walk per episode
-    // (the dedupe above keeps this off the re-sweep path) — never per sweep.
-    const bisect = await this.stopLineBisect(ghGet, sha);
-    // the guilty chain (BR#3307): the bisect names the breaking sha; the
-    // provenance index turns it into PR → task → verdict → session → signer
-    const chain = await this.guiltyChain(bisect.first_failing_sha);
-    const culprit = bisect.first_failing_sha
-      ? bisect.first_failing_pr
-        ? `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} — PR [#${bisect.first_failing_pr.number}](${bisect.first_failing_pr.html_url}) "${bisect.first_failing_pr.title}" (merged ${bisect.first_failing_pr.merged_at ?? "unknown"}) landed the break.`
-        : `**First failing sha:** ${bisect.first_failing_sha.slice(0, 9)} — the PR that landed it could not be resolved (bisect walked ${bisect.walked} commit(s)); check merge history.`
-      : `**First failing sha:** bisect unavailable (${bisect.note ?? "history walk failed"}) — check the run history of recent merges manually.`;
-    const body = [
-      `**STOP-THE-LINE episode task** — bridge main HEAD ${shortSha} is RED. Merges are mechanically halted by the \`main-green gate\` (accepted decision BR#3009, destination-green precondition). This task is the claimable priority item for putting the line back up. Work continues on branches (worktrees) — only the line stops.`,
-      ``,
-      `**Red checks on ${shortSha}:**`,
-      ...verdict.red.map((r) => `- ${r.name} (${r.conclusion}) — ${r.url || "run URL unavailable"}`),
-      ``,
-      culprit,
-      ``,
-      `**Guilty chain:** ${this.guiltyChainLine(chain, bisect.first_failing_sha)}`,
-      ``,
-      `**The one exception — the remediation merge:** a PR green on the exact failing checks (receipted by the \`main-green gate\` carve-out) may merge as the remediation — precedent BR#3010 (PR #168, the 2026-10-24 do.test.ts rig fix). The alert stands until the merge commit's checks come back green.`,
-      ``,
-      `**Done when:** main tip has ALL check-runs settled green (0 red, 0 unsettled) and the \`main-green gate\` reopens — close this task citing the green run receipts.`,
-      ``,
-      `_Filed once per red episode by the hub sweep (BR#3008 + BR#3284), deduped per main-HEAD sha. The ask in the sink (BR#3124) is the attention channel; this task is the work._`,
-    ].join("\n");
-    const created = await this.create(
-      {
-        type: "task",
-        title,
-        body_md: body,
-        // sanitizeTags lowercases (board tags are canonically lowercase — the
-        // chip renders "p0"); role:impl declares the intended work kind for
-        // pickup per the task-publishing norm (Ray's impl cards carry it).
-        tags: ["stop-the-line", "p0", "gtm-blocker", "role:impl"],
-        // the sweep KNOWS the scope, culprit and done-when — it analyzed the
-        // episode as it filed it; publish claimable, not gate-throttled
-        qualified: true,
-        meta: {
-          purpose: "stop-the-line episode task",
-          stop_line: {
-            sha,
-            short_sha: shortSha,
-            red: verdict.red.map((r) => ({ name: r.name, conclusion: r.conclusion, url: r.url })),
-            green_checks: verdict.green,
-            unsettled: verdict.unsettled,
-            first_failing_sha: bisect.first_failing_sha ?? undefined,
-            first_failing_pr: bisect.first_failing_pr,
-            // the resolved guilty chain (BR#3307): null when the provenance
-            // sweep has not stamped the breaking merge yet — honest absence
-            guilty_chain: chain.rec ? {
-              repo: chain.rec.repo, pr: chain.rec.pr,
-              task_id: chain.rec.task?.id ?? null, verdict_id: chain.rec.verdict_id,
-              session: chain.rec.session, signer: chain.rec.signer,
-            } : null,
-            sink_id: sinkId,
-          },
-          // priority 0 — the existing urgent handling: first on the board's
-          // ranked queue, top of the pickup ranking (same shape the human
-          // boost endpoint writes; audited once below as part of the filing)
-          boosted: Date.now(),
-        },
-      },
-      "hub:stop-the-line",
-    );
-    this.state.storage.sql.exec(
-      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-      created.id, sinkId, Date.now(),
-    );
-    // one live episode task at a time: the prior OPEN episode task (a
-    // DIFFERENT red sha — same-sha re-sweeps deduped above) is over by
-    // definition; its sha is no longer main's HEAD. Supersede it with a
-    // supersedes relation so the old card's readers land on the replacement.
-    const prior = this.one(
-      `SELECT id, status, meta FROM artefacts
-       WHERE type = 'task' AND status IN ('todo','in_progress','blocked') AND id != ?
-         AND title LIKE 'STOP-THE-LINE: bridge main RED @ %'
-       ORDER BY created_ts DESC LIMIT 1`,
-      created.id,
-    );
-    if (prior) {
-      const ts = Date.now();
-      const pm = JSON.parse(prior.meta ?? "{}");
-      pm.superseded_reason = `new red main episode @ ${shortSha} — superseded by ${created.id} (one live episode task at a time)`;
-      pm.superseded_by = created.id;
-      this.state.storage.sql.exec(
-        `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-        JSON.stringify(pm), ts, ts, prior.id,
-      );
-      this.state.storage.sql.exec(
-        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
-        created.id, prior.id, ts,
-      );
-      this.version(prior.id, "hub:stop-the-line", "transition", `superseded — new red main episode ${shortSha} (${created.id})`, { from: prior.status, to: "superseded" });
-      this.audit("hub:stop-the-line", "episode_superseded", prior.id, { by: created.id, from: prior.status, new_sha: shortSha });
-    }
-    this.audit("hub:stop-the-line", "episode_task", String(created.id), {
-      sha: shortSha, red: verdict.red.map((r) => r.name),
-      first_failing: bisect.first_failing_sha?.slice(0, 9) ?? "unresolved", boosted: true,
-    });
-  }
-
-  // ---------- episode attribution walk (bisect) ----------
-  // Walk main's recent history (newest → oldest, bounded) to the first
-  // failing sha: the newest commit back from HEAD whose parent settles green
-  // is the merge that broke the line. Unauthenticated GitHub quota is shared
-  // per egress IP, so the walk is CAPPED and any error downgrades to
-  // "bisect unavailable" on the card — a failed attribution never blocks the
-  // filing, and the settled-green boundary always stops the walk.
-  private async stopLineBisect(
-    ghGet: (path: string) => Promise<Response>,
-    headSha: string,
-  ): Promise<{ first_failing_sha?: string; first_failing_pr?: { number: number; title: string; html_url: string; merged_at: string | null }; walked: number; note?: string }> {
-    const WALK = 10;
-    try {
-      const listBody = await (await ghGet(`/commits?per_page=${WALK}`)).json() as any;
-      const commits: string[] = (Array.isArray(listBody) ? listBody : [])
-        .map((c: any) => String(c?.sha ?? ""))
-        .filter((s: string) => /^[0-9a-f]{40}$/.test(s));
-      for (let i = 1; i < commits.length; i++) {
-        const runsBody = await (await ghGet(`/commits/${commits[i]}/check-runs?per_page=100`)).json() as any;
-        const v = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []);
-        if (v.verdict !== "green") continue; // red/unsettled/empty — still inside the red episode, keep walking
-        // commits[i] settles green → its child (commits[i-1], or HEAD itself
-        // when the walk finds green immediately) broke the line
-        const firstFailing = commits[i - 1] || headSha;
-        let pr: { number: number; title: string; html_url: string; merged_at: string | null } | undefined;
-        try {
-          const pullsBody = await (await ghGet(`/commits/${firstFailing}/pulls`)).json() as any;
-          const pulls: any[] = Array.isArray(pullsBody) ? pullsBody : [];
-          const pick = pulls.find((p) => p?.merged_at) ?? pulls[0];
-          if (pick) pr = {
-            number: Number(pick.number),
-            title: String(pick.title ?? ""),
-            html_url: String(pick.html_url ?? ""),
-            merged_at: pick.merged_at ?? null,
-          };
-        } catch { /* pulls lookup failed — the sha is still reported */ }
-        return { first_failing_sha: firstFailing, first_failing_pr: pr, walked: i };
-      }
-      return { walked: commits.length, note: `no settled-green commit within ${WALK} commits of main` };
-    } catch (e) {
-      return { walked: 0, note: String((e as Error).message ?? e).slice(0, 200) };
-    }
-  }
-
-  // ---------- standing merge-queue sweep (BR#3198) ----------
-  // The deterministic executor of the BR#3033 standing merge order ("merge
-  // when green") — the run-side complement of BR#3008's stop-the-line gate.
-  // Every tick (paced by `merge_sweep_minutes`, default 15, 0 = off), for each
-  // OPEN PR on both repos, oldest first:
-  //   superseded-check → 5c mechanical gate (mergeable + clean + every commit
-  //   GitHub-verified + base green + head checks green) + an ACCEPTED
-  //   verify-verdict decision covering the current head → merge (squash per
-  //   repo norm). Mechanical defects auto-bounce the linked card with the
-  //   exact defect; human-leg defects (externals, signing environment) are
-  //   collected into ONE class ask per repo per episode, never one per PR.
-  //
-  // Identity: merges as the token's identity — deploy GH_TOKEN as the
-  // detached-cody credential per BR#3181, never rayh's personal credentials.
-  // Settings: `merge_sweep_minutes` (default 15), `merge_sweep_repos` (JSON
-  // array, default both repos), `merge_sweep_methods` (JSON map repo →
-  // "merge" | "squash", default bridge=merge / superpositional=squash),
-  // `merge_sweep_artefact_id` (class-ask sink, default BR#3198),
-  // `merge_sweep_gh_api_base` (drills/tests only).
-  /** PR provenance sweep (BR#3287): index recent merges — sha → PR → task →
-   *  verify-verdict → agent session — stamp task cards (meta.provenance,
-   *  board-side storage of record per decision BR#3291) and mirror
-   *  best-effort to GitHub (derived, never read back). Dedupe per (repo, pr)
-   *  via the provenance table; backfill window bounds the cold-start scan. */
-  private async provenanceSweep(now: number): Promise<void> {
-    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("provenance_sweep_minutes", "15"), 10) || 15));
-    if (periodMin === 0) return; // explicitly disabled
-    const last = Number(this.settingValue("provenance_last_ts", "0")) || 0;
-    if (now - last < periodMin * 60_000) return;
-    const setLast = (ts: number) =>
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('provenance_last_ts', ?)`, String(ts));
-    setLast(now); // pace BEFORE the fetch — a hung GitHub call must not tight-loop the tick
-
-    const token = this.env.GH_TOKEN;
-    if (!token) {
-      this.audit("hub:provenance", "no_identity", null, { note: "GH_TOKEN not configured — provenance sweep cannot read GitHub; skipping (endpoint + backfill resume when it returns)" });
-      return;
-    }
-    const base = this.settingValue("provenance_gh_api_base", "https://api.github.com").replace(/\/$/, "");
-    let repos: string[] = [];
-    try {
-      const parsed = JSON.parse(this.settingValue("provenance_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
-      if (Array.isArray(parsed)) repos = parsed.map(String);
-    } catch { repos = []; }
-    if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
-    const backfillDays = Math.max(1, Math.min(365, parseInt(this.settingValue("provenance_backfill_days", "30"), 10) || 30));
-
-    const ghGet = async (path: string): Promise<any> => {
-      const res = await fetch(`${base}${path}`, {
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "user-agent": "bridge-provenance-sweep (BR#3287)",
-          "x-github-api-version": "2022-11-28",
-        },
-      });
-      if (res.status === 403 || res.status === 429) {
-        setLast(now + 60 * 60_000); // quota exhausted — back off a full window
-        throw new Error(`github rate limited (HTTP ${res.status})`);
-      }
-      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
-      return res.json();
-    };
-
-    let indexed = 0;
-    for (const repo of repos) {
-      let pulls: any[] = [];
-      try {
-        pulls = await ghGet(`/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=50`) as any[];
-      } catch (e) {
-        this.audit("hub:provenance", "repo_error", null, { repo, error: String((e as Error).message ?? e).slice(0, 200) });
-        continue;
-      }
-      for (const pr of pulls) {
-        if (!pr?.merged_at || !pr?.merge_commit_sha || !pr?.number) continue;
-        const mergedAt = withinBackfillWindow(pr.merged_at, now, backfillDays);
-        if (mergedAt === null) continue;
-        const seen = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, pr.number);
-        if (seen) continue; // dedupe per (repo, pr) — provenance is immutable once stamped
-        try {
-          const detail = await ghGet(`/repos/${repo}/pulls/${pr.number}`);
-          const headSha = String(detail?.head?.sha ?? "");
-          const branch = String(detail?.head?.ref ?? "");
-          const cardRef = prCardRef(branch, `${pr.title ?? ""}\n${pr.body ?? ""}\n${detail?.title ?? ""}\n${detail?.body ?? ""}`);
-          const commitsBody = await ghGet(`/repos/${repo}/pulls/${pr.number}/commits?per_page=100`);
-          const commits = (commitsBody ?? []).map((c: any) => ({
-            verified: c?.commit?.verification?.verified === true,
-            committer_email: String(c?.commit?.committer?.email ?? ""),
-          }));
-          const signer = signerFromCommits(commits);
-          let taskId: string | null = cardRef;
-          let verdictId: string | null = null;
-          let session: string | null = null;
-          if (taskId && /^[0-9a-f]{40}$/.test(headSha)) {
-            // accepted verify lineage: decisions derived_from the linked card
-            // citing the head sha (same join the merge sweep uses — body_md
-            // is selected: citations live in the verdict body, not just meta)
-            const decisions = this.state.storage.sql.exec(
-              `SELECT d.id AS id, d.body_md AS body_md, d.meta AS meta FROM relations r
-               JOIN artefacts d ON d.id = r.src_id
-               WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
-              taskId,
-            ).toArray() as any[];
-            // verdict selection (BR#3307 residue): only a decision that
-            // actually cites the head sha may vouch. Human merges and older
-            // merges often have no accepted decision on the exact head —
-            // falling back to decisions[0] would attach an arbitrary stale
-            // verdict to the chain; verdict_id stays null instead (honest
-            // "unverified", the same contract as a missing card link).
-            const onHead = decisions.find((d: any) =>
-              (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9)),
-            );
-            if (onHead) {
-              verdictId = String(onHead.id);
-              try { session = String(JSON.parse(onHead.meta ?? "{}")?.session ?? "") || null; } catch { session = null; }
-            }
-          }
-          this.state.storage.sql.exec(
-            `INSERT OR REPLACE INTO provenance (repo, pr, merge_sha, head_sha, task_id, verdict_id, session, signer, merged_at, stamped_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            repo, pr.number, String(pr.merge_commit_sha), headSha, taskId, verdictId, session, signer, mergedAt, Date.now(),
-          );
-          indexed++;
-          // board-side stamp: the card carries its own provenance (BR#3291)
-          if (taskId) {
-            const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
-            if (row) {
-              const meta = JSON.parse(row.meta ?? "{}");
-              meta.provenance = {
-                pr: pr.number, repo, merge_sha: String(pr.merge_commit_sha).slice(0, 12), head_sha: headSha.slice(0, 12),
-                verdict_id: verdictId, session, signer, merged_at: mergedAt,
-              };
-              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), taskId);
-              this.audit("hub:provenance", "stamped", taskId, { pr: pr.number, repo, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
-            }
-          } else {
-            // class-only record of absence — a merge with no bridge task is
-            // itself a signal (BR#3291: "no bridge provenance" is honest data)
-            this.audit("hub:provenance", "no_card", null, { repo, pr: pr.number, merge_sha: String(pr.merge_commit_sha).slice(0, 9), signer });
-          }
-          // derived GH mirror (BR#3291: non-authoritative, best-effort)
-          if (taskId) {
-            try {
-              await fetch(`${base}/repos/${repo}/issues/${pr.number}/labels`, {
-                method: "POST",
-                headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json" },
-                // label format per README/spec: bridge:BR-<id> (BR#3307 — the
-                // raw card id renders "bridge:BR#3287"; normalize the #)
-                body: JSON.stringify({ labels: [`bridge:${taskId.replace("#", "-")}`] }),
-              });
-            } catch { /* mirror is best-effort only */ }
-          }
-        } catch (e) {
-          this.audit("hub:provenance", "pr_error", null, { repo, pr: pr.number, error: String((e as Error).message ?? e).slice(0, 200) });
-        }
-      }
-    }
-    if (indexed) this.audit("hub:provenance", "indexed", null, { indexed, repos: repos.join(",") });
-  }
 
   /** sha → PR → task → verify-verdict → agent session (BR#3287). Matches by
    *  merge sha or head sha (7+ hex prefix). Returns null when nothing is
@@ -1004,40 +533,6 @@ export class KnowledgeHub {
    *  (the note renders the error, not the honest-absence line) and the
    *  audit trail receipts it (hub:stop-the-line/guilty_chain_error — SP
    *  review round 1, PR #198: silence was the one thing it must not be). */
-  private async guiltyChain(sha: string | null | undefined): Promise<{ rec: any; error?: string }> {
-    if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) return { rec: null };
-    try {
-      return { rec: await this.provenanceBySha(sha) };
-    } catch (e) {
-      const error = String((e as Error).message ?? e).slice(0, 200);
-      this.audit("hub:stop-the-line", "guilty_chain_error", null, {
-        sha: String(sha).slice(0, 9), error,
-      });
-      return { rec: null, error };
-    }
-  }
-
-  /** One markdown chain segment: `PR #N · task BR#X · verdict BR#Y ·
-   *  session s · signer class` — with honest fallback lines: the provenance
-   *  sweep has not stamped the merge yet, or the lookup failed (withheld,
-   *  never guessed). */
-  private guiltyChainLine(chain: { rec: any; error?: string }, sha: string | null | undefined): string {
-    if (chain.error) {
-      return `_provenance lookup failed (${chain.error}) — the chain is withheld rather than guessed; receipted on the audit trail (hub:stop-the-line/guilty_chain_error)_`;
-    }
-    if (!chain.rec) {
-      return `_no bridge provenance for ${sha ? sha.slice(0, 9) : "this sha"} yet — \`GET /api/kb/provenance?sha=\` returns the chain once the provenance sweep stamps the merge_`;
-    }
-    const rec = chain.rec;
-    const prUrl = `https://github.com/${rec.repo}/pull/${rec.pr}`;
-    return [
-      `PR [#${rec.pr}](${prUrl})`,
-      `task ${rec.task?.id ?? "none (no bridge card)"}`,
-      `verdict ${rec.verdict_id ?? "none (unverified merge)"}`,
-      `session ${rec.session ?? "—"}`,
-      `signer ${rec.signer ?? "unknown"}`,
-    ].join(" · ");
-  }
 
   // ---------- unblock-proxy watch (BR#3361a) ----------
   // The BR#3129 class: a parked card's machine-checkable unblock_condition
@@ -1053,30 +548,20 @@ export class KnowledgeHub {
   // spawned duty re-verifies first-hand (its contract says so).
   //
   // Settings: `unblock_proxy_sweep_minutes` (default 15, 0 = off),
-  // `unblock_proxy_gh_api_base` (default https://api.github.com — drills),
   // `unblock_proxy_default_repo` (bare-number fallback for live checks).
-  private proxyGhGet(base: string, token: string | undefined, setBackoff: (ts: number) => void, now: number) {
-    return async (repo: string, path: string): Promise<{ ok: boolean; status: number; body: any }> => {
-      const headers: Record<string, string> = token
-        ? { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "bridge-proxy-watch (BR#3361)" }
-        : { "User-Agent": "bridge-proxy-watch (BR#3361)", "Accept": "application/vnd.github+json" };
-      const res = await fetch(`${base}/repos/${repo}${path}`, { headers });
-      if (res.status === 403 || res.status === 429) {
-        setBackoff(now + 60 * 60_000); // shared per-IP quota — back off a full window
-        throw new Error(`github rate limited (HTTP ${res.status})`);
-      }
-      return { ok: res.ok, status: res.status, body: res.ok ? await res.json() : null };
-    };
-  }
-
+  //
+  // DEGRADED (BR#3516 §8): the hub holds no VCS credentials, ever — the
+  // GitHub-reading proxyGhGet and the unauthenticated fetches are gone. Only
+  // board-state atoms (br_done) still evaluate; GitHub-state atoms stamp
+  // unresolvable (never auto-flip — conservatism law) and the spawned unblock
+  // duty verifies them first-hand, where the creds live.
   /** Live verdict for one proxy atom. `receipt` is the evidence line that
    *  rides the spawned duty's body (and the per-card stamp). */
   private async evalProxyAtom(
     atom: ProxyAtom,
-    io: { ghGet: (repo: string, path: string) => Promise<{ ok: boolean; status: number; body: any }>; defaultRepo: string },
+    io: { defaultRepo: string },
   ): Promise<{ ok: boolean; receipt: string }> {
     const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
-    const brBranch = (atom.brId ?? "").replace("#", "-");
     switch (atom.kind) {
       case "br_done": {
         const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, atom.brId);
@@ -1086,44 +571,23 @@ export class KnowledgeHub {
       }
       case "pr_merged": {
         if (!atom.repo) return unresolvable;
-        const res = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
-        if (!res.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
-        const merged = !!res.body?.merged_at;
-        return { ok: merged, receipt: merged ? `PR ${atom.repo}#${atom.number} MERGED at ${res.body.merged_at}` : `PR ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}, not merged` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516); verify first-hand (gh pr view) or wait for a train event` };
       }
       case "br_pr_merged": {
         if (!atom.repo) return unresolvable;
-        const res = await io.ghGet(atom.repo, `/pulls?head=${atom.repo}:bridge/${brBranch}&state=all&per_page=20`);
-        if (!res.ok) return { ok: false, receipt: `PR lookup for ${atom.brId} HTTP ${res.status}` };
-        const pr = (Array.isArray(res.body) ? res.body : []).find((p: any) => String(p.head?.ref ?? "") === `bridge/${brBranch}`);
-        if (!pr) return { ok: false, receipt: `no PR with head branch bridge/${brBranch} (${atom.brId})` };
-        const merged = !!pr.merged_at;
-        return { ok: merged, receipt: merged ? `PR ${atom.repo}#${pr.number} for ${atom.brId} MERGED at ${pr.merged_at}` : `PR ${atom.repo}#${pr.number} for ${atom.brId} not merged` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state for ${atom.brId} needs credentials the hub does not hold (BR#3516); verify first-hand or wait for a train event` };
       }
       case "issue_closed": {
         if (!atom.repo) return unresolvable;
-        const res = await io.ghGet(atom.repo, `/issues/${atom.number}`);
-        if (!res.ok) return { ok: false, receipt: `issue ${atom.repo}#${atom.number} lookup HTTP ${res.status}` };
-        const closed = res.body?.state === "closed";
-        return { ok: closed, receipt: `issue ${atom.repo}#${atom.number} state=${res.body?.state ?? "?"}` };
+        return { ok: false, receipt: `unresolvable from the hub — issue ${atom.repo}#${atom.number} state needs credentials the hub does not hold (BR#3516); verify first-hand` };
       }
       case "run_success": {
         if (!atom.repo) return unresolvable;
-        const res = await io.ghGet(atom.repo, `/actions/runs/${atom.runId}`);
-        if (!res.ok) return { ok: false, receipt: `run ${atom.runId} lookup HTTP ${res.status}` };
-        const ok = res.body?.status === "completed" && res.body?.conclusion === "success";
-        return { ok, receipt: `run ${atom.runId} status=${res.body?.status ?? "?"} conclusion=${res.body?.conclusion ?? "?"}` };
+        return { ok: false, receipt: `unresolvable from the hub — run ${atom.runId} outcome needs credentials the hub does not hold (BR#3516); verify first-hand` };
       }
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
-        const pr = await io.ghGet(atom.repo, `/pulls/${atom.number}`);
-        if (!pr.ok) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} lookup HTTP ${pr.status}` };
-        const sha = String(pr.body?.head?.sha ?? "");
-        if (!/^[0-9a-f]{40}$/.test(sha)) return { ok: false, receipt: `PR ${atom.repo}#${atom.number} head sha unavailable` };
-        const runs = await io.ghGet(atom.repo, `/commits/${sha}/check-runs?per_page=100`);
-        if (!runs.ok) return { ok: false, receipt: `check-runs lookup HTTP ${runs.status}` };
-        const verdict = classifyMainCheckRuns(Array.isArray(runs.body?.check_runs) ? runs.body.check_runs : []).verdict;
-        return { ok: verdict === "green", receipt: `PR ${atom.repo}#${atom.number} head ${sha.slice(0, 9)} checks verdict=${verdict}` };
+        return { ok: false, receipt: `unresolvable from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
       }
     }
   }
@@ -1154,10 +618,7 @@ export class KnowledgeHub {
     const setLast = (ts: number) =>
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('unblock_proxy_last_ts', ?)`, String(ts));
     setLast(now); // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
-    const base = this.settingValue("unblock_proxy_gh_api_base", "https://api.github.com").replace(/\/$/, "");
-    const token = this.env.GH_TOKEN as string | undefined;
     const defaultRepo = this.settingValue("unblock_proxy_default_repo", "state-vector/superpositional");
-    const ghGet = this.proxyGhGet(base, token, setLast, now);
     const rows = this.state.storage.sql.exec(
       `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
     ).toArray() as any[];
@@ -1175,7 +636,7 @@ export class KnowledgeHub {
           continue;
         }
         const results: { atom: ProxyAtom; ok: boolean; receipt: string }[] = [];
-        for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { ghGet, defaultRepo })) });
+        for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { defaultRepo })) });
         const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
         if (unparseable || unresolvable) {
           // cannot FULLY read the condition — never auto-flip (conservatism law)
@@ -1241,522 +702,6 @@ export class KnowledgeHub {
     }
   }
 
-  // ---------- closure-receipt audit (BR#3361c) ----------
-  // The BR#3220 class: a DONE card reported "GH#2337 fully closed" while the
-  // issue was OPEN on GitHub — the board reported a closed issue that wasn't.
-  // The done gate (done-close-legs) makes receipts mandatory at done time;
-  // THIS sweep makes them TRUE: it live-verifies every receipted close leg
-  // (issue state + closing comment + guard run) after the done and files a
-  // correction duty on any false claim.
-  //
-  // Settings: `closure_audit_minutes` (default 30, 0 = off),
-  // `closure_audit_gh_api_base` (drills), `closure_audit_default_repo`
-  // (bare-number legs resolve here for live checks).
-  private async closureAuditSweep(now: number): Promise<void> {
-    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("closure_audit_minutes", "30"), 10) || 30));
-    if (periodMin === 0) return; // explicitly disabled
-    const last = Number(this.settingValue("closure_audit_last_ts", "0")) || 0;
-    if (now - last < periodMin * 60_000) return;
-    const setLast = (ts: number) =>
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('closure_audit_last_ts', ?)`, String(ts));
-    setLast(now);
-    const base = this.settingValue("closure_audit_gh_api_base", "https://api.github.com").replace(/\/$/, "");
-    const token = this.env.GH_TOKEN as string | undefined;
-    const defaultRepo = this.settingValue("closure_audit_default_repo", "state-vector/superpositional");
-    const ghGet = this.proxyGhGet(base, token, setLast, now);
-    // bound the pass: quota is shared — leftovers wait for the next cycle
-    const rows = this.state.storage.sql.exec(
-      `SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'done'
-       AND json_extract(meta, '$.close_leg_audit.legs') IS NOT NULL
-       AND json_extract(meta, '$.close_leg_audit.checked_ts') IS NULL LIMIT 10`,
-    ).toArray() as any[];
-    for (const r of rows) {
-      try {
-        const meta = JSON.parse(r.meta ?? "{}");
-        const audit = meta.close_leg_audit;
-        const checks: { repo: string; number: number; issue: string; comment: string; guard: string; ok: boolean }[] = [];
-        let allOk = true;
-        for (const leg of audit.legs ?? []) {
-          const receipt = (audit.receipts ?? []).find((x: any) => x.number === leg.number) ?? {};
-          const repo = leg.repo ?? defaultRepo;
-          let issue = "not checked", comment = "no comment id in receipt", guard = "no guard run in receipt", ok = true;
-          const iss = await ghGet(repo, `/issues/${leg.number}`);
-          if (iss.ok) {
-            issue = `state=${iss.body?.state}`;
-            if (iss.body?.state !== "closed") { ok = false; allOk = false; }
-          } else {
-            issue = `lookup HTTP ${iss.status}`;
-            ok = false; allOk = false; // an unverifiable receipt is not a good receipt
-          }
-          if (receipt.commentId && /^\d{6,}$/.test(String(receipt.commentId))) {
-            const c = await ghGet(repo, `/issues/${leg.number}/comments/${receipt.commentId}`);
-            comment = c.ok ? `comment ${receipt.commentId} exists` : `comment ${receipt.commentId} HTTP ${c.status}`;
-            if (!c.ok) { ok = false; allOk = false; }
-          }
-          if (receipt.guardRun && /^\d{6,}$/.test(String(receipt.guardRun))) {
-            const g = await ghGet(repo, `/actions/runs/${receipt.guardRun}`);
-            guard = g.ok ? `guard run ${receipt.guardRun} exists (${g.body?.conclusion ?? "?"})` : `guard run ${receipt.guardRun} HTTP ${g.status}`;
-            // a guard id that resolves nowhere is suspicious but not damning
-            // (it may live in another repo) — the issue + comment legs decide
-          }
-          checks.push({ repo, number: leg.number, issue, comment, guard, ok });
-        }
-        meta.close_leg_audit.checked_ts = now;
-        meta.close_leg_audit.verdict = allOk ? "ok" : "false";
-        meta.close_leg_audit.checks = checks;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
-        if (allOk) {
-          this.audit("hub:closure-audit", "closure_receipt_ok", r.id, { checks: checks.map((c) => `${c.repo}#${c.number} ${c.issue} ${c.comment}`) });
-          continue;
-        }
-        const detail = checks.map((c) => `${c.repo}#${c.number}: ${c.issue}; ${c.comment}; ${c.guard}`).join(" | ");
-        this.audit("hub:closure-audit", "closure_receipt_false", r.id, { detail: detail.slice(0, 300) });
-        this.version(r.id, "hub:closure-audit", "note", `CLOSURE RECEIPT AUDIT — FALSE: ${detail.slice(0, 300)}`, { checks });
-        // one correction duty per false receipt (flood-guarded)
-        const stamp = meta.last_correction_spawn;
-        if (!(stamp && typeof stamp.at === "number" && now - stamp.at < UNBLOCK_FLOOD_MS)) {
-          const created = await this.create(
-            {
-              type: "task",
-              title: `Correction: false closure receipt on ${r.id}`,
-              session: "", // session-less spawn: the closer stamps it when they claim
-              body_md: `A done card's closure receipt failed the hub's live audit (BR#3361 — the BR#3220 class: the board reported a closed issue that wasn't).\n\nCard: ${r.id} (done, claims close legs with receipts)\nAudit: ${detail}\n\nContract: (1) verify the live state of each leg first-hand (gh issue view). (2) If the issue is OPEN, the close never happened — execute the close per the card's grammar and correct the card record (a progress note correcting the false claim, citing the real receipt: state=closed + closing-comment id + guard run id). (3) If the issue IS closed and the receipt was merely stale/wrong-shaped, correct the record to the true receipt. (4) Close yourself done citing the corrected receipts.`,
-              roles: ["unblock"],
-            },
-            "hub:closure-audit",
-          );
-          this.state.storage.sql.exec(
-            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-            created.id, r.id, Date.now(),
-          );
-          meta.last_correction_spawn = { at: now, child: created.id };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
-          this.audit("hub:closure-audit", "correction_spawned", r.id, { child: created.id });
-        }
-      } catch (e) {
-        this.audit("hub:closure-audit", "sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 300) });
-      }
-    }
-  }
-
-  private async mergeQueueSweep(now: number): Promise<void> {
-    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("merge_sweep_minutes", "15"), 10) || 15));
-    if (periodMin === 0) return; // explicitly disabled
-    const last = Number(this.settingValue("merge_sweep_last_ts", "0")) || 0;
-    if (now - last < periodMin * 60_000) return;
-    const setLast = (ts: number) =>
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last_ts', ?)`, String(ts));    // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
-    setLast(now);
-
-    const token = this.env.GH_TOKEN;
-    if (!token) {
-      this.audit("hub:merge-sweep", "no_identity", null, { note: "GH_TOKEN not configured — the sweep cannot merge as detached-cody (BR#3181); skipping, never merging unauthenticated" });
-      return;
-    }
-    const base = this.settingValue("merge_sweep_gh_api_base", "https://api.github.com").replace(/\/$/, "");
-    let repos: string[] = [];
-    try {
-      const parsed = JSON.parse(this.settingValue("merge_sweep_repos", JSON.stringify(["state-vector/bridge", "state-vector/superpositional"])));
-      if (Array.isArray(parsed)) repos = parsed.map(String);
-    } catch { repos = []; }
-    if (!repos.length) repos = ["state-vector/bridge", "state-vector/superpositional"];
-    let methods: Record<string, string> = {};
-    try {
-      const parsed = JSON.parse(this.settingValue("merge_sweep_methods", JSON.stringify({ "state-vector/bridge": "merge", "state-vector/superpositional": "squash" })));
-      if (parsed && typeof parsed === "object") methods = parsed;
-    } catch { methods = {}; }
-
-    // PR disposition law knobs (BR#3312/BR#3315): every open PR gets exactly
-    // one disposition per pass — merged, closed-with-reason, or advancing
-    // with a clock. Default ON; the clock rows fail safe on unknown data.
-    const prDispositionEnabled = /^(1|true|on|yes)$/i.test(this.settingValue("pr_disposition_enabled", "1"));
-    const prStaleDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_stale_days", "7"), 10) || 7));
-    const prOrphanDays = Math.max(1, Math.min(365, parseInt(this.settingValue("pr_orphan_days", "3"), 10) || 3));
-    const prGraceHours = Math.max(1, Math.min(720, parseInt(this.settingValue("pr_grace_hours", "48"), 10) || 48));
-
-    const ghGet = async (path: string): Promise<any> => {
-      const res = await fetch(`${base}${path}`, {
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "user-agent": "bridge-merge-sweep (BR#3198)",
-          "x-github-api-version": "2022-11-28",
-        },
-      });
-      if (res.status === 403 || res.status === 429) {
-        setLast(now + 60 * 60_000); // quota exhausted — back off a full window
-        throw new Error(`github rate limited (HTTP ${res.status})`);
-      }
-      if (!res.ok) throw new Error(`github ${path} -> HTTP ${res.status}`);
-      return res.json();
-    };
-
-    const cardRef = (text: string): string | null => {
-      const m = /BR#(\d+)/.exec(text ?? "");
-      return m ? `BR#${m[1]}` : null;
-    };
-
-    /** Append a progress note WITHOUT touching status or claims — receipts and
-     *  mechanical-defect notes on cards the sweep must not disturb. */
-    const sweepNote = (id: string, note: string) => {
-      const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
-      if (!row) return;
-      const meta = JSON.parse(row.meta ?? "{}");
-      meta.last_progress = { note: note.slice(0, 500), sentiment: "neutral", actor: "system:merge-sweep", ts: Date.now() };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), id);
-      this.audit("system:merge-sweep", "progress", id, { note: note.slice(0, 500) });
-      this.version(id, "system:merge-sweep", "progress", note.slice(0, 500), { note: note.slice(0, 500) });
-    };
-
-    /** Terminal-state closure (BR#3312): never silent — the reason comment is
-     *  the receipt ON the PR (comment FIRST: a failed comment aborts the
-     *  close), then the card note. PRs are reopenable; the card keeps intent. */
-    const closeWithReason = async (repo: string, prNumber: number, reason: string, linked: string | null) => {
-      const comment = await fetch(`${base}/repos/${repo}/issues/${prNumber}/comments`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "content-type": "application/json",
-          "user-agent": "bridge-merge-sweep (BR#3315)",
-        },
-        body: JSON.stringify({ body: reason }),
-      });
-      if (!comment.ok) throw new Error(`close-reason comment POST -> HTTP ${comment.status}`);
-      const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
-        method: "PATCH",
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "content-type": "application/json",
-          "user-agent": "bridge-merge-sweep (BR#3315)",
-        },
-        body: JSON.stringify({ state: "closed", state_reason: "not_planned" }),
-      });
-      if (!close.ok) throw new Error(`close PATCH -> HTTP ${close.status}`);
-      if (linked) sweepNote(linked, `${reason.slice(0, 380)} — PR #${prNumber} closed by the merge sweep`);
-    };
-
-    const results: any[] = [];
-    for (const repo of repos) {
-      const humanLegs: string[] = [];
-      try {
-        const pulls = await ghGet(`/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100`) as any[];
-        // base-green precondition, once per repo per sweep
-        const head = await ghGet(`/repos/${repo}/commits/main`);
-        const baseSha = String(head?.sha ?? "");
-        let baseVerdict: "green" | "red" | "unsettled" | "empty" = "empty";
-        if (/^[0-9a-f]{40}$/.test(baseSha)) {
-          const runsBody = await ghGet(`/repos/${repo}/commits/${baseSha}/check-runs?per_page=100`);
-          baseVerdict = classifyMainCheckRuns(Array.isArray(runsBody?.check_runs) ? runsBody.check_runs : []).verdict;
-        }
-
-        for (const pr of pulls) {
-          const prNumber = pr.number;
-          try {
-            const detail = await ghGet(`/repos/${repo}/pulls/${prNumber}`);
-            const prText = `${pr.title ?? ""}\n${pr.body ?? ""}\n${detail.title ?? ""}\n${detail.body ?? ""}`;
-            // provenance join (BR#3287): the head branch (bridge/BR-<id>) is the
-            // authoritative key; PR text is the fallback.
-            const linked = cardRef(prText)
-              ?? prCardRef(String(detail?.head?.ref ?? "").replace(/^refs\/heads\//, ""), prText);
-            const card = linked ? this.one(`SELECT id, status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, linked) : null;
-            const cardStatus = card ? String(card.status) : null;
-
-            // accepted verify lineage: decisions derived_from the linked card
-            // whose body/meta cites the current head sha
-            let verifyAcceptedAny = false;
-            let verifyAcceptedOnHead = false;
-            const headSha = String(detail?.head?.sha ?? "");
-            if (linked && /^[0-9a-f]{40}$/.test(headSha)) {
-              const decisions = this.state.storage.sql.exec(
-                `SELECT d.body_md AS body_md, d.meta AS meta FROM relations r
-                 JOIN artefacts d ON d.id = r.src_id
-                 WHERE r.relation = 'derived_from' AND r.dst_id = ? AND d.type = 'decision' AND d.status = 'accepted'`,
-                linked,
-              ).toArray() as any[];
-              verifyAcceptedAny = decisions.length > 0;
-              verifyAcceptedOnHead = decisions.some((d: any) =>
-                (String(d.body_md ?? "") + String(d.meta ?? "")).includes(headSha.slice(0, 9)),
-              );
-            }
-
-            const commitsBody = await ghGet(`/repos/${repo}/pulls/${prNumber}/commits?per_page=100`);
-            const commits = (commitsBody ?? []).map((c: any) => ({
-              sha: String(c?.sha ?? ""),
-              verified: c?.commit?.verification?.verified === true,
-              ts: Date.parse(String(c?.commit?.committer?.date ?? c?.commit?.author?.date ?? "")),
-            }));
-            const headChecksBody = await ghGet(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`);
-            const headChecks = Array.isArray(headChecksBody?.check_runs) ? headChecksBody.check_runs : [];
-
-            const action = decideMergeAction({
-              prNumber, prTitle: String(detail?.title ?? pr.title ?? ""),
-              headSha, baseVerdict,
-              mergeable: detail?.mergeable ?? null,
-              mergeStateStatus: detail?.merge_state_status ?? null,
-              commits, headChecks, cardStatus,
-              verifyAcceptedAny, verifyAcceptedOnHead,
-            });
-
-            // ---- PR disposition law (BR#3312/BR#3315) --------------------
-            // activity = max(pr.updated_at, last commit ts): reviews/comments
-            // and force-pushes bump updated_at, so the PR's own liveness is
-            // the newest of the two.
-            const lastActivityTs = [
-              Date.parse(String(pr.updated_at ?? "")),
-              ...commits.map((c: any) => Number(c?.ts)),
-            ].filter(Number.isFinite).reduce<number | null>((m, t) => (m == null || t > m ? t : m), null);
-            const prCreatedRaw = Date.parse(String(pr.created_at ?? ""));
-            const prCreatedAt = Number.isFinite(prCreatedRaw) ? prCreatedRaw : null;
-
-            // card advancing = in flight with a clock: in_progress/in_review
-            // only while the card itself is recently updated (a dead session's
-            // card ages out of the shield), blocked only with a park stamped
-            // within the stale window (a live unblock condition).
-            let cardAdvancing = false;
-            let cardOwner: string | null = null;
-            let cardTerminalNote: string | null = null;
-            if (card) {
-              cardOwner = card.owner ? String(card.owner) : null;
-              const cmeta = JSON.parse(String(card.meta ?? "{}"));
-              const cardUpdated = Number(card.updated_ts ?? 0);
-              const windowMs = prStaleDays * 86_400_000;
-              if (cardStatus === "in_progress" || cardStatus === "in_review")
-                cardAdvancing = cardUpdated > 0 && now - cardUpdated <= windowMs;
-              else if (cardStatus === "blocked") {
-                const parkTs = Number(cmeta?.blocked?.ts ?? 0);
-                cardAdvancing = parkTs > 0 && now - parkTs <= windowMs;
-              }
-              cardTerminalNote = cmeta?.superseded_reason ? String(cmeta.superseded_reason) : null;
-            }
-
-            // provenance: a RESOLVABLE bridge record — the linked card row, or
-            // the BR#3287 index (a re-opened formerly-merged PR keeps its row).
-            // A BR#-text ref whose card row is gone is absence, not provenance.
-            const hasProvenance = card != null
-              || !!this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, prNumber);
-
-            // escalation episode state, deduped per PR (settings stamp with ts)
-            const escKey = `pr_escalated_${repo}_${prNumber}`;
-            let escalatedAt: number | null = null;
-            let escalationAskId: string | null = null;
-            const escRaw = this.settingValue(escKey, "");
-            if (escRaw) {
-              try {
-                const p = JSON.parse(escRaw);
-                escalatedAt = Number(p?.ts) || null;
-                escalationAskId = p?.ask_id ? String(p.ask_id) : null;
-              } catch { escalatedAt = Number(escRaw) || null; }
-            }
-            const activitySinceEscalation = escalatedAt != null && lastActivityTs != null && lastActivityTs > escalatedAt;
-            if (escalatedAt != null && activitySinceEscalation) {
-              // owner responded — the episode is resolved, the clock resets
-              this.state.storage.sql.exec(`DELETE FROM settings WHERE key = ?`, escKey);
-              if (linked) sweepNote(linked, `PR #${prNumber}: owner responded after the escalation — episode resolved, stale clock reset`);
-            }
-
-            let disposition: PrDisposition | null = null;
-            if (prDispositionEnabled) {
-              disposition = decidePrDisposition({
-                gate: action, repo, prNumber, now,
-                lastActivityTs, cardId: linked, cardStatus, cardAdvancing,
-                hasProvenance, prCreatedAt, cardTerminalNote,
-                escalatedAt, escalationAskId, activitySinceEscalation,
-                prStaleDays, prOrphanDays, prGraceHours,
-              });
-              if (disposition.kind === "close_superseded" && action.kind !== "close_superseded") {
-                // done/rejected card — the law closes what the gate skipped quietly
-                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
-                results.push({ repo, pr: prNumber, kind: "close_superseded" });
-                this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber, cause: "card_terminal" });
-                continue;
-              }
-              if (disposition.kind === "close_orphan") {
-                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
-                results.push({ repo, pr: prNumber, kind: "close_orphan" });
-                continue;
-              }
-              if (disposition.kind === "close_stale") {
-                await closeWithReason(repo, prNumber, `PR closed by the merge sweep (terminal-state law BR#3312): ${disposition.reason}`, linked);
-                results.push({ repo, pr: prNumber, kind: "close_stale" });
-                // the card keeps the work's intent as unclaimed todo — PRs are
-                // reopenable, the deliverable outlives its vehicle
-                if (linked && card && !["done", "superseded", "rejected", "todo"].includes(cardStatus)) {
-                  try {
-                    await this.transition(
-                      { id: linked, to: "todo", note: `PR #${prNumber} closed by the merge sweep (stale) — work intent stays here as unclaimed todo; revive by re-opening or re-submitting a PR. (${disposition.reason.slice(0, 200)})` },
-                      "system:merge-sweep",
-                    );
-                  } catch (e) {
-                    this.audit("system:merge-sweep", "release_card_error", linked, { error: String((e as Error).message ?? e).slice(0, 200) });
-                  }
-                }
-                continue;
-              }
-              if (disposition.kind === "escalate" && linked && card) {
-                const to = cardOwner && isValidAskTarget(cardOwner) && !/^(web|system)/.test(cardOwner) ? cardOwner : "any";
-                const created = await this.askCreate(
-                  {
-                    to,
-                    urgency: "normal",
-                    question: disposition.question,
-                    details: [
-                      `**Merge-sweep escalation (terminal-state law BR#3312 — one bound ask per staleness episode).**`,
-                      ``,
-                      `- PR: https://github.com/${repo}/pull/${prNumber}`,
-                      `- card: ${linked} (${cardStatus ?? "no row"}${cardAdvancing ? ", advancing" : ", not advancing"})`,
-                      `- last PR activity: ${lastActivityTs != null ? new Date(lastActivityTs).toISOString() : "unknown"} (> ${prStaleDays}d ago)`,
-                      ``,
-                      `Do one of: **merge** (it is verified/merge-ready), **rebase** (freshen the head), or **close the PR with a reason** — within ${prGraceHours}h. On silence the sweep closes the PR with a reason citing this ask; the card keeps the work's intent as unclaimed todo and the PR is reopenable.`,
-                    ].join("\n"),
-                    reason: "merge-sweep escalation: PR stale past pr_stale_days with the card not advancing — one bound ask, then close-with-reason",
-                    options: ["Merging/rebasing now", "Closing with reason", "Release the card — not mine"],
-                    artefact_id: linked,
-                  },
-                  "system:merge-sweep",
-                );
-                this.state.storage.sql.exec(
-                  `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
-                  escKey, JSON.stringify({ ts: now, ask_id: created.id }),
-                );
-                sweepNote(linked, `${disposition.reason} — escalation ${created.id} filed on ${to}`);
-                results.push({ repo, pr: prNumber, kind: "escalate", ask: created.id });
-                this.audit("system:merge-sweep", "escalate", linked, { repo, pr: prNumber, ask: created.id, to });
-                continue;
-              }
-              // merge | bounce | passthrough → the pre-law arms below (unchanged)
-            }
-
-            if (action.kind === "merge") {
-              const method = methods[repo] === "squash" ? "squash" : "merge";
-              const mergeRes = await fetch(`${base}/repos/${repo}/pulls/${prNumber}/merge`, {
-                method: "PUT",
-                headers: {
-                  authorization: `Bearer ${token}`,
-                  accept: "application/vnd.github+json",
-                  "content-type": "application/json",
-                  "user-agent": "bridge-merge-sweep (BR#3198)",
-                },
-                body: JSON.stringify({ merge_method: method }),
-              });
-              if (mergeRes.ok) {
-                const merged = await mergeRes.json().catch(() => ({}));
-                const receipt = `${action.receipt} — mergeCommit ${String((merged as any)?.sha ?? "unknown").slice(0, 9)}`;
-                if (linked) sweepNote(linked, receipt);
-                results.push({ repo, pr: prNumber, kind: "merge", sha: String((merged as any)?.sha ?? "").slice(0, 9) });
-                this.audit("system:merge-sweep", "merge", linked, { repo, pr: prNumber, method, receipt: receipt.slice(0, 300) });
-              } else if (mergeRes.status === 405 || mergeRes.status === 409) {
-                // GitHub raced us: no longer mergeable — bounce like any mechanical defect
-                const defect = `PR #${prNumber} merge refused by GitHub (HTTP ${mergeRes.status}) — no longer mergeable/clean. Rebase, resolve, re-push, re-enter the queue`;
-                if (linked && cardStatus === "in_review") await this.transition({ id: linked, to: "in_progress", note: defect }, "system:merge-sweep");
-                else if (linked) sweepNote(linked, defect);
-                results.push({ repo, pr: prNumber, kind: "bounce", defect });
-              } else {
-                throw new Error(`merge PUT -> HTTP ${mergeRes.status}`);
-              }
-            } else if (action.kind === "close_superseded") {
-              const close = await fetch(`${base}/repos/${repo}/issues/${prNumber}`, {
-                method: "PATCH",
-                headers: {
-                  authorization: `Bearer ${token}`,
-                  accept: "application/vnd.github+json",
-                  "content-type": "application/json",
-                  "user-agent": "bridge-merge-sweep (BR#3198)",
-                },
-                body: JSON.stringify({ state: "closed", state_reason: "not_planned" }),
-              });
-              if (close.ok) {
-                if (linked) sweepNote(linked, `${action.reason} — PR #${prNumber} closed by the merge sweep (superseded-check first)`);
-                results.push({ repo, pr: prNumber, kind: "close_superseded" });
-                this.audit("system:merge-sweep", "close_superseded", linked, { repo, pr: prNumber });
-              } else throw new Error(`close PATCH -> HTTP ${close.status}`);
-            } else if (action.kind === "bounce") {
-              if (linked && cardStatus === "in_review") {
-                await this.transition({ id: linked, to: "in_progress", note: action.defect }, "system:merge-sweep");
-              } else if (linked) {
-                sweepNote(linked, action.defect);
-              }
-              results.push({ repo, pr: prNumber, kind: "bounce", defect: action.defect });
-              this.audit("system:merge-sweep", "bounce", linked, { repo, pr: prNumber, defect: action.defect.slice(0, 300) });
-            } else if (action.kind === "note") {
-              if (linked) sweepNote(linked, action.reason);
-              results.push({ repo, pr: prNumber, kind: "note" });
-            } else if (action.kind === "human_leg") {
-              humanLegs.push(action.reason);
-              results.push({ repo, pr: prNumber, kind: "human_leg" });
-            } else {
-              // skip: quiet, no note spam — but the audit trail keeps it honest
-              this.audit("system:merge-sweep", "skip", linked, { repo, pr: prNumber, reason: action.reason.slice(0, 300) });
-              results.push({ repo, pr: prNumber, kind: "skip", reason: action.reason.slice(0, 120) });
-            }
-          } catch (e) {
-            // one PR's failure must never stop the sweep — log and move on
-            this.audit("system:merge-sweep", "pr_error", null, { repo, pr: prNumber, error: String((e as Error).message ?? e).slice(0, 300) });
-            results.push({ repo, pr: prNumber, kind: "pr_error", error: String((e as Error).message ?? e).slice(0, 120) });
-          }
-        }
-
-        // human legs → ONE class ask per repo per episode (rule 5c), deduped
-        if (humanLegs.length) {
-          const sinkId = this.settingValue("merge_sweep_artefact_id", "BR#3198");
-          const title = mergeSweepHumanLegTitle(repo, humanLegs);
-          const dup = this.one(
-            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-               AND c.type = 'question' AND c.title = ? LIMIT 1`,
-            sinkId, title.slice(0, 200),
-          );
-          if (dup) {
-            this.audit("system:merge-sweep", "human_leg_dupe", String(dup.id), { repo, legs: humanLegs.slice(0, 5) });
-          } else {
-            const created = await this.askCreate(
-              {
-                to: "rayh",
-                urgency: "normal",
-                question: title,
-                details: [
-                  `**Human-leg merge blockers (BR#3198 class ask — one ask per class, never per PR).**`,
-                  ``,
-                  ...humanLegs.map((r) => `- ${r}`),
-                  ``,
-                  `_These are the only defects the standing merge sweep (BR#3198) cannot resolve autonomously. Everything mechanical was bounced with the exact defect on the linked card._`,
-                ].join("\n"),
-                reason: "merge sweep collected human-leg defects into the single class ask per rule 5c",
-                options: ["Acknowledge — on it", "Redirect the class"],
-                artefact_id: sinkId,
-              },
-              "system:merge-sweep",
-            );
-            this.audit("system:merge-sweep", "human_leg_ask", String(created.id), { repo, legs: humanLegs.slice(0, 5) });
-            results.push({ repo, pr: null, kind: "human_leg_ask", ask: created.id });
-          }
-        }
-      } catch (e) {
-        this.audit("system:merge-sweep", "repo_error", null, { repo, error: String((e as Error).message ?? e).slice(0, 300) });
-        results.push({ repo, pr: null, kind: "repo_error", error: String((e as Error).message ?? e).slice(0, 120) });
-      }
-    }
-
-    this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO settings (key, value) VALUES ('merge_sweep_last', ?)`,
-      JSON.stringify({
-        ts: now,
-        merged: results.filter((r) => r.kind === "merge").length,
-        bounced: results.filter((r) => r.kind === "bounce").length,
-        closed: results.filter((r) => r.kind === "close_superseded").length,
-        escalated: results.filter((r) => r.kind === "escalate").length,
-        closed_orphan: results.filter((r) => r.kind === "close_orphan").length,
-        closed_stale: results.filter((r) => r.kind === "close_stale").length,
-        human_legs: results.filter((r) => r.kind === "human_leg").length,
-        skipped: results.filter((r) => r.kind === "skip").length,
-        results: results.slice(0, 50),
-      }),
-    );
-    const summary = results.filter((r) => ["merge", "bounce", "close_superseded", "close_orphan", "close_stale", "escalate", "human_leg_ask"].includes(r.kind));
-    if (summary.length)
-      this.audit("system:merge-sweep", "sweep", null, { repos, n: summary.length, actions: summary.slice(0, 20) });
-  }
 
   async eventsSince(since: number, limit: number) {
     // since=0 → the most recent window (newest first, returned oldest-first);
@@ -2180,6 +1125,25 @@ export class KnowledgeHub {
         stamped_at INTEGER NOT NULL,
         PRIMARY KEY (repo, pr)
       );
+      CREATE TABLE IF NOT EXISTS train_events (
+        -- merge train ledger (BR#3516/BR#3517): every lane op is
+        -- executor-fed and hub-decided, so the ledger is the only durable
+        -- record of what the train did and why. seq orders the train's
+        -- causal chain per lane; provenance links merge_sha back to the
+        -- sha→PR→task→verdict→session chain above.
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        kind TEXT NOT NULL, -- merged | bounced | stopped | landed | queued
+        repo TEXT NOT NULL,
+        base TEXT NOT NULL,
+        gateway TEXT,
+        pr INTEGER,
+        task_id TEXT,
+        merge_sha TEXT,
+        head_sha TEXT,
+        detail TEXT -- JSON: reason, carry record, verdict citations
+      );
+      CREATE INDEX IF NOT EXISTS idx_train_events_lane ON train_events (repo, base, seq);
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -2503,6 +1467,7 @@ export class KnowledgeHub {
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
           case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
           case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
+          case "/train": return this.json(await this.trainStatus({ repo: url.searchParams.get("repo") ?? "" }));
         }
       } catch (e) {
         return this.json({ error: String((e as Error).message ?? e) }, 400);
@@ -2524,13 +1489,19 @@ export class KnowledgeHub {
         case "search": return this.json(await this.search(body));
         case "provenance": { const rec = await this.provenanceBySha(parseProvenanceSha(new URLSearchParams({ sha: String((body as any)?.sha ?? "") }))); return rec ? this.json(rec) : this.json({ error: "no bridge provenance for this sha", sha: String((body as any)?.sha ?? "") }, 404); }
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
-        case "enrich": return this.json(await this.enrich(body, actor));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats());
         case "get_history": return this.json(await this.getHistory(String(body.id ?? ""), Number(body.limit ?? 100)));
+        // ---- merge train (BR#3516/BR#3517): executor-fed facts, hub decides ----
+        case "train.lease": return this.json(await this.trainLease(body, actor));
+        case "train.event": return this.json(await this.trainEvent(body, actor));
+        case "train.ci": return this.json(await this.trainCi(body, actor));
+        case "train.status": return this.json(await this.trainStatus(body));
+        case "train.history": return this.json(await this.trainHistory(body));
+        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
@@ -2580,42 +1551,13 @@ export class KnowledgeHub {
         case "admin.token_tags":
         case "admin.settings_get":
         case "admin.settings_set":
-        case "admin.stop_line_sweep":
-        case "admin.merge_queue_sweep":
-        case "admin.provenance_sweep":
         case "admin.unblock_proxy_sweep":
-        case "admin.closure_audit_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
-          if (op === "admin.stop_line_sweep") {
-            // drill/liveness path for the destination-green sweep (BR#3008):
-            // dedupe still applies; pass now=<future epoch ms> to also bypass
-            // the cadence window (the next scheduled sweep waits it out).
-            await this.stopTheLineSweep(Number(body.now ?? Date.now()));
-            const last = this.one(`SELECT value FROM settings WHERE key = 'stop_line_last_sweep_ts'`);
-            return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
-          }
-          if (op === "admin.merge_queue_sweep") {
-            // bootstrap/dispatch path for the standing merge-queue sweep
-            // (BR#3198): pass now=<future epoch ms> to bypass the cadence
-            // window and run immediately; identity + dedupe rules apply.
-            await this.mergeQueueSweep(Number(body.now ?? Date.now()));
-            const sweepLast = this.one(`SELECT value FROM settings WHERE key = 'merge_sweep_last'`);
-            return this.json({ ok: true, last_sweep: sweepLast ? JSON.parse(sweepLast.value) : null });
-          }
-          if (op === "admin.provenance_sweep") {
-            // drill/backfill path for PR provenance indexing (BR#3287):
-            // dedupe per (repo, pr) still applies; pass now=<future epoch ms>
-            // to bypass the cadence window and run immediately.
-            await this.provenanceSweep(Number(body.now ?? Date.now()));
-            const last = this.one(`SELECT value FROM settings WHERE key = 'provenance_last_ts'`);
-            const n = this.one(`SELECT COUNT(*) AS n FROM provenance`);
-            return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0), indexed: Number((n as any)?.n ?? 0) });
-          }
           if (op === "admin.unblock_proxy_sweep") {
             // drill/liveness path for the unblock-proxy watch (BR#3361a):
             // per-card pacing + caps still apply; pass now=<future epoch ms>
@@ -2624,14 +1566,10 @@ export class KnowledgeHub {
             const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
             return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
           }
-          if (op === "admin.closure_audit_sweep") {
-            // drill/liveness path for the closure-receipt audit (BR#3361c):
-            // the per-pass row cap still applies; pass now=<future epoch ms>
-            // to bypass the cadence window and run immediately.
-            await this.closureAuditSweep(Number(body.now ?? Date.now()));
-            const last = this.one(`SELECT value FROM settings WHERE key = 'closure_audit_last_ts'`);
-            return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
-          }
+          // admin.stop_line_sweep / admin.merge_queue_sweep /
+          // admin.provenance_sweep / admin.closure_audit_sweep DELETED with
+          // the sweeps themselves (BR#3516 §8): the hub holds no VCS
+          // credentials; the executor runs the train, the hub watches leases.
           return this.json(await this.settingsSet(body));
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
@@ -2791,11 +1729,9 @@ export class KnowledgeHub {
       if (target) await this.supersedeStaleVerdicts(target, id, `superseded by ${id} — newer verdict for same target`);
     }
     await this.embedArtefact(id, title, bodyMd);
-    // GitHub auto-enrichment: "#1886" in the title pulls issue body/labels
-    if (this.env.GH_TOKEN) {
-      const ref = issueRef(title);
-      if (ref) { try { await this.enrichFromGitHub(id, ref); } catch { /* GH unavailable — stay bare */ } }
-    }
+    // GitHub auto-enrichment was DELETED with the hub's GH_TOKEN paths
+    // (BR#3516 §1: the hub holds no VCS credentials — enrichment is an
+    // executor/agent concern, worker-local creds defended by doctor).
     if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
     return { id, type, status };
   }
@@ -3518,9 +2454,15 @@ export class KnowledgeHub {
         }
       }
     } catch { /* the fence is observability — never blocks the gate */ }
+    // body_md rides the transition too when the caller supplies it (the train's
+    // bounce/stop briefs append to the card body on the same write) — absent a
+    // supplied body, the existing body is preserved.
+    const nextBodyMd = typeof body.body_md === "string" && body.body_md.trim()
+      ? body.body_md
+      : String(row.body_md ?? "");
     this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ? WHERE id = ?`,
-      verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), id,
+      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
+      verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
     );
     // post-conditions on the single write path: violations are breaches (a
     // loud audited trail), never silent repairs.
@@ -3544,6 +2486,21 @@ export class KnowledgeHub {
       ...(body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
+    // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
+    // card is the ACCEPT event — stamp the card's PR provenance and queue it
+    // onto the train (the train owns delivery; the verifier never merges).
+    // The hub parses the PR + head from BOARD data only (no hub GitHub calls).
+    if (row.type === "task" && verdict.status === "done" && parseTags(row.roles ?? "").includes("review")) {
+      try {
+        const parent = this.one(
+          `SELECT p.id AS id FROM relations r JOIN artefacts p ON p.id = r.dst_id WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+          id,
+        );
+        if (parent?.id) await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+      } catch (e) {
+        this.audit("system:merge-train", "queue_hook_error", id, { error: String((e as Error).message ?? e).slice(0, 200) });
+      }
+    }
     // verify-verdict decisions are actionable: the human's answer DOES the
     // thing, not just records it. Accepting a VERIFIED verdict closes the
     // verified task (the accepted decision satisfies its done-gate via the
@@ -3557,12 +2514,25 @@ export class KnowledgeHub {
         const isBounce = String(dm.verdict ?? "").toLowerCase() === "bounce";
         if (target) {
           // verifiers often apply their own verdict before proposing it — the
-          // task is already done/bounced. Ratification must be a clean no-op,
-          // not an "apply failed" error the human has to interpret.
-          const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, target);
-          const already = cur && (isBounce ? cur.status === "in_progress" : cur.status === "done");
+          // task is already done/bounced/queued. Ratification must be a clean
+          // no-op, not an "apply failed" error the human has to interpret.
+          const cur = this.one(`SELECT status, roles, meta FROM artefacts WHERE id = ?`, target);
+          const curRoles = parseTags((cur as any)?.roles ?? "");
+          const targetIsVerify = curRoles.includes("review");
+          const already = cur && (isBounce
+            ? cur.status === "in_progress"
+            : targetIsVerify
+              ? cur.status === "done"
+              : String(JSON.parse(cur.meta ?? "{}")?.merge_train?.state ?? "") === "queued");
           if (already) {
             this.audit(actor, "verdict_already_applied", target, { decision: id, status: cur.status });
+          } else if (!isBounce && !targetIsVerify && cur?.status === "in_progress") {
+            // VERIFIED verdict landing on an IMPL card: under the serialized
+            // merge train the card is QUEUED, not closed (BR#3516 — the train
+            // owns delivery; the merge event closes it later). Same accept
+            // event as the verify-close hook, cited from the decision body.
+            await this.trainQueueOnAccept(target, { note: String((meta?.body_md ?? this.one(`SELECT body_md FROM artefacts WHERE id = ?`, id)?.body_md) ?? "") }, actor);
+            this.audit(actor, "verdict_applied", target, { decision: id, effect: "queued" });
           } else try {
             await this.transition(
               {
@@ -3611,7 +2581,7 @@ export class KnowledgeHub {
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYOU ARE THE MERGE AUTHORITY — substance review AND the merge click are both yours (standing order BR#3033: base green + checks green + verified signatures + mergeable → merge, no human gate).\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n4. "Sole unmet leg = human merge gate" is only valid for a MERGEABLE, checks-green, substance-verified PR. "Accept the unsigned commit" is never an option.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.\n\nMERGE: when substance AND mergeability both hold, YOU merge the PR (gh pr merge <N> — merge-commit, the repo convention) citing the merge sha. Done-with-receipts = merged + reviewed + merge sha in the note. Problems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces — impl fixes and re-enters the SAME round). The loop runs until YOU merge and close.`,
+              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${id} to blocked with note \`merge-train: queued\` — the train gates it, merges it, waits out main CI, and closes it citing the mergeCommit (machine proxy: mergeCommit non-null AND main green).\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`,
               roles: ["review"],
             },
             actor,
@@ -5390,74 +4360,550 @@ export class KnowledgeHub {
     return { settings: this.settingsMap() };
   }
 
-  // ---------- GitHub enrichment ----------
+  // ---------- serialized merge train (BR#3516) ----------
+  // Lane card primitive + lease CAS + train events + the derived queue, on
+  // the DO. Division of labour: the EXECUTOR (scripts/merge-train.mjs on a
+  // gateway machine, worker-local gh, doctor-defended) fetches GitHub facts
+  // and performs the merge; the HUB decides (this state machine) and holds
+  // NO VCS credentials — every fact here was reported by a gateway, the
+  // verify duty's close note, or the queue derive. Pinned in
+  // test/merge-train.test.ts + test/train-hub.test.ts.
 
-  private ghCache = new Map<string, { ts: number; data: any }>();
-
-  private async ghIssue(num: number): Promise<any | null> {
-    if (!this.env.GH_TOKEN) return null;
-    const repo = this.settingsMap().github_repo ?? "state-vector/superpositional";
-    const key = `${repo}#${num}`;
-    const hit = this.ghCache.get(key);
-    if (hit && Date.now() - hit.ts < 600_000) return hit.data;
-    try {
-      const r = await fetch(`https://api.github.com/repos/${repo}/issues/${num}`, {
-        headers: {
-          authorization: `Bearer ${this.env.GH_TOKEN}`,
-          accept: "application/vnd.github+json",
-          "user-agent": "bridge-kb",
-        },
-      });
-      if (!r.ok) return null;
-      const data = await r.json();
-      this.ghCache.set(key, { ts: Date.now(), data });
-      return data;
-    } catch { return null; }
-  }
-
-  /** Pull issue body/labels into a bare artefact. Idempotent via the "## From GitHub" marker. */
-  private async enrichFromGitHub(id: string, num: number) {
-    const row = this.one(`SELECT title, body_md, tags, updated_ts FROM artefacts WHERE id = ?`, id);
-    if (!row || (row.body_md ?? "").includes("## From GitHub")) return null;
-    const issue = await this.ghIssue(num);
-    if (!issue) return null;
-    const labels: string[] = (issue.labels ?? []).map((l: any) => String(l.name ?? l));
-    const body = `${row.body_md ?? ""}\n## From GitHub — #${num}\n**${issue.title}** · state: ${issue.state}${labels.length ? ` · labels: ${labels.join(", ")}` : ""}\n\n${String(issue.body ?? "").slice(0, 2000)}\n`;
-    const existing = parseTags(row.tags);
-    const merged = [...new Set([...existing, ...labels.map((l) => l.toLowerCase().replace(/[^a-z0-9:_-]/g, "-"))])].slice(0, 10);
-    this.state.storage.sql.exec(
-      `UPDATE artefacts SET body_md = ?, tags = ?, updated_ts = ? WHERE id = ?`,
-      body, JSON.stringify(merged), Date.now(), id,
+  /** Lane card lookup by meta.lane.key (exact). */
+  private laneRow(laneKeyValue: string): any {
+    return this.one(
+      `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? LIMIT 1`,
+      laneKeyValue,
     );
-    await this.embedArtefact(id, row.title, body);
-    this.audit("system", "enrich", id, { issue: num });
-    return id;
   }
 
-  /** Enrich one or all bare, issue-referencing tasks. */
-  private async enrich(body: any, actor: string) {
-    if (!this.env.GH_TOKEN) throw new Error("GH_TOKEN not configured — GitHub enrichment unavailable");
-    const targets = body.id
-      ? [String(body.id)]
-      : this.state.storage.sql.exec(
-          `SELECT id, title, body_md FROM artefacts
-           WHERE type = 'task' AND status = 'open' OR (type = 'task' AND status IN ('todo','in_progress','blocked'))
-           ORDER BY updated_ts DESC LIMIT 50`,
-        ).toArray()
-          .filter((r: any) => !(r.body_md ?? "").includes("## From GitHub"))
-          .map((r: any) => r.id);
-    const done: string[] = [];
-    for (const id of targets) {
-      const row = this.one(`SELECT title, body_md FROM artefacts WHERE id = ?`, id);
-      if (!row) continue;
-      const num = issueRef(row.title);
-      if (num && !(row.body_md ?? "").includes("## From GitHub")) {
-        const r = await this.enrichFromGitHub(id, num);
-        if (r) done.push(id);
+  /** Find-or-create the standing lane card for (repo, base). Seed config:
+   *  settings key `train_lane` (JSON map keyed by "repo@base" →
+   *  {required_workflows, ci_typical_minutes}); the card's meta.lane is the
+   *  working copy (config, never hardcoded — BR#3516 §1). */
+  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
+    const key = laneKey(repo, base);
+    const existing = this.laneRow(key);
+    if (existing) {
+      // config updates ride the op that knows better (operator/executor):
+      // required_workflows / ci_typical_minutes refresh in place.
+      const cur = laneOfMeta(existing.meta);
+      if (cfg && cur && (cfg.required_workflows || cfg.ci_typical_minutes != null) &&
+          (JSON.stringify(cfg.required_workflows ?? cur.required_workflows) !== JSON.stringify(cur.required_workflows) ||
+            (cfg.ci_typical_minutes ?? cur.ci_typical_minutes) !== cur.ci_typical_minutes)) {
+        const meta = JSON.parse(existing.meta ?? "{}");
+        meta.lane = { ...meta.lane, ...(cfg.required_workflows ? { required_workflows: cfg.required_workflows } : {}), ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}) };
+        meta.lane.key = key;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), existing.id);
+        this.audit(actor, "train_lane_config", existing.id, { lane: meta.lane });
+      }
+      return existing;
+    }
+    // seed from settings (admin.settings_set) — the operator's lane config
+    let seeded: Partial<LaneSpec> = cfg ?? {};
+    try {
+      const raw = this.settingValue("train_lane", "");
+      if (raw) {
+        const map = JSON.parse(raw);
+        const s = map?.[key] ?? {};
+        seeded = { required_workflows: Array.isArray(s.required_workflows) ? s.required_workflows.map(String) : undefined, ci_typical_minutes: typeof s.ci_typical_minutes === "number" ? s.ci_typical_minutes : undefined, ...seeded };
+      }
+    } catch { /* no/broken setting — defaults hold */ }
+    const lane: LaneSpec = { repo, base, required_workflows: seeded.required_workflows ?? [], ci_typical_minutes: seeded.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES };
+    const alarmSink = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+    const created = await this.create(
+      {
+        type: "task",
+        title: laneCardTitle(repo, base),
+        body_md: laneCardBody(lane, { alarm_sink: alarmSink }),
+        meta: { lane: { ...lane, key }, lease: null, currently: null, stop: null },
+        tags: ["merge-train", "infrastructure"],
+      },
+      actor,
+    );
+    // infrastructure card: blocked from birth, never claimed. The merge_train
+    // flag suppresses the unblock-duty spawn (the train advances this card).
+    // The blocked-needs-path invariant demands the unblock condition — the
+    // lane's exit path is the executor, not an agent.
+    await this.transition(
+      {
+        id: created.id,
+        to: "blocked",
+        note: "merge-train: awaiting an available gateway",
+        merge_train: true,
+        unblock_condition: "the train advances this card — run scripts/merge-train.mjs on a gateway (doctor-gated)",
+      },
+      actor,
+    );
+    this.audit(actor, "create", created.id, { type: "task", auto: "lane", lane_key: key });
+    return this.laneRow(key);
+  }
+
+  /** Recompute the lane card's blocked reason from its meta — the ONLY
+   *  reason-writer, so the lane always shows the truth (idle / leased /
+   *  awaiting CI / stopped / no gateway). Idempotent. */
+  private laneSyncReason(laneId: string, meta: any, now: number): string {
+    const lane = laneOfMeta(meta);
+    const lease: TrainLease | null = meta.lease ?? null;
+    const currently = meta.currently ?? null;
+    const stop = meta.stop ?? null;
+    let reason: string;
+    if (stop) reason = `merge-train: STOPPED — ${stop.reason} (resume when the line is green)`;
+    else if (currently) {
+      const who = lease ? ` by ${lease.holder}` : "";
+      reason = `merge-train: leased${who} — awaiting CI on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr})`;
+    } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
+    else reason = "merge-train: awaiting an available gateway";
+    if (meta.blocked?.reason !== reason) {
+      meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run scripts/merge-train.mjs on a gateway (doctor-gated)" };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), laneId);
+    }
+    return reason;
+  }
+
+  /** Arm (G) — train-watch: lease staleness (the hub's credential-free
+   *  monitoring job). A lapsed lease is cleared and the lane shows the honest
+   *  `awaiting an available gateway`; the next gateway reconciles from live
+   *  GitHub and acquires. No GitHub calls, no asks (an idle lane is not an
+   *  incident — the red line is, and that lives in the stopped flow). */
+  private async trainWatchSweep(now: number): Promise<void> {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
+    ).toArray() as any[];
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const lease: TrainLease | null = meta.lease ?? null;
+        const lapsed = !!lease && lease.expires_ts <= now;
+        if (lapsed) {
+          const holder = lease!.holder;
+          meta.lease = null;
+          const reason = this.laneSyncReason(r.id, meta, now);
+          this.audit("system:merge-train", "lease_lapsed", r.id, { holder, expired_at: new Date(lease!.expires_ts).toISOString(), reason });
+          this.version(r.id, "system:merge-train", "lease_lapsed", `lease of ${holder} lapsed — ${reason}`, {});
+        } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:")) {
+          // reason drifted (older class version) — resync to the truth
+          this.laneSyncReason(r.id, meta, now);
+        }
+      } catch (e) {
+        this.audit("system:merge-train", "watch_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
       }
     }
-    this.audit(actor, "enrich", null, { count: done.length });
-    return { enriched: done };
+  }
+
+  /** train.lease — the CAS op. The DO is single-threaded, so the
+   *  read-check-write is atomic by construction; leaseDecide is the check.
+   *  holder defaults to the authenticated actor (the acting gateway). */
+  private async trainLease(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const action: LeaseAction = ["acquire", "renew", "release"].includes(String(body.action)) ? body.action : null;
+    if (!action) throw new Error("action must be acquire | renew | release");
+    const holder = String(body.holder ?? actor).trim() || actor;
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const now = Date.now();
+    const decided = leaseDecide(meta.lease ?? null, now, holder, action);
+    if (decided.ok === false) throw Object.assign(new Error(decided.reason), { lease_conflict: true });
+    meta.lease = decided.lease;
+    // acquisition carries the executor's lane config (required workflows —
+    // config, never hardcoded); release clears the stop when the line is green again.
+    if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null)) {
+      meta.lane = { ...meta.lane, ...(body.required_workflows ? { required_workflows: (body.required_workflows as unknown[]).map(String).filter(Boolean) } : {}), ...(body.ci_typical_minutes != null ? { ci_typical_minutes: Number(body.ci_typical_minutes) } : {}) };
+      meta.lane.key = laneKey(repo, base);
+    }
+    if (action === "release" && body.line_green) {
+      meta.stop = null;
+      // the stopped phase's in-flight record is the BROKEN merge commit —
+      // never poll it toward a landing; the culprit card was bounced at stop
+      // time, so the lane simply goes idle.
+      if (meta.currently?.phase === "stopped") meta.currently = null;
+    }
+    const reason = this.laneSyncReason(lane.id, meta, now);
+    this.audit(actor, `train:lease_${action}`, lane.id, { lane: laneKey(repo, base), note: decided.note });
+    this.version(lane.id, actor, `train:lease_${action}`, decided.note, { lease: meta.lease, reason });
+    return { ok: true, lane: laneKey(repo, base), lease: meta.lease, currently: meta.currently ?? null, stop: meta.stop ?? null, reason, note: decided.note };
+  }
+
+  /** Resolve the delivery chain for a queued/landed PR — task, verdict
+   *  (closed verify child), session — board data only, zero GitHub calls
+   *  (BR#3516 §7). */
+  private trainChain(taskId: string | null): { task_id: string | null; verdict_id: string | null; session: string | null } {
+    if (!taskId) return { task_id: null, verdict_id: null, session: null };
+    const v = this.one(
+      `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND c.roles LIKE '%"review"%'
+       ORDER BY c.updated_ts DESC LIMIT 1`,
+      taskId,
+    ) as any;
+    return {
+      task_id: taskId,
+      verdict_id: v?.id ?? null,
+      session: v ? (JSON.parse(v.meta ?? "{}").session ?? null) : null,
+    };
+  }
+
+  /** Stamp the provenance index (BR#3287 chain) from a train:merged event —
+   *  board-side storage of record; the lookup endpoint serves it with zero
+   *  hub GitHub calls. */
+  private trainStampProvenance(rec: { repo: string; pr: number; merge_sha: string; head_sha: string | null; task_id: string | null; verdict_id: string | null; session: string | null; signer: string; merged_at: number }) {
+    this.state.storage.sql.exec(
+      `INSERT INTO provenance (repo, pr, merge_sha, head_sha, task_id, verdict_id, session, signer, merged_at, stamped_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (repo, pr) DO UPDATE SET merge_sha = excluded.merge_sha, head_sha = excluded.head_sha,
+         task_id = excluded.task_id, verdict_id = excluded.verdict_id, session = excluded.session,
+         signer = excluded.signer, merged_at = excluded.merged_at, stamped_at = excluded.stamped_at`,
+      rec.repo, rec.pr, rec.merge_sha, rec.head_sha ?? "", rec.task_id, rec.verdict_id, rec.session, rec.signer, rec.merged_at, Date.now(),
+    );
+  }
+
+  /** train.event — kind merged | bounced | stopped | landed. The acting
+   *  gateway (actor) must hold the lease; every event is audited with the
+   *  gateway for attribution and written to the train_events ledger. */
+  private async trainEvent(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const kind = String(body.kind ?? "").trim();
+    if (!["merged", "bounced", "stopped", "landed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed");
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const now = Date.now();
+    const lease: TrainLease | null = meta.lease ?? null;
+    if (!lease || lease.holder !== actor) throw new Error(`train events require the lane lease — held by ${lease?.holder ?? "nobody"}, you are ${actor}`);
+    const pr = Number(body.pr ?? 0) || null;
+    const headSha = body.head_sha ? String(body.head_sha) : null;
+    const mergeSha = body.merge_sha ? String(body.merge_sha) : null;
+    const row = (id: string) => this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, id);
+    const ev = (detail: Record<string, unknown>, taskId: string | null) => {
+      this.state.storage.sql.exec(
+        `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        now, kind, repo, base, actor, pr, taskId, mergeSha, headSha, JSON.stringify(detail),
+      );
+      this.audit(actor, `train:${kind}`, lane.id, { lane: laneKey(repo, base), pr, task: taskId, sha: mergeSha ?? headSha, ...detail });
+    };
+
+    if (kind === "merged") {
+      if (!mergeSha) throw new Error("train:merged needs merge_sha");
+      if (!pr) throw new Error("train:merged needs pr");
+      const chain = this.trainChain(String(body.task_id ?? "") || null);
+      this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: now });
+      // carry-record: a clean machine update moved the verified head X→Y and
+      // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
+      // meta write: carry + awaiting-ci stamp + provenance + (blocked)
+      // reason, so no leg clobbers another.
+      if (chain.task_id) {
+        const card = row(chain.task_id);
+        if (card) {
+          const cm = JSON.parse(card.meta ?? "{}");
+          const stamped = String(cm.pr?.head_sha_at_acceptance ?? "");
+          let next = cm;
+          if (stamped && headSha && stamped.toLowerCase() !== headSha.toLowerCase()) {
+            next = carryAppend(cm, { from_head: stamped, to_head: headSha, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+            this.version(chain.task_id, actor, "train_carry", `verdict carried across clean update ${stamped.slice(0, 9)}→${headSha.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
+          }
+          next.merge_train = { ...(next.merge_train ?? {}), state: "awaiting-ci", pr, merge_sha: mergeSha, merged_at: now };
+          next.provenance = { repo, pr, head_sha: headSha ?? "", merge_sha: mergeSha, task_id: chain.task_id, verdict_id: chain.verdict_id, session: chain.session, signer: String(body.signer ?? "worker-executor"), merged_at: now };
+          // blocked stays blocked (lifecycle forbids blocked→blocked) — the
+          // state rides meta.merge_train; the reason says awaiting-CI.
+          if (card.status === "blocked") {
+            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main CI pending` };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, chain.task_id);
+          } else {
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
+          }
+        }
+      }
+      meta.currently = { pr, merge_sha: mergeSha, head_sha: headSha, merged_at: now, phase: "awaiting-ci", task_id: chain.task_id };
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")) }, chain.task_id);
+      this.version(lane.id, actor, `train:${kind}`, `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`, { currently: meta.currently, reason });
+      return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, reason };
+    }
+
+    if (kind === "bounced") {
+      if (!pr) throw new Error("train:bounced needs pr");
+      const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
+      const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
+      const card = taskId ? row(taskId) : null;
+      if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
+      const cm = JSON.parse(card.meta ?? "{}");
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id });
+      // blocked→in_progress with the fix-up brief; resolution invalidates the
+      // verdict — the card re-enters the queue only after a fresh verify.
+      await this.transition(
+        {
+          id: taskId,
+          to: "in_progress",
+          note: `merge-train bounce — PR #${pr} conflicts with base${conflictFiles.length ? ` (${conflictFiles.length} file(s))` : ""}`,
+          body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
+        },
+        actor,
+      );
+      cm.merge_train = { ...(cm.merge_train ?? {}), state: "bounced", pr, bounced_at: now };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
+      meta.currently = null;
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      ev({ task: taskId, conflict_files: conflictFiles }, taskId);
+      this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced — ${conflictFiles.length} conflicting file(s); re-verify then re-queue at the back`, { reason });
+      return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, conflict_files: conflictFiles, reason };
+    }
+
+    if (kind === "stopped") {
+      if (!mergeSha && !headSha) throw new Error("train:stopped needs sha (merge_sha or head_sha)");
+      const sha = mergeSha ?? headSha!;
+      const failing: { name: string; conclusion?: string | null; url?: string | null }[] = Array.isArray(body.failing) ? body.failing : [];
+      const culprit = String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null;
+      const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
+      meta.stop = { sha, reason: why, at: now, pr, failing };
+      // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
+      // failing runs; red at admission ⇒ no merge happened, nothing bounces.
+      if (culprit && meta.currently) {
+        const card = row(culprit);
+        if (card && card.status === "blocked") {
+          const lines = [
+            `Merge-train STOP THE LINE: your PR #${pr} landed as ${sha.slice(0, 9)} and broke main — required workflows RED.`,
+            ...failing.map((f) => `- ${f.name}: ${f.conclusion ?? "failed"}${f.url ? ` (${f.url})` : ""}`),
+            ``,
+            `Fix forward or revert, then re-enter review. The lane is stopped until main is green again (BR#3516 §6 — v1 stops the line; no auto-revert).`,
+          ];
+          await this.transition(
+            {
+              id: culprit,
+              to: "in_progress",
+              note: `merge-train stop-the-line — main RED at ${sha.slice(0, 9)}: ${failing.map((f) => f.name).join(", ") || why}`,
+              body_md: `${String(card.body_md ?? "")}\n\n---\n\n${lines.join("\n")}`,
+            },
+            actor,
+          );
+          const cm2 = JSON.parse(card.meta ?? "{}");
+          cm2.merge_train = { ...(cm2.merge_train ?? {}), state: "stopped", pr, sha, at: now };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm2), culprit);
+        }
+      }
+      meta.currently = meta.currently ? { ...meta.currently, phase: "stopped" } : null;
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      // ONE ask per class: the sha+workflows make the title unique per red
+      // episode; askCreate's identical-open-ask guard dedupes the rest.
+      const askTitle = trainStopAskTitle({ repo, base }, sha, failing.map((f) => f.name).length ? failing.map((f) => f.name) : [why]);
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: `the merge train stopped the ${repo}@${base} line — merges halt until green (BR#3516 §6)`,
+            details: [
+              `Lane ${laneKey(repo, base)} stopped by gateway ${actor} at ${new Date(now).toISOString()}.`,
+              `Commit: ${sha}`,
+              failing.length ? `Failing required workflows:\n${failing.map((f) => `- ${f.name}${f.url ? ` — ${f.url}` : ""}`).join("\n")}` : `Reason: ${why}`,
+              culprit ? `Culprit card: ${culprit} (bounced with the failing runs).` : "No merge had landed — stopped at admission.",
+              `Resume: main green again (the executor auto-resumes next tick) or a recorded authority decision.`,
+            ].join("\n\n"),
+            options: ["Ack — on it", "Revert the culprit", "Waive — resume the lane"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        // an identical ask is already open for this episode — that IS one per class
+        this.audit(actor, "train:stopped", lane.id, { ask_deduped: String((e as Error).message ?? e).slice(0, 160) });
+      }
+      ev({ reason: why, failing, culprit }, culprit);
+      this.version(lane.id, actor, `train:${kind}`, `line stopped — ${why}`, { stop: meta.stop, reason });
+      return { ok: true, kind, lane: laneKey(repo, base), sha, stop: meta.stop, reason };
+    }
+
+    // kind === "landed": the hub decides from facts — checks ride the event
+    // and MUST classify green (the executor never self-certifies; a stale or
+    // lying landed is rejected, not applied).
+    if (!meta.currently || meta.currently.phase === "stopped") throw new Error("train:landed with no awaiting-CI merge on the lane");
+    if (!mergeSha || Number(meta.currently.pr) !== Number(pr)) throw new Error(`train:landed must cite the lane's in-flight merge (PR #${meta.currently.pr}, ${String(meta.currently.merge_sha).slice(0, 9)})`);
+    const checks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
+    const laneSpec = laneOfMeta(meta)!;
+    const classified = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
+    if (classified.verdict !== "green") throw new Error(`train:landed rejected — required runs classify ${classified.verdict} (failing: ${classified.failing.map((f) => f.name).join(", ") || "none"}; pending: ${classified.pending.join(", ") || "none"}); post train.ci instead and let the hub decide`);
+    return this.landedFlow(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
+  }
+
+  /** The landed close: impl card blocked→in_progress→done (lifecycle law:
+   *  blocked→done is illegal) citing mergeCommit + main green — the machine
+   *  proxy — then the lane idles and the derived queue advances. */
+  private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null }): Promise<any> {
+    const now = Date.now();
+    const laneSpec = laneOfMeta(meta)!;
+    const taskId: string | null = meta.currently?.task_id ?? null;
+    if (taskId) {
+      const card = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, taskId);
+      if (card && card.status !== "done" && card.status !== "superseded") {
+        const note = trainLandedCloseNote({ repo: laneSpec.repo, prNumber: p.pr, mergeSha: p.mergeSha, gateway: actor, greenRunUrl: p.greenRunUrl });
+        if (card.status === "blocked")
+          await this.transition({ id: taskId, to: "in_progress", note: `merge-train: landed — closing on the machine proxy (mergeCommit ${p.mergeSha.slice(0, 9)} non-null + main green)`, merge_train: true }, actor);
+        await this.transition({ id: taskId, to: "done", note }, actor);
+        const cm = JSON.parse(card.meta ?? "{}");
+        cm.merge_train = { ...(cm.merge_train ?? {}), state: "landed", pr: p.pr, merge_sha: p.mergeSha, landed_at: now };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
+      }
+    }
+    meta.currently = null;
+    const reason = this.laneSyncReason(lane.id, meta, now);
+    this.state.storage.sql.exec(
+      `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+      now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ run: p.greenRunUrl ?? null }),
+    );
+    this.audit(actor, "train:landed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, merge_sha: p.mergeSha });
+    this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed — ${p.mergeSha.slice(0, 9)} green on main; card ${taskId ?? "n/a"} closed`, { reason });
+    return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, reason };
+  }
+
+  /** train.ci — executor-fed CI facts on the lane's merge commit; the HUB
+   *  decides (BR#3516: executor-fed facts, hub-decided). Green ⇒ landed;
+   *  red ⇒ stop-the-line; pending past the bound ⇒ fail-closed stop. */
+  private async trainCi(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const now = Date.now();
+    const lease: TrainLease | null = meta.lease ?? null;
+    if (!lease || lease.holder !== actor) throw new Error(`train.ci requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    if (!meta.currently) {
+      // nothing in flight — the executor is just heartbeating; facts noted.
+      this.audit(actor, "train:ci_idle", lane.id, { lane: laneKey(repo, base), sha: String(body.sha ?? "").slice(0, 9) });
+      return { ok: true, decided: "idle", lane: laneKey(repo, base) };
+    }
+    const sha = String(body.sha ?? "");
+    if (sha && String(meta.currently.merge_sha).toLowerCase() !== sha.toLowerCase())
+      throw new Error(`stale CI report — the lane's in-flight merge is ${String(meta.currently.merge_sha).slice(0, 9)}, not ${sha.slice(0, 9)}`);
+    const checks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
+    const laneSpec = laneOfMeta(meta)!;
+    const v: RequiredRunsVerdict = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
+    const pr = Number(meta.currently.pr);
+    const mergeSha = String(meta.currently.merge_sha);
+    if (v.verdict === "green") {
+      const out = await this.landedFlow(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
+      return { ...out, decided: "landed" };
+    }
+    if (v.verdict === "red") {
+      const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, failing: v.failing }, actor);
+      return { ...out, decided: "stopped" };
+    }
+    // pending — the bound decides: unknown past ~3× typical ⇒ fail-closed
+    if (v.bound_exceeded) {
+      const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)` }, actor);
+      return { ...out, decided: "stopped_bound" };
+    }
+    const reason = this.laneSyncReason(lane.id, { ...meta, currently: { ...meta.currently } }, now);
+    this.audit(actor, "train:ci_pending", lane.id, { lane: laneKey(repo, base), pending: v.pending, missing: v.missing });
+    return { ok: true, decided: "pending", lane: laneKey(repo, base), pending: v.pending, missing: v.missing, reason };
+  }
+
+  /** The ACCEPT hook (verify-side convention, BR#3516 §1): a verify duty
+   *  closing done on an impl card stamps meta.pr{repo, number,
+   *  head_sha_at_acceptance} and queues the card onto the train. Parses the
+   *  PR + head from BOARD data (the close note) — zero hub GitHub calls.
+   *  Idempotent: an already-queued card just re-stamps the (new) head. */
+  private async trainQueueOnAccept(parentId: string, src: { note?: string }, actor: string): Promise<void> {
+    const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
+    if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
+    const meta = JSON.parse(parent.meta ?? "{}");
+    const note = String(src.note ?? "");
+    // the head sha the verifier recorded in the close note (head <40-hex>)
+    const headMatch = TRAIN_HEAD_STAMP_RE.exec(note);
+    const headSha = headMatch ? headMatch[1] : null;
+    // the PR: this note → the parent's stamp → the parent's body
+    const prFrom = (text: string) => {
+      const m = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/.exec(text);
+      return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+    };
+    const ref = prFrom(note) ?? (meta.pr?.repo && meta.pr?.number ? { repo: String(meta.pr.repo), number: Number(meta.pr.number) } : null) ?? prFrom(String(parent.body_md ?? ""));
+    if (!ref) {
+      // not a PR card (or the verifier forgot the link) — nothing to queue
+      this.audit("system:merge-train", "queue_skipped", parentId, { reason: "no PR reference in the close note, stamp, or card body" });
+      return;
+    }
+    if (!headSha && !meta.pr?.head_sha_at_acceptance) {
+      // the verdict cannot be bound to a head — do NOT queue (the train's
+      // gate would fail-closed); stamp the miss and leave the card in flight.
+      meta.merge_train = { ...(meta.merge_train ?? {}), state: "unbound", pr: ref.number, at: Date.now() };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+      this.audit("system:merge-train", "queue_unbound", parentId, { reason: "verify close carried no `head <sha>` — re-verify close must cite the live head before the train can gate it" });
+      return;
+    }
+    meta.pr = { ...(meta.pr ?? {}), repo: ref.repo, number: ref.number, ...(headSha ? { head_sha_at_acceptance: headSha } : {}) };
+    meta.merge_train = { ...(meta.merge_train ?? {}), state: "queued", at: Date.now(), pr: ref.number };
+    const alreadyQueued = parent.status === "blocked" && String(meta.blocked?.reason ?? "").startsWith(MERGE_TRAIN_REASON_PREFIX);
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+    if (!alreadyQueued) {
+      await this.transition(
+        {
+          id: parentId,
+          to: "blocked",
+          note: MERGE_TRAIN_QUEUED_REASON,
+          merge_train: true,
+          unblock_condition: "the merge train advances this card — no agent action needed until it bounces (then fix per the brief)",
+        },
+        actor,
+      );
+    }
+    // the lane card exists before anything can lease it
+    await this.laneEnsure(ref.repo, String(meta.pr.base ?? "main"), actor);
+    this.audit(actor, "train_queued", parentId, { pr: ref.number, repo: ref.repo, head: (headSha ?? "").slice(0, 9), requeued: alreadyQueued });
+    this.version(parentId, actor, "train_queued", `queued on the merge train — ${ref.repo}#${ref.number}${headSha ? ` @ ${headSha.slice(0, 9)}` : ""}${alreadyQueued ? " (re-queued, stamp refreshed)" : ""}`, { pr: ref.number });
+  }
+
+  /** train.status — the lane + derived-queue snapshot (GET /train mirrors
+   *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. */
+  private async trainStatus(body: any): Promise<any> {
+    const repoFilter = String(body?.repo ?? "").trim();
+    const lanes = this.state.storage.sql.exec(
+      `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL ORDER BY title`,
+    ).toArray() as any[];
+    const out: any[] = [];
+    for (const l of lanes) {
+      const meta = JSON.parse(l.meta ?? "{}");
+      const lane = laneOfMeta(meta);
+      if (!lane) continue;
+      if (repoFilter && lane.repo !== repoFilter) continue;
+      const cards = this.state.storage.sql.exec(
+        `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+         AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+      ).toArray() as any[];
+      const queue = mergeTrainQueue(
+        cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
+      ).filter((c) => {
+        const cm = cards.find((x) => x.id === c.id);
+        return cm && String(JSON.parse(cm.meta ?? "{}").merge_train?.repo ?? lane.repo) === lane.repo;
+      });
+      out.push({
+        lane: `${lane.repo}@${lane.base}`,
+        card: l.id,
+        lease: meta.lease ?? null,
+        currently: meta.currently ?? null,
+        stop: meta.stop ?? null,
+        required_workflows: lane.required_workflows,
+        reason: String(meta.blocked?.reason ?? ""),
+        queue,
+      });
+    }
+    return { lanes: out };
+  }
+
+  /** train.history — the train_events ledger (provenance serving). */
+  private trainHistory(body: any): any {
+    const clauses: string[] = [];
+    const args: unknown[] = [];
+    if (body?.repo) { clauses.push("repo = ?"); args.push(String(body.repo)); }
+    if (body?.base) { clauses.push("base = ?"); args.push(String(body.base)); }
+    if (body?.kind) { clauses.push("kind = ?"); args.push(String(body.kind)); }
+    if (body?.pr) { clauses.push("pr = ?"); args.push(Number(body.pr)); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.state.storage.sql.exec(
+      `SELECT seq, ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail FROM train_events ${where} ORDER BY seq DESC LIMIT ?`,
+      ...args, Math.min(Number(body?.limit ?? 50), 200),
+    ).toArray() as any[];
+    return { events: rows.map((r) => ({ ...r, detail: JSON.parse(r.detail ?? "{}") })) };
   }
 
   // ---------- helpers ----------

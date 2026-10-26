@@ -727,6 +727,56 @@ fn doctor() -> bool {
                 Err(e) => ok("token valid", &format!("probe failed: {e}"), &mut bad, false),
             }
         }
+        // ---- merge-train executor prerequisites (BR#3517): gh (authed, repo
+        // scope), git, node with type stripping, and the executor script in
+        // the checkout. Warnings (the doctor serves every CLI, not only train
+        // machines) but each one names the fix. ----
+        let gh_ver = std::process::Command::new("gh").arg("--version").output();
+        ok(
+            "gh present",
+            if gh_ver.map(|o| o.status.success()).unwrap_or(false) { "" } else { "gh not runnable — the merge-train executor needs it (winget/brew install gh)" },
+            &mut bad, false,
+        );
+        let gh_auth = std::process::Command::new("gh").args(["auth", "status"]).output();
+        match gh_auth {
+            Ok(o) if o.status.success() => {
+                ok("gh authed", "", &mut bad, false);
+                let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                if !text.contains("repo") {
+                    ok("gh token scopes", "no `repo` scope — the executor cannot merge; fix: gh auth refresh -h github.com -s repo", &mut bad, false);
+                }
+            }
+            _ => ok("gh authed", "gh auth status failed — run `gh auth login`", &mut bad, false),
+        }
+        let git_ver = std::process::Command::new("git").arg("--version").output();
+        ok(
+            "git present",
+            if git_ver.map(|o| o.status.success()).unwrap_or(false) { "" } else { "git not runnable" },
+            &mut bad, false,
+        );
+        let node_ver = std::process::Command::new("node").arg("--version").output();
+        match node_ver {
+            Ok(o) if o.status.success() => {
+                let v = String::from_utf8_lossy(&o.stdout).trim().trim_start_matches('v').to_string();
+                let major: u32 = v.split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                let detail = if major >= 23 {
+                    String::new()
+                } else {
+                    format!("node {v} — the executor imports the hub's TS helpers; node ≥ 23 (native type stripping) required")
+                };
+                ok("node (executor runtime)", &detail, &mut bad, false);
+            }
+            _ => ok("node (executor runtime)", "node not runnable — scripts/merge-train.mjs cannot start", &mut bad, false),
+        }
+        if !cfg.workdir.is_empty() {
+            let script = std::path::Path::new(&cfg.workdir).join("scripts/merge-train.mjs");
+            let detail = if script.exists() {
+                String::new()
+            } else {
+                format!("missing at {} — pull the merge-train branch (BR#3517)", script.display())
+            };
+            ok("executor script", &detail, &mut bad, false);
+        }
         if model_to_check(&cfg).is_some() {
             let url = format!("{}/v1/models", cfg.url.trim_end_matches('/'));
             let probe = client

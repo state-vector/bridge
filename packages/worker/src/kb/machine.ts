@@ -485,13 +485,16 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // entering blocked: at most ONE live unblock child per parent, ever. Ask
   // gates auto-resume (a spawned child would race the answer); subprocess
   // declarations are silence-on-a-working-task, not a block; unblock duties
-  // don't spawn their own kind.
+  // don't spawn their own kind. Merge-train parks (BR#3516 §2) are
+  // machine-managed: the train itself is the unblock path, and a spawned
+  // child would race the executor's CAS lease — suppressed via merge_train.
   if (
     i.to === "blocked" &&
     r !== "unblock" &&
     !meta.awaiting_ask &&
     !i.body?.awaiting_ask_id &&
-    i.body?.class !== "subprocess"
+    i.body?.class !== "subprocess" &&
+    !i.body?.merge_train
   ) {
     const open = await c.openUnblockChild();
     if (open) {

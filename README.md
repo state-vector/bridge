@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git — every failure names the fix
+bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git, node ≥23, scripts/merge-train.mjs) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -292,16 +292,19 @@ PR link, review verifies with receipts in a fresh session. Separation of duties,
 gates, and verify auto-spawn are enforced server-side in `packages/worker/src/kb/do.ts`,
 not by client convention.
 
-**Verify is the merge authority** (standing order BR#3033). The verify round enforces
-mergeability (main-green gate, checks green, GitHub-verified signatures), reviews substance,
-and — when both hold — **merges the PR itself**, citing the merge sha in its done receipts.
-There is no separate human merge gate for a verified PR. The cycle is: impl works → rebases
-→ pushes a mergeable PR → `in_review`; verify picks it up (rank 0), reviews substance AND
-mechanics; problems found → bounce back to impl with findings (`in_review → in_progress`,
-one round, N bounces — the same verify round re-enters, it never stacks); loop until verify
-merges and closes. Impl owns mergeability *preparation* (rebase before every in_review — a
-conflicting PR is the impl's defect, not the reviewer's); verify owns mergeability
-*enforcement* (confirm, then merge).
+**Verify is the merge authority; the merge train is the executor** (standing order BR#3033,
+re-divisioned by BR#3516). The verify round reviews substance and records an accepted or
+rejected verdict — its accepted verdict is what licenses the merge; the mechanical merge
+itself is executed by the **merge train** (the next section): a credential-holding edge
+executor that runs the 5c gate and merges when the verdict covers the current head and
+checks are green. There is no separate human merge gate for a verified PR. The cycle is:
+impl works → rebases → pushes a mergeable PR → `in_review`; verify reviews substance
+(mergeability confirmed first — rule 5c); findings → bounce back to impl
+(`in_review → in_progress`, one round, N bounces — the same verify round re-enters, it
+never stacks); loop until the train merges and closes. Impl owns mergeability
+*preparation* (rebase before every in_review — a conflicting PR is the impl's defect, not
+the reviewer's); the train owns mergeability *enforcement* (a conflicting, red or unsigned
+PR is bounced with the exact defect — never merged silently).
 
 - Hub defaults: `DEFAULT_ROLE_PLAYBOOKS` in `packages/worker/src/kb/core.ts`.
 - Per-hub overrides: admin settings → **Roles & playbooks** (`settings.roles.*`); clearing
@@ -384,36 +387,28 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   now also requires `Test` and `CLI build (packages/cli)` green on the PR's own head, with
   `strict_required_status_checks_policy` on: the checks must come from the latest head, so
   a stale green never counts. A red-head PR cannot merge even while main is green — the
-  sweep's red-head bounce (`decideMergeAction`) and every human/verify merge now obey the
-  same law: two reds never merge. Deliberately NOT required: the `Superpositional` review
+  train's gate (`decideTrainGate`, composing the standing `decideMergeAction` in
+  `packages/worker/src/kb/core.ts`) enforces the same law: two reds never merge.
+  Deliberately NOT required: the `Superpositional` review
   (a failing review is a quality issue and merge-allowed — a required check would deadlock
   against it) and the BR#2267 externals (Workers builds / deploy previews never gate). The
   bypass actor is unchanged — rayh alone keeps `bypass_mode=always`: the human retains the
   loud escape hatch; machines do not. Proven end-to-end by probe PRs #216 and #217.
-- **The alert**: the hub watchdog sweep (`stopTheLineSweep` in
-  `packages/worker/src/kb/do.ts`, paced by the `stop_line_sweep_minutes` setting, default
-  5 min, `0` = off) reads the same public API and, when main is RED, files ONE
-  time-sensitive ask to you per red episode — deduped per main-HEAD sha under the
-  `ALARM SINK` board card, so ten PRs seeing one red main produce one ask, not ten. A red
-  main pages the board even when nobody opens a PR. The ask carries the **guilty chain**
-  (BR#3307): PR · task · verify verdict · agent session · signer class, resolved from the
-  provenance index — or an honest "no bridge provenance yet" when the sweep has not stamped
-  the merge. `admin.stop_line_sweep` drills it on demand.
-- **The work**: the ask is attention; the episode task is the claimable item (BR#3284).
-  On RED the sweep also files ONE P0 task per red episode —
-  `STOP-THE-LINE: bridge main RED @ <short-sha> — fix main first` — child of the
-  `ALARM SINK` card, deduped per main-HEAD sha, and superseding the prior open episode
-  task when a new red sha lands (one live episode task at a time). Its body carries the
-  red checks with run links, the **first failing sha** and the PR that landed it (a
-  bounded bisect walk over recent main history; a failed walk degrades to "bisect
-  unavailable" on the card and never blocks the filing), the **guilty chain** from the
-  provenance index (BR#3307: PR · task · verdict · session · signer, with an honest
-  "no bridge provenance yet" fallback), the remediation carve-out
-  (BR#3010 precedent), and the done-when: *main tip all check-runs settled green (0 red,
-  0 unsettled) + gate reopened*. The task is boosted — priority 0 in the pickup ranking,
-  top of the board's ranked queue, ahead of unblock duty — and tagged
-  `p0` / `stop-the-line` / `gtm-blocker`. Fixing main is top-priority work the moment the
-  line stops; work on branches (worktrees) continues — only the line stops.
+- **The stop (executor-fed, BR#3516)**: the hub holds no VCS credentials and no longer
+  reads GitHub — red detection is fed in by the merge-train executor: its awaiting-CI
+  poll posts the merge commit's check runs (`train.ci`), the hub classifies them
+  (`classifyRequiredRuns` — red, or unknown past 3× the lane's typical CI time,
+  fail-closed), and any non-green verdict **stops the line**: the lane card reads
+  `merge-train: STOPPED — … (resume when the line is green)`, the just-merged **culprit
+  card is bounced** to `in_progress` with the failing runs appended (red after merge), and
+  ONE time-sensitive ask is filed per red episode to the `ALARM SINK` card
+  (`train_alarm_sink_id` setting, default BR#3124) — deduped per sha by the
+  identical-open-ask guard, so ten red runs are one ask, not ten. Options ride the ask:
+  `Ack — on it` / `Revert the culprit` / `Waive — resume the lane`. Green again → the
+  executor's next CI poll feeds a green classification (`train:landed`) and the hub
+  releases the stop automatically. v1 stops the line; there is no auto-revert — fix
+  forward or revert is the culprit card's job. Work on branches (worktrees) continues —
+  only the line stops.
 
 ### The deploy drift alarm's settle window (BR#3289)
 
@@ -426,81 +421,147 @@ non-failing `::warning::` annotations for up to 10 minutes (`SETTLE_WINDOW_SECON
 and goes green the moment the hub serves the pushed SHA — or a newer main tip containing it (a
 faster merge superseding this push's deploy is not drift; drift is "deployed hub ≠ main tip").
 Only a window that elapses stale fails loudly — real drift (CF Builds stalled or bypassed),
-feeding the `main-green gate` and `stopTheLineSweep` exactly as before — and so does a hub that
-never answers. A failing main-tip lookup never turns a mismatch green (fail-closed). Guarded by
-`npm run test:deploy-drift-alarm`.
+feeding the `main-green gate` and the merge train's base-green leg exactly as before — and so
+does a hub that never answers. A failing main-tip lookup never turns a mismatch green
+(fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
 
-## The standing merge-queue sweep
+## The merge train: serialized merges, credential-free hub (BR#3516)
 
-The gate blocks bad merges; the sweep executes good ones. Accepted decision BR#3033 made
-"merge when green" standing law, and BR#3198 made it deterministic: the hub watchdog runs
-`mergeQueueSweep` (`packages/worker/src/kb/do.ts`) FIRST on every tick, paced by the
-`merge_sweep_minutes` setting (default 15, `0` = off), and for each open PR on both repos,
-oldest first:
+Accepted decision BR#3516 re-divisioned the merge machinery: **the hub holds no VCS
+credentials, ever.** Every GitHub fact is fed to it by an executor running on your own
+machine; the hub decides (lease CAS, classification, events, queue) and only the
+executor acts (`gh`). The hub-side sweeps that read GitHub — the standing merge-queue
+sweep (BR#3198), the PR-disposition executor (BR#3312), the provenance sweep, the
+GitHub-reading closure audit — are deleted, not deprecated: a hub that cannot reach
+GitHub cannot lie about GitHub. The pure decision tables survive, pinned
+(`packages/worker/test/merge-sweep.test.ts`); the executor's gate
+(`decideTrainGate` → `decideMergeAction`) is one implementation shared with the hub,
+unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
-1. **Superseded-check first** — a PR whose linked card is superseded closes without review
-   (the BR#3034 queue norm).
-2. **The 5c mechanical gate** — `mergeable=true`, `mergeStateStatus` clean (or `unstable`
-   with only BR#2267 externals failing), every commit GitHub-verified, base (main) green,
-   head checks green. Mergeability is a precondition, not a finding.
-3. **All green + an accepted verify verdict on the current head** → merge (squash per repo
-   norm), merge receipt on the linked card. No human click.
-4. **Mechanical defect** (conflicts / red check / base red) → the linked card bounces to
-   `in_progress` with the exact defect named — one line per PR, never silent.
-5. **Human-leg defects only** (signing-environment / external-mirror failures) → collected
-   into ONE class ask per repo per episode, never one per PR (rule 5c).
+### The executor
 
-### PR disposition law (BR#3312)
+`scripts/merge-train.mjs` runs on any machine that has `gh` (authed, with the `repo`
+scope), `git`, **Node ≥ 23** (native type stripping — it imports the hub's own gate
+helpers from `packages/worker/src/kb/core.ts`) and a clone of the target repo:
 
-The sweep never skips a PR quietly: every open PR is adjudicated each pass by the pure
-`decidePrDisposition` function (`packages/worker/src/kb/core.ts`), isolated per-PR so one bad
-PR can't cost the others their disposition. PRs cannot be abandoned — merged, closed with a
-reason, escalated, or bounced. In precedence order:
+```bash
+cd /path/to/repo-clone                 # the repo the train drives (MERGE_TRAIN_WORKDIR)
+export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
+export BRIDGE_TOKEN=<token from the Connect tab>
+node /path/to/bridge/scripts/merge-train.mjs          # long-running loop (45s ticks)
+node /path/to/bridge/scripts/merge-train.mjs --once   # single tick (cron-friendly)
+```
 
-| Disposition | Fires when | Action |
-| --- | --- | --- |
-| `close_superseded` | linked card is superseded / done / rejected | comment + close `not_planned` (done cards close now too — the law supersedes the old quiet skip) |
-| `merge` | 5c gate green + accepted verify verdict | squash-merge — the gate outranks every clock below |
-| `close_orphan` | no provenance (no resolvable card row and no provenance-index row) and the PR is older than `pr_orphan_days` (default 3) | comment + close `not_planned` |
-| `escalate` | card resolvable, no PR activity for `pr_stale_days` (default 7), not escalated yet | one ask to the card owner, bound to the card |
-| `close_stale` | escalated, `pr_grace_hours` (default 48) expired, still no activity since the escalation | comment + close `not_planned`; the unclaimed card drops back to `todo` |
-| `bounce` | mechanical defect (conflicts / red base / red head) | card → `in_progress` with the exact defect named — the legacy bounce, now receipted |
-| passthrough | otherwise (note / skip / human-leg) | unchanged |
+Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
+`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD` (`merge | squash |
+rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone, default cwd). Flags:
+`--lane <repo>@<base>` (drive one lane only), `--once`, `--interval <secs>`,
+`--method <m>`. `bridge doctor` gates the prerequisites (gh present + authed + `repo`
+scope, git, node ≥ 23, the executor script in the checkout — each failure names the
+fix); the script re-probes the cheap ones every start. Keep it alive like the runner
+(systemd / launchd / `nohup`) or run `--once` from cron. It merges as whatever identity
+that `gh` is authed as — use the detached-cody credential per BR#3181, never a personal
+one.
 
-Activity is `max(pr.updated_at, last commit)`; unknown timestamps fail safe — no clock fires on
-a PR we can't date. Escalation is deduped in settings (`pr_escalated_<repo>_<n>`) and cleared
-by an owner response. Kill switch: `pr_disposition_enabled` (default on) restores the
-pre-law passthrough. The decision table is pinned in `packages/worker/test/merge-sweep.test.ts`
-and the sweep wiring in the `mergeQueueSweep` DO drill (`packages/worker/test/stop-line.test.ts`).
+One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
+GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
+lands, stops or pends) → else queue[0] → `decideTrainGate` → act: merge (`gh`) →
+`train:merged` → next tick polls CI on the merge commit.
 
-Identity: the sweep merges as **detached-cody** per BR#3181 — deploy `GH_TOKEN` must be the
-detached-cody credential, never rayh's personal credentials. Without it the sweep audits
-`no_identity` and merges nothing. `admin.merge_queue_sweep` drills it on demand; the pure
-decision rules are pinned in `packages/worker/test/merge-sweep.test.ts`.
+### Lanes, leases, queues
+
+- **A lane card per `repo@base`** — created on demand (`train.lane`), tagged
+  `merge-train` + `infrastructure`, never claimable by agents, blocked at birth with the
+  honest reason `merge-train: awaiting an available gateway` (merges happen when your
+  machines are on). The card's blocked reason is recomputed by the hub from the card's
+  own meta — `idle` / `leased by X` / `awaiting CI on <sha> (PR #N)` / `STOPPED` /
+  `awaiting an available gateway` — so the board always shows the lane's truth.
+- **The lease is CAS with a 5-minute TTL**: acquire → held across the whole queue
+  (`merge-train: leased by X — idle` between items) → release. The hub stamps
+  `holder = the authenticated actor`; the executor never supplies a holder, so a leaked
+  token cannot forge another machine's lease. A lapsed lease is cleared by the hub's
+  credential-free train-watch sweep and the next gateway reconciles from live GitHub —
+  a crashed executor cannot wedge the lane.
+- **The queue is derived, never stored**: every open PR on the lane is re-read from
+  GitHub each tick, oldest first, and only the head of the queue may merge — one merge
+  in flight per lane, CI settling on the merge commit before the next head enters.
+  Serialized is the point: no interleaved merges, no surprise rebases, every merge
+  attributable to exactly one lane event.
+
+### The gate, the carry law, the bounce
+
+`decideTrainGate` composes the standing `decideMergeAction` 5c gate (`mergeable`, clean,
+every commit GitHub-verified, base green, head checks green) plus **verdict coverage**:
+the accepted verify verdict must stamp the exact head, or arrive by a contiguous
+machine-clean carry chain:
+
+- **Carry law (BR#3516 §5)**: the base advanced and the executor's `gh pr
+  update-branch` lands machine-clean → the accepted verdict CARRIES (the hub appends
+  the carry record on `train:merged`). A conflict resolved by hand means authored code
+  changed under the verdict → the verdict is INVALID at the new head: the executor
+  enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
+  the PR's card, the card re-enters review, and the train re-queues it at the BACK once
+  a fresh verify accepts the new head.
+- **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
+  head, unsigned commits, a head the verdict no longer covers — the same law the verify
+  round enforces (rule 5c), now executed by the train. Human-leg defects
+  (signing-environment, external mirrors) file ONE class ask per episode, never one per
+  PR.
+
+### The ops (MCP + HTTP)
+
+`train.status` (GET `/train` mirrors it) · `train.lease` (acquire / renew / release) ·
+`train.event` (`merged | bounced | stopped | landed`) · `train.ci` (executor-fed check
+runs on the merge commit) · `train.lane` (ensure / configure) · `train.history` (the
+`train_events` ledger — provenance serving). The executor never self-certifies:
+`train:landed` re-classifies the fed check runs and REJECTS a non-green report outright
+("post train.ci instead and let the hub decide").
+
+### Setup
+
+```jsonc
+// admin.settings_set — lane config seeds the lane card at birth; the
+// operator/executor refreshes it in place via train.lane afterwards
+"train_lane": {
+  "state-vector/bridge@main": {
+    "required_workflows": ["Test", "CLI build (packages/cli)"],
+    "ci_typical_minutes": 20
+  }
+},
+"train_alarm_sink_id": "BR#3124"   // stop-the-line asks land here (default BR#3124)
+```
+
+`required_workflows` names the checks that must be green to land (the same checks the
+main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI bound
+(unknown past 3× typical classifies red — the train never waits forever). Lane identity
+is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
 
 ## PR provenance: who touched main, from bridge
 
-Every merge is attributable (BR#3287): the hub runs `provenanceSweep` (`packages/worker/src/kb/do.ts`,
-paced by `provenance_sweep_minutes`, default 15, `0` = off) over recent merged PRs on both repos
-(backfill window `provenance_backfill_days`, default 30) and records, per PR: merge sha, head sha,
-the linked task (head branch `bridge/BR-<id>` is the authoritative join key, PR text the fallback),
-the accepted verify verdict citing that head, the owning agent **session**, and the signer class
-(`detached-cody` / `signed` / `partially-signed` / `unsigned`).
+Every merge is attributable (BR#3287) — and under BR#3516 the stamping is
+**ledger-native**: there is no provenance sweep and no backfill job; the train's
+`train:merged` events stamp the chain as each merge lands. Per merge the ledger
+records: merge sha, head sha, the linked task (head branch `bridge/BR-<id>` is the
+authoritative join key, PR text the fallback), the accepted verify verdict covering
+that head (stamp or carry chain), the owning agent **session**, and the signer class
+(`detached-cody` / `signed` / `partially-signed` / `unsigned`) — plus the carry record
+when the verdict rode a machine-clean base update (BR#3516 §5).
 
-- **Storage of record is the board** (decision BR#3291): the task card carries `meta.provenance`
-  (rendered as a provenance strip in TaskDetail, and on the board's Top rows as a PR link +
-  verifier badge for in-flight work — BR#3307), the DO keeps a `provenance` index table, and
-  `GET /api/kb/provenance?sha=<7-40 hex>` resolves sha → PR → task → verdict → session. Unknown sha
-  = honest 404 "no bridge provenance"; merges with no bridge task are recorded as absence — itself a signal.
-  The verdict leg is honest too (BR#3307): when no accepted decision cites the head sha (human merges,
-  older merges), `verdict_id` is recorded `null` — never an arbitrary stale verdict.
-- **Absence renders explicitly** (BR#3287 spec item 3): a Top row with nothing stamped carries a
-  muted "no bridge provenance" chip — untracked merge, non-bridge work, or not yet swept. Absence
-  is a rendered state, never silence.
-- **GitHub mirror is derived and non-authoritative**: the sweep best-effort adds a `bridge:BR-<id>`
-  label; nothing machine-facing reads it back.
-- Consumers: the red-main guilty-agent attribution loop (BR#3284), humans auditing who landed what,
-  and any agent needing receipts. `admin.provenance_sweep` drills/backfills on demand.
+- **Storage of record is the board** (decision BR#3291): the task card carries
+  `meta.provenance` (rendered as a provenance strip in TaskDetail, and on the board's
+  Top rows as a PR link + verifier badge for in-flight work — BR#3307), the DO keeps a
+  `provenance` index, and `GET /api/kb/provenance?sha=<7-40 hex>` resolves
+  sha → PR → task → verdict → session (`POST /provenance` and the MCP surface mirror
+  it for machine consumers). Unknown sha = honest 404 "no bridge provenance"; merges
+  with no bridge task are recorded as absence — itself a signal. The verdict leg is
+  honest too (BR#3307): when no accepted decision covers the head sha, `verdict_id` is
+  recorded `null` — never an arbitrary stale verdict.
+- **Absence renders explicitly** (BR#3287 spec item 3): a Top row with nothing stamped
+  carries a muted "no bridge provenance" chip — untracked merge, non-bridge work, or
+  not yet trained. Absence is a rendered state, never silence.
+- Consumers: the stop-the-line culprit bounce (the ask names the just-merged card —
+  the guilty chain is on the ask, one lookup away), humans auditing who landed what,
+  and any agent needing receipts. `train.history` serves the raw ledger.
 
 ## The closure tier: flipped proxies, terminal legs, receipts (BR#3361)
 
@@ -516,9 +577,13 @@ closes those leaks with four hub mechanisms:
   `bridge/BR-<N>`), `issue_closed`, `br_done`, `run_success`, `pr_checks_green` — and cuts the
   DUTY clauses ("then a fresh session closes…") so instruction text never parses as a precondition.
   Conservatism law: machine-looking text that yields no atom stamps the verdict `unparseable`
-  (never auto-flips); atoms with no resolvable repo stamp `unresolvable`. When every atom verifies
-  TRUE live, the sweep auto-spawns the unblock duty with the receipts embedded — a trigger, never
-  an authority: the spawned duty re-verifies first-hand. The machine's caps still apply (≤1 open
+  (never auto-flips); atoms with no resolvable repo stamp `unresolvable`. Since BR#3516 the
+  hub holds no VCS credentials: **GitHub-state atoms (`pr_merged`, `br_pr_merged`,
+  `issue_closed`, `run_success`, `pr_checks_green`) now classify `unresolvable` and spawn
+  nothing** — only board-state atoms (e.g. `br_done`) still verify TRUE live and auto-spawn
+  the unblock duty with the receipts embedded (a trigger, never an authority: the spawned
+  duty re-verifies first-hand; GitHub-state conditions flip when an acting session or the
+  executor operator checks them first-hand). The machine's caps still apply (≤1 open
   unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
@@ -527,11 +592,12 @@ closes those leaks with four hub mechanisms:
   the very next attempt has an owner — no orphan terminal legs.
 - **Done-gate closure receipts** (c): the receipt contract is `state=closed + closing-comment id
   (or the comment URL) + guard run id (or n/a)`. Intent language ("will close", "fully closed",
-  "close-guard blocked") is not a receipt. The done-time stamp (`meta.close_leg_audit`) is then
-  LIVE-verified by `closureAuditSweep` (`closure_audit_minutes`, default 30, `0` = off): issue
-  state, closing comment, guard run each checked against GitHub; a false claim (the BR#3220 class
-  — the board reported a closed issue that wasn't) files a `Correction: false closure receipt`
-  duty exactly once.
+  "close-guard blocked") is not a receipt. The done-time stamp (`meta.close_leg_audit`) records
+  the claim; the LIVE GitHub re-verification sweep (`closureAuditSweep`) was deleted under
+  BR#3516 — the hub no longer reads GitHub — so a false claim (the BR#3220 class — the board
+  reporting a closed issue that wasn't) surfaces through the close-duty child's first-hand
+  re-verification instead of a hub sweep; the gate still rejects an unreceipted done and
+  auto-derives the close-leg duty exactly as before.
 - **Duplicate-executor fence** (d): orient exposes the executor lease (`executor_session`) on open
   cards and my_tasks; a state-changing op by a named session other than the lease holder while the
   holder is alive (<10m) is audited `system:fence / duplicate_executor` — observability, never a
@@ -540,9 +606,12 @@ closes those leaks with four hub mechanisms:
   to claim them stamps the lease.
 
 Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts),
-`test/closure-sweep.test.ts` (real DO: flip → spawn → dedupe; rejected done → child → parent done;
-audit ok/false + correction; fence audit + lease). `admin.unblock_proxy_sweep` /
-`admin.closure_audit_sweep` drill on demand.
+`test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty;
+rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence
+audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
+queue and classification) and `test/train-hub.test.ts` (real-DO train drills: lease races,
+landed / stopped / bounced flows, the stop-the-line ask).
+`admin.unblock_proxy_sweep` drills on demand.
 
 ## 5 · Use it
 

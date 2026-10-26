@@ -4,22 +4,20 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
  * Closure-tier duty scheduling (BR#3361) — real DO drill against the bundled
- * worker, canned GitHub served by a local HTTP server (the stop-line rig
- * recipe: function-form outboundService breaks workerd startup here).
+ * worker. DEGRADED under BR#3516: the hub holds no VCS credentials, ever, so
+ * the machine-proxy watch can no longer read GitHub — GitHub-state atoms stamp
+ * UNRESOLVABLE (never auto-flip; conservatism law) and only board-state atoms
+ * (br_done) still evaluate. The closure-RECEIPT audit sweep is gone with it:
+ * receipts' truth is owned by the verify session that cites them and by the
+ * train's machine-proxy close (train:landed — pinned in train-hub.test.ts).
  *
- * Four mechanisms, one canned server each way:
- *  (a) unblock-proxy watch: a blocked card parked on BR#3129's REAL exit
- *      condition ("PR #2327 mergeCommit non-null") auto-spawns the unblock
- *      duty when the proxy flips TRUE (canned merged), stamps honest
- *      verdicts otherwise (PR 2400 canned open → "false"; machine-looking
- *      text that yields no atom → "unparseable", never flips), and dedupes.
+ * Three mechanisms, one real DO:
+ *  (a) unblock-proxy watch (degraded): board-state atoms evaluate; GitHub
+ *      atoms stamp unresolvable citing BR#3516 and spawn nothing; unparseable
+ *      stays honest; the park-time machine round is unaffected.
  *  (b) terminal close-leg ownership: a done rejected by done-close-legs
  *      auto-derives the close-duty child; the child's receipted done
  *      unblocks the parent's done.
- *  (c) closure-receipt audit: a done card's receipts are live-verified
- *      (issue state + closing comment + guard run); a false claim (the
- *      BR#3220 class — done card says closed, GitHub says open) files a
- *      correction duty.
  *  (d) duplicate-executor fence: orient exposes the executor lease; a
  *      state-changing op by a non-holder while the holder is alive is
  *      audited (system:fence / duplicate_executor), never blocked.
@@ -113,12 +111,12 @@ afterAll(async () => {
 
 // ---------- (a) the unblock-proxy watch ----------
 
-describe("unblockProxySweep (real DO, canned GitHub)", () => {
-  it("flipped machine proxy auto-spawns the unblock duty with receipts; false and unparseable never flip; dedupe holds", async () => {
-    // P1 parks on BR#3129's REAL condition — canned PR 2327 says MERGED.
-    // Entering blocked auto-spawns the park-time unblock round (the machine's
-    // standing law); it runs, finds the proxy still false, and closes with
-    // findings — exactly BR#3129's story before the flip nobody noticed.
+describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
+  it("GitHub-state atoms stamp UNRESOLVABLE (BR#3516 — the hub holds no VCS creds) and spawn nothing; unparseable stays honest", async () => {
+    // P1 parks on BR#3129's REAL condition ("PR #2327 mergeCommit non-null" —
+    // a pr_merged atom with a repo). The park-time machine round spawns as
+    // always (transition law, unchanged); the SWEEP, though, can no longer
+    // read the PR — unresolvable, never a flip, never a duty.
     const p1 = await kbJson("/create", { type: "task", title: "IMPL: re-close GH #2274 (drill)", qualified: true, session: "drill-exec-p1" });
     expect(p1.status).toBe(200);
     const p1id = String(p1.body.id);
@@ -131,17 +129,17 @@ describe("unblockProxySweep (real DO, canned GitHub)", () => {
     await kbJson("/transition", { id: parkRound.id, to: "in_progress", actor: "drill-exec-u1", session: "drill-exec-u1" });
     const parkDone = await kbJson("/transition", {
       id: parkRound.id, to: "done", actor: "drill-exec-u1",
-      note: "checked live via https://github.com/state-vector/superpositional/pull/2327 — still OPEN, not merged (findings); proxy false at check time",
+      note: "checked the condition first-hand — still blocked at check time (findings); the executor's gh and a train event are the credentialed readers now",
     });
     expect(parkDone.status, `park round done failed: ${JSON.stringify(parkDone.body)}`).toBe(200);
 
-    // P2: machine-looking text that yields NO atom — never flips
+    // P2: machine-looking text that yields NO atom — honest unparseable
     const p2 = await kbJson("/create", { type: "task", title: "IMPL: unparseable drill", qualified: true, session: "drill-exec-p2" });
     const p2id = String(p2.body.id);
     await block(p2id, "drill-exec-p2", "GH#2274 pending re-close", "parked");
 
-    // P3: well-formed atom, canned PR 2400 says OPEN → verdict false, no spawn
-    const p3 = await kbJson("/create", { type: "task", title: "IMPL: false-proxy drill", qualified: true, session: "drill-exec-p3" });
+    // P3: well-formed pr_merged atom — the hub cannot read it either
+    const p3 = await kbJson("/create", { type: "task", title: "IMPL: gh-atom drill", qualified: true, session: "drill-exec-p3" });
     const p3id = String(p3.body.id);
     await block(p3id, "drill-exec-p3",
       "Machine proxy: PR https://github.com/state-vector/superpositional/pull/2400 mergeCommit non-null (state=MERGED). Then a fresh session closes the leg.",
@@ -153,40 +151,30 @@ describe("unblockProxySweep (real DO, canned GitHub)", () => {
     expect(sweep1.status, `sweep1 failed: ${JSON.stringify(sweep1.body)}`).toBeLessThan(500);
     expect(sweep1.body.error).toBeUndefined();
 
-    // P1 flipped: the unblock duty exists, owns the receipts, is a child
-    const p1Now = await taskById(p1id);
-    expect(p1Now.meta?.proxy_check?.verdict).toBe("true");
-    const spawnedId = p1Now.meta?.proxy_check?.spawned;
-    expect(spawnedId).toBeTruthy();
-    const duty = await taskById(spawnedId);
-    expect(duty.title).toBe(`Unblock: IMPL: re-close GH #2274 (drill)`);
-    expect(duty.status).toBe("todo");
-    expect(duty.roles).toContain("unblock");
-    expect(String(duty.body_md)).toContain("MACHINE PROXY");
-    expect(String(duty.body_md)).toContain("MERGED at 2026-10-25T00:51:11Z");
-    expect(String(duty.body_md)).toContain("live re-verify first");
-    const p1Rels = (await kbJson("/relations", { id: p1id })).body?.relations ?? [];
-    expect(p1Rels).toContainEqual(expect.objectContaining({ relation: "child_of", artefact_id: spawnedId, dir: "in" }));
+    // P1/P3: unresolvable with the BR#3516 receipt — stamped, never flipped,
+    // nothing spawned from the sweep
+    for (const id of [p1id, p3id]) {
+      const now = await taskById(id);
+      expect(now.meta?.proxy_check?.verdict, `${id}`).toBe("unresolvable");
+      expect(String(now.meta?.proxy_check?.atoms?.[0]?.receipt)).toContain("BR#3516");
+      expect(now.meta?.proxy_check?.spawned).toBeUndefined();
+    }
 
     // P2 stamped honestly unparseable — stamped, never flipped, no duty
     const p2Now = await taskById(p2id);
     expect(p2Now.meta?.proxy_check?.verdict).toBe("unparseable");
     expect(p2Now.meta?.proxy_check?.detail).toContain("never auto-flips");
 
-    // P3 read false — stamped, no duty
-    const p3Now = await taskById(p3id);
-    expect(p3Now.meta?.proxy_check?.verdict).toBe("false");
-    expect(p3Now.meta?.proxy_check?.atoms?.[0]?.receipt).toContain("state=open, not merged");
-
-    // dedupe: a second sweep (past cadence + card pacing) must NOT spawn again
+    // a second sweep re-stamps the same verdicts (per-card pacing, no churn
+    // audits, no duties of any kind from the sweep)
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 61 * 60_000 + 17 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const p1After = await taskById(p1id);
-    expect(p1After.meta?.proxy_check?.spawn_skipped).toContain("existing unblock child");
-    const duties = (await unblockDuties()).filter((d: any) =>
+    expect(p1After.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p1After.meta?.proxy_check?.spawned).toBeUndefined();
+    const openDuties = (await unblockDuties()).filter((d: any) =>
       d.title.startsWith("Unblock: IMPL: re-close GH #2274") && ["todo", "in_progress", "blocked"].includes(d.status));
-    expect(duties.length).toBe(1);
-    expect(duties[0].id).toBe(String(spawnedId));
+    expect(openDuties.length).toBe(0);
   });
 });
 
@@ -240,68 +228,12 @@ describe("done-close-legs auto-derivation (real DO)", () => {
   });
 });
 
-// ---------- (c) the closure-receipt audit ----------
-
-describe("closureAuditSweep (real DO, canned GitHub)", () => {
-  it("true receipts verify ok; a false 'closed' claim (BR#3220 class) files the correction duty exactly once", async () => {
-    // card A: receipted done for leg 2261 — canned GitHub confirms CLOSED
-    const a = await kbJson("/create", {
-      type: "task", title: "IMPL: audit-ok drill", qualified: true, session: "drill-exec-audit-a",
-      body_md: "work\n\n## Done when\n- close GH #2261 (the incident issue)\n",
-    });
-    const aId = String(a.body.id);
-    await kbJson("/transition", { id: aId, to: "in_progress", actor: "drill-exec-audit-a", session: "drill-exec-audit-a" });
-    const aDone = await kbJson("/transition", {
-      id: aId, to: "done", actor: "drill-exec-audit-a",
-      note: "GH #2261 state=closed, closing comment 17623388240 (https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240), guard run 40198911366 guard=allow",
-    });
-    expect(aDone.status).toBe(200); // receipt present at the gate → done passes
-    expect((await taskById(aId)).meta?.close_leg_audit?.checked_ts ?? null).toBeNull(); // armed for the audit
-
-    // card B: receipt-shaped claim for leg 2337 — canned GitHub says OPEN
-    // (the BR#3220 class: the board reports a closed issue that isn't)
-    const b = await kbJson("/create", {
-      type: "task", title: "IMPL: audit-false drill", qualified: true, session: "drill-exec-audit-b",
-      body_md: "work\n\n## Done when\n- close GH #2337 (the ref-blind leak issue)\n",
-    });
-    const bId = String(b.body.id);
-    await kbJson("/transition", { id: bId, to: "in_progress", actor: "drill-exec-audit-b", session: "drill-exec-audit-b" });
-    const bDone = await kbJson("/transition", {
-      id: bId, to: "done", actor: "drill-exec-audit-b",
-      note: "RESIDUE CLEARED: GH #2337 state=closed, closing comment 17629999999, guard run 40199999999",
-    });
-    expect(bDone.status).toBe(200); // the gate checks the receipt SHAPE; the audit checks the TRUTH
-
-    const sweep = await kbJson("/admin.closure_audit_sweep", { now: t0 + 120_000 });
-    expect(sweep.status, `audit sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
-    expect(sweep.body.error).toBeUndefined();
-
-    const aNow = await taskById(aId);
-    expect(aNow.meta?.close_leg_audit?.verdict).toBe("ok");
-    expect(aNow.meta?.close_leg_audit?.checked_ts).toBeTruthy();
-    expect(aNow.meta?.close_leg_audit?.checks?.[0]?.issue).toContain("state=closed");
-    expect(aNow.meta?.close_leg_audit?.checks?.[0]?.comment).toContain("comment 17623388240 exists");
-
-    const bNow = await taskById(bId);
-    expect(bNow.meta?.close_leg_audit?.verdict).toBe("false");
-    expect(bNow.meta?.close_leg_audit?.checks?.[0]?.issue).toContain("state=open");
-
-    // one correction duty, bound to the false card, child_of it
-    const corrections = (await unblockDuties()).filter((x: any) => x.title.startsWith("Correction: false closure receipt"));
-    expect(corrections.length).toBe(1);
-    expect(String(corrections[0].title)).toContain(bId);
-    expect(corrections[0].roles).toContain("unblock");
-    expect(String(corrections[0].body_md)).toContain("verify the live state of each leg first-hand");
-    const bRels = (await kbJson("/relations", { id: bId })).body?.relations ?? [];
-    expect(bRels).toContainEqual(expect.objectContaining({ relation: "child_of", artefact_id: corrections[0].id, dir: "in" }));
-
-    // a re-sweep re-audits nothing (checked_ts set) — no second correction
-    const sweep2 = await kbJson("/admin.closure_audit_sweep", { now: t0 + 120_000 + 31 * 60_000 });
-    expect(sweep2.body.error).toBeUndefined();
-    const corrections2 = (await unblockDuties()).filter((x: any) => x.title.startsWith("Correction: false closure receipt"));
-    expect(corrections2.length).toBe(1);
-  });
-});
+// ---------- (c) the closure-receipt audit — GONE with BR#3516 ----------
+// The audit sweep class is deleted: receipts' truth is owned by the verify
+// session that cites them (head-stamped close notes) and by the train's
+// machine-proxy close (train:landed — mergeCommit non-null + main green),
+// pinned in train-hub.test.ts. The hub never re-reads GitHub to check a
+// receipt — it has no credentials to do so.
 
 // ---------- (d) the duplicate-executor fence ----------
 

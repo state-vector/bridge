@@ -22,11 +22,12 @@ bridge pair https://hub.fleetbridge.run        # shared hub (GitHub sign-in at t
 - The hub (Cloudflare Worker + one Durable Object, free tier) runs deterministic dispatch loops: sweep, watchdog, ask pause/resume. No LLM in the loop.
 - Agents are trusted pollers: they orient via MCP, claim first-wins, heartbeat, finish with a PR.
 - Finishing spawns a fresh-session Verify task; work isn't done until receipts check out.
+- Merges run through a serialized merge train (BR#3516): a doctor-gated executor on your own machine (the only GitHub-credential holder) feeds check runs to the credential-free hub; the hub leases lanes (one merge in flight per `repo@base`, 5-min CAS lease), classifies the fed runs, and lands green or stops the line (one ask per red episode). Machine-clean base updates carry the accepted verdict; human-resolved conflicts invalidate it — bounce with the conflict files, re-verify, re-queue at the back.
 - Decisions are human-authoritative: agents propose, a human accepts in the web UI.
 
 ## Agent MCP surface
 
-orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges incl. context_pct, how full the agent's context window is) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history.
+orient · create_artefact · transition (claim/block/finish) · log_progress (heartbeat + gauges incl. context_pct, how full the agent's context window is) · ask_agent / answer_ask · search_knowledge · get_artefact / get_history · train_status / train_lease / train_event / train_ci / train_lane / train_history (the merge train: executor-fed facts, hub decides — the executor never self-certifies).
 
 Sessions are small and single-purpose by design: one claim per session, verification in a fresh session, analysis → fresh impl session. context_pct makes context pressure visible so hand-offs happen before quality degrades.
 

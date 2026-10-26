@@ -32,6 +32,12 @@ export const TOOL_NAMES = [
   "search_knowledge",
   "session_alive",
   "stats",
+  "train_ci",
+  "train_event",
+  "train_history",
+  "train_lane",
+  "train_lease",
+  "train_status",
   "transition",
   "update_artefact",
 ] as const;
@@ -125,4 +131,74 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   asks: z.looseObject({}),
   answer_ask: z.looseObject({ id: z.string(), answer: z.string() }),
+  // ---- merge train (BR#3516/BR#3517): executor-fed GitHub facts, hub-decided.
+  // The lease is the CAS gate — every mutating train op requires it.
+  train_lease: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    action: z.enum(["acquire", "renew", "release"]),
+    holder: z.string().optional(),
+    required_workflows: z.array(z.string()).optional(),
+    ci_typical_minutes: z.number().optional(),
+    line_green: z.boolean().optional(),
+  }),
+  train_event: z.looseObject({
+    repo: z.string(),
+    kind: z.enum(["merged", "bounced", "stopped", "landed"]),
+    base: z.string().optional(),
+    pr: z.number().int().optional(),
+    head_sha: z.string().optional(),
+    merge_sha: z.string().optional(),
+    task_id: z.string().optional(),
+    signer: z.string().optional(),
+    run_url: z.string().optional(),
+    carry_from: z.string().optional(),
+    reason: z.string().optional(),
+    conflict_files: z.array(z.string()).optional(),
+    failing: z
+      .array(
+        z.looseObject({
+          name: z.string().optional(),
+          conclusion: z.string().nullish(),
+          url: z.string().nullish(),
+        }),
+      )
+      .optional(),
+    culprit_task: z.string().optional(),
+    checks: z.array(z.looseObject({ name: z.string().optional(), conclusion: z.string().nullish(), html_url: z.string().nullish() })).optional(),
+  }),
+  train_ci: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    sha: z.string().optional(),
+    checks: z
+      .array(
+        z.looseObject({
+          name: z.string().optional(),
+          conclusion: z.string().nullish(),
+          status: z.string().nullish(),
+          html_url: z.string().nullish(),
+        }),
+      )
+      .optional(),
+    run_url: z.string().optional(),
+  }),
+  train_status: z.looseObject({ repo: z.string().optional() }),
+  train_history: z.looseObject({
+    repo: z.string().optional(),
+    base: z.string().optional(),
+    kind: z.string().optional(),
+    pr: z.number().int().optional(),
+    limit: z.number().int().max(200).optional(),
+  }),
+  train_lane: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    spec: z
+      .looseObject({
+        required_workflows: z.array(z.string()).optional(),
+        ci_typical_minutes: z.number().optional(),
+      })
+      .optional(),
+  }),
 } as const satisfies Record<ToolName, z.ZodType>;

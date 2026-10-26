@@ -126,9 +126,12 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
   it("accepting the latest verdict leaves ZERO proposed verdicts for the target — no regrow", async () => {
     const { body: t } = await kbJson("/create", { type: "task", title: "supersede target B", qualified: true });
     const target = t.id;
-    // the verdict applies by closing the task — claimable state first (the
-    // done edge never fires from todo)
+    // the verdict applies by QUEUEING the task for the merge train (BR#3516:
+    // the train owns delivery — the accept no longer closes; train:landed's
+    // machine proxy closes later). The card needs its PR and the covered head.
     await kbJson("/transition", { id: target, to: "in_progress", note: "claim" });
+    const HEAD = "e".repeat(40);
+    const v2Body = `verified head ${HEAD} — https://github.com/state-vector/bridge/pull/9102`;
 
     const { body: v1 } = await kbJson("/create", {
       type: "decision", title: `stacked round 1 for ${target}`,
@@ -137,9 +140,10 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
     const { body: v2 } = await kbJson("/create", {
       type: "decision", title: `stacked round 2 for ${target}`,
       meta: verdictMeta(target, "verified", "9102"),
+      body_md: v2Body,
     });
     // v1 was swept at v2's create (leg above); give v2 its evidence link so the
-    // human accept also closes the task end-to-end
+    // human accept applies end-to-end
     await kbJson("/link", { src: v2.id, relation: "supports", dst: target });
 
     const acc = await kbJson("/transition", { id: v2.id, to: "accepted", note: "accepted by human (For Me)", actor: "web" });
@@ -150,9 +154,13 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
     // for the same target resurfaces as the new latest. After both prongs:
     // nothing proposed for the target, ever.
     expect(await proposedVerdictsFor(target)).toEqual([]);
-    // and the task closed on the accepted verdict (side effect confirmed)
+    // and the task is QUEUED on the accepted verdict (side effect confirmed) —
+    // blocked on the train, stamped with the PR + the covered head
     const { body: tNow } = await kbJson("/get", { id: target });
-    expect(tNow.status).toBe("done");
+    expect(tNow.status).toBe("blocked");
+    expect(tNow.meta?.merge_train?.state).toBe("queued");
+    expect(tNow.meta?.pr?.number).toBe(9102);
+    expect(tNow.meta?.pr?.head_sha_at_acceptance).toBe(HEAD);
   });
 
   it("act-time sweep: legacy stacked verdicts (pre-fix data) collapse when the human acts on one", async () => {
