@@ -1,0 +1,155 @@
+import { Miniflare } from "miniflare";
+import { readFileSync, existsSync, realpathSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+/**
+ * Web comment plane + ask-band/detail UX contracts (BR#3462).
+ *
+ * Leg 1 (route, behavioral): every human comment from the web UI posts
+ * POST /api/kb/progress — the human-plane allowlist must map that sub to the
+ * DO op the switch actually knows, `progress.log` (do.ts). Before the fix the
+ * unmapped name hit the DO as bare `progress` and 404'd "unknown op progress"
+ * (reproduced live against the deployed hub 2026-10-26): TaskDetail comments,
+ * decision-popover comments and discussion replies all failed. Red-first: this
+ * test 404s until index.js maps the sub.
+ * Legs 2+3 (source-assertion): AskBand rows must render their artefact id
+ * (you cannot tell WHICH verdict/ask you are acting on otherwise) and
+ * TaskDetail must load artefact/related/history in parallel (sequential awaits
+ * made the panel cold-load seconds and a mid-chain failure emptied later
+ * sections) — asserted on the view sources per the repo's source-assertion
+ * convention (needles assembled from parts; no UI test rig exists — this
+ * suite is the only one that runs).
+ */
+
+const SECRET = "test-gh-secret";
+
+function sessionCookie(login = "ray", ws = "global") {
+  const exp = String(Date.now() + 60_000);
+  const sig = createHmac("sha256", SECRET).update(`${exp}.${login}.${ws}`).digest("hex");
+  return `bridge_session=${exp}.${login}.${ws}.${sig}`;
+}
+
+let mf: Miniflare;
+let cookie: string;
+
+beforeAll(() => {
+  const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
+  if (!existsSync(bundle)) {
+    throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (the npm test script does this before vitest)");
+  }
+  mf = new Miniflare({
+    workers: [{
+      name: "main",
+      scriptPath: bundle,
+      // realpath + modulesRoot: workerd's virtual FS rejects ".." segments
+      modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")),
+      modules: true,
+      compatibilityDate: "2025-09-06",
+      durableObjects: { KB: { className: "KnowledgeHub", useSQLite: true } },
+      bindings: { GITHUB_CLIENT_ID: "test-client", GITHUB_CLIENT_SECRET: SECRET },
+    }],
+  });
+  cookie = sessionCookie();
+});
+
+afterAll(async () => {
+  await mf.dispose();
+});
+
+const api = (path: string, init?: { method?: string; body?: string }) =>
+  mf.dispatchFetch(`https://main${path}`, {
+    method: init?.method ?? "GET",
+    headers: { cookie, "content-type": "application/json" },
+    body: init?.body,
+  });
+
+describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
+  it("posts a web comment through to progress.log (200, logged, visible in history)", async () => {
+    // verdict-duty tasks are claimable without qualification (role:review) —
+    // same rig the throughput route test uses. The task must be in_progress:
+    // unclaimed todo hits progressLog's claim-refusal early return (200 with
+    // note_postscript, nothing logged — agent-claim semantics, out of scope
+    // here), while the live repro was a comment on an in-progress card.
+    const create = await api("/api/kb/create", {
+      method: "POST",
+      body: JSON.stringify({ type: "task", title: "web comment plane smoke", tags: ["role:review"] }),
+    }).then((r) => r.json() as any);
+    expect(create.id).toMatch(/^BR#\d+$/);
+    const claim = await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: create.id, to: "in_progress", note: "claim" }) });
+    expect(claim.status).toBe(200);
+
+    const note = "human comment from the web UI — must land on the card history";
+    const res = await api("/api/kb/progress", {
+      method: "POST",
+      body: JSON.stringify({ id: create.id, note }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    // content-verified (AGENTS.md rule 1): the note echoes back AND lands in
+    // the task history the TaskDetail comment thread reads
+    expect(body.error).toBeUndefined();
+    expect(body.note).toBe(note);
+    expect(body.note_postscript).toBeUndefined(); // full log path, not the claim refusal
+
+    const hist = await api(`/api/kb/history?id=${encodeURIComponent(create.id)}`).then((r) => r.json() as any);
+    const logged = (hist.versions ?? []).filter((v: any) => v.action === "progress");
+    expect(logged.some((v: any) => (v.summary ?? "").includes("web UI — must land"))).toBe(true);
+  });
+
+  it("keeps the allowlist strict: an unknown sub still 404s on the route plane", async () => {
+    const res = await api("/api/kb/not-an-op", { method: "POST", body: JSON.stringify({ id: "BR#1" }) });
+    expect(res.status).toBe(404);
+  });
+
+  it("still maps ask_answer → ask.answer (domain response, never an op-mapping 404)", async () => {
+    // a bogus id gets a DO domain error — the point is it is NOT the route's
+    // bare "not found" (the op reached the DO switch)
+    const res = await api("/api/kb/ask_answer", { method: "POST", body: JSON.stringify({ id: "BR#999999", answer: "x" }) });
+    const text = await res.text();
+    expect(text).not.toContain("unknown op");
+    expect(text === "not found").toBe(false);
+  });
+});
+
+// ---- legs 2 + 3: source assertions on the ui-kit views (no UI rig exists) ----
+
+const askBandSrc = readFileSync(new URL("../../ui-kit/src/views/AskBand.tsx", import.meta.url).pathname, "utf8");
+const taskDetailSrc = readFileSync(new URL("../../ui-kit/src/views/TaskDetail.tsx", import.meta.url).pathname, "utf8");
+
+describe("AskBand rows render their artefact id (BR#3462 leg 2)", () => {
+  const rowFns = ["function BandVerdictRow", "function BandDecisionRow", "function BandNodeAskRow"];
+  for (const fn of rowFns) {
+    it(`${fn.slice(9)} renders the artefact id as a visible mono chip`, () => {
+      const start = askBandSrc.indexOf(fn);
+      expect(start).toBeGreaterThan(-1);
+      const body = askBandSrc.slice(start, askBandSrc.indexOf("\nfunction ", start + 1) === -1 ? askBandSrc.length : askBandSrc.indexOf("\nfunction ", start + 1));
+      // the .ab-id mono chip class (the established id-render pattern —
+      // TaskDetail:354 / ForMeView:138) with the row's artefact id inside
+      expect(body).toContain("ab-id");
+      expect(body).toMatch(/ab-id">\{(latest|d|nodeAsk)\.id\}/);
+    });
+  }
+});
+
+describe("TaskDetail loads artefact/related/history in parallel (BR#3462 leg 3)", () => {
+  it("issues the three section loads together (allSettled), not as a sequential await chain", () => {
+    // the load effect must NOT contain the old sequential chain
+    // (artefact → related → history, each awaiting the previous)
+    expect(taskDetailSrc).toContain("Promise.allSettled");
+    expect(taskDetailSrc).not.toMatch(/await kbApi\.artefact[\s\S]{0,400}await kbApi\.related[\s\S]{0,400}await kbApi\.history/);
+    // per-section error handling, correctly labeled (the old catches both said
+    // "load task relations" — including the history one)
+    expect(taskDetailSrc).toContain("load related tasks");
+    expect(taskDetailSrc).toContain("load history");
+    expect(taskDetailSrc).not.toContain('reportError("load task relations"');
+  });
+
+  it("bounds the non-essential related load with a timeout (renders without it)", () => {
+    expect(taskDetailSrc).toMatch(/RELATED_TIMEOUT|related.*timeout/i);
+  });
+
+  it("surfaces the server error on a failed comment instead of a bare 'comment failed'", () => {
+    expect(taskDetailSrc).toMatch(/comment failed: \$\{\(e as Error\)\.message\}/);
+  });
+});

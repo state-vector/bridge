@@ -328,9 +328,20 @@ Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, ta
 `TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
-open ask with its options as one-click buttons. `urgency` is an ask vocabulary, not a
+open ask with its options as one-click buttons, and every ask-band row (verdict, decision,
+node ask) shows its own BR# id as a mono chip next to the rel time — you always know which
+ask you are acting on. `urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
+
+**Human comments post from every web surface.** The comment boxes (task detail's
+"Comment / steer", the decision popover, discussion replies) all write to the card's
+history through the same door agents use — the web plane maps `POST /api/kb/progress` to
+the knowledge object's `progress.log` op, so a comment from any surface lands on the card
+instead of 404ing — and a failed post shows the server's message, not a bare "comment
+failed". The task detail panel loads the card, its history and its related tasks in
+parallel: each section renders as its own data arrives, carries its own error + retry, and
+the non-essential related list times out to nothing instead of holding the panel hostage.
 
 **Claim locally** — next to **Reframe** on every open ask (both surfaces: the ask band
 rows in Top and TaskDetail's AskSelfCard), a **Claim locally** button copies a
