@@ -11,13 +11,39 @@ import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
  *     as actor "web" which satisfies the human-authoritative gate
  *   - open agent asks addressed to the human (hub plane)
  *   - open question threads (link into Discussions)
+ *
+ *  BR#3457 busy-hold: acting on a decision never removes it mid-flight —
+ *  the card pins to the bottom of its section (held map + holdOrder) with
+ *  an ACTIONING chip until a refetch confirms it left `proposed`; on error
+ *  the hold drops and the card returns to its slot with the error inline.
+ *  Server-side, one actionable verdict per target: the group cannot regrow.
  */
 
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
+import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
+import {
+  beginHold,
+  groupBusy,
+  groupDecisions,
+  holdOrder,
+  holdOrderGroups,
+  mergeHeld,
+  reconcileHold,
+  settleHold,
+  type HeldMap,
+} from "./forMeHold";
 
-function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
+function DecisionRow({ d, onDone, held, onAct, onFail }: {
+  d: KbArtefact;
+  onDone: (id: string) => void;
+  held: HeldMap;
+  onAct: (d: KbArtefact) => void;
+  onFail: (id: string) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const { busy, err, act } = useDecisionAct(d, onDone);
+  const { busy, err, act } = useDecisionAct(d, onDone, { onAct, onFail });
+  // busy-hold (BR#3457): from click until a refetch confirms, the card stays
+  // in the list, pinned to the bottom of its section, buttons dead.
+  const busyNow = busy || held.has(d.id);
   return (
     <Card className="ask-urgent forme-item">
       {(() => {
@@ -27,6 +53,7 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
             <Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>
             {f.verdict && <Chip tone={f.verdict === "bounce" ? "needs" : "done"}>{f.verdict.toUpperCase()}</Chip>}
             {f.target && <Chip tone="scope">{f.target}</Chip>}
+            {busyNow && <Chip tone="needs">ACTIONING…</Chip>}
             <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {(d.meta as any)?.proposed_by ?? d.owner ?? "—"}</span>
           </div>
         );
@@ -45,33 +72,45 @@ function DecisionRow({ d, onDone }: { d: KbArtefact; onDone: (id: string) => voi
           const acceptLabel = f.kind === "verify" && f.verdict === "bounce" ? "Bounce it" : "Accept";
           return (
             <>
-              <Btn variant="accept" disabled={busy} onClick={() => void act("accepted")}>{acceptLabel}</Btn>
-              <Btn variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-              <Btn quiet onClick={() => setOpen(true)}>Details / comment…</Btn>
+              <Btn variant="accept" disabled={busyNow} onClick={() => void act("accepted")}>{acceptLabel}</Btn>
+              <Btn variant="reject" disabled={busyNow} onClick={() => void act("rejected")}>Reject</Btn>
+              <Btn quiet disabled={busyNow} onClick={() => setOpen(true)}>Details / comment…</Btn>
             </>
           );
         })()}
         {err && <span className="k-err">{err}</span>}
       </ActionRow>
-      {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
+      {open && <DecisionPopover d={d} holding={busyNow} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} onAct={onAct} onFail={onFail} />}
     </Card>
   );
 }
 
 /** One card per TARGET TASK: latest verdict is actionable, identical prior
  *  rounds collapse into a muted line (the flood fix — round 9 of "unchanged"
- *  bounce verdicts is loop telemetry, not 9 separate human decisions). */
-function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior: KbArtefact[]; onDone: (id: string) => void }) {
+ *  bounce verdicts is loop telemetry, not 9 separate human decisions).
+ *  BR#3457: while the human's action is in flight the WHOLE group pins to the
+ *  bottom of the section with an actioning chip — server-side, one actionable
+ *  verdict per target means the group can never regrow after it confirms. */
+function VerdictGroupRow({ latest, prior, onDone, held, onAct, onFail }: {
+  latest: KbArtefact;
+  prior: KbArtefact[];
+  onDone: (id: string) => void;
+  held: HeldMap;
+  onAct: (d: KbArtefact) => void;
+  onFail: (id: string) => void;
+}) {
   const [showPrior, setShowPrior] = useState(false);
   const m = (latest.meta ?? {}) as Record<string, unknown>;
   const target = String(m.task ?? m.verify_target ?? "");
   const verdict = String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : "verified";
+  const busyNow = groupBusy({ latest, prior }, held);
   return (
     <Card className="ask-urgent forme-item">
       <div className="ask-chips">
         <Chip tone="urgent">VERDICT</Chip>
         <Chip tone={verdict === "bounce" ? "needs" : "done"}>{verdict.toUpperCase()}</Chip>
         <Chip tone="scope">{target}</Chip>
+        {busyNow && <Chip tone="needs">ACTIONING…</Chip>}
         <span className="why-line">{latest.id} · proposed {rel(latest.created_ts)}</span>
       </div>
       <h3 className="ask-question" onClick={() => void 0}>
@@ -89,24 +128,31 @@ function VerdictGroupRow({ latest, prior, onDone }: { latest: KbArtefact; prior:
           {d.id} · {rel(d.created_ts)} · {String((d.meta as any)?.verdict ?? "").toUpperCase()} — {(d.title ?? "").slice(0, 80)}
         </p>
       ))}
-      <VerdictActions d={latest} onDone={onDone} />
+      <VerdictActions d={latest} onDone={onDone} held={held} onAct={onAct} onFail={onFail} />
     </Card>
   );
 }
 
-function VerdictActions({ d, onDone }: { d: KbArtefact; onDone: (id: string) => void }) {
+function VerdictActions({ d, onDone, held, onAct, onFail }: {
+  d: KbArtefact;
+  onDone: (id: string) => void;
+  held: HeldMap;
+  onAct: (d: KbArtefact) => void;
+  onFail: (id: string) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const { busy, err, act } = useDecisionAct(d, onDone);
+  const { busy, err, act } = useDecisionAct(d, onDone, { onAct, onFail });
+  const busyNow = busy || held.has(d.id);
   const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
   return (
     <>
       <ActionRow>
-        <Btn variant="accept" disabled={busy} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</Btn>
-        <Btn variant="reject" disabled={busy} onClick={() => void act("rejected")}>Reject</Btn>
-        <Btn quiet onClick={() => setOpen(true)}>Details / comment…</Btn>
+        <Btn variant="accept" disabled={busyNow} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</Btn>
+        <Btn variant="reject" disabled={busyNow} onClick={() => void act("rejected")}>Reject</Btn>
+        <Btn quiet disabled={busyNow} onClick={() => setOpen(true)}>Details / comment…</Btn>
         {err && <span className="k-err">{err}</span>}
       </ActionRow>
-      {open && <DecisionPopover d={d} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} />}
+      {open && <DecisionPopover d={d} holding={busyNow} onClose={() => setOpen(false)} onChanged={() => onDone(d.id)} onAct={onAct} onFail={onFail} />}
     </>
   );
 }
@@ -163,11 +209,21 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
   const [proposed, setProposed] = useState<KbArtefact[] | null>(null);
   const [steering, setSteering] = useState<KbArtefact[] | null>(null);
   const [tick, setTick] = useState(0);
+  // busy-hold (BR#3457): decisions being actioned stay in the list, pinned to
+  // the bottom of their section, until a refetch confirms they left `proposed`.
+  const [held, setHeld] = useState<HeldMap<KbArtefact>>(() => new Map());
+  const markAct = (d: KbArtefact) => setHeld((m) => beginHold(m, d, "accepted"));
+  const markFail = (id: string) => setHeld((m) => settleHold(m, id, false));
 
   const load = async () => {
     try {
       const r = await kbApi.artefacts({ type: "decision", status: "proposed" });
-      setProposed(r.artefacts ?? []);
+      const list = r.artefacts ?? [];
+      setProposed(list);
+      // confirm-or-keep: a held id still listed keeps holding (the server has
+      // not flipped it yet); one no longer listed is confirmed gone — the row
+      // unmounts. This is the ONLY door that removes an actioned card.
+      setHeld((m) => reconcileHold(m, new Set(list.map((x) => x.id))).held);
     } catch {
       setProposed([]);
     }
@@ -212,7 +268,16 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
 
   const bump = () => { void refresh(); setTick((x) => x + 1); };
 
-  const grouped = useMemo(() => groupDecisions(proposed ?? []), [proposed]);
+  // held cards merge into the list (a held-only card must keep rendering) and
+  // each section orders busy-last, then created_ts desc — the no-jump law.
+  const merged = useMemo(() => mergeHeld(proposed ?? [], held), [proposed, held]);
+  const grouped = useMemo(() => {
+    const g = groupDecisions(merged);
+    return {
+      verdictCards: holdOrderGroups(g.verdictCards, held),
+      generic: holdOrder(g.generic, held),
+    };
+  }, [merged, held]);
 
   const total = grouped.verdictCards.length + grouped.generic.length + asked.length + blockedOnAsk.length;
 
@@ -269,11 +334,11 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
       ))}
 
       {grouped.verdictCards.map(({ latest, prior }) => (
-        <VerdictGroupRow key={latest.id} latest={latest} prior={prior} onDone={bump} />
+        <VerdictGroupRow key={latest.id} latest={latest} prior={prior} onDone={bump} held={held} onAct={markAct} onFail={markFail} />
       ))}
 
       {grouped.generic.map((d) => (
-        <DecisionRow key={d.id} d={d} onDone={bump} />
+        <DecisionRow key={d.id} d={d} onDone={bump} held={held} onAct={markAct} onFail={markFail} />
       ))}
 
       {questions.length > 0 && (

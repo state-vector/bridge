@@ -2781,6 +2781,15 @@ export class KnowledgeHub {
     }
     this.audit(actor, "create", id, { type, title });
     this.version(id, actor, "create", title, { type, title, body_md: bodyMd, tags: tags ?? [], roles });
+    // ONE ACTIONABLE VERDICT PER TARGET (BR#3457): a fresh verify-verdict for
+    // a target sweeps still-proposed older rounds of the same verify effort —
+    // otherwise accepting the latest resurfaces an older round as the new
+    // "latest" and the For Me card regrows (the dedup gate above only covered
+    // identical repeats; this covers changed verdicts / changed receipts).
+    if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      const target = String(createMeta.task ?? createMeta.verify_target ?? "").trim();
+      if (target) await this.supersedeStaleVerdicts(target, id, `superseded by ${id} — newer verdict for same target`);
+    }
     await this.embedArtefact(id, title, bodyMd);
     // GitHub auto-enrichment: "#1886" in the title pulls issue body/labels
     if (this.env.GH_TOKEN) {
@@ -2789,6 +2798,35 @@ export class KnowledgeHub {
     }
     if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
     return { id, type, status };
+  }
+
+  /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
+   *  taking over a target supersedes every OTHER still-proposed verify-verdict
+   *  for that target: older rounds of the same verify effort, and create-race
+   *  stragglers. BR#1782's dedup covered identical repeats at create; this
+   *  covers "a newer verdict exists" — without it, accepting the latest
+   *  resurfaces an older round as the new "latest" and the For Me card
+   *  regrows as if the human's click did nothing. All sweep transitions act
+   *  as "system:verdictsweep" so the act-time prong (doTransition) never
+   *  cascades onto the takeover verdict itself. */
+  private async supersedeStaleVerdicts(target: string, exceptId: string, reason: string): Promise<void> {
+    const stale = this.state.storage.sql.exec(
+      `SELECT id FROM artefacts WHERE type = 'decision' AND status = 'proposed'
+       AND json_extract(meta, '$.decision_class') = 'verify-verdict'
+       AND (json_extract(meta, '$.task') = ? OR json_extract(meta, '$.verify_target') = ?)
+       AND id != ?`,
+      target, target, exceptId,
+    ).toArray() as any[];
+    for (const s of stale) {
+      try {
+        await this.transition({ id: s.id, to: "superseded", note: reason, replacement_id: exceptId }, "system:verdictsweep");
+        this.audit("system:verdictsweep", "verdict_superseded", s.id, { target, by: exceptId });
+      } catch (e) {
+        // one refused sweep never blocks the takeover — the gate's refusal is
+        // observability (the card simply stays until the next prong fires)
+        this.audit("system:verdictsweep", "verdict_sweep_failed", s.id, { target, by: exceptId, error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
   }
 
   /** A progress artefact (meta.task → task id) doubles as a heartbeat on that task:
@@ -3545,6 +3583,18 @@ export class KnowledgeHub {
             this.version(id, "decision:verdict", "note", `verdict apply failed on ${target}: ${msg}`, { target, error: msg });
           }
         }
+      }
+    }
+    // BR#3457 act-time prong: the human acted on THIS verdict — any other
+    // still-proposed verdict for the same target must not survive to regrow
+    // the For Me card (legacy stacked rounds created before the create-time
+    // sweep, or create-race stragglers). The sweeper's own transitions don't
+    // cascade — the guard keeps the takeover verdict safe.
+    if (row.type === "decision" && (verdict.status === "accepted" || verdict.status === "superseded") && actor !== "system:verdictsweep") {
+      const dm = meta ?? {};
+      if (dm.decision_class === "verify-verdict") {
+        const target = String(dm.task ?? dm.verify_target ?? "").trim();
+        if (target) await this.supersedeStaleVerdicts(target, id, `superseded by human action on ${id} — one actionable verdict per target (BR#3457)`);
       }
     }
     // ---- execute the effects the executor decided (do.ts never decides) ----
