@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import snarkdown from "snarkdown";
 import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
@@ -108,18 +108,34 @@ export function Comment({ v }: { v: HistoryEntry }) {
   );
 }
 
-export function useDecisionAct(d: KbArtefact, onDone: (id: string) => void) {
+export function useDecisionAct(
+  d: KbArtefact,
+  onDone: (id: string) => void,
+  hooks?: { onAct?: (d: KbArtefact) => void; onFail?: (id: string) => void },
+) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const act = async (to: "accepted" | "rejected") => {
+  const act = async (to: "accepted" | "rejected", opts?: { note?: string; reason?: string }) => {
     setBusy(true);
     setErr("");
+    // busy-hold (BR#3457): the parent pins the card to the bottom of its
+    // section BEFORE the call — the card must never vanish mid-flight; it
+    // leaves the list only when a post-action refetch confirms it.
+    hooks?.onAct?.(d);
     try {
-      await kbApi.transition(d.id, to, { note: to === "accepted" ? "accepted by human (For Me)" : "rejected by human (For Me)" });
+      // LIFECYCLES.decision has no `rejected` edge (core.ts: proposed →
+      // accepted | superseded) — Reject routes to supersede-with-reason
+      // (BR#2474 popover copy: "Supersede = the verdict doesn't hold; record why").
+      const supersede = to === "rejected";
+      const note = opts?.note ?? (supersede
+        ? `superseded by human (For Me): ${opts?.reason?.trim() || "verdict does not hold"}`
+        : "accepted by human (For Me)");
+      await kbApi.transition(d.id, supersede ? "superseded" : "accepted", { note });
       onDone(d.id);
       return true;
     } catch (e) {
       setErr(`failed: ${(e as Error).message}`);
+      hooks?.onFail?.(d.id); // error: un-busy, the card returns to its slot
       return false;
     } finally {
       setBusy(false);
@@ -128,15 +144,33 @@ export function useDecisionAct(d: KbArtefact, onDone: (id: string) => void) {
   return { busy, err, act };
 }
 
-export function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onClose: () => void; onChanged: () => void }) {
+export function DecisionPopover({ d, onClose, onChanged, holding = false, onAct, onFail }: {
+  d: KbArtefact;
+  onClose: () => void;
+  onChanged: () => void;
+  /** true while the row holds this decision busy — the popover stays open
+   *  (buttons dead) until the refetch confirms, then closes with the row */
+  holding?: boolean;
+  onAct?: (d: KbArtefact) => void;
+  onFail?: (id: string) => void;
+}) {
   const tasks = useKb((s) => s.tasks) as any[];
-  const { busy: actBusy, act } = useDecisionAct(d, onChanged);
+  const { busy: actBusy, err: actErr, act } = useDecisionAct(d, onChanged, { onAct, onFail });
+  const actedRef = useRef(false);
   const [comments, setComments] = useState<HistoryEntry[] | null>(null);
   const [comment, setComment] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const dead = busy || actBusy || holding;
+
+  // BR#3457: a successful action closes ONLY on confirmation (the card leaving
+  // the proposed list releases the row's hold). A failed action keeps the
+  // popover open with the error — actedRef stays false.
+  useEffect(() => {
+    if (actedRef.current && !holding) onClose();
+  }, [holding]);
 
   useEffect(() => {
     let dead = false;
@@ -170,20 +204,16 @@ export function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onCl
 
   const actWithNote = async (to: "accepted" | "rejected") => {
     if (to === "rejected" && !rejectReason.trim()) return;
-    setBusy(true);
-    try {
-      const note = to === "accepted"
-        ? `accepted by human (For Me)${comment.trim() ? ` — ${comment.trim()}` : ""}`
-        : `rejected by human (For Me) — ${rejectReason.trim()}`;
-      await kbApi.transition(d.id, to, { note });
-      setMsg(to === "accepted" ? "accepted" : "rejected");
-      onChanged();
-      onClose();
-    } catch (e) {
-      setMsg(`failed: ${(e as Error).message}`);
-    } finally {
-      setBusy(false);
-      setTimeout(() => setMsg(""), 2500);
+    const note = to === "accepted"
+      ? `accepted by human (For Me)${comment.trim() ? ` — ${comment.trim()}` : ""}`
+      : `superseded by human (For Me): ${rejectReason.trim()}`;
+    const ok = await act(to, { note });
+    if (ok) {
+      actedRef.current = true;
+      setMsg(to === "accepted" ? "accepted" : "superseded — the verdict doesn't hold");
+      onChanged(); // bump → refetch → the row's hold releases on confirmation
+      // no onClose() here — the popover closes when the hold confirms (the
+      // effect above), never before the server's state is visible
     }
   };
 
@@ -263,40 +293,25 @@ export function DecisionPopover({ d, onClose, onChanged }: { d: KbArtefact; onCl
               value={rejectReason}
               placeholder="Why reject? (required)"
               onChange={(e) => setRejectReason(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void act("rejected"); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && rejectReason.trim()) void actWithNote("rejected"); }}
             />
-            <Btn variant="reject" disabled={busy || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</Btn>
-            <Btn quiet onClick={() => setRejectOpen(false)}>Cancel</Btn>
+            <Btn variant="reject" disabled={dead || !rejectReason.trim()} onClick={() => void actWithNote("rejected")}>Confirm reject</Btn>
+            <Btn quiet disabled={dead} onClick={() => setRejectOpen(false)}>Cancel</Btn>
           </div>
         )}
 
         <ActionRow>
-          <Btn variant="accept" disabled={busy || actBusy} onClick={() => void actWithNote("accepted")}>Accept</Btn>
-          <Btn quiet disabled={busy || actBusy} onClick={() => setRejectOpen(true)}>Reject…</Btn>
+          <Btn variant="accept" disabled={dead} onClick={() => void actWithNote("accepted")}>Accept</Btn>
+          <Btn quiet disabled={dead} onClick={() => setRejectOpen(true)}>Reject…</Btn>
         </ActionRow>
-        {msg && <p className="ok">{msg}</p>}
+        {(msg || actErr) && <p className={actErr ? "k-err" : "ok"}>{actErr || msg}</p>}
       </div>
     </div>
   );
 }
 
-/** For Me flood fix (BR#1782): verify-verdict decisions group by TARGET TASK —
- *  one actionable card per task (latest verdict + collapsed identical rounds). */
-export function groupDecisions(proposed: KbArtefact[]): { verdictCards: Array<{ latest: KbArtefact; prior: KbArtefact[] }>; generic: KbArtefact[] } {
-  const verdicts = proposed.filter((d) => (d.meta as any)?.decision_class === "verify-verdict" && ((d.meta as any)?.task || (d.meta as any)?.verify_target));
-  const generic = proposed.filter((d) => !verdicts.includes(d));
-  const byTarget = new Map<string, KbArtefact[]>();
-  for (const d of verdicts) {
-    const key = String((d.meta as any).task ?? (d.meta as any).verify_target);
-    const arr = byTarget.get(key) ?? [];
-    arr.push(d);
-    byTarget.set(key, arr);
-  }
-  const verdictCards: Array<{ latest: KbArtefact; prior: KbArtefact[] }> = [];
-  for (const [, arr] of byTarget) {
-    arr.sort((a, b) => b.created_ts - a.created_ts);
-    verdictCards.push({ latest: arr[0], prior: arr.slice(1) });
-  }
-  verdictCards.sort((a, b) => b.latest.created_ts - a.latest.created_ts);
-  return { verdictCards, generic };
-}
+/** For Me flood fix (BR#1782) + busy-hold (BR#3457): grouping and ordering
+ *  live in the dependency-free forMeHold module (the worker's vitest tier
+ *  tests the law directly). Re-exported here so the ask band keeps its
+ *  import path. */
+export { groupDecisions } from "./forMeHold";

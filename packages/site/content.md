@@ -149,6 +149,8 @@ Non-task artefacts: **steering** (draft → active → superseded; constrains do
 
 Verify-verdict decisions always carry a plain-English ask at the top — **what accepting does** (PASS closes the target task done; BOUNCE bounces it back to in_progress), **why it lands on you** (agents propose, only a human accepts), and that you are not being asked to re-verify. Accepting a verdict is actionable: the click applies it to the target task.
 
+**One actionable verdict per target, ever** (BR#3457): a newer verify-verdict for the same target supersedes the still-proposed older rounds at create time, and the human's accept/reject sweeps any leftover proposed sibling — a stacked group (three verify rounds on one task) collapses to one card that can never regrow after the click. The click itself never makes the card jump: acting pins it to the bottom of its For Me section with an `actioning…` chip and dead buttons until a refetch confirms the decision left `proposed`; on error it returns to its slot with the reason inline. Reject routes to supersede-with-reason (the decision lifecycle has no `rejected` edge — a verdict that doesn't hold is superseded with the why).
+
 ### The ask contract: asks are question nodes
 
 When an agent needs a human or a peer, `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered `type: "question"` node, `child_of` the subject task when one is given (`artefact_id`). The subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to `in_progress`. Three fields are the whole contract, enforced server-side:
