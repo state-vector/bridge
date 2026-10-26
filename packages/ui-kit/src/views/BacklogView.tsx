@@ -84,7 +84,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       { key: "human", title: "Blocked — awaiting you", note: "pending human ask — answer it and the asker resumes.", rows: blockedHuman, showRank: false, showBoost: false },
       { key: "verify", title: "Blocked — awaiting verify", note: "in review; the owner stays parked until a fresh verify session rules.", rows: verify, showRank: false, showBoost: false },
       { key: "unblocking", title: "Blocked — unblock duty live", note: "an agent is actively working the unblock; nothing for you to do.", rows: unblocking, showRank: false, showBoost: false },
-      { key: "other", title: "Blocked — other", note: "machine exit conditions — they move when the condition fires.", rows: blockedOther, showRank: false, showBoost: false },
+      { key: "other", title: "Blocked — other", note: "everything else parked: most carry a machine exit condition the hub re-checks every 15 min — a condition the parser can't read never auto-flips; open the card to resolve or re-scope", rows: blockedOther, showRank: false, showBoost: false },
       { key: "timeout", title: "Timeout — churn/rework parks", note: "cannot be actioned by anyone; the owning agent resumes or the park lapses.", rows: timeout, showRank: false, showBoost: false },
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
     ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))

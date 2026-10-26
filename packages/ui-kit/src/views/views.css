@@ -1038,3 +1038,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   animation: ask-spin .7s linear infinite; flex: none;
 }
 @keyframes ask-spin { to { transform: rotate(360deg); } }
+
+/* BR#3457 actioning affordance: a held card grays out while its decision is
+   in flight — pin-to-bottom comes from holdOrder, this is the visual half
+   (spinner chip + dead buttons ship in ForMeView). */
+.forme-actioning { opacity: .6; transition: opacity .15s ease; }

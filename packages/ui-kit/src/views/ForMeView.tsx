@@ -42,10 +42,11 @@ function DecisionRow({ d, onDone, held, onAct, onFail }: {
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone, { onAct, onFail });
   // busy-hold (BR#3457): from click until a refetch confirms, the card stays
-  // in the list, pinned to the bottom of its section, buttons dead.
+  // in the list, pinned to the bottom of its section, grayed out with a
+  // spinner chip — buttons dead.
   const busyNow = busy || held.has(d.id);
   return (
-    <Card className="ask-urgent forme-item">
+    <Card className={"ask-urgent forme-item" + (busyNow ? " forme-actioning" : "")}>
       {(() => {
         const f = decisionFrame(d);
         return (
@@ -53,7 +54,7 @@ function DecisionRow({ d, onDone, held, onAct, onFail }: {
             <Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>
             {f.verdict && <Chip tone={f.verdict === "bounce" ? "needs" : "done"}>{f.verdict.toUpperCase()}</Chip>}
             {f.target && <Chip tone="scope">{f.target}</Chip>}
-            {busyNow && <Chip tone="needs">ACTIONING…</Chip>}
+            {busyNow && <Chip tone="needs"><span className="ask-spinner" aria-hidden="true"></span> ACTIONING…</Chip>}
             <span className="why-line">{d.id} · proposed {rel(d.created_ts)} · by {(d.meta as any)?.proposed_by ?? d.owner ?? "—"}</span>
           </div>
         );
@@ -105,12 +106,12 @@ function VerdictGroupRow({ latest, prior, onDone, held, onAct, onFail }: {
   const verdict = String(m.verdict ?? "").toLowerCase() === "bounce" ? "bounce" : "verified";
   const busyNow = groupBusy({ latest, prior }, held);
   return (
-    <Card className="ask-urgent forme-item">
+    <Card className={"ask-urgent forme-item" + (busyNow ? " forme-actioning" : "")}>
       <div className="ask-chips">
         <Chip tone="urgent">VERDICT</Chip>
         <Chip tone={verdict === "bounce" ? "needs" : "done"}>{verdict.toUpperCase()}</Chip>
         <Chip tone="scope">{target}</Chip>
-        {busyNow && <Chip tone="needs">ACTIONING…</Chip>}
+        {busyNow && <Chip tone="needs"><span className="ask-spinner" aria-hidden="true"></span> ACTIONING…</Chip>}
         <span className="why-line">{latest.id} · proposed {rel(latest.created_ts)}</span>
       </div>
       <h3 className="ask-question" onClick={() => void 0}>

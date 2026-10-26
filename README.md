@@ -352,7 +352,7 @@ the knowledge object's `progress.log` op, so a comment from any surface lands on
 instead of 404ing — and a failed post shows the server's message, not a bare "comment
 failed". The task detail panel loads the card, its history and its related tasks in
 parallel: each section renders as its own data arrives, carries its own error + retry, and
-the non-essential related list times out to nothing instead of holding the panel hostage.
+the non-essential related list times out to nothing instead of holding the panel hostage. Every section races its own timeout — the card and history get 15s, related enrichment 5s — so a stalled fetch answers with a named error + retry (or an explicit loading spinner) and never leaves the panel a bare shell.
 
 **Claim locally** — next to **Reframe** on every open ask (both surfaces: the ask band
 rows in Top and TaskDetail's AskSelfCard), a **Claim locally** button copies a

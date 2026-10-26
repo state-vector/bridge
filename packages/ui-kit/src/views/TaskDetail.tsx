@@ -35,6 +35,19 @@ export const HISTORY_LABEL: Record<string, string> = {
 /** related is enrichment (dep-graph titles fall back to the live board store) —
  *  bounded so a cold DO can't hold the panel hostage (BR#3462 leg 3). */
 const RELATED_TIMEOUT_MS = 5000;
+/** essential sections (card + history) get a longer leash than the
+ *  non-essential related enrichment — but NEVER none: a hung fetch used to
+ *  leave the panel a bare shell with no error and no retry (the desktop
+ *  detail-window "minimal content" report, 2026-10-26). */
+const SECTION_TIMEOUT_MS = 15000;
+
+/** race a section's fetch against a timeout — every section answers, one way or another */
+const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+  Promise.race([
+    p,
+    new Promise<never>((_, rej) =>
+      setTimeout(() => rej(new Error(`${label}: no answer in ${ms / 1000}s — retry`)), ms)),
+  ]);
 
 export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
   const inFlight = tasks.filter((t) => ["in_progress", "blocked", "todo"].includes(t.status));
@@ -439,13 +452,13 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
     // it races a timeout and the panel renders without it when slow/failed.
     void (async () => {
       const [a, r, h] = await Promise.allSettled([
-        kbApi.artefact(taskId),
+        withTimeout(kbApi.artefact(taskId), SECTION_TIMEOUT_MS, "load task"),
         Promise.race([
           kbApi.related(taskId),
           new Promise<never>((_, rej) =>
             setTimeout(() => rej(new Error(`no answer in ${RELATED_TIMEOUT_MS / 1000}s`)), RELATED_TIMEOUT_MS)),
         ]),
-        kbApi.history(taskId),
+        withTimeout(kbApi.history(taskId), SECTION_TIMEOUT_MS, "load history"),
       ]);
       if (!on) return;
       if (a.status === "fulfilled") {
@@ -526,6 +539,13 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           <div className="detail-block">
             <span className="k-err">load task failed: {taskErr}</span>{" "}
             <Btn size="sm" quiet onClick={reload}>Retry</Btn>
+          </div>
+        )}
+
+        {!task && !taskErr && (
+          <div className="detail-block">
+            <span className="ask-spinner" aria-hidden="true"></span>{" "}
+            <span className="muted-note">loading task…</span>
           </div>
         )}
 

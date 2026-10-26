@@ -9,12 +9,16 @@ export function TaskWindow() {
   const taskId = params.get("task");
   const decisionId = params.get("decision");
   const [decision, setDecision] = useState<KbArtefact | null>(null);
+  const [decErr, setDecErr] = useState("");
 
   useEffect(() => {
     if (!decisionId) return;
     let on = true;
-    kbApi.artefact(decisionId).then((a) => { if (on) setDecision(a as KbArtefact); }).catch(() => {});
-    return () => { on = false; };
+    const to = setTimeout(() => { if (on) setDecErr("no answer in 15s — reopen the window"); }, 15000);
+    kbApi.artefact(decisionId)
+      .then((a) => { clearTimeout(to); if (on) { setDecision(a as KbArtefact); setDecErr(""); } })
+      .catch((e) => { clearTimeout(to); if (on) setDecErr(String((e as Error).message ?? e)); });
+    return () => { on = false; clearTimeout(to); };
   }, [decisionId]);
 
   if (taskId) {
@@ -31,7 +35,7 @@ export function TaskWindow() {
       </div>
     );
   }
-  return <div className="task-window task-window-empty">{decisionId ? "loading decision…" : "nothing to show"}</div>;
+  return <div className="task-window task-window-empty">{decisionId ? (decErr ? `load decision failed: ${decErr}` : "loading decision…") : "nothing to show"}</div>;
 }
 
 /** refs inside a detail window open ANOTHER window (never navigate this one) */
