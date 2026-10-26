@@ -1435,6 +1435,32 @@ export type TrainGateInput = {
   legNumber?: number;
 };
 
+// ---- the executor's fact boundary (BR#3714) ----
+
+/** gh's `mergeable` is the GraphQL enum STRING "MERGEABLE"|"CONFLICTING"|
+ *  "UNKNOWN" (null while GitHub computes) — but the 5c gate compares
+ *  `mergeable !== true` (boolean). Fed raw, the string satisfies neither
+ *  `true` nor `null`: every gated candidate bounced "unmergeable —
+ *  CONFLICTING" and the train could never merge anything (BR#3714, latent
+ *  since BR#3517 — the unit tests passed because they fed booleans).
+ *  REST-shaped booleans pass through; anything else is null (wait this
+ *  tick, never a bounce). */
+export function normalizeGhMergeable(v: unknown): boolean | null {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v === "MERGEABLE") return true;
+  if (v === "CONFLICTING") return false;
+  return null; // "UNKNOWN", null, undefined, anything else
+}
+
+/** gh's `mergeStateStatus` is UPPERCASE ("CLEAN"|"UNSTABLE"|"BEHIND"|…)
+ *  while the gate compares lowercase — normalize at the same boundary
+ *  (BR#3714), so a real state is named honestly instead of every PR
+ *  reading as unmergeable. */
+export function normalizeGhMergeState(v: unknown): string | null {
+  return typeof v === "string" ? v.toLowerCase() : null;
+}
+
 /** The per-candidate gate the executor runs before merging (BR#3516 §2),
  *  each leg fail-closed: verdict coverage (stamp or contiguous carry) ·
  *  base-green · mergeable=MERGEABLE with bound-wait through null · every

@@ -6,6 +6,8 @@ import {
   decideTrainGate,
   leaseDecide,
   mergeTrainQueue,
+  normalizeGhMergeable,
+  normalizeGhMergeState,
   trainBounceBrief,
   trainCardMatchesLane,
   trainLandedCloseNote,
@@ -617,5 +619,78 @@ describe("decideTrainGate legs (BR#3659 — the gate is per-leg)", () => {
       headChecks: [green(1)],
     });
     expect(legacy.kind).toBe("merge");
+  });
+});
+
+// ---------- BR#3714: the executor's fact boundary ----------
+
+describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums → the gate's contract)", () => {
+  it("gh's GraphQL enum strings map to the boolean the 5c gate compares", () => {
+    expect(normalizeGhMergeable("MERGEABLE")).toBe(true);
+    expect(normalizeGhMergeable("CONFLICTING")).toBe(false);
+    expect(normalizeGhMergeable("UNKNOWN")).toBe(null); // GitHub still computing
+    expect(normalizeGhMergeable(null)).toBe(null);
+    expect(normalizeGhMergeable(undefined)).toBe(null);
+    expect(normalizeGhMergeable("MERGEABLE ")).toBe(null); // no sloppy truth — exact enum only
+    // REST-shaped booleans pass through (both shapes are legal gh output)
+    expect(normalizeGhMergeable(true)).toBe(true);
+    expect(normalizeGhMergeable(false)).toBe(false);
+  });
+
+  it("gh's UPPERCASE mergeStateStatus lands lowercase; non-strings are null", () => {
+    expect(normalizeGhMergeState("CLEAN")).toBe("clean");
+    expect(normalizeGhMergeState("UNSTABLE")).toBe("unstable");
+    expect(normalizeGhMergeState("BEHIND")).toBe("behind");
+    expect(normalizeGhMergeState("DIRTY")).toBe("dirty");
+    expect(normalizeGhMergeState("BLOCKED")).toBe("blocked");
+    expect(normalizeGhMergeState(null)).toBe(null);
+    expect(normalizeGhMergeState(42)).toBe(null);
+  });
+
+  it("THE REPRO: a gh-shaped PR (enum strings, pre-fix the bouncing case) merges through the SAME gate", () => {
+    // Live receipt 2026-10-27: gh pr view 222 --repo state-vector/bridge
+    // → mergeable:"MERGEABLE", mergeStateStatus:"BEHIND" (strings). Fed raw,
+    // decideMergeAction read "MERGEABLE" ≠ true → bounce "unmergeable —
+    // CONFLICTING" — the lie every tick told a perfectly mergeable PR.
+    const HEAD = "a".repeat(40);
+    const d = decideTrainGate({
+      prNumber: 222,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 222, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: normalizeGhMergeable("MERGEABLE"),
+      mergeStateStatus: normalizeGhMergeState("CLEAN"),
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }],
+    });
+    expect(d.kind).toBe("merge");
+  });
+
+  it("the boundary is fail-closed in gh's shapes too — CONFLICTING bounces, UNKNOWN waits, states name themselves honestly", () => {
+    const HEAD = "b".repeat(40);
+    const base = {
+      prNumber: 220,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 220, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }],
+    } as Parameters<typeof decideTrainGate>[0];
+    const gh = (m: unknown, s: unknown): Parameters<typeof decideTrainGate>[0] =>
+      ({ ...base, mergeable: normalizeGhMergeable(m), mergeStateStatus: normalizeGhMergeState(s) });
+    // genuinely conflicting → the honest bounce (PR #220's real state)
+    const conflict = decideTrainGate(gh("CONFLICTING", "DIRTY"));
+    expect(conflict.kind).toBe("bounce");
+    if (conflict.kind === "bounce") expect(conflict.defect).toContain("CONFLICTING against base");
+    // UNKNOWN → null → skip this tick (never a bounce)
+    expect(decideTrainGate(gh("UNKNOWN", "UNKNOWN")).kind).toBe("skip");
+    // uppercase states read back lowercase-named: BEHIND bounces NAMING behind
+    const behind = decideTrainGate(gh("MERGEABLE", "BEHIND"));
+    expect(behind.kind).toBe("bounce");
+    if (behind.kind === "bounce") expect(behind.defect).toContain("mergeStateStatus=behind");
+    // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
+    expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
   });
 });

@@ -46,6 +46,8 @@ import {
   classifyMainCheckRuns,
   decideTrainGate,
   mergeSweepHumanLegTitle,
+  normalizeGhMergeable,
+  normalizeGhMergeState,
   trainLegs,
   trainLegLanded,
   TRAIN_CI_BOUND_MULTIPLIER,
@@ -130,10 +132,21 @@ function preflight() {
 // GitHub fact fetchers (executor side — the hub's facts ALL ride these)
 // ---------------------------------------------------------------------------
 
-/** PR head facts: head sha, mergeability, merge state, state, merge commit. */
+/** PR head facts: head sha, mergeability, merge state, state, merge commit.
+ *  BR#3714: gh's JSON here is the GraphQL shape — `mergeable` is the enum
+ *  STRING "MERGEABLE"|"CONFLICTING"|"UNKNOWN" (never a boolean) and
+ *  `mergeStateStatus` is UPPERCASE. Normalized AT the fact boundary so the
+ *  5c gate's boolean/lowercase contract holds for every consumer (gate,
+ *  bounce triage, update-branch recheck); the pure normalizers are
+ *  unit-pinned in test/merge-train.test.ts. */
 function prFacts(repo, n) {
-  return ghJson(["pr", "view", String(n), "--repo", repo, "--json",
+  const raw = ghJson(["pr", "view", String(n), "--repo", repo, "--json",
     "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,baseRefName"]);
+  return {
+    ...raw,
+    mergeable: normalizeGhMergeable(raw.mergeable),
+    mergeStateStatus: normalizeGhMergeState(raw.mergeStateStatus),
+  };
 }
 
 /** Check runs on a commit (merge-commit CI poll + head/base checks). */
