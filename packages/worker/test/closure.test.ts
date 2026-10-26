@@ -43,6 +43,13 @@ const BR3185_COND =
 const BR3331_COND =
   "Machine proxy: BR#3337's fix PR on https://github.com/state-vector/bridge is MERGED (mergeCommit non-null). Then a FRESH session: (1) verify no new transition_rejected events on BR#3298 after 2026-10-25T11:34:22.236Z (fresh breach recurrences would have coalesced onto this open card); (2) close BR#3331 done citing the merge commit + the on-card diagnosis. Alternative proxy: BR#3337 reaches done via its own verify chain with receipts.";
 
+// REAL BR#3423 unblock condition — verbatim (the root-blocker card; retrieved
+// 2026-10-26). The stale-ledger specimen: it sat blocked for DAYS with both
+// legs holding (BR#3417 answered by web:rayh; PR #2387 merged 8adf1e85) while
+// the sweep stamped "unparseable — never auto-flips".
+const BR3423_COND =
+  "Both legs, machine atoms: (1) BR#3417 answered (status ≠ todo) with GO — any of Option A / Option B / revert #2368 + gate waiver; (2) BR#3415's fix PR merges past the red stop-the-line gate. Then: `gh run list -R state-vector/superpositional --workflow 'Deploy Dev' --branch main` shows a run NEWER than 40205622594 with conclusion=success AND headSha at-or-descendant of the fix merge (decisive deploy on main GREEN) — after which PRs #2352 (BR#3186), #2381 (BR#3328), #2385 (BR#3400) are rebased + green onto that main and their machine proxies flip. A FRESH session then works the 3 queued cards' merge legs; this root card closes only WITH CI-run-URL receipts per its done-when (never auto-close).";
+
 // REAL BR#3348 done note (version seq 123386, 2026-10-25T14:01Z) — verbatim
 const BR3348_DONE_NOTE = `VERIFY ACCEPTED (fresh-session verify duty BR#3360, session bridge-task-BR-3360, live 2026-10-25T14:01Z; verdict decision BR#3368) — all 4 legs first-hand. No PR exists: paperwork execution only, so nothing to merge; done-with-receipts = verified closes + corrected records. (1) GH #2274 CLOSED/COMPLETED 13:43:19Z, last comment carries 'scenario: manifest-rowcount-basename-collision', guard run https://github.com/state-vector/superpositional/actions/runs/40198911366 logged 'closure evidence present — allow', scenario confirmed first-hand at fixtures/bug-corpus/defects.toml:1225 on main (issue=2274), PR #2327 MERGED b4343e554 00:51:11Z; BR#3129 done with additive exit receipts. (2) GH #2261 CLOSED/COMPLETED 13:44:52Z, final-ledger comment corrects the stale 'Fix 2 READY, awaiting human merge' line — all 6 PR merge states re-verified first-hand, shas match the ledger verbatim (#2275 960a270b8 08:29:07Z, #2309 3c691ab7b 19:06:01Z, #2321 18933f066 19:16:41Z, #2299 af713a90a 22:53:07Z, #2302 87e835829 22:52:47Z, #2276 3cab1f9e 08:21:49Z), grammar 'scenario: none — owned by #2372', #2372 OPEN, guard run https://github.com/state-vector/superpositional/actions/runs/40199028430 allow. (3) GH #2337 CLOSED/COMPLETED 13:45:36Z, last comment 'scenario: none — owned by #2373' with the in-CI coverage justification, #2373 OPEN, PR #2340 MERGED 4beedf7f6 08:50:59Z, guard run https://github.com/state-vector/superpositional/actions/runs/40199089019 allow; BR#3220 correction-of-record appended 13:48:56Z + independent double-check note from this verify session. (4) Stability: all three still CLOSED/COMPLETED at 14:01:06Z (~16-18 min post-close, no reopen; guard read the LAST comment each time). Note: a parallel executor raced the same closes (shared rayh credential); surviving last comments are consistent and guard-allowed — no conflicting residue. Follow-ups per the task's pattern note filed by impl: BR#3358 + BR#3361 (closure-tier duty scheduling), BR#3359 (GH #2372 push-path fix).`;
 
@@ -68,6 +75,32 @@ describe("parseProxyCondition (machine-checkable atoms from real conditions)", (
     expect(unparseable).toBe(false);
     expect(atoms).toHaveLength(1);
     expect(atoms[0]).toMatchObject({ kind: "br_pr_merged", repo: "state-vector/bridge", brId: "BR#3337" });
+  });
+
+  it("BR#3423's real condition: br_answered(3417) + bare br_pr_merged(3415); the 'Then:' duty tail no longer poisons the parse (BR#3620)", () => {
+    const { atoms, unparseable } = parseProxyCondition(BR3423_COND);
+    expect(unparseable).toBe(false);
+    // (1) the answered-ask leg is a board-state atom; (2) the bare fix-PR leg
+    // (no repo URL, present tense) parses; the gh-run duty tail is CUT.
+    expect(atoms).toHaveLength(2);
+    expect(atoms[0]).toMatchObject({ kind: "br_answered", repo: null, brId: "BR#3417" });
+    expect(atoms[1]).toMatchObject({ kind: "br_pr_merged", repo: null, brId: "BR#3415" });
+    // the duty tail's machine-looking text must not manufacture run/pr atoms
+    expect(atoms.some((a) => a.kind === "run_success")).toBe(false);
+    expect(atoms.some((a) => a.kind === "pr_merged")).toBe(false);
+  });
+
+  it("bare 'BR#N answered' phrasing parses wherever it appears (the ask-resolution class)", () => {
+    for (const line of [
+      "BR#3607 answered YES — superseded",
+      "ask BR#3531 answered with GO",
+      "(1) BR#3417 is answered (status ≠ todo) with GO",
+      "BR#3417 now resolved — Option A",
+    ]) {
+      const { atoms, unparseable } = parseProxyCondition(line);
+      expect(unparseable, line).toBe(false);
+      expect(atoms[0]?.kind, line).toBe("br_answered");
+    }
   });
 
   it("a repo-less machine predicate still parses (the sweep stamps it unresolvable, never flips)", () => {
@@ -241,6 +274,7 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
     expect(validateAwaitEvent({ event: "br_pr_merged", id: "BR#2327" })).toEqual({ event: "br_pr_merged", id: "BR#2327" });
     expect(validateAwaitEvent({ event: "issue_closed", repo: "state-vector/bridge", n: 2261 })).toEqual({ event: "issue_closed", repo: "state-vector/bridge", n: 2261 });
     expect(validateAwaitEvent({ event: "br_done", id: "BR#3372" })).toEqual({ event: "br_done", id: "BR#3372" });
+    expect(validateAwaitEvent({ event: "br_answered", id: "BR#3417" })).toEqual({ event: "br_answered", id: "BR#3417" });
     expect(validateAwaitEvent({ event: "run_success", repo: "state-vector/superpositional", newer_than: "40254898149" })).toEqual({ event: "run_success", repo: "state-vector/superpositional", run_id: undefined, newer_than: "40254898149" });
     expect(validateAwaitEvent({ event: "pr_checks_green", repo: "state-vector/bridge", n: 218 })).toEqual({ event: "pr_checks_green", repo: "state-vector/bridge", n: 218 });
     expect(validateAwaitEvent({ event: "ask", ask_id: "BR#3531" })).toEqual({ event: "ask", ask_id: "BR#3531" });
@@ -260,6 +294,7 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
     const a = parseProxyCondition("Machine proxy: PR https://github.com/state-vector/superpositional/pull/2327 mergeCommit non-null");
     expect(awaitEventFromAtoms(a.atoms)).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2327 });
     expect(awaitEventFromAtoms(parseProxyCondition("BR#3372 done").atoms)).toEqual({ event: "br_done", id: "BR#3372" });
+    expect(awaitEventFromAtoms(parseProxyCondition("BR#3417 answered (status ≠ todo) with GO").atoms)).toEqual({ event: "br_answered", id: "BR#3417" });
     expect(awaitEventFromAtoms(parseProxyCondition("PR #2327 mergeCommit non-null").atoms)).toBeNull(); // no repo slug → unresolvable, stays text → ask migration
     expect(awaitEventFromAtoms([])).toBeNull(); // nothing machine-checkable → stays text → ask migration
     // multi-atom conjunctions are NOT single events — no silent partial reads
@@ -269,6 +304,7 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
 
   it("describeAwaitEvent renders human-friendly annotation from the structure", () => {
     expect(describeAwaitEvent({ event: "pr_merged", repo: "state-vector/bridge", n: 84 })).toBe("PR state-vector/bridge#84 merged (mergeCommit non-null)");
+    expect(describeAwaitEvent({ event: "br_answered", id: "BR#3417" })).toBe("BR#3417 answered (no longer open)");
     expect(describeAwaitEvent({ event: "ask", ask_id: "BR#3531" })).toBe("ask BR#3531 answered");
     expect(describeAwaitEvent({ event: "time", until_ts: 123 })).toBe("timer elapsed (until_ts 123)");
   });
@@ -277,6 +313,7 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
     expect(awaitEventToAtom({ event: "ask", ask_id: "BR#1" })).toBeNull();
     expect(awaitEventToAtom({ event: "time", until_ts: 1 })).toBeNull();
     expect(awaitEventToAtom({ event: "pr_merged", repo: "a/b", n: 2 })?.kind).toBe("pr_merged");
+    expect(awaitEventToAtom({ event: "br_answered", id: "BR#3417" })).toMatchObject({ kind: "br_answered", brId: "BR#3417" });
   });
 
   it("deployed: the one credential-free external atom — the hub against its own version stamp", () => {

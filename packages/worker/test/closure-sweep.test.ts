@@ -5,16 +5,21 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 /**
  * Closure-tier duty scheduling (BR#3361) — real DO drill against the bundled
  * worker. DEGRADED under BR#3516: the hub holds no VCS credentials, ever, so
- * the machine-proxy watch can no longer read GitHub — GitHub-state atoms stamp
- * UNRESOLVABLE (never auto-flip; conservatism law) and only board-state atoms
- * (br_done) still evaluate. The closure-RECEIPT audit sweep is gone with it:
- * receipts' truth is owned by the verify session that cites them and by the
- * train's machine-proxy close (train:landed — pinned in train-hub.test.ts).
+ * the machine-proxy watch cannot READ GitHub live — GitHub-state atoms stamp
+ * UNRESOLVABLE (never auto-flip; conservatism law) UNLESS the ledger itself
+ * knows the fact: board-state atoms (br_done, br_answered — BR#3620) evaluate
+ * always, and pr_merged/br_pr_merged evaluate from the train-stamped
+ * provenance table (BR#3620). The closure-RECEIPT audit sweep is gone with
+ * BR#3516: receipts' truth is owned by the verify session that cites them and
+ * by the train's machine-proxy close (train:landed — pinned in train-hub.test.ts).
  *
- * Three mechanisms, one real DO:
- *  (a) unblock-proxy watch (degraded): board-state atoms evaluate; GitHub
- *      atoms stamp unresolvable citing BR#3516 and spawn nothing; unparseable
- *      stays honest; the park-time machine round is unaffected.
+ * Four mechanisms, one real DO:
+ *  (a) unblock-proxy watch (degraded): board-state atoms evaluate; provenance-
+ *      backed merge atoms evaluate; unknown GitHub state stamps unresolvable
+ *      citing BR#3516 and spawns nothing; unparseable stays honest; the
+ *      park-time machine round is unaffected.
+ *      BR#3620 flips: answered-ask cards (br_answered) and train-stamped
+ *      merges flip for real — the stale-ledger class.
  *  (b) terminal close-leg ownership: a done rejected by done-close-legs
  *      auto-derives the close-duty child; the child's receipted done
  *      unblocks the parent's done.
@@ -465,5 +470,105 @@ describe("BR#4062 — ask/time prose parks type at the door and sweep first-clas
     const after = await taskById(pid);
     expect(after.meta?.proxy_check?.verdict).toBe("waiting");
     expect(String(after.meta?.proxy_check?.detail)).toContain(`awaiting ask ${askId}`);
+  });
+});
+
+// ---------- BR#3620: the stale-ledger flips ----------
+// The BR#3423/BR#3415 class: cards sat blocked for days with legs holding —
+// (a) "BR#N answered" had NO atom kind (whole condition stamped unparseable),
+// (b) GitHub-state atoms never consulted the ledger's own provenance table
+// (stamped by train events, zero hub GitHub calls). Both flip now; everything
+// else stays conservative (unparseable/unresolvable still never lie).
+
+describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
+  it("br_answered: a card parked on a human ruling flips when the ruling lands (board-state, no creds)", async () => {
+    const q = await kbJson("/create", { type: "task", title: "Ruling drill: fix direction GO?", qualified: true, session: "drill-ruling-q" });
+    expect(q.status).toBe(200);
+    const qid = String(q.body.id);
+    const a = await kbJson("/create", { type: "task", title: "IMPL: parked on the ruling (BR#3620)", qualified: true, session: "drill-exec-a3620" });
+    const aid = String(a.body.id);
+    const park = await block(aid, "drill-exec-a3620",
+      `Both legs, machine atoms: (1) BR#${qid.slice(3)} answered (status ≠ todo) with GO — any of Option A / Option B / gate waiver; (2) proceed.`,
+      "parked on the ruling");
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    // the park-time round spawned (parseable condition) — close it so the
+    // flip can spawn a FRESH duty (≤1 open unblock child per parent)
+    const parkRound = (await unblockDuties()).find((x: any) =>
+      x.title.startsWith("Unblock: IMPL: parked on the ruling (BR#3620)") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(parkRound, "the park-time round must exist").toBeTruthy();
+    const c1 = await kbJson("/transition", { id: parkRound.id, to: "in_progress", actor: "drill-u1", session: "drill-u1" });
+    expect(c1.status, `park-round claim failed: ${JSON.stringify(c1.body)}`).toBe(200);
+    const c2 = await kbJson("/transition", { id: parkRound.id, to: "done", actor: "drill-u1", note: "checked first-hand: the ruling is still open at check time — condition still blocked (findings)" });
+    expect(c2.status, `park-round close failed: ${JSON.stringify(c2.body)}`).toBe(200);
+
+    // sweep 1: the ruling card is still todo → verdict false, nothing spawns
+    const sweep1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 101 * 60_000 });
+    expect(sweep1.status, JSON.stringify(sweep1.body)).toBeLessThan(500);
+    expect(sweep1.body.error).toBeUndefined();
+    expect((await taskById(aid)).meta?.proxy_check?.verdict).toBe("false");
+
+    // the ruling lands: the ask/question card resolves (board-state event)
+    await kbJson("/transition", { id: qid, to: "in_progress", actor: "web:rayh", session: "web" });
+    await kbJson("/transition", { id: qid, to: "done", actor: "web:rayh", session: "web", note: "GO — Option A" });
+
+    // sweep 2: flip — verdict true, fresh duty spawned with the receipt
+    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 117 * 60_000 });
+    expect(sweep2.body.error).toBeUndefined();
+    const aNow = await taskById(aid);
+    expect(aNow.meta?.proxy_check?.verdict).toBe("true");
+    const flip = (await unblockDuties()).find((x: any) =>
+      x.title.startsWith("Unblock: IMPL: parked on the ruling (BR#3620)") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(flip, "the flip must spawn a fresh unblock duty").toBeTruthy();
+    expect(String(flip.body_md)).toContain("MACHINE PROXY");
+    expect(String(flip.body_md)).toContain(`${qid} status=done (answered)`);
+  });
+
+  it("pr_merged + bare br_pr_merged flip from the train-stamped provenance ledger (no creds)", async () => {
+    const p1 = await kbJson("/create", { type: "task", title: "IMPL: parked on the train (BR#3620 url form)", qualified: true, session: "drill-exec-p3620a" });
+    const p1id = String(p1.body.id);
+    const p2 = await kbJson("/create", { type: "task", title: "IMPL: parked on the train (BR#3620 bare form)", qualified: true, session: "drill-exec-p3620b" });
+    const p2id = String(p2.body.id);
+    // the train stamps the ledger (BR#3287): lease → merged event — zero
+    // GitHub calls; the hub owns this fact
+    const lease = await kbJson("/train.lease", { repo: "state-vector/superpositional", base: "main", action: "acquire" });
+    expect(lease.status, JSON.stringify(lease.body)).toBe(200);
+    const ev = await kbJson("/train.event", {
+      repo: "state-vector/superpositional", base: "main", kind: "merged",
+      pr: 2440, merge_sha: "8adf1e85cfb0ee853682ff0e5b9e361c0ce7edd5", head_sha: "f180fc0f7aa8",
+      task_id: p2id, signer: "drill-signer",
+    });
+    expect(ev.status, `train.event failed: ${JSON.stringify(ev.body)}`).toBe(200);
+    await kbJson("/train.lease", { repo: "state-vector/superpositional", base: "main", action: "release" });
+
+    const park1 = await block(p1id, "drill-exec-p3620a",
+      "Machine proxy: PR https://github.com/state-vector/superpositional/pull/2440 mergeCommit non-null (state=MERGED). Then a fresh session closes it done.", "parked");
+    const park2 = await block(p2id, "drill-exec-p3620b",
+      `Machine proxy: BR#${p2id.slice(3)}'s fix PR merges past the red stop-the-line gate. Then a fresh session closes it done.`, "parked");
+    expect(park1.status, JSON.stringify(park1.body)).toBe(200);
+    expect(park2.status, JSON.stringify(park2.body)).toBe(200);
+    // close the park-time rounds so the flips spawn fresh duties
+    for (const prefix of ["Unblock: IMPL: parked on the train (BR#3620 url form)", "Unblock: IMPL: parked on the train (BR#3620 bare form)"]) {
+      const round = (await unblockDuties()).find((x: any) =>
+        x.title.startsWith(prefix) && ["todo", "in_progress", "blocked"].includes(x.status));
+      expect(round, prefix).toBeTruthy();
+      const c3 = await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-u2", session: "drill-u2" });
+      expect(c3.status, `park-round claim failed (${prefix}): ${JSON.stringify(c3.body)}`).toBe(200);
+      const c4 = await kbJson("/transition", { id: round.id, to: "done", actor: "drill-u2", note: "checked first-hand: no provenance row at check time — condition still blocked (findings)" });
+      expect(c4.status, `park-round close failed (${prefix}): ${JSON.stringify(c4.body)}`).toBe(200);
+    }
+
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 133 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    for (const id of [p1id, p2id]) {
+      const now = await taskById(id);
+      expect(now.meta?.proxy_check?.verdict, id).toBe("true");
+      expect(now.meta?.proxy_check?.spawned, id).toBeTruthy();
+    }
+    // the spawn receipts cite the LEDGER (sha + signer), never a GitHub read
+    const duties = (await unblockDuties()).filter((d: any) =>
+      d.title.startsWith("Unblock: IMPL: parked on the train (BR#3620") && ["todo", "in_progress", "blocked"].includes(d.status));
+    const bodies = duties.map((d: any) => String(d.body_md)).join("\n");
+    expect(bodies).toContain("provenance: state-vector/superpositional#2440 merged (sha 8adf1e85c, signer drill-signer)");
+    expect(bodies).toContain("provenance: BR#");
   });
 });

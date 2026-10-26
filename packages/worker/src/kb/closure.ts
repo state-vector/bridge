@@ -27,6 +27,9 @@ export interface ProxyAtom {
     | "br_pr_merged"
     | "issue_closed"
     | "br_done"
+    /** BR#3620: "BR#N answered" — board-state atom (the ask/question card
+     *  done/superseded), evaluable with zero creds. */
+    | "br_answered"
     | "run_success"
     | "pr_checks_green"
     | "deployed"
@@ -71,6 +74,7 @@ const DUTY_MARKERS = [
   /\bthen\s+an?\s+\S+\s+session\b/i,
   /\bthen\s+an?\s+agent\b/i,
   /\bthen\s+transition\b/i,
+  /\bthen\s*:/i,
   /\bciting\b/i,
   /\balternative\s+proxy\b/i,
   /\bexit\s+condition\s+of\s+record\b/i,
@@ -121,6 +125,7 @@ function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
     case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id };
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n };
     case "br_done": return { kind: "br_done", repo: null, brId: e.id };
+    case "br_answered": return { kind: "br_answered", repo: null, brId: e.id };
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
@@ -162,11 +167,14 @@ export function parseProxyCondition(text: string): ParsedCondition {
       lineYielded = true;
     };
 
-    // pr_merged: "PR <url|#N> … mergeCommit non-null / state MERGED / merged"
-    // ALL PR numbers on the line (BR#3986: first-match exec truncated
-    // conjunctions — "PR #1 merged AND PR #2 merged" gated on #1 only).
+    // pr_merged: "PR <url|#N> … mergeCommit non-null / state MERGED / merged /
+    // merges" — "merges" covers the future-tense precondition shape ("…'s fix
+    // PR merges past the red gate"), whose meaning here is exactly "has
+    // merged" (BR#3620). ALL PR numbers on the line (BR#3986: first-match
+    // exec truncated conjunctions — "PR #1 merged AND PR #2 merged" gated on
+    // #1 only).
     let prMerged = false;
-    if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+    if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b|merges\b)/i.test(line)) {
       const nums = new Set<number>(numbersFromPullUrls(line));
       for (const m of line.matchAll(/PR\s+#?(\d+)\b/g)) nums.add(Number(m[1]));
       for (const n of nums) push({ kind: "pr_merged", repo, number: n });
@@ -175,8 +183,10 @@ export function parseProxyCondition(text: string): ParsedCondition {
 
     // br_pr_merged: "BR#N's fix PR on <repo> is MERGED" — the PR itself is
     // unnamed; the sweep resolves it by head branch bridge/BR-<N>. Only when
-    // the line didn't already name a concrete PR; every BR# on the line.
-    if (!prMerged && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+    // the line didn't already name a concrete PR; every BR# on the line. The
+    // repo is OPTIONAL (BR#3620): a bare "BR#N's fix PR merges" resolves
+    // against the sweep's default repo at eval time.
+    if (!prMerged && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b|merges\b)/i.test(line)) {
       for (const m of line.matchAll(/\bBR#(\d+)\b/g)) push({ kind: "br_pr_merged", repo, brId: `BR#${m[1]}` });
     }
 
@@ -192,6 +202,17 @@ export function parseProxyCondition(text: string): ParsedCondition {
     // BR#3946 vanished from the machine gate entirely.
     for (const m of line.matchAll(/\bBR#(\d+)\s+(?:is\s+)?done\b/gi)) {
       push({ kind: "br_done", repo: null, brId: `BR#${m[1]}` });
+    }
+
+    // br_answered: "BR#N answered|decided|resolved" — board-state: the
+    // ask/question card left todo (done/superseded). The BR#3423 class:
+    // parked on a human ruling that answered days ago, with no atom kind to
+    // read it, so the whole condition stamped unparseable and the card never
+    // moved (BR#3620). Requires a continuation after the verb ("answered with
+    // GO") so the bare derived annotation "ask BR#N answered" keeps
+    // re-deriving the typed ask atom (BR#4062) instead of double-parsing.
+    for (const m of line.matchAll(/\b(?:ask\s+)?BR#(\d+)\s+(?:is\s+)?(?:now\s+)?(?:answered|decided|resolved)\b(?=\s+\S)/gi)) {
+      push({ kind: "br_answered", repo: null, brId: `BR#${m[1]}` });
     }
 
     // run_success: "run <id> … SUCCESS / green" — every run on the line.
@@ -398,6 +419,7 @@ export type AwaitEvent =
   | { event: "br_pr_merged"; id: string }
   | { event: "issue_closed"; repo: string; n: number }
   | { event: "br_done"; id: string }
+  | { event: "br_answered"; id: string }
   | { event: "run_success"; repo: string; run_id?: string; newer_than?: string }
   | { event: "pr_checks_green"; repo: string; n: number }
   | { event: "deployed"; commit: string }
@@ -406,11 +428,11 @@ export type AwaitEvent =
 
 export const AWAIT_EVENT_KINDS = [
   "pr_merged", "br_pr_merged", "issue_closed", "br_done",
-  "run_success", "pr_checks_green", "deployed", "ask", "time",
+  "br_answered", "run_success", "pr_checks_green", "deployed", "ask", "time",
 ] as const;
 
 export const AWAIT_GRAMMAR_DOC =
-  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"br_answered",id} (a resolved ask/question card) | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
 
 /** Closed-set validation. Returns the normalised event or null (fail-closed). */
 export function validateAwaitEvent(v: unknown): AwaitEvent | null {
@@ -429,6 +451,7 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
         : null;
     case "br_pr_merged":
     case "br_done":
+    case "br_answered":
       return id(e.id) ? ({ event: kind, id: e.id } as AwaitEvent) : null;
     case "run_success": {
       if (!repo) return null;
@@ -458,6 +481,7 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "br_done": return { kind: "br_done", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
+    case "br_answered": return { kind: "br_answered", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
@@ -472,6 +496,7 @@ export function describeAwaitEvent(e: AwaitEvent): string {
     case "br_pr_merged": return `${e.id}'s fix PR (head branch bridge/${e.id.slice(3)}) merged`;
     case "issue_closed": return `GH issue ${e.repo}#${e.n} closed`;
     case "br_done": return `${e.id} done`;
+    case "br_answered": return `${e.id} answered (no longer open)`;
     case "run_success":
       return e.run_id
         ? `GitHub run ${e.repo}/${e.run_id} conclusion=success`
@@ -494,6 +519,7 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
     case "br_pr_merged": return a.brId ? { event: "br_pr_merged", id: a.brId } : null;
     case "issue_closed": return a.repo && a.number ? { event: "issue_closed", repo: a.repo, n: a.number } : null;
     case "br_done": return a.brId ? { event: "br_done", id: a.brId } : null;
+    case "br_answered": return a.brId ? { event: "br_answered", id: a.brId } : null;
     case "run_success": return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
     case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
     case "deployed": return a.commit ? { event: "deployed", commit: a.commit } : null;

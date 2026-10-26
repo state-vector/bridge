@@ -746,13 +746,34 @@ export class KnowledgeHub {
         const done = row.status === "done" || row.status === "superseded";
         return { ok: done, receipt: `${atom.brId} status=${row.status}` };
       }
+      case "br_answered": {
+        // board-state like br_done: the ask/question card left todo —
+        // answered, superseded, or any terminal state counts (BR#3620: the
+        // BR#3423 class — a human ruling that answered while the card sat).
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, atom.brId);
+        if (!row) return { ok: false, receipt: `${atom.brId} not found on this board` };
+        const answered = row.status === "done" || row.status === "superseded";
+        return { ok: answered, receipt: `${atom.brId} status=${row.status}${answered ? " (answered)" : " (still open)"}` };
+      }
       case "pr_merged": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516); verify first-hand (gh pr view) or wait for a train event` };
+        // ledger-native first (BR#3620): the provenance table is stamped by
+        // train events with zero hub GitHub calls — a train-stamped merge is
+        // a fact the hub OWNS, unlike a GitHub read it cannot make.
+        const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, atom.repo, atom.number);
+        if (pv) return { ok: true, receipt: `provenance: ${atom.repo}#${atom.number} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516) and no train provenance row exists — verify first-hand (gh pr view) or wait for a train event` };
       }
       case "br_pr_merged": {
-        if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — GitHub state for ${atom.brId} needs credentials the hub does not hold (BR#3516); verify first-hand or wait for a train event` };
+        // bare form resolves against the default repo (the board's project
+        // repo); ledger-native provenance by task_id (BR#3620).
+        const repo = atom.repo ?? io.defaultRepo;
+        const pv = this.one(
+          `SELECT pr, merge_sha, signer FROM provenance WHERE task_id = ? AND repo = ? ORDER BY merged_at DESC LIMIT 1`,
+          atom.brId, repo,
+        );
+        if (pv) return { ok: true, receipt: `provenance: ${atom.brId}'s PR ${repo}#${pv.pr} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state for ${atom.brId} needs credentials the hub does not hold (BR#3516) and no train provenance row exists — verify first-hand or wait for a train event` };
       }
       case "issue_closed": {
         if (!atom.repo) return unresolvable;
@@ -866,11 +887,25 @@ export class KnowledgeHub {
           }
         }
         if (!atoms.length) {
+          // BR#3620: an existing migration ask IS a typed await — wire it so
+          // its resolution flips the card through the ask branch. The legacy
+          // hole: the ask was recorded, answered, and the card never moved
+          // because the free-text condition stayed unread.
+          if (bmeta.await_migration_ask && !bmeta.await_event) {
+            meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "ask", ask_id: bmeta.await_migration_ask } };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            this.stampProxyCheck(r.id, meta, now, "waiting", `awaiting ask ${bmeta.await_migration_ask} (migration ask wired as the typed await)`, prev);
+            continue;
+          }
           // BR#3578 migration: a legacy blocked card awaiting NOTHING (no
           // typed event, no atoms, no bound ask) becomes an ACTIVE ask to the
           // human — once per card, never once per sweep. Cards whose
           // root_blocker is still open skip: the root owns the human leg.
-          const rooted = meta.root_blocker
+          // EXCEPTION (BR#3620): a card that is its OWN root (the root-blocker
+          // rollup stamped root_key on the root card itself) owns nobody's
+          // leg but its own — it gets the migration ask like any other.
+          const selfRooted = String(meta.root_blocker ?? "") === r.id;
+          const rooted = !selfRooted && meta.root_blocker
             ? this.one(`SELECT status FROM artefacts WHERE id = ?`, String(meta.root_blocker))
             : null;
           if (!meta.awaiting_ask?.ask_id && !bmeta.await_migration_ask
@@ -897,7 +932,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
               artefact_id: r.id,
             }, "hub:proxy-watch").catch(() => null);
             if (ask) {
-              meta.blocked = { ...(meta.blocked ?? {}), await_migration_ask: ask.id };
+              meta.blocked = { ...(meta.blocked ?? {}), await_migration_ask: ask.id, await_event: { event: "ask", ask_id: ask.id } };
               this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
             }
           }

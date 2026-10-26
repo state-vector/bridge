@@ -879,18 +879,23 @@ closes those leaks with four hub mechanisms:
 - **Unblock-proxy watch** (a): `unblockProxySweep` (paced by `unblock_proxy_sweep_minutes`, default
   15, `0` = off) re-evaluates every blocked card's `unblock_condition` on each pass. The parser
   (`packages/worker/src/kb/closure.ts`) extracts machine-checkable atoms — `pr_merged` (PR + url/number),
-  `br_pr_merged` (a "BR#N's fix PR on <repo> is MERGED" condition, resolved by head branch
-  `bridge/BR-<N>`), `issue_closed`, `br_done`, `run_success`, `pr_checks_green` — and cuts the
-  DUTY clauses ("then a fresh session closes…") so instruction text never parses as a precondition.
+  `br_pr_merged` (a "BR#N's fix PR is MERGED/merges" condition — with a repo URL, or bare and resolved
+  against the default repo), `issue_closed`, `br_done`, `br_answered` ("BR#N answered" — the ask/question
+  card left `todo`), `run_success`, `pr_checks_green` — and cuts the DUTY clauses ("then a fresh session
+  closes…", "Then: …") so instruction text never parses as a precondition.
   Conservatism law: machine-looking text that yields no atom stamps the verdict `unparseable`
   (never auto-flips); atoms with no resolvable repo stamp `unresolvable`. Since BR#3516 the
-  hub holds no VCS credentials: **GitHub-state atoms (`pr_merged`, `br_pr_merged`,
-  `issue_closed`, `run_success`, `pr_checks_green`) now classify `unresolvable` and spawn
-  nothing** — only board-state atoms (e.g. `br_done`) still verify TRUE live and auto-spawn
-  the unblock duty with the receipts embedded (a trigger, never an authority: the spawned
-  duty re-verifies first-hand; GitHub-state conditions flip when an acting session or the
-  executor operator checks them first-hand). The machine's caps still apply (≤1 open
-  unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
+  hub holds no VCS credentials and never reads GitHub live: **unknown GitHub state (`issue_closed`,
+  `run_success`, `pr_checks_green`, merges with no ledger row) stamps `unresolvable` and spawns
+  nothing** — but three fact classes the hub owns outright still verify and auto-spawn the unblock
+  duty with the receipts embedded (a trigger, never an authority: the spawned duty re-verifies
+  first-hand): **board-state atoms** `br_done` and `br_answered` (BR#3620 — the answered-ask class,
+  so a card parked on a human ruling flips the moment the ruling lands); and **merge atoms backed by
+  the ledger** (BR#3620): `pr_merged`/`br_pr_merged` evaluate from the train-stamped provenance table
+  (BR#3287 — `train.event merged`), receipts citing the stamped sha + signer, no credentials needed.
+  Legacy prose cards the sweep cannot fully read get one migration ask (BR#3578) — which is itself
+  wired as a typed await, so answering it flips the card (BR#3620). The machine's caps still apply
+  (≤1 open unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.
@@ -911,9 +916,11 @@ closes those leaks with four hub mechanisms:
   (rule 5d + protocol card 7). Hub/auto-spawned duties start session-less — the first real session
   to claim them stamps the lease.
 
-Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts),
-`test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty;
-rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence
+Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts —
+including BR#3423's stale-ledger specimen, BR#3620),
+`test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty; the
+BR#3620 flips — answered-ask and train-stamped-merge cards flip, park-round close receipts; rejected
+done → close-duty child → receipted done unblocks the parent; duplicate-executor fence
 audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
 queue and classification) and `test/train-hub.test.ts` (real-DO train drills: lease races,
 landed / stopped / bounced flows, the stop-the-line ask).
