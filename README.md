@@ -359,7 +359,11 @@ answered via the ask band or progress entries, closed to done/superseded — nev
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
-`in_progress`. Three fields are the whole contract, enforced server-side (`askCreate` /
+`in_progress` — but only onto a **live holder**: the resume checks the holder's real liveness
+signals (session-alive vouch, last heartbeat, session/owner ping) against the same stale window
+the watchdog uses, and a dead holder (no live signal, ask older than the window) is released to
+the pool for fresh dispatch instead (BR#3819) — an ask can never resume work onto a session
+that already finished. Three fields are the whole contract, enforced server-side (`askCreate` /
 `askAnswer` in `packages/worker/src/kb/do.ts`):
 
 - **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes
@@ -404,7 +408,7 @@ fallback window instead, so it is never lost.
 
 ## Blocked cards await something typed (BR#3578)
 
-A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
+A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject (live holders only — a dead holder is released to the pool for fresh dispatch, BR#3819); an elapsed timer fires the duty. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
 
 ## Destination-green: the stop-the-line gate
 
@@ -667,6 +671,35 @@ audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure g
 queue and classification) and `test/train-hub.test.ts` (real-DO train drills: lease races,
 landed / stopped / bounced flows, the stop-the-line ask).
 `admin.unblock_proxy_sweep` drills on demand.
+
+## Answers unblock structurally: no self-edges, live-holder resume, the force-close exit (BR#3819)
+
+The specimen: a watchdog rollup stamped a card `child_of` **itself** at creation; the done gate
+then counted the card as its own open child forever — every →done rejected "still has 1 open
+child" with no agent-repairable exit (MCP has no unlink), and answered asks kept resuming work
+onto runners that had already finished. Four laws close the class:
+
+- **Self-edges are unrepresentable** (a): the link API rejects `src == dst` for EVERY relation
+  kind — loud, naming the self-edge class — so no writer (agent, rollup, future feature) can
+  stamp a card as its own child ever again. The non-API write path is covered too: a
+  `replacement_id` self-supersede is refused. Type errors no longer mask the honest reason —
+  the self-edge check runs before relation validation.
+- **The impossible state is invisible** (b): a one-time migration (`self_edges_v1`,
+  settings-stamped, idempotent across boots) deleted the existing self-edges (per-edge audited),
+  and every gate reader excludes `src = dst` defensively — a gate must never read state that
+  cannot exist.
+- **The agent-executable exit** (c): a card the done-open-children gate refuses because a child
+  is genuinely unclosable (the self-edge class, or an orphan that cannot be closed first) closes
+  with a **force-close-with-reason** in the done note — `force-close-children: BR#12, BR#13 —
+  why these children cannot be closed first` — EVERY open child named (a partial list is
+  refused by name), every named child audited as closed-by-force (`meta.force_close` + version
+  note). Loud by construction; never a silent path.
+- **Answers resume live holders only** (d): the ask contract above — an answered ask resumes a
+  holder with a live signal inside the stale window; a dead holder is released to the pool with
+  a loud note, never resumed onto a finished runner.
+
+Drill: `packages/worker/test/br3819-self-edge.test.ts` (real DO: per-relation self-edge
+rejection, migration stamp, partial/complete force-close, live-resume vs dead-release).
 
 ## 5 · Use it
 
