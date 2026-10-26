@@ -86,6 +86,68 @@ describe("parseProxyCondition (machine-checkable atoms from real conditions)", (
   });
 });
 
+// ---------- BR#3668: the human-gate law + parenthetical strip ----------
+// REAL BR#3358 park (live meta.blocked, 2026-10-26) — the stale-true
+// specimen. The sweep mis-parsed the verify-provenance aside "(BR#3361 done,
+// decision BR#3409)" inside this text into a br_done atom, stamped it as the
+// park's await_event, and re-fired it every cycle (8 dispatch duties on the
+// same non-flip). Both fields verbatim.
+const BR3358_COND =
+  "Human-only: Ray supersedes BR#3358 into BR#3361 via web/admin (BR#2480; ask BR#3374 on record with the 4 one-click options). No machine atom can flip this — unblockProxySweep conservatism law (BR#3409) must treat it as unparseable/unresolvable and never auto-flip. Until the supersede lands this card is agent-terminal: a future claimant verifies first (BR#3361 done, decision BR#3409), stands down (no impl, no fork), re-parks blocked-on-owner — never in_progress, never todo (BR#3390), never answers any bound ask agent-side (BR#3384 rule 2: auto-resume re-arms dispatch).";
+const BR3358_REASON =
+  "STAND-DOWN re-park (dispatch #3 of this released duplicate; bridge-task-BR-3358, 2026-10-25 ~16:0xZ). Verify-first executed per the owner duty's additive note (hist seq 124960): canonical BR#3361 is DONE — verify verdict decision BR#3409 (VERIFY MERGED): PR https://github.com/state-vector/bridge/pull/207 MERGED 2dd0b42053ad32e7fc431f05a405ea022d004c46, 2/2 signatures valid, checks green (runs 40206526647/40206526651), all four closure-tier mechanisms live (unblockProxySweep / done-close-legs + close-duty auto-derivation / closureAuditSweep correction duties / duplicate_executor fence + 5d stand-down law). Fresh receipts this session: bridge main tip now d77f94f6cbca (PR #205 per BR#3414) with 2dd0b42053ad an ancestor (compare behind_by=0) — the fix of record is on main. Nothing of this card's three leak shapes remains unimplemented; BR#3409: 'No residuals; nothing agent-advanceable remains.' Zero files touched, no fork, no PR — re-parked per the card banner + family law (BR#3384, BR#3390, BR#2480, accepted BR#2508). Sole outstanding leg = owner's web/admin supersede.";
+
+describe("parseProxyCondition human-gate law (BR#3668, real corpus)", () => {
+  it("BR#3358's REAL unblock_condition parses to ZERO atoms — human-gated by design, even though the prose carries '(BR#3361 done, …)'", () => {
+    const { atoms, unparseable, humanGated, humanGate } = parseProxyCondition(BR3358_COND);
+    expect(atoms).toHaveLength(0);
+    expect(unparseable).toBe(true);
+    expect(humanGated).toBe(true);
+    expect(humanGate).toBeTruthy();
+  });
+
+  it("BR#3358's REAL blocked_reason prose parses to ZERO atoms too — park-note prose is never atomized", () => {
+    const { atoms, unparseable, humanGated } = parseProxyCondition(BR3358_REASON);
+    expect(atoms).toHaveLength(0);
+    expect(unparseable).toBe(true);
+    expect(humanGated).toBe(true);
+  });
+
+  it("each closed-set marker classifies on its own; a plain machine condition does not", () => {
+    for (const t of [
+      "Human-only: Ray clicks the release",
+      "no machine atom can flip this card",
+      "the owner supersedes via web/admin",
+      "owner/web-only release",
+    ]) {
+      const p = parseProxyCondition(t);
+      expect(p.humanGated, t).toBe(true);
+      expect(p.atoms, t).toHaveLength(0);
+      expect(p.unparseable, t).toBe(true);
+    }
+    expect(parseProxyCondition("Machine proxy: BR#3337 done with receipts").humanGated).toBeFalsy();
+  });
+
+  it("a parenthetical '(BR#N done, …)' never yields br_done — provenance asides are annotation", () => {
+    const withPr = parseProxyCondition(
+      "Machine proxy: PR https://github.com/state-vector/bridge/pull/207 merged (BR#3361 done, decision BR#3409)",
+    );
+    expect(withPr.atoms.map((a) => a.kind)).toEqual(["pr_merged"]);
+    const proseOnly = parseProxyCondition(
+      "verify-first executed per the owner duty (BR#3361 done, decision BR#3409) before acting",
+    );
+    expect(proseOnly.atoms).toHaveLength(0);
+    expect(proseOnly.unparseable).toBe(false); // honest prose once the aside is stripped
+  });
+
+  it("preconditions OUTSIDE parentheses still parse — stripping never suppresses real atoms", () => {
+    const p = parseProxyCondition("Machine proxy: BR#3337 done with receipts (decision BR#3409)");
+    expect(p.atoms).toHaveLength(1);
+    expect(p.atoms[0]).toMatchObject({ kind: "br_done", brId: "BR#3337" });
+    expect(p.unparseable).toBe(false);
+  });
+});
+
 describe("parseCloseLegs (terminal legs from real text)", () => {
   it("BR#3348's real done note: exactly the 3 executed legs, bare form (repo resolved at live-check time)", () => {
     const legs = parseCloseLegs(BR3348_DONE_NOTE);

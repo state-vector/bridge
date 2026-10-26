@@ -665,6 +665,16 @@ function cutDutyClauses(line) {
   }
   return cut;
 }
+function humanGateMarker(text2) {
+  for (const m of HUMAN_GATE_MARKERS) {
+    const hit = m.exec(String(text2 ?? ""));
+    if (hit) return hit[0];
+  }
+  return null;
+}
+function stripParentheticals(line) {
+  return line.replace(/\([^()]*\)/g, " ");
+}
 function repoFromLine(line) {
   const m = /github\.com\/([\w.-]+)\/([\w.-]+)/.exec(line);
   return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
@@ -674,11 +684,14 @@ function numberFromPullUrl(line) {
   return m ? Number(m[1]) : null;
 }
 function parseProxyCondition(text2) {
+  const src = String(text2 ?? "");
+  const gate = humanGateMarker(src);
+  if (gate) return { atoms: [], unparseable: true, humanGated: true, humanGate: gate };
   const atoms = [];
   let unparseable = false;
   const duty = cutDutyClauses(String(text2 ?? ""));
   for (const rawLine of duty.split(/\r?\n|(?<=;)\s*/)) {
-    const line = rawLine.trim();
+    const line = stripParentheticals(rawLine.trim());
     if (!line) continue;
     const repo = repoFromLine(line);
     let lineYielded = false;
@@ -722,6 +735,20 @@ function parseProxyCondition(text2) {
     if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
   }
   return { atoms, unparseable };
+}
+function proxySpawnReceipts(dutyBodyMd) {
+  const body = String(dutyBodyMd ?? "");
+  const at = body.indexOf("MACHINE PROXY");
+  if (at < 0) return [];
+  const out = [];
+  for (const line of body.slice(at).split(/\r?\n/)) {
+    if (/^\s*-\s+/.test(line)) out.push(line.replace(/^\s*-\s+/, "").trim());
+    else if (out.length) break;
+  }
+  return out;
+}
+function sameProxyReceipts(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 function parseCloseLegs(text2) {
   const byRepo = /* @__PURE__ */ new Map();
@@ -776,7 +803,93 @@ function parseClosureReceipt(note, leg) {
 function legLabel(leg) {
   return `${leg.repo ?? "GH"}#${leg.number}`;
 }
-var LOOKS_MACHINE, DUTY_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT;
+function validateAwaitEvent(v) {
+  if (typeof v !== "object" || v === null) return null;
+  const e = v;
+  const kind = String(e.event ?? "");
+  const repo = typeof e.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(e.repo) ? e.repo : null;
+  const num = /* @__PURE__ */ __name((x) => typeof x === "number" && Number.isInteger(x) && x > 0, "num");
+  const id = /* @__PURE__ */ __name((x) => typeof x === "string" && /^BR#\d+$/.test(x) ? x : null, "id");
+  switch (kind) {
+    case "pr_merged":
+    case "issue_closed":
+    case "pr_checks_green":
+      return repo && num(e.n) ? { event: kind, repo, n: e.n } : null;
+    case "br_pr_merged":
+    case "br_done":
+      return id(e.id) ? { event: kind, id: e.id } : null;
+    case "run_success": {
+      if (!repo) return null;
+      const rid = typeof e.run_id === "string" && /^\d{6,}$/.test(e.run_id) ? e.run_id : void 0;
+      const nt = typeof e.newer_than === "string" && /^\d{6,}$/.test(e.newer_than) ? e.newer_than : void 0;
+      return rid || nt ? { event: "run_success", repo, run_id: rid, newer_than: nt } : null;
+    }
+    case "ask":
+      return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
+    case "time":
+      return typeof e.until_ts === "number" && Number.isFinite(e.until_ts) && e.until_ts > 0 ? { event: "time", until_ts: e.until_ts } : null;
+    default:
+      return null;
+  }
+}
+function awaitEventToAtom(e) {
+  switch (e.event) {
+    case "pr_merged":
+      return { kind: "pr_merged", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "br_pr_merged":
+      return { kind: "br_pr_merged", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
+    case "issue_closed":
+      return { kind: "issue_closed", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "br_done":
+      return { kind: "br_done", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
+    case "run_success":
+      return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
+    case "pr_checks_green":
+      return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "ask":
+    case "time":
+      return null;
+  }
+}
+function describeAwaitEvent(e) {
+  switch (e.event) {
+    case "pr_merged":
+      return `PR ${e.repo}#${e.n} merged (mergeCommit non-null)`;
+    case "br_pr_merged":
+      return `${e.id}'s fix PR (head branch bridge/${e.id.slice(3)}) merged`;
+    case "issue_closed":
+      return `GH issue ${e.repo}#${e.n} closed`;
+    case "br_done":
+      return `${e.id} done`;
+    case "run_success":
+      return e.run_id ? `GitHub run ${e.repo}/${e.run_id} conclusion=success` : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
+    case "pr_checks_green":
+      return `all checks green on PR ${e.repo}#${e.n}`;
+    case "ask":
+      return `ask ${e.ask_id} answered`;
+    case "time":
+      return `timer elapsed (until_ts ${e.until_ts})`;
+  }
+}
+function awaitEventFromAtoms(atoms) {
+  if (atoms.length !== 1) return null;
+  const a = atoms[0];
+  switch (a.kind) {
+    case "pr_merged":
+      return a.repo && a.number ? { event: "pr_merged", repo: a.repo, n: a.number } : null;
+    case "br_pr_merged":
+      return a.brId ? { event: "br_pr_merged", id: a.brId } : null;
+    case "issue_closed":
+      return a.repo && a.number ? { event: "issue_closed", repo: a.repo, n: a.number } : null;
+    case "br_done":
+      return a.brId ? { event: "br_done", id: a.brId } : null;
+    case "run_success":
+      return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
+    case "pr_checks_green":
+      return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
+  }
+}
+var LOOKS_MACHINE, DUTY_MARKERS, HUMAN_GATE_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT, AWAIT_GRAMMAR_DOC;
 var init_closure = __esm({
   "src/kb/closure.ts"() {
     LOOKS_MACHINE = /\b(?:PR\s?#|pull\/\d+|mergeCommit|MERGED|GH\s?#|GH#\d|issue\s?#?\d|BR#\d|run\s+\d{6,}|check\s+run|actions\/runs\/\d)/i;
@@ -789,9 +902,19 @@ var init_closure = __esm({
       /\bexit\s+condition\s+of\s+record\b/i
     ];
     __name(cutDutyClauses, "cutDutyClauses");
+    HUMAN_GATE_MARKERS = [
+      /\bhuman[- ]only\b/i,
+      /\bno machine atom can flip\b/i,
+      /\bweb\s*\/\s*admin\b/i,
+      /\bowner\s*\/\s*web[- ]only\b/i
+    ];
+    __name(humanGateMarker, "humanGateMarker");
+    __name(stripParentheticals, "stripParentheticals");
     __name(repoFromLine, "repoFromLine");
     __name(numberFromPullUrl, "numberFromPullUrl");
     __name(parseProxyCondition, "parseProxyCondition");
+    __name(proxySpawnReceipts, "proxySpawnReceipts");
+    __name(sameProxyReceipts, "sameProxyReceipts");
     CLOSE_PATTERNS = [
       /\bclose(?:s|d)?\s+(?:the\s+)?(?:GH\s?#|GH#|issue\s+#)(\d+)/gi,
       /\bclose(?:s|d)?\s+(?:the\s+)?#(\d+)\b/gi,
@@ -811,6 +934,11 @@ var init_closure = __esm({
     __name(extractGuardRun, "extractGuardRun");
     __name(parseClosureReceipt, "parseClosureReceipt");
     __name(legLabel, "legLabel");
+    AWAIT_GRAMMAR_DOC = 'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+    __name(validateAwaitEvent, "validateAwaitEvent");
+    __name(awaitEventToAtom, "awaitEventToAtom");
+    __name(describeAwaitEvent, "describeAwaitEvent");
+    __name(awaitEventFromAtoms, "awaitEventFromAtoms");
   }
 });
 
@@ -1146,12 +1274,26 @@ var init_machine = __esm({
         guard: /* @__PURE__ */ __name((i) => noteOf(i) ? null : `bouncing back from review requires the reviewer's findings (note) \u2014 "no" without reasons is not an answer`, "guard")
       },
       {
-        name: "blocked-needs-path",
+        // BR#3578: a blocked card must AWAIT something typed — a machine event,
+        // an open ask, or a timer. Machine-managed parks (subprocess budgets,
+        // merge-train leases) carry their own trip-wires. Free text alone is
+        // optional annotation, never the exit condition.
+        name: "blocked-needs-typed-await",
         when: /* @__PURE__ */ __name((i) => i.to === "blocked", "when"),
         guard: /* @__PURE__ */ __name((i) => {
           const reason = String(i.body?.note ?? i.body?.reason ?? "").trim();
-          const unblock = String(i.body?.unblock_condition ?? "").trim();
-          return reason && unblock ? null : "moving to blocked requires BOTH a reason (note) and an unblock condition \u2014 a blocked card without an unblock path is a dead end";
+          if (!reason) return "moving to blocked requires a reason (note)";
+          if (i.body?.awaiting_ask_id) return null;
+          if (i.body?.merge_train || i.body?.class === "subprocess") return null;
+          if (i.body?.await_event !== void 0) {
+            return validateAwaitEvent(i.body.await_event) ? null : `malformed await_event \u2014 the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+          }
+          const text2 = String(i.body?.unblock_condition ?? "").trim();
+          if (text2) {
+            const { atoms, unparseable } = parseProxyCondition(text2);
+            if (!unparseable && awaitEventFromAtoms(atoms)) return null;
+          }
+          return `moving to blocked requires a typed await_event \u2014 ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578)`;
         }, "guard")
       },
       {
@@ -1759,18 +1901,80 @@ var init_do = __esm({
         for (const r of rows) {
           try {
             const meta3 = JSON.parse(r.meta ?? "{}");
-            const cond = String(meta3.blocked?.unblock_condition ?? "").trim();
+            const bmeta = meta3.blocked ?? {};
+            const aw = validateAwaitEvent(bmeta.await_event) ?? null;
+            const cond = String(bmeta.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : "");
             if (!cond) continue;
             const prev = meta3.proxy_check;
             if (prev?.at && now - Number(prev.at) < periodMin * 6e4) continue;
-            const { atoms, unparseable } = parseProxyCondition(cond);
+            if (aw && (aw.event === "ask" || aw.event === "time")) {
+              const fired = aw.event === "time" ? now >= aw.until_ts : (() => {
+                const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
+                return !a || a.status === "done" || a.status === "superseded";
+              })();
+              if (!fired) {
+                this.stampProxyCheck(
+                  r.id,
+                  meta3,
+                  now,
+                  "waiting",
+                  aw.event === "time" ? `timer until ${new Date(aw.until_ts).toISOString()}` : `awaiting ask ${aw.ask_id}`,
+                  prev
+                );
+                continue;
+              }
+              const receipt = aw.event === "time" ? `timer elapsed (until_ts ${aw.until_ts}, checked ${new Date(now).toISOString()})` : `ask ${aw.ask_id} answered/closed`;
+              await this.spawnProxyDuty(r, meta3, now, prev, cond, [`${describeAwaitEvent(aw)} \u2192 ${receipt}`]);
+              continue;
+            }
+            const parsed = parseProxyCondition(cond);
+            if (parsed.humanGated) {
+              this.stampProxyCheck(
+                r.id,
+                meta3,
+                now,
+                "unparseable",
+                `human-gated by design ("${parsed.humanGate}") \u2014 the only exit is a human action; never atomized, never flipped, never re-fired (BR#3668)`,
+                prev
+              );
+              continue;
+            }
+            let atoms;
+            let unparseable;
+            if (aw) {
+              atoms = [awaitEventToAtom(aw)];
+              unparseable = false;
+            } else {
+              atoms = parsed.atoms;
+              unparseable = parsed.unparseable;
+              const derived2 = awaitEventFromAtoms(atoms);
+              if (derived2) {
+                meta3.blocked = { ...meta3.blocked ?? {}, await_event: derived2 };
+                this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), r.id);
+              }
+            }
             if (!atoms.length) {
+              const rooted = meta3.root_blocker ? this.one(`SELECT status FROM artefacts WHERE id = ?`, String(meta3.root_blocker)) : null;
+              if (!meta3.awaiting_ask?.ask_id && !bmeta.await_migration_ask && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
+                const ask = await this.askCreate({
+                  to: "ray",
+                  question: `Blocked card ${r.id} awaits nothing the machine can read \u2014 re-scope it, or release it back to the pool?`,
+                  reason: "the exit condition is prose the hub cannot parse (BR#3578 migration): parked cards awaiting nothing are impossible now \u2014 this one needs a human ruling",
+                  options: ["RE-SCOPE \u2014 I'll rewrite the exit condition", "RELEASE \u2014 back to the pool anyway", "SUPERSEDE \u2014 drop it"],
+                  details: `"${r.title}" is parked ${unparseable ? "on machine-looking text that parsed to no atom" : "text-only"}: "${cond.slice(0, 240)}". Under BR#3578 every blocked card awaits a typed event, an open ask, or a timer \u2014 give this one one, or release it.`,
+                  artefact_id: r.id
+                }, "hub:proxy-watch").catch(() => null);
+                if (ask) {
+                  meta3.blocked = { ...meta3.blocked ?? {}, await_migration_ask: ask.id };
+                  this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), r.id);
+                }
+              }
               this.stampProxyCheck(
                 r.id,
                 meta3,
                 now,
                 unparseable ? "unparseable" : "no_atoms",
-                unparseable ? "condition mentions machine state but no atom parsed \u2014 never auto-flips" : null,
+                unparseable ? "condition mentions machine state but no atom parsed \u2014 never auto-flips (migrated to an ask)" : "no machine atoms \u2014 migrated to an ask",
                 prev
               );
               continue;
@@ -1802,39 +2006,72 @@ var init_do = __esm({
               );
               continue;
             }
-            const openChild = this.one(
-              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
-              r.id
-            );
-            const lastSpawn = meta3.last_unblock_spawn;
-            const flooded = lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS && String(lastSpawn.exit ?? "") === cond;
-            if (openChild || flooded) {
-              this.stampProxyCheck(
-                r.id,
-                meta3,
-                now,
-                "true",
-                null,
-                prev,
-                { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" }
-              );
-              if (prev?.verdict !== "true") {
-                this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
-              }
-              continue;
-            }
-            const ts = Date.now();
-            const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
-            const atomLines = results.map((x) => `- "${x.atom.raw}" \u2192 ${x.receipt}`).join("\n");
-            const created = await this.create(
-              {
-                type: "task",
-                title: `Unblock: ${rootTitle.slice(0, 190)}`,
-                session: "",
-                // session-less spawn: the closer stamps it when they claim
-                body_md: `Unblock duty for ${r.id} \u2014 "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).
+            await this.spawnProxyDuty(r, meta3, now, prev, cond, results.map((x) => `"${x.atom.raw}" \u2192 ${x.receipt}`));
+          } catch (e) {
+            this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
+      }
+      /** BR#3361a / BR#3578: the flip — the exit condition held TRUE; spawn the
+       *  unblock duty with the receipts embedded. Shared by atom flips and
+       *  ask/time timer fires. Machine caps still apply: ≤1 open unblock child,
+       *  flood guard on identical exit conditions. */
+      async spawnProxyDuty(r, meta3, now, prev, cond, receiptLines) {
+        const openChild = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`,
+          r.id
+        );
+        const lastSpawn = meta3.last_unblock_spawn;
+        const flooded = lastSpawn && typeof lastSpawn.at === "number" && now - lastSpawn.at < UNBLOCK_FLOOD_MS && String(lastSpawn.exit ?? "") === cond;
+        if (openChild || flooded) {
+          this.stampProxyCheck(
+            r.id,
+            meta3,
+            now,
+            "true",
+            null,
+            prev,
+            { spawned: openChild?.id ?? null, spawn_skipped: openChild ? `existing unblock child ${openChild.id}` : "flood guard" }
+          );
+          if (prev?.verdict !== "true") {
+            this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: openChild?.id ?? null, reason: openChild ? "existing unblock child" : "flood guard" });
+          }
+          return;
+        }
+        const lastChild = this.one(
+          `SELECT c.id AS id, c.body_md AS body FROM relations rel JOIN artefacts c ON c.id = rel.src_id
+       WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND c.roles LIKE '%"unblock"%'
+       ORDER BY c.created_ts DESC LIMIT 1`,
+          r.id
+        );
+        const firedReceipts = lastChild ? proxySpawnReceipts(String(lastChild.body ?? "")) : [];
+        if (lastChild && firedReceipts.length && sameProxyReceipts(firedReceipts, receiptLines)) {
+          this.stampProxyCheck(
+            r.id,
+            meta3,
+            now,
+            "true",
+            null,
+            prev,
+            { spawned: lastChild.id, spawn_skipped: `receipt-identical to the ${lastChild.id} spawn \u2014 steady-true atom, no changed receipt since last fire (BR#3668 dedup)` }
+          );
+          if (prev?.verdict !== "true") {
+            this.audit("hub:proxy-watch", "proxy_flip_deferred", r.id, { spawned: lastChild.id, reason: "stale-true dedup (BR#3668): identical receipts" });
+          }
+          return;
+        }
+        const ts = Date.now();
+        const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
+        const atomLines = receiptLines.map((l) => `- ${l}`).join("\n");
+        const created = await this.create(
+          {
+            type: "task",
+            title: `Unblock: ${rootTitle.slice(0, 190)}`,
+            session: "",
+            // session-less spawn: the closer stamps it when they claim
+            body_md: `Unblock duty for ${r.id} \u2014 "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).
 
 Blocked why: ${String(meta3.blocked?.reason ?? "").trim() || "see parent"}.
 Exit condition: ${cond}
@@ -1845,32 +2082,20 @@ ${atomLines}
 The predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first \u2014 this sweep is a trigger, not an authority), transition ${r.id} \u2192 in_progress with the resolution note, then close yourself done citing these receipts.
 
 Contract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings \u2014 do NOT respawn an unblock task, do not leave yourself open.`,
-                roles: ["unblock"]
-              },
-              "hub:proxy-watch"
-            );
-            this.state.storage.sql.exec(
-              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-              created.id,
-              r.id,
-              ts
-            );
-            meta3.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500) };
-            this.stampProxyCheck(
-              r.id,
-              meta3,
-              now,
-              "true",
-              null,
-              prev,
-              { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })), spawned: created.id }
-            );
-            this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, atoms: results.map((x) => x.receipt) });
-            this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE \u2014 unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
-          } catch (e) {
-            this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
-          }
-        }
+            roles: ["unblock"]
+          },
+          "hub:proxy-watch"
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          created.id,
+          r.id,
+          ts
+        );
+        meta3.last_unblock_spawn = { at: ts, exit: cond.slice(0, 500), receipts: receiptLines };
+        this.stampProxyCheck(r.id, meta3, now, "true", null, prev, { spawned: created.id, receipts: receiptLines });
+        this.audit("hub:proxy-watch", "proxy_flip", r.id, { spawned: created.id, receipts: receiptLines });
+        this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE \u2014 unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
       }
       async eventsSince(since, limit) {
         const rows = since > 0 ? this.state.storage.sql.exec(
@@ -2810,12 +3035,23 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
                 const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
                 if (!alreadyRight) {
                   if (round >= 3) {
-                    await this.transition({
-                      id: trow.id,
-                      to: "blocked",
-                      note: `verify loop stalled \u2014 ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
-                      unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)"
-                    }, "system:verifier");
+                    const stallAsk = await this.askCreate({
+                      to: "ray",
+                      question: `Verify loop stalled on ${trow.id} (${round} identical ${verdict} rounds) \u2014 cancel the loop or keep it parked?`,
+                      reason: "the verifier keeps proposing the identical verdict; auto-apply made no progress \u2014 the loop needs a human ruling",
+                      options: ["CANCEL \u2014 transition the loop to todo for re-scoping", "KEEP PARKED \u2014 I'll clear the blocker myself", "SUPERSEDE \u2014 drop the stalled round"],
+                      details: `Verify loop stalled: ${round} rounds with identical verdict (${verdict}), each auto-applied with no progress. Read the verify history on ${trow.id} before answering.`,
+                      artefact_id: trow.id
+                    }, "system:verifier").catch(() => null);
+                    if (stallAsk?.task_status !== "blocked") {
+                      await this.transition({
+                        id: trow.id,
+                        to: "blocked",
+                        note: `verify loop stalled \u2014 ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
+                        unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
+                        ...stallAsk ? { await_event: { event: "ask", ask_id: stallAsk.id } } : {}
+                      }, "system:verifier");
+                    }
                   } else {
                     await this.transition({
                       id: trow.id,
@@ -3458,8 +3694,15 @@ Contract: (1) verify live state first (gh issue view <N> --repo <repo> --json st
           else meta3[k] = v;
         }
         if (verdict.status === "blocked") {
-          if (!meta3.blocked)
-            meta3.blocked = { reason: String(body.note ?? body.reason ?? "").trim(), unblock_condition: String(body.unblock_condition ?? "").trim(), ts };
+          if (!meta3.blocked) {
+            const aw = validateAwaitEvent(body.await_event) ?? awaitEventFromAtoms(parseProxyCondition(String(body.unblock_condition ?? "")).atoms);
+            meta3.blocked = {
+              reason: String(body.note ?? body.reason ?? "").trim(),
+              unblock_condition: String(body.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : ""),
+              ts,
+              ...aw ? { await_event: aw } : {}
+            };
+          }
           delete meta3.subprocess;
         } else if (meta3.blocked) {
           delete meta3.blocked;
@@ -4322,7 +4565,8 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
                 id: artefactId,
                 to: "blocked",
                 note: `blocked on ${to}: ${question.slice(0, 100)}`,
-                unblock_condition: `answer ask ${id}`
+                unblock_condition: `answer ask ${id}`,
+                await_event: { event: "ask", ask_id: id }
               }, actor);
               taskStatus = "blocked";
             }
@@ -4338,13 +4582,14 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
        WHERE type = 'question' AND status IN ('todo','in_progress','blocked')
        ORDER BY created_ts DESC LIMIT 50`
         ).toArray();
+        const tags = Array.isArray(body.tags) ? body.tags.map(String) : [];
         const inbox = nodes.map((n) => {
           const m = JSON.parse(n.meta ?? "{}");
           if (!m.ask) return null;
           const out = { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
           if (m.ask.reframe) out.reframe = m.ask.reframe;
           return out;
-        }).filter((x) => !!x && (x.to_target === "any" || x.to_target === label || true));
+        }).filter((x) => !!x && (x.to_target === "any" || x.to_target === label || String(x.to_target).startsWith(`${label}@`) || tags.some((t) => x.to_target === `tag:${t}`)));
         const open2 = this.state.storage.sql.exec(
           `SELECT id, from_label, to_target, question, created_ts FROM asks
        WHERE status = 'open' AND from_label != ? ORDER BY created_ts DESC LIMIT 50`,
@@ -4462,12 +4707,27 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
               this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
             }
             if (subject.status === "blocked") {
-              await this.transition({
-                id: subject.id,
-                to: "in_progress",
-                note: `ask ${id} answered \u2014 resumed: ${answer.slice(0, 100)}`
-              }, `system:question(${actor})`);
-              taskStatus2 = "in_progress";
+              const isMigrationAsk = String(sm.blocked?.await_migration_ask ?? "") === id;
+              const optHit = (Array.isArray(m.ask?.options) ? m.ask.options : []).some((o) => /^(RELEASE|CANCEL|SUPERSEDE)\b/i.test(String(o ?? "").trim()) && answer.trim().toLowerCase().startsWith(String(o).trim().slice(0, 12).toLowerCase()));
+              const asActor = `system:question(${actor})`;
+              if (isMigrationAsk || optHit) {
+                if (/\bSUPERSEDE\b/i.test(answer)) {
+                  await this.transition({ id: subject.id, to: "superseded", note: `ask ${id} answered \u2014 dropped: ${answer.slice(0, 120)}` }, asActor);
+                  taskStatus2 = "superseded";
+                } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
+                  await this.transition({ id: subject.id, to: "todo", note: `ask ${id} answered \u2014 released to the pool: ${answer.slice(0, 120)}` }, asActor);
+                  taskStatus2 = "todo";
+                } else {
+                  taskStatus2 = "blocked";
+                }
+              } else {
+                await this.transition({
+                  id: subject.id,
+                  to: "in_progress",
+                  note: `ask ${id} answered \u2014 resumed: ${answer.slice(0, 100)}`
+                }, asActor);
+                taskStatus2 = "in_progress";
+              }
             }
           }
           this.audit(actor, "answer", subject?.id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
@@ -4770,6 +5030,21 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
           if (!tags.includes("attempted")) tags.push("attempted");
           const attempts = (meta3.attempt?.attempts ?? 0) + 1;
           if (attempts >= 5) {
+            void this.askCreate({
+              to: "ray",
+              question: `Rework loop on ${t.id} \u2014 re-scope it, or release it back to the pool?`,
+              reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) \u2014 re-running repeats the claim\u2192stall cycle`,
+              options: ["RE-SCOPE \u2014 I'll rewrite the card myself", "RELEASE \u2014 back to the pool anyway", "SUPERSEDE \u2014 drop it"],
+              details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering \u2014 fix what keeps failing, re-scope, or deliberately continue.`,
+              artefact_id: t.id
+            }, "system:reaper").then((loopAsk) => {
+              const fresh = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id = ?`, t.id)?.meta ?? "{}"));
+              fresh.blocked = { ...fresh.blocked ?? {}, await_event: { event: "ask", ask_id: loopAsk.id } };
+              fresh.awaiting_ask = { ...fresh.awaiting_ask ?? {}, ask_id: loopAsk.id, ts: Date.now() };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(fresh), t.id);
+              this.audit("system:reaper", "loop_ask_filed", t.id, { ask_id: loopAsk.id, attempts });
+            }).catch(() => {
+            });
             meta3.blocked = {
               reason: `rework loop detected \u2014 ${attempts} dispatch attempts without completion (last release reason: ${reason.slice(0, 160)}). Re-running again would repeat the cycle; escalated to a human.`,
               unblock_condition: "human: review the attempt history (get_history) \u2014 either fix what keeps failing, re-scope the task, or transition it todo yourself to deliberately continue",
@@ -27145,6 +27420,10 @@ var init_mcp = __esm({
         to: external_exports.string(),
         note: external_exports.string().optional(),
         unblock_condition: external_exports.string().optional(),
+        /** BR#3578 typed await — closed grammar validated in worker closure.ts;
+         *  machine event | open ask | timer. Free text (unblock_condition) is
+         *  optional human annotation derived from this when absent. */
+        await_event: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
         class: external_exports.enum(["subprocess"]).optional(),
         budget_minutes: external_exports.number().int().max(1440).optional(),
         replacement_id: external_exports.string().optional()
@@ -27819,7 +28098,7 @@ var init_mcp2 = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "b5582caff529e98bc1aebff929a849ca9815da4a", built_at: "2026-10-26T06:27:43Z" };
+    module.exports = { commit: "7cd92ba9fd9a4450da865d38e60854f366fbe365", built_at: "2026-10-26T15:05:34Z" };
   }
 });
 

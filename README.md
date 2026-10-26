@@ -589,6 +589,16 @@ closes those leaks with four hub mechanisms:
   duty re-verifies first-hand; GitHub-state conditions flip when an acting session or the
   executor operator checks them first-hand). The machine's caps still apply (≤1 open
   unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
+  Two BR#3668 guards complete the law: **human-gate markers** ("Human-only", "no machine atom
+  can flip this", "web/admin", "owner/web-only") in the condition text classify it unparseable
+  BY DESIGN — zero atoms, never flipped, never re-fired, and no migration ask (the marker names
+  the human leg already engaged; a text-derived machine `await_event` contradicting the markers
+  is ignored) — and a **stale-true dedup**: the sweep re-fires only on a CHANGED receipt. The
+  last sweep-spawned duty's body carries the receipt set its spawn was fired on; an identical
+  fresh evaluation (a born-true atom that can never flip — the BR#3358 class: one stand-down
+  duty per cycle, each re-verifying the same non-flip) stamps `true` with the dedup receipt and
+  spawns nothing. Park-time rounds and close-leg duties carry no receipts block and never dedup;
+  a genuine false→true transition still spawns exactly once.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.
@@ -609,10 +619,15 @@ closes those leaks with four hub mechanisms:
   (rule 5d + protocol card 7). Hub/auto-spawned duties start session-less — the first real session
   to claim them stamps the lease.
 
-Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts),
+Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts —
+incl. BR#3358's human-gated park parsing to zero atoms and the "(BR#N done, …)" parenthetical
+never yielding `br_done`),
 `test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty;
 rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence
-audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
+audit + lease; BR#3668 stale-true dedup — a born-true atom spawns exactly once and never
+re-fires, a genuine false→true transition still spawns exactly once, a human-gated park never
+flips and never migration-asks),
+plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
 queue and classification) and `test/train-hub.test.ts` (real-DO train drills: lease races,
 landed / stopped / bounced flows, the stop-the-line ask).
 `admin.unblock_proxy_sweep` drills on demand.

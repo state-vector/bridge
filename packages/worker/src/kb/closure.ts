@@ -37,6 +37,14 @@ export interface ParsedCondition {
   /** machine-predicate-looking text that produced NO atom — the sweep must
    *  never auto-flip such a card (it cannot fully read the condition) */
   unparseable: boolean;
+  /** BR#3668: the text itself declares a HUMAN-only exit (explicit human-gate
+   *  markers). The condition is unparseable BY DESIGN — never atomized, never
+   *  flipped, never re-fired; a machine-shaped await_event stamped onto such
+   *  a park (e.g. derived from prose before this law) contradicts the card's
+   *  own markers and is ignored for flip purposes. */
+  humanGated?: boolean;
+  /** the exact marker that classified the condition (for stamps and tests) */
+  humanGate?: string;
 }
 
 /** Machine-predicate-looking text: if this matches and no atom parsed, the
@@ -66,6 +74,40 @@ function cutDutyClauses(line: string): string {
   return cut;
 }
 
+/** BR#3668: explicit human-gate markers — the closed set. A condition whose
+ *  TEXT declares a human-only exit is unparseable by design: the sweep never
+ *  atomizes it, never flips it, and never re-fires it, no matter what
+ *  machine-looking fragments the surrounding prose contains. Deliberately a
+ *  closed list (conservatism: unparseable is the safe direction) — extend it
+ *  only when a real specimen demands it. */
+const HUMAN_GATE_MARKERS: RegExp[] = [
+  /\bhuman[- ]only\b/i,
+  /\bno machine atom can flip\b/i,
+  /\bweb\s*\/\s*admin\b/i,
+  /\bowner\s*\/\s*web[- ]only\b/i,
+];
+
+/** The first human-gate marker found in the text, or null. */
+export function humanGateMarker(text: string): string | null {
+  for (const m of HUMAN_GATE_MARKERS) {
+    const hit = m.exec(String(text ?? ""));
+    if (hit) return hit[0];
+  }
+  return null;
+}
+
+/** BR#3668: parentheticals are annotation, never preconditions. The live
+ *  specimen: BR#3358's condition carries the verify-provenance aside
+ *  "(BR#3361 done, decision BR#3409)" inside agent-terminal guidance — the
+ *  sweep mis-parsed it into a br_done atom and stamped it as the park's
+ *  await_event, contradicting the condition's own human-only marker.
+ *  Stripping happens BEFORE atom-scanning so prose asides can never yield
+ *  atoms (and never suppress them: a precondition's trigger words live
+ *  outside its parentheses). */
+function stripParentheticals(line: string): string {
+  return line.replace(/\([^()]*\)/g, " ");
+}
+
 function repoFromLine(line: string): string | null {
   const m = /github\.com\/([\w.-]+)\/([\w.-]+)/.exec(line);
   return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
@@ -82,6 +124,14 @@ function numberFromPullUrl(line: string): number | null {
  * evaluates TRUE and nothing is unparseable.
  */
 export function parseProxyCondition(text: string): ParsedCondition {
+  const src = String(text ?? "");
+  // BR#3668: human-gate markers classify the condition BEFORE any atom scan —
+  // zero atoms, unparseable by design. The marker check must precede the
+  // parenthetical strip: the mis-parse of record hid inside a parenthetical
+  // of a human-gated condition, and either guard alone would have let the
+  // other layer down on differently-shaped prose.
+  const gate = humanGateMarker(src);
+  if (gate) return { atoms: [], unparseable: true, humanGated: true, humanGate: gate };
   const atoms: ProxyAtom[] = [];
   let unparseable = false;
   // Cut the DUTY clauses over the WHOLE text before splitting: real conditions
@@ -91,7 +141,7 @@ export function parseProxyCondition(text: string): ParsedCondition {
   // #N") would mark the condition unparseable (BR#3129's real condition).
   const duty = cutDutyClauses(String(text ?? ""));
   for (const rawLine of duty.split(/\r?\n|(?<=;)\s*/)) {
-    const line = rawLine.trim();
+    const line = stripParentheticals(rawLine.trim());
     if (!line) continue;
     const repo = repoFromLine(line);
     let lineYielded = false;
@@ -149,6 +199,35 @@ export function parseProxyCondition(text: string): ParsedCondition {
     if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
   }
   return { atoms, unparseable };
+}
+
+// ---------- 1b. sweep spawn receipts (the stale-true dedup, BR#3668) ----------
+
+/**
+ * Extract the receipt lines a sweep spawn was fired ON, from the spawned
+ * duty body's "MACHINE PROXY … (receipts):" block (its `- "raw" → receipt`
+ * lines). Empty for duty bodies without the block — park-time machine
+ * rounds, close-leg duties, correction duties — so the dedup never
+ * suppresses a spawn on their account (their receipts live in the note, not
+ * the template).
+ */
+export function proxySpawnReceipts(dutyBodyMd: string): string[] {
+  const body = String(dutyBodyMd ?? "");
+  const at = body.indexOf("MACHINE PROXY");
+  if (at < 0) return [];
+  const out: string[] = [];
+  for (const line of body.slice(at).split(/\r?\n/)) {
+    if (/^\s*-\s+/.test(line)) out.push(line.replace(/^\s*-\s+/, "").trim());
+    else if (out.length) break; // the block ends at the first non-item line
+  }
+  return out;
+}
+
+/** Receipt-set identity: same lines, same order. Order is the parse order —
+ *  deterministic for the same condition text and board state, so line-wise
+ *  equality is the honest "did the evaluated receipt change" test. */
+export function sameProxyReceipts(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
 // ---------- 2. terminal close legs ----------
