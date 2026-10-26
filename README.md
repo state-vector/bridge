@@ -131,6 +131,28 @@ the device credential and anchors identity: the hub vends it on first pairing
 on every pairing and desktop login, and re-pairing or re-login rotates the
 gateway token in place against it — the hostname is a display label only:
 
+**Rotation is graceful and self-healing (BR#3787)** — a gateway is never
+killed by a rotation and never needs a manual re-pair:
+
+- **Identity law**: provisioning and pairing match tokens by the **principal
+  only**. A label held by another device's credential is a collision —
+  self-provision mints a suffixed row, human pairing refuses with a named
+  error. Rotation never steals another device's token (the 2026-10-27 fleet
+  401 ping-pong was exactly this theft).
+- **72h grace**: when a token rotates, the **previous** hash keeps
+  authenticating for 72 hours, flagged stale. Rotation is a re-vend signal,
+  not an amputation — in-flight dispatches finish. Admin revocation still
+  kills both hashes instantly.
+- **Negotiated self-heal**: every authenticated response carries
+  `x-bridge-token-epoch`; the runner re-vends its own row proactively at the
+  next tick boundary when the epoch moves (`POST /api/token/repair`, agent
+  plane — the principal is the credential, so **headless gateways self-heal
+  without a human session**). On a hard 401 the same repair runs first, the
+  desktop self-provision second, loud logout last — and every repair failure
+  reason is logged, never swallowed. Only a lost/revoked principal (or an
+  admin revoke) forces a human re-pair. Repairs are rate-limited per token
+  (6/hour) so a crash loop can't mint infinitely.
+
 ```jsonc
 {
   "schema_version": 2,                 // written by the runner; future versions warn

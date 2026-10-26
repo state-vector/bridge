@@ -486,6 +486,10 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
                 .map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| s.eq_ignore_ascii_case("gateway")))
                 .unwrap_or(false);
             apply_vended_credentials(&mut cfg, url, &token, &ws, label, gateway_class)?;
+            // BR#3787 — fresh pairing: full re-adopt of the epoch from the
+            // next response header (the vend response may not carry it).
+            TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+            TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
             eprintln!("[pair] authorized — token for workspace '{}' saved to the keychain (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
             Ok(PairPoll::Authorized(cfg))
         }
@@ -626,6 +630,58 @@ pub fn self_provision(
         "[dispatch] gateway self-provisioned for workspace '{}' — token in the OS keychain",
         cfg.ws.as_deref().unwrap_or("?")
     );
+    // BR#3787 — full re-adopt: the next response's epoch header becomes the
+    // vend epoch (avoids repairing against a stale observed epoch).
+    TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+    TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
+    Ok(cfg)
+}
+
+/// BR#3787 layer 2 — agent-plane repair: re-vend THIS device's row using the
+/// durable principal. No human plane, no session cookie — headless gateways
+/// self-heal (hermes-class boxes never could). The hub matches by principal
+/// ONLY (never label — the theft class) and rate-limits per row; the
+/// response's secret becomes our credential and its epoch the vend epoch.
+fn repair_by_principal(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<DispatchConfig, String> {
+    let principal = ensure_principal_from_file();
+    if principal.is_empty() {
+        return Err("no device principal on file — re-pair required".into());
+    }
+    let resp = client
+        .post(format!("{url}/api/token/repair"))
+        .header("content-type", "application/json")
+        .body(json!({ "principal": principal, "host": host_slug() }).to_string())
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?;
+    // read the body as text first so a non-JSON response (Cloudflare error
+    // page, HTML redirect, plain-text 500) is NAMED in the error
+    let body_text = resp.text().map_err(|e| format!("read body: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+        format!(
+            "hub returned non-JSON for token repair: {e} — body: {}",
+            body_text.chars().take(200).collect::<String>()
+        )
+    })?;
+    let err = || {
+        format!(
+            "token repair failed: {}",
+            parsed.get("error").and_then(|e| e.as_str()).unwrap_or("no secret in response")
+        )
+    };
+    let secret = parsed.get("secret").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).ok_or_else(err)?;
+    let ws = parsed.get("ws").and_then(|w| w.as_str()).filter(|w| !w.is_empty()).unwrap_or("state-vector").to_string();
+    let label = parsed.get("label").and_then(|l| l.as_str()).map(|s| s.to_string());
+    if let Some(ep) = parsed.get("epoch").and_then(|e| e.as_u64()) {
+        TOKEN_EPOCH_VEND.store(ep, Ordering::Relaxed);
+    } else {
+        TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
+    }
+    TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+    let mut cfg = load_config().unwrap_or_else(default_config);
+    apply_vended_credentials(&mut cfg, url, secret, &ws, label, true)?;
     Ok(cfg)
 }
 
@@ -844,6 +900,16 @@ fn mcp_call_session(
         .map_err(|e| format!("bridge unreachable: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("bridge {} on /mcp", resp.status()));
+    }
+    // BR#3787 — the epoch rides every authenticated response; capture it
+    // before the body is consumed.
+    if let Some(v) = resp
+        .headers()
+        .get("x-bridge-token-epoch")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        TOKEN_EPOCH_SEEN.store(v, Ordering::Relaxed);
     }
     let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     if let Some(err) = body.get("error") {
@@ -1718,6 +1784,22 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
 /// sweep preserves uncommitted state onto wip/<task>-<date> (never main).
 const WORKTREE_SWEEP_CAP: usize = 20;
 static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// BR#3787 — negotiated token catch-up. The hub stamps every authenticated
+/// /mcp response with the row's epoch (bumped at each rotation);
+/// TOKEN_EPOCH_VEND is the epoch of the secret this runner holds. 0 = unknown
+/// on either side: the first observation ADOPTS (never repairs on unknowns).
+/// A later mismatch means the row rotated elsewhere (another login/repair) —
+/// the runner re-vends its OWN row proactively at the next tick boundary
+/// instead of discovering the rotation by a mid-dispatch 401.
+static TOKEN_EPOCH_SEEN: AtomicU64 = AtomicU64::new(0);
+static TOKEN_EPOCH_VEND: AtomicU64 = AtomicU64::new(0);
+
+/// Does the epoch the hub just showed differ from the epoch we vended?
+/// 0 on either side means unknown — never repair on unknowns.
+fn epoch_repair_needed(vend: u64, seen: u64) -> bool {
+    vend > 0 && seen > 0 && vend != seen
+}
 
 fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
     let active: HashSet<String> = in_flight
@@ -3359,15 +3441,46 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.max_sessions = cfg.max_sessions;
     }
     let mut did_logout = false;
-    // Self-healing law (BR#2840): a hub-rejected token gets exactly ONE
-    // repair attempt per loop run (re-vend via self-provision — the
-    // deterministic label rotates in place hub-side). Repair fails → loud
-    // logout with a human-readable reason. Never silent, never snap-only.
-    let mut token_repair_attempted = false;
+    // Self-healing law (BR#2840, BR#3787): a hub-rejected token gets a repair
+    // LADDER — agent-plane principal repair (headless-safe), then desktop
+    // self-provision (human plane), then loud logout with the reason. Every
+    // failure reason is logged; a successful repair re-arms for the NEXT
+    // rotation. Never silent, never snap-only.
     let mut cfg = cfg;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // BR#3787 — negotiated catch-up at the tick boundary: the hub's epoch
+        // header moved past the epoch we vended (another login/repair rotated
+        // our row). Re-vend NOW, proactively — never by mid-dispatch 401.
+        {
+            let seen = TOKEN_EPOCH_SEEN.load(Ordering::Relaxed);
+            let vend = TOKEN_EPOCH_VEND.load(Ordering::Relaxed);
+            if epoch_repair_needed(vend, seen) {
+                match reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|client| repair_by_principal(&client, &cfg.url))
+                {
+                    Ok(fresh) => {
+                        cfg = fresh;
+                        eprintln!("[dispatch] token epoch {vend} → {seen}: re-vended by principal (proactive catch-up)");
+                        snap_activity(&snap, "dispatch", "token rotated elsewhere — re-vended proactively (epoch catch-up)");
+                        write_runner_state(&snap);
+                    }
+                    Err(pe) => {
+                        // the reason is logged; the hub-side rate limiter is
+                        // the backstop against tick-loop churn
+                        eprintln!("[dispatch] proactive epoch catch-up failed: {pe}");
+                        snap_activity(&snap, "error", &format!("proactive epoch catch-up failed: {pe}"));
+                    }
+                }
+                TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed); // re-adopt from the next response
+            } else if vend == 0 && seen > 0 {
+                TOKEN_EPOCH_VEND.store(seen, Ordering::Relaxed); // first observation adopts
+            }
         }
         match tick(
             &cfg,
@@ -3391,30 +3504,63 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
             Err(e) => {
                 // A hub-rejected token (401: revoked/expired/rotated away) is
-                // not retryable as-is — but before giving up, attempt repair
-                // ONCE: re-vend through the live human session (the login is
-                // the approval). Headless (no session) or failed repair →
-                // loud logout, clear the dead credential, await the next
-                // login. (Tick errors reaching here are orient's —
-                // "bridge {status} on /mcp" — so the prefix match cannot hit
-                // task IDs.)
+                // not retryable as-is — but before giving up, repair. Ladder
+                // (BR#3787): (1) agent-plane repair by principal — the
+                // durable device credential, works HEADLESS; (2) the desktop
+                // human-plane self-provision (the login is the approval);
+                // (3) loud logout, clear the dead credential, await the next
+                // login. Every failure reason is LOGGED and snapshotted —
+                // never swallowed (the 2026-10-27 incidents said "the
+                // one-time repair failed" with zero why). (Tick errors
+                // reaching here are orient's — "bridge {status} on /mcp" —
+                // so the prefix match cannot hit task IDs.)
                 if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
-                    if !token_repair_attempted {
-                        token_repair_attempted = true;
-                        let repaired = crate::session::load().and_then(|s| {
-                            let client = reqwest::blocking::Client::builder()
-                                .timeout(Duration::from_secs(30))
-                                .build()
-                                .ok()?;
-                            self_provision(&client, &cfg.url, &s.value).ok()
-                        });
-                        if let Some(fresh) = repaired {
-                            cfg = fresh;
-                            let msg = "gateway token repaired — re-vended by self-provision after hub 401".to_string();
-                            eprintln!("[dispatch] {msg}");
-                            snap_activity(&snap, "dispatch", &msg);
-                            write_runner_state(&snap);
-                            continue;
+                    {
+                        match reqwest::blocking::Client::builder()
+                            .timeout(Duration::from_secs(30))
+                            .build()
+                        {
+                            Ok(client) => {
+                                match repair_by_principal(&client, &cfg.url) {
+                                    Ok(fresh) => {
+                                        cfg = fresh;
+                                        let msg = "gateway token repaired — re-vended by principal (agent plane) after hub 401".to_string();
+                                        eprintln!("[dispatch] {msg}");
+                                        snap_activity(&snap, "dispatch", &msg);
+                                        write_runner_state(&snap);
+                                        continue;
+                                    }
+                                    Err(pe) => {
+                                        eprintln!("[dispatch] principal repair failed: {pe}");
+                                        snap_activity(&snap, "error", &format!("principal repair failed: {pe}"));
+                                        // desktop fallback: human-plane self-provision
+                                        match crate::session::load() {
+                                            Some(s) => match self_provision(&client, &cfg.url, &s.value) {
+                                                Ok(fresh) => {
+                                                    cfg = fresh;
+                                                    let msg = "gateway token repaired — re-vended by self-provision (human plane) after hub 401".to_string();
+                                                    eprintln!("[dispatch] {msg}");
+                                                    snap_activity(&snap, "dispatch", &msg);
+                                                    write_runner_state(&snap);
+                                                    continue;
+                                                }
+                                                Err(se) => {
+                                                    eprintln!("[dispatch] self-provision repair failed: {se}");
+                                                    snap_activity(&snap, "error", &format!("self-provision repair failed: {se}"));
+                                                }
+                                            },
+                                            None => {
+                                                eprintln!("[dispatch] no web session on this device — human-plane repair unavailable (headless)");
+                                                snap_activity(&snap, "error", "no web session — human-plane repair unavailable (headless)");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(be) => {
+                                eprintln!("[dispatch] repair client build failed: {be}");
+                                snap_activity(&snap, "error", &format!("repair client build failed: {be}"));
+                            }
                         }
                     }
                     // BR#2532: same guided-surface treatment as the identity
@@ -3745,6 +3891,19 @@ mod tests {
         let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
         assert_ne!(dir, other);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn epoch_repair_needed_only_on_known_mismatch() {
+        // BR#3787 negotiated catch-up: 0 = unknown on either side — the first
+        // observation adopts (never repairs on unknowns); only a KNOWN
+        // mismatch (both non-zero, different) triggers a proactive re-vend.
+        assert!(!epoch_repair_needed(0, 0));
+        assert!(!epoch_repair_needed(0, 5), "unknown vend must adopt, not repair");
+        assert!(!epoch_repair_needed(5, 0), "unknown seen must adopt, not repair");
+        assert!(!epoch_repair_needed(5, 5), "same epoch: in sync");
+        assert!(epoch_repair_needed(5, 6), "row rotated elsewhere: repair");
+        assert!(epoch_repair_needed(6, 5), "row rotated back: repair");
     }
 
     #[test]
