@@ -949,10 +949,13 @@ export function mergeSweepHumanLegTitle(repo: string, reasons: string[]): string
 // PR disposition law (decision BR#3312, accepted; impl BR#3315): no PR floats
 // without a terminal path — merged, closed-with-reason, or actively advancing
 // with a clock. decidePrDisposition composes the standing 5c/verify gate
-// (decideMergeAction) with the law's clock rows; the sweep (kb/do.ts
-// mergeQueueSweep) classifies every open PR each pass and acts on exactly one
-// disposition. Closure is always WITH a reason (the receipt), never silent;
-// PRs are reopenable — the card keeps the work's intent.
+// (decideMergeAction) with the law's clock rows. Under BR#3516 the hub-side
+// sweep that ran it each pass is deleted — the hub holds no VCS credentials,
+// every GitHub fact is executor-fed — so the table stays pinned in
+// test/merge-sweep.test.ts as the law's contract, while the train executor's
+// per-candidate gate (decideTrainGate) carries the gate rows live. Closure is
+// always WITH a reason (the receipt), never silent; PRs are reopenable — the
+// card keeps the work's intent.
 // ---------------------------------------------------------------------------
 
 /** Card states that make the PR a leftover vehicle: close it now. `rejected`
@@ -1080,3 +1083,340 @@ export function prEscalationAskTitle(repo: string, prNumber: number, cardId: str
   if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
   return prefix + text + suffix;
 }
+
+// ---------------------------------------------------------------------------
+// Serialized merge train (decision BR#3516, accepted; impl BR#3517): one merge
+// at a time per (repo, base) lane, leased to an opportunistic edge executor.
+// Division of labour — the hub holds no VCS credentials, ever: the executor
+// (scripts/merge-train.mjs on a gateway machine, worker-local gh) fetches
+// GitHub facts and reports them through the train ops; the HUB decides (this
+// decision layer + the DO's state machine). Pure helpers here; the DO
+// (kb/do.ts) owns the lane card primitive, the lease write, the train_events
+// ledger, and the derived queue. Pinned in test/merge-train.test.ts.
+// ---------------------------------------------------------------------------
+
+/** Lease TTL: ~5 minutes, renewed per executor tick; lapse ⇒ the next gateway
+ *  reconciles from live GitHub state and acquires (opportunistic — merges
+ *  happen when machines are on, Ray-ruled). */
+export const TRAIN_LEASE_TTL_MS = 5 * 60_000;
+
+export type TrainLease = { holder: string; heartbeat_ts: number; expires_ts: number };
+export type LeaseAction = "acquire" | "renew" | "release";
+
+/** THE lease CAS decision — the check half of the DO's atomic
+ *  read-check-write (DOs are single-threaded, so read-check-write is atomic
+ *  by construction; this function is the check, pure so the lease-kill test
+ *  — executor dies mid-merge, second gateway reconciles — is unit-testable).
+ *  acquire: free / lapsed / already-mine ⇒ grant (a crash's lease is
+ *  reconciled over, never poison); live-held by another ⇒ reject. renew:
+ *  only the (mine, any age — a holder renews after a brief stall) lease.
+ *  release: only the holder clears; nobody else — a stale executor cannot
+ *  kick a live one, lapse is the forced expiry. */
+export function leaseDecide(
+  current: TrainLease | null | undefined,
+  now: number,
+  holder: string,
+  action: LeaseAction,
+): { ok: true; lease: TrainLease | null; note: string } | { ok: false; reason: string } {
+  const live = !!current && current.expires_ts > now;
+  const mine = !!current && current.holder === holder;
+  const iso = (t: number) => new Date(t).toISOString();
+  if (action === "acquire") {
+    if (!current)
+      return { ok: true, lease: { holder, heartbeat_ts: now, expires_ts: now + TRAIN_LEASE_TTL_MS }, note: "lease granted — lane was free" };
+    if (mine)
+      return { ok: true, lease: { holder, heartbeat_ts: now, expires_ts: now + TRAIN_LEASE_TTL_MS }, note: live ? "lease re-granted — already mine" : "lease re-granted — my lease had lapsed" };
+    if (!live)
+      return { ok: true, lease: { holder, heartbeat_ts: now, expires_ts: now + TRAIN_LEASE_TTL_MS }, note: `lease granted — prior holder ${current.holder} lapsed at ${iso(current.expires_ts)}; reconciling from live GitHub state` };
+    return { ok: false, reason: `lane lease held live by ${current.holder} until ${iso(current.expires_ts)} — stand down this tick` };
+  }
+  if (action === "renew") {
+    if (!current) return { ok: false, reason: "no lease to renew — acquire first" };
+    if (!mine) return { ok: false, reason: `lease held by ${current.holder} — renew denied` };
+    return { ok: true, lease: { holder, heartbeat_ts: now, expires_ts: now + TRAIN_LEASE_TTL_MS }, note: "lease renewed" };
+  }
+  if (!current) return { ok: true, lease: null, note: "lease already clear" };
+  if (!mine) return { ok: false, reason: `lease held by ${current.holder} — only the holder releases; lapse is the forced expiry` };
+  return { ok: true, lease: null, note: "lease released" };
+}
+
+/** Lane identity: ONE standing lane card per (repo, base). Config, never
+ *  hardcoded (BR#3516 §1): required workflows + CI bound ride meta.lane. */
+export type LaneSpec = {
+  repo: string;
+  base: string;
+  /** required workflows the awaiting-CI phase polls on the merge commit */
+  required_workflows: string[];
+  /** typical CI wall-clock, minutes — the unknown bound is 3× this */
+  ci_typical_minutes?: number;
+};
+
+export const LANE_TITLE_PREFIX = "Merge lane: ";
+export function laneKey(repo: string, base: string): string {
+  return `${repo}@${base}`;
+}
+export function laneCardTitle(repo: string, base: string): string {
+  return `${LANE_TITLE_PREFIX}${repo}@${base}`;
+}
+
+/** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
+ *  the caller fails loud, a guessed lane config would gate the wrong CI. */
+export function laneOfMeta(meta: any): LaneSpec | null {
+  const lane = meta?.lane;
+  if (!lane || typeof lane !== "object" || typeof lane.repo !== "string" || !lane.repo || typeof lane.base !== "string" || !lane.base) return null;
+  const required = Array.isArray(lane.required_workflows) ? lane.required_workflows.map((w: unknown) => String(w ?? "").trim()).filter(Boolean) : [];
+  return {
+    repo: lane.repo,
+    base: lane.base,
+    required_workflows: required,
+    ci_typical_minutes: typeof lane.ci_typical_minutes === "number" && lane.ci_typical_minutes > 0 ? lane.ci_typical_minutes : undefined,
+  };
+}
+
+/** The lane card's standing body (created once, updated only by events). */
+export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): string {
+  return [
+    `Standing merge lane for **${lane.repo}** base **${lane.base}** — serialized: one merge at a time, gated, lease-held by an opportunistic gateway executor (decision BR#3516).`,
+    ``,
+    `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — the awaiting-CI phase passes through immediately)_"}`,
+    lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
+    ``,
+    `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
+    `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`scripts/merge-train.mjs\` on a gateway to work it.`,
+  ].join("\n");
+}
+
+// ---- the derived queue ----
+
+/** One candidate on the derived queue — a card blocked with a `merge-train:`
+ *  reason. The queue is COMPUTED at read time, NEVER a stored ordered list
+ *  (BR#3516 §1): the board's rows are the only store, so queue position can
+ *  never drift from reality. */
+export const MERGE_TRAIN_REASON_PREFIX = "merge-train:";
+export const MERGE_TRAIN_QUEUED_REASON = "merge-train: queued";
+
+export type TrainCandidate = { id: string; status_ts: number; meta: any };
+
+/** Queue order: CRITICAL class first, FIFO within class. The board's existing
+ *  boost stamp (meta.boosted) is the CRITICAL class; everything else orders by
+ *  blocked-since (status_ts ascending). */
+export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "critical" | "normal" }[] {
+  const queued = cards.filter((c) =>
+    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX)),
+  );
+  const rank = (c: TrainCandidate) => (c.meta?.boosted ? 0 : 1);
+  return [...queued]
+    .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
+    .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
+}
+
+// ---- carry-record law (BR#3516 §5) ----
+
+/** One machine-clean head move: `update-branch` (server-side, bought CI, no
+ *  human resolution) — the accepted verdict CARRIES across it. A conflict
+ *  resolution is authored code: it never produces a carry-record, it
+ *  produces a bounce. One sentence: **machine-clean carries;
+ *  human-resolved invalidates.** */
+export type CarryRecord = {
+  from_head: string;
+  to_head: string;
+  prior_verdict_id: string | null;
+  carried_ts: number;
+  via: "update-branch";
+};
+
+/** Does an accepted verdict cover this head? The straight stamp
+ *  (meta.pr.head_sha_at_acceptance === head) or a CONTIGUOUS carry chain
+ *  stamped → … → head. A break anywhere is uncovered — fail-closed, the
+ *  verdict must be re-rendered at the new head. Prefix-compatible: a 9-hex
+ *  stamp covers the full 40-hex it prefixes, never the reverse. */
+export function verdictCoversHead(meta: any, headSha: string): boolean {
+  const pr = meta?.pr ?? {};
+  const stamped = String(pr.head_sha_at_acceptance ?? "").toLowerCase();
+  const target = String(headSha ?? "").toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(stamped) || !/^[0-9a-f]{7,40}$/.test(target)) return false;
+  let cur = stamped;
+  if (target.startsWith(cur) || cur.startsWith(target)) return true;
+  for (const c of Array.isArray(pr.carry) ? pr.carry : []) {
+    const from = String(c?.from_head ?? "").toLowerCase();
+    const to = String(c?.to_head ?? "").toLowerCase();
+    if (from !== cur || !/^[0-9a-f]{7,40}$/.test(to)) return false;
+    cur = to;
+  }
+  return target.startsWith(cur) || cur.startsWith(target);
+}
+
+/** Append a carry link to the chain (pure; the caller persists meta). */
+export function carryAppend(meta: any, rec: CarryRecord): any {
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  const pr = { ...(m.pr ?? {}) };
+  pr.carry = [...(Array.isArray(pr.carry) ? pr.carry : []), rec];
+  m.pr = pr;
+  return m;
+}
+
+// ---- awaiting-CI phase (BR#3516 §2) ----
+
+/** The unknown-past bound: ~3× typical CI wall-clock ⇒ fail-closed stop
+ *  (never merge on unknown). Lanes override typical via meta.lane. */
+export const TRAIN_CI_BOUND_MULTIPLIER = 3;
+export const TRAIN_CI_TYPICAL_MINUTES = 20;
+
+export type RequiredRunsVerdict = {
+  verdict: "green" | "red" | "pending";
+  /** required workflow that settled red on the merge commit — the stop-the-line culprit */
+  failing: MainRedCheck[];
+  /** required workflow never seen on the merge commit (CI not started) */
+  missing: string[];
+  /** required workflow still running / inconclusive */
+  pending: string[];
+  /** wall-clock bound exceeded while still pending — the caller fail-closes */
+  bound_exceeded: boolean;
+};
+
+/** Classify the executor-fed check runs on the merge commit against the
+ *  lane's REQUIRED workflows. Same judge rule as classifyMainCheckRuns
+ *  (newest non-cancelled run per name; cancelled says nothing). Required is
+ *  lane config — an unconfigured lane has no required set, so green is
+ *  vacuous and the phase passes through. */
+export function classifyRequiredRuns(
+  runs: MainCheckRun[],
+  required: string[],
+  opts: { merged_at: number; now: number; typical_ms?: number },
+): RequiredRunsVerdict {
+  const byName = new Map<string, MainCheckRun[]>();
+  for (const r of runs) {
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const failing: MainRedCheck[] = [];
+  const missing: string[] = [];
+  const pending: string[] = [];
+  for (const name of required) {
+    const list = byName.get(name) ?? [];
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge || judge.conclusion == null) {
+      (list.length ? pending : missing).push(name);
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+      failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
+      pending.push(name);
+    }
+  }
+  const typical = opts.typical_ms ?? TRAIN_CI_TYPICAL_MINUTES * 60_000;
+  const bound_exceeded = opts.now - opts.merged_at > TRAIN_CI_BOUND_MULTIPLIER * typical;
+  if (failing.length) return { verdict: "red", failing, missing, pending, bound_exceeded };
+  if (!pending.length && !missing.length) return { verdict: "green", failing, missing, pending, bound_exceeded };
+  return { verdict: "pending", failing, missing, pending, bound_exceeded };
+}
+
+// ---- the train's admission gate (executor-side, fail-closed) ----
+
+export type TrainGateInput = {
+  prNumber: number;
+  /** the LIVE head sha from GitHub (executor-fetched, never the card's claim) */
+  headSha: string;
+  /** the linked impl card's meta (carries meta.pr — the stamp + carry chain) */
+  cardMeta: any;
+  cardStatus: string | null;
+  /** classifyMainCheckRuns verdict on the BASE (main) HEAD */
+  baseVerdict: "green" | "red" | "unsettled" | "empty";
+  /** GitHub pull API mergeable; null while GitHub computes — wait this tick */
+  mergeable: boolean | null;
+  mergeStateStatus: string | null;
+  /** commits of the PR: REST verification (verified=true = signed+valid) */
+  commits: { sha: string; verified: boolean }[];
+  headChecks: MainCheckRun[];
+};
+
+/** The per-candidate gate the executor runs before merging (BR#3516 §2),
+ *  each leg fail-closed: verdict coverage (stamp or contiguous carry) ·
+ *  base-green · mergeable=MERGEABLE with bound-wait through null · every
+ *  commit GitHub-verified · head checks green (BR#2267 externals exempt).
+ *  Composes the standing decideMergeAction; the train layer adds the
+ *  carry law the sweep never had. */
+export function decideTrainGate(i: TrainGateInput): MergeAction {
+  if (i.cardStatus === "superseded")
+    return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
+  if (i.cardStatus === "done")
+    return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+  if (!verdictCoversHead(i.cardMeta, i.headSha)) {
+    const stamped = String(i.cardMeta?.pr?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
+    return {
+      kind: "bounce",
+      defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+    };
+  }
+  const gate = decideMergeAction({
+    prNumber: i.prNumber,
+    prTitle: "",
+    headSha: i.headSha,
+    baseVerdict: i.baseVerdict,
+    mergeable: i.mergeable,
+    mergeStateStatus: i.mergeStateStatus,
+    commits: i.commits,
+    headChecks: i.headChecks,
+    cardStatus: i.cardStatus,
+    verifyAcceptedOnHead: true,
+    verifyAcceptedAny: true,
+  });
+  if (gate.kind === "merge")
+    return {
+      kind: "merge",
+      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516): head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green`,
+    };
+  return gate;
+}
+
+// ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
+
+/** train:bounced fix-up brief: the conflict files ride in, the verdict is
+ *  INVALID at the new head, re-verify then re-queue at the back. */
+export function trainBounceBrief(input: {
+  prNumber: number;
+  repo: string;
+  headSha: string | null;
+  conflictFiles: string[];
+  verdictId: string | null;
+}): string {
+  const files = input.conflictFiles.length
+    ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
+    : "- (no file list supplied — run the trial rebase locally to enumerate)";
+  return [
+    `Merge-train bounce: PR #${input.prNumber} (${input.repo}) conflicts with its base${input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : ""}.`,
+    ``,
+    `**Conflicting files:**`,
+    files,
+    ``,
+    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head — machine-clean carries, human-resolved invalidates. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+  ].join("\n");
+}
+
+/** Deterministic stop-the-line ask title (ONE per red episode — the sha makes
+ *  it unique; askCreate's identical-open-ask guard dedupes). ≤240 chars,
+ *  ends "?" — the ask contract. */
+export function trainStopAskTitle(lane: { repo: string; base: string }, sha: string, failing: string[]): string {
+  const prefix = `MERGE TRAIN STOP THE LINE: ${lane.repo}@${lane.base} commit ${sha.slice(0, 9)} RED (`;
+  const suffix = `) — merges halted until green. Acknowledge?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let names = failing.join(", ");
+  if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + names + suffix;
+}
+
+/** The machine-proxy close note for train:landed — cites the merge commit
+ *  (mergeCommit non-null) and main green, per the done-when's machine proxy. */
+export function trainLandedCloseNote(input: { repo: string; prNumber: number; mergeSha: string; gateway: string; greenRunUrl?: string | null }): string {
+  return [
+    `landed via the serialized merge train (BR#3516) — PR [#${input.prNumber}](https://github.com/${input.repo}/pull/${input.prNumber}) merged as ${input.mergeSha.slice(0, 9)} by gateway ${input.gateway}; machine proxy held: mergeCommit non-null AND required main workflows green${input.greenRunUrl ? ` (${input.greenRunUrl})` : ""}.`,
+    `merge commit: https://github.com/${input.repo}/commit/${input.mergeSha}`,
+  ].join("\n");
+}
+
+/** The verify template's accept instruction — the head sha the verifier must
+ *  record in the close note so the hub can stamp head_sha_at_acceptance
+ *  without any hub-side GitHub call. */
+export const TRAIN_HEAD_STAMP_RE = /(?:^|\s)head[=:\s]+([0-9a-f]{7,40})(?=\s|$)/i;

@@ -5,7 +5,7 @@ Access application created for the workers.dev hostname (AUD from the Access app
 
 ## 1. Worker
 
-Deploys are **push-to-main** — Cloudflare's git integration builds and ships the worker on every push to `main`. Local `npx wrangler deploy` from the box still works for out-of-band fixes. Do NOT wire GitHub Actions deploys. CI, when added, is for tests only.
+Deploys are **push-to-main** — Cloudflare's git integration builds and ships the worker on every push to `main`. Local `npx wrangler deploy` from the box still works for out-of-band fixes. Do NOT wire GitHub Actions deploys. CI, when added, is for tests only. **The hub needs no GitHub token** (BR#3516): every GitHub fact is fed to it by the merge-train executor running on your own machine (section 7) — a legacy `GH_TOKEN` secret on the worker is inert and can be deleted.
 
 ```bash
 cd ~/bridge/packages/worker
@@ -116,6 +116,38 @@ npm run build -w @bridge/desktop         # → src-tauri/target/release/bundle/m
   with the token stored in the app's settings. First launch of the .app: grant
   notification permission.
 
+
+## 7 · Merge-train executor (BR#3516)
+
+The hub holds **no VCS credentials** — every GitHub fact is fed to it by the merge-train
+executor running on your own machine. On the box that merges (any machine with a clone
+of the target repo):
+
+```bash
+# prerequisites — `bridge doctor` checks each and names the fix:
+#   gh authed WITH the `repo` scope   (fix: gh auth refresh -h github.com -s repo)
+#   git · node ≥ 23 (native type stripping — the executor imports the hub's TS helpers)
+#   scripts/merge-train.mjs present in the bridge checkout
+cd /path/to/target-repo-clone        # the repo the train drives
+export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
+export BRIDGE_TOKEN=<token from the Connect tab>
+node /path/to/bridge/scripts/merge-train.mjs            # 45s tick loop
+node /path/to/bridge/scripts/merge-train.mjs --once     # cron-friendly single tick
+```
+
+Optional env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
+`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD` (`merge | squash |
+rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone; default cwd); flag
+`--lane <repo>@<base>` drives one lane only. Keep it alive like the runner
+(systemd / launchd / `nohup`) or run `--once` from cron. It merges via `gh` as whatever
+identity that `gh` is authed as — use the detached-cody credential per BR#3181, never a
+personal one.
+
+Lane config (required workflows + typical CI minutes) lives in admin settings
+(`train_lane`, a JSON map keyed `"repo@base"`; the executor/operator refreshes it in
+place via `train.lane`); stop-the-line asks land on the card in `train_alarm_sink_id`
+(default BR#3124). The lease / carry / bounce / stop-the-line contract is in README
+("The merge train").
 
 ## Rollback / kill switch
 

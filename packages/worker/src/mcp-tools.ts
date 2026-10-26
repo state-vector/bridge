@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.3.5";
+export const BUILD = "0.4.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -253,6 +253,41 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Answer an ask from your inbox.",
     schema: TOOL_ARG_SCHEMAS.answer_ask,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("ask.answer", { id: args.id, answer: args.answer }))),
+  },
+  // ---- merge train (BR#3516/BR#3517) — executor-facing: scripts/merge-train.mjs.
+  // Division of labour: the EXECUTOR fetches GitHub facts and performs the
+  // merge (worker-local gh, doctor-defended); the HUB decides and holds NO
+  // VCS credentials. Every mutating op requires the lane lease (train_lease
+  // acquire first; CAS ~5 min TTL — renew on every tick).
+  train_lease: {
+    description: "Merge-train lane lease (CAS). action: acquire | renew | release — acquire fails while another holder's lease is live (~5 min TTL; lapse then reconcile from live GitHub state); renew/release only by the holder. Acquire carries the lane config (required_workflows, ci_typical_minutes — config, never hardcoded). release with line_green:true clears a stop-the-line.",
+    schema: TOOL_ARG_SCHEMAS.train_lease,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lease", args), null, 1)),
+  },
+  train_event: {
+    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue). Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_event,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.event", args), null, 1)),
+  },
+  train_ci: {
+    description: "Report required-workflow check runs (checks[]) observed on the lane's merge commit — the hub classifies (green → landed; red → stop-the-line; unknown past ~3× typical CI → fail-closed stop; else pending). Executor-fed facts, hub decides. Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_ci,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.ci", args), null, 1)),
+  },
+  train_status: {
+    description: "Merge-train snapshot: lane cards, lease holders, in-flight merge phase, stop state, and the DERIVED queue (computed from blocked cards, never stored). Executor's reconciliation source — never trust a prior holder's picture.",
+    schema: TOOL_ARG_SCHEMAS.train_status,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.status", args), null, 1)),
+  },
+  train_history: {
+    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed with provenance (sha → PR → task → verdict → session).",
+    schema: TOOL_ARG_SCHEMAS.train_history,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.history", args), null, 1)),
+  },
+  train_lane: {
+    description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing.",
+    schema: TOOL_ARG_SCHEMAS.train_lane,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
   },
 });
 
