@@ -484,7 +484,13 @@ One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile f
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
 lands, stops or pends) → else the queue head's **first unlanded leg on this lane**
 (BR#3659: a multi-PR card rides leg by leg) → `decideTrainGate` → act: merge (`gh`) →
-`train:merged` → next tick polls CI on the merge commit.
+`train:merged` → next tick polls CI on the merge commit. Every fact crosses the
+executor's fact boundary normalized (BR#3714): gh's GraphQL `mergeable` is the enum
+string `"MERGEABLE"|"CONFLICTING"|"UNKNOWN"` — never a boolean — and
+`mergeStateStatus` is UPPERCASE; `prFacts()` maps them to the boolean|null/lowercase
+the shared gate compares. Fed raw, the strings satisfied neither `mergeable !== true`
+nor `=== "clean"`, and every gated candidate bounced (genuinely mergeable PRs
+included) as "unmergeable — CONFLICTING".
 
 ### Lanes, leases, queues
 
