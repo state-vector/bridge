@@ -3489,11 +3489,34 @@ export class KnowledgeHub {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
         if (subject.status === "blocked") {
-          await this.transition({
-            id: subject.id, to: "in_progress",
-            note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
-          }, `system:question(${actor})`);
-          taskStatus = "in_progress";
+          // BR#3578 answer dispatch: when the ask IS the exit path (a
+          // migration ask, or an option that names the action), the ANSWER
+          // actions the card — SUPERSEDE drops it, RELEASE/CANCEL releases
+          // to the pool, KEEP/RE-SCOPE stays a deliberate human-owned park
+          // (the answered ask is the record; the marker prevents re-ask spam).
+          // Without dispatch semantics this is the generic rule-6 resume.
+          const isMigrationAsk = String(sm.blocked?.await_migration_ask ?? "") === id;
+          const optHit = (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
+            .some((o) => /^(RELEASE|CANCEL|SUPERSEDE)\b/i.test(String(o ?? "").trim())
+              && answer.trim().toLowerCase().startsWith(String(o).trim().slice(0, 12).toLowerCase()));
+          const asActor = `system:question(${actor})`;
+          if (isMigrationAsk || optHit) {
+            if (/\bSUPERSEDE\b/i.test(answer)) {
+              await this.transition({ id: subject.id, to: "superseded", note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
+              taskStatus = "superseded";
+            } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
+              await this.transition({ id: subject.id, to: "todo", note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
+              taskStatus = "todo";
+            } else {
+              taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
+            }
+          } else {
+            await this.transition({
+              id: subject.id, to: "in_progress",
+              note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
+            }, asActor);
+            taskStatus = "in_progress";
+          }
         }
       }
       this.audit(actor, "answer", subject?.id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
