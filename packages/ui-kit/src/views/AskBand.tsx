@@ -117,6 +117,8 @@ function BandVerdictRow({ latest, prior, onDone, openDecision, nested, pending, 
       <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
         <div className="ab-head">
           <Chip tone="urgent">VERDICT</Chip>
+          {/* the verdict's own id — which BR# you are acting on (BR#3462 leg 2) */}
+          <span className="gw-mono ab-id">{latest.id}</span>
           <span className="why-line">{f.target ?? "task"} · {rel(latest.created_ts)}</span>
           <span className="ab-actions">
             {pending && <span className="ask-spinner" title="sending…" />}
@@ -159,7 +161,7 @@ function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending }
       <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
         <span className="ab-kind"><Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip></span>
         <span className="ab-main"><span className="ab-title" title={d.title}>{d.title}</span></span>
-        <span className="ab-meta">{rel(d.created_ts)}</span>
+        <span className="ab-meta"><span className="gw-mono ab-id">{d.id}</span> · {rel(d.created_ts)}</span>
         <span className="ab-actions">
           {pending && <span className="ask-spinner" title="sending…" />}
           <Btn size="sm" variant="accept" disabled={busy} onClick={() => go("accepted")}>Accept</Btn>
@@ -213,7 +215,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
           <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
         )}
       </span>
-      <span className="ab-meta">{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
+      <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
       <span className="ab-actions">
         {ask.reframe
           ? <span className="muted-note">reframed — awaiting re-ask</span>

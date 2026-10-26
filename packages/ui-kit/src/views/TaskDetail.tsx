@@ -32,6 +32,10 @@ export const HISTORY_LABEL: Record<string, string> = {
   reassign: "reaped",
 };
 
+/** related is enrichment (dep-graph titles fall back to the live board store) —
+ *  bounded so a cold DO can't hold the panel hostage (BR#3462 leg 3). */
+const RELATED_TIMEOUT_MS = 5000;
+
 export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
   const inFlight = tasks.filter((t) => ["in_progress", "blocked", "todo"].includes(t.status));
   const sentiments = inFlight
@@ -406,6 +410,11 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
   const [busy, setBusy] = useState(false);
   const [versions, setVersions] = useState<KbVersion[]>([]);
   const [reloadKey, setReloadKey] = useState(0);
+  // per-section load errors (BR#3462 leg 3): a section's failure must not
+  // blank the sections after it, and the label must name the section
+  const [taskErr, setTaskErr] = useState("");
+  const [relErr, setRelErr] = useState("");
+  const [histErr, setHistErr] = useState("");
 
   const boardTasks = useKb((s) => s.tasks) as any[];
   // children resolve from the LIVE board store first (complete + realtime via
@@ -420,26 +429,55 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
   useEffect(() => {
     let on = true;
+    const errOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    // parallel loads (BR#3462 leg 3): artefact, related and history are
+    // independent reads — the old sequential chain paid the auth + DO round
+    // trip three times over (cold DO = seconds), left later sections empty on
+    // any mid-chain failure, and mislabeled the history failure "load task
+    // relations". allSettled renders each section as its own data lands;
+    // per-section error + retry below. related is non-essential enrichment —
+    // it races a timeout and the panel renders without it when slow/failed.
     void (async () => {
-      try {
-        const a = await kbApi.artefact(taskId);
-        if (on) {
-          setTask(a as KbArtefact & { meta?: TaskMeta });
-          setBody(a.body_md ?? "");
-          setRelations(((a as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
-        }
-      } catch (e) { useKb.getState().reportError("load task", e); }
-      try {
-        const r = await kbApi.related(taskId);
-        if (on) setRelated(r.artefacts ?? []);
-      } catch (e) { useKb.getState().reportError("load task relations", e); }
-      try {
-        const h = await kbApi.history(taskId);
-        if (on) setVersions(h.versions ?? []);
-      } catch (e) { useKb.getState().reportError("load task relations", e); }
+      const [a, r, h] = await Promise.allSettled([
+        kbApi.artefact(taskId),
+        Promise.race([
+          kbApi.related(taskId),
+          new Promise<never>((_, rej) =>
+            setTimeout(() => rej(new Error(`no answer in ${RELATED_TIMEOUT_MS / 1000}s`)), RELATED_TIMEOUT_MS)),
+        ]),
+        kbApi.history(taskId),
+      ]);
+      if (!on) return;
+      if (a.status === "fulfilled") {
+        const art = a.value as KbArtefact & { meta?: TaskMeta };
+        setTask(art);
+        setBody(art.body_md ?? "");
+        setRelations(((art as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
+        setTaskErr("");
+      } else {
+        setTaskErr(errOf(a.reason));
+        useKb.getState().reportError("load task", a.reason);
+      }
+      if (r.status === "fulfilled") {
+        setRelated(r.value.artefacts ?? []);
+        setRelErr("");
+      } else {
+        setRelErr(errOf(r.reason)); // panel renders without it
+        useKb.getState().reportError("load related tasks", r.reason);
+      }
+      if (h.status === "fulfilled") {
+        setVersions(h.value.versions ?? []);
+        setHistErr("");
+      } else {
+        setHistErr(errOf(h.reason));
+        useKb.getState().reportError("load history", h.reason);
+      }
     })();
     return () => { on = false; };
   }, [taskId, reloadKey]);
+  // per-section retry: the loads are parallel + idempotent GETs, so re-running
+  // the whole set is the honest retry (no stale-mix risk)
+  const reload = () => setReloadKey((x) => x + 1);
 
     // navigate to another task inside the same panel (task refs / dep graph)
   const nav = (id: string) => {
@@ -455,7 +493,12 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
       setTimeout(() => setMsg(""), 2000);
       const h = await kbApi.history(taskId);
       setVersions(h.versions ?? []);
-    } catch (e) { useKb.getState().reportError("post comment", e); setMsg("comment failed"); } finally {
+    } catch (e) {
+      // surface the server's message — the next route/DO defect must be
+      // diagnosable from the UI, not a bare "comment failed" (BR#3462 leg 1)
+      useKb.getState().reportError("post comment", e);
+      setMsg(`comment failed: ${(e as Error).message}`);
+    } finally {
       setBusy(false);
     }
   };
@@ -478,6 +521,13 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
             ? <RefText text={askKernel(task.title)} onOpen={nav} />
             : <RefText text={task?.title ?? taskId} onOpen={nav} />}
         </h2>
+
+        {taskErr && (
+          <div className="detail-block">
+            <span className="k-err">load task failed: {taskErr}</span>{" "}
+            <Btn size="sm" quiet onClick={reload}>Retry</Btn>
+          </div>
+        )}
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
 
@@ -519,7 +569,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         <div className="detail-block history-block">
           <label>History</label>
           <div className="version-history">
-            {versions.length === 0 && <span className="muted-note">no history yet</span>}
+            {histErr ? (
+              <span className="k-err">load history failed: {histErr} </span>
+            ) : versions.length === 0 && <span className="muted-note">no history yet</span>}
+            {histErr && <Btn size="sm" quiet onClick={reload}>Retry</Btn>}
             {versions
               // drop machine announcements: dispatch/heartbeat/relay noise the
               // board already shows — history is for humans reading what happened
@@ -539,6 +592,8 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         {relations.length > 0 && (
           <div className="detail-block">
             <label>Dependency graph</label>
+            {relErr && <span className="muted-note">related tasks unavailable ({relErr}) — </span>}
+            {relErr && <Btn size="sm" quiet onClick={reload}>Retry</Btn>}
             <DepGraph selfId={taskId} selfTitle={task?.title ?? ""} relations={relations} related={related} onOpen={nav} />
           </div>
         )}

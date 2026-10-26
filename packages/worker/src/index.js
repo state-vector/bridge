@@ -219,8 +219,12 @@ export default {
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
-        // do ops are dot-namespaced (ask.answer); the web plane uses snake_case
-        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${op.replace(/_/g, ".")}`, {
+        // do ops are dot-namespaced (ask.answer); the web plane uses snake_case.
+        // web `progress` is DO `progress.log` (BR#3462 leg 1): the bare name has
+        // no underscore so the dot-mapping passed it through and the DO 404'd
+        // "unknown op progress" — every human comment from the web UI failed.
+        const doOp = { progress: "progress.log" }[op] ?? op;
+        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${doOp.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
