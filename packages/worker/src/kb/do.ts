@@ -4471,7 +4471,7 @@ export class KnowledgeHub {
       ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ? AND revoked_ts IS NULL`, principal) as any
       : null;
     if (!own) {
-      const byLabel = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label) as any;
+      const byLabel = this.one(`SELECT id, label, principal FROM auth_tokens WHERE label = ?`, label) as any;
       if (byLabel && byLabel.principal && byLabel.principal !== principal) {
         let n = 2;
         while (this.one(`SELECT 1 FROM auth_tokens WHERE label = ?`, `${label}-${n}`)) n++;
@@ -4482,10 +4482,17 @@ export class KnowledgeHub {
     }
     if (own) {
       this.rotateTokenRow(own.id as string);
+      // Replace-by-principal rotates THE ROW in place — its label is STABLE.
+      // Re-stamping the requested host slug here UNIQUE-fails the moment
+      // another row has come to hold it (hostname rename, dev/prod split,
+      // fleet suffix history): the desktop startup looped forever on
+      // "self-provision failed: UNIQUE constraint failed: auth_tokens.label"
+      // (2026-10-27). Label is display-only (BR#899); the row keeps its own.
       this.state.storage.sql.exec(
-        `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = ?, revoked_ts = NULL WHERE id = ?`,
-        hash, label, mintTags, principal, own.id,
+        `UPDATE auth_tokens SET hash = ?, tags = ?, principal = ?, revoked_ts = NULL WHERE id = ?`,
+        hash, mintTags, principal, own.id,
       );
+      label = String(own.label ?? label);
       id = own.id as string;
       await register(hash, (vended ?? principal) || null);
     } else {

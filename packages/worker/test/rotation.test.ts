@@ -117,6 +117,38 @@ describe("BR#3787 layer 0 — identity law (principal-only provisioning)", () =>
     expect(oldIdent.body.token_stale).toBe(true);
     expect(oldIdent.body.token_epoch).toBe(2);
   });
+
+  it("re-provision whose host slug ANOTHER row holds keeps the row's own label — never UNIQUE-fails (2026-10-27 dev-startup incident)", async () => {
+    // another live device already holds the slug the device is about to report
+    const holder = await kbJson("/admin.mint", { label: "contested", tags: ["gateway"], principal: "p_holder_11111111111111111111" });
+    expect(holder.status).toBeLessThan(500);
+    // our row was minted earlier under a different host label
+    const first = await kbJson("/self.provision", {
+      actor: "web:rayh", login: "rayh",
+      principal: "p_rename_22222222222222222222",
+      host: "renamed-box",
+    });
+    expect(first.body.secret).toBeTruthy();
+    // the device now reports host "contested" (hostname rename, dev/prod
+    // split, fleet suffix history). The old code re-stamped the row's label
+    // to the requested slug and died on auth_tokens.label UNIQUE — the
+    // desktop startup looped on "self-provision failed: UNIQUE constraint
+    // failed: auth_tokens.label".
+    const re = await kbJson("/self.provision", {
+      actor: "web:rayh", login: "rayh",
+      principal: "p_rename_22222222222222222222",
+      host: "contested",
+    });
+    expect(re.status).toBeLessThan(500);
+    expect(re.body.error).toBeUndefined();
+    expect(re.body.secret).toBeTruthy();
+    expect(re.body.epoch).toBe(2, "replace-by-principal rotated our row in place");
+    expect(re.body.label).toBe("renamed-box", "the row keeps its stable label — the slug holder is untouched");
+    // the holder's credential is UNTOUCHED
+    const holderIdent = await kbJson("/auth.identify", { bearer: holder.body.secret });
+    expect(holderIdent.body.error).toBeUndefined();
+    expect(holderIdent.body.token_epoch).toBe(1);
+  });
 });
 
 describe("BR#3787 layer 1 — rotation keeps the previous hash alive (stale)", () => {
