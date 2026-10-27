@@ -287,6 +287,57 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "web:ray" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
   });
+
+  // BR#3611: a gateway's claim is ATTRIBUTED — owner = attributedAgent
+  // (do.ts claim path), so the gateway's raw actor never equals the owner and
+  // the gate structurally refused every self-release (the stale-claim path in
+  // dispatch.rs never succeeded live; the rejection churn re-armed breach
+  // cards, specimen BR#3610).
+  it("gateway self-release of its own attributed claim passes; cross-gateway stays gated (BR#3611)", async () => {
+    // same gateway, body.agent === owner (the attributed agent) → allowed
+    const selfRelease = input({
+      status: "in_progress",
+      to: "todo",
+      owner: "mac-modem-opencode",
+      actor: "mac-modem",
+      body: { gateway: true, agent: "mac-modem-opencode" },
+    });
+    expect((await decide(selfRelease, baseCtx())).ok).toBe(true);
+    // a DIFFERENT gateway's attributed agent ≠ owner — still a claim race
+    const crossGateway = await decide(
+      input({
+        status: "in_progress",
+        to: "todo",
+        owner: "mac-modem-opencode",
+        actor: "ip-172-31-1-230",
+        body: { gateway: true, agent: "ip-172-31-1-230-opencode" },
+      }),
+      baseCtx(),
+    );
+    expect(crossGateway.ok).toBe(false);
+    if (crossGateway.ok === false) {
+      expect(crossGateway.code).toBe("guard-failed");
+      expect(crossGateway.rule).toBe("release-needs-ownership");
+    }
+    // the exemption needs the gateway flag: a plain agent body naming the
+    // owner's agent still refuses — mcp.ts strips gateway/agent from
+    // non-gateway tokens, so this shape cannot occur live, and the rule does
+    // not trust it if it did
+    const forged = await decide(
+      input({
+        status: "in_progress",
+        to: "todo",
+        owner: "mac-modem-opencode",
+        actor: "agent-x",
+        body: { agent: "mac-modem-opencode" },
+      }),
+      baseCtx(),
+    );
+    expect(forged.ok).toBe(false);
+    if (forged.ok === false) {
+      expect(forged.rule).toBe("release-needs-ownership");
+    }
+  });
 });
 
 // ---------- BR#3361 (b)+(c): done-close-legs — terminal legs are owned ----------
@@ -891,6 +942,11 @@ describe("claim-race classification (BR#3337)", () => {
     // refused, the loser skips (specimen BR#3427: 3 rule-9 release attempts
     // on a runner-claimed card raised a breach card before this fix)
     expect(breachClass("task BR#1 is claimed by other-gw — only the owner or a human can release it to the pool")).toBe("claim_race");
+    // BR#3611: PR #210's proven-unblock wording (8a1acbd) broke the sentence
+    // literal — the structural pair must receive it too (specimen BR#3610:
+    // this exact wording regressed to class 'other' and re-armed breach cards
+    // on the ownership key)
+    expect(breachClass("task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]")).toBe("claim_race");
   });
 
   it("a claim-race storm never raises a breach card (the breaker does not count it)", () => {
@@ -911,6 +967,34 @@ describe("claim-race classification (BR#3337)", () => {
 
   it("ownership-gate rejections never raise a breach card either (BR#3429)", () => {
     expect(detectBreaches(ownershipEvents(9), new Set())).toHaveLength(0);
+  });
+
+  // BR#3611: PR #210's proven-unblock wording (8a1acbd) broke the sentence
+  // literal — the structural pair must classify the new wording the same way
+  // (specimen BR#3610: 3 rejections in this wording raised a breach card at
+  // the default threshold 3).
+  const ownershipEventsNewWording = (n: number, task = "BR#3611A") =>
+    Array.from({ length: n }, (_, i) => ({
+      ts: 1_000_000 + i * 60_000,
+      task,
+      op: "transition_rejected",
+      reason:
+        "task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]",
+    }));
+
+  it("proven-unblock wording (PR #210) folds as claim_race too (BR#3611)", () => {
+    expect(detectBreaches(ownershipEventsNewWording(9), new Set())).toHaveLength(0);
+    // the wording variant contaminates no genuine class either
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#3611B",
+      op: "transition_rejected",
+      reason: "task BR#3611B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const mixed = [...ownershipEventsNewWording(5, "BR#3611B"), ...genuine];
+    expect(detectBreaches(mixed, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
   });
 
   it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
