@@ -139,6 +139,34 @@ export const UNBLOCK_FLOOD_MS = 60 * 60_000;
 
 // ---------- effects: decided here, executed by do.ts ----------
 
+/** Whether url parses as a shape the runner's scm registry can clone: a GitHub
+ *  repo or PR reference, or a full .git clone URL. Anything else (truncated
+ *  fragments, runs/issues pages of unknown repos, prose) is not a receipt the
+ *  runner should clone. */
+export function isClonableRepoRef(url: string): boolean {
+  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/pull\/\d+)?\/?$/.test(url)
+    || /^https?:\/\/\S+\.git$/.test(url);
+}
+
+/** The PR/repo receipt a spawned verify body may cite, extracted from the
+ *  handoff note. The runner captures agent output at terminal width and
+ *  hard-wraps mid-word, so the first URL in a note is routinely split across
+ *  lines ("…/state-vector/super\npositional/pull/2343"); the old bare
+ *  `https?://\S+` scrape stamped the truncated prefix
+ *  (https://github.com/state-vector/super) into verify bodies and the runner
+ *  cloned the ghost repo — dispatch skipped, task churned (BR#3845 ×11).
+ *  Unwrap line breaks first, then accept only a clonable reference — else
+ *  null (the verify body renders "see note": a repo-less dispatch, never a
+ *  ghost clone). */
+export function prFromNote(note: string): string | null {
+  const flat = note.replace(/\r?\n/g, "");
+  for (const m of flat.matchAll(/https?:\/\/\S+/g)) {
+    const url = m[0].replace(/[.,;:!?)\]>'"]+$/, "");
+    if (isClonableRepoRef(url)) return url;
+  }
+  return null;
+}
+
 export type Effect =
   | { kind: "spawn_verify"; parent: string; pr: string | null }
   | { kind: "reuse_verify"; parent: string; verify: string }
@@ -471,7 +499,7 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
         effects.push({
           kind: "spawn_verify",
           parent: i.id,
-          pr: (String(i.body?.note ?? "").match(/https?:\/\/\S+/) || [])[0] ?? null,
+          pr: prFromNote(String(i.body?.note ?? "")),
         });
     }
   }
