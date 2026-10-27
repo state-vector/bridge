@@ -1541,7 +1541,7 @@ fn refused_cache_store(cache: &HashMap<String, RefusedRef>) {
 fn refused_reference(cache: &mut HashMap<String, RefusedRef>, tid: &str, url: Option<&str>) -> bool {
     match (cache.get(tid), url) {
         (Some(r), Some(u)) if r.url == u => true,
-        (Some(_), other) => {
+        (Some(_), _) => {
             // reference changed (or removed) since the refusal — re-arm
             cache.remove(tid);
             refused_cache_store(cache);
