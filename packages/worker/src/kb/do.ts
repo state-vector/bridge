@@ -3153,11 +3153,15 @@ export class KnowledgeHub {
     }
     const breaches = detectBreaches(events, openKeys, { highWater });
     for (const b of breaches) {
+      const gapNote =
+        b.klass === "unclassified"
+          ? `\n- classifier gap: NO breachClass pattern matched this reason. Either a benign flow missing a named class (add the pattern to breachClass, machine.ts — cite the specimen task) or a genuine novel defect (investigate the sample below). The "unclassified" pile is a to-do list for the classifier, never a verdict.\n`
+          : "";
       const created = await this.create(
         {
           type: "task",
           title: `Breach: ${b.klass} on ${taskId} — ${b.count} event${b.count === 1 ? "" : "s"}`,
-          body_md: `Structural breach detected server-side (fold over the audit stream).\n\n- class: ${b.klass}\n- task: ${taskId}\n- events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})\n- sample: ${b.sample}\n\nOne open card per (task, class) — reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
+          body_md: `Structural breach detected server-side (fold over the audit stream).\n\n- class: ${b.klass}\n- task: ${taskId}\n- events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})\n- sample: ${b.sample}${gapNote}\nOne open card per (task, class) — reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
           tags: ["breach", `breach:${b.klass}`],
         },
         "system:breach",
