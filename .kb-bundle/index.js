@@ -1560,7 +1560,7 @@ var init_rollup = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "34416e2f0225ac1199191d07fb14d8d659290abf", built_at: "2026-10-27T12:00:23Z" };
+    module.exports = { commit: "78b993a8e5a9b0736db979658e338aec4ac7b8e2", built_at: "2026-10-27T22:43:35Z" };
   }
 });
 
@@ -2947,6 +2947,8 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
               return this.json(await this.update(body, actor));
             case "transition":
               return this.json(await this.transition(body, actor));
+            case "supersede.task":
+              return this.json(await this.supersedeTask(body, actor));
             case "link":
               return this.json(await this.link(body, actor));
             case "relations":
@@ -3692,6 +3694,68 @@ Contract: (1) verify live state first (gh issue view <N> --repo <repo> --json st
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), parentId);
         this.audit(actor, "create", created.id, { type: "task", auto: "close_leg", parent: parentId, legs: shape });
         this.version(parentId, actor, "note", `close leg(s) ${shape} unowned at done \u2014 auto-derived close-duty child ${created.id} (BR#3361)`, { child: created.id, legs: shape });
+      }
+      /** BR#3910: one-click human supersede from the web plane. BR#2480 law: no
+       *  agent may supersede — the route in index.js only admits cookie (human)
+       *  sessions, and the task lifecycle deliberately has no →superseded edge,
+       *  so MCP/agent transitions stay gate-rejected. This op composes the
+       *  documented two-step (BR#1852/BR#1935 precedent) server-side in ONE call:
+       *  blocked → (gated release) → todo → superseded, then the machine-readable
+       *  lineage (supersedes relation, replacement → superseded — the same shape
+       *  doTransition stamps from body.replacement_id). Intermediate states never
+       *  leave this function; every validation throws BEFORE the first write, so
+       *  a refused supersede leaves the card byte-for-byte unchanged (the silent
+       *  no-op class this card kills). */
+      async supersedeTask(body, actor) {
+        const id = String(body.id ?? "").trim();
+        if (!id) throw new Error("supersede requires id");
+        const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+        if (!row) throw new Error(`no such artefact: ${id}`);
+        if (row.type !== "task") throw new Error(`supersede is a task action \u2014 ${id} is a ${row.type}`);
+        if (row.status !== "blocked" && row.status !== "todo") {
+          const hint = row.status === "in_progress" ? " (a live claim: release it first \u2014 only the owner or a human can release it)" : row.status === "in_review" ? " (under review \u2014 bounce or close it through review, or release it first)" : "";
+          throw new Error(`supersede applies to blocked|todo cards \u2014 ${id} is '${row.status}'${hint}`);
+        }
+        let replacementId = String(body.replacement_id ?? "").trim();
+        if (replacementId) {
+          const bare = /^(?:BR#?|#)?(\d+)$/i.exec(replacementId);
+          if (bare) replacementId = `BR#${bare[1]}`;
+          if (replacementId === id) throw new Error("replacement_id names the card itself \u2014 a card cannot supersede into itself");
+          const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, replacementId);
+          if (!rep) throw new Error(`replacement ${replacementId} not found \u2014 create it first, then supersede`);
+          if (rep.type !== row.type) throw new Error(`replacement must be a ${row.type} \u2014 ${replacementId} is a ${rep.type}`);
+        }
+        const note = String(body.note ?? "").trim() || (replacementId ? `superseded via web \u2014 replaced by ${replacementId}` : "superseded via web");
+        const ts = Date.now();
+        if (row.status === "blocked") {
+          await this.transition({ id, to: "todo", note: `supersede (step 1/2)${replacementId ? ` \u2014 replacement ${replacementId}` : ""}` }, actor);
+        }
+        const meta3 = JSON.parse(row.meta ?? "{}");
+        meta3.superseded_reason = note;
+        if (replacementId) meta3.superseded_by = replacementId;
+        delete meta3.blocked;
+        delete meta3.subprocess;
+        delete meta3.attempt;
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ?, owner = '' WHERE id = ?`,
+          JSON.stringify(meta3),
+          ts,
+          ts,
+          id
+        );
+        if (replacementId) {
+          const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, replacementId);
+          if (rep && rep.type === row.type)
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+              replacementId,
+              id,
+              ts
+            );
+        }
+        this.audit(actor, "transition", id, { from: row.status, to: "superseded", note, ...replacementId ? { replacement_id: replacementId } : {} });
+        this.version(id, actor, "transition", `${row.status} \u2192 superseded \u2014 ${note}`, { from: row.status, to: "superseded", note });
+        return { id, status: "superseded", ...replacementId ? { replacement_id: replacementId } : {} };
       }
       /** Lazy SQL-backed context for the machine rules — a guard only queries
        *  what it actually reads, so cheap transitions stay cheap. */
@@ -6532,7 +6596,7 @@ ${failing.map((f) => `- ${f.name}${f.url ? ` \u2014 ${f.url}` : ""}`).join("\n")
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/util.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/util.js
 var util_exports = {};
 __export(util_exports, {
   BIGINT_FORMAT_RANGES: () => BIGINT_FORMAT_RANGES,
@@ -7278,7 +7342,7 @@ function constantCatch(value) {
 }
 var Cached, EVALUATING, captureStackTrace, allowsEval, getParsedType, propertyKeyTypes, primitiveTypes, NUMBER_FORMAT_RANGES, BIGINT_FORMAT_RANGES, highSurrogate, Class, installing, broke, breaker, CONSTANT_CATCH;
 var init_util = __esm({
-  "../contracts/node_modules/zod/v4/core/util.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/util.js"() {
     init_core2();
     __name(assertEqual, "assertEqual");
     __name(assertNotEqual, "assertNotEqual");
@@ -7475,7 +7539,7 @@ var init_util = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/core.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/core.js
 function newError(Definition) {
   const E = _E;
   if (E) {
@@ -7584,7 +7648,7 @@ function config(newConfig) {
 }
 var _a, NEVER, _zodDesc, _E, $brand, $ZodAsyncError, $ZodEncodeError, globalConfig;
 var init_core2 = __esm({
-  "../contracts/node_modules/zod/v4/core/core.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/core.js"() {
     init_util();
     NEVER = /* @__PURE__ */ Object.freeze({
       status: "aborted"
@@ -7617,7 +7681,7 @@ var init_core2 = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/errors.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/errors.js
 function _getMessage() {
   const internals = this._zod;
   internals.message ?? (internals.message = JSON.stringify(internals.def, jsonStringifyReplacer, 2));
@@ -7775,7 +7839,7 @@ function prettifyError(error62) {
 }
 var _messageDesc, _issuesDesc, _installedToString, initializer, $ZodError, $ZodRealError;
 var init_errors = __esm({
-  "../contracts/node_modules/zod/v4/core/errors.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/errors.js"() {
     init_core2();
     init_util();
     __name(_getMessage, "_getMessage");
@@ -7824,7 +7888,7 @@ var init_errors = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/parse.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/parse.js
 function finalizeParams(callee, params) {
   return { callee: params?.callee ?? callee, Err: params?.Err };
 }
@@ -7864,7 +7928,7 @@ function validateFallback(schema, value, _ctx) {
 }
 var _parse, parse, _parseAsync, parseAsync, _safeParse, safeParse2, _safeParseAsync, safeParseAsync, COMPILE_INVALID, COMPILE_FALLBACK, validate, validateAsync, _encode, encode, _decode, decode, _encodeAsync, encodeAsync, _decodeAsync, decodeAsync, _safeEncode, safeEncode, _safeDecode, safeDecode, _safeEncodeAsync, safeEncodeAsync, _safeDecodeAsync, safeDecodeAsync;
 var init_parse = __esm({
-  "../contracts/node_modules/zod/v4/core/parse.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/parse.js"() {
     init_core2();
     init_errors();
     init_util();
@@ -7995,7 +8059,7 @@ var init_parse = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/regexes.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/regexes.js
 var regexes_exports = {};
 __export(regexes_exports, {
   anyString: () => anyString,
@@ -8096,7 +8160,7 @@ function fixedBase64url(length) {
 }
 var cuid, cuid2, ulid, xid, ksuid, nanoid, duration, extendedDuration, guid, uuid, uuid4, uuid6, uuid7, email, html5Email, rfc5322Email, unicodeEmail, idnEmail, browserEmail, _emoji, ipv4, ipv6, mac, cidrv4, cidrv6, base64, base64url, hostname, domain, httpProtocol, e164, creditCard, currencyCode, iban, dateSource, date, anyString, string, bigint, integer, number, boolean, _null, _undefined, lowercase, uppercase, hex, md5_hex, md5_base64, md5_base64url, sha1_hex, sha1_base64, sha1_base64url, sha256_hex, sha256_base64, sha256_base64url, sha384_hex, sha384_base64, sha384_base64url, sha512_hex, sha512_base64, sha512_base64url;
 var init_regexes = __esm({
-  "../contracts/node_modules/zod/v4/core/regexes.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/regexes.js"() {
     init_util();
     cuid = /^[cC][0-9a-z]{6,}$/;
     cuid2 = /^[0-9a-z]+$/;
@@ -8181,7 +8245,7 @@ var init_regexes = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/checks.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/checks.js
 function handleCheckPropertyResult(result, payload, property) {
   if (result.issues.length) {
     payload.issues.push(...prefixIssues(property, result.issues));
@@ -8189,7 +8253,7 @@ function handleCheckPropertyResult(result, payload, property) {
 }
 var $ZodCheck, _whenHasSize, _whenHasLength, numericOriginMap, $ZodCheckLessThan, $ZodCheckGreaterThan, $ZodCheckMultipleOf, $ZodCheckNumberFormat, $ZodCheckBigIntFormat, $ZodCheckMaxSize, $ZodCheckMinSize, $ZodCheckSizeEquals, $ZodCheckMaxLength, $ZodCheckMinLength, $ZodCheckLengthEquals, $ZodCheckStringFormat, $ZodCheckRegex, $ZodCheckLowerCase, $ZodCheckUpperCase, $ZodCheckIncludes, $ZodCheckStartsWith, $ZodCheckEndsWith, $ZodCheckProperty, $ZodCheckProperties, $ZodCheckMimeType, $ZodCheckOverwrite;
 var init_checks = __esm({
-  "../contracts/node_modules/zod/v4/core/checks.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/checks.js"() {
     init_core2();
     init_regexes();
     init_util();
@@ -8666,10 +8730,10 @@ var init_checks = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/doc.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/doc.js
 var Doc;
 var init_doc = __esm({
-  "../contracts/node_modules/zod/v4/core/doc.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/doc.js"() {
     Doc = class {
       static {
         __name(this, "Doc");
@@ -8715,10 +8779,10 @@ ${content.join("\n")}
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/versions.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/versions.js
 var version;
 var init_versions = __esm({
-  "../contracts/node_modules/zod/v4/core/versions.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/versions.js"() {
     version = {
       major: 4,
       minor: 6,
@@ -8727,7 +8791,7 @@ var init_versions = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/schemas.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/schemas.js
 async function validateAsync2(inst, value) {
   const ctx = { async: true };
   return toStandardResult(await inst._zod.run({ value, issues: [] }, ctx), ctx);
@@ -9408,7 +9472,7 @@ function handleRefineResult(result, payload, input2, inst) {
 }
 var $ZodType, toStandardResult, $ZodString, $ZodStringFormat, $ZodGUID, $ZodUUID, $ZodEmail, URL_BAD_FORMAT, URL_UNPARSEABLE, asciiTabOrNewline, $ZodURL, $ZodEmoji, $ZodNanoID, $ZodCUID, $ZodCUID2, $ZodULID, $ZodXID, $ZodKSUID, $ZodISODateTime, $ZodISODate, $ZodISOTime, $ZodISODuration, $ZodIPv4, ipv6Alphabet, $ZodIPv6, $ZodMAC, $ZodCIDRv4, $ZodCIDRv6, base64Charset, $ZodBase64, base64urlCharset, $ZodBase64URL, $ZodE164, CC_SANITIZE, $ZodCreditCard, $ZodIBAN, $ZodJWT, $ZodCustomStringFormat, $ZodNumber, $ZodNumberFormat, $ZodBoolean, $ZodBigInt, $ZodBigIntFormat, $ZodSymbol, $ZodUndefined, $ZodNull, $ZodAny, $ZodUnknown, $ZodNever, $ZodVoid, $ZodDate, arraySize, mapSize, setSize, $ZodArray, NO_SYMBOL_KEYS, $ZodObject, $ZodObjectJIT, $ZodUnion, $ZodXor, $ZodDiscriminatedUnion, $ZodIntersection, $ZodTuple, $ZodRecord, $ZodMap, $ZodSet, $ZodEnum, $ZodLiteral, $ZodFile, $ZodTransform, $ZodOptional, $ZodExactOptional, $ZodNullable, $ZodDefault, $ZodPrefault, $ZodNonOptional, $ZodSuccess, $ZodCatch, $ZodNaN, $ZodPipe, $ZodCodec, $ZodPreprocess, $ZodReadonly, $ZodTemplateLiteral, $ZodFunction, $ZodPromise, $ZodLazy, $ZodCustom;
 var init_schemas = __esm({
-  "../contracts/node_modules/zod/v4/core/schemas.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/schemas.js"() {
     init_checks();
     init_core2();
     init_doc();
@@ -11226,7 +11290,7 @@ var init_schemas = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/memoizer.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/memoizer.js
 function isRef(value) {
   return value !== null && typeof value === "object";
 }
@@ -11390,7 +11454,7 @@ function isBackEdge(ctx, value) {
 }
 var $ZodCyclicError, STATE, NO_ISSUES, recursive, NONE, ASSUMED, PROVEN, handoff, open, memo;
 var init_memoizer = __esm({
-  "../contracts/node_modules/zod/v4/core/memoizer.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/memoizer.js"() {
     init_util();
     $ZodCyclicError = class extends Error {
       static {
@@ -11519,7 +11583,7 @@ var init_memoizer = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ar.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ar.js
 function ar_default() {
   return {
     localeError: error()
@@ -11527,7 +11591,7 @@ function ar_default() {
 }
 var error;
 var init_ar = __esm({
-  "../contracts/node_modules/zod/v4/locales/ar.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ar.js"() {
     init_util();
     error = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -11639,7 +11703,7 @@ var init_ar = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/az.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/az.js
 function az_default() {
   return {
     localeError: error2()
@@ -11647,7 +11711,7 @@ function az_default() {
 }
 var error2;
 var init_az = __esm({
-  "../contracts/node_modules/zod/v4/locales/az.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/az.js"() {
     init_util();
     error2 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -11758,7 +11822,7 @@ var init_az = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/be.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/be.js
 function getBelarusianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -11781,7 +11845,7 @@ function be_default() {
 }
 var error3;
 var init_be = __esm({
-  "../contracts/node_modules/zod/v4/locales/be.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/be.js"() {
     init_util();
     __name(getBelarusianPlural, "getBelarusianPlural");
     error3 = /* @__PURE__ */ __name(() => {
@@ -11936,7 +12000,7 @@ var init_be = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/bg.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/bg.js
 function bg_default() {
   return {
     localeError: error4()
@@ -11944,7 +12008,7 @@ function bg_default() {
 }
 var error4;
 var init_bg = __esm({
-  "../contracts/node_modules/zod/v4/locales/bg.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/bg.js"() {
     init_util();
     error4 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12070,7 +12134,7 @@ var init_bg = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/bn.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/bn.js
 function bn_default() {
   return {
     localeError: error5()
@@ -12078,7 +12142,7 @@ function bn_default() {
 }
 var error5;
 var init_bn = __esm({
-  "../contracts/node_modules/zod/v4/locales/bn.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/bn.js"() {
     init_util();
     error5 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12192,7 +12256,7 @@ var init_bn = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ca.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ca.js
 function ca_default() {
   return {
     localeError: error6()
@@ -12200,7 +12264,7 @@ function ca_default() {
 }
 var error6;
 var init_ca = __esm({
-  "../contracts/node_modules/zod/v4/locales/ca.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ca.js"() {
     init_util();
     error6 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12314,7 +12378,7 @@ var init_ca = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ckb.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ckb.js
 function ckb_default() {
   return {
     localeError: error7()
@@ -12322,7 +12386,7 @@ function ckb_default() {
 }
 var error7;
 var init_ckb = __esm({
-  "../contracts/node_modules/zod/v4/locales/ckb.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ckb.js"() {
     init_util();
     error7 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12455,7 +12519,7 @@ var init_ckb = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/cs.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/cs.js
 function cs_default() {
   return {
     localeError: error8()
@@ -12463,7 +12527,7 @@ function cs_default() {
 }
 var error8;
 var init_cs = __esm({
-  "../contracts/node_modules/zod/v4/locales/cs.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/cs.js"() {
     init_util();
     error8 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12580,7 +12644,7 @@ var init_cs = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/da.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/da.js
 function da_default() {
   return {
     localeError: error9()
@@ -12588,7 +12652,7 @@ function da_default() {
 }
 var error9;
 var init_da = __esm({
-  "../contracts/node_modules/zod/v4/locales/da.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/da.js"() {
     init_util();
     error9 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12709,7 +12773,7 @@ var init_da = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/de.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/de.js
 function de_default() {
   return {
     localeError: error10()
@@ -12717,7 +12781,7 @@ function de_default() {
 }
 var error10;
 var init_de = __esm({
-  "../contracts/node_modules/zod/v4/locales/de.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/de.js"() {
     init_util();
     error10 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12831,7 +12895,7 @@ var init_de = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/el.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/el.js
 function el_default() {
   return {
     localeError: error11()
@@ -12839,7 +12903,7 @@ function el_default() {
 }
 var error11;
 var init_el = __esm({
-  "../contracts/node_modules/zod/v4/locales/el.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/el.js"() {
     init_util();
     error11 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -12952,7 +13016,7 @@ var init_el = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/en.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/en.js
 function en_default() {
   return {
     localeError: error12()
@@ -12960,7 +13024,7 @@ function en_default() {
 }
 var error12;
 var init_en = __esm({
-  "../contracts/node_modules/zod/v4/locales/en.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/en.js"() {
     init_util();
     error12 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13086,7 +13150,7 @@ var init_en = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/eo.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/eo.js
 function eo_default() {
   return {
     localeError: error13()
@@ -13094,7 +13158,7 @@ function eo_default() {
 }
 var error13;
 var init_eo = __esm({
-  "../contracts/node_modules/zod/v4/locales/eo.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/eo.js"() {
     init_util();
     error13 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13209,7 +13273,7 @@ var init_eo = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/es.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/es.js
 function es_default() {
   return {
     localeError: error14()
@@ -13217,7 +13281,7 @@ function es_default() {
 }
 var error14;
 var init_es = __esm({
-  "../contracts/node_modules/zod/v4/locales/es.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/es.js"() {
     init_util();
     error14 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13354,7 +13418,7 @@ var init_es = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/fa.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/fa.js
 function fa_default() {
   return {
     localeError: error15()
@@ -13362,7 +13426,7 @@ function fa_default() {
 }
 var error15;
 var init_fa = __esm({
-  "../contracts/node_modules/zod/v4/locales/fa.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/fa.js"() {
     init_util();
     error15 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13482,7 +13546,7 @@ var init_fa = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/fi.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/fi.js
 function fi_default() {
   return {
     localeError: error16()
@@ -13490,7 +13554,7 @@ function fi_default() {
 }
 var error16;
 var init_fi = __esm({
-  "../contracts/node_modules/zod/v4/locales/fi.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/fi.js"() {
     init_util();
     error16 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13608,7 +13672,7 @@ var init_fi = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/fr.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/fr.js
 function fr_default() {
   return {
     localeError: error17()
@@ -13616,7 +13680,7 @@ function fr_default() {
 }
 var error17;
 var init_fr = __esm({
-  "../contracts/node_modules/zod/v4/locales/fr.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/fr.js"() {
     init_util();
     error17 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13746,7 +13810,7 @@ var init_fr = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/fr-CA.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/fr-CA.js
 function fr_CA_default() {
   return {
     localeError: error18()
@@ -13754,7 +13818,7 @@ function fr_CA_default() {
 }
 var error18;
 var init_fr_CA = __esm({
-  "../contracts/node_modules/zod/v4/locales/fr-CA.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/fr-CA.js"() {
     init_util();
     error18 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13867,7 +13931,7 @@ var init_fr_CA = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/gu.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/gu.js
 function gu_default() {
   return {
     localeError: error19()
@@ -13875,7 +13939,7 @@ function gu_default() {
 }
 var error19;
 var init_gu = __esm({
-  "../contracts/node_modules/zod/v4/locales/gu.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/gu.js"() {
     init_util();
     error19 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -13989,7 +14053,7 @@ var init_gu = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/he.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/he.js
 function he_default() {
   return {
     localeError: error20()
@@ -13997,7 +14061,7 @@ function he_default() {
 }
 var error20;
 var init_he = __esm({
-  "../contracts/node_modules/zod/v4/locales/he.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/he.js"() {
     init_util();
     error20 = /* @__PURE__ */ __name(() => {
       const TypeNames = {
@@ -14198,7 +14262,7 @@ var init_he = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/hi.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/hi.js
 function hi_default() {
   return {
     localeError: error21()
@@ -14206,7 +14270,7 @@ function hi_default() {
 }
 var error21;
 var init_hi = __esm({
-  "../contracts/node_modules/zod/v4/locales/hi.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/hi.js"() {
     init_util();
     error21 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -14318,7 +14382,7 @@ var init_hi = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/hr.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/hr.js
 function hr_default() {
   return {
     localeError: error22()
@@ -14326,7 +14390,7 @@ function hr_default() {
 }
 var error22;
 var init_hr = __esm({
-  "../contracts/node_modules/zod/v4/locales/hr.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/hr.js"() {
     init_util();
     error22 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -14453,7 +14517,7 @@ var init_hr = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/hu.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/hu.js
 function hu_default() {
   return {
     localeError: error23()
@@ -14461,7 +14525,7 @@ function hu_default() {
 }
 var error23;
 var init_hu = __esm({
-  "../contracts/node_modules/zod/v4/locales/hu.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/hu.js"() {
     init_util();
     error23 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -14575,7 +14639,7 @@ var init_hu = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/hy.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/hy.js
 function getArmenianPlural(count, one, many) {
   return Math.abs(count) === 1 ? one : many;
 }
@@ -14593,7 +14657,7 @@ function hy_default() {
 }
 var error24;
 var init_hy = __esm({
-  "../contracts/node_modules/zod/v4/locales/hy.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/hy.js"() {
     init_util();
     __name(getArmenianPlural, "getArmenianPlural");
     __name(withDefiniteArticle, "withDefiniteArticle");
@@ -14744,7 +14808,7 @@ var init_hy = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/id.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/id.js
 function id_default() {
   return {
     localeError: error25()
@@ -14752,7 +14816,7 @@ function id_default() {
 }
 var error25;
 var init_id = __esm({
-  "../contracts/node_modules/zod/v4/locales/id.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/id.js"() {
     init_util();
     error25 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -14864,7 +14928,7 @@ var init_id = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/is.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/is.js
 function is_default() {
   return {
     localeError: error26()
@@ -14872,7 +14936,7 @@ function is_default() {
 }
 var error26;
 var init_is = __esm({
-  "../contracts/node_modules/zod/v4/locales/is.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/is.js"() {
     init_util();
     error26 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -14987,7 +15051,7 @@ var init_is = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/it.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/it.js
 function it_default() {
   return {
     localeError: error27()
@@ -14995,7 +15059,7 @@ function it_default() {
 }
 var error27;
 var init_it = __esm({
-  "../contracts/node_modules/zod/v4/locales/it.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/it.js"() {
     init_util();
     error27 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15109,7 +15173,7 @@ var init_it = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ja.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ja.js
 function ja_default() {
   return {
     localeError: error28()
@@ -15117,7 +15181,7 @@ function ja_default() {
 }
 var error28;
 var init_ja = __esm({
-  "../contracts/node_modules/zod/v4/locales/ja.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ja.js"() {
     init_util();
     error28 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15230,7 +15294,7 @@ var init_ja = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ka.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ka.js
 function ka_default() {
   return {
     localeError: error29()
@@ -15238,7 +15302,7 @@ function ka_default() {
 }
 var error29;
 var init_ka = __esm({
-  "../contracts/node_modules/zod/v4/locales/ka.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ka.js"() {
     init_util();
     error29 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15356,7 +15420,7 @@ var init_ka = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/km.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/km.js
 function km_default() {
   return {
     localeError: error30()
@@ -15364,7 +15428,7 @@ function km_default() {
 }
 var error30;
 var init_km = __esm({
-  "../contracts/node_modules/zod/v4/locales/km.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/km.js"() {
     init_util();
     error30 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15480,18 +15544,18 @@ var init_km = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/kh.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/kh.js
 function kh_default() {
   return km_default();
 }
 var init_kh = __esm({
-  "../contracts/node_modules/zod/v4/locales/kh.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/kh.js"() {
     init_km();
     __name(kh_default, "default");
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/kn.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/kn.js
 function kn_default() {
   return {
     localeError: error31()
@@ -15499,7 +15563,7 @@ function kn_default() {
 }
 var error31;
 var init_kn = __esm({
-  "../contracts/node_modules/zod/v4/locales/kn.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/kn.js"() {
     init_util();
     error31 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15615,7 +15679,7 @@ var init_kn = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ko.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ko.js
 function ko_default() {
   return {
     localeError: error32()
@@ -15623,7 +15687,7 @@ function ko_default() {
 }
 var error32;
 var init_ko = __esm({
-  "../contracts/node_modules/zod/v4/locales/ko.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ko.js"() {
     init_util();
     error32 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -15740,7 +15804,7 @@ var init_ko = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/lt.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/lt.js
 function getUnitTypeFromNumber(number4) {
   const abs = Math.abs(number4);
   const last = abs % 10;
@@ -15758,7 +15822,7 @@ function lt_default() {
 }
 var capitalizeFirstCharacter, error33;
 var init_lt = __esm({
-  "../contracts/node_modules/zod/v4/locales/lt.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/lt.js"() {
     init_util();
     capitalizeFirstCharacter = /* @__PURE__ */ __name((text2) => {
       return text2.charAt(0).toUpperCase() + text2.slice(1);
@@ -15957,7 +16021,7 @@ var init_lt = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/mk.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/mk.js
 function mk_default() {
   return {
     localeError: error34()
@@ -15965,7 +16029,7 @@ function mk_default() {
 }
 var error34;
 var init_mk = __esm({
-  "../contracts/node_modules/zod/v4/locales/mk.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/mk.js"() {
     init_util();
     error34 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16080,7 +16144,7 @@ var init_mk = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ms.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ms.js
 function ms_default() {
   return {
     localeError: error35()
@@ -16088,7 +16152,7 @@ function ms_default() {
 }
 var error35;
 var init_ms = __esm({
-  "../contracts/node_modules/zod/v4/locales/ms.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ms.js"() {
     init_util();
     error35 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16201,7 +16265,7 @@ var init_ms = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ne.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ne.js
 function ne_default() {
   return {
     localeError: error36()
@@ -16209,7 +16273,7 @@ function ne_default() {
 }
 var error36;
 var init_ne = __esm({
-  "../contracts/node_modules/zod/v4/locales/ne.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ne.js"() {
     init_util();
     error36 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16321,7 +16385,7 @@ var init_ne = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/nl.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/nl.js
 function nl_default() {
   return {
     localeError: error37()
@@ -16329,7 +16393,7 @@ function nl_default() {
 }
 var error37;
 var init_nl = __esm({
-  "../contracts/node_modules/zod/v4/locales/nl.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/nl.js"() {
     init_util();
     error37 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16445,7 +16509,7 @@ var init_nl = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/nn.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/nn.js
 function nn_default() {
   return {
     localeError: error38()
@@ -16453,7 +16517,7 @@ function nn_default() {
 }
 var error38;
 var init_nn = __esm({
-  "../contracts/node_modules/zod/v4/locales/nn.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/nn.js"() {
     init_util();
     error38 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16567,7 +16631,7 @@ var init_nn = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/no.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/no.js
 function no_default() {
   return {
     localeError: error39()
@@ -16575,7 +16639,7 @@ function no_default() {
 }
 var error39;
 var init_no = __esm({
-  "../contracts/node_modules/zod/v4/locales/no.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/no.js"() {
     init_util();
     error39 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16689,7 +16753,7 @@ var init_no = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ota.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ota.js
 function ota_default() {
   return {
     localeError: error40()
@@ -16697,7 +16761,7 @@ function ota_default() {
 }
 var error40;
 var init_ota = __esm({
-  "../contracts/node_modules/zod/v4/locales/ota.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ota.js"() {
     init_util();
     error40 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16812,7 +16876,7 @@ var init_ota = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ps.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ps.js
 function ps_default() {
   return {
     localeError: error41()
@@ -16820,7 +16884,7 @@ function ps_default() {
 }
 var error41;
 var init_ps = __esm({
-  "../contracts/node_modules/zod/v4/locales/ps.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ps.js"() {
     init_util();
     error41 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -16940,7 +17004,7 @@ var init_ps = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/pl.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/pl.js
 function pl_default() {
   return {
     localeError: error42()
@@ -16948,7 +17012,7 @@ function pl_default() {
 }
 var error42;
 var init_pl = __esm({
-  "../contracts/node_modules/zod/v4/locales/pl.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/pl.js"() {
     init_util();
     error42 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17063,7 +17127,7 @@ var init_pl = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/pt.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/pt.js
 function pt_default() {
   return {
     localeError: error43()
@@ -17071,7 +17135,7 @@ function pt_default() {
 }
 var error43;
 var init_pt = __esm({
-  "../contracts/node_modules/zod/v4/locales/pt.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/pt.js"() {
     init_util();
     error43 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17216,7 +17280,7 @@ var init_pt = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/pt-BR.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/pt-BR.js
 function pt_BR_default() {
   return {
     localeError: error44()
@@ -17224,7 +17288,7 @@ function pt_BR_default() {
 }
 var error44;
 var init_pt_BR = __esm({
-  "../contracts/node_modules/zod/v4/locales/pt-BR.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/pt-BR.js"() {
     init_util();
     error44 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17370,7 +17434,7 @@ var init_pt_BR = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ro.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ro.js
 function ro_default() {
   return {
     localeError: error45()
@@ -17378,7 +17442,7 @@ function ro_default() {
 }
 var error45;
 var init_ro = __esm({
-  "../contracts/node_modules/zod/v4/locales/ro.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ro.js"() {
     init_util();
     error45 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17501,7 +17565,7 @@ var init_ro = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ru.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ru.js
 function getRussianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -17524,7 +17588,7 @@ function ru_default() {
 }
 var error46;
 var init_ru = __esm({
-  "../contracts/node_modules/zod/v4/locales/ru.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ru.js"() {
     init_util();
     __name(getRussianPlural, "getRussianPlural");
     error46 = /* @__PURE__ */ __name(() => {
@@ -17679,7 +17743,7 @@ var init_ru = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/sk.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/sk.js
 function sk_default() {
   return {
     localeError: error47()
@@ -17687,7 +17751,7 @@ function sk_default() {
 }
 var error47;
 var init_sk = __esm({
-  "../contracts/node_modules/zod/v4/locales/sk.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/sk.js"() {
     init_util();
     error47 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17804,7 +17868,7 @@ var init_sk = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/sl.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/sl.js
 function sl_default() {
   return {
     localeError: error48()
@@ -17812,7 +17876,7 @@ function sl_default() {
 }
 var error48;
 var init_sl = __esm({
-  "../contracts/node_modules/zod/v4/locales/sl.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/sl.js"() {
     init_util();
     error48 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -17927,7 +17991,7 @@ var init_sl = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/sv.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/sv.js
 function sv_default() {
   return {
     localeError: error49()
@@ -17935,7 +17999,7 @@ function sv_default() {
 }
 var error49;
 var init_sv = __esm({
-  "../contracts/node_modules/zod/v4/locales/sv.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/sv.js"() {
     init_util();
     error49 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18051,7 +18115,7 @@ var init_sv = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ta.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ta.js
 function ta_default() {
   return {
     localeError: error50()
@@ -18059,7 +18123,7 @@ function ta_default() {
 }
 var error50;
 var init_ta = __esm({
-  "../contracts/node_modules/zod/v4/locales/ta.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ta.js"() {
     init_util();
     error50 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18175,7 +18239,7 @@ var init_ta = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/tg.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/tg.js
 function tg_default() {
   return {
     localeError: error51()
@@ -18183,7 +18247,7 @@ function tg_default() {
 }
 var error51;
 var init_tg = __esm({
-  "../contracts/node_modules/zod/v4/locales/tg.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/tg.js"() {
     init_util();
     error51 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18300,7 +18364,7 @@ var init_tg = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/th.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/th.js
 function th_default() {
   return {
     localeError: error52()
@@ -18308,7 +18372,7 @@ function th_default() {
 }
 var error52;
 var init_th = __esm({
-  "../contracts/node_modules/zod/v4/locales/th.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/th.js"() {
     init_util();
     error52 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18424,7 +18488,7 @@ var init_th = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/tk.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/tk.js
 function tk_default() {
   return {
     localeError: error53()
@@ -18432,7 +18496,7 @@ function tk_default() {
 }
 var error53;
 var init_tk = __esm({
-  "../contracts/node_modules/zod/v4/locales/tk.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/tk.js"() {
     init_util();
     error53 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18540,7 +18604,7 @@ var init_tk = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/tr.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/tr.js
 function tr_default() {
   return {
     localeError: error54()
@@ -18548,7 +18612,7 @@ function tr_default() {
 }
 var error54;
 var init_tr = __esm({
-  "../contracts/node_modules/zod/v4/locales/tr.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/tr.js"() {
     init_util();
     error54 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18659,7 +18723,7 @@ var init_tr = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/uk.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/uk.js
 function uk_default() {
   return {
     localeError: error55()
@@ -18667,7 +18731,7 @@ function uk_default() {
 }
 var error55;
 var init_uk = __esm({
-  "../contracts/node_modules/zod/v4/locales/uk.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/uk.js"() {
     init_util();
     error55 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18781,18 +18845,18 @@ var init_uk = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ua.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ua.js
 function ua_default() {
   return uk_default();
 }
 var init_ua = __esm({
-  "../contracts/node_modules/zod/v4/locales/ua.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ua.js"() {
     init_uk();
     __name(ua_default, "default");
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/ur.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/ur.js
 function ur_default() {
   return {
     localeError: error56()
@@ -18800,7 +18864,7 @@ function ur_default() {
 }
 var error56;
 var init_ur = __esm({
-  "../contracts/node_modules/zod/v4/locales/ur.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/ur.js"() {
     init_util();
     error56 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -18916,7 +18980,7 @@ var init_ur = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/uz.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/uz.js
 function uz_default() {
   return {
     localeError: error57()
@@ -18924,7 +18988,7 @@ function uz_default() {
 }
 var error57;
 var init_uz = __esm({
-  "../contracts/node_modules/zod/v4/locales/uz.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/uz.js"() {
     init_util();
     error57 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -19038,7 +19102,7 @@ var init_uz = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/vi.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/vi.js
 function vi_default() {
   return {
     localeError: error58()
@@ -19046,7 +19110,7 @@ function vi_default() {
 }
 var error58;
 var init_vi = __esm({
-  "../contracts/node_modules/zod/v4/locales/vi.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/vi.js"() {
     init_util();
     error58 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -19160,7 +19224,7 @@ var init_vi = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/zh-CN.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/zh-CN.js
 function zh_CN_default() {
   return {
     localeError: error59()
@@ -19168,7 +19232,7 @@ function zh_CN_default() {
 }
 var error59;
 var init_zh_CN = __esm({
-  "../contracts/node_modules/zod/v4/locales/zh-CN.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/zh-CN.js"() {
     init_util();
     error59 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -19283,7 +19347,7 @@ var init_zh_CN = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/zh-TW.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/zh-TW.js
 function zh_TW_default() {
   return {
     localeError: error60()
@@ -19291,7 +19355,7 @@ function zh_TW_default() {
 }
 var error60;
 var init_zh_TW = __esm({
-  "../contracts/node_modules/zod/v4/locales/zh-TW.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/zh-TW.js"() {
     init_util();
     error60 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -19404,7 +19468,7 @@ var init_zh_TW = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/yo.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/yo.js
 function yo_default() {
   return {
     localeError: error61()
@@ -19412,7 +19476,7 @@ function yo_default() {
 }
 var error61;
 var init_yo = __esm({
-  "../contracts/node_modules/zod/v4/locales/yo.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/yo.js"() {
     init_util();
     error61 = /* @__PURE__ */ __name(() => {
       const Sizable = {
@@ -19525,7 +19589,7 @@ var init_yo = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/locales/index.js
+// ../../../../packages/contracts/node_modules/zod/v4/locales/index.js
 var locales_exports = {};
 __export(locales_exports, {
   ar: () => ar_default,
@@ -19593,7 +19657,7 @@ __export(locales_exports, {
   zhTW: () => zh_TW_default
 });
 var init_locales = __esm({
-  "../contracts/node_modules/zod/v4/locales/index.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/locales/index.js"() {
     init_ar();
     init_az();
     init_be();
@@ -19660,13 +19724,13 @@ var init_locales = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/registries.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/registries.js
 function registry() {
   return new $ZodRegistry();
 }
 var _a2, $output, $input, $ZodRegistry, globalRegistry;
 var init_registries = __esm({
-  "../contracts/node_modules/zod/v4/core/registries.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/registries.js"() {
     $output = /* @__PURE__ */ Symbol("ZodOutput");
     $input = /* @__PURE__ */ Symbol("ZodInput");
     $ZodRegistry = class {
@@ -19718,7 +19782,7 @@ var init_registries = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/compile.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/compile.js
 function compileValidator(schema, parser) {
   try {
     return compileFn(schema, { assertOnly: true });
@@ -21280,7 +21344,7 @@ function generateTransformCheck(doc, ctx, schema, accessor) {
 }
 var INVALID, FALLBACK_FLAG, ZodCompileAsyncError, ZodCompileUnsupportedError, WHEN_DEFAULTED_CHECKS, PATTERN_IS_COMPLETE;
 var init_compile = __esm({
-  "../contracts/node_modules/zod/v4/core/compile.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/compile.js"() {
     init_core2();
     init_doc();
     init_memoizer();
@@ -21420,7 +21484,7 @@ var init_compile = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/api.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/api.js
 function snapshotChecks(def) {
   if (def.checks)
     def.checks = [...def.checks];
@@ -22473,7 +22537,7 @@ function _stringFormat(Class2, format, fnOrRegex, _params = {}) {
 }
 var TimePrecision;
 var init_api = __esm({
-  "../contracts/node_modules/zod/v4/core/api.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/api.js"() {
     init_checks();
     init_registries();
     init_schemas();
@@ -22606,7 +22670,7 @@ var init_api = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/to-json-schema.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/to-json-schema.js
 function assignProps(target, ...sources) {
   for (const source of sources) {
     for (const key of Reflect.ownKeys(source)) {
@@ -23122,7 +23186,7 @@ function isTransforming(_schema, _ctx) {
 }
 var FOLDABLE_KEYS, UNION_KEYS, createToJSONSchemaMethod, createStandardJSONSchemaMethod;
 var init_to_json_schema = __esm({
-  "../contracts/node_modules/zod/v4/core/to-json-schema.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/to-json-schema.js"() {
     init_registries();
     init_util();
     __name(assignProps, "assignProps");
@@ -23155,7 +23219,7 @@ var init_to_json_schema = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/json-schema-processors.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/json-schema-processors.js
 function aggregateChecks(schema) {
   const agg = {};
   const def = schema._zod.def;
@@ -23305,7 +23369,7 @@ function toJSONSchema(input2, params) {
 }
 var narrowMin, narrowMax, narrowBoth, addDivisor, addPattern, intersectMime, setFormat, minContributor, maxContributor, formatContributor, contributors, formatMap, exactPatterns, exactPattern, stringProcessor, numberProcessor, booleanProcessor, bigintProcessor, symbolProcessor, nullProcessor, undefinedProcessor, voidProcessor, neverProcessor, anyProcessor, unknownProcessor, dateProcessor, enumProcessor, literalProcessor, nanProcessor, templateLiteralProcessor, fileProcessor, successProcessor, customProcessor, functionProcessor, transformProcessor, mapProcessor, setProcessor, arrayProcessor, objectProcessor, unionProcessor, intersectionProcessor, tupleProcessor, pendingRecords, recordProcessor, nullableProcessor, nonoptionalProcessor, UNREPRESENTABLE_DEFAULT, defaultProcessor, prefaultProcessor, catchProcessor, pipeProcessor, readonlyProcessor, promiseProcessor, optionalProcessor, lazyProcessor, allProcessors;
 var init_json_schema_processors = __esm({
-  "../contracts/node_modules/zod/v4/core/json-schema-processors.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/json-schema-processors.js"() {
     init_regexes();
     init_schemas();
     init_to_json_schema();
@@ -23918,10 +23982,10 @@ var init_json_schema_processors = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/json-schema-generator.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/json-schema-generator.js
 var JSONSchemaGenerator;
 var init_json_schema_generator = __esm({
-  "../contracts/node_modules/zod/v4/core/json-schema-generator.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/json-schema-generator.js"() {
     init_json_schema_processors();
     init_to_json_schema();
     JSONSchemaGenerator = class {
@@ -24006,14 +24070,14 @@ var init_json_schema_generator = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/json-schema.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/json-schema.js
 var json_schema_exports = {};
 var init_json_schema = __esm({
-  "../contracts/node_modules/zod/v4/core/json-schema.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/json-schema.js"() {
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/index.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/index.js
 var core_exports2 = {};
 __export(core_exports2, {
   $ZodAny: () => $ZodAny,
@@ -24330,7 +24394,7 @@ __export(core_exports2, {
   withParser: () => withParser
 });
 var init_core3 = __esm({
-  "../contracts/node_modules/zod/v4/core/index.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/index.js"() {
     init_core2();
     init_parse();
     init_errors();
@@ -24353,7 +24417,7 @@ var init_core3 = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/checks.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/checks.js
 var checks_exports2 = {};
 __export(checks_exports2, {
   endsWith: () => _endsWith,
@@ -24388,12 +24452,12 @@ __export(checks_exports2, {
   uppercase: () => _uppercase
 });
 var init_checks2 = __esm({
-  "../contracts/node_modules/zod/v4/classic/checks.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/checks.js"() {
     init_core3();
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/errors.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/errors.js
 function _lazyMethod(proto, key, make) {
   Object.defineProperty(proto, key, {
     configurable: true,
@@ -24410,7 +24474,7 @@ function _lazyMethod(proto, key, make) {
 }
 var _installedErrorProtos, initializer2, ZodError, ZodRealError;
 var init_errors2 = __esm({
-  "../contracts/node_modules/zod/v4/classic/errors.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/errors.js"() {
     init_core3();
     init_core3();
     init_util();
@@ -24448,10 +24512,10 @@ var init_errors2 = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/parse.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/parse.js
 var parse2, parseAsync2, safeParse3, safeParseAsync2, encode2, decode2, encodeAsync2, decodeAsync2, safeEncode2, safeDecode2, safeEncodeAsync2, safeDecodeAsync2;
 var init_parse2 = __esm({
-  "../contracts/node_modules/zod/v4/classic/parse.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/parse.js"() {
     init_core3();
     init_errors2();
     init_core3();
@@ -24470,7 +24534,7 @@ var init_parse2 = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/schemas.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/schemas.js
 var schemas_exports2 = {};
 __export(schemas_exports2, {
   ZodAny: () => ZodAny,
@@ -25144,7 +25208,7 @@ function preprocess(fn, schema) {
 }
 var ZodType, _ZodString, ZodString, ZodStringFormat, ZodISODateTime, ZodISODate, ZodISOTime, ZodISODuration, ZodEmail, ZodGUID, ZodUUID, ZodURL, ZodEmoji, ZodNanoID, ZodCUID, ZodCUID2, ZodULID, ZodXID, ZodKSUID, ZodIPv4, ZodMAC, ZodIPv6, ZodCIDRv4, ZodCIDRv6, ZodBase64, ZodBase64URL, ZodE164, ZodCreditCard, ZodIBAN, ZodJWT, ZodCustomStringFormat, ZodNumber, ZodNumberFormat, ZodBoolean, ZodBigInt, ZodBigIntFormat, ZodSymbol, ZodUndefined, ZodNull, ZodAny, ZodUnknown, ZodNever, ZodVoid, ZodDate, ZodArray, ZodObject, ZodUnion, ZodXor, ZodDiscriminatedUnion, ZodIntersection, ZodTuple, ZodRecord, ZodMap, ZodSet, ZodEnum, ZodLiteral, ZodFile, ZodTransform, ZodOptional, ZodExactOptional, ZodNullable, ZodDefault, ZodPrefault, ZodNonOptional, ZodSuccess, ZodCatch, ZodNaN, ZodPipe, ZodCodec, ZodPreprocess, ZodReadonly, ZodTemplateLiteral, ZodLazy, ZodPromise, ZodFunction, ZodCustom, describe2, meta2, ZodInstanceOf, stringbool;
 var init_schemas2 = __esm({
-  "../contracts/node_modules/zod/v4/classic/schemas.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/schemas.js"() {
     init_core3();
     init_core3();
     init_json_schema_processors();
@@ -26224,7 +26288,7 @@ var init_schemas2 = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/compat.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/compat.js
 function setErrorMap(map2) {
   config({
     customError: map2
@@ -26235,7 +26299,7 @@ function getErrorMap() {
 }
 var ZodIssueCode, ZodFirstPartyTypeKind;
 var init_compat = __esm({
-  "../contracts/node_modules/zod/v4/classic/compat.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/compat.js"() {
     init_core3();
     ZodIssueCode = {
       invalid_type: "invalid_type",
@@ -26257,7 +26321,7 @@ var init_compat = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/iso.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/iso.js
 var iso_exports = {};
 __export(iso_exports, {
   ZodISODate: () => ZodISODate,
@@ -26282,7 +26346,7 @@ function duration2(params) {
   return _isoDuration(ZodISODuration, params);
 }
 var init_iso = __esm({
-  "../contracts/node_modules/zod/v4/classic/iso.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/iso.js"() {
     init_core3();
     init_schemas2();
     init_schemas2();
@@ -26293,7 +26357,7 @@ var init_iso = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/from-json-schema.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/from-json-schema.js
 function detectVersion(schema, defaultTarget) {
   const $schema = schema.$schema;
   if ($schema === "https://json-schema.org/draft/2020-12/schema") {
@@ -26924,7 +26988,7 @@ function fromJSONSchema(schema, params) {
 }
 var z, RECOGNIZED_KEYS, SCHEMA_KEYWORDS, SCHEMA_MAP_KEYWORDS, fullTime;
 var init_from_json_schema = __esm({
-  "../contracts/node_modules/zod/v4/classic/from-json-schema.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/from-json-schema.js"() {
     init_registries();
     init_util();
     init_checks2();
@@ -27049,7 +27113,7 @@ var init_from_json_schema = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/core/visit.js
+// ../../../../packages/contracts/node_modules/zod/v4/core/visit.js
 function visit(schema, fnOrHandlers) {
   const fn = typeof fnOrHandlers === "function" ? fnOrHandlers : (node2, rewritten) => {
     const h = fnOrHandlers[node2._zod.def.type];
@@ -27206,7 +27270,7 @@ function visit(schema, fnOrHandlers) {
 }
 var RESOLVING;
 var init_visit = __esm({
-  "../contracts/node_modules/zod/v4/core/visit.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/core/visit.js"() {
     init_schemas();
     init_util();
     RESOLVING = /* @__PURE__ */ Symbol("z.visit/resolving");
@@ -27214,7 +27278,7 @@ var init_visit = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/deep-partial.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/deep-partial.js
 function deepPartial(schema) {
   return visit(schema, {
     object: /* @__PURE__ */ __name((s) => s.partial(), "object"),
@@ -27226,14 +27290,14 @@ function deepPartial(schema) {
   });
 }
 var init_deep_partial = __esm({
-  "../contracts/node_modules/zod/v4/classic/deep-partial.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/deep-partial.js"() {
     init_visit();
     init_schemas2();
     __name(deepPartial, "deepPartial");
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/in-out.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/in-out.js
 function withChecks(side, checks) {
   if (!checks?.length)
     return side;
@@ -27263,7 +27327,7 @@ function output(schema) {
   });
 }
 var init_in_out = __esm({
-  "../contracts/node_modules/zod/v4/classic/in-out.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/in-out.js"() {
     init_util();
     init_visit();
     init_schemas2();
@@ -27275,7 +27339,7 @@ var init_in_out = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/coerce.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/coerce.js
 var coerce_exports = {};
 __export(coerce_exports, {
   bigint: () => bigint3,
@@ -27300,7 +27364,7 @@ function date4(params) {
   return _coercedDate(ZodDate, params);
 }
 var init_coerce = __esm({
-  "../contracts/node_modules/zod/v4/classic/coerce.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/coerce.js"() {
     init_core3();
     init_schemas2();
     __name(string3, "string");
@@ -27311,7 +27375,7 @@ var init_coerce = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/v4/classic/external.js
+// ../../../../packages/contracts/node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
   $brand: () => $brand,
@@ -27574,7 +27638,7 @@ __export(external_exports, {
   xor: () => xor
 });
 var init_external = __esm({
-  "../contracts/node_modules/zod/v4/classic/external.js"() {
+  "../../../../packages/contracts/node_modules/zod/v4/classic/external.js"() {
     init_core3();
     init_schemas2();
     init_checks2();
@@ -27593,18 +27657,18 @@ var init_external = __esm({
   }
 });
 
-// ../contracts/node_modules/zod/index.js
+// ../../../../packages/contracts/node_modules/zod/index.js
 var init_zod = __esm({
-  "../contracts/node_modules/zod/index.js"() {
+  "../../../../packages/contracts/node_modules/zod/index.js"() {
     init_external();
     init_external();
   }
 });
 
-// ../contracts/src/orient.ts
+// ../../../../packages/contracts/src/orient.ts
 var OrientCountSchema, OrientTaskItemSchema, OrientCandidateItemSchema, OrientResponseSchema, ORIENT_REQUIRED_KEYS;
 var init_orient = __esm({
-  "../contracts/src/orient.ts"() {
+  "../../../../packages/contracts/src/orient.ts"() {
     "use strict";
     init_zod();
     OrientCountSchema = external_exports.object({
@@ -27686,10 +27750,10 @@ var init_orient = __esm({
   }
 });
 
-// ../contracts/src/mcp.ts
+// ../../../../packages/contracts/src/mcp.ts
 var TOOL_NAMES, TOOL_ARG_SCHEMAS;
 var init_mcp = __esm({
-  "../contracts/src/mcp.ts"() {
+  "../../../../packages/contracts/src/mcp.ts"() {
     "use strict";
     init_zod();
     TOOL_NAMES = [
@@ -27865,7 +27929,7 @@ var init_mcp = __esm({
   }
 });
 
-// ../contracts/src/table.ts
+// ../../../../packages/contracts/src/table.ts
 function defineToolTable(table) {
   return table;
 }
@@ -27877,7 +27941,7 @@ function mcpToolsList(table) {
   }));
 }
 var init_table = __esm({
-  "../contracts/src/table.ts"() {
+  "../../../../packages/contracts/src/table.ts"() {
     "use strict";
     init_zod();
     init_mcp();
@@ -27886,10 +27950,10 @@ var init_table = __esm({
   }
 });
 
-// ../contracts/src/pairing.ts
+// ../../../../packages/contracts/src/pairing.ts
 var PairStartRequestSchema, PairStartResponseSchema, PairPollRequestSchema, PairPollResponseSchema;
 var init_pairing = __esm({
-  "../contracts/src/pairing.ts"() {
+  "../../../../packages/contracts/src/pairing.ts"() {
     "use strict";
     init_zod();
     PairStartRequestSchema = external_exports.looseObject({
@@ -27921,10 +27985,10 @@ var init_pairing = __esm({
   }
 });
 
-// ../contracts/src/provision.ts
+// ../../../../packages/contracts/src/provision.ts
 var AgentProvisionRequestSchema, AgentProvisionResponseSchema, SelfProvisionRequestSchema;
 var init_provision = __esm({
-  "../contracts/src/provision.ts"() {
+  "../../../../packages/contracts/src/provision.ts"() {
     "use strict";
     init_zod();
     AgentProvisionRequestSchema = external_exports.looseObject({
@@ -27955,10 +28019,10 @@ var init_provision = __esm({
   }
 });
 
-// ../contracts/src/ask.ts
+// ../../../../packages/contracts/src/ask.ts
 var AskCreatePayloadSchema, AskAnswerPayloadSchema;
 var init_ask = __esm({
-  "../contracts/src/ask.ts"() {
+  "../../../../packages/contracts/src/ask.ts"() {
     "use strict";
     init_zod();
     AskCreatePayloadSchema = external_exports.looseObject({
@@ -27981,10 +28045,10 @@ var init_ask = __esm({
   }
 });
 
-// ../contracts/src/config.ts
+// ../../../../packages/contracts/src/config.ts
 var BackendConfigSchema, BridgeConfigSchema, CONFIG_REQUIRED_KEYS;
 var init_config = __esm({
-  "../contracts/src/config.ts"() {
+  "../../../../packages/contracts/src/config.ts"() {
     "use strict";
     init_zod();
     BackendConfigSchema = external_exports.looseObject({
@@ -28025,9 +28089,9 @@ var init_config = __esm({
   }
 });
 
-// ../contracts/src/index.ts
+// ../../../../packages/contracts/src/index.ts
 var init_src = __esm({
-  "../contracts/src/index.ts"() {
+  "../../../../packages/contracts/src/index.ts"() {
     "use strict";
     init_orient();
     init_mcp();
@@ -28429,19 +28493,19 @@ var init_mcp2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/webcrypto.js
+// ../../../../node_modules/jose/dist/browser/runtime/webcrypto.js
 var webcrypto_default, isCryptoKey;
 var init_webcrypto = __esm({
-  "../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/webcrypto.js"() {
     webcrypto_default = crypto;
     isCryptoKey = /* @__PURE__ */ __name((key) => key instanceof CryptoKey, "isCryptoKey");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/digest.js
+// ../../../../node_modules/jose/dist/browser/runtime/digest.js
 var digest, digest_default;
 var init_digest = __esm({
-  "../../node_modules/jose/dist/browser/runtime/digest.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/digest.js"() {
     init_webcrypto();
     digest = /* @__PURE__ */ __name(async (algorithm, data) => {
       const subtleDigest = `SHA-${algorithm.slice(-3)}`;
@@ -28451,7 +28515,7 @@ var init_digest = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/buffer_utils.js
+// ../../../../node_modules/jose/dist/browser/lib/buffer_utils.js
 function concat(...buffers) {
   const size = buffers.reduce((acc, { length }) => acc + length, 0);
   const buf = new Uint8Array(size);
@@ -28501,7 +28565,7 @@ async function concatKdf(secret, bits, value) {
 }
 var encoder, decoder, MAX_INT32;
 var init_buffer_utils = __esm({
-  "../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/buffer_utils.js"() {
     init_digest();
     encoder = new TextEncoder();
     decoder = new TextDecoder();
@@ -28516,10 +28580,10 @@ var init_buffer_utils = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/base64url.js
+// ../../../../node_modules/jose/dist/browser/runtime/base64url.js
 var encodeBase64, encode3, decodeBase64, decode3;
 var init_base64url = __esm({
-  "../../node_modules/jose/dist/browser/runtime/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/base64url.js"() {
     init_buffer_utils();
     encodeBase64 = /* @__PURE__ */ __name((input2) => {
       let unencoded = input2;
@@ -28559,7 +28623,7 @@ var init_base64url = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/errors.js
+// ../../../../node_modules/jose/dist/browser/util/errors.js
 var errors_exports2 = {};
 __export(errors_exports2, {
   JOSEAlgNotAllowed: () => JOSEAlgNotAllowed,
@@ -28580,7 +28644,7 @@ __export(errors_exports2, {
 });
 var JOSEError, JWTClaimValidationFailed, JWTExpired, JOSEAlgNotAllowed, JOSENotSupported, JWEDecryptionFailed, JWEInvalid, JWSInvalid, JWTInvalid, JWKInvalid, JWKSInvalid, JWKSNoMatchingKey, JWKSMultipleMatchingKeys, JWKSTimeout, JWSSignatureVerificationFailed;
 var init_errors3 = __esm({
-  "../../node_modules/jose/dist/browser/util/errors.js"() {
+  "../../../../node_modules/jose/dist/browser/util/errors.js"() {
     JOSEError = class extends Error {
       static {
         __name(this, "JOSEError");
@@ -28742,16 +28806,16 @@ var init_errors3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/random.js
+// ../../../../node_modules/jose/dist/browser/runtime/random.js
 var random_default;
 var init_random = __esm({
-  "../../node_modules/jose/dist/browser/runtime/random.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/random.js"() {
     init_webcrypto();
     random_default = webcrypto_default.getRandomValues.bind(webcrypto_default);
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/iv.js
+// ../../../../node_modules/jose/dist/browser/lib/iv.js
 function bitLength(alg) {
   switch (alg) {
     case "A128GCM":
@@ -28771,7 +28835,7 @@ function bitLength(alg) {
 }
 var iv_default;
 var init_iv = __esm({
-  "../../node_modules/jose/dist/browser/lib/iv.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/iv.js"() {
     init_errors3();
     init_random();
     __name(bitLength, "bitLength");
@@ -28779,10 +28843,10 @@ var init_iv = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_iv_length.js
+// ../../../../node_modules/jose/dist/browser/lib/check_iv_length.js
 var checkIvLength, check_iv_length_default;
 var init_check_iv_length = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_iv_length.js"() {
     init_errors3();
     init_iv();
     checkIvLength = /* @__PURE__ */ __name((enc, iv) => {
@@ -28794,10 +28858,10 @@ var init_check_iv_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_cek_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js
 var checkCekLength, check_cek_length_default;
 var init_check_cek_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_cek_length.js"() {
     init_errors3();
     checkCekLength = /* @__PURE__ */ __name((cek, expected) => {
       const actual = cek.byteLength << 3;
@@ -28809,10 +28873,10 @@ var init_check_cek_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
+// ../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js
 var timingSafeEqual, timing_safe_equal_default;
 var init_timing_safe_equal = __esm({
-  "../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/timing_safe_equal.js"() {
     timingSafeEqual = /* @__PURE__ */ __name((a, b) => {
       if (!(a instanceof Uint8Array)) {
         throw new TypeError("First argument must be a buffer");
@@ -28835,7 +28899,7 @@ var init_timing_safe_equal = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/crypto_key.js
+// ../../../../node_modules/jose/dist/browser/lib/crypto_key.js
 function unusable(name, prop = "algorithm.name") {
   return new TypeError(`CryptoKey does not support this operation, its ${prop} must be ${name}`);
 }
@@ -28992,7 +29056,7 @@ function checkEncCryptoKey(key, alg, ...usages) {
   checkUsage(key, usages);
 }
 var init_crypto_key = __esm({
-  "../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/crypto_key.js"() {
     __name(unusable, "unusable");
     __name(isAlgorithm, "isAlgorithm");
     __name(getHashLength, "getHashLength");
@@ -29003,7 +29067,7 @@ var init_crypto_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/invalid_key_input.js
+// ../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js
 function message(msg, actual, ...types2) {
   types2 = types2.filter(Boolean);
   if (types2.length > 2) {
@@ -29030,7 +29094,7 @@ function withAlg(alg, actual, ...types2) {
 }
 var invalid_key_input_default;
 var init_invalid_key_input = __esm({
-  "../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/invalid_key_input.js"() {
     __name(message, "message");
     invalid_key_input_default = /* @__PURE__ */ __name((actual, ...types2) => {
       return message("Key must be ", actual, ...types2);
@@ -29039,10 +29103,10 @@ var init_invalid_key_input = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/is_key_like.js
+// ../../../../node_modules/jose/dist/browser/runtime/is_key_like.js
 var is_key_like_default, types;
 var init_is_key_like = __esm({
-  "../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/is_key_like.js"() {
     init_webcrypto();
     is_key_like_default = /* @__PURE__ */ __name((key) => {
       if (isCryptoKey(key)) {
@@ -29054,7 +29118,7 @@ var init_is_key_like = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/decrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/decrypt.js
 async function cbcDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -29106,7 +29170,7 @@ async function gcmDecrypt(enc, cek, ciphertext, iv, tag2, aad) {
 }
 var decrypt, decrypt_default;
 var init_decrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/decrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -29150,10 +29214,10 @@ var init_decrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_disjoint.js
+// ../../../../node_modules/jose/dist/browser/lib/is_disjoint.js
 var isDisjoint, is_disjoint_default;
 var init_is_disjoint = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_disjoint.js"() {
     isDisjoint = /* @__PURE__ */ __name((...headers) => {
       const sources = headers.filter(Boolean);
       if (sources.length === 0 || sources.length === 1) {
@@ -29179,7 +29243,7 @@ var init_is_disjoint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_object.js
+// ../../../../node_modules/jose/dist/browser/lib/is_object.js
 function isObjectLike(value) {
   return typeof value === "object" && value !== null;
 }
@@ -29197,16 +29261,16 @@ function isObject2(input2) {
   return Object.getPrototypeOf(input2) === proto;
 }
 var init_is_object = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_object.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_object.js"() {
     __name(isObjectLike, "isObjectLike");
     __name(isObject2, "isObject");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/bogus.js
+// ../../../../node_modules/jose/dist/browser/runtime/bogus.js
 var bogusWebCrypto, bogus_default;
 var init_bogus = __esm({
-  "../../node_modules/jose/dist/browser/runtime/bogus.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/bogus.js"() {
     bogusWebCrypto = [
       { hash: "SHA-256", name: "HMAC" },
       true,
@@ -29216,7 +29280,7 @@ var init_bogus = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/aeskw.js
+// ../../../../node_modules/jose/dist/browser/runtime/aeskw.js
 function checkKeySize(key, alg) {
   if (key.algorithm.length !== parseInt(alg.slice(1, 4), 10)) {
     throw new TypeError(`Invalid key size for alg: ${alg}`);
@@ -29234,7 +29298,7 @@ function getCryptoKey(key, alg, usage) {
 }
 var wrap, unwrap;
 var init_aeskw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/aeskw.js"() {
     init_bogus();
     init_webcrypto();
     init_crypto_key();
@@ -29257,7 +29321,7 @@ var init_aeskw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/ecdhes.js
+// ../../../../node_modules/jose/dist/browser/runtime/ecdhes.js
 async function deriveKey(publicKey, privateKey, algorithm, keyLength, apu = new Uint8Array(0), apv = new Uint8Array(0)) {
   if (!isCryptoKey(publicKey)) {
     throw new TypeError(invalid_key_input_default(publicKey, ...types));
@@ -29295,7 +29359,7 @@ function ecdhAllowed(key) {
   return ["P-256", "P-384", "P-521"].includes(key.algorithm.namedCurve) || key.algorithm.name === "X25519" || key.algorithm.name === "X448";
 }
 var init_ecdhes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/ecdhes.js"() {
     init_buffer_utils();
     init_webcrypto();
     init_crypto_key();
@@ -29307,20 +29371,20 @@ var init_ecdhes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_p2s.js
+// ../../../../node_modules/jose/dist/browser/lib/check_p2s.js
 function checkP2s(p2s2) {
   if (!(p2s2 instanceof Uint8Array) || p2s2.length < 8) {
     throw new JWEInvalid("PBES2 Salt Input must be 8 or more octets");
   }
 }
 var init_check_p2s = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_p2s.js"() {
     init_errors3();
     __name(checkP2s, "checkP2s");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/pbes2kw.js
+// ../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js
 function getCryptoKey2(key, alg) {
   if (key instanceof Uint8Array) {
     return webcrypto_default.subtle.importKey("raw", key, "PBKDF2", false, ["deriveBits"]);
@@ -29356,7 +29420,7 @@ async function deriveKey2(p2s2, alg, p2c, key) {
 }
 var encrypt, decrypt2;
 var init_pbes2kw = __esm({
-  "../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/pbes2kw.js"() {
     init_random();
     init_buffer_utils();
     init_base64url();
@@ -29380,7 +29444,7 @@ var init_pbes2kw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js
 function subtleRsaEs(alg) {
   switch (alg) {
     case "RSA-OAEP":
@@ -29393,16 +29457,16 @@ function subtleRsaEs(alg) {
   }
 }
 var init_subtle_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_rsaes.js"() {
     init_errors3();
     __name(subtleRsaEs, "subtleRsaEs");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/check_key_length.js
+// ../../../../node_modules/jose/dist/browser/runtime/check_key_length.js
 var check_key_length_default;
 var init_check_key_length = __esm({
-  "../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/check_key_length.js"() {
     check_key_length_default = /* @__PURE__ */ __name((alg, key) => {
       if (alg.startsWith("RS") || alg.startsWith("PS")) {
         const { modulusLength } = key.algorithm;
@@ -29414,10 +29478,10 @@ var init_check_key_length = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/rsaes.js
+// ../../../../node_modules/jose/dist/browser/runtime/rsaes.js
 var encrypt2, decrypt3;
 var init_rsaes = __esm({
-  "../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/rsaes.js"() {
     init_subtle_rsaes();
     init_bogus();
     init_webcrypto();
@@ -29458,7 +29522,7 @@ var init_rsaes = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/is_jwk.js
+// ../../../../node_modules/jose/dist/browser/lib/is_jwk.js
 function isJWK(key) {
   return isObject2(key) && typeof key.kty === "string";
 }
@@ -29472,7 +29536,7 @@ function isSecretJWK(key) {
   return isJWK(key) && key.kty === "oct" && typeof key.k === "string";
 }
 var init_is_jwk = __esm({
-  "../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/is_jwk.js"() {
     init_is_object();
     __name(isJWK, "isJWK");
     __name(isPrivateJWK, "isPrivateJWK");
@@ -29481,7 +29545,7 @@ var init_is_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js
 function subtleMapping(jwk) {
   let algorithm;
   let keyUsages;
@@ -29570,7 +29634,7 @@ function subtleMapping(jwk) {
 }
 var parse3, jwk_to_key_default;
 var init_jwk_to_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/jwk_to_key.js"() {
     init_webcrypto();
     init_errors3();
     __name(subtleMapping, "subtleMapping");
@@ -29593,10 +29657,10 @@ var init_jwk_to_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/normalize_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/normalize_key.js
 var exportKeyValue, privCache, pubCache, isKeyObject, importAndCache, normalizePublicKey, normalizePrivateKey, normalize_key_default;
 var init_normalize_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/normalize_key.js"() {
     init_is_jwk();
     init_base64url();
     init_jwk_to_key();
@@ -29665,7 +29729,7 @@ var init_normalize_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/cek.js
+// ../../../../node_modules/jose/dist/browser/lib/cek.js
 function bitLength2(alg) {
   switch (alg) {
     case "A128GCM":
@@ -29685,7 +29749,7 @@ function bitLength2(alg) {
 }
 var cek_default;
 var init_cek = __esm({
-  "../../node_modules/jose/dist/browser/lib/cek.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/cek.js"() {
     init_errors3();
     init_random();
     __name(bitLength2, "bitLength");
@@ -29693,10 +29757,10 @@ var init_cek = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/format_pem.js
+// ../../../../node_modules/jose/dist/browser/lib/format_pem.js
 var format_pem_default;
 var init_format_pem = __esm({
-  "../../node_modules/jose/dist/browser/lib/format_pem.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/format_pem.js"() {
     format_pem_default = /* @__PURE__ */ __name((b64, descriptor) => {
       const newlined = (b64.match(/.{1,64}/g) || []).join("\n");
       return `-----BEGIN ${descriptor}-----
@@ -29706,7 +29770,7 @@ ${newlined}
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/asn1.js
+// ../../../../node_modules/jose/dist/browser/runtime/asn1.js
 function getElement(seq) {
   const result = [];
   let next = 0;
@@ -29775,7 +29839,7 @@ function getSPKI(x509) {
 }
 var genericExport, toSPKI, toPKCS8, findOid, getNamedCurve2, genericImport, fromPKCS8, fromSPKI, fromX509;
 var init_asn1 = __esm({
-  "../../node_modules/jose/dist/browser/runtime/asn1.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/asn1.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -29917,7 +29981,7 @@ var init_asn1 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/import.js
+// ../../../../node_modules/jose/dist/browser/key/import.js
 async function importSPKI(spki, alg, options) {
   if (typeof spki !== "string" || spki.indexOf("-----BEGIN PUBLIC KEY-----") !== 0) {
     throw new TypeError('"spki" must be SPKI formatted string');
@@ -29959,7 +30023,7 @@ async function importJWK(jwk, alg) {
   }
 }
 var init_import = __esm({
-  "../../node_modules/jose/dist/browser/key/import.js"() {
+  "../../../../node_modules/jose/dist/browser/key/import.js"() {
     init_base64url();
     init_asn1();
     init_jwk_to_key();
@@ -29972,7 +30036,7 @@ var init_import = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/check_key_type.js
+// ../../../../node_modules/jose/dist/browser/lib/check_key_type.js
 function checkKeyType(allowJwk, alg, key, usage) {
   const symmetric = alg.startsWith("HS") || alg === "dir" || alg.startsWith("PBES2") || /^A\d{3}(?:GCM)?KW$/.test(alg);
   if (symmetric) {
@@ -29983,7 +30047,7 @@ function checkKeyType(allowJwk, alg, key, usage) {
 }
 var tag, jwkMatchesOp, symmetricTypeCheck, asymmetricTypeCheck, check_key_type_default, checkKeyTypeWithJwk;
 var init_check_key_type = __esm({
-  "../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/check_key_type.js"() {
     init_invalid_key_input();
     init_is_key_like();
     init_is_jwk();
@@ -30053,7 +30117,7 @@ var init_check_key_type = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/encrypt.js
+// ../../../../node_modules/jose/dist/browser/runtime/encrypt.js
 async function cbcEncrypt(enc, plaintext, cek, iv, aad) {
   if (!(cek instanceof Uint8Array)) {
     throw new TypeError(invalid_key_input_default(cek, "Uint8Array"));
@@ -30092,7 +30156,7 @@ async function gcmEncrypt(enc, plaintext, cek, iv, aad) {
 }
 var encrypt3, encrypt_default;
 var init_encrypt = __esm({
-  "../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/encrypt.js"() {
     init_buffer_utils();
     init_check_iv_length();
     init_check_cek_length();
@@ -30136,7 +30200,7 @@ var init_encrypt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/aesgcmkw.js
+// ../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js
 async function wrap2(alg, key, cek, iv) {
   const jweAlgorithm = alg.slice(0, 7);
   const wrapped = await encrypt_default(jweAlgorithm, cek, key, iv, new Uint8Array(0));
@@ -30151,7 +30215,7 @@ async function unwrap2(alg, key, encryptedKey, iv, tag2) {
   return decrypt_default(jweAlgorithm, key, encryptedKey, iv, tag2, new Uint8Array(0));
 }
 var init_aesgcmkw = __esm({
-  "../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/aesgcmkw.js"() {
     init_encrypt();
     init_decrypt();
     init_base64url();
@@ -30160,7 +30224,7 @@ var init_aesgcmkw = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js
 async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options) {
   check_key_type_default(alg, key, "decrypt");
   key = await normalize_key_default.normalizePrivateKey?.(key, alg) || key;
@@ -30274,7 +30338,7 @@ async function decryptKeyManagement(alg, key, encryptedKey, joseHeader, options)
 }
 var decrypt_key_management_default;
 var init_decrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/decrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -30292,7 +30356,7 @@ var init_decrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_crit.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_crit.js
 function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader, joseHeader) {
   if (joseHeader.crit !== void 0 && protectedHeader?.crit === void 0) {
     throw new Err('"crit" (Critical) Header Parameter MUST be integrity protected');
@@ -30324,17 +30388,17 @@ function validateCrit(Err, recognizedDefault, recognizedOption, protectedHeader,
 }
 var validate_crit_default;
 var init_validate_crit = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_crit.js"() {
     init_errors3();
     __name(validateCrit, "validateCrit");
     validate_crit_default = validateCrit;
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/validate_algorithms.js
+// ../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js
 var validateAlgorithms, validate_algorithms_default;
 var init_validate_algorithms = __esm({
-  "../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/validate_algorithms.js"() {
     validateAlgorithms = /* @__PURE__ */ __name((option, algorithms) => {
       if (algorithms !== void 0 && (!Array.isArray(algorithms) || algorithms.some((s) => typeof s !== "string"))) {
         throw new TypeError(`"${option}" option must be an array of strings`);
@@ -30348,7 +30412,7 @@ var init_validate_algorithms = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js
 async function flattenedDecrypt(jwe, key, options) {
   if (!isObject2(jwe)) {
     throw new JWEInvalid("Flattened JWE must be an object");
@@ -30491,7 +30555,7 @@ async function flattenedDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/decrypt.js"() {
     init_base64url();
     init_decrypt();
     init_errors3();
@@ -30506,7 +30570,7 @@ var init_decrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js
 async function compactDecrypt(jwe, key, options) {
   if (jwe instanceof Uint8Array) {
     jwe = decoder.decode(jwe);
@@ -30532,7 +30596,7 @@ async function compactDecrypt(jwe, key, options) {
   return result;
 }
 var init_decrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/decrypt.js"() {
     init_decrypt2();
     init_errors3();
     init_buffer_utils();
@@ -30540,7 +30604,7 @@ var init_decrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js
 async function generalDecrypt(jwe, key, options) {
   if (!isObject2(jwe)) {
     throw new JWEInvalid("General JWE must be an object");
@@ -30569,7 +30633,7 @@ async function generalDecrypt(jwe, key, options) {
   throw new JWEDecryptionFailed();
 }
 var init_decrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/decrypt.js"() {
     init_decrypt2();
     init_errors3();
     init_is_object();
@@ -30577,18 +30641,18 @@ var init_decrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/private_symbols.js
+// ../../../../node_modules/jose/dist/browser/lib/private_symbols.js
 var unprotected;
 var init_private_symbols = __esm({
-  "../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/private_symbols.js"() {
     unprotected = /* @__PURE__ */ Symbol();
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
+// ../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js
 var keyToJWK, key_to_jwk_default;
 var init_key_to_jwk = __esm({
-  "../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/key_to_jwk.js"() {
     init_webcrypto();
     init_invalid_key_input();
     init_base64url();
@@ -30613,7 +30677,7 @@ var init_key_to_jwk = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/export.js
+// ../../../../node_modules/jose/dist/browser/key/export.js
 async function exportSPKI(key) {
   return toSPKI(key);
 }
@@ -30624,7 +30688,7 @@ async function exportJWK(key) {
   return key_to_jwk_default(key);
 }
 var init_export = __esm({
-  "../../node_modules/jose/dist/browser/key/export.js"() {
+  "../../../../node_modules/jose/dist/browser/key/export.js"() {
     init_asn1();
     init_asn1();
     init_key_to_jwk();
@@ -30634,7 +30698,7 @@ var init_export = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
+// ../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js
 async function encryptKeyManagement(alg, enc, key, providedCek, providedParameters = {}) {
   let encryptedKey;
   let parameters;
@@ -30714,7 +30778,7 @@ async function encryptKeyManagement(alg, enc, key, providedCek, providedParamete
 }
 var encrypt_key_management_default;
 var init_encrypt_key_management = __esm({
-  "../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/encrypt_key_management.js"() {
     init_aeskw();
     init_ecdhes();
     init_pbes2kw();
@@ -30731,10 +30795,10 @@ var init_encrypt_key_management = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js
 var FlattenedEncrypt;
 var init_encrypt2 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/flattened/encrypt.js"() {
     init_base64url();
     init_private_symbols();
     init_encrypt();
@@ -30889,10 +30953,10 @@ var init_encrypt2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/general/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js
 var IndividualRecipient, GeneralEncrypt;
 var init_encrypt3 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/general/encrypt.js"() {
     init_encrypt2();
     init_private_symbols();
     init_errors3();
@@ -31061,7 +31125,7 @@ var init_encrypt3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
+// ../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js
 function subtleDsa(alg, algorithm) {
   const hash2 = `SHA-${alg.slice(-3)}`;
   switch (alg) {
@@ -31090,13 +31154,13 @@ function subtleDsa(alg, algorithm) {
   }
 }
 var init_subtle_dsa = __esm({
-  "../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/subtle_dsa.js"() {
     init_errors3();
     __name(subtleDsa, "subtleDsa");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
+// ../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js
 async function getCryptoKey3(alg, key, usage) {
   if (usage === "sign") {
     key = await normalize_key_default.normalizePrivateKey(key, alg);
@@ -31117,7 +31181,7 @@ async function getCryptoKey3(alg, key, usage) {
   throw new TypeError(invalid_key_input_default(key, ...types, "Uint8Array", "JSON Web Key"));
 }
 var init_get_sign_verify_key = __esm({
-  "../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/get_sign_verify_key.js"() {
     init_webcrypto();
     init_crypto_key();
     init_invalid_key_input();
@@ -31127,10 +31191,10 @@ var init_get_sign_verify_key = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/verify.js
+// ../../../../node_modules/jose/dist/browser/runtime/verify.js
 var verify, verify_default;
 var init_verify = __esm({
-  "../../node_modules/jose/dist/browser/runtime/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/verify.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -31149,7 +31213,7 @@ var init_verify = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/verify.js
 async function flattenedVerify(jws, key, options) {
   if (!isObject2(jws)) {
     throw new JWSInvalid("Flattened JWS must be an object");
@@ -31255,7 +31319,7 @@ async function flattenedVerify(jws, key, options) {
   return result;
 }
 var init_verify2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/verify.js"() {
     init_base64url();
     init_verify();
     init_errors3();
@@ -31271,7 +31335,7 @@ var init_verify2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/verify.js
 async function compactVerify(jws, key, options) {
   if (jws instanceof Uint8Array) {
     jws = decoder.decode(jws);
@@ -31291,7 +31355,7 @@ async function compactVerify(jws, key, options) {
   return result;
 }
 var init_verify3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/verify.js"() {
     init_verify2();
     init_errors3();
     init_buffer_utils();
@@ -31299,7 +31363,7 @@ var init_verify3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/verify.js
+// ../../../../node_modules/jose/dist/browser/jws/general/verify.js
 async function generalVerify(jws, key, options) {
   if (!isObject2(jws)) {
     throw new JWSInvalid("General JWS must be an object");
@@ -31321,7 +31385,7 @@ async function generalVerify(jws, key, options) {
   throw new JWSSignatureVerificationFailed();
 }
 var init_verify4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/verify.js"() {
     init_verify2();
     init_errors3();
     init_is_object();
@@ -31329,18 +31393,18 @@ var init_verify4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/epoch.js
+// ../../../../node_modules/jose/dist/browser/lib/epoch.js
 var epoch_default;
 var init_epoch = __esm({
-  "../../node_modules/jose/dist/browser/lib/epoch.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/epoch.js"() {
     epoch_default = /* @__PURE__ */ __name((date5) => Math.floor(date5.getTime() / 1e3), "default");
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/secs.js
+// ../../../../node_modules/jose/dist/browser/lib/secs.js
 var minute, hour, day, week, year, REGEX, secs_default;
 var init_secs = __esm({
-  "../../node_modules/jose/dist/browser/lib/secs.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/secs.js"() {
     minute = 60;
     hour = minute * 60;
     day = hour * 24;
@@ -31399,10 +31463,10 @@ var init_secs = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
+// ../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js
 var normalizeTyp, checkAudiencePresence, jwt_claims_set_default;
 var init_jwt_claims_set = __esm({
-  "../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
+  "../../../../node_modules/jose/dist/browser/lib/jwt_claims_set.js"() {
     init_errors3();
     init_buffer_utils();
     init_epoch();
@@ -31505,7 +31569,7 @@ var init_jwt_claims_set = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/verify.js
+// ../../../../node_modules/jose/dist/browser/jwt/verify.js
 async function jwtVerify(jwt2, key, options) {
   const verified = await compactVerify(jwt2, key, options);
   if (verified.protectedHeader.crit?.includes("b64") && verified.protectedHeader.b64 === false) {
@@ -31519,7 +31583,7 @@ async function jwtVerify(jwt2, key, options) {
   return result;
 }
 var init_verify5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/verify.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/verify.js"() {
     init_verify3();
     init_jwt_claims_set();
     init_errors3();
@@ -31527,7 +31591,7 @@ var init_verify5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/decrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/decrypt.js
 async function jwtDecrypt(jwt2, key, options) {
   const decrypted = await compactDecrypt(jwt2, key, options);
   const payload = jwt_claims_set_default(decrypted.protectedHeader, decrypted.plaintext, options);
@@ -31548,7 +31612,7 @@ async function jwtDecrypt(jwt2, key, options) {
   return result;
 }
 var init_decrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/decrypt.js"() {
     init_decrypt3();
     init_jwt_claims_set();
     init_errors3();
@@ -31556,10 +31620,10 @@ var init_decrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js
 var CompactEncrypt;
 var init_encrypt4 = __esm({
-  "../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwe/compact/encrypt.js"() {
     init_encrypt2();
     CompactEncrypt = class {
       static {
@@ -31592,10 +31656,10 @@ var init_encrypt4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/sign.js
+// ../../../../node_modules/jose/dist/browser/runtime/sign.js
 var sign, sign_default;
 var init_sign = __esm({
-  "../../node_modules/jose/dist/browser/runtime/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/sign.js"() {
     init_subtle_dsa();
     init_webcrypto();
     init_check_key_length();
@@ -31610,10 +31674,10 @@ var init_sign = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/flattened/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/flattened/sign.js
 var FlattenedSign;
 var init_sign2 = __esm({
-  "../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/flattened/sign.js"() {
     init_base64url();
     init_sign();
     init_is_disjoint();
@@ -31700,10 +31764,10 @@ var init_sign2 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/compact/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/compact/sign.js
 var CompactSign;
 var init_sign3 = __esm({
-  "../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/compact/sign.js"() {
     init_sign2();
     CompactSign = class {
       static {
@@ -31727,10 +31791,10 @@ var init_sign3 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jws/general/sign.js
+// ../../../../node_modules/jose/dist/browser/jws/general/sign.js
 var IndividualSignature, GeneralSign;
 var init_sign4 = __esm({
-  "../../node_modules/jose/dist/browser/jws/general/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jws/general/sign.js"() {
     init_sign2();
     init_errors3();
     IndividualSignature = class {
@@ -31806,7 +31870,7 @@ var init_sign4 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/produce.js
+// ../../../../node_modules/jose/dist/browser/jwt/produce.js
 function validateInput(label, input2) {
   if (!Number.isFinite(input2)) {
     throw new TypeError(`Invalid ${label} input`);
@@ -31815,7 +31879,7 @@ function validateInput(label, input2) {
 }
 var ProduceJWT;
 var init_produce = __esm({
-  "../../node_modules/jose/dist/browser/jwt/produce.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/produce.js"() {
     init_epoch();
     init_is_object();
     init_secs();
@@ -31885,10 +31949,10 @@ var init_produce = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/sign.js
+// ../../../../node_modules/jose/dist/browser/jwt/sign.js
 var SignJWT;
 var init_sign5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/sign.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/sign.js"() {
     init_sign3();
     init_errors3();
     init_buffer_utils();
@@ -31913,10 +31977,10 @@ var init_sign5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/encrypt.js
+// ../../../../node_modules/jose/dist/browser/jwt/encrypt.js
 var EncryptJWT;
 var init_encrypt5 = __esm({
-  "../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/encrypt.js"() {
     init_encrypt4();
     init_buffer_utils();
     init_produce();
@@ -31991,7 +32055,7 @@ var init_encrypt5 = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/thumbprint.js
+// ../../../../node_modules/jose/dist/browser/jwk/thumbprint.js
 async function calculateJwkThumbprint(jwk, digestAlgorithm) {
   if (!isObject2(jwk)) {
     throw new TypeError("JWK must be an object");
@@ -32035,7 +32099,7 @@ async function calculateJwkThumbprintUri(jwk, digestAlgorithm) {
 }
 var check2;
 var init_thumbprint = __esm({
-  "../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/thumbprint.js"() {
     init_digest();
     init_base64url();
     init_errors3();
@@ -32051,7 +32115,7 @@ var init_thumbprint = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwk/embedded.js
+// ../../../../node_modules/jose/dist/browser/jwk/embedded.js
 async function EmbeddedJWK(protectedHeader, token) {
   const joseHeader = {
     ...protectedHeader,
@@ -32067,7 +32131,7 @@ async function EmbeddedJWK(protectedHeader, token) {
   return key;
 }
 var init_embedded = __esm({
-  "../../node_modules/jose/dist/browser/jwk/embedded.js"() {
+  "../../../../node_modules/jose/dist/browser/jwk/embedded.js"() {
     init_import();
     init_is_object();
     init_errors3();
@@ -32075,7 +32139,7 @@ var init_embedded = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/local.js
+// ../../../../node_modules/jose/dist/browser/jwks/local.js
 function getKtyFromAlg(alg) {
   switch (typeof alg === "string" && alg.slice(0, 2)) {
     case "RS":
@@ -32127,7 +32191,7 @@ function createLocalJWKSet(jwks) {
 }
 var LocalJWKSet;
 var init_local = __esm({
-  "../../node_modules/jose/dist/browser/jwks/local.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/local.js"() {
     init_import();
     init_errors3();
     init_is_object();
@@ -32212,10 +32276,10 @@ var init_local = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
+// ../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js
 var fetchJwks, fetch_jwks_default;
 var init_fetch_jwks = __esm({
-  "../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/fetch_jwks.js"() {
     init_errors3();
     fetchJwks = /* @__PURE__ */ __name(async (url2, timeout, options) => {
       let controller;
@@ -32252,7 +32316,7 @@ var init_fetch_jwks = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwks/remote.js
+// ../../../../node_modules/jose/dist/browser/jwks/remote.js
 function isCloudflareWorkers() {
   return typeof WebSocketPair !== "undefined" || typeof navigator !== "undefined" && true || typeof EdgeRuntime !== "undefined" && EdgeRuntime === "vercel";
 }
@@ -32304,7 +32368,7 @@ function createRemoteJWKSet(url2, options) {
 }
 var USER_AGENT, jwksCache, RemoteJWKSet, experimental_jwksCache;
 var init_remote = __esm({
-  "../../node_modules/jose/dist/browser/jwks/remote.js"() {
+  "../../../../node_modules/jose/dist/browser/jwks/remote.js"() {
     init_fetch_jwks();
     init_errors3();
     init_local();
@@ -32389,10 +32453,10 @@ var init_remote = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/jwt/unsecured.js
+// ../../../../node_modules/jose/dist/browser/jwt/unsecured.js
 var UnsecuredJWT;
 var init_unsecured = __esm({
-  "../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
+  "../../../../node_modules/jose/dist/browser/jwt/unsecured.js"() {
     init_base64url();
     init_buffer_utils();
     init_errors3();
@@ -32430,7 +32494,7 @@ var init_unsecured = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/base64url.js
+// ../../../../node_modules/jose/dist/browser/util/base64url.js
 var base64url_exports2 = {};
 __export(base64url_exports2, {
   decode: () => decode4,
@@ -32438,14 +32502,14 @@ __export(base64url_exports2, {
 });
 var encode4, decode4;
 var init_base64url2 = __esm({
-  "../../node_modules/jose/dist/browser/util/base64url.js"() {
+  "../../../../node_modules/jose/dist/browser/util/base64url.js"() {
     init_base64url();
     encode4 = encode3;
     decode4 = decode3;
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_protected_header.js
+// ../../../../node_modules/jose/dist/browser/util/decode_protected_header.js
 function decodeProtectedHeader(token) {
   let protectedB64u;
   if (typeof token === "string") {
@@ -32475,7 +32539,7 @@ function decodeProtectedHeader(token) {
   }
 }
 var init_decode_protected_header = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_protected_header.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -32483,7 +32547,7 @@ var init_decode_protected_header = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/decode_jwt.js
+// ../../../../node_modules/jose/dist/browser/util/decode_jwt.js
 function decodeJwt(jwt2) {
   if (typeof jwt2 !== "string")
     throw new JWTInvalid("JWTs must use Compact JWS serialization, JWT must be a string");
@@ -32511,7 +32575,7 @@ function decodeJwt(jwt2) {
   return result;
 }
 var init_decode_jwt = __esm({
-  "../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
+  "../../../../node_modules/jose/dist/browser/util/decode_jwt.js"() {
     init_base64url2();
     init_buffer_utils();
     init_is_object();
@@ -32520,7 +32584,7 @@ var init_decode_jwt = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/generate.js
+// ../../../../node_modules/jose/dist/browser/runtime/generate.js
 async function generateSecret(alg, options) {
   let length;
   let algorithm;
@@ -32662,7 +32726,7 @@ async function generateKeyPair(alg, options) {
   return webcrypto_default.subtle.generateKey(algorithm, options?.extractable ?? false, keyUsages);
 }
 var init_generate = __esm({
-  "../../node_modules/jose/dist/browser/runtime/generate.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/generate.js"() {
     init_webcrypto();
     init_errors3();
     init_random();
@@ -32672,46 +32736,46 @@ var init_generate = __esm({
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_key_pair.js
+// ../../../../node_modules/jose/dist/browser/key/generate_key_pair.js
 async function generateKeyPair2(alg, options) {
   return generateKeyPair(alg, options);
 }
 var init_generate_key_pair = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_key_pair.js"() {
     init_generate();
     __name(generateKeyPair2, "generateKeyPair");
   }
 });
 
-// ../../node_modules/jose/dist/browser/key/generate_secret.js
+// ../../../../node_modules/jose/dist/browser/key/generate_secret.js
 async function generateSecret2(alg, options) {
   return generateSecret(alg, options);
 }
 var init_generate_secret = __esm({
-  "../../node_modules/jose/dist/browser/key/generate_secret.js"() {
+  "../../../../node_modules/jose/dist/browser/key/generate_secret.js"() {
     init_generate();
     __name(generateSecret2, "generateSecret");
   }
 });
 
-// ../../node_modules/jose/dist/browser/runtime/runtime.js
+// ../../../../node_modules/jose/dist/browser/runtime/runtime.js
 var runtime_default;
 var init_runtime = __esm({
-  "../../node_modules/jose/dist/browser/runtime/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/runtime/runtime.js"() {
     runtime_default = "WebCryptoAPI";
   }
 });
 
-// ../../node_modules/jose/dist/browser/util/runtime.js
+// ../../../../node_modules/jose/dist/browser/util/runtime.js
 var runtime_default2;
 var init_runtime2 = __esm({
-  "../../node_modules/jose/dist/browser/util/runtime.js"() {
+  "../../../../node_modules/jose/dist/browser/util/runtime.js"() {
     init_runtime();
     runtime_default2 = runtime_default;
   }
 });
 
-// ../../node_modules/jose/dist/browser/index.js
+// ../../../../node_modules/jose/dist/browser/index.js
 var browser_exports = {};
 __export(browser_exports, {
   CompactEncrypt: () => CompactEncrypt,
@@ -32754,7 +32818,7 @@ __export(browser_exports, {
   jwtVerify: () => jwtVerify
 });
 var init_browser = __esm({
-  "../../node_modules/jose/dist/browser/index.js"() {
+  "../../../../node_modules/jose/dist/browser/index.js"() {
     init_decrypt3();
     init_decrypt2();
     init_decrypt4();
@@ -33316,6 +33380,16 @@ var index_default = {
           const body2 = await request.json().catch(() => ({}));
           body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body2)
+          }));
+        }
+        if (sub === "supersede" && request.method === "POST") {
+          if (auth2.bearer) return kbCors(json3({ error: "supersede is web/human-only (BR#2480) \u2014 agents cannot supersede; coordinate via ask_agent instead" }, 403));
+          const body2 = await request.json().catch(() => ({}));
+          body2.actor = `web:${auth2.login ?? "anon"}`;
+          return kbCors(env.KB.get(kbId).fetch("https://kb/supersede.task", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(body2)

@@ -402,9 +402,24 @@ in_review, verify separation, human legs escalate to you. The button only copies
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
 
+**Supersede** — next to **Claim locally** in the ask action row, and beside **Unblock
+now** on every blocked card (and on unclaimed todo cards): a **Supersede…** button
+retires a dead card in one click (BR#3910). The dialog shows the card's current
+status and takes an optional replacement task id (`BR#<n>`, `#<n>` or a bare number,
+validated before submit). The server composes the documented two-step itself —
+blocked → release → todo → superseded (the BR#1852/BR#1935 precedent) — so the raw
+intermediate states never surface; the card lands `superseded` with `superseded_by`
+plus a clickable replacement link, and the `supersedes` relation records the lineage
+machine-readably. Supersede is **web/human-only (BR#2480)**: the route refuses
+gateway bearers with 403 and the agent-facing transition gate still has no
+`→superseded` edge, so no session can execute it. Every refusal surfaces the server's
+message inline and in the banner with the card left unchanged — a silent no-op is the
+defect class this button exists to kill (BR#3649's answer-before-click misfire,
+BR#3905's timer-spin churn on dead-premise blocked cards).
+
 ## Blocked cards await something typed (BR#3578)
 
-A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
+A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty. Dead-premise cards whose premise can no longer hold are closed for good by the human-only **Supersede** button instead of looping through re-check duties (BR#3910). Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
 
 ## Destination-green: the stop-the-line gate
 

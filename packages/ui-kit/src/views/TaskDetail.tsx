@@ -7,6 +7,7 @@ import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel, TASK_REF_RE } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
+import { SupersedeBtn } from "./supersede";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -148,6 +149,8 @@ function MdLong({ text, limit = 260 }: { text: string | undefined; limit?: numbe
 interface TaskMeta {
   session?: string;
   blocked?: { reason?: string; unblock_condition?: string; ts?: number };
+  superseded_reason?: string;
+  superseded_by?: string;
   last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number; completion_pct?: number; confidence_pct?: number; risk_pct?: number; context_pct?: number };
   attempt?: { by?: string; attempts?: number; last_reason?: string };
   qualification?: { state?: string; how?: string; by?: string; bars?: string[] };
@@ -162,7 +165,7 @@ interface TaskMeta {
 /** Full state of the item: identity, gauges, structured meta, facts. Read-only —
  *  the forms (progress / status) live further down; this is the display half.
  *  Shared with KnowledgeView (any artefact type gets the same treatment). */
-export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string }; onChanged?: () => void }) {
+export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const m = (task.meta ?? {}) as TaskMeta;
   const lp = m.last_progress;
   const [ask, setAsk] = useState<KbAsk | null>(null);
@@ -254,7 +257,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
           ))}
         </div>
       )}
-      {m.blocked && (
+      {m.blocked && !["done", "superseded"].includes(task.status) && (
         <div className="task-blocked-info">
           <div className="progress-note"><b>why blocked:</b> <LongText text={m.blocked.reason} limit={220} /></div>
           {(splitConditions(m.blocked.unblock_condition).length > 0) && (
@@ -276,7 +279,29 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
             <span className="muted-note">
               {m.blocked.unblock_condition ? `resume before the gate: "${trunc(m.blocked.unblock_condition, 90)}"` : "resume the task now"}
             </span>
+            {/* BR#3910: the kill switch beside the resume switch — a dead-premise
+                card must not force "unblock" as the only exit (the BR#3905
+                timer-spin class: undiscoverable supersede → endless re-checks) */}
+            <SupersedeBtn task={task as any} onChanged={onChanged} />
           </div>
+        </div>
+      )}
+      {/* unclaimed todo cards: the same kill switch, no blocked box to host it
+          (ask-cards host theirs in the ask action row instead — one button, one place) */}
+      {!m.blocked && task.type === "task" && task.status === "todo" && !(task.meta as TaskMeta | undefined)?.ask && (
+        <div className="row" style={{ marginBottom: 6 }}>
+          <SupersedeBtn task={task as any} onChanged={onChanged} />
+        </div>
+      )}
+      {((task.meta as TaskMeta | undefined)?.superseded_by || (task.meta as TaskMeta | undefined)?.superseded_reason) && (
+        <div className="progress-note" title="supersede lineage (BR#3910) — the replacement link opens the successor card">
+          <b>superseded</b>
+          {(task.meta as TaskMeta | undefined)?.superseded_by && (
+            <> — replacement: <RefText text={(task.meta as TaskMeta | undefined)!.superseded_by!} onOpen={onOpen} /></>
+          )}
+          {(task.meta as TaskMeta | undefined)?.superseded_reason && (
+            <>{((task.meta as TaskMeta | undefined)?.superseded_by ? " · " : " — ")}{(task.meta as TaskMeta | undefined)!.superseded_reason}</>
+          )}
         </div>
       )}
       {ask && ask.status === "open" && (
@@ -398,6 +423,12 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
           </>
         )}
         <ClaimLocallyBtn task={task} ask={{ reason: ask.reason, options: ask.options as string[] | undefined, to: ask.to, from: ask.from }} />
+        {/* BR#3910: the supersede action in the same action row — visible where
+            the human is already steering, not buried in admin (the misfire
+            class: GO answers landed while the click had nowhere to land) */}
+        {["blocked", "todo"].includes(task.status) && (
+          <SupersedeBtn task={task} onChanged={onChanged} />
+        )}
       </div>
       {err && <p className="k-err">{err}</p>}
     </div>
@@ -549,7 +580,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           </div>
         )}
 
-        {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
+        {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />}
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
           <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
@@ -643,13 +674,13 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 }
 
 /** Render text with task references (BR#12, TASK-007) as clickable links. */
-export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
+export function RefText({ text, onOpen }: { text: string; onOpen?: (id: string) => void }) {
   const parts = text.split(TASK_REF_RE);
   return (
     <>
       {parts.map((p, i) =>
         /^(BR#\d+|TASK-\d+)$/.test(p) ? (
-          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen(p); }}>{p}</span>
+          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen?.(p); }}>{p}</span>
         ) : (
           <span key={i}>{p}</span>
         ),

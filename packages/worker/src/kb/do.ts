@@ -1608,6 +1608,7 @@ export class KnowledgeHub {
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
+        case "supersede.task": return this.json(await this.supersedeTask(body, actor));
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats());
@@ -2313,6 +2314,80 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
     this.audit(actor, "create", created.id, { type: "task", auto: "close_leg", parent: parentId, legs: shape });
     this.version(parentId, actor, "note", `close leg(s) ${shape} unowned at done — auto-derived close-duty child ${created.id} (BR#3361)`, { child: created.id, legs: shape });
+  }
+
+  /** BR#3910: one-click human supersede from the web plane. BR#2480 law: no
+   *  agent may supersede — the route in index.js only admits cookie (human)
+   *  sessions, and the task lifecycle deliberately has no →superseded edge,
+   *  so MCP/agent transitions stay gate-rejected. This op composes the
+   *  documented two-step (BR#1852/BR#1935 precedent) server-side in ONE call:
+   *  blocked → (gated release) → todo → superseded, then the machine-readable
+   *  lineage (supersedes relation, replacement → superseded — the same shape
+   *  doTransition stamps from body.replacement_id). Intermediate states never
+   *  leave this function; every validation throws BEFORE the first write, so
+   *  a refused supersede leaves the card byte-for-byte unchanged (the silent
+   *  no-op class this card kills). */
+  private async supersedeTask(body: any, actor: string) {
+    const id = String(body.id ?? "").trim();
+    if (!id) throw new Error("supersede requires id");
+    const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "task") throw new Error(`supersede is a task action — ${id} is a ${row.type}`);
+    if (row.status !== "blocked" && row.status !== "todo") {
+      const hint = row.status === "in_progress"
+        ? " (a live claim: release it first — only the owner or a human can release it)"
+        : row.status === "in_review"
+          ? " (under review — bounce or close it through review, or release it first)"
+          : "";
+      throw new Error(`supersede applies to blocked|todo cards — ${id} is '${row.status}'${hint}`);
+    }
+    // replacement: optional, but a supplied one must resolve — the lineage is
+    // machine-readable (supersedes relation + superseded_by) and a dangling
+    // pointer would strand the successor hunt on the board
+    let replacementId = String(body.replacement_id ?? "").trim();
+    if (replacementId) {
+      const bare = /^(?:BR#?|#)?(\d+)$/i.exec(replacementId);
+      if (bare) replacementId = `BR#${bare[1]}`;
+      if (replacementId === id) throw new Error("replacement_id names the card itself — a card cannot supersede into itself");
+      const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, replacementId);
+      if (!rep) throw new Error(`replacement ${replacementId} not found — create it first, then supersede`);
+      if (rep.type !== row.type) throw new Error(`replacement must be a ${row.type} — ${replacementId} is a ${rep.type}`);
+    }
+    const note = String(body.note ?? "").trim()
+      || (replacementId ? `superseded via web — replaced by ${replacementId}` : "superseded via web");
+    const ts = Date.now();
+    // leg 1 — a blocked card releases through the GATE first (the documented
+    // two-step). web:* actors are release-exempt (machine.ts), so the human
+    // click cannot be locked out by a stale owner. Any gate rejection throws
+    // here — before any supersede write.
+    if (row.status === "blocked") {
+      await this.transition({ id, to: "todo", note: `supersede (step 1/2)${replacementId ? ` — replacement ${replacementId}` : ""}` }, actor);
+    }
+    // leg 2 — todo → superseded by direct write, exactly how the machine's
+    // own supersede_children effect terminates duty children (do.ts): there
+    // is no lifecycle edge by design (agents can never supersede), so the
+    // server composes it under the verified human actor with full audit.
+    const meta = JSON.parse(row.meta ?? "{}");
+    meta.superseded_reason = note;
+    if (replacementId) meta.superseded_by = replacementId;
+    delete meta.blocked; // terminal — the parked-reason box must not resurrect ("Unblock now" on a dead card)
+    delete meta.subprocess;
+    delete meta.attempt;
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ?, owner = '' WHERE id = ?`,
+      JSON.stringify(meta), ts, ts, id,
+    );
+    if (replacementId) {
+      const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, replacementId);
+      if (rep && rep.type === row.type)
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+          replacementId, id, ts,
+        );
+    }
+    this.audit(actor, "transition", id, { from: row.status, to: "superseded", note, ...(replacementId ? { replacement_id: replacementId } : {}) });
+    this.version(id, actor, "transition", `${row.status} → superseded — ${note}`, { from: row.status, to: "superseded", note });
+    return { id, status: "superseded", ...(replacementId ? { replacement_id: replacementId } : {}) };
   }
 
   /** Lazy SQL-backed context for the machine rules — a guard only queries

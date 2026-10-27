@@ -215,6 +215,20 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
+      if (sub === "supersede" && request.method === "POST") {
+        // BR#3910: one-click human supersede (the action next to Reframe /
+        // Claim locally). Web/human-only per BR#2480 — a gateway bearer is an
+        // agent identity, and no agent may supersede; the session cookie is
+        // the human. The DO op composes the documented two-step server-side
+        // (blocked → release → todo → superseded, BR#1852/BR#1935 precedent),
+        // so the click never exposes raw intermediate states.
+        if (auth.bearer) return kbCors(json({ error: "supersede is web/human-only (BR#2480) — agents cannot supersede; coordinate via ask_agent instead" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(env.KB.get(kbId).fetch("https://kb/supersede.task", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        }));
+      }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
