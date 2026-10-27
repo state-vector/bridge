@@ -389,7 +389,7 @@ function laneCardBody(lane, cfg) {
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3\xD7 typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 \xD7 ${TRAIN_CI_TYPICAL_MINUTES} min`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards \u2014 never a stored list).`,
-    `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure \u2014 do not claim; run \`scripts/merge-train.mjs\` on a gateway to work it.`
+    `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure \u2014 do not claim; run \`bridge train\` on a gateway to work it.`
   ].join("\n");
 }
 function mergeTrainQueue(cards) {
@@ -1560,7 +1560,7 @@ var init_rollup = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "34416e2f0225ac1199191d07fb14d8d659290abf", built_at: "2026-10-27T12:00:23Z" };
+    module.exports = { commit: "78b993a8e5a9b0736db979658e338aec4ac7b8e2", built_at: "2026-10-27T15:22:06Z" };
   }
 });
 
@@ -5845,8 +5845,9 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
       }
       // ---------- serialized merge train (BR#3516) ----------
       // Lane card primitive + lease CAS + train events + the derived queue, on
-      // the DO. Division of labour: the EXECUTOR (scripts/merge-train.mjs on a
-      // gateway machine, worker-local gh, doctor-defended) fetches GitHub facts
+      // the DO. Division of labour: the EXECUTOR (`bridge train`, the CLI's
+      // native executor — BR#3879 — on a gateway machine, worker-local gh,
+      // doctor-defended) fetches GitHub facts
       // and performs the merge; the HUB decides (this state machine) and holds
       // NO VCS credentials — every fact here was reported by a gateway, the
       // verify duty's close note, or the queue derive. Pinned in
@@ -5905,7 +5906,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
             to: "blocked",
             note: "merge-train: awaiting an available gateway",
             merge_train: true,
-            unblock_condition: "the train advances this card \u2014 run scripts/merge-train.mjs on a gateway (doctor-gated)"
+            unblock_condition: "the train advances this card \u2014 run `bridge train` on a gateway (doctor-gated)"
           },
           actor
         );
@@ -5928,7 +5929,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} \u2014 idle`;
         else reason = "merge-train: awaiting an available gateway";
         if (meta3.blocked?.reason !== reason) {
-          meta3.blocked = { ...meta3.blocked ?? {}, reason, unblock_condition: meta3.blocked?.unblock_condition ?? "the train advances this card \u2014 run scripts/merge-train.mjs on a gateway (doctor-gated)" };
+          meta3.blocked = { ...meta3.blocked ?? {}, reason, unblock_condition: meta3.blocked?.unblock_condition ?? "the train advances this card \u2014 run `bridge train` on a gateway (doctor-gated)" };
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta3), laneId);
         }
         return reason;
@@ -28227,7 +28228,7 @@ ${required2.join("\n")}` : named ? void 0 : 'you did not name this session \u201
         schema: TOOL_ARG_SCHEMAS.answer_ask,
         handler: /* @__PURE__ */ __name(async (args, ctx) => text(JSON.stringify(await ctx.call("ask.answer", { id: args.id, answer: args.answer }))), "handler")
       },
-      // ---- merge train (BR#3516/BR#3517) — executor-facing: scripts/merge-train.mjs.
+      // ---- merge train (BR#3516/BR#3517) — executor-facing: `bridge train` (the CLI's native executor, BR#3879).
       // Division of labour: the EXECUTOR fetches GitHub facts and performs the
       // merge (worker-local gh, doctor-defended); the HUB decides and holds NO
       // VCS credentials. Every mutating op requires the lane lease (train_lease

@@ -436,8 +436,9 @@ export class KnowledgeHub {
     }
     // (B/C/D/G — the hub's GitHub sweeps — DELETED with the hub's credentials
     // (BR#3516 §1/§8): the merge-queue sweep is re-homed as the opportunistic
-    // edge executor (scripts/merge-train.mjs, worker-local creds, doctor-
-    // defended); stop-the-line reads move into the executor's awaiting-CI
+    // edge executor (`bridge train`, the CLI's native executor — BR#3879,
+    // worker-local creds, doctor-defended); stop-the-line reads move into the
+    // executor's awaiting-CI
     // poll; provenance is stamped ledger-native by train events; the closure
     // audit was GitHub-reading. The hub keeps its credential-free monitoring
     // job below: lane lease staleness.)
@@ -4733,8 +4734,9 @@ export class KnowledgeHub {
 
   // ---------- serialized merge train (BR#3516) ----------
   // Lane card primitive + lease CAS + train events + the derived queue, on
-  // the DO. Division of labour: the EXECUTOR (scripts/merge-train.mjs on a
-  // gateway machine, worker-local gh, doctor-defended) fetches GitHub facts
+  // the DO. Division of labour: the EXECUTOR (`bridge train`, the CLI's
+  // native executor — BR#3879 — on a gateway machine, worker-local gh,
+  // doctor-defended) fetches GitHub facts
   // and performs the merge; the HUB decides (this state machine) and holds
   // NO VCS credentials — every fact here was reported by a gateway, the
   // verify duty's close note, or the queue derive. Pinned in
@@ -4803,7 +4805,7 @@ export class KnowledgeHub {
         to: "blocked",
         note: "merge-train: awaiting an available gateway",
         merge_train: true,
-        unblock_condition: "the train advances this card — run scripts/merge-train.mjs on a gateway (doctor-gated)",
+        unblock_condition: "the train advances this card — run `bridge train` on a gateway (doctor-gated)",
       },
       actor,
     );
@@ -4827,7 +4829,7 @@ export class KnowledgeHub {
     } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
     else reason = "merge-train: awaiting an available gateway";
     if (meta.blocked?.reason !== reason) {
-      meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run scripts/merge-train.mjs on a gateway (doctor-gated)" };
+      meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run `bridge train` on a gateway (doctor-gated)" };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), laneId);
     }
     return reason;

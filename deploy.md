@@ -126,13 +126,12 @@ of the target repo):
 ```bash
 # prerequisites — `bridge doctor` checks each and names the fix:
 #   gh authed WITH the `repo` scope   (fix: gh auth refresh -h github.com -s repo)
-#   git · node ≥ 23 (native type stripping — the executor imports the hub's TS helpers)
-#   scripts/merge-train.mjs present in the bridge checkout
+#   git
 cd /path/to/target-repo-clone        # the repo the train drives
 export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
 export BRIDGE_TOKEN=<token from the Connect tab>
-node /path/to/bridge/scripts/merge-train.mjs            # 45s tick loop
-node /path/to/bridge/scripts/merge-train.mjs --once     # cron-friendly single tick
+bridge train                         # 45s tick loop
+bridge train --once                  # cron-friendly single tick
 ```
 
 Optional env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),

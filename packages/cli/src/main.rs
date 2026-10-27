@@ -9,6 +9,8 @@
 //!   bridge pair <hub-url>       device-flow pairing — prints a code, saves config, runs
 //!   bridge status               print runner state (~/.bridge/dispatch/runner.json)
 //!   bridge reset-principal      clear the write-once device identity (~/.bridge/principal)
+//!   bridge train [--once]       native merge-train executor (BR#3516/BR#3879) — 45s
+//!                               tick loop, or one tick with --once (cron-friendly)
 //!
 //! Signals: Ctrl-C kills the process. Ephemeral state lives under
 //! ~/.bridge/dispatch/; the hub owns all authoritative state, so a killed
@@ -38,6 +40,12 @@ mod session;
 mod store;
 #[path = "../../desktop/src-tauri/src/transport.rs"]
 mod transport;
+// The native merge-train executor (BR#3879, decision BR#3880): `bridge train
+// [--once]` — the port of the BR#3517 Node executor script, which this module
+// tree replaces (the script is deleted; the gate it imported from the hub's TS
+// is ported one-for-one in train_gate.rs).
+mod train;
+mod train_gate;
 
 use dispatch::DispatchConfig;
 use std::path::PathBuf;
@@ -155,6 +163,10 @@ fn main() {
                 eprintln!("[bridge] service install failed: {e}");
                 std::process::exit(1);
             }
+        }
+        "train" => {
+            // native merge-train executor (BR#3879) — replaces the deleted Node executor script
+            std::process::exit(train::run(&args));
         }
         "run" | "--help" | "-h" | "help" => {
             if cmd != "run" {
@@ -728,9 +740,10 @@ fn doctor() -> bool {
             }
         }
         // ---- merge-train executor prerequisites (BR#3517): gh (authed, repo
-        // scope), git, node with type stripping, and the executor script in
-        // the checkout. Warnings (the doctor serves every CLI, not only train
-        // machines) but each one names the fix. ----
+        // scope) and git — `bridge train` is the native executor (BR#3879),
+        // there is no external runtime or script to check. Warnings (the
+        // doctor serves every CLI, not only train machines) but each one
+        // names the fix. ----
         let gh_ver = std::process::Command::new("gh").arg("--version").output();
         ok(
             "gh present",
@@ -754,29 +767,6 @@ fn doctor() -> bool {
             if git_ver.map(|o| o.status.success()).unwrap_or(false) { "" } else { "git not runnable" },
             &mut bad, false,
         );
-        let node_ver = std::process::Command::new("node").arg("--version").output();
-        match node_ver {
-            Ok(o) if o.status.success() => {
-                let v = String::from_utf8_lossy(&o.stdout).trim().trim_start_matches('v').to_string();
-                let major: u32 = v.split('.').next().unwrap_or("0").parse().unwrap_or(0);
-                let detail = if major >= 23 {
-                    String::new()
-                } else {
-                    format!("node {v} — the executor imports the hub's TS helpers; node ≥ 23 (native type stripping) required")
-                };
-                ok("node (executor runtime)", &detail, &mut bad, false);
-            }
-            _ => ok("node (executor runtime)", "node not runnable — scripts/merge-train.mjs cannot start", &mut bad, false),
-        }
-        if !cfg.workdir.is_empty() {
-            let script = std::path::Path::new(&cfg.workdir).join("scripts/merge-train.mjs");
-            let detail = if script.exists() {
-                String::new()
-            } else {
-                format!("missing at {} — pull the merge-train branch (BR#3517)", script.display())
-            };
-            ok("executor script", &detail, &mut bad, false);
-        }
         if model_to_check(&cfg).is_some() {
             let url = format!("{}/v1/models", cfg.url.trim_end_matches('/'));
             let probe = client
@@ -1185,6 +1175,8 @@ USAGE:
   bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
+  bridge train [--once]  native merge-train executor (BR#3516): drive the serialized
+                           merge train — 45s tick loop, or one tick with --once
   bridge logs [opts]     view the hub event log (headless):
                            --limit N    last N events (default 30)
                            -f           follow — poll for new events

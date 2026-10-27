@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git, node ≥23, scripts/merge-train.mjs) — every failure names the fix
+bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -479,16 +479,17 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
-`scripts/merge-train.mjs` runs on any machine that has `gh` (authed, with the `repo`
-scope), `git`, **Node ≥ 23** (native type stripping — it imports the hub's own gate
-helpers from `packages/worker/src/kb/core.ts`) and a clone of the target repo:
+`bridge train` — the executor is native to the CLI (BR#3879: the Node script and its
+runtime dependency are gone, the gate ported one-for-one into `train_gate.rs`). It runs
+on any machine that has `gh` (authed, with the `repo` scope), `git` and a clone of the
+target repo — no Node, nothing to materialize:
 
 ```bash
 cd /path/to/repo-clone                 # the repo the train drives (MERGE_TRAIN_WORKDIR)
 export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
 export BRIDGE_TOKEN=<token from the Connect tab>
-node /path/to/bridge/scripts/merge-train.mjs          # long-running loop (45s ticks)
-node /path/to/bridge/scripts/merge-train.mjs --once   # single tick (cron-friendly)
+bridge train                           # long-running loop (45s ticks)
+bridge train --once                    # single tick (cron-friendly)
 ```
 
 Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
@@ -496,8 +497,8 @@ Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
 rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone, default cwd). Flags:
 `--lane <repo>@<base>` (drive one lane only), `--once`, `--interval <secs>`,
 `--method <m>`. `bridge doctor` gates the prerequisites (gh present + authed + `repo`
-scope, git, node ≥ 23, the executor script in the checkout — each failure names the
-fix); the script re-probes the cheap ones every start. Keep it alive like the runner
+scope, git — each failure names the fix); the executor re-probes the cheap ones every
+start. Keep it alive like the runner
 (systemd / launchd / `nohup`) or run `--once` from cron. It merges as whatever identity
 that `gh` is authed as — use the detached-cody credential per BR#3181, never a personal
 one.
@@ -509,7 +510,7 @@ lands, stops or pends) → else the queue head's **first unlanded leg on this la
 `train:merged` → next tick polls CI on the merge commit. Every fact crosses the
 executor's fact boundary normalized (BR#3714): gh's GraphQL `mergeable` is the enum
 string `"MERGEABLE"|"CONFLICTING"|"UNKNOWN"` — never a boolean — and
-`mergeStateStatus` is UPPERCASE; `prFacts()` maps them to the boolean|null/lowercase
+`mergeStateStatus` is UPPERCASE; `pr_facts()` maps them to the boolean|null/lowercase
 the shared gate compares. Fed raw, the strings satisfied neither `mergeable !== true`
 nor `=== "clean"`, and every gated candidate bounced (genuinely mergeable PRs
 included) as "unmergeable — CONFLICTING".

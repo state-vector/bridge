@@ -1102,7 +1102,7 @@ export function prEscalationAskTitle(repo: string, prNumber: number, cardId: str
 // Serialized merge train (decision BR#3516, accepted; impl BR#3517): one merge
 // at a time per (repo, base) lane, leased to an opportunistic edge executor.
 // Division of labour — the hub holds no VCS credentials, ever: the executor
-// (scripts/merge-train.mjs on a gateway machine, worker-local gh) fetches
+// (`bridge train` on a gateway machine, worker-local gh) fetches
 // GitHub facts and reports them through the train ops; the HUB decides (this
 // decision layer + the DO's state machine). Pure helpers here; the DO
 // (kb/do.ts) owns the lane card primitive, the lease write, the train_events
@@ -1196,7 +1196,7 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
-    `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`scripts/merge-train.mjs\` on a gateway to work it.`,
+    `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`bridge train\` on a gateway to work it.`,
   ].join("\n");
 }
 

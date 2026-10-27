@@ -115,7 +115,7 @@ describe("stopLineAskTitle (one ask per red episode)", () => {
 // ---------- tier 2: the train's stop-the-line drills (real DO, no GitHub) ----------
 // The hub holds no VCS credentials (BR#3516 §8 — the canned-GitHub sweeps are
 // deleted), so the drill FEEDS red/green facts through the train ops exactly
-// as scripts/merge-train.mjs does, and asserts the hub's decisions. Each test
+// as `bridge train` (the native executor) does, and asserts the hub's decisions. Each test
 // works its own lane (distinct repo) so episodes never cross-talk; the alarm
 // ask is bound to a drill-local sink via the `train_alarm_sink_id` setting
 // (production default BR#3124).
