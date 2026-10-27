@@ -223,6 +223,17 @@ export const RULES: Rule[] = [
       !!i.owner &&
       i.owner !== i.actor &&
       !OWNER_RELEASE_EXEMPT.test(i.actor) &&
+      // BR#3611: gateway SELF-release of its own attributed claim. A
+      // gateway's claim is attributed — owner = attributedAgent
+      // (`owner = attributedAgent ?? actor`, do.ts claim path) — so the
+      // gateway's raw actor differs from the owner by construction and the
+      // gate above structurally refuses every self-release (the stale-claim
+      // path in dispatch.rs never succeeded live). `body.gateway` is derived
+      // from the token's gateway tag (mcp.ts, never client args) and
+      // `body.agent` is the attributed agent — a plain agent token cannot
+      // forge the pair. A DIFFERENT gateway's agent ≠ owner → still gated
+      // (claim-race semantics preserved).
+      !(i.body?.gateway === true && !!i.body?.agent && i.body.agent === i.owner) &&
       // PROVEN-UNBLOCK RELEASE (2026-10-25, Ray GO): a role:unblock duty that
       // VERIFIED the card's exit condition met may release a PARKED card —
       // scope: from-status blocked (a park, not a live claim) + the release
@@ -717,7 +728,15 @@ export function breachClass(reason: string): string {
   // (dispatched session vs runner-held claim) tried to release a claimed
   // card. The gate refuses, the loser skips, the owner/human decides.
   // Symmetric with the runner (dispatch.rs is_claim_race_error). Specimen: BR#3427.
-  if (r.includes("only the owner or a human can release it")) return "claim_race";
+  // BR#3611: match the STRUCTURAL pair, not a sentence literal — the runner
+  // already does (`is_claim_race_error`: "claimed by" + "only the owner").
+  // PR #210 (8a1acbd) edited the guard's wording ("a human" → "a human, or
+  // an unblock duty holding proof of the met exit condition") and the old
+  // literal stopped matching, silently re-arming breach cards on the
+  // ownership key (specimen BR#3610). Both wordings contain
+  // `is claimed by <owner> — only the owner`; future wording edits stop
+  // re-breaking this classifier.
+  if (r.includes("claimed by") && r.includes("only the owner")) return "claim_race";
   if (r.includes("pr link")) return "gate:review-needs-pr";
   if (r.includes("unreviewed")) return "gate:done-unreviewed";
   if (r.includes("references no git repository")) return "gate:no-repo";
