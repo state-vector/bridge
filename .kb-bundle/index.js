@@ -33147,6 +33147,11 @@ var index_default = {
     if (url2.pathname === "/ingest") {
       return handleIngest(request, env);
     }
+    if (url2.pathname === "/v1/models") {
+      if (request.method !== "GET" && request.method !== "HEAD") return json3({ error: "GET only" }, 405);
+      const ids = [...new Set(String(env.MODEL_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean))];
+      return json3({ object: "list", data: ids.map((id) => ({ id, object: "model", owned_by: "bridge" })) });
+    }
     if (url2.pathname === "/api/kb-machine/rename") {
       const body = await request.json().catch(() => ({}));
       const { resolveTokenWs: resolveTokenWs2 } = await Promise.resolve().then(() => (init_mcp2(), mcp_exports));

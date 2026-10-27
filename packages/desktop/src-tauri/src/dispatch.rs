@@ -2250,6 +2250,48 @@ fn claim_race_run(stdout: &str, stderr: &str) -> bool {
     ownership(stdout) || ownership(stderr)
 }
 
+/// BR#3823: the stale-claim flow's LIVE-card gate. The orient slice and the
+/// liveness verdict describe how the card looked seconds ago; before firing
+/// a release the flow re-checks the freshly-fetched card itself: still
+/// `in_progress` AND still attributed to THIS runner (the owner composite the
+/// hub stamped from the claim's agent identity — `agent_identity(cfg)`,
+/// owner = attributedAgent ?? actor, do.ts). Anything else — the watchdog
+/// stall-released it to blocked, another dispatcher re-claimed it, the fetch
+/// failed, owner is missing — is "not ours to release": skip the release,
+/// the note, and the re-claim (debug only). Fail-safe by construction: an
+/// unverifiable card is never released. Specimen: BR#3299 22:48Z — the old
+/// flow released into a card the watchdog had already redirected; the
+/// ownership rejection folded as breach 'other' and a phantom "stale claim
+/// released" note posted on top, then a note-less re-claim folded a second
+/// 'other' — a ~10-11m cycle per session death.
+fn stale_claim_live(art: &serde_json::Value, expected_owner: &str) -> bool {
+    art.get("status").and_then(|v| v.as_str()) == Some("in_progress")
+        && art.get("owner").and_then(|v| v.as_str()) == Some(expected_owner)
+}
+
+/// BR#3823: the re-claim leg's resolution note. If the card was redirected
+/// to blocked in the race between our release and the re-claim (watchdog
+/// stall-release, churn guard), the note re-stamps the card's own blocked
+/// reason + unblock condition — so the blocked → in_progress leg passes
+/// unblock-needs-resolution (machine.ts) with the prior promise preserved,
+/// not erased, and the transition itself carries an honest account of the
+/// recovery on every path.
+fn reclaim_resolution_note(live: &serde_json::Value) -> String {
+    let base = "runner: re-claim — stale claim released (session died), starting fresh";
+    if live.get("status").and_then(|s| s.as_str()) != Some("blocked") {
+        return base.to_string();
+    }
+    let reason = live
+        .get("blocked_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cond = live
+        .get("unblock_condition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!("{base}; prior block re-stamped — reason: {reason} | unblock condition: {cond}")
+}
+
 fn spawn_opencode(
     cfg: &DispatchConfig,
     snap: &SharedSnapshot,
@@ -3373,12 +3415,57 @@ fn tick(
                 // the dispatched session died holding its claim: release the
                 // stale claim (in_progress → todo), then claim fresh and spawn
                 // a new session (never resume a dead conversation).
-                release_claim(cfg, tid, "runner: stale claim released — session died");
+                // BR#3823: only when the LIVE card still says so. The slice +
+                // liveness verdict can be stale by the time we act — the
+                // watchdog stall-release may have already redirected the card
+                // (blocked) or another dispatcher may hold it. Re-check the
+                // freshly-fetched card: still in_progress AND still attributed
+                // to this runner, else skip the release, the note, and the
+                // re-claim (debug only — the card is not ours to release).
+                let mine = agent_identity(cfg);
+                if !stale_claim_live(&art, &mine) {
+                    eprintln!(
+                        "[dispatch] {tid}: stale-claim check — card now {status}/{owner} (not in_progress/not mine) — skipping release + re-claim (BR#3823)",
+                        status = art.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        owner = art.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
+                    );
+                    snap_activity(
+                        snap,
+                        "info",
+                        &format!("{tid} stale-claim skipped — card moved on, not ours to release (BR#3823)"),
+                    );
+                    continue;
+                }
+                match release_claim(cfg, tid, "runner: stale claim released — session died") {
+                    ReleaseOutcome::Released => {}
+                    ReleaseOutcome::ClaimRace => {
+                        // the release was refused (claim race) — the card was
+                        // NOT released, so there is nothing to re-claim: the
+                        // card is the watchdog's or another dispatcher's now.
+                        eprintln!("[dispatch] {tid}: stale release raced (gate refused) — card not released, skipping re-claim (BR#3823)");
+                        snap_activity(snap, "info", &format!("{tid} stale release raced — skipped (BR#3823)"));
+                        continue;
+                    }
+                    ReleaseOutcome::Failed(e) => {
+                        eprintln!("[dispatch] ERROR: stale release {tid} failed: {e}");
+                        snap_activity(snap, "error", &format!("stale release {tid} failed: {e}"));
+                        attempts.insert(tid.to_string(), Instant::now());
+                        continue;
+                    }
+                }
+                // BR#3823: the re-claim leg carries a resolution note — if the
+                // card was redirected to blocked between our release and this
+                // claim, the note re-stamps the card's own blocked reason +
+                // unblock condition so the blocked → in_progress leg passes
+                // unblock-needs-resolution (a note-less re-claim there folded
+                // as a second breach-'other', specimen BR#3299).
+                let live = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+                let reclaim_note = reclaim_resolution_note(&live);
                 match mcp_call_task(
                     cfg,
                     id,
                     "transition",
-                    json!({ "id": tid, "to": "in_progress" }),
+                    json!({ "id": tid, "to": "in_progress", "note": reclaim_note }),
                     &tid,
                 ) {
                     Ok(_) => {}
@@ -4666,6 +4753,80 @@ mod tests {
         assert!(failed.contains("RELEASE FAILED"));
         assert!(failed.contains("card NOT released"));
         assert!(failed.contains("bridge unreachable"));
+    }
+
+    // ---------- BR#3823: the stale-claim flow acts on the LIVE card ----------
+
+    #[test]
+    fn stale_claim_live_requires_in_progress_and_own_attribution_br3823() {
+        let mine = "macbook-pro-local-opencode";
+        // still ours and still in_progress → the flow may release + re-claim
+        assert!(stale_claim_live(
+            &json!({ "id": "BR#1", "status": "in_progress", "owner": mine }),
+            mine
+        ));
+        // the BR#3299 specimen shape: the watchdog stall-released the card to
+        // blocked before the flow fired — skip (release, note, re-claim all)
+        assert!(!stale_claim_live(
+            &json!({ "id": "BR#3299", "status": "blocked", "owner": "" }),
+            mine
+        ));
+        // another dispatcher re-claimed → not ours any more
+        assert!(!stale_claim_live(
+            &json!({ "id": "BR#2", "status": "in_progress", "owner": "other-gw-opencode" }),
+            mine
+        ));
+        // owner missing → unattributable → fail-safe skip
+        assert!(!stale_claim_live(&json!({ "id": "BR#3", "status": "in_progress" }), mine));
+        // fetch failed (empty slice) → fail-safe skip
+        assert!(!stale_claim_live(&json!({}), mine));
+    }
+
+    #[test]
+    fn release_outcome_maps_the_three_release_results_br3823() {
+        // success → Released (the re-claim leg may run)
+        assert_eq!(
+            release_outcome(&Ok(json!({ "id": "BR#1", "status": "todo" }))),
+            ReleaseOutcome::Released
+        );
+        // ownership-gate refusal → ClaimRace (re-claim leg must NOT run;
+        // release_note already stays silent on this shape — BR#3611)
+        assert_eq!(
+            release_outcome(&Err("ERROR: task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead. [rule: release-needs-ownership]".to_string())),
+            ReleaseOutcome::ClaimRace
+        );
+        // lifecycle refusal (the card flipped to blocked under us) → ClaimRace
+        assert_eq!(
+            release_outcome(&Err(
+                "task: 'in_progress' → 'todo' not allowed (allowed: in_review, done, blocked)".to_string()
+            )),
+            ReleaseOutcome::ClaimRace
+        );
+        // genuine failure → Failed (the honest failure note was already posted)
+        match release_outcome(&Err("bridge unreachable: connection refused".to_string())) {
+            ReleaseOutcome::Failed(e) => assert!(e.contains("bridge unreachable")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaim_note_re_stamps_the_prior_block_br3823() {
+        // the card was redirected to blocked between our release and the
+        // re-claim: the note re-stamps the card's own reason + unblock
+        // condition so the blocked → in_progress leg passes
+        // unblock-needs-resolution with the prior promise preserved
+        let note = reclaim_resolution_note(&json!({
+            "status": "blocked",
+            "blocked_reason": "stalled — no update for >10m; released to the pool by watchdog",
+            "unblock_condition": "read the task history (get_history) and the last gate error",
+        }));
+        assert!(note.contains("re-claim"));
+        assert!(note.contains("stalled — no update for >10m; released to the pool by watchdog"));
+        assert!(note.contains("read the task history (get_history) and the last gate error"));
+        // plain path (card todo after our release) → generic note, no re-stamp
+        let plain = reclaim_resolution_note(&json!({ "status": "todo" }));
+        assert!(plain.contains("re-claim"));
+        assert!(!plain.contains("re-stamped"));
     }
 
     #[test]
