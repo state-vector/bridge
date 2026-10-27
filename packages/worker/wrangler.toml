@@ -48,9 +48,19 @@ new_sqlite_classes = ["KnowledgeHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
+# BR#3885: /v1/models joins the same law that put /api/token/repair here
+# (372bbe973) — a route missing from this list is silently eaten by the SPA
+# assets layer. Any new worker-handled path MUST be added here.
+run_worker_first = ["/__version", "/ingest", "/v1/models", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
 
 [vars]
+# The model registry (BR#3885): comma-separated ids served by GET /v1/models
+# in OpenAI shape — the list the CLI doctor's pinned-model check resolves
+# against (trim + dedupe applied; empty = 0 ids served, a named doctor FAIL).
+# Set it HERE, not in the dashboard — this file is the deploy truth and a
+# push would clobber dashboard-only vars. e.g.
+#   MODEL_IDS = "sp-gateway/glm-5.3-flash,glm-4.7"
+MODEL_IDS = ""
 # Overridden by `wrangler secret put` at deploy:
 #   GITHUB_CLIENT_ID      GitHub OAuth app client id (human sign-in)
 #   GITHUB_CLIENT_SECRET  GitHub OAuth app client secret (also HMAC-signs session cookies)
