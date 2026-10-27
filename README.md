@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git, node ≥23, scripts/merge-train.mjs) — every failure names the fix
+bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, the merge-train executor prerequisites (gh authed + repo scope, git, node ≥23), and that the workdir's executor copies match the ones embedded in this install — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -479,6 +479,15 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+The executor ships **inside the CLI install** (decision BR#3880 — the install is the
+unit): every `bridge run` start materializes the executor and its one dependency —
+`{workdir}/scripts/merge-train.mjs` + `{workdir}/packages/worker/src/kb/core.ts` —
+byte-compared against the copies embedded in the binary, so a current copy is a no-op
+and a stale one is refreshed. No bridge checkout is required on the executor box; the
+workdir copies are derived cache, and `bridge doctor` compares them against this
+install (missing/stale → the remedy is always "start `bridge run`, which materializes
+its own executor" — never a branch or ref).
+
 `scripts/merge-train.mjs` runs on any machine that has `gh` (authed, with the `repo`
 scope), `git`, **Node ≥ 23** (native type stripping — it imports the hub's own gate
 helpers from `packages/worker/src/kb/core.ts`) and a clone of the target repo:
@@ -487,8 +496,8 @@ helpers from `packages/worker/src/kb/core.ts`) and a clone of the target repo:
 cd /path/to/repo-clone                 # the repo the train drives (MERGE_TRAIN_WORKDIR)
 export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
 export BRIDGE_TOKEN=<token from the Connect tab>
-node /path/to/bridge/scripts/merge-train.mjs          # long-running loop (45s ticks)
-node /path/to/bridge/scripts/merge-train.mjs --once   # single tick (cron-friendly)
+node <workdir>/scripts/merge-train.mjs                # the CLI-materialized copy (long-running loop, 45s ticks)
+node /path/to/bridge/scripts/merge-train.mjs --once   # a checkout copy works too (single tick, cron-friendly)
 ```
 
 Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
@@ -496,8 +505,10 @@ Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
 rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone, default cwd). Flags:
 `--lane <repo>@<base>` (drive one lane only), `--once`, `--interval <secs>`,
 `--method <m>`. `bridge doctor` gates the prerequisites (gh present + authed + `repo`
-scope, git, node ≥ 23, the executor script in the checkout — each failure names the
-fix); the script re-probes the cheap ones every start. Keep it alive like the runner
+scope, git, node ≥ 23, and the workdir executor copies matching this install — each
+failure names the fix, and the executor remedy is always "start `bridge run`, which
+materializes its own copies from the install"); the script re-probes the cheap ones
+every start. Keep it alive like the runner
 (systemd / launchd / `nohup`) or run `--once` from cron. It merges as whatever identity
 that `gh` is authed as — use the detached-cody credential per BR#3181, never a personal
 one.

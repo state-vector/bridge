@@ -48,6 +48,30 @@ use std::sync::{Arc, Mutex};
 const BRIDGE_AGENT_MD: &str = include_str!("../agents/bridge.md");
 const BRIDGE_AGENT_NAME: &str = "bridge";
 
+/// The merge-train executor, shipped INSIDE the install (decision BR#3880:
+/// the install is the unit — a shipped binary never sends the workdir chasing
+/// a mutable VCS ref; the workdir copy is derived cache, materialized from
+/// here). Same pattern as BRIDGE_AGENT_MD above.
+const MERGE_TRAIN_MJS: &str = include_str!("../../../scripts/merge-train.mjs");
+/// The executor's one local import — the shared train-gate helpers (a single
+/// self-contained file, zero imports of its own). Embedded alongside so the
+/// materialized pair is complete: the executor runs from the workdir alone,
+/// no bridge checkout required.
+const MERGE_TRAIN_CORE_TS: &str = include_str!("../../../packages/worker/src/kb/core.ts");
+
+/// Every runtime asset the merge-train executor needs, as
+/// `(workdir-relative path, embedded contents, doctor check name)`.
+/// Materialized into the workdir at runner start; the doctor compares the
+/// workdir copies against these same embedded copies.
+const EXECUTOR_ASSETS: &[(&str, &str, &str)] = &[
+    ("scripts/merge-train.mjs", MERGE_TRAIN_MJS, "executor script"),
+    (
+        "packages/worker/src/kb/core.ts",
+        MERGE_TRAIN_CORE_TS,
+        "executor gate helpers",
+    ),
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
@@ -288,6 +312,16 @@ fn run(cfg: Option<DispatchConfig>) {
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let last_error = Arc::new(Mutex::new(None));
     let snap = Arc::new(Mutex::new(dispatch::DispatchSnapshot::default()));
+    // The install is the unit (decision BR#3880): every runner start refreshes
+    // the workdir's executor copies from the binary — setup flows through here
+    // too (pair/first-run both onboard then run), so env-configured and
+    // systemd-restarted runners re-derive the cache identically. Idempotent:
+    // current copies are not rewritten.
+    if let Some(c) = &cfg {
+        if !c.workdir.is_empty() {
+            materialize_executor(&c.workdir);
+        }
+    }
     dispatch::run_loop(cfg, stop, running, last_error, snap);
 }
 
@@ -655,6 +689,74 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
     }
 }
 
+/// A workdir copy of a shipped runtime asset vs the copy embedded in this
+/// install (decision BR#3880 §2: the doctor asserts facts about the current
+/// install and prescribes only what the install can deliver).
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum AssetState {
+    /// byte-identical to the embedded copy — nothing to do
+    Current,
+    /// present but different bytes
+    Stale,
+    /// absent or unreadable
+    Missing,
+}
+
+/// Compare one workdir file against the embedded copy.
+fn asset_state(path: &std::path::Path, embedded: &str) -> AssetState {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes == embedded.as_bytes() => AssetState::Current,
+        Ok(_) => AssetState::Stale,
+        Err(_) => AssetState::Missing,
+    }
+}
+
+/// Doctor detail for one workdir asset. The remedy derives from the install
+/// ONLY (decision BR#3880): the runner materializes its own executor, so the
+/// cure is starting it — never "pull branch X", never a PR, never a BR id
+/// (mutable VCS pointers baked into a shipped binary go stale by design).
+fn executor_detail(state: AssetState, path: &std::path::Path) -> String {
+    match state {
+        AssetState::Current => String::new(),
+        AssetState::Missing => format!(
+            "missing at {} — start `bridge run` (it materializes its own executor from this install)",
+            path.display()
+        ),
+        AssetState::Stale => format!(
+            "stale at {} — start `bridge run` (it materializes its own executor from this install)",
+            path.display()
+        ),
+    }
+}
+
+/// Write the embedded copy of one asset into the workdir if missing or
+/// byte-differs. Idempotent: a current copy is a no-op (no write at all).
+/// Returns whether a write happened.
+fn materialize_asset(workdir: &str, rel: &str, embedded: &str) -> std::io::Result<bool> {
+    let path = std::path::Path::new(workdir).join(rel);
+    if asset_state(&path, embedded) == AssetState::Current {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, embedded)?;
+    Ok(true)
+}
+
+/// Materialize every shipped executor asset into the workdir. Best-effort at
+/// runner start: a failed write must not kill dispatch — the doctor surfaces
+/// any residue as a named check.
+fn materialize_executor(workdir: &str) {
+    for (rel, embedded, _) in EXECUTOR_ASSETS {
+        match materialize_asset(workdir, rel, embedded) {
+            Ok(true) => eprintln!("[bridge] materialized {rel} into the workdir (from this install)"),
+            Ok(false) => {}
+            Err(e) => eprintln!("[bridge] WARNING: could not materialize {rel} into the workdir: {e} — `bridge doctor` names the residue"),
+        }
+    }
+}
+
 /// Headless setup check: every failure names the fix. Exit 1 when setup is
 /// incomplete so scripts can gate on it.
 fn doctor() -> bool {
@@ -727,10 +829,10 @@ fn doctor() -> bool {
                 Err(e) => ok("token valid", &format!("probe failed: {e}"), &mut bad, false),
             }
         }
-        // ---- merge-train executor prerequisites (BR#3517): gh (authed, repo
-        // scope), git, node with type stripping, and the executor script in
-        // the checkout. Warnings (the doctor serves every CLI, not only train
-        // machines) but each one names the fix. ----
+        // ---- executor currency (decision BR#3880): the binary carries the
+        // canonical copies, the workdir copies are derived cache. gh/git/node
+        // prerequisites stay warnings (the doctor serves every CLI, not only
+        // train machines) but each one names the fix. ----
         let gh_ver = std::process::Command::new("gh").arg("--version").output();
         ok(
             "gh present",
@@ -769,13 +871,11 @@ fn doctor() -> bool {
             _ => ok("node (executor runtime)", "node not runnable — scripts/merge-train.mjs cannot start", &mut bad, false),
         }
         if !cfg.workdir.is_empty() {
-            let script = std::path::Path::new(&cfg.workdir).join("scripts/merge-train.mjs");
-            let detail = if script.exists() {
-                String::new()
-            } else {
-                format!("missing at {} — pull the merge-train branch (BR#3517)", script.display())
-            };
-            ok("executor script", &detail, &mut bad, false);
+            for (rel, embedded, name) in EXECUTOR_ASSETS {
+                let path = std::path::Path::new(&cfg.workdir).join(rel);
+                let detail = executor_detail(asset_state(&path, embedded), &path);
+                ok(name, &detail, &mut bad, false);
+            }
         }
         if model_to_check(&cfg).is_some() {
             let url = format!("{}/v1/models", cfg.url.trim_end_matches('/'));
@@ -1173,6 +1273,58 @@ mod tests {
         assert!(extract_model_ids(&empty).is_empty());
         let junk: serde_json::Value = serde_json::json!({ "unexpected": true });
         assert!(extract_model_ids(&junk).is_empty());
+    }
+
+    #[test]
+    fn executor_assets_materialize_into_an_empty_workdir_idempotently() {
+        // BR#3879: a fresh install + empty workdir must yield a WORKING
+        // executor — every shipped asset materializes (the script AND its one
+        // self-contained import), the second run is a no-op write, and the
+        // doctor's three states (missing/stale/current) are all observed.
+        let dir = std::env::temp_dir().join(format!("bridge-3879-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp workdir");
+        let wd = dir.to_str().expect("utf-8 temp dir");
+
+        for (rel, embedded, _) in EXECUTOR_ASSETS {
+            let path = dir.join(rel);
+            assert_eq!(asset_state(&path, embedded), AssetState::Missing, "{rel}");
+            assert!(materialize_asset(wd, rel, embedded).expect("write"), "{rel}");
+            assert_eq!(asset_state(&path, embedded), AssetState::Current, "{rel}");
+            // idempotent: a current copy is not rewritten
+            assert!(!materialize_asset(wd, rel, embedded).expect("no-op"), "{rel}");
+        }
+
+        // stale: foreign bytes → Stale → materialize refreshes → Current
+        let script = dir.join("scripts/merge-train.mjs");
+        std::fs::write(&script, "// some stale copy from an old ref").unwrap();
+        assert_eq!(asset_state(&script, MERGE_TRAIN_MJS), AssetState::Stale);
+        assert!(materialize_asset(wd, "scripts/merge-train.mjs", MERGE_TRAIN_MJS).unwrap());
+        assert_eq!(asset_state(&script, MERGE_TRAIN_MJS), AssetState::Current);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn executor_remedies_derive_from_the_install_only() {
+        // Decision BR#3880: a doctor remedy never names a mutable VCS ref —
+        // no branch pull instructions, no PR, no BR id, no checkout steps.
+        // The only cure it prescribes is materializing from this install.
+        // (The banned substrings are assembled from pieces so THIS source
+        // file itself carries no mutable-ref pointer for the done-when grep.)
+        let pull_the = concat!("pull", " the");
+        let branch_paren = concat!("branch", " (");
+        for (rel, _, name) in EXECUTOR_ASSETS {
+            for state in [AssetState::Missing, AssetState::Stale] {
+                let detail = executor_detail(state, std::path::Path::new(rel));
+                for banned in [pull_the, branch_paren, "BR#", "PR #", "checkout", "git pull"] {
+                    assert!(!detail.contains(banned), "{name}: remedy names a mutable ref ({banned}): {detail}");
+                }
+                assert!(detail.contains("bridge run"), "{name}: remedy must name the install's own materializer: {detail}");
+                assert!(detail.contains("from this install"), "{name}: remedy must derive from the install: {detail}");
+            }
+        }
+        assert_eq!(executor_detail(AssetState::Current, std::path::Path::new("x")), "");
     }
 }
 
