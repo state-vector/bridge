@@ -19,6 +19,7 @@ import {
   type Applied,
 } from "../src/kb/machine.ts";
 import { LIFECYCLES } from "../src/kb/core.ts";
+import { AWAIT_GRAMMAR_DOC } from "../src/kb/closure.ts";
 
 // ---- null-law context: every lazy lookup permissive/empty. Individual tests
 // override only the accessor they exercise. ----
@@ -1019,6 +1020,46 @@ describe("claim-race classification (BR#3337)", () => {
     expect(detectBreaches(mixedOwnership, new Set())).toMatchObject([
       { klass: "gate:done-unreviewed", count: 3 },
     ]);
+  });
+});
+
+// ---------- BR#3738: the BR#3578 fail-closed typed-await park gates ----------
+
+describe("typed-await gate classification (BR#3738)", () => {
+  // The two BR#3578 rejections a mis-parked card can raise, built from the
+  // live grammar doc exactly as the guards emit them (machine.ts, rule
+  // blocked-needs-typed-await) plus the " [rule: …]" suffix do.ts appends to
+  // every guard rejection. Specimen BR#3731 event 1 (2026-10-26T16:27:45Z):
+  // a verify duty parked BR#3576 with {event:"run_success", run_id: 40358175346
+  // as a NUMBER} → gate refused; the corrected string retry succeeded 32s
+  // later — the gate, not the park, was rejected. Both fold as 'other' here
+  // until this fix.
+  const BLOCKED_NEEDS_TYPED_AWAIT = `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578) [rule: blocked-needs-typed-await]`;
+  const MALFORMED_AWAIT_EVENT = `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC} [rule: blocked-needs-typed-await]`;
+
+  it("classifies the two fail-closed typed-await park gates", () => {
+    expect(breachClass(BLOCKED_NEEDS_TYPED_AWAIT)).toBe("gate:blocked-needs-typed-await");
+    expect(breachClass(MALFORMED_AWAIT_EVENT)).toBe("gate:malformed-await-event");
+  });
+
+  it("classifies through the 300-char audit slice — the [rule: …] tag never survives it", () => {
+    // do.ts audits reason = e.message.slice(0, 300); both gate messages embed
+    // AWAIT_GRAMMAR_DOC (~290 chars), so the tag is cut off in the stored
+    // event. The stems must live inside the slice — that is why these two
+    // gates match message stems rather than the rule tag.
+    expect(breachClass(BLOCKED_NEEDS_TYPED_AWAIT.slice(0, 300))).toBe("gate:blocked-needs-typed-await");
+    expect(breachClass(MALFORMED_AWAIT_EVENT.slice(0, 300))).toBe("gate:malformed-await-event");
+  });
+
+  it("a typed-await gate storm raises ONE breach card under its own class", () => {
+    const storm = (reason: string, task: string) =>
+      [0, 1, 2].map((n) => ({ ts: 2_000_000 + n * 60_000, task, op: "transition_rejected", reason }));
+    const malformed = detectBreaches(storm(MALFORMED_AWAIT_EVENT, "BR#3738A"), new Set());
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0].klass).toBe("gate:malformed-await-event");
+    const blockedNeeds = detectBreaches(storm(BLOCKED_NEEDS_TYPED_AWAIT, "BR#3738B"), new Set());
+    expect(blockedNeeds).toHaveLength(1);
+    expect(blockedNeeds[0].klass).toBe("gate:blocked-needs-typed-await");
   });
 });
 
