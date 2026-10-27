@@ -254,7 +254,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.answer_ask,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("ask.answer", { id: args.id, answer: args.answer }))),
   },
-  // ---- merge train (BR#3516/BR#3517) — executor-facing: scripts/merge-train.mjs.
+  // ---- merge train (BR#3516/BR#3517) — executor-facing: bridge train.
   // Division of labour: the EXECUTOR fetches GitHub facts and performs the
   // merge (worker-local gh, doctor-defended); the HUB decides and holds NO
   // VCS credentials. Every mutating op requires the lane lease (train_lease

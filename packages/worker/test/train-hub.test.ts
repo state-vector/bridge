@@ -110,7 +110,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(lane1.blocked.reason).toBe("merge-train: awaiting an available gateway");
     const laneTags = Array.isArray(l1.body.tags) ? l1.body.tags : JSON.parse(String(l1.body.tags ?? "[]"));
     expect(laneTags).toEqual(expect.arrayContaining(["merge-train", "infrastructure"]));
-    expect(String(l1.body.body_md)).toContain("scripts/merge-train.mjs");
+    expect(String(l1.body.body_md)).toContain("bridge train");
     expect(String(l1.body.body_md)).toContain("BR#3516");
     expect(String(l1.body.body_md)).toContain("Rust Tests");
     // find-or-create: the second call returns the SAME card, untouched
