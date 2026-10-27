@@ -101,7 +101,13 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   steering: { draft: ["active"], active: ["superseded"] },
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
   decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+  // blocked → superseded (BR#3913, per accepted BR#2508(a)): a parked card's
+  // one drop edge. Guarded at the law table (machine.ts supersede-authority):
+  // an answered ask offering SUPERSEDE (the answer is the authorisation,
+  // BR#3578 dispatch) or a web/human action may take it — a bare agent
+  // session never can. todo/done stay closed (BR#2508: done is a reviewed
+  // terminal; a drop never rides the churn-counted release path).
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo", "superseded"] },
   // questions are answered, never claimed: todo → done (answer) or superseded (closed by ADR)
   question: { todo: ["done", "superseded"] },
   progress: {},
