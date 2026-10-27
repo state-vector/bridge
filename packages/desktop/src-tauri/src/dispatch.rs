@@ -486,6 +486,10 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
                 .map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| s.eq_ignore_ascii_case("gateway")))
                 .unwrap_or(false);
             apply_vended_credentials(&mut cfg, url, &token, &ws, label, gateway_class)?;
+            // BR#3787 — fresh pairing: full re-adopt of the epoch from the
+            // next response header (the vend response may not carry it).
+            TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+            TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
             eprintln!("[pair] authorized — token for workspace '{}' saved to the keychain (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
             Ok(PairPoll::Authorized(cfg))
         }
@@ -626,6 +630,58 @@ pub fn self_provision(
         "[dispatch] gateway self-provisioned for workspace '{}' — token in the OS keychain",
         cfg.ws.as_deref().unwrap_or("?")
     );
+    // BR#3787 — full re-adopt: the next response's epoch header becomes the
+    // vend epoch (avoids repairing against a stale observed epoch).
+    TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+    TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
+    Ok(cfg)
+}
+
+/// BR#3787 layer 2 — agent-plane repair: re-vend THIS device's row using the
+/// durable principal. No human plane, no session cookie — headless gateways
+/// self-heal (hermes-class boxes never could). The hub matches by principal
+/// ONLY (never label — the theft class) and rate-limits per row; the
+/// response's secret becomes our credential and its epoch the vend epoch.
+fn repair_by_principal(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<DispatchConfig, String> {
+    let principal = ensure_principal_from_file();
+    if principal.is_empty() {
+        return Err("no device principal on file — re-pair required".into());
+    }
+    let resp = client
+        .post(format!("{url}/api/token/repair"))
+        .header("content-type", "application/json")
+        .body(json!({ "principal": principal, "host": host_slug() }).to_string())
+        .send()
+        .map_err(|e| format!("bridge unreachable: {e}"))?;
+    // read the body as text first so a non-JSON response (Cloudflare error
+    // page, HTML redirect, plain-text 500) is NAMED in the error
+    let body_text = resp.text().map_err(|e| format!("read body: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+        format!(
+            "hub returned non-JSON for token repair: {e} — body: {}",
+            body_text.chars().take(200).collect::<String>()
+        )
+    })?;
+    let err = || {
+        format!(
+            "token repair failed: {}",
+            parsed.get("error").and_then(|e| e.as_str()).unwrap_or("no secret in response")
+        )
+    };
+    let secret = parsed.get("secret").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).ok_or_else(err)?;
+    let ws = parsed.get("ws").and_then(|w| w.as_str()).filter(|w| !w.is_empty()).unwrap_or("state-vector").to_string();
+    let label = parsed.get("label").and_then(|l| l.as_str()).map(|s| s.to_string());
+    if let Some(ep) = parsed.get("epoch").and_then(|e| e.as_u64()) {
+        TOKEN_EPOCH_VEND.store(ep, Ordering::Relaxed);
+    } else {
+        TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
+    }
+    TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+    let mut cfg = load_config().unwrap_or_else(default_config);
+    apply_vended_credentials(&mut cfg, url, secret, &ws, label, true)?;
     Ok(cfg)
 }
 
@@ -845,6 +901,16 @@ fn mcp_call_session(
     if !resp.status().is_success() {
         return Err(format!("bridge {} on /mcp", resp.status()));
     }
+    // BR#3787 — the epoch rides every authenticated response; capture it
+    // before the body is consumed.
+    if let Some(v) = resp
+        .headers()
+        .get("x-bridge-token-epoch")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        TOKEN_EPOCH_SEEN.store(v, Ordering::Relaxed);
+    }
     let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     if let Some(err) = body.get("error") {
         return Err(format!(
@@ -898,10 +964,24 @@ fn agent_identity(cfg: &DispatchConfig) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "gateway".into());
+    format!("{}-{}", slugify(&host).to_lowercase(), agent_segment(cfg))
+}
+
+/// The agent segment nested under the gateway label (<gateway>/<segment>):
+/// the agent_name override when set, else just the backend name. The gateway
+/// label already carries the machine — the old <hostname>-<backend> autogen
+/// double-prefixed it (macbook-pro-local-2/macbook-pro-local-opencode = 46
+/// chars) past the hub's 40-char token-label cap, so every dispatch 400'd on
+/// provisioning and released its claim; hermes (ip-172-31-1-230/…) only fit
+/// at exactly 40 by luck (BR#3846).
+fn agent_segment(cfg: &DispatchConfig) -> String {
+    if let Some(a) = &cfg.agent_name {
+        return a.clone();
+    }
     let backend = cfg.backends.keys().next().cloned()
         .or_else(|| cfg.backend.clone())
         .unwrap_or_else(|| "opencode".into());
-    format!("{}-{}", slugify(&host).to_lowercase(), slugify(&backend).to_lowercase())
+    slugify(&backend).to_lowercase()
 }
 
 // ---- local dispatch snapshot (rendered by the app's Local view) ----
@@ -1283,7 +1363,14 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
             return scm::forge_for(&expanded).and_then(|f| f.repo_ref(&expanded));
         }
     }
-    let mut rest = body_md;
+    // scrape the newline-unwrapped body: the runner's terminal-width capture
+    // hard-wraps agent output mid-word, and a URL split across lines
+    // ("…/state-vector/super\npositional/pull/2343") scraped as its truncated
+    // first line — a ghost repo that failed to clone and churned the task
+    // (BR#3845). Line breaks are never meaningful inside a URL, so removing
+    // them before scraping can only rejoin real ones.
+    let flat = body_md.replace('\r', "").replace('\n', "");
+    let mut rest: &str = &flat;
     while let Some(i) = rest.find("https://") {
         rest = &rest[i..];
         let end = rest
@@ -1319,7 +1406,58 @@ fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
 
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
 /// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
-fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloneFailure {
+    /// git reached the remote and got a definitive "no such repo" — an
+    /// authoring defect in the card's repo reference. Retrying the same
+    /// reference can never succeed; the BR#3845 class burned 13 watchdog
+    /// cycles re-clone-failing a ghost repo (state-vector/super) before a
+    /// human noticed.
+    NotFound(String),
+    /// credentials — the reference is fine, the runner's access isn't.
+    /// Retrying without fixing access is futile, but it isn't the card's
+    /// defect; named loudly, claimed released, retried only on access change.
+    Auth(String),
+    /// network/infra flake — retry next cycle is the right move.
+    Transient(String),
+}
+
+impl CloneFailure {
+    /// Fatal classes refuse the reference outright (recorded, skipped until it
+    /// changes); Transient keeps the retry-next-cycle behaviour.
+    pub(crate) fn fatal(&self) -> bool {
+        matches!(self, CloneFailure::NotFound(_) | CloneFailure::Auth(_))
+    }
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            CloneFailure::NotFound(s) | CloneFailure::Auth(s) | CloneFailure::Transient(s) => s,
+        }
+    }
+}
+
+/// Classify a git clone/fetch stderr into the failure taxonomy. GitHub says
+/// "Repository not found" for both a missing repo and a private one the
+/// runner can't see — both are fatal-until-changed for this reference.
+fn classify_clone_failure(stderr: &str) -> CloneFailure {
+    let s = stderr.to_lowercase();
+    let fatal_not_found = s.contains("repository not found")
+        || s.contains("repo not found")
+        || s.contains("does not appear to be a git repository")
+        || s.contains("not a git repository");
+    if fatal_not_found {
+        CloneFailure::NotFound(stderr.trim().to_string())
+    } else if s.contains("authentication failed")
+        || s.contains("could not read username")
+        || s.contains("permission denied")
+        || s.contains("http 403")
+    {
+        CloneFailure::Auth(stderr.trim().to_string())
+    } else {
+        CloneFailure::Transient(stderr.trim().to_string())
+    }
+}
+
+fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
     let tail: String = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -1332,28 +1470,85 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
         .join("-");
     let slug = slugify(&tail);
     let repos_dir = PathBuf::from(workdir).join("repos");
-    std::fs::create_dir_all(&repos_dir).ok()?;
+    std::fs::create_dir_all(&repos_dir).map_err(|e| CloneFailure::Transient(e.to_string()))?;
     let path = repos_dir.join(&slug);
     if path.join(".git").exists() {
-        let ok = Command::new("git")
+        let out = Command::new("git")
             .current_dir(&path)
             .args(["fetch", "--all", "--prune"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        return if ok { Some(path) } else { None };
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+        return if out.status.success() {
+            Ok(path)
+        } else {
+            Err(classify_clone_failure(&String::from_utf8_lossy(&out.stderr)))
+        };
     }
-    let ok = Command::new("git")
+    let out = Command::new("git")
         .args(["clone", repo_url])
         .arg(&path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok { Some(path) } else { None }
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+    if out.status.success() {
+        Ok(path)
+    } else {
+        Err(classify_clone_failure(&String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// ---- refused-reference cache (BR#3845 self-heal) ----
+/// A card whose repo reference is fatally unclonable (ghost repo, no access)
+/// must not re-enter the claim→clone-fail→watchdog-release loop forever. The
+/// runner records (task → reference + reason) locally and skips the reference
+/// until it CHANGES on the card — the author fixes the URL, the record no
+/// longer matches, dispatch resumes. Local to this runner host: the hub
+/// machine stays the verdict authority; this is provisioning self-defense.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RefusedRef {
+    pub url: String,
+    pub reason: String,
+    pub ts: u64,
+}
+
+fn refused_cache_path() -> Option<PathBuf> {
+    dispatch_dir().map(|d| d.join("refused-repos.json"))
+}
+
+fn refused_cache_load() -> HashMap<String, RefusedRef> {
+    let Some(p) = refused_cache_path() else {
+        return HashMap::new();
+    };
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn refused_cache_store(cache: &HashMap<String, RefusedRef>) {
+    if let Some(p) = refused_cache_path() {
+        let _ = std::fs::write(&p, serde_json::to_string_pretty(cache).unwrap_or_default());
+    }
+}
+
+/// Whether this task's CURRENT reference is the one we already refused:
+/// true = skip dispatch (the defect stands); false = proceed (fresh task, or
+/// the author fixed the URL — the stale record is dropped so it can't pin the
+/// card forever).
+fn refused_reference(cache: &mut HashMap<String, RefusedRef>, tid: &str, url: Option<&str>) -> bool {
+    match (cache.get(tid), url) {
+        (Some(r), Some(u)) if r.url == u => true,
+        (Some(_), _) => {
+            // reference changed (or removed) since the refusal — re-arm
+            cache.remove(tid);
+            refused_cache_store(cache);
+            false
+        }
+        (None, _) => false,
+    }
 }
 
 /// Owning repo of a worktree: the worktree's .git FILE points at
@@ -1719,6 +1914,22 @@ fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
 const WORKTREE_SWEEP_CAP: usize = 20;
 static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// BR#3787 — negotiated token catch-up. The hub stamps every authenticated
+/// /mcp response with the row's epoch (bumped at each rotation);
+/// TOKEN_EPOCH_VEND is the epoch of the secret this runner holds. 0 = unknown
+/// on either side: the first observation ADOPTS (never repairs on unknowns).
+/// A later mismatch means the row rotated elsewhere (another login/repair) —
+/// the runner re-vends its OWN row proactively at the next tick boundary
+/// instead of discovering the rotation by a mid-dispatch 401.
+static TOKEN_EPOCH_SEEN: AtomicU64 = AtomicU64::new(0);
+static TOKEN_EPOCH_VEND: AtomicU64 = AtomicU64::new(0);
+
+/// Does the epoch the hub just showed differ from the epoch we vended?
+/// 0 on either side means unknown — never repair on unknowns.
+fn epoch_repair_needed(vend: u64, seen: u64) -> bool {
+    vend > 0 && seen > 0 && vend != seen
+}
+
 fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
     let active: HashSet<String> = in_flight
         .iter()
@@ -2063,15 +2274,52 @@ fn spawn_opencode(
         );
     }
     let worktree = if let Some(url) = &repo_url {
-        let Some(repo_path) = ensure_repo_clone(&cfg.workdir, url) else {
-            eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — skipping spawn");
-            snap_activity(snap, "error", &format!("{tid}: clone failed ({url})"));
-            note_task(
-                cfg,
-                tid,
-                &format!("runner: git clone failed for {url} — check the repo exists and the runner host has access; will retry next cycle"),
-            );
-            return;
+        let repo_path = match ensure_repo_clone(&cfg.workdir, url) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — {} — skipping spawn", e.detail());
+                snap_activity(snap, "error", &format!("{tid}: clone failed ({url}): {}", e.detail()));
+                let mut refused = refused_cache_load();
+                if e.fatal() {
+                    // BR#3845 self-heal: record the refusal so the claim →
+                    // clone-fail → 10-min-watchdog-stall → release loop stops
+                    // after ONE cycle; the candidate skip re-arms the moment
+                    // the card's reference changes.
+                    refused.insert(
+                        tid.to_string(),
+                        RefusedRef {
+                            url: url.clone(),
+                            reason: match &e {
+                                CloneFailure::NotFound(_) => "repository not found (authoring defect in the card's repo reference)".into(),
+                                CloneFailure::Auth(_) => "access denied (runner lacks credentials for this repo)".into(),
+                                CloneFailure::Transient(_) => unreachable!("fatal arm"),
+                            },
+                            ts: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        },
+                    );
+                    refused_cache_store(&refused);
+                    release_claim(
+                        cfg,
+                        tid,
+                        &format!(
+                            "runner: clone of {url} is fatally refused ({}) — recorded; dispatch skipped until the card's repo reference changes (fix meta.repo/body URL, or grant the runner access)",
+                            e.detail()
+                        ),
+                    );
+                } else {
+                    // transient: release the claim so the retry starts NOW —
+                    // holding it only bought a 10-minute watchdog stall
+                    release_claim(
+                        cfg,
+                        tid,
+                        &format!("runner: transient clone failure for {url} ({}) — claim released, will retry next cycle", e.detail()),
+                    );
+                }
+                return;
+            }
         };
         let worktree = if cfg.isolate && !skip_worktree {
             ensure_worktree(&repo_path, tid, resume)
@@ -2240,7 +2488,7 @@ fn spawn_opencode(
     // (machinename/*), and the namespace survives re-pairings because the
     // gateway label is the stable root.
     let agent_label = match &cfg.label {
-        Some(l) if !l.is_empty() => format!("{l}/{}", agent_identity(cfg)),
+        Some(l) if !l.is_empty() => format!("{l}/{}", agent_segment(cfg)),
         _ => agent_identity(cfg),
     };
     // Provision the worker's per-agent token. There is NO second class check
@@ -3213,6 +3461,25 @@ fn tick(
         }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        // BR#3845 self-heal: a reference this runner already refused (fatal
+        // clone failure) is skipped WITHOUT claiming — the recorded refusal
+        // stands until the card's repo URL changes, so a ghost reference can't
+        // re-enter the claim → clone-fail → watchdog-stall loop forever. A
+        // changed URL drops the record and dispatch resumes.
+        let candidate_url = source_repo(&body_md, &task_meta);
+        let mut refused = refused_cache_load();
+        if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
+            let reason = refused.get(tid).map(|r| r.reason.clone()).unwrap_or_default();
+            if gated_announced.insert(format!("{tid}:refused")) {
+                eprintln!(
+                    "[dispatch] SKIP: {tid} refused repo reference {} ({}) — fix the reference on the card to re-arm",
+                    candidate_url.unwrap_or_default(),
+                    reason
+                );
+                snap_activity(snap, "info", &format!("{tid} refused repo reference ({reason}) — skipped until it changes"));
+            }
+            continue;
+        }
         if let Err(e) = mcp_call_task(
             cfg,
             id,
@@ -3359,15 +3626,46 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.max_sessions = cfg.max_sessions;
     }
     let mut did_logout = false;
-    // Self-healing law (BR#2840): a hub-rejected token gets exactly ONE
-    // repair attempt per loop run (re-vend via self-provision — the
-    // deterministic label rotates in place hub-side). Repair fails → loud
-    // logout with a human-readable reason. Never silent, never snap-only.
-    let mut token_repair_attempted = false;
+    // Self-healing law (BR#2840, BR#3787): a hub-rejected token gets a repair
+    // LADDER — agent-plane principal repair (headless-safe), then desktop
+    // self-provision (human plane), then loud logout with the reason. Every
+    // failure reason is logged; a successful repair re-arms for the NEXT
+    // rotation. Never silent, never snap-only.
     let mut cfg = cfg;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // BR#3787 — negotiated catch-up at the tick boundary: the hub's epoch
+        // header moved past the epoch we vended (another login/repair rotated
+        // our row). Re-vend NOW, proactively — never by mid-dispatch 401.
+        {
+            let seen = TOKEN_EPOCH_SEEN.load(Ordering::Relaxed);
+            let vend = TOKEN_EPOCH_VEND.load(Ordering::Relaxed);
+            if epoch_repair_needed(vend, seen) {
+                match reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|client| repair_by_principal(&client, &cfg.url))
+                {
+                    Ok(fresh) => {
+                        cfg = fresh;
+                        eprintln!("[dispatch] token epoch {vend} → {seen}: re-vended by principal (proactive catch-up)");
+                        snap_activity(&snap, "dispatch", "token rotated elsewhere — re-vended proactively (epoch catch-up)");
+                        write_runner_state(&snap);
+                    }
+                    Err(pe) => {
+                        // the reason is logged; the hub-side rate limiter is
+                        // the backstop against tick-loop churn
+                        eprintln!("[dispatch] proactive epoch catch-up failed: {pe}");
+                        snap_activity(&snap, "error", &format!("proactive epoch catch-up failed: {pe}"));
+                    }
+                }
+                TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed); // re-adopt from the next response
+            } else if vend == 0 && seen > 0 {
+                TOKEN_EPOCH_VEND.store(seen, Ordering::Relaxed); // first observation adopts
+            }
         }
         match tick(
             &cfg,
@@ -3391,30 +3689,63 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
             Err(e) => {
                 // A hub-rejected token (401: revoked/expired/rotated away) is
-                // not retryable as-is — but before giving up, attempt repair
-                // ONCE: re-vend through the live human session (the login is
-                // the approval). Headless (no session) or failed repair →
-                // loud logout, clear the dead credential, await the next
-                // login. (Tick errors reaching here are orient's —
-                // "bridge {status} on /mcp" — so the prefix match cannot hit
-                // task IDs.)
+                // not retryable as-is — but before giving up, repair. Ladder
+                // (BR#3787): (1) agent-plane repair by principal — the
+                // durable device credential, works HEADLESS; (2) the desktop
+                // human-plane self-provision (the login is the approval);
+                // (3) loud logout, clear the dead credential, await the next
+                // login. Every failure reason is LOGGED and snapshotted —
+                // never swallowed (the 2026-10-27 incidents said "the
+                // one-time repair failed" with zero why). (Tick errors
+                // reaching here are orient's — "bridge {status} on /mcp" —
+                // so the prefix match cannot hit task IDs.)
                 if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
-                    if !token_repair_attempted {
-                        token_repair_attempted = true;
-                        let repaired = crate::session::load().and_then(|s| {
-                            let client = reqwest::blocking::Client::builder()
-                                .timeout(Duration::from_secs(30))
-                                .build()
-                                .ok()?;
-                            self_provision(&client, &cfg.url, &s.value).ok()
-                        });
-                        if let Some(fresh) = repaired {
-                            cfg = fresh;
-                            let msg = "gateway token repaired — re-vended by self-provision after hub 401".to_string();
-                            eprintln!("[dispatch] {msg}");
-                            snap_activity(&snap, "dispatch", &msg);
-                            write_runner_state(&snap);
-                            continue;
+                    {
+                        match reqwest::blocking::Client::builder()
+                            .timeout(Duration::from_secs(30))
+                            .build()
+                        {
+                            Ok(client) => {
+                                match repair_by_principal(&client, &cfg.url) {
+                                    Ok(fresh) => {
+                                        cfg = fresh;
+                                        let msg = "gateway token repaired — re-vended by principal (agent plane) after hub 401".to_string();
+                                        eprintln!("[dispatch] {msg}");
+                                        snap_activity(&snap, "dispatch", &msg);
+                                        write_runner_state(&snap);
+                                        continue;
+                                    }
+                                    Err(pe) => {
+                                        eprintln!("[dispatch] principal repair failed: {pe}");
+                                        snap_activity(&snap, "error", &format!("principal repair failed: {pe}"));
+                                        // desktop fallback: human-plane self-provision
+                                        match crate::session::load() {
+                                            Some(s) => match self_provision(&client, &cfg.url, &s.value) {
+                                                Ok(fresh) => {
+                                                    cfg = fresh;
+                                                    let msg = "gateway token repaired — re-vended by self-provision (human plane) after hub 401".to_string();
+                                                    eprintln!("[dispatch] {msg}");
+                                                    snap_activity(&snap, "dispatch", &msg);
+                                                    write_runner_state(&snap);
+                                                    continue;
+                                                }
+                                                Err(se) => {
+                                                    eprintln!("[dispatch] self-provision repair failed: {se}");
+                                                    snap_activity(&snap, "error", &format!("self-provision repair failed: {se}"));
+                                                }
+                                            },
+                                            None => {
+                                                eprintln!("[dispatch] no web session on this device — human-plane repair unavailable (headless)");
+                                                snap_activity(&snap, "error", "no web session — human-plane repair unavailable (headless)");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(be) => {
+                                eprintln!("[dispatch] repair client build failed: {be}");
+                                snap_activity(&snap, "error", &format!("repair client build failed: {be}"));
+                            }
                         }
                     }
                     // BR#2532: same guided-surface treatment as the identity
@@ -3748,6 +4079,19 @@ mod tests {
     }
 
     #[test]
+    fn epoch_repair_needed_only_on_known_mismatch() {
+        // BR#3787 negotiated catch-up: 0 = unknown on either side — the first
+        // observation adopts (never repairs on unknowns); only a KNOWN
+        // mismatch (both non-zero, different) triggers a proactive re-vend.
+        assert!(!epoch_repair_needed(0, 0));
+        assert!(!epoch_repair_needed(0, 5), "unknown vend must adopt, not repair");
+        assert!(!epoch_repair_needed(5, 0), "unknown seen must adopt, not repair");
+        assert!(!epoch_repair_needed(5, 5), "same epoch: in sync");
+        assert!(epoch_repair_needed(5, 6), "row rotated elsewhere: repair");
+        assert!(epoch_repair_needed(6, 5), "row rotated back: repair");
+    }
+
+    #[test]
     fn source_repo_meta_repo_wins_and_normalizes() {
         // structured meta.repo wins outright: bare owner/repo expands, and
         // receipt-page URLs normalize to the owning clone URL
@@ -3773,6 +4117,117 @@ mod tests {
             source_repo("see https://github.com/other/repo", &json!({ "repo": "not a repo" })),
             None
         );
+    }
+
+    #[test]
+    fn source_repo_scrape_survives_midword_line_wrap() {
+        // BR#3845: the runner's terminal-width capture split the URL inside
+        // the repo name; the scrape must rejoin it — the truncated first line
+        // (state-vector/super) is a ghost repo whose clone failed and churned
+        // the task eleven times. Line breaks are never meaningful in a URL.
+        assert_eq!(
+            source_repo(
+                "confirm the receipts (PR: https://github.com/state-vector/super\npositional/pull/2343, merge state, findings)",
+                &json!({}),
+            ),
+            Some("https://github.com/state-vector/superpositional".to_string())
+        );
+        // \r\n wrap shapes unwrap identically
+        assert_eq!(
+            source_repo(
+                "PR https://github.com/o/r/pull/7\r\n is ready",
+                &json!({}),
+            ),
+            Some("https://github.com/o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_clone_failure_taxonomy() {
+        // BR#3845 self-heal: fatal classes stop the retry loop, transient
+        // keeps the retry-next-cycle behaviour
+        assert!(matches!(
+            classify_clone_failure("remote: Repository not found.\nfatal: Could not read from remote repository."),
+            CloneFailure::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: 'x' does not appear to be a git repository"),
+            CloneFailure::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: Authentication failed for 'https://github.com/o/r.git/'"),
+            CloneFailure::Auth(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: Could not resolve host: github.com"),
+            CloneFailure::Transient(_)
+        ));
+        assert!(classify_clone_failure("remote: Repository not found.").fatal());
+        assert!(classify_clone_failure("fatal: Authentication failed").fatal());
+        assert!(!classify_clone_failure("fatal: Could not resolve host: github.com").fatal());
+    }
+
+    #[test]
+    fn refused_reference_skips_until_the_reference_changes() {
+        let mut cache = HashMap::new();
+        // fresh task: not refused
+        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/o/r")));
+        // record a refusal (as the clone-failure path does), then the SAME
+        // reference is skipped...
+        cache.insert(
+            "BR#1".into(),
+            RefusedRef { url: "https://github.com/state-vector/super".into(), reason: "repository not found".into(), ts: 0 },
+        );
+        assert!(refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/super")));
+        // ...but a FIXED reference re-arms dispatch and drops the record
+        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/superpositional")));
+        assert!(!cache.contains_key("BR#1"), "stale refusal must not pin the card forever");
+        // repo-less after a refusal (reference removed) also re-arms
+        cache.insert("BR#2".into(), RefusedRef { url: "https://github.com/o/r".into(), reason: "x".into(), ts: 0 });
+        assert!(!refused_reference(&mut cache, "BR#2", None));
+        assert!(!cache.contains_key("BR#2"));
+    }
+
+    #[test]
+    fn agent_segment_drops_the_host_prefix_under_a_gateway() {
+        // BR#3846: compounding the gateway label with the <hostname>-<backend>
+        // autogen produced macbook-pro-local-2/macbook-pro-local-opencode
+        // (46 chars) — past the hub's 40-char token-label cap, so provisioning
+        // 400'd and every dispatch released its claim. Under a gateway the
+        // segment is the backend alone; an explicit agent_name override wins.
+        let mut cfg = DispatchConfig {
+            schema_version: default_schema_version(),
+            url: "https://hub.example".into(),
+            token: String::new(),
+            workdir: default_workdir(),
+            agent: None,
+            model: None,
+            backend: None,
+            poll_secs: default_poll_secs(),
+            timeout_mins: default_timeout_mins(),
+            opencode_bin: default_opencode_bin(),
+            label: Some("macbook-pro-local-2".into()),
+            agent_name: None,
+            ws: None,
+            gateway: Some(true),
+            max_sessions: default_max_sessions(),
+            report_minutes: None,
+            isolate: true,
+            worktree_exempt_repos: vec![],
+            backends: std::collections::BTreeMap::from([
+                ("opencode".to_string(), Default::default()),
+            ]),
+            models: None,
+            agents: None,
+            identity: None,
+        };
+        assert_eq!(agent_segment(&cfg), "opencode");
+        assert_eq!(
+            format!("{}/{}", cfg.label.as_deref().unwrap(), agent_segment(&cfg)),
+            "macbook-pro-local-2/opencode" // 28 chars — fits the cap
+        );
+        cfg.agent_name = Some("custom-agent".into());
+        assert_eq!(agent_segment(&cfg), "custom-agent");
     }
 
     #[test]

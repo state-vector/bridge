@@ -3,6 +3,22 @@ main = "src/index.js"
 compatibility_date = "2026-01-15"
 # account_id comes from CLOUDFLARE_ACCOUNT_ID in the environment — not committed.
 
+# The workers.dev subdomain stays enabled explicitly: defining routes makes
+# wrangler's default flip to disabled, and a deploy from this file then
+# silently stopped serving https://<subdomain>.workers.dev (the 2026-10-27
+# NXDOMAIN that left desktops "bridge unreachable" mid-startup).
+workers_dev = true
+
+# The shared hub also answers on our own domain — attached as a Workers
+# custom domain on deploy (the DNS record + edge cert are created on the
+# zone automatically). console.fleetbridge.run stays attached as an alias.
+# NOTE: top-level, NOT under [build] — nesting it there made wrangler parse
+# it as build.routes, warn "Unexpected fields", and silently drop the
+# custom-domain attachment from every deploy.
+routes = [
+  { pattern = "hub.fleetbridge.run", custom_domain = true },
+]
+
 # The served UI lives in @bridge/webapp, built to dist at deploy time by this
 # hook — dist is a build ARTIFACT, never committed; the source of truth is
 # packages/webapp/src and Cloudflare builds from it on every deploy.
@@ -15,16 +31,6 @@ compatibility_date = "2026-01-15"
 [build]
 command = "printf '{\"commit\":\"%s\",\"built_at\":\"%s\"}' \"$(git rev-parse HEAD 2>/dev/null || echo unknown)\" \"$(date -u +%FT%TZ)\" > src/__version.json && cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
 
-# Your deployment lives at https://<your-subdomain>.workers.dev once deployed.
-# workers_dev stays true so both `wrangler deploy` from the box and CF's git
-# integration publish to that URL.
-
-# The shared hub also answers on our own domain — attached as a Workers
-# custom domain on deploy (the DNS record + edge cert are created on the
-# zone automatically). console.fleetbridge.run stays attached as an alias.
-routes = [
-  { pattern = "hub.fleetbridge.run", custom_domain = true },
-]
 
 # Workers AI: re-enable by adding [ai] binding = "AI" once the deploy env has
 # CLOUDFLARE_API_TOKEN (local dev fails without it). Until then search = FTS + trigram fuzzy.
@@ -48,7 +54,7 @@ new_sqlite_classes = ["KnowledgeHub"]
 [assets]
 directory = "../webapp/dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
+run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
 
 [vars]
 # Overridden by `wrangler secret put` at deploy:

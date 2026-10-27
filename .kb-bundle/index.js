@@ -133,6 +133,11 @@ function selfProvisionLabel(host) {
   const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
   return slug || "device";
 }
+function graceActive(rotated_ts, now) {
+  if (typeof rotated_ts !== "number" || !Number.isFinite(rotated_ts)) return false;
+  const age = now - rotated_ts;
+  return age >= 0 && age < TOKEN_GRACE_MS;
+}
 function doWs(ws) {
   return ws === DEFAULT_WS_SLUG ? "global" : `ws:${ws}`;
 }
@@ -558,7 +563,7 @@ function trainParseNoteLegs(text2) {
     ...paired[i] !== null ? { head_sha_at_acceptance: heads[paired[i]].sha } : {}
   }));
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, TRAIN_LEASE_TTL_MS, LANE_TITLE_PREFIX, MERGE_TRAIN_REASON_PREFIX, MERGE_TRAIN_QUEUED_REASON, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES, TRAIN_HEAD_STAMP_RE, TRAIN_HEAD_STAMP_RE_G, TRAIN_PR_URL_RE;
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, TOKEN_GRACE_MS, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, TRAIN_LEASE_TTL_MS, LANE_TITLE_PREFIX, MERGE_TRAIN_REASON_PREFIX, MERGE_TRAIN_QUEUED_REASON, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES, TRAIN_HEAD_STAMP_RE, TRAIN_HEAD_STAMP_RE_G, TRAIN_PR_URL_RE;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -623,6 +628,8 @@ var init_core = __esm({
     __name(tokenWorkspace, "tokenWorkspace");
     __name(tagsSayGateway, "tagsSayGateway");
     __name(selfProvisionLabel, "selfProvisionLabel");
+    TOKEN_GRACE_MS = 72 * 60 * 60 * 1e3;
+    __name(graceActive, "graceActive");
     DEFAULT_WS_SLUG = "state-vector";
     __name(doWs, "doWs");
     __name(isValidAskTarget, "isValidAskTarget");
@@ -910,6 +917,8 @@ function validateAwaitEvent(v) {
     }
     case "ask":
       return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
+    case "deployed":
+      return typeof e.commit === "string" && /^[0-9a-f]{7,40}$/i.test(e.commit) ? { event: "deployed", commit: e.commit.toLowerCase() } : null;
     case "time":
       return typeof e.until_ts === "number" && Number.isFinite(e.until_ts) && e.until_ts > 0 ? { event: "time", until_ts: e.until_ts } : null;
     default:
@@ -930,6 +939,8 @@ function awaitEventToAtom(e) {
       return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
     case "pr_checks_green":
       return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "deployed":
+      return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
     case "ask":
     case "time":
       return null;
@@ -949,6 +960,8 @@ function describeAwaitEvent(e) {
       return e.run_id ? `GitHub run ${e.repo}/${e.run_id} conclusion=success` : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
     case "pr_checks_green":
       return `all checks green on PR ${e.repo}#${e.n}`;
+    case "deployed":
+      return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
     case "ask":
       return `ask ${e.ask_id} answered`;
     case "time":
@@ -971,7 +984,16 @@ function awaitEventFromAtoms(atoms) {
       return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
     case "pr_checks_green":
       return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
+    case "deployed":
+      return a.commit ? { event: "deployed", commit: a.commit } : null;
   }
+}
+function deployedSatisfied(hubCommit, wanted) {
+  if (!hubCommit || hubCommit === "unknown") return false;
+  const h = hubCommit.toLowerCase();
+  const w = wanted.toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(w)) return false;
+  return h.startsWith(w) || w.startsWith(h);
 }
 var LOOKS_MACHINE, DUTY_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT, AWAIT_GRAMMAR_DOC;
 var init_closure = __esm({
@@ -1008,11 +1030,12 @@ var init_closure = __esm({
     __name(extractGuardRun, "extractGuardRun");
     __name(parseClosureReceipt, "parseClosureReceipt");
     __name(legLabel, "legLabel");
-    AWAIT_GRAMMAR_DOC = 'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+    AWAIT_GRAMMAR_DOC = 'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
     __name(validateAwaitEvent, "validateAwaitEvent");
     __name(awaitEventToAtom, "awaitEventToAtom");
     __name(describeAwaitEvent, "describeAwaitEvent");
     __name(awaitEventFromAtoms, "awaitEventFromAtoms");
+    __name(deployedSatisfied, "deployedSatisfied");
   }
 });
 
@@ -1034,6 +1057,17 @@ function metaOf(m) {
     }
   }
   return m ?? {};
+}
+function isClonableRepoRef(url2) {
+  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/pull\/\d+)?\/?$/.test(url2) || /^https?:\/\/\S+\.git$/.test(url2);
+}
+function prFromNote(note) {
+  const flat = note.replace(/\r?\n/g, "");
+  for (const m of flat.matchAll(/https?:\/\/\S+/g)) {
+    const url2 = m[0].replace(/[.,;:!?)\]>'"]+$/, "");
+    if (isClonableRepoRef(url2)) return url2;
+  }
+  return null;
 }
 async function decide(i, c) {
   const base = validateTransition(i.type, i.status, i.to);
@@ -1104,7 +1138,7 @@ async function decide(i, c) {
         effects.push({
           kind: "spawn_verify",
           parent: i.id,
-          pr: (String(i.body?.note ?? "").match(/https?:\/\/\S+/) || [])[0] ?? null
+          pr: prFromNote(String(i.body?.note ?? ""))
         });
     }
   }
@@ -1205,7 +1239,7 @@ function breachClass(reason) {
   if (r.includes("open child")) return "gate:open-children";
   if (r.includes("cannot block")) return "gate:verdict-no-blocked";
   if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
-  return "other";
+  return "unclassified";
 }
 function classOf(e) {
   if (e.op === "invariant_violation") return "invariant";
@@ -1258,6 +1292,8 @@ var init_machine = __esm({
     SILENT_ESCALATE_CYCLES = 3;
     SILENT_REDIRECT_CYCLES = 5;
     UNBLOCK_FLOOD_MS = 60 * 6e4;
+    __name(isClonableRepoRef, "isClonableRepoRef");
+    __name(prFromNote, "prFromNote");
     RULES = [
       {
         name: "verdict-no-in_review",
@@ -1521,6 +1557,13 @@ var init_rollup = __esm({
   }
 });
 
+// src/__version.json
+var require_version = __commonJS({
+  "src/__version.json"(exports, module) {
+    module.exports = { commit: "34416e2f0225ac1199191d07fb14d8d659290abf", built_at: "2026-10-27T12:00:23Z" };
+  }
+});
+
 // src/kb/do.ts
 function tagsForWrite(verdict, base) {
   if (!verdict.tags_add.length) return base;
@@ -1528,7 +1571,7 @@ function tagsForWrite(verdict, base) {
   for (const x of verdict.tags_add) if (!t.includes(x)) t.push(x);
   return t;
 }
-var TRAIN_ALARM_SINK_ID, KnowledgeHub;
+var TRAIN_ALARM_SINK_ID, TOKEN_REPAIR_LIMIT, TOKEN_REPAIR_WINDOW_MS, KnowledgeHub;
 var init_do = __esm({
   "src/kb/do.ts"() {
     init_core();
@@ -1538,6 +1581,8 @@ var init_do = __esm({
     init_closure();
     init_rollup();
     TRAIN_ALARM_SINK_ID = "BR#3124";
+    TOKEN_REPAIR_LIMIT = 6;
+    TOKEN_REPAIR_WINDOW_MS = 60 * 60 * 1e3;
     KnowledgeHub = class _KnowledgeHub {
       constructor(state, env) {
         this.state = state;
@@ -1949,6 +1994,16 @@ var init_do = __esm({
           case "pr_checks_green": {
             if (!atom.repo) return unresolvable;
             return { ok: false, receipt: `unresolvable from the hub \u2014 PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
+          }
+          case "deployed": {
+            if (!atom.commit) return unresolvable;
+            try {
+              const v = await Promise.resolve().then(() => __toESM(require_version(), 1));
+              const ok = deployedSatisfied(String(v.commit ?? ""), atom.commit);
+              return { ok, receipt: ok ? `hub deployed commit=${v.commit} (wanted ${atom.commit})` : `hub deployed commit=${v.commit ?? "unknown"} \u2014 wanted ${atom.commit} (deploy the hub to flip this atom)` };
+            } catch {
+              return { ok: false, receipt: "hub has no version stamp (pre-[build]-hook deploy) \u2014 atom cannot flip" };
+            }
           }
         }
       }
@@ -2458,7 +2513,12 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
         transport TEXT NOT NULL DEFAULT 'mcp',
         created_ts INTEGER NOT NULL,
         last_seen_ts INTEGER,
-        revoked_ts INTEGER
+        revoked_ts INTEGER,
+        prev_hash TEXT,
+        rotated_ts INTEGER,
+        epoch INTEGER NOT NULL DEFAULT 1,
+        repairs_count INTEGER NOT NULL DEFAULT 0,
+        repairs_window_ts INTEGER
       );
       -- gateway \u2192 dispatched-agent attribution (BR#2455): stamped whenever a
       -- gateway-tagged token claims/progresses as an agent. Feeds Connect's
@@ -2495,7 +2555,8 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
       CREATE TABLE IF NOT EXISTS ws_tokens (
         hash TEXT PRIMARY KEY,
         ws TEXT NOT NULL,
-        created_ts INTEGER NOT NULL
+        created_ts INTEGER NOT NULL,
+        principal TEXT
       );
       CREATE TABLE IF NOT EXISTS pairings (
         code TEXT PRIMARY KEY,
@@ -2580,6 +2641,13 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
           `ALTER TABLE pairings ADD COLUMN type TEXT`,
           `ALTER TABLE pairings ADD COLUMN principal TEXT`,
           `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
+          `ALTER TABLE auth_tokens ADD COLUMN prev_hash TEXT`,
+          `ALTER TABLE auth_tokens ADD COLUMN rotated_ts INTEGER`,
+          `ALTER TABLE auth_tokens ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1`,
+          `ALTER TABLE auth_tokens ADD COLUMN repairs_count INTEGER NOT NULL DEFAULT 0`,
+          `ALTER TABLE auth_tokens ADD COLUMN repairs_window_ts INTEGER`,
+          `ALTER TABLE ws_tokens ADD COLUMN principal TEXT`,
+          // BR#3787: principal→ws for the agent-plane repair route
           `ALTER TABLE sessions ADD COLUMN kind TEXT`,
           `ALTER TABLE sessions ADD COLUMN worktree TEXT`
           // BR#3204: where the session's tree lives — board collision visibility
@@ -2804,7 +2872,7 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
           const body2 = await request.json();
           const identity = await this.identify(String(body2.bearer ?? ""));
           const newLabel = String(body2.label ?? "").trim();
-          if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+          if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
           const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
           if (!old) throw new Error("auth token not found");
           if (newLabel !== old.label) {
@@ -2907,6 +2975,8 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
               return this.json(await this.agentProvision(body, actor));
             case "self.provision":
               return this.json(await this.selfProvision(body, actor));
+            case "token.repair":
+              return this.json(await this.tokenRepair(body));
             case "agents.list":
               return this.json(await this.listAgents());
             case "session.touch":
@@ -2957,6 +3027,8 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
               return this.json(await this.wsMembers(body, String(body.login)));
             case "ws.token_register":
               return this.json(await this.wsTokenRegister(body));
+            case "ws.token_lookup_principal":
+              return this.json(await this.wsTokenLookupPrincipal(body));
             case "ws.token_lookup":
               return this.json(await this.wsTokenLookup(body));
             case "ws.pair.start":
@@ -3941,6 +4013,8 @@ ${doneNote}`);
           switch (fx.kind) {
             case "spawn_verify": {
               const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
+              const stamp = meta3?.pr ?? {};
+              const prLink = typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0 ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}` : fx.pr && isClonableRepoRef(fx.pr) ? fx.pr : "see note";
               const created = await this.create(
                 {
                   type: "task",
@@ -3954,7 +4028,7 @@ VERIFY GATE \u2014 mergeability is a precondition, NOT a finding (2026-10-23 uns
 2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable \u2014 unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").
 3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.
 
-Then double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.
+Then double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.
 
 ACCEPT (substance AND mergeability both hold):
 1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note \u2014 the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).
@@ -4385,6 +4459,9 @@ ${m.bootstrap_md}` : "") + scoreLine;
         }
         const breaches = detectBreaches(events, openKeys, { highWater });
         for (const b of breaches) {
+          const gapNote = b.klass === "unclassified" ? `
+- classifier gap: NO breachClass pattern matched this reason. Either a benign flow missing a named class (add the pattern to breachClass, machine.ts \u2014 cite the specimen task) or a genuine novel defect (investigate the sample below). The "unclassified" pile is a to-do list for the classifier, never a verdict.
+` : "";
           const created = await this.create(
             {
               type: "task",
@@ -4394,8 +4471,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
 - class: ${b.klass}
 - task: ${taskId}
 - events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})
-- sample: ${b.sample}
-
+- sample: ${b.sample}${gapNote}
 One open card per (task, class) \u2014 reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
               tags: ["breach", `breach:${b.klass}`]
             },
@@ -4476,15 +4552,54 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
       async identify(bearer) {
         if (!bearer) throw new Error("missing bearer");
         const hash2 = await hashAuthToken(bearer);
-        let row = this.one(`SELECT id, label, tags, principal, revoked_ts FROM auth_tokens WHERE hash = ?`, hash2);
+        let row = this.one(
+          `SELECT id, label, tags, principal, revoked_ts, epoch FROM auth_tokens WHERE hash = ?`,
+          hash2
+        );
         if (!row) {
           await new Promise((r) => setTimeout(r, 250));
-          row = this.one(`SELECT id, label, tags, principal, revoked_ts FROM auth_tokens WHERE hash = ?`, hash2);
+          row = this.one(
+            `SELECT id, label, tags, principal, revoked_ts, epoch FROM auth_tokens WHERE hash = ?`,
+            hash2
+          );
+        }
+        let stale = false;
+        if (!row) {
+          const prow = this.one(
+            `SELECT id, label, tags, principal, revoked_ts, epoch, rotated_ts FROM auth_tokens WHERE prev_hash = ?`,
+            hash2
+          );
+          if (prow && !prow.revoked_ts && graceActive(prow.rotated_ts, Date.now())) {
+            row = prow;
+            stale = true;
+          }
         }
         if (!row) throw new Error("unknown auth token");
         if (row.revoked_ts) throw new Error("auth token revoked");
         this.state.storage.sql.exec(`UPDATE auth_tokens SET last_seen_ts = ? WHERE id = ?`, Date.now(), row.id);
-        return { token_id: row.id, label: row.label, tags: parseTags(row.tags), principal: row.principal ?? null };
+        return {
+          token_id: row.id,
+          label: row.label,
+          tags: parseTags(row.tags),
+          principal: row.principal ?? null,
+          token_epoch: Number(row.epoch ?? 1),
+          token_stale: stale
+        };
+      }
+      /** BR#3787 — rotation bookkeeping: preserve the outgoing hash as the grace
+       *  hash and bump the epoch the negotiated catch-up reads. Call before (or
+       *  together with) the hash swap; the register() of the NEW hash is the
+       *  caller's job. The OUTGOING hash's registry row persists by design —
+       *  grace needs the old hash routable for the window. */
+      rotateTokenRow(id) {
+        const old = this.one(`SELECT hash FROM auth_tokens WHERE id = ?`, id);
+        this.state.storage.sql.exec(
+          `UPDATE auth_tokens SET prev_hash = ?, rotated_ts = ?, epoch = COALESCE(epoch, 1) + 1 WHERE id = ?`,
+          old?.hash ?? null,
+          Date.now(),
+          id
+        );
+        return Number(old?.epoch ?? 1) + 1;
       }
       /**
        * Connected identities, separated by class (BR#2455): `gateways` are the
@@ -5260,17 +5375,31 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
       async wsTokenRegister(body) {
         const hash2 = String(body.hash ?? ""), ws = String(body.ws ?? "");
         if (!/^[0-9a-f]{64}$/.test(hash2) || !isWsSlug(ws)) throw new Error("bad token registration");
+        const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         this.state.storage.sql.exec(
-          `INSERT INTO ws_tokens (hash, ws, created_ts) VALUES (?, ?, ?)
-       ON CONFLICT(hash) DO UPDATE SET ws = excluded.ws`,
+          `INSERT INTO ws_tokens (hash, ws, created_ts, principal) VALUES (?, ?, ?, ?)
+       ON CONFLICT(hash) DO UPDATE SET ws = excluded.ws, principal = excluded.principal`,
           hash2,
           ws,
-          Date.now()
+          Date.now(),
+          principal
         );
         return { ok: true };
       }
       async wsTokenLookup(body) {
         const row = this.one(`SELECT ws FROM ws_tokens WHERE hash = ?`, String(body.hash ?? ""));
+        return { ws: row?.ws ?? null };
+      }
+      /** BR#3787 layer 2 — resolve the workspace that owns a principal, so the
+       *  agent-plane repair route can reach the right DO without the caller
+       *  knowing the workspace. */
+      async wsTokenLookupPrincipal(body) {
+        const principal = String(body.principal ?? "").trim();
+        if (!principal) return { ws: null };
+        const row = this.one(
+          `SELECT ws FROM ws_tokens WHERE principal = ? ORDER BY created_ts DESC LIMIT 1`,
+          principal
+        );
         return { ws: row?.ws ?? null };
       }
       // ---- device pairing (lives in the registry DO) ----
@@ -5343,7 +5472,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const tags = gateway ? ["gateway"] : Array.isArray(body.tags) ? body.tags.map((t) => String(t)).slice(0, 10) : [];
         if (!isWsSlug(ws)) throw new Error("bad workspace slug");
         if (/^_/.test(label)) throw new Error(`labels beginning with '_' are reserved system roots (got '${label}')`);
-        if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._/-]");
+        if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
         const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
         if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
         const stub = this.env.KB.get(this.env.KB.idFromName(doWs(ws)));
@@ -5406,7 +5535,7 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const caller = String(body.provisioned_by ?? actor);
         if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
         const label = String(body.label ?? "").trim();
-        if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
+        if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error(`agent label '${label}' must be 2-64 chars [a-zA-Z0-9._/-]`);
         if (label.includes("/") && !label.startsWith(`${caller}/`)) {
           throw new Error(`namespaced label '${label}' must live under the provisioning gateway's own namespace ('${caller}/...')`);
         }
@@ -5473,81 +5602,106 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
         const login = String(body.login ?? "").trim();
         if (!login) throw new Error("self-provision requires the session login (worker-derived)");
         const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : "";
-        const label = selfProvisionLabel(body.host);
+        let label = selfProvisionLabel(body.host);
         const ws = this.wsSlug() || String(body.ws ?? "");
         const secret = generateAuthToken();
         const hash2 = await hashAuthToken(secret);
         const mintTags = JSON.stringify(["gateway"]);
-        const register = /* @__PURE__ */ __name((h) => this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/ws.token_register", {
+        const register = /* @__PURE__ */ __name((h, p) => this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/ws.token_register", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ hash: h, ws })
+          body: JSON.stringify({ hash: h, ws, principal: p })
         }), "register");
         let id;
         let vended;
-        let own2 = principal ? this.one(`SELECT id, label FROM auth_tokens WHERE principal = ?`, principal) : null;
+        let own2 = principal ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ? AND revoked_ts IS NULL`, principal) : null;
         if (!own2) {
-          own2 = this.one(`SELECT id, label FROM auth_tokens WHERE label = ?`, label);
+          const byLabel = this.one(`SELECT id, label, principal FROM auth_tokens WHERE label = ?`, label);
+          if (byLabel && byLabel.principal && byLabel.principal !== principal) {
+            let n = 2;
+            while (this.one(`SELECT 1 FROM auth_tokens WHERE label = ?`, `${label}-${n}`)) n++;
+            label = `${label}-${n}`;
+          } else if (byLabel && !byLabel.principal) {
+            own2 = byLabel;
+          }
         }
         if (own2) {
+          this.rotateTokenRow(own2.id);
           this.state.storage.sql.exec(
-            `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = ?, revoked_ts = NULL WHERE id = ?`,
+            `UPDATE auth_tokens SET hash = ?, tags = ?, principal = ?, revoked_ts = NULL WHERE id = ?`,
             hash2,
-            label,
             mintTags,
             principal,
             own2.id
           );
+          label = String(own2.label ?? label);
           id = own2.id;
-          await register(hash2);
+          await register(hash2, (vended ?? principal) || null);
         } else {
           vended = principal || generateAuthToken();
           id = `at_${crypto.randomUUID().slice(0, 8)}`;
-          try {
-            this.state.storage.sql.exec(
-              `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
-              id,
-              label,
-              hash2,
-              mintTags,
-              vended,
-              Date.now()
-            );
-          } catch (e) {
-            if (!String(e).includes("UNIQUE")) throw e;
-            const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
-            if (!racer) throw e;
-            this.state.storage.sql.exec(
-              `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
-              hash2,
-              mintTags,
-              racer.id
-            );
-            id = racer.id;
-            if (racer.principal) vended = racer.principal;
+          let inserted = false;
+          for (let attempt = 0; attempt < 20 && !inserted; attempt++) {
+            try {
+              this.state.storage.sql.exec(
+                `INSERT INTO auth_tokens (id, label, hash, tags, transport, principal, created_ts) VALUES (?, ?, ?, ?, 'mcp', ?, ?)`,
+                id,
+                label,
+                hash2,
+                mintTags,
+                vended,
+                Date.now()
+              );
+              inserted = true;
+            } catch (e) {
+              if (!String(e).includes("UNIQUE")) throw e;
+              const racer = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
+              if (racer && principal && racer.principal === principal) {
+                this.rotateTokenRow(racer.id);
+                this.state.storage.sql.exec(
+                  `UPDATE auth_tokens SET hash = ?, tags = ?, revoked_ts = NULL WHERE id = ?`,
+                  hash2,
+                  mintTags,
+                  racer.id
+                );
+                id = racer.id;
+                vended = racer.principal;
+                inserted = true;
+              } else {
+                let n = 2;
+                while (this.one(`SELECT 1 FROM auth_tokens WHERE label = ?`, `${label}-${n}`)) n++;
+                label = `${label}-${n}`;
+              }
+            }
           }
-          await register(hash2);
+          if (!inserted) throw new Error("self-provision: could not mint a non-colliding label");
+          await register(hash2, (vended ?? principal) || null);
         }
         this.audit(actor, "self_provision", null, { label, principal: vended ?? principal, login, ws, token_id: id, replaced: !!own2 });
-        return { secret, label, ws, id, principal: vended ?? principal };
+        const epochRow = this.one(`SELECT epoch FROM auth_tokens WHERE id = ?`, id);
+        return { secret, label, ws, id, principal: vended ?? principal, epoch: Number(epochRow?.epoch ?? 1) };
       }
       async tokenMint(body) {
         const label = String(body.label ?? "").trim();
-        if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+        if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
         if (label.includes("/") && !label.startsWith("_direct/")) {
           throw new Error("labels cannot contain '/' \u2014 only the reserved _direct/ root (directly connected agents) may");
         }
         const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : null;
         const secret = generateAuthToken();
         const hash2 = await hashAuthToken(secret);
-        let own2 = principal ? this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE principal = ?`, principal) : null;
-        const byLabel = this.one(`SELECT id, label, revoked_ts FROM auth_tokens WHERE label = ?`, label);
+        const own2 = principal ? this.one(`SELECT id, label, revoked_ts, principal FROM auth_tokens WHERE principal = ? AND revoked_ts IS NULL`, principal) : null;
+        const byLabel = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label);
+        if (byLabel && own2?.id !== byLabel.id && byLabel.principal && byLabel.principal !== principal) {
+          throw new Error(`label '${label}' already belongs to another device's credential \u2014 pick a different label (rotation never steals, BR#3787)`);
+        }
         if (own2 && byLabel && own2.id !== byLabel.id) {
           this.state.storage.sql.exec(`DELETE FROM auth_tokens WHERE id = ?`, byLabel.id);
           this.audit("pair", "replace", byLabel.id, { label });
         }
         const target = own2 && !byLabel ? own2 : byLabel ?? own2;
         if (target) {
+          const epoch = this.rotateTokenRow(target.id);
           const mintTags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
           this.state.storage.sql.exec(
             `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
@@ -5563,11 +5717,11 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
             await reg.fetch("https://kb/ws.token_register", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ hash: hash2, ws: ws2 })
+              body: JSON.stringify({ hash: hash2, ws: ws2, principal })
             });
           }
           this.audit("pair", "reassociate", target.id, { label });
-          return { id: target.id, label, secret, reassociated: true };
+          return { id: target.id, label, secret, reassociated: true, epoch };
         }
         const tags = Array.isArray(body.tags) ? body.tags.map((t) => String(t).slice(0, 40)).slice(0, 10) : [];
         const transport = TRANSPORTS.includes(body.transport) ? body.transport : "mcp";
@@ -5589,11 +5743,55 @@ ${p.playbook}`).join("") + gaugeDebtNote + scoreDirective,
           await reg.fetch("https://kb/ws.token_register", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ hash: hash2, ws })
+            body: JSON.stringify({ hash: hash2, ws, principal })
           });
         }
         this.audit("admin", "mint", id, { label, transport, tags });
-        return { id, label, tags, transport, secret };
+        return { id, label, tags, transport, secret, epoch: 1 };
+      }
+      /** BR#3787 layer 2 — agent-plane repair: a device holding its principal
+       *  re-vends ITS OWN row's token without the human plane (headless-safe —
+       *  the principal IS the durable credential, BR#2711 §2). Matches by
+       *  principal ONLY (never by label — the theft class). Rate-limited per row
+       *  so a crash loop cannot mint infinitely. Unknown/revoked principal →
+       *  named error: the runner's cue for the loud re-pair logout. */
+      async tokenRepair(body) {
+        const principal = typeof body.principal === "string" && body.principal.trim() ? body.principal.trim().slice(0, 80) : "";
+        if (!principal) throw new Error("repair requires the device principal");
+        const row = this.one(
+          `SELECT id, label, hash, epoch, revoked_ts, repairs_count, repairs_window_ts FROM auth_tokens
+       WHERE principal = ? AND revoked_ts IS NULL
+       ORDER BY COALESCE(last_seen_ts, created_ts) DESC LIMIT 1`,
+          principal
+        );
+        if (!row) throw new Error("no live token for this principal \u2014 re-pair required (principal unknown, revoked, or reset)");
+        const now = Date.now();
+        const inWindow = typeof row.repairs_window_ts === "number" && now - row.repairs_window_ts < TOKEN_REPAIR_WINDOW_MS;
+        const count = inWindow ? Number(row.repairs_count ?? 0) : 0;
+        if (count >= TOKEN_REPAIR_LIMIT) {
+          throw new Error(`repair rate limit reached (${TOKEN_REPAIR_LIMIT}/hour) \u2014 park and retry within the hour`);
+        }
+        const secret = generateAuthToken();
+        const hash2 = await hashAuthToken(secret);
+        this.rotateTokenRow(row.id);
+        this.state.storage.sql.exec(
+          `UPDATE auth_tokens SET hash = ?, repairs_count = ?, repairs_window_ts = ? WHERE id = ?`,
+          hash2,
+          count + 1,
+          now,
+          row.id
+        );
+        const ws = this.wsSlug();
+        if (ws) {
+          const reg = this.env.KB.get(this.env.KB.idFromName(doWs(DEFAULT_WS_SLUG)));
+          await reg.fetch("https://kb/ws.token_register", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ hash: hash2, ws, principal })
+          });
+        }
+        this.audit("self", "repair", row.id, { label: row.label, epoch: Number(row.epoch ?? 1) + 1 });
+        return { secret, label: row.label, ws, id: row.id, epoch: Number(row.epoch ?? 1) + 1, principal };
       }
       async tokenList() {
         const rows = this.state.storage.sql.exec(
@@ -28187,7 +28385,9 @@ Fix the cause and retry. Read the error \u2014 it states the required fix.` }],
       return json2({ jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32e3, message: message2 } });
     }
   }
-  return json2({ jsonrpc: "2.0", id: msg.id ?? null, result });
+  const epochHeader = identity.token_epoch ? { "x-bridge-token-epoch": String(identity.token_epoch) } : {};
+  if (identity.token_stale) epochHeader["x-bridge-token-stale"] = "1";
+  return json2({ jsonrpc: "2.0", id: msg.id ?? null, result }, 200, epochHeader);
 }
 async function kb(hub, op, payload) {
   const r = await hub.fetch(`https://kb/${op}`, {
@@ -28208,10 +28408,10 @@ async function callTool(name, args, ctx) {
   if (!def) return err(`unknown tool: ${name}`);
   return await def.handler(args, ctx);
 }
-function json2(obj, status = 200) {
+function json2(obj, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" }
+    headers: { "content-type": "application/json", "cache-control": "no-store", ...extraHeaders }
   });
 }
 var wsRouteCache;
@@ -28226,13 +28426,6 @@ var init_mcp2 = __esm({
     __name(kb, "kb");
     __name(callTool, "callTool");
     __name(json2, "json");
-  }
-});
-
-// src/__version.json
-var require_version = __commonJS({
-  "src/__version.json"(exports, module) {
-    module.exports = { commit: "7cd92ba9fd9a4450da865d38e60854f366fbe365", built_at: "2026-10-26T15:30:27Z" };
   }
 });
 
@@ -33168,9 +33361,15 @@ var index_default = {
       const body = await request.json().catch(() => ({}));
       try {
         if (url2.pathname === "/api/pair/start" && request.method === "POST") {
+          const host = String(body.host ?? body.device ?? "").trim();
+          if (!host) {
+            return json3({ error: "pair/start must carry the device host \u2014 update the bridge CLI/desktop (a nameless device cannot be paired safely, BR#3787)" }, 400);
+          }
           return json3(await wsCall(env, "ws.pair.start", {
-            device: String(body.device ?? "device"),
-            type: body.type === "agent" ? "agent" : "gateway"
+            device: host,
+            host,
+            type: body.type === "agent" ? "agent" : "gateway",
+            principal: typeof body.principal === "string" ? body.principal : ""
           }));
         }
         if (url2.pathname === "/api/pair/poll" && request.method === "POST") {
@@ -33196,6 +33395,31 @@ var index_default = {
         return new Response("not found", { status: 404 });
       } catch (e) {
         return json3({ error: String(e.message ?? e) }, 400);
+      }
+    }
+    if (url2.pathname === "/api/token/repair" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const principal = typeof body.principal === "string" ? body.principal.trim() : "";
+      if (!principal) return json3({ error: "repair requires the device principal" }, 400);
+      try {
+        const reg = await wsCall(env, "ws.token_lookup_principal", { principal });
+        if (!reg?.ws) {
+          return json3({ error: "no live token for this principal \u2014 re-pair required (principal unknown, revoked, or reset)" }, 404);
+        }
+        const r = await env.KB.get(env.KB.idFromName(doWs(reg.ws))).fetch("https://kb/token.repair", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ principal, host: String(body.host ?? "") })
+        });
+        const out = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const msg = String(out.error ?? "token repair failed");
+          const status = /rate limit/i.test(msg) ? 429 : 409;
+          return json3({ error: msg }, status);
+        }
+        return json3(out);
+      } catch (e) {
+        return json3({ error: String(e?.message ?? e) }, 502);
       }
     }
     const auth = await checkAuth(request, env);

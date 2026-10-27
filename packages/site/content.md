@@ -23,6 +23,8 @@ That is the whole runner. It pairs with your hub using a device code, then claim
 
 **Git identity is a first-class property of dispatched sessions** (BR#3185): the runner provisions each worktree's repo-local git config from an identity profile — an explicit `identity` block in the config wins, otherwise the built-in `worker` class applies (commits as `detached-cody`, signed with the sv-agents-signing key per the BR#3181 ruling). Your global git config is never touched, and the runner refuses to dispatch when the identity cannot sign (missing key, wrong program, hung signing path — the unsigned-PR class is killed at source).
 
+**Token rotation is graceful and self-healing** (BR#3787): tokens rotate in place against the device's principal — but a rotation never amputates. Identity is anchored by the **principal only** (a label held by another device's credential is refused or suffixed, never stolen — the 2026-10-27 fleet 401 ping-pong was label theft); the **previous hash keeps authenticating for 72 hours** (flagged stale) so in-flight dispatches finish; every response carries the token's **epoch**, and the runner re-vends its own row **proactively** (`/api/token/repair` on the agent plane — the principal is the credential, so headless gateways self-heal with no human session, rate-limited 6/hour). Only a lost or admin-revoked principal forces a human re-pair, and every repair failure reason is logged, never swallowed.
+
 Every push to `main` also publishes a rolling **dev** pre-release of the binaries — `install.sh` with no arguments always resolves to the newest versioned release, never dev. Install the dev channel with `curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash -s -- dev`.
 
 ## Three surfaces, one hub

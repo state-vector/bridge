@@ -280,6 +280,20 @@ export function selfProvisionLabel(host: unknown): string {
   return slug || "device";
 }
 
+/**
+ * BR#3787 layer 1 — is a rotation's grace window still open? The PREVIOUS
+ * token hash keeps authenticating for GRACE_MS after the rotation (stale,
+ * flagged), so a mid-dispatch rotation never amputates an in-flight gateway.
+ * Pure so the boundary is unit-testable; identify() applies it.
+ */
+export const TOKEN_GRACE_MS = 72 * 60 * 60 * 1000;
+
+export function graceActive(rotated_ts: unknown, now: number): boolean {
+  if (typeof rotated_ts !== "number" || !Number.isFinite(rotated_ts)) return false;
+  const age = now - rotated_ts;
+  return age >= 0 && age < TOKEN_GRACE_MS;
+}
+
 // ---------- workspaces ----------
 /**
  * One deployment hosts many workspaces; every human cookie and agent token is
