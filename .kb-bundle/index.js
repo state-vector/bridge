@@ -1239,6 +1239,8 @@ function breachClass(reason) {
   if (r.includes("open child")) return "gate:open-children";
   if (r.includes("cannot block")) return "gate:verdict-no-blocked";
   if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
+  if (r.includes("malformed await_event")) return "gate:malformed-await-event";
+  if (r.includes("requires a typed await_event")) return "gate:blocked-needs-typed-await";
   return "unclassified";
 }
 function classOf(e) {

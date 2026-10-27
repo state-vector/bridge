@@ -745,6 +745,19 @@ export function breachClass(reason: string): string {
   if (r.includes("open child")) return "gate:open-children";
   if (r.includes("cannot block")) return "gate:verdict-no-blocked";
   if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
+  // BR#3738: the BR#3578 fail-closed typed-await park gates. Both rejections
+  // come from one rule (blocked-needs-typed-await), but the causes differ: a
+  // park with no grammar-valid await_event at all vs a park whose await_event
+  // fails the closed grammar (specimen BR#3731 event 1, 2026-10-26: a
+  // run_success await with run_id as a NUMBER — validateAwaitEvent refuses,
+  // the corrected string retry 32s later succeeded, proving the gate not the
+  // park was rejected). The audited reason is the thrown message sliced to
+  // 300 chars (do.ts) and both messages embed AWAIT_GRAMMAR_DOC (~290 chars),
+  // so the "[rule: …]" tag never survives the slice — these matches key on
+  // the message stems, which live inside it. Structural fragments, not
+  // sentence literals (BR#3612's wording-drift lesson).
+  if (r.includes("malformed await_event")) return "gate:malformed-await-event";
+  if (r.includes("requires a typed await_event")) return "gate:blocked-needs-typed-await";
   return "unclassified";
 }
 
