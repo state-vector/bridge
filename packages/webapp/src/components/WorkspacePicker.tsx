@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Btn, Select } from "@bridge/ui-kit";
 import { wsApi, type WsList } from "../lib/workspaces";
+import { WorkspaceMembers } from "./WorkspaceMembers";
 
 /** Workspace selector/creator — the hub scopes every board, token and agent
  *  to a workspace; this is the human's door between them. Switch re-mints
@@ -8,6 +9,7 @@ import { wsApi, type WsList } from "../lib/workspaces";
 export function WorkspacePicker() {
   const [data, setData] = useState<WsList | null>(null);
   const [creating, setCreating] = useState(false);
+  const [managing, setManaging] = useState(false);
   const [slug, setSlug] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -76,6 +78,17 @@ export function WorkspacePicker() {
       ) : (
         <Btn size="sm" quiet className="ws-new" title="create a workspace — you become its owner and first member" onClick={() => setCreating(true)}>＋</Btn>
       )}
+      <Btn
+        size="sm"
+        quiet
+        on={managing}
+        className="ws-people"
+        title="members — invite by GitHub username or remove them"
+        onClick={() => setManaging(!managing)}
+      >
+        👥
+      </Btn>
+      {managing && <WorkspaceMembers ws={data.current} onChanged={load} />}
       {msg && <span className="muted-note">{msg}</span>}
       {err && <span className="st-err">{err}</span>}
     </div>

@@ -59,9 +59,12 @@ Access gate (default deny):
 npx wrangler secret put GITHUB_ALLOWED_USERS   # e.g. "rayh" or "*" for any GitHub account
 ```
 
-Without this secret, NO GitHub login can sign in (default deny). Set a comma-separated
-allowlist to limit access, or `*` to leave the hub open to any GitHub account. Workspace
-scoping (WORKSPACE_MEMBERS) is a second, finer gate on top.
+Without this secret, only allowlisted + **invited** GitHub logins can sign in (default deny).
+Set a comma-separated allowlist to limit access, or `*` to leave the hub open to any GitHub
+account. Beyond the allowlist, invitations are the self-serve second door: any workspace
+member invites/removes members by GitHub username (👥 in the web top bar), and an invited
+login can sign in even when not allowlisted. Everyone holds the same rights; the workspace
+creator cannot be removed.
 
 ```# rotate = re-put (also invalidates all session cookies — they're HMAC-signed with the secret)
 npx wrangler secret delete BRIDGE_UI_PASSWORD   # if the old shared password was set
@@ -70,9 +73,10 @@ npx wrangler secret delete BRIDGE_UI_PASSWORD   # if the old shared password was
 **Workspace scoping.** Every human session is scoped to one workspace slug —
 its own DOs (`ws:<slug>`), so users only see content from their workspace:
 
-- `WORKSPACE_MEMBERS` (optional secret): JSON map slug → GitHub logins, e.g.
-  `{"state-vector":["rayh"],"client-x":["grace"]}`. A login in no list gets an
-  isolated auto-workspace `gh-<login>` (empty, private).
+- Membership is registry-backed (SQLite in the DO): members are invited or
+  removed at runtime by GitHub username from the web UI — no secret edits,
+  no redeploys. An invited login gets an isolated personal workspace plus the
+  workspaces they were invited to.
 - Legacy pre-workspaces session cookies map to the default workspace
   `state-vector` (re-login refreshes the cookie with the workspace segment).
 
