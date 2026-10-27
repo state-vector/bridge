@@ -141,8 +141,15 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
             previously_attempted: (m.attempt?.attempts ?? 0) > 0 ? m.attempt : undefined,
           }
         : undefined;
+      // BR#3911: on a question, surface a live human hold in domain language —
+      // "in hand" instead of answer prompts, even on the direct read.
+      const claimLive = a.type === "question" && m.human_claimed
+        && typeof m.human_claimed.expires_ts === "number" && m.human_claimed.expires_ts > Date.now()
+        ? { by: String(m.human_claimed.by ?? ""), expires_ts: m.human_claimed.expires_ts }
+        : undefined;
       return text(JSON.stringify({
         ...a,
+        ...(claimLive ? { human_claimed: claimLive } : {}),
         ...(traits ? { traits } : {}),
         relations: (rel as any).relations,
         see_also: also,

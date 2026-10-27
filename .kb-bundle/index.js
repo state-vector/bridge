@@ -79,6 +79,11 @@ function taskKind(meta3) {
 function isQuestionTask(meta3) {
   return taskKind(meta3) === "question";
 }
+function humanClaimLive(meta3, now) {
+  const c = meta3?.human_claimed;
+  if (!c || typeof c.expires_ts !== "number" || c.expires_ts <= now) return null;
+  return { by: String(c.by ?? ""), ts: Number(c.ts ?? now), expires_ts: c.expires_ts };
+}
 function validateTransition(type, from, to) {
   const allowed = LIFECYCLES[type]?.[from];
   if (!allowed) return { ok: false, reason: `status '${from}' is terminal for ${type}` };
@@ -563,7 +568,7 @@ function trainParseNoteLegs(text2) {
     ...paired[i] !== null ? { head_sha_at_acceptance: heads[paired[i]].sha } : {}
   }));
 }
-var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, INITIAL_STATUS, RELATIONS, WS_RE, TOKEN_GRACE_MS, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, TRAIN_LEASE_TTL_MS, LANE_TITLE_PREFIX, MERGE_TRAIN_REASON_PREFIX, MERGE_TRAIN_QUEUED_REASON, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES, TRAIN_HEAD_STAMP_RE, TRAIN_HEAD_STAMP_RE_G, TRAIN_PR_URL_RE;
+var ARTEFACT_TYPES, TASK_KINDS, KIND_TYPE, KIND_ROLE, KIND_TAG, ROLE_NAMES, LIFECYCLES, QUESTION_CLAIM_MINUTES, INITIAL_STATUS, RELATIONS, WS_RE, TOKEN_GRACE_MS, DEFAULT_WS_SLUG, ASK_OPEN, ASK_ANSWERED, TRANSPORTS, DEFAULT_BOARD, DEFAULT_PROJECT, DEFAULT_CRON_PLAYBOOK, DEFAULT_ROLE_PLAYBOOKS, SENTIMENTS, LIMITS, EMBED_MODEL, TRIGRAM_DIM, GH_RECEIPT_RE, GH_COMMIT_RE, MAIN_RED_CONCLUSIONS, TRAIN_LEASE_TTL_MS, LANE_TITLE_PREFIX, MERGE_TRAIN_REASON_PREFIX, MERGE_TRAIN_QUEUED_REASON, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES, TRAIN_HEAD_STAMP_RE, TRAIN_HEAD_STAMP_RE_G, TRAIN_PR_URL_RE;
 var init_core = __esm({
   "src/kb/core.ts"() {
     ARTEFACT_TYPES = [
@@ -595,6 +600,8 @@ var init_core = __esm({
       progress: {},
       agent: {}
     };
+    QUESTION_CLAIM_MINUTES = 10;
+    __name(humanClaimLive, "humanClaimLive");
     INITIAL_STATUS = {
       steering: "draft",
       goal: "draft",
@@ -1560,7 +1567,7 @@ var init_rollup = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "34416e2f0225ac1199191d07fb14d8d659290abf", built_at: "2026-10-27T12:00:23Z" };
+    module.exports = { commit: "78b993a8e5a9b0736db979658e338aec4ac7b8e2", built_at: "2026-10-27T22:45:58Z" };
   }
 });
 
@@ -1680,6 +1687,11 @@ var init_do = __esm({
         const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
         const staleMs = staleMin * 6e4;
         const now = Date.now();
+        try {
+          await this.questionClaimSweep(now);
+        } catch (e) {
+          this.audit("system:watchdog", "sweep_error", "question_claim_sweep", { error: String(e.message ?? e).slice(0, 300) });
+        }
         const rows = this.state.storage.sql.exec(
           `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND status = 'in_progress'`
@@ -2989,6 +3001,10 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
               return this.json(await this.askAnswer(body, actor));
             case "ask.get":
               return this.json(await this.askGet(String(body.id ?? "")));
+            case "question.claim":
+              return this.json(await this.questionClaim(body, actor));
+            case "question.release":
+              return this.json(await this.questionRelease(body, actor));
             case "purge_smoke":
               return this.json(await this.purgeSmoke(body));
             case "ask.reframe":
@@ -3047,12 +3063,16 @@ Contract: if the live state does NOT hold (the sweep mis-read), record findings 
             case "admin.settings_get":
             case "admin.settings_set":
             case "admin.unblock_proxy_sweep":
+            case "admin.question_claim_sweep":
               if (!isAdmin) return this.json({ error: "admin only" }, 403);
               if (op === "admin.mint") return this.json(await this.tokenMint(body));
               if (op === "admin.list_tokens") return this.json(await this.tokenList());
               if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
               if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
               if (op === "admin.settings_get") return this.json(await this.settingsGet());
+              if (op === "admin.question_claim_sweep") {
+                return this.json({ expired: await this.questionClaimSweep(Number(body.now) || Date.now()) });
+              }
               if (op === "admin.unblock_proxy_sweep") {
                 await this.unblockProxySweep(Number(body.now ?? Date.now()));
                 const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
@@ -3820,6 +3840,9 @@ Contract: (1) verify live state first (gh issue view <N> --repo <repo> --json st
         } else if (meta3.blocked) {
           delete meta3.blocked;
         }
+        if (row.type === "question" && (verdict.status === "done" || verdict.status === "superseded")) {
+          delete meta3.human_claimed;
+        }
         let owner = row.owner;
         const bounceFromReview = row.status === "in_review";
         let ghostBounce = false;
@@ -4303,7 +4326,7 @@ Contract: check whether the exit condition now holds (live receipts, GitHub stat
         const confidence_pct = pct(body.confidence_pct);
         const risk_pct = pct(body.risk_pct);
         const context_pct = pct(body.context_pct);
-        const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
+        const row = this.one(`SELECT id, type, status, owner, meta, tags, roles FROM artefacts WHERE id = ?`, id);
         if (!row) throw new Error(`no such artefact: ${id}`);
         const meta3 = JSON.parse(row.meta ?? "{}");
         const m = this.settingsMap();
@@ -4321,6 +4344,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
         } else if (row.status === "todo") {
           const tRoles = parseTags(row.roles);
           if (row.type === "question") {
+            const claim2 = humanClaimLive(meta3, Date.now());
             return {
               id,
               note,
@@ -4331,7 +4355,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
               risk_pct,
               context_pct,
               instructions,
-              note_postscript: "contribution logged on a question \u2014 questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task)."
+              note_postscript: claim2 ? `contribution logged, but ${claim2.by} (human) has this question in hand until ${new Date(claim2.expires_ts).toISOString()} \u2014 hold new pings; the claim auto-expires if they no-show` : "contribution logged on a question \u2014 questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task)."
             };
           }
           const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
@@ -4742,6 +4766,96 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
         this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
         return { id, ask: id, question, artefact_id: artefactId || void 0, options, urgency, task_status: taskStatus };
       }
+      // ---------- question human-claim hold (BR#3911) ----------
+      /** Human-actor authority, same shape machine.ts uses for decision
+       *  acceptance: the web plane stamps `web:<login>`, humans sign `human:*`.
+       *  Gateway/agent labels are rejected — a claim is a HUMAN hold. */
+      static HUMAN_ACTOR = /^web(:|$)|^human:/;
+      /** BR#3911: Claim on a question = a named human takes it — a transient hold
+       *  that dismisses the question from the agent surfaces ("claimed by <human>
+       *  — in hand") with a 10-minute timeout that re-opens it on a no-show.
+       *  Claim ≠ answer: protocol 6b stands, the question still closes via the
+       *  author's ADR. This is a meta stamp, NOT a transition — the claim law
+       *  (question-not-claimable) and the runner claim path are untouched, and
+       *  agent claims stay forbidden. */
+      async questionClaim(body, actor) {
+        if (!_KnowledgeHub.HUMAN_ACTOR.test(actor))
+          throw new Error("question claim is a human hold \u2014 sign in as the human in the webapp (agents: questions are answered, not claimed; contribute via log_progress)");
+        const id = String(body.id ?? "");
+        const row = this.one(`SELECT id, type, status, meta FROM artefacts WHERE id = ?`, id);
+        if (!row) throw new Error(`no such artefact: ${id}`);
+        if (row.type !== "question") throw new Error(`${id} is a ${row.type} \u2014 the claim-hold exists only on question cards (work items claim via transition, as today)`);
+        if (row.status !== "todo") throw new Error(`${id} is ${row.status} \u2014 only an open question can be claimed`);
+        const meta3 = JSON.parse(row.meta ?? "{}");
+        if (meta3.ask?.answer) throw new Error(`${id} is already answered \u2014 nothing to hold`);
+        const minutes = Math.max(1, Math.min(60, Number(body.minutes) || this.questionClaimMinutes()));
+        const ts = Date.now();
+        const prior = meta3.human_claimed ?? null;
+        meta3.human_claimed = { by: actor, ts, expires_ts: ts + minutes * 6e4 };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta3), ts, id);
+        this.audit(actor, "question_claim", id, { by: actor, expires_ts: meta3.human_claimed.expires_ts, minutes, prior_by: prior?.by ?? null });
+        this.version(
+          id,
+          actor,
+          "note",
+          prior ? `human claim re-stamped by ${actor} \u2014 in hand for ${minutes}m (previous hold by ${prior.by ?? "?"} replaced)` : `human claim \u2014 ${actor} has this in hand for ${minutes}m; agents stand down (auto-reverts to the pool on expiry, honest churn)`,
+          { human_claimed: meta3.human_claimed, prior: prior ?? void 0 }
+        );
+        return { id, human_claimed: meta3.human_claimed };
+      }
+      /** BR#3911: the human puts the question back before the window lapses —
+       *  the symmetric early exit, so a misclick doesn't park a question for the
+       *  full window. Recorded like every claim change, never silent. */
+      async questionRelease(body, actor) {
+        if (!_KnowledgeHub.HUMAN_ACTOR.test(actor))
+          throw new Error("question release is a human action \u2014 agents cannot touch a human's claim hold");
+        const id = String(body.id ?? "");
+        const row = this.one(`SELECT id, type, meta FROM artefacts WHERE id = ?`, id);
+        if (!row) throw new Error(`no such artefact: ${id}`);
+        if (row.type !== "question") throw new Error(`${id} is a ${row.type} \u2014 nothing to release`);
+        const meta3 = JSON.parse(row.meta ?? "{}");
+        const claim2 = humanClaimLive(meta3, Date.now());
+        if (!claim2) throw new Error(`${id} has no live human claim \u2014 nothing to release (expired holds are already reverted by the sweep)`);
+        delete meta3.human_claimed;
+        const ts = Date.now();
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta3), ts, id);
+        this.audit(actor, "question_release", id, { by: claim2.by, released_by: actor });
+        this.version(id, actor, "note", `human claim released early by ${actor} \u2014 back in the pool now`, { released_claim: claim2 });
+        return { id, released: true };
+      }
+      /** BR#3911 timeout sweep: a live claim past its window auto-reverts — the
+       *  stamp clears and the expiry lands in the version log (honest churn, not
+       *  silent). The question was never anything but todo (the hold is meta, not
+       *  a status), so "re-open" is exactly: the chip clears, the pool sees it
+       *  again. Runs on the watchdog alarm; `admin.question_claim_sweep` drills it
+       *  with an injected clock. */
+      async questionClaimSweep(now) {
+        const rows = this.state.storage.sql.exec(
+          `SELECT id, meta FROM artefacts WHERE type = 'question' AND status = 'todo'`
+        ).toArray();
+        let expired = 0;
+        for (const r of rows) {
+          try {
+            const meta3 = JSON.parse(r.meta ?? "{}");
+            const c = meta3.human_claimed;
+            if (!c || typeof c.expires_ts !== "number" || c.expires_ts > now) continue;
+            delete meta3.human_claimed;
+            const heldMin = Math.max(1, Math.round((c.expires_ts - Number(c.ts ?? c.expires_ts)) / 6e4));
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta3), now, r.id);
+            this.version(r.id, "system:watchdog", "note", `human claim expired \u2014 ${c.by ?? "a human"} held it ${heldMin}m without an answer or close; back in the pool`, { expired_claim: c });
+            this.audit("system:watchdog", "question_claim_expired", r.id, { by: c.by ?? "", held_min: heldMin });
+            expired++;
+          } catch (e) {
+            this.audit("system:watchdog", "sweep_error", r.id, { error: String(e.message ?? e).slice(0, 300) });
+          }
+        }
+        return expired;
+      }
+      /** Hold window from settings (`question_claim_minutes`, 1-60), defaulting to
+       *  the BR#3911 spec value. */
+      questionClaimMinutes() {
+        return Math.max(1, Math.min(60, parseInt(this.settingValue("question_claim_minutes", String(QUESTION_CLAIM_MINUTES)), 10) || QUESTION_CLAIM_MINUTES));
+      }
       async askInbox(body) {
         const label = String(body.label ?? "");
         const nodes = this.state.storage.sql.exec(
@@ -4753,6 +4867,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
         const inbox = nodes.map((n) => {
           const m = JSON.parse(n.meta ?? "{}");
           if (!m.ask) return null;
+          if (humanClaimLive(m, Date.now())) return null;
           const out = { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
           if (m.ask.reframe) out.reframe = m.ask.reframe;
           return out;
@@ -4852,6 +4967,8 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
           const m = JSON.parse(node2.meta ?? "{}");
           if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
           m.ask = { ...m.ask ?? {}, answer: answer.slice(0, 4e3), answered_by: actor, answered_ts: Date.now() };
+          const hadClaim = !!m.human_claimed;
+          if (hadClaim) delete m.human_claimed;
           const now = Date.now();
           this.state.storage.sql.exec(
             `UPDATE artefacts SET meta = ?, status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -4860,7 +4977,7 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
             now,
             id
           );
-          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node2.status, to: "done", answer: answer.slice(0, 200) });
+          this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node2.status, to: "done", answer: answer.slice(0, 200), claim_resolved: hadClaim || void 0 });
           let taskStatus2;
           const subject = this.one(
             `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -4961,6 +5078,12 @@ One open card per (task, class) \u2014 reoccurrences coalesce here instead of sp
             }
             if (m.subprocess) t.subprocess = { reason: (m.subprocess.reason ?? "").slice(0, 120), deadline_ts: m.subprocess.deadline_ts };
             if (m.session && ["in_progress", "in_review"].includes(t.status)) t.executor_session = m.session;
+            delete t.meta;
+          }
+          if (t.type === "question") {
+            const qm = JSON.parse(t.meta ?? "{}");
+            const claim2 = humanClaimLive(qm, Date.now());
+            if (claim2) t.human_claimed = { by: claim2.by, expires_ts: claim2.expires_ts };
             delete t.meta;
           }
           return t;
@@ -28136,8 +28259,10 @@ ${required2.join("\n")}` : named ? void 0 : 'you did not name this session \u201
             claim_reason: isQuestion ? "question \u2014 answered, not claimed (contribute via log_progress {id, did})" : gated ? `operator gated: ${gated} \u2014 a human clears the gate` : ["todo", "blocked"].includes(a.status ?? "") ? void 0 : `status '${a.status}' is not claimable (claim = todo \u2192 in_progress)`,
             previously_attempted: (m.attempt?.attempts ?? 0) > 0 ? m.attempt : void 0
           } : void 0;
+          const claimLive = a.type === "question" && m.human_claimed && typeof m.human_claimed.expires_ts === "number" && m.human_claimed.expires_ts > Date.now() ? { by: String(m.human_claimed.by ?? ""), expires_ts: m.human_claimed.expires_ts } : void 0;
           return text(JSON.stringify({
             ...a,
+            ...claimLive ? { human_claimed: claimLive } : {},
             ...traits ? { traits } : {},
             relations: rel.relations,
             see_also: also,
@@ -33307,6 +33432,16 @@ var index_default = {
           const body2 = await request.json().catch(() => ({}));
           body2.actor = auth2.bearer ? "gateway" : `web:${auth2.login ?? "anon"}`;
           return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body2)
+          }));
+        }
+        if ((sub === "question_claim" || sub === "question_release") && request.method === "POST") {
+          if (auth2.bearer) return kbCors(json3({ error: "question claim is a human hold \u2014 a gateway bearer cannot hold a question; answer or contribute instead (protocol 6b)" }, 403));
+          const body2 = await request.json().catch(() => ({}));
+          body2.actor = `web:${auth2.login ?? "anon"}`;
+          return kbCors(env.KB.get(kbId).fetch(`https://kb/question.${sub === "question_claim" ? "claim" : "release"}`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(body2)

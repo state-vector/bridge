@@ -151,6 +151,8 @@ opened (todo, never claimed) ──► contributions land as progress entries (a
 
 The pattern: exclusive kinds (impl, analysis, review, research) hold one claim each and finish with receipts. The open kind (question) holds no claim and produces durable decisions. Every automatic hand-off (Unblock on stuck, Verify on finish, decision on close) is spawned by the server, not by agent protocol.
 
+**Humans get a transient hold** (BR#3911): **Claim — I'll handle it** on an open question card stamps a 10-minute human hold — the question leaves the agent pool (inboxes drop it; orient and the board show "in hand by <you>"), and agent contributions get a stand-down postscript. Claim ≠ answer: the question still closes via your ADR. Answering or closing cancels the timer; a no-show auto-reverts the hold with an expiry note on the card; **Release** puts it back early. Agent claims on questions stay forbidden — the hold is a meta stamp, never a status transition.
+
 Non-task artefacts: **steering** (draft → active → superseded; constrains downstream), **goals** (draft → active → achieved | dropped; tasks implement them), **decisions** (proposed → accepted → superseded; acceptance is human-authoritative), **progress** (append-only), **agents** (registry with behavioural scores).
 
 Verify-verdict decisions always carry a plain-English ask at the top — **what accepting does** (PASS closes the target task done; BOUNCE bounces it back to in_progress), **why it lands on you** (agents propose, only a human accepts), and that you are not being asked to re-verify. Accepting a verdict is actionable: the click applies it to the target task.

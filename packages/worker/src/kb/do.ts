@@ -88,6 +88,9 @@ import {
   trainBounceBrief,
   trainStopAskTitle,
   trainLandedCloseNote,
+  // question human-claim hold (BR#3911)
+  humanClaimLive,
+  QUESTION_CLAIM_MINUTES,
   type TrainLease,
   type LeaseAction,
   type MainCheckRun,
@@ -237,6 +240,11 @@ export class KnowledgeHub {
     const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
     const staleMs = staleMin * 60_000;
     const now = Date.now();
+    // (0b) BR#3911: human-claim holds on questions auto-revert past their
+    // window — the pool sees the question again, the expiry is on the record.
+    try { await this.questionClaimSweep(now); } catch (e) {
+      this.audit("system:watchdog", "sweep_error", "question_claim_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
     const rows = this.state.storage.sql.exec(
       `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND status = 'in_progress'`,
@@ -1630,6 +1638,8 @@ export class KnowledgeHub {
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
+        case "question.claim": return this.json(await this.questionClaim(body, actor));
+        case "question.release": return this.json(await this.questionRelease(body, actor));
         case "purge_smoke": return this.json(await this.purgeSmoke(body));
         case "ask.reframe": return this.json(await this.askReframe(body, actor));
         case "orient": return this.json(await this.orient(body));
@@ -1671,12 +1681,18 @@ export class KnowledgeHub {
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
+        case "admin.question_claim_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
           if (op === "admin.settings_get") return this.json(await this.settingsGet());
+          if (op === "admin.question_claim_sweep") {
+            // drill/liveness path for the BR#3911 claim-expiry sweep — the
+            // same injected-clock shape as the proxy watch's drill
+            return this.json({ expired: await this.questionClaimSweep(Number(body.now) || Date.now()) });
+          }
           if (op === "admin.unblock_proxy_sweep") {
             // drill/liveness path for the unblock-proxy watch (BR#3361a):
             // per-card pacing + caps still apply; pass now=<future epoch ms>
@@ -2465,6 +2481,11 @@ export class KnowledgeHub {
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
     }
+    // BR#3911: a question leaving todo (answered done, ADR supersede) cancels
+    // any live human-claim hold — the hold was waiting for exactly this.
+    if (row.type === "question" && (verdict.status === "done" || verdict.status === "superseded")) {
+      delete meta.human_claimed;
+    }
     // claim semantics: in_progress on a task claims it for the actor (system actors don't steal claims)
     let owner = row.owner;
     // claim only on fresh pickup or abandoned re-claim — a review bounce returns to the AUTHOR
@@ -3016,7 +3037,12 @@ export class KnowledgeHub {
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
     const context_pct = pct(body.context_pct);
-    const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
+    // `type` + `roles` are read below (the question branch and the role
+    // qualifier check) — the select used to omit them, so row.type was always
+    // undefined and the question postscript was dead code: contributions on
+    // todo questions fell through to the claim path and 400'd on the machine
+    // rejection instead of logging additively (protocol 6b).
+    const row = this.one(`SELECT id, type, status, owner, meta, tags, roles FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
     const m = this.settingsMap();
@@ -3044,9 +3070,14 @@ export class KnowledgeHub {
       const tRoles: string[] = parseTags(row.roles);
       // questions: contributions never claim — the author closes with an ADR
       if (row.type === "question") {
+        // BR#3911: while a human holds the question, tell the contributor to
+        // stand down — the hold exists to stop exactly this pinging.
+        const claim = humanClaimLive(meta, Date.now());
         return {
           id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: "contribution logged on a question — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task).",
+          note_postscript: claim
+            ? `contribution logged, but ${claim.by} (human) has this question in hand until ${new Date(claim.expires_ts).toISOString()} — hold new pings; the claim auto-expires if they no-show`
+            : "contribution logged on a question — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task).",
         };
       }
       const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
@@ -3476,6 +3507,102 @@ export class KnowledgeHub {
     this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
     return { id, ask: id, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
   }
+  // ---------- question human-claim hold (BR#3911) ----------
+
+  /** Human-actor authority, same shape machine.ts uses for decision
+   *  acceptance: the web plane stamps `web:<login>`, humans sign `human:*`.
+   *  Gateway/agent labels are rejected — a claim is a HUMAN hold. */
+  private static HUMAN_ACTOR = /^web(:|$)|^human:/;
+
+  /** BR#3911: Claim on a question = a named human takes it — a transient hold
+   *  that dismisses the question from the agent surfaces ("claimed by <human>
+   *  — in hand") with a 10-minute timeout that re-opens it on a no-show.
+   *  Claim ≠ answer: protocol 6b stands, the question still closes via the
+   *  author's ADR. This is a meta stamp, NOT a transition — the claim law
+   *  (question-not-claimable) and the runner claim path are untouched, and
+   *  agent claims stay forbidden. */
+  private async questionClaim(body: any, actor: string) {
+    if (!KnowledgeHub.HUMAN_ACTOR.test(actor))
+      throw new Error("question claim is a human hold — sign in as the human in the webapp (agents: questions are answered, not claimed; contribute via log_progress)");
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT id, type, status, meta FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "question") throw new Error(`${id} is a ${row.type} — the claim-hold exists only on question cards (work items claim via transition, as today)`);
+    if (row.status !== "todo") throw new Error(`${id} is ${row.status} — only an open question can be claimed`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (meta.ask?.answer) throw new Error(`${id} is already answered — nothing to hold`);
+    const minutes = Math.max(1, Math.min(60, Number(body.minutes) || this.questionClaimMinutes()));
+    const ts = Date.now();
+    const prior = meta.human_claimed ?? null;
+    meta.human_claimed = { by: actor, ts, expires_ts: ts + minutes * 60_000 };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), ts, id);
+    this.audit(actor, "question_claim", id, { by: actor, expires_ts: meta.human_claimed.expires_ts, minutes, prior_by: prior?.by ?? null });
+    this.version(
+      id, actor, "note",
+      prior
+        ? `human claim re-stamped by ${actor} — in hand for ${minutes}m (previous hold by ${prior.by ?? "?"} replaced)`
+        : `human claim — ${actor} has this in hand for ${minutes}m; agents stand down (auto-reverts to the pool on expiry, honest churn)`,
+      { human_claimed: meta.human_claimed, prior: prior ?? undefined },
+    );
+    return { id, human_claimed: meta.human_claimed };
+  }
+
+  /** BR#3911: the human puts the question back before the window lapses —
+   *  the symmetric early exit, so a misclick doesn't park a question for the
+   *  full window. Recorded like every claim change, never silent. */
+  private async questionRelease(body: any, actor: string) {
+    if (!KnowledgeHub.HUMAN_ACTOR.test(actor))
+      throw new Error("question release is a human action — agents cannot touch a human's claim hold");
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT id, type, meta FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "question") throw new Error(`${id} is a ${row.type} — nothing to release`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    const claim = humanClaimLive(meta, Date.now());
+    if (!claim) throw new Error(`${id} has no live human claim — nothing to release (expired holds are already reverted by the sweep)`);
+    delete meta.human_claimed;
+    const ts = Date.now();
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), ts, id);
+    this.audit(actor, "question_release", id, { by: claim.by, released_by: actor });
+    this.version(id, actor, "note", `human claim released early by ${actor} — back in the pool now`, { released_claim: claim });
+    return { id, released: true };
+  }
+
+  /** BR#3911 timeout sweep: a live claim past its window auto-reverts — the
+   *  stamp clears and the expiry lands in the version log (honest churn, not
+   *  silent). The question was never anything but todo (the hold is meta, not
+   *  a status), so "re-open" is exactly: the chip clears, the pool sees it
+   *  again. Runs on the watchdog alarm; `admin.question_claim_sweep` drills it
+   *  with an injected clock. */
+  private async questionClaimSweep(now: number): Promise<number> {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type = 'question' AND status = 'todo'`,
+    ).toArray() as any[];
+    let expired = 0;
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const c = meta.human_claimed;
+        if (!c || typeof c.expires_ts !== "number" || c.expires_ts > now) continue;
+        delete meta.human_claimed;
+        const heldMin = Math.max(1, Math.round((c.expires_ts - Number(c.ts ?? c.expires_ts)) / 60_000));
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, r.id);
+        this.version(r.id, "system:watchdog", "note", `human claim expired — ${c.by ?? "a human"} held it ${heldMin}m without an answer or close; back in the pool`, { expired_claim: c });
+        this.audit("system:watchdog", "question_claim_expired", r.id, { by: c.by ?? "", held_min: heldMin });
+        expired++;
+      } catch (e) {
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
+    return expired;
+  }
+
+  /** Hold window from settings (`question_claim_minutes`, 1-60), defaulting to
+   *  the BR#3911 spec value. */
+  private questionClaimMinutes(): number {
+    return Math.max(1, Math.min(60, parseInt(this.settingValue("question_claim_minutes", String(QUESTION_CLAIM_MINUTES)), 10) || QUESTION_CLAIM_MINUTES));
+  }
+
   private async askInbox(body: any) {
     const label = String(body.label ?? "");
     // nodes are the inbox; open legacy rows are shown until the v2 migration
@@ -3498,6 +3625,10 @@ export class KnowledgeHub {
       .map((n) => {
         const m = JSON.parse(n.meta ?? "{}");
         if (!m.ask) return null;
+        // BR#3911: a human has this question in hand — it leaves the agent
+        // pool ("stop nudging"). The hold auto-expires; the sweep clears the
+        // stamp and the question resurfaces here on its own.
+        if (humanClaimLive(m, Date.now())) return null;
         const out: any = { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
         if (m.ask.reframe) out.reframe = m.ask.reframe;
         return out;
@@ -3600,6 +3731,10 @@ export class KnowledgeHub {
       const m = JSON.parse(node.meta ?? "{}");
       if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
+      // BR#3911: an answer resolves a live human-claim hold — the timer is
+      // cancelled by the very act the hold was waiting for.
+      const hadClaim = !!m.human_claimed;
+      if (hadClaim) delete m.human_claimed;
       // questions complete directly (todo → done) — the claimant status machine
       // is for work items, not for Q&A nodes
       const now = Date.now();
@@ -3609,7 +3744,7 @@ export class KnowledgeHub {
       );
       // stamp the real from→to — a status change with no from/to is a silent
       // mutation as far as the replay fold is concerned (BR#3322)
-      this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200) });
+      this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200), claim_resolved: hadClaim || undefined });
       let taskStatus: string | undefined;
       const subject = this.one(
         `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
@@ -3717,6 +3852,14 @@ export class KnowledgeHub {
         // on a card can see WHO holds it before acting (the advisory half of
         // the duplicate-executor fence; the audit half fires on transitions)
         if (m.session && ["in_progress", "in_review"].includes(t.status)) t.executor_session = m.session;
+        delete t.meta;
+      }
+      // BR#3911: a human-held question stays visible but says "in hand" —
+      // agents see the hold instead of answer prompts, and stand down.
+      if (t.type === "question") {
+        const qm = JSON.parse(t.meta ?? "{}");
+        const claim = humanClaimLive(qm, Date.now());
+        if (claim) t.human_claimed = { by: claim.by, expires_ts: claim.expires_ts };
         delete t.meta;
       }
       return t;

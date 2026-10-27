@@ -339,6 +339,61 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
 }
 
 
+/** BR#3911 — the human-claim hold band for OPEN question cards: "Claim — I'll
+ *  handle it" stamps a 10-minute hold that dismisses the question from the
+ *  agent pool; a live hold renders the countdown chip ("in hand by <who>") and
+ *  an early Release. Claim ≠ answer — the question still closes via the
+ *  author's ADR; answering or closing cancels the timer server-side. */
+function QuestionHoldBand({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void }) {
+  const [now, setNow] = useState(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (task.type !== "question" || ["done", "superseded"].includes(task.status)) return null;
+  const c = (task.meta?.human_claimed ?? null) as { by?: string; ts?: number; expires_ts?: number } | null;
+  const live = c && typeof c.expires_ts === "number" && c.expires_ts > now ? c : null;
+  const claim = async () => {
+    setBusy(true); setErr("");
+    try {
+      await kbApi.questionClaim(task.id);
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setErr((e as Error).message || "claim failed"); } finally { setBusy(false); }
+  };
+  const release = async () => {
+    setBusy(true); setErr("");
+    try {
+      await kbApi.questionRelease(task.id);
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setErr((e as Error).message || "release failed"); } finally { setBusy(false); }
+  };
+  const msLeft = live ? Math.max(0, (c!.expires_ts ?? 0) - now) : 0;
+  const mm = Math.floor(msLeft / 60000);
+  const ss = Math.floor((msLeft % 60000) / 1000);
+  return (
+    <div className="task-blocked-info" style={{ marginBottom: 10 }}>
+      {live ? (
+        <div className="ask-chips">
+          <Chip tone="scope" title="a human has this question in hand — agents stand down; it auto-reopens when the hold expires">in hand by {live.by || "human"}</Chip>
+          <span className="gw-mono" title="time left before the hold auto-expires">{mm}:{String(ss).padStart(2, "0")}</span>
+          <Btn size="sm" quiet disabled={busy} title="put it back now — the question re-enters the agent pool immediately" onClick={() => void release()}>Release</Btn>
+          {err && <span className="k-err">{err}</span>}
+        </div>
+      ) : (
+        <div className="row" style={{ marginTop: 4, flexWrap: "wrap", gap: 6 }}>
+          <Btn size="sm" disabled={busy} title="I (named human) am picking this up — dismisses it from the agent pool for 10 minutes; auto-reopens if unanswered; answering or closing cancels the timer" onClick={() => void claim()}>Claim — I'll handle it</Btn>
+          <span className="muted-note">10-min hold — agents stand down; auto-reopens if unanswered</span>
+          {err && <span className="k-err">{err}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
@@ -553,6 +608,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
           <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
+        )}
+
+        {task && (
+          <QuestionHoldBand task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
         )}
 
         {task?.meta?.last_progress?.note && (

@@ -106,6 +106,31 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   agent: {},
 };
 
+// ---------- question human-claim hold (BR#3911) ----------
+
+/** A named human's transient hold on an open question: "I am picking this up —
+ *  stop nudging/spawning." Claim ≠ answer (protocol 6b stands: the question
+ *  still closes via the author's ADR); the hold just dismisses the question
+ *  from the agent surfaces for a short window and self-heals on a no-show. */
+export interface HumanClaim {
+  by: string;
+  ts: number;
+  expires_ts: number;
+}
+
+/** Default hold window (minutes) — the BR#3911 spec value. The hub reads the
+ *  `question_claim_minutes` setting (1-60) and falls back to this. */
+export const QUESTION_CLAIM_MINUTES = 10;
+
+/** The live claim on an open question, or null — pure so every surface (sweep,
+ *  inbox, orient, UI) agrees on what "in hand" means. An expired stamp reads as
+ *  no claim: the sweep clears it for the record, but nobody waits on it. */
+export function humanClaimLive(meta: any, now: number): HumanClaim | null {
+  const c = meta?.human_claimed;
+  if (!c || typeof c.expires_ts !== "number" || c.expires_ts <= now) return null;
+  return { by: String(c.by ?? ""), ts: Number(c.ts ?? now), expires_ts: c.expires_ts };
+}
+
 /** Initial status when an artefact of this type is created. */
 export const INITIAL_STATUS: Record<ArtefactType, string> = {
   steering: "draft",

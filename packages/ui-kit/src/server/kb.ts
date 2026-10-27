@@ -175,6 +175,13 @@ export const kbApi = {
     j<{ id: string; status: string; artefact_id?: string; task_status?: string }>("/api/kb/ask_answer", { method: "POST", body: JSON.stringify({ id, answer }) }),
   askReframe: (id: string, feedback?: string) =>
     j<{ id: string; reframe: { by: string; feedback: string; ts: number } }>("/api/kb/ask_reframe", { method: "POST", body: JSON.stringify({ id, feedback }) }),
+  // BR#3911: human-claim hold on a question — claim ≠ answer; a 10-minute
+  // "in hand" hold that dismisses the question from the agent pool and
+  // auto-reopens on expiry. Server rejects gateway bearers (human plane only).
+  questionClaim: (id: string, minutes?: number) =>
+    j<{ id: string; human_claimed: { by: string; ts: number; expires_ts: number } }>("/api/kb/question_claim", { method: "POST", body: JSON.stringify({ id, ...(minutes ? { minutes } : {}) }) }),
+  questionRelease: (id: string) =>
+    j<{ id: string; released: boolean }>("/api/kb/question_release", { method: "POST", body: JSON.stringify({ id }) }),
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),

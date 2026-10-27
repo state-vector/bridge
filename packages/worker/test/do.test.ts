@@ -514,3 +514,136 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
     expect(mine).toHaveLength(1); // the closed card only
   });
 });
+
+// ---------- BR#3911: human-claim hold on questions ----------
+
+describe("question human-claim hold (BR#3911, real storage)", () => {
+  it("a human claim stamps human_claimed with a 10-minute window; the question stays todo", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "hold drill: who owns the reindex?", actor: "web:rayh" });
+    const r = await kbJson("/question.claim", { id: q.id, actor: "web:rayh" });
+    expect(r.status).toBe(200);
+    const c = r.body.human_claimed;
+    expect(c.by).toBe("web:rayh");
+    expect(c.expires_ts - c.ts).toBe(10 * 60_000);
+    const got = await kbJson("/get", { id: q.id });
+    expect(got.body.status).toBe("todo"); // the hold is meta, never a status change
+    expect(got.body.meta.human_claimed.by).toBe("web:rayh");
+  });
+
+  it("agent and gateway actors are rejected — the hold is human-only", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "hold drill: agent rejection?", actor: "web:rayh" });
+    const agent = await kbJson("/question.claim", { id: q.id, actor: "some-agent-opencode" });
+    expect(agent.status).toBe(400);
+    expect(String(agent.body.error)).toContain("human");
+    const gw = await kbJson("/question.claim", { id: q.id, actor: "gateway" });
+    expect(gw.status).toBe(400);
+    const rel = await kbJson("/question.release", { id: q.id, actor: "some-agent-opencode" });
+    expect(rel.status).toBe(400);
+  });
+
+  it("claims on non-questions and answered questions are rejected", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "not a question" });
+    const wrong = await kbJson("/question.claim", { id: t.id, actor: "web:rayh" });
+    expect(wrong.status).toBe(400);
+    expect(String(wrong.body.error)).toContain("only on question");
+    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "human", reason: "drill", options: ["GO", "NO-GO"] });
+    expect(ask.status).toBe(200);
+    await kbJson("/ask.answer", { id: ask.body.id, answer: "GO" });
+    const ans = await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
+    expect(ans.status).toBe(400);
+  });
+
+  it("agent claims on questions stay forbidden (transition law unchanged)", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "law unchanged drill?", actor: "web:rayh" });
+    const claim = await kbJson("/transition", { id: q.id, to: "in_progress", note: "claim", actor: "some-agent-opencode" });
+    expect(claim.status).toBe(400);
+    // rejected either by the lifecycle edge (questions never leave todo) or by
+    // the question-not-claimable law — both are the claim staying forbidden
+    expect(String(claim.body.error)).toMatch(/answered, not claimed|not allowed/);
+  });
+
+  it("contributions keep logging on a held question with a stand-down postscript (6b intact)", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "contribution drill?", actor: "web:rayh" });
+    await kbJson("/question.claim", { id: q.id, actor: "web:rayh" });
+    const p = await kbJson("/progress.log", { id: q.id, actor: "drone-1", note: "found prior art in KB", did: "found prior art", will: "none" });
+    expect(p.status).toBe(200);
+    expect(String(p.body.note_postscript)).toContain("in hand");
+    // unheld questions keep the plain 6b postscript
+    const { body: q2 } = await kbJson("/create", { type: "question", title: "plain contribution drill?", actor: "web:rayh" });
+    const p2 = await kbJson("/progress.log", { id: q2.id, actor: "drone-1", note: "another data point" });
+    expect(p2.status).toBe(200);
+    expect(String(p2.body.note_postscript)).toContain("answered, not claimed");
+  });
+
+  it("an answer resolves the hold — the timer is cancelled and the stamp clears", async () => {
+    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "human", reason: "drill", options: ["GO", "NO-GO"] });
+    await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    const got = await kbJson("/get", { id: ask.body.id });
+    expect(got.body.status).toBe("done");
+    expect(got.body.meta.human_claimed).toBeUndefined();
+  });
+
+  it("a close (done) cancels the hold too", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "close cancels hold drill?", actor: "web:rayh" });
+    await kbJson("/question.claim", { id: q.id, actor: "web:rayh" });
+    const done = await kbJson("/transition", { id: q.id, to: "done", note: "author closed with an ADR", actor: "web:rayh" });
+    expect(done.status).toBe(200);
+    const got = await kbJson("/get", { id: q.id });
+    expect(got.body.meta.human_claimed).toBeUndefined();
+  });
+
+  it("release puts the question back before the window lapses; releasing again errors", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "early release drill?", actor: "web:rayh" });
+    await kbJson("/question.claim", { id: q.id, actor: "web:rayh" });
+    const rel = await kbJson("/question.release", { id: q.id, actor: "web:rayh" });
+    expect(rel.status).toBe(200);
+    const got = await kbJson("/get", { id: q.id });
+    expect(got.body.meta.human_claimed).toBeUndefined();
+    const again = await kbJson("/question.release", { id: q.id, actor: "web:rayh" });
+    expect(again.status).toBe(400);
+  });
+
+  it("the timeout sweep auto-reverts an expired hold loudly (version note), and only then", async () => {
+    const { body: q } = await kbJson("/create", { type: "question", title: "expiry sweep drill?", actor: "web:rayh" });
+    const claim = await kbJson("/question.claim", { id: q.id, actor: "web:rayh", minutes: 1 });
+    expect(claim.status).toBe(200);
+    const c = claim.body.human_claimed;
+    // before expiry: nothing happens
+    const early = await kbJson("/admin.question_claim_sweep", { now: c.ts + 30_000 });
+    expect(early.status).toBe(200);
+    expect(early.body.expired).toBe(0);
+    const still = await kbJson("/get", { id: q.id });
+    expect(still.body.meta.human_claimed).toBeTruthy();
+    // past expiry: the stamp clears and the expiry is on the record
+    const sweep = await kbJson("/admin.question_claim_sweep", { now: c.expires_ts + 1000 });
+    expect(sweep.body.expired).toBe(1);
+    const got = await kbJson("/get", { id: q.id });
+    expect(got.body.status).toBe("todo");
+    expect(got.body.meta.human_claimed).toBeUndefined();
+    const h = await kbJson("/get_history", { id: q.id, limit: 10 });
+    const notes = JSON.stringify(h.body.versions ?? []);
+    expect(notes).toContain("human claim expired");
+    // idempotent: a second sweep reaps nothing
+    const again = await kbJson("/admin.question_claim_sweep", { now: c.expires_ts + 2000 });
+    expect(again.body.expired).toBe(0);
+  });
+
+  it("a held question leaves the agent inbox and returns after expiry/release", async () => {
+    const ask = await kbJson("/ask.create", { question: "inbox dismissal drill?", to: "hold-drill-agent", reason: "drill", options: ["GO", "NO-GO"] });
+    expect(ask.status).toBe(200);
+    const before = await kbJson("/ask.inbox", { label: "hold-drill-agent" });
+    expect(JSON.stringify(before.body)).toContain(ask.body.id);
+    await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
+    const during = await kbJson("/ask.inbox", { label: "hold-drill-agent" });
+    expect(JSON.stringify(during.body)).not.toContain(ask.body.id);
+    // orient says "in hand" instead of shipping answer prompts
+    const ori = await kbJson("/orient", { label: "hold-drill-agent" });
+    const row = (ori.body.open_artefacts ?? []).find((x: any) => x.id === ask.body.id);
+    expect(row?.human_claimed?.by).toBe("web:rayh");
+    await kbJson("/question.release", { id: ask.body.id, actor: "web:rayh" });
+    const after = await kbJson("/ask.inbox", { label: "hold-drill-agent" });
+    expect(JSON.stringify(after.body)).toContain(ask.body.id);
+  });
+});
