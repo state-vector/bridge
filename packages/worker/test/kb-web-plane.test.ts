@@ -153,3 +153,27 @@ describe("TaskDetail loads artefact/related/history in parallel (BR#3462 leg 3)"
     expect(taskDetailSrc).toMatch(/comment failed: \$\{\(e as Error\)\.message\}/);
   });
 });
+
+describe("BandNodeAskRow offers a typed answer as the last option (BR#3912)", () => {
+  // Source assertion on the real component (no UI rig exists — repo
+  // convention): an options-only ask row cannot be answered in one place when
+  // the option IS a promise to write something ("RE-SCOPE — I'll rewrite the
+  // card myself"). The row must carry the type-your-own affordance inline.
+  const start = askBandSrc.indexOf("function BandNodeAskRow");
+  const body = askBandSrc.slice(start, askBandSrc.indexOf("\nfunction ", start + 1) === -1 ? askBandSrc.length : askBandSrc.indexOf("\nfunction ", start + 1));
+
+  it("renders the type-your-own toggle after the option buttons", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toContain("type your own answer…");
+    // the affordance comes last: options first, free text as the final row
+    expect(body.indexOf("AskOptions")).toBeGreaterThan(-1);
+    expect(body.indexOf("type your own answer…")).toBeGreaterThan(body.indexOf("AskOptions"));
+  });
+
+  it("submits the typed text through the same askAnswer path as a click", () => {
+    expect(body).toContain("TextInput");
+    expect(body).toMatch(/void answer\(custom\)/);
+    // no silent sends: empty text and busy both disable/ignore submission
+    expect(body).toMatch(/!custom\.trim\(\) \|\| !busy|custom\.trim\(\) && !busy/);
+  });
+});
