@@ -917,6 +917,8 @@ function validateAwaitEvent(v) {
     }
     case "ask":
       return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
+    case "deployed":
+      return typeof e.commit === "string" && /^[0-9a-f]{7,40}$/i.test(e.commit) ? { event: "deployed", commit: e.commit.toLowerCase() } : null;
     case "time":
       return typeof e.until_ts === "number" && Number.isFinite(e.until_ts) && e.until_ts > 0 ? { event: "time", until_ts: e.until_ts } : null;
     default:
@@ -937,6 +939,8 @@ function awaitEventToAtom(e) {
       return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
     case "pr_checks_green":
       return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "deployed":
+      return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
     case "ask":
     case "time":
       return null;
@@ -956,6 +960,8 @@ function describeAwaitEvent(e) {
       return e.run_id ? `GitHub run ${e.repo}/${e.run_id} conclusion=success` : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
     case "pr_checks_green":
       return `all checks green on PR ${e.repo}#${e.n}`;
+    case "deployed":
+      return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
     case "ask":
       return `ask ${e.ask_id} answered`;
     case "time":
@@ -978,7 +984,16 @@ function awaitEventFromAtoms(atoms) {
       return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
     case "pr_checks_green":
       return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
+    case "deployed":
+      return a.commit ? { event: "deployed", commit: a.commit } : null;
   }
+}
+function deployedSatisfied(hubCommit, wanted) {
+  if (!hubCommit || hubCommit === "unknown") return false;
+  const h = hubCommit.toLowerCase();
+  const w = wanted.toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(w)) return false;
+  return h.startsWith(w) || w.startsWith(h);
 }
 var LOOKS_MACHINE, DUTY_MARKERS, CLOSE_PATTERNS, RECEIPT_CONTRACT, AWAIT_GRAMMAR_DOC;
 var init_closure = __esm({
@@ -1015,11 +1030,12 @@ var init_closure = __esm({
     __name(extractGuardRun, "extractGuardRun");
     __name(parseClosureReceipt, "parseClosureReceipt");
     __name(legLabel, "legLabel");
-    AWAIT_GRAMMAR_DOC = 'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+    AWAIT_GRAMMAR_DOC = 'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
     __name(validateAwaitEvent, "validateAwaitEvent");
     __name(awaitEventToAtom, "awaitEventToAtom");
     __name(describeAwaitEvent, "describeAwaitEvent");
     __name(awaitEventFromAtoms, "awaitEventFromAtoms");
+    __name(deployedSatisfied, "deployedSatisfied");
   }
 });
 
@@ -1541,6 +1557,13 @@ var init_rollup = __esm({
   }
 });
 
+// src/__version.json
+var require_version = __commonJS({
+  "src/__version.json"(exports, module) {
+    module.exports = { commit: "34416e2f0225ac1199191d07fb14d8d659290abf", built_at: "2026-10-27T12:00:23Z" };
+  }
+});
+
 // src/kb/do.ts
 function tagsForWrite(verdict, base) {
   if (!verdict.tags_add.length) return base;
@@ -1971,6 +1994,16 @@ var init_do = __esm({
           case "pr_checks_green": {
             if (!atom.repo) return unresolvable;
             return { ok: false, receipt: `unresolvable from the hub \u2014 PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
+          }
+          case "deployed": {
+            if (!atom.commit) return unresolvable;
+            try {
+              const v = await Promise.resolve().then(() => __toESM(require_version(), 1));
+              const ok = deployedSatisfied(String(v.commit ?? ""), atom.commit);
+              return { ok, receipt: ok ? `hub deployed commit=${v.commit} (wanted ${atom.commit})` : `hub deployed commit=${v.commit ?? "unknown"} \u2014 wanted ${atom.commit} (deploy the hub to flip this atom)` };
+            } catch {
+              return { ok: false, receipt: "hub has no version stamp (pre-[build]-hook deploy) \u2014 atom cannot flip" };
+            }
           }
         }
       }
@@ -28393,13 +28426,6 @@ var init_mcp2 = __esm({
     __name(kb, "kb");
     __name(callTool, "callTool");
     __name(json2, "json");
-  }
-});
-
-// src/__version.json
-var require_version = __commonJS({
-  "src/__version.json"(exports, module) {
-    module.exports = { commit: "98b0d3ed8be9076fbaa5722d17e7cf8a84799f02", built_at: "2026-10-27T11:33:58Z" };
   }
 });
 

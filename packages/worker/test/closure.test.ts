@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  deployedSatisfied,
   doneWhenSection,
   legLabel,
   parseCloseLegs,
@@ -206,5 +207,26 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
     expect(awaitEventToAtom({ event: "ask", ask_id: "BR#1" })).toBeNull();
     expect(awaitEventToAtom({ event: "time", until_ts: 1 })).toBeNull();
     expect(awaitEventToAtom({ event: "pr_merged", repo: "a/b", n: 2 })?.kind).toBe("pr_merged");
+  });
+
+  it("deployed: the one credential-free external atom — the hub against its own version stamp", () => {
+    expect(validateAwaitEvent({ event: "deployed", commit: "34416e2" })).toEqual({ event: "deployed", commit: "34416e2" });
+    expect(validateAwaitEvent({ event: "deployed", commit: "34416E2F0225AC1199191D07FB14D8D659290ABF" })).toEqual({ event: "deployed", commit: "34416e2f0225ac1199191d07fb14d8d659290abf" }); // normalized lowercase
+    expect(validateAwaitEvent({ event: "deployed", commit: "nothex" })).toBeNull();
+    expect(validateAwaitEvent({ event: "deployed", commit: "12345" })).toBeNull(); // < 7 hex
+    expect(awaitEventToAtom({ event: "deployed", commit: "34416e2" })?.kind).toBe("deployed");
+    expect(describeAwaitEvent({ event: "deployed", commit: "34416e2" })).toContain("hub worker is deployed at commit 34416e2");
+    expect(awaitEventFromAtoms(awaitEventToAtom({ event: "deployed", commit: "34416e2" }) ? [{ kind: "deployed", repo: null, commit: "34416e2", raw: "x" }] : [])).toEqual({ event: "deployed", commit: "34416e2" });
+  });
+
+  it("deployedSatisfied: prefix match both ways, newer stamp satisfies an older pin, garbage never flips", () => {
+    const full = "34416e2f0225ac1199191d07fb14d8d659290abf";
+    expect(deployedSatisfied(full, "34416e2")).toBe(true); // pin prefix of stamp
+    expect(deployedSatisfied("34416e2", full)).toBe(true); // wanted longer than known — still a match
+    expect(deployedSatisfied(full, full)).toBe(true);
+    expect(deployedSatisfied(full, "deadbee")).toBe(false);
+    expect(deployedSatisfied("unknown", "34416e2")).toBe(false); // pre-build-hook stamp
+    expect(deployedSatisfied(null, "34416e2")).toBe(false);
+    expect(deployedSatisfied(full, "zzzzzzz")).toBe(false); // not hex → can never flip
   });
 });

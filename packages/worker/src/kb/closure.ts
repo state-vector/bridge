@@ -22,13 +22,24 @@
 // ---------- 1. unblock-proxy atoms ----------
 
 export interface ProxyAtom {
-  kind: "pr_merged" | "br_pr_merged" | "issue_closed" | "br_done" | "run_success" | "pr_checks_green";
+  kind:
+    | "pr_merged"
+    | "br_pr_merged"
+    | "issue_closed"
+    | "br_done"
+    | "run_success"
+    | "pr_checks_green"
+    | "deployed";
   /** repo slug "owner/name"; null = no repo resolvable from the text (the
    *  atom is then unresolvable — the condition can never auto-flip) */
   repo: string | null;
   number?: number;
   brId?: string;
   runId?: string;
+  /** deployed: the hub-worker commit prefix the card waits for (7-40 hex).
+   *  The ONLY credential-free external-state atom: the hub evaluates it
+   *  against its OWN baked version stamp — no GitHub creds, no guesswork. */
+  commit?: string;
   raw: string;
 }
 
@@ -299,16 +310,17 @@ export type AwaitEvent =
   | { event: "br_done"; id: string }
   | { event: "run_success"; repo: string; run_id?: string; newer_than?: string }
   | { event: "pr_checks_green"; repo: string; n: number }
+  | { event: "deployed"; commit: string }
   | { event: "ask"; ask_id: string }
   | { event: "time"; until_ts: number };
 
 export const AWAIT_EVENT_KINDS = [
   "pr_merged", "br_pr_merged", "issue_closed", "br_done",
-  "run_success", "pr_checks_green", "ask", "time",
+  "run_success", "pr_checks_green", "deployed", "ask", "time",
 ] as const;
 
 export const AWAIT_GRAMMAR_DOC =
-  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
 
 /** Closed-set validation. Returns the normalised event or null (fail-closed). */
 export function validateAwaitEvent(v: unknown): AwaitEvent | null {
@@ -336,6 +348,10 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
     }
     case "ask":
       return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
+    case "deployed":
+      return typeof e.commit === "string" && /^[0-9a-f]{7,40}$/i.test(e.commit)
+        ? { event: "deployed", commit: e.commit.toLowerCase() }
+        : null;
     case "time":
       return typeof e.until_ts === "number" && Number.isFinite(e.until_ts) && e.until_ts > 0
         ? { event: "time", until_ts: e.until_ts }
@@ -354,6 +370,7 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "br_done": return { kind: "br_done", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
+    case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
     case "ask": case "time": return null;
   }
 }
@@ -370,6 +387,7 @@ export function describeAwaitEvent(e: AwaitEvent): string {
         ? `GitHub run ${e.repo}/${e.run_id} conclusion=success`
         : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
     case "pr_checks_green": return `all checks green on PR ${e.repo}#${e.n}`;
+    case "deployed": return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
     case "ask": return `ask ${e.ask_id} answered`;
     case "time": return `timer elapsed (until_ts ${e.until_ts})`;
   }
@@ -388,5 +406,18 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
     case "br_done": return a.brId ? { event: "br_done", id: a.brId } : null;
     case "run_success": return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
     case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
+    case "deployed": return a.commit ? { event: "deployed", commit: a.commit } : null;
   }
+}
+
+/** Whether the hub's OWN deployed commit satisfies a `deployed` atom: prefix
+ *  match both ways (the card may pin 7-hex, the stamp is 40-hex, and future
+ *  deploys only ADD commits — a newer stamp still satisfies an older pin).
+ *  Pure + exported for the regression test. */
+export function deployedSatisfied(hubCommit: string | null, wanted: string): boolean {
+  if (!hubCommit || hubCommit === "unknown") return false;
+  const h = hubCommit.toLowerCase();
+  const w = wanted.toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(w)) return false;
+  return h.startsWith(w) || w.startsWith(h);
 }
