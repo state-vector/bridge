@@ -103,6 +103,8 @@ import {
   replayStatus,
   BREACH_WINDOW_MS,
   UNBLOCK_FLOOD_MS,
+  isClonableRepoRef,
+  prFromNote,
   RuleCtx,
 } from "./machine.ts";
 import {
@@ -1536,7 +1538,7 @@ export class KnowledgeHub {
       const body: any = await request.json();
       const identity = await this.identify(String(body.bearer ?? ""));
       const newLabel = String(body.label ?? "").trim();
-      if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(newLabel)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+      if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
       const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
       if (!old) throw new Error("auth token not found");
       if (newLabel !== old.label) {
@@ -2723,11 +2725,24 @@ export class KnowledgeHub {
           // checks receipts, completes it, then closes the parent (done) or
           // bounces it (in_progress with findings).
           const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
+          // Receipt URL for the verify body. The authoritative meta.pr stamp
+          // (repo+number → canonical URL) wins; a scraped fx.pr must still
+          // parse as a clonable reference — a wrapped-prefix fragment
+          // ("…/state-vector/super") once dispatched a ghost clone and
+          // churned the card (BR#3845). Nothing resolvable → "see note": a
+          // repo-less dispatch, never a ghost clone.
+          const stamp = (meta?.pr ?? {}) as { repo?: unknown; number?: unknown };
+          const prLink: string =
+            typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
+              ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
+              : fx.pr && isClonableRepoRef(fx.pr)
+                ? fx.pr
+                : "see note";
           const created = await this.create(
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${fx.pr ?? "see note"}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${id} to blocked with note \`merge-train: queued\` — the train gates it, merges it, waits out main CI, and closes it citing the mergeCommit (machine proxy: mergeCommit non-null AND main green).\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`,
+              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${id} to blocked with note \`merge-train: queued\` — the train gates it, merges it, waits out main CI, and closes it citing the mergeCommit (machine proxy: mergeCommit non-null AND main green).\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`,
               roles: ["review"],
             },
             actor,
@@ -3716,7 +3731,7 @@ export class KnowledgeHub {
     // (gateway_agents edges): the gateway is the dispatcher and resumer of its
     // workers — owner labels churn with pairings, the gateway does not. This
     // is what makes "same gateway immediately resumes its work" real.
-    // machine/agent naming: dispatched workers are labelled <gateway>.<agent>,
+    // machine/agent naming: dispatched workers are labelled <gateway>/<agent>,
     // so a gateway's my_tasks is a prefix glob — its own label plus everything
     // under it — with the gateway_agents edges kept for legacy unprefixed
     // workers.
@@ -4294,7 +4309,7 @@ export class KnowledgeHub {
     // directly connected agents) — a gateway may not take one, so
     // _direct/* ownership can never be impersonated by a paired device
     if (/^_/.test(label)) throw new Error(`labels beginning with '_' are reserved system roots (got '${label}')`);
-    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._/-]");
+    if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
     const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
     if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
     // mint in the target workspace's DO (registers hash → ws in the central
@@ -4359,7 +4374,7 @@ export class KnowledgeHub {
     // gateway is a token trait: the caller's TAG provisions, its name is irrelevant
     if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
     const label = String(body.label ?? "").trim();
-    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error(`agent label '${label}' must be 2-40 chars [a-zA-Z0-9._-]`);
+    if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error(`agent label '${label}' must be 2-64 chars [a-zA-Z0-9._/-]`);
     // a namespaced label (<gateway>/<agent>) may only live under the
     // provisioning gateway's own prefix — otherwise an agent label could
     // squat inside another gateway's ownership glob
@@ -4520,7 +4535,7 @@ export class KnowledgeHub {
 
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
-    if (!/^[a-zA-Z0-9._\/-]{2,40}$/.test(label)) throw new Error("label must be 2-40 chars [a-zA-Z0-9._-]");
+    if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
     // the only '/' allowed in a human-minted label is the reserved
     // _direct/ root — directly connected agents live there
     if (label.includes("/") && !label.startsWith("_direct/")) {

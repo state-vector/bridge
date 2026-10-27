@@ -455,6 +455,23 @@ describe("effects decided executor-side (F4)", () => {
     expect(v.effects).toEqual([{ kind: "spawn_verify", parent: "BR#1", pr: "https://github.com/x/y/pull/7" }]);
   });
 
+  it("the pr scrape rejoins the runner's mid-word line wrap (BR#3845)", async () => {
+    // the runner captures agent output at terminal width and hard-wraps
+    // mid-word; the old bare `https?://\S+` scrape stamped the truncated
+    // first line (github.com/state-vector/super) into the verify body and
+    // the runner cloned the ghost repo — dispatch skipped, task churned ×11
+    const wrapped = "PR [#2343](https://github.com/state-vector/super\npositional/pull/2343) is merge-ready";
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: wrapped } }), baseCtx()));
+    expect(v.effects).toEqual([
+      { kind: "spawn_verify", parent: "BR#1", pr: "https://github.com/state-vector/superpositional/pull/2343" },
+    ]);
+  });
+
+  it("the pr scrape refuses unclonable fragments — null, the body renders 'see note'", async () => {
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "receipts: https://example.com/whatever, prose only" } }), baseCtx()));
+    expect(v.effects).toEqual([{ kind: "spawn_verify", parent: "BR#1", pr: null }]);
+  });
+
   it("an open verify round is REUSED, not stacked (the churn that drowned the pool)", async () => {
     const c = baseCtx();
     c.openVerifyChild = () => ({ id: "BR#99" });

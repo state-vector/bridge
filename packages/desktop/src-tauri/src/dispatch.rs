@@ -964,10 +964,24 @@ fn agent_identity(cfg: &DispatchConfig) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "gateway".into());
+    format!("{}-{}", slugify(&host).to_lowercase(), agent_segment(cfg))
+}
+
+/// The agent segment nested under the gateway label (<gateway>/<segment>):
+/// the agent_name override when set, else just the backend name. The gateway
+/// label already carries the machine — the old <hostname>-<backend> autogen
+/// double-prefixed it (macbook-pro-local-2/macbook-pro-local-opencode = 46
+/// chars) past the hub's 40-char token-label cap, so every dispatch 400'd on
+/// provisioning and released its claim; hermes (ip-172-31-1-230/…) only fit
+/// at exactly 40 by luck (BR#3846).
+fn agent_segment(cfg: &DispatchConfig) -> String {
+    if let Some(a) = &cfg.agent_name {
+        return a.clone();
+    }
     let backend = cfg.backends.keys().next().cloned()
         .or_else(|| cfg.backend.clone())
         .unwrap_or_else(|| "opencode".into());
-    format!("{}-{}", slugify(&host).to_lowercase(), slugify(&backend).to_lowercase())
+    slugify(&backend).to_lowercase()
 }
 
 // ---- local dispatch snapshot (rendered by the app's Local view) ----
@@ -1349,7 +1363,14 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
             return scm::forge_for(&expanded).and_then(|f| f.repo_ref(&expanded));
         }
     }
-    let mut rest = body_md;
+    // scrape the newline-unwrapped body: the runner's terminal-width capture
+    // hard-wraps agent output mid-word, and a URL split across lines
+    // ("…/state-vector/super\npositional/pull/2343") scraped as its truncated
+    // first line — a ghost repo that failed to clone and churned the task
+    // (BR#3845). Line breaks are never meaningful inside a URL, so removing
+    // them before scraping can only rejoin real ones.
+    let flat = body_md.replace('\r', "").replace('\n', "");
+    let mut rest: &str = &flat;
     while let Some(i) = rest.find("https://") {
         rest = &rest[i..];
         let end = rest
@@ -1385,7 +1406,58 @@ fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
 
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
 /// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
-fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloneFailure {
+    /// git reached the remote and got a definitive "no such repo" — an
+    /// authoring defect in the card's repo reference. Retrying the same
+    /// reference can never succeed; the BR#3845 class burned 13 watchdog
+    /// cycles re-clone-failing a ghost repo (state-vector/super) before a
+    /// human noticed.
+    NotFound(String),
+    /// credentials — the reference is fine, the runner's access isn't.
+    /// Retrying without fixing access is futile, but it isn't the card's
+    /// defect; named loudly, claimed released, retried only on access change.
+    Auth(String),
+    /// network/infra flake — retry next cycle is the right move.
+    Transient(String),
+}
+
+impl CloneFailure {
+    /// Fatal classes refuse the reference outright (recorded, skipped until it
+    /// changes); Transient keeps the retry-next-cycle behaviour.
+    pub(crate) fn fatal(&self) -> bool {
+        matches!(self, CloneFailure::NotFound(_) | CloneFailure::Auth(_))
+    }
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            CloneFailure::NotFound(s) | CloneFailure::Auth(s) | CloneFailure::Transient(s) => s,
+        }
+    }
+}
+
+/// Classify a git clone/fetch stderr into the failure taxonomy. GitHub says
+/// "Repository not found" for both a missing repo and a private one the
+/// runner can't see — both are fatal-until-changed for this reference.
+fn classify_clone_failure(stderr: &str) -> CloneFailure {
+    let s = stderr.to_lowercase();
+    let fatal_not_found = s.contains("repository not found")
+        || s.contains("repo not found")
+        || s.contains("does not appear to be a git repository")
+        || s.contains("not a git repository");
+    if fatal_not_found {
+        CloneFailure::NotFound(stderr.trim().to_string())
+    } else if s.contains("authentication failed")
+        || s.contains("could not read username")
+        || s.contains("permission denied")
+        || s.contains("http 403")
+    {
+        CloneFailure::Auth(stderr.trim().to_string())
+    } else {
+        CloneFailure::Transient(stderr.trim().to_string())
+    }
+}
+
+fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
     let tail: String = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -1398,28 +1470,85 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Option<PathBuf> {
         .join("-");
     let slug = slugify(&tail);
     let repos_dir = PathBuf::from(workdir).join("repos");
-    std::fs::create_dir_all(&repos_dir).ok()?;
+    std::fs::create_dir_all(&repos_dir).map_err(|e| CloneFailure::Transient(e.to_string()))?;
     let path = repos_dir.join(&slug);
     if path.join(".git").exists() {
-        let ok = Command::new("git")
+        let out = Command::new("git")
             .current_dir(&path)
             .args(["fetch", "--all", "--prune"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        return if ok { Some(path) } else { None };
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+        return if out.status.success() {
+            Ok(path)
+        } else {
+            Err(classify_clone_failure(&String::from_utf8_lossy(&out.stderr)))
+        };
     }
-    let ok = Command::new("git")
+    let out = Command::new("git")
         .args(["clone", repo_url])
         .arg(&path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok { Some(path) } else { None }
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+    if out.status.success() {
+        Ok(path)
+    } else {
+        Err(classify_clone_failure(&String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// ---- refused-reference cache (BR#3845 self-heal) ----
+/// A card whose repo reference is fatally unclonable (ghost repo, no access)
+/// must not re-enter the claim→clone-fail→watchdog-release loop forever. The
+/// runner records (task → reference + reason) locally and skips the reference
+/// until it CHANGES on the card — the author fixes the URL, the record no
+/// longer matches, dispatch resumes. Local to this runner host: the hub
+/// machine stays the verdict authority; this is provisioning self-defense.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RefusedRef {
+    pub url: String,
+    pub reason: String,
+    pub ts: u64,
+}
+
+fn refused_cache_path() -> Option<PathBuf> {
+    dispatch_dir().map(|d| d.join("refused-repos.json"))
+}
+
+fn refused_cache_load() -> HashMap<String, RefusedRef> {
+    let Some(p) = refused_cache_path() else {
+        return HashMap::new();
+    };
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn refused_cache_store(cache: &HashMap<String, RefusedRef>) {
+    if let Some(p) = refused_cache_path() {
+        let _ = std::fs::write(&p, serde_json::to_string_pretty(cache).unwrap_or_default());
+    }
+}
+
+/// Whether this task's CURRENT reference is the one we already refused:
+/// true = skip dispatch (the defect stands); false = proceed (fresh task, or
+/// the author fixed the URL — the stale record is dropped so it can't pin the
+/// card forever).
+fn refused_reference(cache: &mut HashMap<String, RefusedRef>, tid: &str, url: Option<&str>) -> bool {
+    match (cache.get(tid), url) {
+        (Some(r), Some(u)) if r.url == u => true,
+        (Some(_), other) => {
+            // reference changed (or removed) since the refusal — re-arm
+            cache.remove(tid);
+            refused_cache_store(cache);
+            false
+        }
+        (None, _) => false,
+    }
 }
 
 /// Owning repo of a worktree: the worktree's .git FILE points at
@@ -2145,15 +2274,52 @@ fn spawn_opencode(
         );
     }
     let worktree = if let Some(url) = &repo_url {
-        let Some(repo_path) = ensure_repo_clone(&cfg.workdir, url) else {
-            eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — skipping spawn");
-            snap_activity(snap, "error", &format!("{tid}: clone failed ({url})"));
-            note_task(
-                cfg,
-                tid,
-                &format!("runner: git clone failed for {url} — check the repo exists and the runner host has access; will retry next cycle"),
-            );
-            return;
+        let repo_path = match ensure_repo_clone(&cfg.workdir, url) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — {} — skipping spawn", e.detail());
+                snap_activity(snap, "error", &format!("{tid}: clone failed ({url}): {}", e.detail()));
+                let mut refused = refused_cache_load();
+                if e.fatal() {
+                    // BR#3845 self-heal: record the refusal so the claim →
+                    // clone-fail → 10-min-watchdog-stall → release loop stops
+                    // after ONE cycle; the candidate skip re-arms the moment
+                    // the card's reference changes.
+                    refused.insert(
+                        tid.to_string(),
+                        RefusedRef {
+                            url: url.clone(),
+                            reason: match &e {
+                                CloneFailure::NotFound(_) => "repository not found (authoring defect in the card's repo reference)".into(),
+                                CloneFailure::Auth(_) => "access denied (runner lacks credentials for this repo)".into(),
+                                CloneFailure::Transient(_) => unreachable!("fatal arm"),
+                            },
+                            ts: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        },
+                    );
+                    refused_cache_store(&refused);
+                    release_claim(
+                        cfg,
+                        tid,
+                        &format!(
+                            "runner: clone of {url} is fatally refused ({}) — recorded; dispatch skipped until the card's repo reference changes (fix meta.repo/body URL, or grant the runner access)",
+                            e.detail()
+                        ),
+                    );
+                } else {
+                    // transient: release the claim so the retry starts NOW —
+                    // holding it only bought a 10-minute watchdog stall
+                    release_claim(
+                        cfg,
+                        tid,
+                        &format!("runner: transient clone failure for {url} ({}) — claim released, will retry next cycle", e.detail()),
+                    );
+                }
+                return;
+            }
         };
         let worktree = if cfg.isolate && !skip_worktree {
             ensure_worktree(&repo_path, tid, resume)
@@ -2322,7 +2488,7 @@ fn spawn_opencode(
     // (machinename/*), and the namespace survives re-pairings because the
     // gateway label is the stable root.
     let agent_label = match &cfg.label {
-        Some(l) if !l.is_empty() => format!("{l}/{}", agent_identity(cfg)),
+        Some(l) if !l.is_empty() => format!("{l}/{}", agent_segment(cfg)),
         _ => agent_identity(cfg),
     };
     // Provision the worker's per-agent token. There is NO second class check
@@ -3295,6 +3461,25 @@ fn tick(
         }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        // BR#3845 self-heal: a reference this runner already refused (fatal
+        // clone failure) is skipped WITHOUT claiming — the recorded refusal
+        // stands until the card's repo URL changes, so a ghost reference can't
+        // re-enter the claim → clone-fail → watchdog-stall loop forever. A
+        // changed URL drops the record and dispatch resumes.
+        let candidate_url = source_repo(&body_md, &task_meta);
+        let mut refused = refused_cache_load();
+        if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
+            let reason = refused.get(tid).map(|r| r.reason.clone()).unwrap_or_default();
+            if gated_announced.insert(format!("{tid}:refused")) {
+                eprintln!(
+                    "[dispatch] SKIP: {tid} refused repo reference {} ({}) — fix the reference on the card to re-arm",
+                    candidate_url.unwrap_or_default(),
+                    reason
+                );
+                snap_activity(snap, "info", &format!("{tid} refused repo reference ({reason}) — skipped until it changes"));
+            }
+            continue;
+        }
         if let Err(e) = mcp_call_task(
             cfg,
             id,
@@ -3932,6 +4117,117 @@ mod tests {
             source_repo("see https://github.com/other/repo", &json!({ "repo": "not a repo" })),
             None
         );
+    }
+
+    #[test]
+    fn source_repo_scrape_survives_midword_line_wrap() {
+        // BR#3845: the runner's terminal-width capture split the URL inside
+        // the repo name; the scrape must rejoin it — the truncated first line
+        // (state-vector/super) is a ghost repo whose clone failed and churned
+        // the task eleven times. Line breaks are never meaningful in a URL.
+        assert_eq!(
+            source_repo(
+                "confirm the receipts (PR: https://github.com/state-vector/super\npositional/pull/2343, merge state, findings)",
+                &json!({}),
+            ),
+            Some("https://github.com/state-vector/superpositional".to_string())
+        );
+        // \r\n wrap shapes unwrap identically
+        assert_eq!(
+            source_repo(
+                "PR https://github.com/o/r/pull/7\r\n is ready",
+                &json!({}),
+            ),
+            Some("https://github.com/o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_clone_failure_taxonomy() {
+        // BR#3845 self-heal: fatal classes stop the retry loop, transient
+        // keeps the retry-next-cycle behaviour
+        assert!(matches!(
+            classify_clone_failure("remote: Repository not found.\nfatal: Could not read from remote repository."),
+            CloneFailure::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: 'x' does not appear to be a git repository"),
+            CloneFailure::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: Authentication failed for 'https://github.com/o/r.git/'"),
+            CloneFailure::Auth(_)
+        ));
+        assert!(matches!(
+            classify_clone_failure("fatal: Could not resolve host: github.com"),
+            CloneFailure::Transient(_)
+        ));
+        assert!(classify_clone_failure("remote: Repository not found.").fatal());
+        assert!(classify_clone_failure("fatal: Authentication failed").fatal());
+        assert!(!classify_clone_failure("fatal: Could not resolve host: github.com").fatal());
+    }
+
+    #[test]
+    fn refused_reference_skips_until_the_reference_changes() {
+        let mut cache = HashMap::new();
+        // fresh task: not refused
+        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/o/r")));
+        // record a refusal (as the clone-failure path does), then the SAME
+        // reference is skipped...
+        cache.insert(
+            "BR#1".into(),
+            RefusedRef { url: "https://github.com/state-vector/super".into(), reason: "repository not found".into(), ts: 0 },
+        );
+        assert!(refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/super")));
+        // ...but a FIXED reference re-arms dispatch and drops the record
+        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/superpositional")));
+        assert!(!cache.contains_key("BR#1"), "stale refusal must not pin the card forever");
+        // repo-less after a refusal (reference removed) also re-arms
+        cache.insert("BR#2".into(), RefusedRef { url: "https://github.com/o/r".into(), reason: "x".into(), ts: 0 });
+        assert!(!refused_reference(&mut cache, "BR#2", None));
+        assert!(!cache.contains_key("BR#2"));
+    }
+
+    #[test]
+    fn agent_segment_drops_the_host_prefix_under_a_gateway() {
+        // BR#3846: compounding the gateway label with the <hostname>-<backend>
+        // autogen produced macbook-pro-local-2/macbook-pro-local-opencode
+        // (46 chars) — past the hub's 40-char token-label cap, so provisioning
+        // 400'd and every dispatch released its claim. Under a gateway the
+        // segment is the backend alone; an explicit agent_name override wins.
+        let mut cfg = DispatchConfig {
+            schema_version: default_schema_version(),
+            url: "https://hub.example".into(),
+            token: String::new(),
+            workdir: default_workdir(),
+            agent: None,
+            model: None,
+            backend: None,
+            poll_secs: default_poll_secs(),
+            timeout_mins: default_timeout_mins(),
+            opencode_bin: default_opencode_bin(),
+            label: Some("macbook-pro-local-2".into()),
+            agent_name: None,
+            ws: None,
+            gateway: Some(true),
+            max_sessions: default_max_sessions(),
+            report_minutes: None,
+            isolate: true,
+            worktree_exempt_repos: vec![],
+            backends: std::collections::BTreeMap::from([
+                ("opencode".to_string(), Default::default()),
+            ]),
+            models: None,
+            agents: None,
+            identity: None,
+        };
+        assert_eq!(agent_segment(&cfg), "opencode");
+        assert_eq!(
+            format!("{}/{}", cfg.label.as_deref().unwrap(), agent_segment(&cfg)),
+            "macbook-pro-local-2/opencode" // 28 chars — fits the cap
+        );
+        cfg.agent_name = Some("custom-agent".into());
+        assert_eq!(agent_segment(&cfg), "custom-agent");
     }
 
     #[test]
