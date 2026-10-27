@@ -118,6 +118,7 @@ import {
   awaitEventFromAtoms,
   awaitEventToAtom,
   describeAwaitEvent,
+  deployedSatisfied,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -607,6 +608,18 @@ export class KnowledgeHub {
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
         return { ok: false, receipt: `unresolvable from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
+      }
+      case "deployed": {
+        // the one credential-free external atom: the hub IS the deploy. Its
+        // [build] hook bakes src/__version.json — same stamp /__version serves.
+        if (!atom.commit) return unresolvable;
+        try {
+          const v = (await import("../__version.json")) as { commit?: string };
+          const ok = deployedSatisfied(String(v.commit ?? ""), atom.commit);
+          return { ok, receipt: ok ? `hub deployed commit=${v.commit} (wanted ${atom.commit})` : `hub deployed commit=${v.commit ?? "unknown"} — wanted ${atom.commit} (deploy the hub to flip this atom)` };
+        } catch {
+          return { ok: false, receipt: "hub has no version stamp (pre-[build]-hook deploy) — atom cannot flip" };
+        }
       }
     }
   }
