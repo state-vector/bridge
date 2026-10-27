@@ -700,8 +700,11 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
 };
 
 /** Classify an audit event into a stable breach class. Known gates get named
- *  classes; unknown reasons fall into a coarse bucket so the fold stays
- *  deduped even for novel messages. */
+ *  classes; unknown reasons fall into `unclassified` — an HONEST catch-all
+ *  (Ray, 2026-10-27: "we shouldn't have 'other' — be clearer about the
+ *  categories"): it reads as what it is, a classifier GAP, not a mystery
+ *  defect. The fold's card states the action for it (add a pattern or fix
+ *  the flow), so an unclassified pile points at breachClass itself. */
 export function breachClass(reason: string): string {
   const r = reason.toLowerCase();
   // BR#3337: lifecycle-edge rejections are claim races — two dispatchers
@@ -723,7 +726,7 @@ export function breachClass(reason: string): string {
   if (r.includes("open child")) return "gate:open-children";
   if (r.includes("cannot block")) return "gate:verdict-no-blocked";
   if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
-  return "other";
+  return "unclassified";
 }
 
 /** Per-event breach class: the four op shapes are their own classes; a

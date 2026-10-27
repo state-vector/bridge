@@ -1223,7 +1223,7 @@ function breachClass(reason) {
   if (r.includes("open child")) return "gate:open-children";
   if (r.includes("cannot block")) return "gate:verdict-no-blocked";
   if (r.includes("never reviewed")) return "gate:verdict-no-in_review";
-  return "other";
+  return "unclassified";
 }
 function classOf(e) {
   if (e.op === "invariant_violation") return "invariant";
@@ -4426,6 +4426,9 @@ ${m.bootstrap_md}` : "") + scoreLine;
         }
         const breaches = detectBreaches(events, openKeys, { highWater });
         for (const b of breaches) {
+          const gapNote = b.klass === "unclassified" ? `
+- classifier gap: NO breachClass pattern matched this reason. Either a benign flow missing a named class (add the pattern to breachClass, machine.ts \u2014 cite the specimen task) or a genuine novel defect (investigate the sample below). The "unclassified" pile is a to-do list for the classifier, never a verdict.
+` : "";
           const created = await this.create(
             {
               type: "task",
@@ -4435,8 +4438,7 @@ ${m.bootstrap_md}` : "") + scoreLine;
 - class: ${b.klass}
 - task: ${taskId}
 - events: ${b.count} in the window (first ${new Date(b.first_ts).toISOString()}, last ${new Date(b.last_ts).toISOString()})
-- sample: ${b.sample}
-
+- sample: ${b.sample}${gapNote}
 One open card per (task, class) \u2014 reoccurrences coalesce here instead of spawning duplicates. Investigate the cause (get_history on ${taskId}, the Log), fix the loop, then close this card with what you found.`,
               tags: ["breach", `breach:${b.klass}`]
             },
@@ -28397,7 +28399,7 @@ var init_mcp2 = __esm({
 // src/__version.json
 var require_version = __commonJS({
   "src/__version.json"(exports, module) {
-    module.exports = { commit: "da8106b00cf3104b95d4ef1165472b10843e085f", built_at: "2026-10-27T05:31:18Z" };
+    module.exports = { commit: "98b0d3ed8be9076fbaa5722d17e7cf8a84799f02", built_at: "2026-10-27T11:33:58Z" };
   }
 });
 

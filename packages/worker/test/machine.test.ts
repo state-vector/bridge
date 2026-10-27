@@ -822,7 +822,7 @@ describe("breach fold (dedupe by task+class)", () => {
   it("classifies the known gate families", () => {
     expect(breachClass("moving to in_review requires the PR link")).toBe("gate:review-needs-pr");
     expect(breachClass("runner: task references no git repository")).toBe("gate:no-repo");
-    expect(breachClass("something novel")).toBe("other");
+    expect(breachClass("something novel")).toBe("unclassified");
   });
 
   // ---------- BR#3443: a closed card's events never re-fold (high-water) ----------
