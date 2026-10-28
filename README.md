@@ -678,6 +678,54 @@ main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI
 (unknown past 3× typical classifies red — the train never waits forever). Lane identity
 is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
 
+## The hub self-canary: daily synthetic lifecycle (BR#4177)
+
+The hub is coordination infrastructure — it gets the same treatment the product gets:
+its load-bearing paths get a **synthetic end-to-end canary**, run daily, red alarm to
+the alarm sink. `bridge canary` is a single cron-friendly lifecycle pass against the
+**deployed hub** (same MCP surface as every agent, same `BRIDGE_URL`/`BRIDGE_TOKEN`):
+
+```bash
+export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
+export BRIDGE_TOKEN=<token from the Connect tab>
+~/.local/bin/bridge canary          # one full pass (typ. 15–25 min; worst case ~65)
+# cron/launchd daily — exit 0 = green, 1 = red (filed alarm), 2 = config fatal
+```
+
+Four legs, each named for a failure class actually observed:
+
+1. **Duty spawn → dispatch → delivery** — a qualified synthetic task must be claimed
+   by a runner within 10 minutes and deliver its marker to the board within 10 more.
+   Catches the "result delivered late/lost" class (two observed in a single week).
+2. **Flip-on-event** — a synthetic card parks on a typed `{event:"time"}` await; the
+   unblock proxy sweep must flip it within two sweep cycles, no human action. Catches
+   the stale-ledger class (BR#3620 family: resolutions hidden for a day). The
+   `pr_merged`/`run_success` flavors of the same mechanism fire daily on the real
+   train; the canary uses the timer flavor because the hub holds no GitHub
+   credentials by design (BR#3516) — non-lane GitHub facts are never fed to it.
+3. **Queue visibility** — a fixture carrying the BR#4079 canonical stamp
+   (`merge_train.pr>0` + `merge-train:` reason, `blocked`) must appear in the
+   **derived** train queue, then vanish the moment it retires. Catches the
+   clobbered-stamp class (BR#3912). The fixture cites an obviously-fake PR
+   (`999901`); if a train tick ever lands on it, the executor's `gh pr view` fails
+   harmlessly before any gate — one lost tick, zero board writes.
+4. **Reconcile accounting** — BR#4170's report must run green (every PR accounted).
+   Armed but skipping until that lane lands its report surface; a missing dependency
+   is not a red.
+
+**Red path**: one deduped ask per failing leg class, bound to the alarm sink
+(`train_alarm_sink_id`, default BR#3124) — the same child-ask pattern the train's
+stop-the-line uses, so a stuck class pages once, not daily. **Green path**: a
+`[hub-canary]` progress artefact stamps every run; **48 hours of silence on that feed
+is the canary's own liveness alarm** (a canary that stops running must be observable
+too).
+
+Fixtures self-clean by law: tagged `[canary]`, retired to `blocked` with a 30-day
+typed timer (inert: never fires, never claimable, never queued). Task→superseded is
+not a client-legal edge (core.ts LIFECYCLES), so retirement — not deletion — keeps the
+board free of fixture accumulation without loosening the state machine. At most two
+inert blocked fixtures accumulate per run.
+
 ## PR provenance: who touched main, from bridge
 
 Every merge is attributable (BR#3287) — and under BR#3516 the stamping is
