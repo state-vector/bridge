@@ -585,6 +585,64 @@ describe("effects decided executor-side (F4)", () => {
     if (unblockDuty.ok === false) expect(unblockDuty.rule).toBe("verdict-no-blocked");
   });
 
+  it("merge-train parks never spawn unblock children — the train's flag OR the agent re-queue's canonical note (BR#4135)", async () => {
+    // BR#3516 §2: the train itself is the unblock path; a spawned child
+    // would race the executor's CAS lease. The train's own park carries the
+    // typed flag —
+    const trainPark = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "queued on the merge train", merge_train: true, unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(trainPark.effects).toEqual([]);
+    // — while agent re-parks follow the verify-duty contract, which marks the
+    // park in the note. Specimen BR#3990 rounds 4→6: the note flavor was
+    // missed, so every re-queue spawned an unblock child the next bounce
+    // superseded and the re-park after it flood-guarded — one breach card
+    // (BR#4135) per bounce cycle.
+    const agentRequeue = ok(
+      await decide(
+        input({
+          status: "in_review",
+          to: "blocked",
+          body: { note: "merge-train: queued — verify RE-ACCEPT at the unchanged live head", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(agentRequeue.effects).toEqual([]);
+    // any merge-train note flavor counts on a blocked park (bounce KINDs, BR#4066)
+    const stopped = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "merge-train: stopped — lane halted", unblock_condition: "PR https://github.com/a/b/pull/11 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(stopped.effects).toEqual([]);
+    // the suppression is SCOPED to the spawn gate: a plain park with the same
+    // exit condition still spawns its unblock round
+    const plain = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(plain.effects[0].kind).toBe("spawn_unblock");
+  });
+
   it("parent movement supersedes ephemeral children; a bounce keeps the newest verify round", async () => {
     const done = ok(await decide(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), baseCtx()));
     expect(done.effects).toContainEqual({ kind: "supersede_children", parent: "BR#1", tag: "unblock", keep_newest: false, cause: "BR#1 → done — unblock round closed" });

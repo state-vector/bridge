@@ -543,14 +543,27 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // declarations are silence-on-a-working-task, not a block; unblock duties
   // don't spawn their own kind. Merge-train parks (BR#3516 §2) are
   // machine-managed: the train itself is the unblock path, and a spawned
-  // child would race the executor's CAS lease — suppressed via merge_train.
+  // child would race the executor's CAS lease. The train's OWN transitions
+  // mark the park with body.merge_train; agent re-parks follow the
+  // verify-duty contract instead, which marks it in the NOTE ("merge-train:
+  // queued — …" — the canonical prefix the verify template in do.ts
+  // instructs). Missing the agent flavor made every re-queue spawn an
+  // unblock child that the next bounce superseded (keep_newest: false) and
+  // the re-park after it flood-guarded on the stale stamp — spawn →
+  // supersede → flood-skip → threshold-1 breach card, one loop per train
+  // bounce (specimen BR#3990 rounds 4→6, breach BR#4135). Scope: the SPAWN
+  // gate only — the typed-await exemption (blocked-needs-typed-await) stays
+  // keyed on body.merge_train so prose cannot dodge the grammar by
+  // prefixing a note (BR#3578 fail-closed).
+  const mergeTrainPark =
+    Boolean(i.body?.merge_train) || /^merge-train:/i.test(String(i.body?.note ?? "").trimStart());
   if (
     i.to === "blocked" &&
     r !== "unblock" &&
     !meta.awaiting_ask &&
     !i.body?.awaiting_ask_id &&
     i.body?.class !== "subprocess" &&
-    !i.body?.merge_train
+    !mergeTrainPark
   ) {
     const open = await c.openUnblockChild();
     if (open) {

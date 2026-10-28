@@ -588,7 +588,13 @@ machine-clean carry chain:
   changed under the verdict → the verdict is INVALID at the new head: the executor
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
-  a fresh verify accepts the new head.
+  a fresh verify accepts the new head. A bounce and its re-queue are machine-managed
+  round trips: a train park — the train's own `merge_train` flag, or an agent re-queue
+  following the verify contract's canonical `merge-train: queued` note — never spawns
+  an unblock child. The train is the unblock path (BR#3516 §2); a spawned child would
+  only be superseded by the next bounce, with the re-park after it flood-guarded on
+  the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
+  BR#4135).
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
