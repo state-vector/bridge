@@ -132,6 +132,15 @@ export function churnRelease(nextAttempts: number, verdictDuty: boolean, fromSta
 export const SILENT_ESCALATE_CYCLES = 3; // verdict duties
 export const SILENT_REDIRECT_CYCLES = 5; // impl/analysis
 
+/** BR#4248: the churn redirect parks on a typed COOLDOWN TIMER, not prose.
+ *  The park's await_event ({event:"time"}) is the machine-readable exit the
+ *  proxy sweep evaluates; on fire the unblock duty re-checks and releases
+ *  (a proven-unblock release resets the attempt counter). 24h matches the
+ *  gate-rejection reaper fuse (do.ts reapAbandoned idleLimit): both
+ *  mechanisms promise the same thing — nobody will look at this for a day,
+ *  then it comes back on its own. */
+export const CHURN_COOLDOWN_MS = 24 * 60 * 60_000;
+
 // Flood guard: a superseded unblock round still counts while fresh (<60m) and
 // the exit condition is unchanged — the BR#909 class spawned one child per
 // churn cycle (17 cards) because each cycle superseded the last.
@@ -532,7 +541,14 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       status = "blocked";
       patch.blocked = {
         reason: blockReason,
+        // BR#4248: the park awaits a typed cooldown timer — grammar-valid,
+        // machine-readable, sweep-consumed. The prose unblock condition is
+        // annotation for the human who eventually reads the card; it is NOT
+        // the exit condition (BR#3578). The server must not mint the very
+        // "awaits nothing" parks that law kills — the invariant at the end
+        // of decide() refuses a redirect that lands without the typed atom.
         unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
+        await_event: { event: "time", until_ts: now + CHURN_COOLDOWN_MS },
         ts: now,
       };
       patch.attempt = attempt;
@@ -649,6 +665,22 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       }
     }
   }
+
+  // BR#4248 — structural invariant, not a point-fix: ANY internal patch that
+  // lands status = blocked (entered the pipeline as ≠ blocked) must carry a
+  // grammar-valid typed await. The churn redirect enters as → todo, so the
+  // door gate (blocked-needs-typed-await) never evaluates it — that bypass is
+  // how prose-only parks (the BR#4235 "awaits nothing" ask factory) were
+  // minted. Actor transitions to blocked are already gated at the door; this
+  // post-condition closes the internal path, for every flip site, forever.
+  // A rejection here means a generator regressed to prose-only parks.
+  if (i.to !== "blocked" && status === "blocked" && !validateAwaitEvent((patch.blocked as any)?.await_event))
+    return {
+      ok: false,
+      code: "guard-failed",
+      rule: "blocked-await-invariant",
+      message: `internal redirect to blocked without a grammar-valid await_event — prose-only parks are structurally impossible (BR#3578/BR#4248): stamp a typed await (${AWAIT_GRAMMAR_DOC})`,
+    };
 
   return { ok: true, status, owner_clear: ownerClear, tags_add: tagsAdd, meta_patch: patch, effects };
 }

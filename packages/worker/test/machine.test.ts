@@ -10,6 +10,7 @@ import {
   breachClass,
   silentCycles,
   replayStatus,
+  CHURN_COOLDOWN_MS,
   CHURN_ESCALATE_ATTEMPTS,
   CHURN_REDIRECT_ATTEMPTS,
   SILENT_ESCALATE_CYCLES,
@@ -19,7 +20,7 @@ import {
   type Applied,
 } from "../src/kb/machine.ts";
 import { LIFECYCLES } from "../src/kb/core.ts";
-import { AWAIT_GRAMMAR_DOC } from "../src/kb/closure.ts";
+import { AWAIT_GRAMMAR_DOC, validateAwaitEvent } from "../src/kb/closure.ts";
 
 // ---- null-law context: every lazy lookup permissive/empty. Individual tests
 // override only the accessor they exercise. ----
@@ -747,6 +748,15 @@ describe("churn escalate/redirect (attempts + version-log silent cycles)", () =>
     expect(v.effects[0]).toMatchObject({ kind: "release_redirect", attempts: CHURN_REDIRECT_ATTEMPTS });
   });
 
+  it("BR#4248: the redirect park carries a grammar-valid typed time atom (24h cooldown) — prose is annotation only", async () => {
+    const v = ok(await released(CHURN_REDIRECT_ATTEMPTS - 1));
+    const aw = (v.meta_patch.blocked as any)?.await_event;
+    expect(aw).toEqual({ event: "time", until_ts: 1_000_000 + CHURN_COOLDOWN_MS }); // input() pins now = 1_000_000
+    expect(validateAwaitEvent(aw)?.event).toBe("time"); // the door grammar accepts it — sweep-consumable
+    // the prose stays as the human-readable annotation, never the exit condition
+    expect((v.meta_patch.blocked as any).unblock_condition).toContain("re-claim");
+  });
+
   it("silent cycles escalate server-side from the version log (3–5 zero-output watchdog stalls)", () => {
     const stall = (n: number): Parameters<typeof silentCycles>[0][number] => ({ ts: n, actor: "system:watchdog", action: "transition", summary: "stalled — no update for >10m; released to the pool by watchdog" });
     const agent = (n: number): Parameters<typeof silentCycles>[0][number] => ({ ts: n, actor: "agent-x", action: "progress", summary: "working" });
@@ -769,6 +779,28 @@ describe("churn escalate/redirect (attempts + version-log silent cycles)", () =>
     const v = ok(await released(1, [], events));
     expect(v.status).toBe("blocked");
     expect(v.meta_patch.blocked).toMatchObject({ reason: expect.stringContaining("silent churn") });
+    // BR#4248: the silent-cycle redirect parks typed too — no prose path
+    expect(validateAwaitEvent((v.meta_patch.blocked as any)?.await_event)?.event).toBe("time");
+  });
+
+  it("BR#4248: a proven-unblock release after the timer fires resets the counter — the fresh start never re-trips the guard", async () => {
+    const v = ok(
+      await decide(
+        input({
+          status: "blocked",
+          to: "todo",
+          roles: ["unblock"],
+          owner: "someone-else", // the parked card's claim is not the duty's — the proven-unblock exemption covers it
+          meta: { attempt: { by: "system:watchdog", at: 1, attempts: CHURN_REDIRECT_ATTEMPTS, last_reason: "churn guard: released to the pool 5 times without completing" } },
+          actor: "unblock-duty",
+          body: { note: "cooldown timer elapsed — live re-check first-hand: the exit condition holds (probe receipt). Releasing." },
+        }),
+        { ...baseCtx(), recentEvents: () => [] },
+      ),
+    );
+    expect(v.status).toBe("todo"); // released — not re-parked, not escalated
+    expect(v.owner_clear).toBe(true);
+    expect(v.meta_patch.attempt).toBeUndefined(); // fresh start: the counter is deleted, not incremented
   });
 });
 
