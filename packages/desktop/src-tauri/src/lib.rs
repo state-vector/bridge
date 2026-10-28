@@ -1,6 +1,7 @@
 mod console;
 mod dispatch;
 mod keychain;
+mod logging;
 mod mac_notify;
 mod menubar;
 mod opencode;
@@ -348,7 +349,7 @@ pub fn run() {
                 if let Some(pid) = dispatch::external_runner_pid() {
                     // a headless runner already polls this hub from another
                     // process — observe it, never race it for claims
-                    eprintln!("[dispatch] runner live in pid {pid} — observing, not starting a second loop");
+                    crate::logging::emit("dispatch", None, &format!("runner live in pid {pid} — observing, not starting a second loop"));
                 } else {
                     // A failed start (hub unreachable, self-provision error)
                     // must NEVER abort the app: the setup hook cannot unwind,
@@ -357,7 +358,7 @@ pub fn run() {
                     // its login/pairing screen and Settings → Reconnect
                     // retries the whole path.
                     if let Err(e) = dispatch::start(&state, cfg) {
-                        eprintln!("[dispatch] startup failed — app continues, retry from Settings: {e}");
+                        crate::logging::emit("dispatch", None, &format!("startup failed — app continues, retry from Settings: {e}"));
                         if let Ok(mut g) = state.last_error.lock() {
                             *g = Some(format!("gateway did not start: {e}"));
                         }

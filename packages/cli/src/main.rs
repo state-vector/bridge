@@ -49,6 +49,12 @@ mod train;
 #[path = "../../desktop/src-tauri/src/train_gate.rs"]
 mod train_gate;
 
+// BR#4400 — the single runner-log mechanism, vendored verbatim (same law as
+// dispatch.rs above): every converted call site in the vendored modules
+// resolves `crate::logging` against this module in the CLI build.
+#[path = "../../desktop/src-tauri/src/logging.rs"]
+mod logging;
+
 /// The hub self-canary (BR#4177): `bridge canary [--once]` — a daily
 /// synthetic end-to-end lifecycle against the deployed hub (duty
 /// spawn→delivery, flip-on-event, queue visibility, reconcile accounting),

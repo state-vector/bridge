@@ -33,25 +33,20 @@
 //! next tick polls CI on the merge commit. Carry law (BR#3516 §5):
 //! machine-clean carries, human-resolved invalidates.
 
+use crate::logging::{emit, now_ms};
 use crate::train_gate::{
     classify_main_check_runs, decide_train_gate, merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, train_leg_landed, train_legs, MainCheckRun, MainVerdict, MergeAction,
     TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
-/// Daemon-leg log routing: the standalone CLI logs to stdout (journald/nohup
-/// capture both, and `> train.log` users expect stdout); the in-process
-/// gateway leg flips this once at spawn so its lines land where the host
-/// app's other daemon lines go (stderr, matching dispatch.rs).
-static LOG_STDERR: AtomicBool = AtomicBool::new(false);
 
 /// How the tick's gh credential classifies (BR#3181). Probed from
 /// `gh api user --jq .login`; Worker = an identity on the worker allowlist.
@@ -159,43 +154,14 @@ struct Ctx {
     last_action_ms: u64,
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 fn trunc(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// UTC ISO-8601 log timestamps without a chrono dependency (civil-from-days).
-fn iso(ts_ms: u64) -> String {
-    let secs = (ts_ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    if mo <= 2 {
-        y += 1;
-    }
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
+/// BR#4400: the unified runner-line format lives in `logging::emit`; the
+/// train leg is just subsystem `train` with the lane key as scope.
 fn log(lane: Option<&str>, msg: &str) {
-    let line = format!("[{}]{} {msg}", iso(now_ms()), lane.map(|l| format!(" {l}")).unwrap_or_default());
-    if LOG_STDERR.load(Ordering::Relaxed) {
-        let _ = writeln!(std::io::stderr(), "{line}");
-    } else {
-        let _ = writeln!(std::io::stdout(), "{line}");
-        let _ = std::io::stdout().flush();
-    }
+    emit("train", lane, msg);
 }
 
 fn short_host() -> String {
@@ -954,15 +920,18 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
 
 /// Entry: `bridge train [--once] [--lane repo@base] [--interval secs] [--method merge|squash|rebase]`.
 pub fn run(args: &[String]) -> i32 {
+    // Standalone CLI: stdout, what journald/nohup capture and `> train.log`
+    // users expect (the in-process gateway leg keeps the stderr default).
+    crate::logging::prefer_stdout(true);
     let mut ctx = match Ctx::resolve(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[merge-train] fatal: {e}");
+            emit("train", None, &format!("fatal: {e}"));
             return 1;
         }
     };
     if let Err(e) = ctx.preflight(true) {
-        eprintln!("[merge-train] fatal: {e}");
+        emit("train", None, &format!("fatal: {e}"));
         return 1;
     }
     if ctx.once {
@@ -1040,12 +1009,12 @@ impl DaemonTrainConfig {
 pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::sync::Arc<AtomicBool>) {
     let cfg = DaemonTrainConfig::from_runner(hub, token, label);
     if !cfg.enabled {
-        eprintln!("[train] gateway train leg disabled (MERGE_TRAIN_ENABLED=0) — not spawning");
+        emit("train", None, "gateway train leg disabled (MERGE_TRAIN_ENABLED=0) — not spawning");
         return;
     }
     let spawned = std::thread::Builder::new().name("merge-train".into()).spawn(move || daemon_loop(cfg, stop));
     if let Err(e) = spawned {
-        eprintln!("[train] failed to spawn gateway train leg: {e}");
+        emit("train", None, &format!("failed to spawn gateway train leg: {e}"));
     }
 }
 
@@ -1085,7 +1054,9 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
 }
 
 fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
-    LOG_STDERR.store(true, Ordering::Relaxed);
+    // BR#4400: the in-process leg keeps logging's default (stderr — where the
+    // host app's other daemon lines go); the standalone CLI opted into stdout
+    // via prefer_stdout(true) in run().
     log(
         None,
         &format!(

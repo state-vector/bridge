@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::logging::emit;
 use crate::opencode;
 use crate::scm;
 
@@ -388,7 +389,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
         .build()
         .map_err(|e| e.to_string())?;
     let code = pair_start(&client, url, host_slug().as_str(), ensure_principal_from_file().as_str())?;
-    eprintln!("[pair] open {url}/pair and enter code {code}");
+    emit("dispatch", None, &format!("pair: open {url}/pair and enter code {code}"));
     println!("[pair] open {url}/pair and enter code {code}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
@@ -404,7 +405,7 @@ pub fn pair_device(url: &str) -> Result<DispatchConfig, String> {
                 continue;
             }
             PairPoll::Authorized(cfg) => {
-                eprintln!("[pair] authorized — token saved");
+                emit("dispatch", None, "pair: authorized — token saved");
                 return Ok(cfg);
             }
             PairPoll::Expired => return Err("pairing code expired — run again".into()),
@@ -490,7 +491,7 @@ pub fn pair_poll(client: &reqwest::blocking::Client, url: &str, code: &str) -> R
             // next response header (the vend response may not carry it).
             TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
             TOKEN_EPOCH_VEND.store(0, Ordering::Relaxed);
-            eprintln!("[pair] authorized — token for workspace '{}' saved to the keychain (settings preserved)", cfg.ws.as_deref().unwrap_or("?"));
+            emit("dispatch", None, &format!("pair: authorized — token for workspace '{}' saved to the keychain (settings preserved)", cfg.ws.as_deref().unwrap_or("?")));
             Ok(PairPoll::Authorized(cfg))
         }
         Some("expired") => Ok(PairPoll::Expired),
@@ -621,14 +622,18 @@ pub fn self_provision(
     if let Some(p) = resp.get("principal").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
         if p != ensure_principal_from_file() {
             store_principal(p);
-            eprintln!("[dispatch] device credential vended by the hub and stored");
+            emit("dispatch", None, "device credential vended by the hub and stored");
         }
     }
     let mut cfg = load_config().unwrap_or_else(default_config);
     apply_vended_credentials(&mut cfg, url, secret, ws, label, true)?;
-    eprintln!(
-        "[dispatch] gateway self-provisioned for workspace '{}' — token in the OS keychain",
-        cfg.ws.as_deref().unwrap_or("?")
+    emit(
+        "dispatch",
+        None,
+        &format!(
+            "gateway self-provisioned for workspace '{}' — token in the OS keychain",
+            cfg.ws.as_deref().unwrap_or("?")
+        ),
     );
     // BR#3787 — full re-adopt: the next response's epoch header becomes the
     // vend epoch (avoids repairing against a stale observed epoch).
@@ -2360,8 +2365,10 @@ fn release_claim(cfg: &DispatchConfig, tid: &str, did: &str) -> ReleaseOutcome {
     let outcome = release_outcome(&res);
     match release_note(&res, did) {
         Some(note) => note_task(cfg, tid, &note),
-        None => eprintln!(
-            "[dispatch] {tid}: release raced (gate refused, card not released) — no note posted (BR#3611)"
+        None => emit(
+            "dispatch",
+            Some(tid),
+            "release raced (gate refused, card not released) — no note posted (BR#3611)",
         ),
     }
     outcome
@@ -2572,16 +2579,20 @@ fn spawn_opencode(
     };
     let skip_worktree = surgical || repo_exempt;
     if skip_worktree {
-        eprintln!(
-            "[dispatch] {tid}: per-task worktree skipped — {}",
-            if surgical { "task is surgical-by-declaration" } else { "repo is worktree-exempt" }
+        emit(
+            "dispatch",
+            Some(tid),
+            &format!(
+                "per-task worktree skipped — {}",
+                if surgical { "task is surgical-by-declaration" } else { "repo is worktree-exempt" }
+            ),
         );
     }
     let worktree = if let Some(url) = &repo_url {
         let repo_path = match ensure_repo_clone(&cfg.workdir, url) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[dispatch] ERROR: {tid}: clone failed for {url} — {} — skipping spawn", e.detail());
+                emit("dispatch", Some(tid), &format!("ERROR: clone failed for {url} — {} — skipping spawn", e.detail()));
                 snap_activity(snap, "error", &format!("{tid}: clone failed ({url}): {}", e.detail()));
                 let mut refused = refused_cache_load();
                 if e.fatal() {
@@ -2637,11 +2648,9 @@ fn spawn_opencode(
         // (surgical / exempt-repo) opted into the shared tree knowingly, so the
         // guard does not apply to them.
         if cfg.isolate && !skip_worktree && worktree.is_none() {
-            let msg = format!(
-                "ERROR: {tid}: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)"
-            );
-            eprintln!("[dispatch] {msg}");
-            snap_activity(snap, "error", &msg);
+            let msg = "ERROR: worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)";
+            emit("dispatch", Some(tid), msg);
+            snap_activity(snap, "error", &format!("{tid}: {msg}"));
             return;
         }
         // Identity leg (BR#3185): write the profile's repo-local git config and
@@ -2655,11 +2664,11 @@ fn spawn_opencode(
             let profile = cfg.identity_profile();
             if let Err(e) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
                 let msg = format!(
-                    "ERROR: {tid}: identity profile failed — refusing to dispatch ({}). Fix the runner's identity config or provision the signing key.",
+                    "ERROR: identity profile failed — refusing to dispatch ({}). Fix the runner's identity config or provision the signing key.",
                     e
                 );
-                eprintln!("[dispatch] {msg}");
-                snap_activity(snap, "error", &msg);
+                emit("dispatch", Some(tid), &msg);
+                snap_activity(snap, "error", &format!("{tid}: {msg}"));
                 note_task(
                     cfg,
                     tid,
@@ -2755,18 +2764,22 @@ fn spawn_opencode(
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
-    eprintln!(
-        "[dispatch] {tid} dispatched — {} opencode session bridge-{tid}{}",
-        if resume {
-            format!("resuming session {}", resume_session.as_deref().unwrap_or("?"))
-        } else {
-            "new".to_string()
-        },
-        worktree
+    emit(
+        "dispatch",
+        Some(tid),
+        &format!(
+            "dispatched — {} opencode session bridge-{tid}{}",
+            if resume {
+                format!("resuming session {}", resume_session.as_deref().unwrap_or("?"))
+            } else {
+                "new".to_string()
+            },
+            worktree
             .as_ref()
             .map(|p| format!(" (worktree {})", p.display()))
             .or_else(|| scratch.as_ref().map(|p| format!(" (scratch {})", p.display())))
             .unwrap_or_default(),
+        ),
     );
     snap_activity(
         snap,
@@ -2805,7 +2818,13 @@ fn spawn_opencode(
     let agent_token = match provision_agent_token(cfg, &agent_label) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[dispatch] ERROR: agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim");
+            emit(
+                "dispatch",
+                Some(tid),
+                &format!(
+                    "ERROR: agent token provisioning failed for {agent_label}: {e} — no fallback (gateway token would mis-attribute); releasing claim"
+                ),
+            );
             snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
             release_claim(
                 cfg,
@@ -2963,13 +2982,13 @@ fn tick(
     let avail_ok = !avail.is_empty();
     if !avail_ok {
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
-        eprintln!("[dispatch] {msg}");
+        emit("dispatch", None, msg);
         snap_activity(snap, "error", msg);
         if in_flight.is_empty() {
             std::process::exit(1);
         }
     } else if !*last_avail_ok {
-        eprintln!("[dispatch] agents available — resuming claims");
+        emit("dispatch", None, "agents available — resuming claims");
         snap_activity(snap, "info", "agents available — resuming claims");
     }
     *last_avail_ok = avail_ok;
@@ -3054,11 +3073,10 @@ fn tick(
             // healthy sessions declared timed out looked dead because none
             // of their output was visible until the verdict).
             if e.2.elapsed() >= Duration::from_secs(60) && !line.is_empty() {
-                eprintln!(
-                    "[dispatch] {} · {}m in · {}",
-                    inf.task_id,
-                    inf.started.elapsed().as_secs() / 60,
-                    line
+                emit(
+                    "dispatch",
+                    Some(&inf.task_id),
+                    &format!("{}m in · {}", inf.started.elapsed().as_secs() / 60, line),
                 );
                 e.2 = Instant::now();
             }
@@ -3129,18 +3147,21 @@ fn tick(
                 result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
             ));
         }
-        eprintln!(
-            "[dispatch] {} {} in ~{}m — agent reply: {}",
-            inf.task_id,
-            if outcome.timed_out {
-                "TIMED OUT"
-            } else if !outcome_ok {
-                "FAILED"
-            } else {
-                "finished"
-            },
-            mins,
-            reply_excerpt
+        emit(
+            "dispatch",
+            Some(&inf.task_id),
+            &format!(
+                "{} in ~{}m — agent reply: {}",
+                if outcome.timed_out {
+                    "TIMED OUT"
+                } else if !outcome_ok {
+                    "FAILED"
+                } else {
+                    "finished"
+                },
+                mins,
+                reply_excerpt
+            ),
         );
         // final progress (with 100% on success) is logged AFTER the handoff —
         // a task must never sit in_progress showing 100% because a gate
@@ -3154,9 +3175,10 @@ fn tick(
             // BR#3337: a session that died racing for a claim performed no
             // work and proves nothing about the agent CLI — not a dispatch
             // failure, the breaker stays untouched.
-            eprintln!(
-                "[dispatch] {} lost a claim race (gate rejections, no work) — not a dispatch failure",
-                inf.task_id
+            emit(
+                "dispatch",
+                Some(&inf.task_id),
+                "lost a claim race (gate rejections, no work) — not a dispatch failure",
             );
             snap_activity(snap, "info", &format!("{} — claim race, not a dispatch failure", inf.task_id));
         } else {
@@ -3483,7 +3505,7 @@ fn tick(
                         "sentiment": "neutral",
                     }),
                 ) {
-                    eprintln!("[dispatch] ERROR: relay failed for {}: {e}", inf.task_id);
+                    emit("dispatch", Some(&inf.task_id), &format!("ERROR: relay failed: {e}"));
                 }
             }
             continue;
@@ -3502,7 +3524,7 @@ fn tick(
                 "sentiment": "neutral",
             }),
         ) {
-            eprintln!("[dispatch] ERROR: relay failed for {}: {e}", inf.task_id);
+            emit("dispatch", Some(&inf.task_id), &format!("ERROR: relay failed: {e}"));
         } else if let Ok(mut s) = snap.lock() {
             if let Some(f) = s.in_flight.iter_mut().find(|f| f.task_id == inf.task_id) {
                 f.last_note = live.clone();
@@ -3634,10 +3656,14 @@ fn tick(
                 // re-claim (debug only — the card is not ours to release).
                 let mine = agent_identity(cfg);
                 if !stale_claim_live(&art, &mine) {
-                    eprintln!(
-                        "[dispatch] {tid}: stale-claim check — card now {status}/{owner} (not in_progress/not mine) — skipping release + re-claim (BR#3823)",
-                        status = art.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-                        owner = art.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
+                    emit(
+                        "dispatch",
+                        Some(tid),
+                        &format!(
+                            "stale-claim check — card now {status}/{owner} (not in_progress/not mine) — skipping release + re-claim (BR#3823)",
+                            status = art.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                            owner = art.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
+                        ),
                     );
                     snap_activity(
                         snap,
@@ -3652,12 +3678,12 @@ fn tick(
                         // the release was refused (claim race) — the card was
                         // NOT released, so there is nothing to re-claim: the
                         // card is the watchdog's or another dispatcher's now.
-                        eprintln!("[dispatch] {tid}: stale release raced (gate refused) — card not released, skipping re-claim (BR#3823)");
+                        emit("dispatch", Some(tid), "stale release raced (gate refused) — card not released, skipping re-claim (BR#3823)");
                         snap_activity(snap, "info", &format!("{tid} stale release raced — skipped (BR#3823)"));
                         continue;
                     }
                     ReleaseOutcome::Failed(e) => {
-                        eprintln!("[dispatch] ERROR: stale release {tid} failed: {e}");
+                        emit("dispatch", Some(tid), &format!("ERROR: stale release failed: {e}"));
                         snap_activity(snap, "error", &format!("stale release {tid} failed: {e}"));
                         attempts.insert(tid.to_string(), Instant::now());
                         continue;
@@ -3682,12 +3708,12 @@ fn tick(
                     Err(e) if is_claim_race_error(&e) => {
                         // raced between release and re-claim — another
                         // dispatcher won the card; skip, it is theirs now
-                        eprintln!("[dispatch] {tid}: stale claim released, re-claim raced — skipping");
+                        emit("dispatch", Some(tid), "stale claim released, re-claim raced — skipping");
                         snap_activity(snap, "info", &format!("{tid} re-claim raced after stale release — skipped"));
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[dispatch] ERROR: re-claim {tid} failed: {e}");
+                        emit("dispatch", Some(tid), &format!("ERROR: re-claim failed: {e}"));
                         snap_activity(snap, "error", &format!("re-claim {tid} failed: {e}"));
                         attempts.insert(tid.to_string(), Instant::now());
                         continue;
@@ -3807,7 +3833,7 @@ fn tick(
         // between must skip silently (race lost), never claim-and-fail.
         if let Some(st) = art.get("status").and_then(|s| s.as_str()) {
             if st != "todo" {
-                eprintln!("[dispatch] {tid}: claim race lost (status now {st}) — skipping");
+                emit("dispatch", Some(tid), &format!("claim race lost (status now {st}) — skipping"));
                 snap_activity(snap, "info", &format!("{tid} claim race lost (now {st}) — skipped"));
                 continue;
             }
@@ -3824,10 +3850,14 @@ fn tick(
         if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
             let reason = refused.get(tid).map(|r| r.reason.clone()).unwrap_or_default();
             if gated_announced.insert(format!("{tid}:refused")) {
-                eprintln!(
-                    "[dispatch] SKIP: {tid} refused repo reference {} ({}) — fix the reference on the card to re-arm",
-                    candidate_url.unwrap_or_default(),
-                    reason
+                emit(
+                    "dispatch",
+                    Some(tid),
+                    &format!(
+                        "SKIP: refused repo reference {} ({}) — fix the reference on the card to re-arm",
+                        candidate_url.unwrap_or_default(),
+                        reason
+                    ),
                 );
                 snap_activity(snap, "info", &format!("{tid} refused repo reference ({reason}) — skipped until it changes"));
             }
@@ -3845,14 +3875,14 @@ fn tick(
                 // another gateway or session owns the card. That is a claim
                 // race: retryable next tick, never a dispatch failure (no
                 // error bookkeeping, no backoff, breaker untouched).
-                eprintln!("[dispatch] {tid}: claim raced (rejected: {}) — skipping", truncate(&e, 100));
+                emit("dispatch", Some(tid), &format!("claim raced (rejected: {}) — skipping", truncate(&e, 100)));
                 snap_activity(snap, "info", &format!("{tid} claim raced — skipped (retryable)"));
                 continue;
             }
             // claim failed for a real reason — don't kill the tick or the whole
             // claim loop; surface it on stderr too (snap-only failures read as
             // silence) and back off this candidate
-            eprintln!("[dispatch] ERROR: claim {tid} failed: {e}");
+            emit("dispatch", Some(tid), &format!("ERROR: claim failed: {e}"));
             attempts.insert(tid.to_string(), Instant::now());
             snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
             continue;
@@ -3893,7 +3923,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             Ok(url) => match pair_device(url.trim_end_matches('/')) {
                 Ok(c) => {
                     if let Err(e) = c.save() {
-                        eprintln!("[dispatch] ERROR: config save failed: {e}");
+                        emit("dispatch", None, &format!("ERROR: config save failed: {e}"));
                     }
                     c
                 }
@@ -3901,14 +3931,14 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                     if let Ok(mut g) = last_error.lock() {
                         *g = Some(e.clone());
                     }
-                    eprintln!("[dispatch] ERROR: pairing failed: {e}");
+                    emit("dispatch", None, &format!("ERROR: pairing failed: {e}"));
                     running.store(false, Ordering::Relaxed);
                     return;
                 }
             },
             Err(_) => {
                 let msg = "no config and no BRIDGE_URL — set BRIDGE_URL (or ~/.bridge/config.json) to pair".to_string();
-                eprintln!("[dispatch] {msg}");
+                emit("dispatch", None, &msg);
                 if let Ok(mut g) = last_error.lock() {
                     *g = Some(msg);
                 }
@@ -3935,7 +3965,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             snap_logout(&snap, msg);
             msg.to_string()
         };
-        eprintln!("[dispatch] {msg}");
+        emit("dispatch", None, &msg);
         logout_core(&stop, &running, &snap, true);
         if let Ok(mut g) = last_error.lock() {
             *g = Some(msg.to_string());
@@ -3975,9 +4005,13 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut live_notes: HashMap<String, (String, Instant, Instant)> = HashMap::new();
     // gated tasks announce ONCE per app run — visibility without a flood
     let mut gated_announced: HashSet<String> = HashSet::new();
-    eprintln!(
-        "[dispatch] loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
-        cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
+    emit(
+        "dispatch",
+        None,
+        &format!(
+            "loop started — {} (poll every {}s, workdir {}, up to {} concurrent sessions)",
+            cfg.url, cfg.poll_secs, cfg.workdir, cfg.max_sessions
+        ),
     );
     if let Ok(mut s) = snap.lock() {
         s.running = true;
@@ -4023,14 +4057,14 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 {
                     Ok(fresh) => {
                         cfg = fresh;
-                        eprintln!("[dispatch] token epoch {vend} → {seen}: re-vended by principal (proactive catch-up)");
+                        emit("dispatch", None, &format!("token epoch {vend} → {seen}: re-vended by principal (proactive catch-up)"));
                         snap_activity(&snap, "dispatch", "token rotated elsewhere — re-vended proactively (epoch catch-up)");
                         write_runner_state(&snap);
                     }
                     Err(pe) => {
                         // the reason is logged; the hub-side rate limiter is
                         // the backstop against tick-loop churn
-                        eprintln!("[dispatch] proactive epoch catch-up failed: {pe}");
+                        emit("dispatch", None, &format!("proactive epoch catch-up failed: {pe}"));
                         snap_activity(&snap, "error", &format!("proactive epoch catch-up failed: {pe}"));
                     }
                 }
@@ -4056,7 +4090,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         ) {
             Ok(msgs) => {
                 for msg in msgs {
-                    eprintln!("[dispatch] {msg}");
+                    emit("dispatch", None, &msg);
                 }
                 // BR#4113: tick clears the needs-attention flag when its
                 // orient gets through — the hub accepted our token again
@@ -4079,7 +4113,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 // deploying): log, snapshot, keep polling.
                 match classify_hub_error(&e) {
                     HubErrClass::Transient => {
-                        eprintln!("[dispatch] ERROR: {e}");
+                        emit("dispatch", None, &format!("ERROR: {e}"));
                         snap_activity(&snap, "error", &e);
                         if let Ok(mut g) = last_error.lock() {
                             *g = Some(e);
@@ -4101,7 +4135,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                                 } else {
                                     "gateway self-healed — credential re-vended after hub auth rejection; dispatch resumes now".to_string()
                                 };
-                                eprintln!("[dispatch] {msg}");
+                                emit("dispatch", None, &msg);
                                 snap_activity(&snap, "dispatch", &msg);
                                 if let Ok(mut g) = last_error.lock() {
                                     *g = None;
@@ -4111,7 +4145,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                             }
                             Err(failures) => {
                                 for f in &failures {
-                                    eprintln!("[dispatch] self-heal ladder: {f}");
+                                    emit("dispatch", None, &format!("self-heal ladder: {f}"));
                                     snap_activity(&snap, "error", &format!("self-heal ladder: {f}"));
                                 }
                                 // park EXACTLY once per episode — on the run
@@ -4123,7 +4157,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                                         failures.last().map(|s| s.as_str()).unwrap_or("unknown"),
                                         AUTH_BACKOFF_CAP_SECS
                                     );
-                                    eprintln!("[dispatch] PARKED: {msg}");
+                                    emit("dispatch", None, &format!("PARKED: {msg}"));
                                     snap_needs_attention(&snap, &msg);
                                     if let Ok(mut g) = last_error.lock() {
                                         *g = Some(msg);
@@ -4156,7 +4190,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         // gateway is not dispatching.
     }
     write_runner_state(&snap);
-    eprintln!("[dispatch] loop stopped");
+    emit("dispatch", None, "loop stopped");
 }
 
 pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(), String> {
@@ -4185,9 +4219,13 @@ pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(
                 .map_err(|e| e.to_string())?;
             let vendored = self_provision(&client, &hub, &s.value)
                 .map_err(|e| format!("gateway has no token and self-provision failed: {e}"))?;
-            eprintln!(
-                "[dispatch] self-provisioned gateway token at start (workspace '{}')",
-                vendored.ws.as_deref().unwrap_or("?")
+            emit(
+                "dispatch",
+                None,
+                &format!(
+                    "self-provisioned gateway token at start (workspace '{}')",
+                    vendored.ws.as_deref().unwrap_or("?")
+                ),
             );
             cfg = Some(vendored);
         }
@@ -4198,7 +4236,7 @@ pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(
     // working too: resolve() order is env > file).
     if let Some(c) = &cfg {
         if let Err(e) = c.save() {
-            eprintln!("[dispatch] ERROR: config save failed: {e}");
+            emit("dispatch", None, &format!("ERROR: config save failed: {e}"));
         }
     }
     state.stop.store(false, Ordering::Relaxed);
@@ -4251,7 +4289,7 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     running.store(false, Ordering::Relaxed);
     if clear_credential {
         if let Err(e) = crate::store::TokenStore::open().clear_token() {
-            eprintln!("[dispatch] WARNING: credential clear failed: {e}");
+            emit("dispatch", None, &format!("WARNING: credential clear failed: {e}"));
         }
         if let Some(dir) = dispatch_dir() {
             // vendored per-agent credentials — re-provisioned after the next login
@@ -4265,13 +4303,17 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     // BR#2532: persist the post-logout state (incl. an auto-logout notice, if
     // this was one) so an observing desktop UI sees it in the flat file
     write_runner_state(snap);
-    eprintln!(
-        "[dispatch] logged out — {}",
-        if clear_credential {
-            "credential cleared; sign in to re-provision"
-        } else {
-            "session ended; the gateway keeps running (token stays in the keychain)"
-        }
+    emit(
+        "dispatch",
+        None,
+        &format!(
+            "logged out — {}",
+            if clear_credential {
+                "credential cleared; sign in to re-provision"
+            } else {
+                "session ended; the gateway keeps running (token stays in the keychain)"
+            }
+        ),
     );
 }
 
@@ -5305,7 +5347,7 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
         cache.insert(agent_label.to_string(), secret.to_string());
         let _ = std::fs::write(&cache_path, serde_json::to_string_pretty(&cache).unwrap_or_default());
         if rotate {
-            eprintln!("[dispatch] agent token for '{agent_label}' re-vended by rotate (cache was empty)");
+            emit("dispatch", None, &format!("agent token for '{agent_label}' re-vended by rotate (cache was empty)"));
         }
         return Ok(secret.to_string());
     }
