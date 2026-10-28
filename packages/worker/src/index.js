@@ -13,22 +13,10 @@ export default {
       return handleIngest(request, env);
     }
 
-    // BR#3885 — model registry probe (machine plane, UNAUTHENTICATED). The
-    // CLI doctor checks every pinned backend model against GET /v1/models
-    // (BR#3055/BR#2843 spec item 3) and is the tool you run when pairing is
-    // already broken, so the route must answer without a session — checkAuth
-    // reads cookies only, so the doctor's Bearer header could never pass it
-    // anyway. The list is configuration, not a secret: MODEL_IDS (wrangler
-    // [vars], comma-separated) IS the registry — the hub owns the ids its
-    // dispatch plane accepts; never proxy an upstream /v1/models here (that
-    // couples hub availability to a second service for a list already held).
-    // wrangler.toml MUST list this route in run_worker_first or the SPA
-    // assets layer serves index.html instead (372bbe973 class, third incident).
-    if (url.pathname === "/v1/models") {
-      if (request.method !== "GET" && request.method !== "HEAD") return json({ error: "GET only" }, 405);
-      const ids = [...new Set(String(env.MODEL_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean))];
-      return json({ object: "list", data: ids.map((id) => ({ id, object: "model", owned_by: "bridge" })) });
-    }
+    // BR#4252: the /v1/models route is REMOVED. The hub is not a model
+    // gateway and never was — agent CLIs resolve model ids against their own
+    // provider config; a hub-served registry was fabricated authority that
+    // shipped empty and FAILed every valid doctor pin. Do not re-add.
 
     // MCP: machine plane (bearer) — agents talk to the knowledge layer here.
     // machine-plane stats: watchdog liveness for headless observers (token auth).
