@@ -30,6 +30,13 @@ import worker from "../src/index.js";
 
 const HTML_NEVER = /<html|<!doctype/i;
 
+/** workers-types narrows Body.json() to `unknown`; these tests assert fields
+ *  on the parsed body, so every body parse goes through this one helper
+ *  (BR#4237 bounce: 11x TS2339 "property does not exist on type unknown"). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const jsonBody = async (r: Response): Promise<Record<string, any>> =>
+  (await r.json()) as Record<string, any>;
+
 // ---------- tier A: DO entry, fake-state fault injection ----------
 
 interface Faults { sql?: boolean; getAlarm?: boolean; setAlarm?: boolean }
@@ -65,7 +72,7 @@ describe("DO fetch entry: injected storage faults (BR#4212)", () => {
     const res = await kbPost(hub, "/orient");
     expect(res.status).toBe(503);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.result_class).toBe("infra_storage_fault");
     expect(body.stage).toBe("ensure_schema");
     expect(JSON.stringify(body)).not.toMatch(HTML_NEVER);
@@ -76,7 +83,7 @@ describe("DO fetch entry: injected storage faults (BR#4212)", () => {
     const res = await kbPost(hub, "/stats");
     // the op itself ran (stats served) despite the faulted alarm guard
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.channel.entry_faults.alarm_rearm.n).toBeGreaterThanOrEqual(1);
   });
 
@@ -85,7 +92,7 @@ describe("DO fetch entry: injected storage faults (BR#4212)", () => {
     const res = await kbPost(hub, "/orient", "{not json");
     expect(res.status).toBe(400);
     expect(res.headers.get("content-type")).toContain("application/json");
-    expect((await res.json()).error).toBe("bad json");
+    expect((await jsonBody(res)).error).toBe("bad json");
   });
 
   it("alarm(): a faulted re-arm never throws out of the handler (schedule survives via the entry guard)", async () => {
@@ -95,7 +102,7 @@ describe("DO fetch entry: injected storage faults (BR#4212)", () => {
     // the fault is counted and visible to the watchdog's /stats probe
     const res = await kbPost(hub, "/stats");
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.channel.entry_faults.alarm_rearm.n).toBeGreaterThanOrEqual(1);
   });
 });
@@ -161,7 +168,7 @@ describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mis
     }), rejectingEnv());
     expect(res.status).toBe(503);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.result_class).toBe("infra_storage_fault");
     expect(JSON.stringify(body)).not.toMatch(HTML_NEVER);
   });
@@ -182,7 +189,7 @@ describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mis
       body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/list" }),
     }), rejectingEnv());
     expect(res.status).toBe(503);
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.error.code).toBe(-32000);
     expect(body.error.data.result_class).toBe("infra_storage_fault");
     expect(JSON.stringify(body)).not.toMatch(/unauthorized/i);
@@ -197,7 +204,7 @@ describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mis
       body: JSON.stringify({ jsonrpc: "2.0", id: 8, method: "tools/list" }),
     }), env);
     expect(res.status).toBe(401);
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.error.code).toBe(-32001);
   });
 
@@ -212,7 +219,7 @@ describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mis
       body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }),
     }), env);
     expect(res.status).toBe(503);
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.error.data.result_class).toBe("infra_storage_fault");
     expect(JSON.stringify(body)).not.toMatch(/unauthorized/i);
   });
@@ -240,7 +247,11 @@ beforeAll(() => {
   });
   return (async () => {
     const ns = await mf.getDurableObjectNamespace("KB");
-    const stub = await ns.get(ns.idFromName("global"));
+    // miniflare's loose generic stub type carries no `fetch` — the rig calls
+    // the DO directly, so pin the one signature the rig uses (BR#4237 bounce).
+    const stub = (await ns.get(ns.idFromName("global"))) as unknown as {
+      fetch: (url: string, init?: RequestInit) => Promise<Response>;
+    };
     kb = (path, init) => stub.fetch(`https://kb${path}`, init);
     await kb("/orient", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ actor: "test" }) });
   })();
@@ -259,7 +270,7 @@ describe("real-SQLite rig: channel counters surface in /stats (BR#4212 leg 3)", 
     const res = await kb("/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await jsonBody(res);
     expect(body.channel).toBeTruthy();
     expect(body.channel.routes["POST /stats"].ok).toBeGreaterThanOrEqual(1);
     expect(body.channel.write_ops.ok).toBeGreaterThanOrEqual(2);
