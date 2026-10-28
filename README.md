@@ -111,6 +111,17 @@ layer — the desktop opens a live WebSocket to the hub with its paired
 gateway-class token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
 cookie-only), so both surfaces always look and update identically.
 
+**The board is push-driven — no polling (BR#4362).** The socket carries
+state, not just a doorbell: every mutation streams a `kb.event` frame, and
+the hub pushes a coalesced `kb.board` snapshot (at most one board build per
+second, no matter the mutation rate or how many clients are connected) plus
+a hydration snapshot on connect. Clients apply frames to their store and
+fetch nothing on a timer; `GET /board` stays as a 2s-cached hydration path
+for stragglers. Desktop shells whose webview can't hold a cross-origin
+socket tail the events mirror adaptively (2s while busy, backing off to 30s
+idle) and coalesce event bursts into one refresh — the 2026-10-29 overload
+was every client refetching the full board per event.
+
 Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
