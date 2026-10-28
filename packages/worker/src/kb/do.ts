@@ -5784,7 +5784,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // nothing to repair) and the watchdog then punished the resulting
       // silence by releasing the card — the exact queue-slot destruction
       // fixed above. Instead: straight back into review; the standard
-      // in_review handoff auto-spawns a fresh verify duty.
+      // in_review handoff auto-spawns a fresh verify duty. The re-entry note
+      // MUST carry the PR link: the review-needs-pr gate rejects a link-less
+      // in_review transition, so every coverage bounce emitted one audited
+      // rejection (folded as a gate:review-needs-pr breach event — the
+      // BR#4428 storm on BR#4363: 3 bounces, 3 events) and the card
+      // stranded in_progress instead of re-entering review.
       if (bounceKind === "coverage") {
         try {
           await this.transition(
@@ -5792,7 +5797,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               id: taskId,
               to: "in_review",
               session: "",
-              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train`,
+              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head of PR https://github.com/${repo}/pull/${pr}; its accept re-queues the train`,
             },
             actor,
           );
