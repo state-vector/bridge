@@ -7,6 +7,8 @@
  * are legal.
  */
 
+import type { AwaitEvent } from "./closure";
+
 export const ARTEFACT_TYPES = [
   "steering",
   "goal",
@@ -1222,6 +1224,61 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
   return [...queued]
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
     .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
+}
+
+// ---- typed-proxy preservation (BR#4067) ----
+
+/** result_class stamped on a watchdog hold-park (a silence that would have
+ *  released a card carrying a machine wait). The score side exempts it — a
+ *  hold preserves state, it is neither an abandonment nor a lost run. */
+export const PROXY_WAIT_HOLD_RESULT_CLASS = "proxy_wait_hold";
+
+/** The PR leg a card's merge-train state points at, from any of the shapes
+ *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).
+ *  0 when none resolves. */
+export function trainPrLeg(meta: any): number {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const fromPr = (m.pr as any)?.number;
+  const fromPrs = Array.isArray(m.prs) && m.prs.length ? (m.prs[0] as any)?.number : undefined;
+  return Number(fromPr ?? fromPrs ?? mt.pr ?? 0) || 0;
+}
+
+/** The typed await a train-owned card parks on — the pr_merged proxy derived
+ *  from its live PR leg. Null when the leg lacks a well-formed repo/number
+ *  (callers then fall back to the machine-managed park flag). */
+export function trainProxyEvent(meta: any): AwaitEvent | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
+  const n = trainPrLeg(meta);
+  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+}
+
+/** BR#4067 — does a release path need to HOLD? Returns the hold description
+ *  when the card carries machine-wait state — a merge-train queue slot
+ *  (queued/awaiting-ci/bounced on a live PR leg), a typed await_event, or a
+ *  bound ask — and null when a release may proceed. Every watchdog release
+ *  path (stall sweep, review sweep, lapsed subprocess, reaper reassign) and
+ *  the machine's machine-actor backstop consult this one predicate: the
+ *  PR #257 class is a card released to todo while its wait state (queue
+ *  slot, proxy, ask) was still live. */
+export function releaseHold(meta: any): string | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced") {
+    const pr = trainPrLeg(meta);
+    if (pr) {
+      const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
+      return `merge-train ${st} on PR ${repo}#${pr} — the typed pr_merged proxy owns the exit`;
+    }
+  }
+  if (m.blocked?.await_event && typeof m.blocked.await_event === "object")
+    return `a typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")}) — the proxy watch owns the exit`;
+  if (m.awaiting_ask)
+    return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
+  return null;
 }
 
 // ---- carry-record law (BR#3516 §5) ----

@@ -13,7 +13,7 @@
 // Applied(effects) | Rejection{code, rule, message}. Effects (spawn, escalate,
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
-import { parseTags, validateTransition } from "./core";
+import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -417,23 +417,39 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   const base = validateTransition(i.type as any, i.status, i.to);
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
   // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
-  // system sweeps) must never destroy merge-train state. A card the train
-  // owns (meta.merge_train queued/awaiting-ci with a live PR leg) is parked
-  // on the typed pr_merged proxy — the proxy watch owns its exit, not the
-  // staleness sweep. Humans and owners still release freely (rule-9 / web).
-  if (i.type === "task" && i.to === "todo" && i.status === "blocked" && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? ""))) {
-    const mtq = ((metaOf(i.meta).merge_train ?? {}) as Record<string, unknown>);
-    if (mtq.state === "queued" || mtq.state === "awaiting-ci") {
-      const m = metaOf(i.meta);
-      const pr = (m.pr as any)?.number ?? (Array.isArray(m.prs) ? ((m.prs as any[])[0]?.number ?? 0) : 0);
-      if (pr) {
-        return {
-          ok: false,
-          code: "guard-failed",
-          rule: "release-holds-train-queue",
-          message: `card is merge-train ${String(mtq.state)} (typed await pr_merged ${String((m.pr as any)?.repo ?? "repo")}#${pr}) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool.`,
-        };
-      }
+  // system sweeps) must never destroy merge-train state or a typed wait. A
+  // card the train owns (meta.merge_train queued/awaiting-ci/bounced with a
+  // live PR leg) is parked on the typed pr_merged proxy; a card with a typed
+  // await_event or a bound ask parks on that wait — the proxy watch / the
+  // answer owns the exit, not the staleness sweep. Humans and owners still
+  // release freely (rule-9 / web). The sweeps hold BEFORE attempting a todo
+  // release (they park blocked); this backstop catches any machine-actor
+  // path that slips past them.
+  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? ""))) {
+    const m = metaOf(i.meta);
+    const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
+    const st = String(mtq.state ?? "");
+    const pr = trainPrLeg(m);
+    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr) {
+      const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-train-queue",
+        message: `card is merge-train ${st} (typed await pr_merged ${repo}#${pr}) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool.`,
+      };
+    }
+    const hold = releaseHold(m);
+    if (hold) {
+      const aw = m.blocked?.await_event
+        ? `typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")})`
+        : `bound ask (${String(m.awaiting_ask?.ask_id ?? "")})`;
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-typed-await",
+        message: `card parks on a ${aw} — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release.`,
+      };
     }
   }
   for (const r of RULES) {
