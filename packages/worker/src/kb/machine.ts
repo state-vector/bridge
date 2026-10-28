@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition } from "./core";
-import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -338,10 +338,12 @@ export const RULES: Rule[] = [
       if (!reason) return "moving to blocked requires a reason (note)";
       if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
       if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
+      const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done/br_pr_merged event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). Await the real upstream leg.`;
       if (i.body?.await_event !== undefined) {
-        return validateAwaitEvent(i.body.await_event)
-          ? null
-          : `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        const ev = validateAwaitEvent(i.body.await_event);
+        if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        if (isSelfAwait(String(i.id), ev)) return selfMsg;
+        return null;
       }
       // compat shim: legacy text conditions that parse cleanly to ONE atom
       // are derived typed events at write time; unparseable/no-atom text is
@@ -349,7 +351,18 @@ export const RULES: Rule[] = [
       const text = String(i.body?.unblock_condition ?? "").trim();
       if (text) {
         const { atoms, unparseable } = parseProxyCondition(text);
-        if (!unparseable && awaitEventFromAtoms(atoms)) return null;
+        if (!unparseable && atoms.length > 1) {
+          // BR#3986: the extractors now collect EVERY match, so a conjunction
+          // parses to N atoms — but a park awaits ONE typed event. Reject
+          // loud naming the atoms instead of letting the sweep gate on the
+          // first one while the rest vanish from the machine gate.
+          return `condition text parses to ${atoms.length} machine atoms (${atoms.map((a) => a.raw).join(" | ")}). A park awaits ONE typed event — ${AWAIT_GRAMMAR_DOC}. Name a single machine leg in await_event, or carry the rest as prose: multi-atom conjunctions never self-migrate (BR#3986).`;
+        }
+        if (!unparseable && atoms.length === 1) {
+          const single = awaitEventFromAtoms(atoms);
+          if (single && isSelfAwait(String(i.id), single)) return selfMsg;
+          if (single) return null;
+        }
       }
       return `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578)`;
     },
@@ -758,6 +771,11 @@ export function breachClass(reason: string): string {
   // sentence literals (BR#3612's wording-drift lesson).
   if (r.includes("malformed await_event")) return "gate:malformed-await-event";
   if (r.includes("requires a typed await_event")) return "gate:blocked-needs-typed-await";
+  // BR#3986: the multi-atom + self-referential park rejections (same rule,
+  // distinct causes — a conjunction the sweep could only partially gate vs a
+  // park deadlocked on its own done).
+  if (r.includes("self-referential await")) return "gate:self-referential-await";
+  if (r.includes("machine atoms (")) return "gate:multi-atom-condition";
   return "unclassified";
 }
 

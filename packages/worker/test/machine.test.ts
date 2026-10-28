@@ -248,6 +248,39 @@ describe("loop regressions", () => {
     expect(malformed).toBeTruthy();
   });
 
+  it("BR#3986: a multi-atom conjunction text park is refused loud, naming every atom", async () => {
+    const rej = await check(
+      input({ status: "in_progress", to: "blocked", body: { note: "waiting", unblock_condition: "BR#3945 done AND BR#3946 done" } }),
+      baseCtx(),
+    );
+    expect(rej).toBeTruthy();
+    expect(String(rej)).toContain("2 machine atoms");
+    expect(String(rej)).toContain("BR#3945");
+    expect(String(rej)).toContain("BR#3946");
+    expect(breachClass(String(rej))).toBe("gate:multi-atom-condition");
+  });
+
+  it("BR#3986: a park awaiting its own done is refused — explicit AND text-derived (the BR#136 deadlock)", async () => {
+    const explicit = await check(
+      input({ id: "BR#136", status: "in_progress", to: "blocked", body: { note: "x", await_event: { event: "br_done", id: "BR#136" } } }),
+      baseCtx(),
+    );
+    expect(explicit).toBeTruthy();
+    expect(String(explicit)).toContain("self-referential");
+    expect(breachClass(String(explicit))).toBe("gate:self-referential-await");
+    // the text shim derives {br_done, BR#136} from prose — same refusal
+    const derived = await check(
+      input({ id: "BR#136", status: "in_progress", to: "blocked", body: { note: "x", unblock_condition: "then the sweep transitions BR#136 done" } }),
+      baseCtx(),
+    );
+    expect(derived).toBeTruthy();
+    expect(String(derived)).toContain("self-referential");
+    // another card's br_done still passes the single-atom text shim
+    expect(
+      await check(input({ id: "BR#3557", status: "in_progress", to: "blocked", body: { note: "x", unblock_condition: "BR#3945 done" } }), baseCtx()),
+    ).toBeNull();
+  });
+
   it("every rule has a name and the set is stable (table drift alarm)", () => {
     expect(RULES.map((r) => r.name).sort()).toEqual(
       [

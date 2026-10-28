@@ -82,9 +82,18 @@ function repoFromLine(line: string): string | null {
   return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
 }
 
-function numberFromPullUrl(line: string): number | null {
-  const m = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/.exec(line);
-  return m ? Number(m[1]) : null;
+/** ALL pull-URL numbers on the line — a conjunction may merge several PRs
+ *  (BR#3986: first-match exec silently swallowed every condition after the
+ *  first, so the sweep gated on the wrong atom). */
+function numbersFromPullUrls(line: string): number[] {
+  return [...String(line ?? "").matchAll(/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/g)].map((m) => Number(m[1]));
+}
+
+/** Dedupe key for atoms of the same kind pointing at the same target — the
+ *  same BR#/PR#/run mentioned twice on one line is ONE condition, not two. */
+function atomKey(a: ProxyAtom): string {
+  const target = a.brId ?? (a.number !== undefined ? String(a.number) : a.runId ?? a.commit ?? "");
+  return `${a.kind}|${a.repo ?? ""}|${target}`;
 }
 
 /**
@@ -94,6 +103,7 @@ function numberFromPullUrl(line: string): number | null {
  */
 export function parseProxyCondition(text: string): ParsedCondition {
   const atoms: ProxyAtom[] = [];
+  const seen = new Set<string>();
   let unparseable = false;
   // Cut the DUTY clauses over the WHOLE text before splitting: real conditions
   // enumerate the duty steps with semicolons ("then a fresh session: (1) …;
@@ -105,56 +115,61 @@ export function parseProxyCondition(text: string): ParsedCondition {
     const line = rawLine.trim();
     if (!line) continue;
     const repo = repoFromLine(line);
+    const raw = line.slice(0, 200);
     let lineYielded = false;
+    const push = (a: Omit<ProxyAtom, "raw">) => {
+      const atom = { ...a, raw } as ProxyAtom;
+      const key = atomKey(atom);
+      if (seen.has(key)) {
+        lineYielded = true; // a dup of an earlier line's atom still parsed
+        return;
+      }
+      seen.add(key);
+      atoms.push(atom);
+      lineYielded = true;
+    };
 
     // pr_merged: "PR <url|#N> … mergeCommit non-null / state MERGED / merged"
+    // ALL PR numbers on the line (BR#3986: first-match exec truncated
+    // conjunctions — "PR #1 merged AND PR #2 merged" gated on #1 only).
+    let prMerged = false;
     if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
-      const urlN = numberFromPullUrl(line);
-      const bare = /PR\s+#?(\d+)\b/.exec(line);
-      const prNumber = urlN ?? (bare ? Number(bare[1]) : null);
-      if (prNumber) {
-        atoms.push({ kind: "pr_merged", repo, number: prNumber, raw: line.trim().slice(0, 200) });
-        lineYielded = true;
-      }
+      const nums = new Set<number>(numbersFromPullUrls(line));
+      for (const m of line.matchAll(/PR\s+#?(\d+)\b/g)) nums.add(Number(m[1]));
+      for (const n of nums) push({ kind: "pr_merged", repo, number: n });
+      prMerged = nums.size > 0;
     }
 
     // br_pr_merged: "BR#N's fix PR on <repo> is MERGED" — the PR itself is
-    // unnamed; the sweep resolves it by head branch bridge/BR-<N>.
-    if (!lineYielded) {
-      const br = /\bBR#(\d+)\b/.exec(line);
-      if (br && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
-        atoms.push({ kind: "br_pr_merged", repo, brId: `BR#${br[1]}`, raw: line.trim().slice(0, 200) });
-        lineYielded = true;
-      }
+    // unnamed; the sweep resolves it by head branch bridge/BR-<N>. Only when
+    // the line didn't already name a concrete PR; every BR# on the line.
+    if (!prMerged && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+      for (const m of line.matchAll(/\bBR#(\d+)\b/g)) push({ kind: "br_pr_merged", repo, brId: `BR#${m[1]}` });
     }
 
-    // issue_closed: "GH#N closed" / "issue #N is CLOSED" / URL + closed
-    const issueClosed = /(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/i.exec(line);
-    if (issueClosed) {
-      const n = Number(issueClosed[1]);
-      atoms.push({ kind: "issue_closed", repo, number: n, raw: line.trim().slice(0, 200) });
-      lineYielded = true;
+    // issue_closed: "GH#N closed" / "issue #N is CLOSED" / URL + closed —
+    // every GH# on the line.
+    for (const m of line.matchAll(/(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/gi)) {
+      push({ kind: "issue_closed", repo, number: Number(m[1]) });
     }
 
-    // br_done: "BR#N done" / "BR#N is done"
-    const brDone = /\bBR#(\d+)\s+(?:is\s+)?done\b/i.exec(line);
-    if (brDone) {
-      atoms.push({ kind: "br_done", repo: null, brId: `BR#${brDone[1]}`, raw: line.trim().slice(0, 200) });
-      lineYielded = true;
+    // br_done: "BR#N done" / "BR#N is done" — EVERY "BR#N done" on the line.
+    // The headline BR#3986 defect: non-global exec yielded the FIRST match
+    // only, so "BR#3945 done AND BR#3946 done" gated on BR#3945 alone while
+    // BR#3946 vanished from the machine gate entirely.
+    for (const m of line.matchAll(/\bBR#(\d+)\s+(?:is\s+)?done\b/gi)) {
+      push({ kind: "br_done", repo: null, brId: `BR#${m[1]}` });
     }
 
-    // run_success: "run <id> … SUCCESS / green"
-    const runOk = /\brun\s+(\d{6,})\b/.exec(line);
-    if (runOk && /\b(?:SUCCESS|success|green)\b/.test(line)) {
-      atoms.push({ kind: "run_success", repo, runId: runOk[1], raw: line.trim().slice(0, 200) });
-      lineYielded = true;
+    // run_success: "run <id> … SUCCESS / green" — every run on the line.
+    if (/\b(?:SUCCESS|success|green)\b/.test(line)) {
+      for (const m of line.matchAll(/\brun\s+(\d{6,})\b/g)) push({ kind: "run_success", repo, runId: m[1] });
     }
 
-    // pr_checks_green: "a fresh green check run … on PR #N (head)"
-    const checks = /green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/i.exec(line);
-    if (checks) {
-      atoms.push({ kind: "pr_checks_green", repo, number: Number(checks[1]), raw: line.trim().slice(0, 200) });
-      lineYielded = true;
+    // pr_checks_green: "a fresh green check run … on PR #N (head)" — every
+    // PR the green-check sentence names.
+    for (const m of line.matchAll(/green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/gi)) {
+      push({ kind: "pr_checks_green", repo, number: Number(m[1]) });
     }
 
     if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
@@ -408,6 +423,14 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
     case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
     case "deployed": return a.commit ? { event: "deployed", commit: a.commit } : null;
   }
+}
+
+/** Self-referential await (BR#3986 / the BR#136 deadlock): a card awaiting
+ *  its own done can never fire — the typed event's subject only reaches that
+ *  state AFTER the card unblocks, so the park deadlocks silently. Pure +
+ *  exported for the park gate and the regression tests. */
+export function isSelfAwait(cardId: string, e: AwaitEvent): boolean {
+  return (e.event === "br_done" || e.event === "br_pr_merged") && e.id === cardId;
 }
 
 /** Whether the hub's OWN deployed commit satisfies a `deployed` atom: prefix
