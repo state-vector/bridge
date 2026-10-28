@@ -254,7 +254,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     const card1 = (await kbJson("/get", { id: c1 })).body;
     expect(card1.status).toBe("in_progress");
     expect(card1.meta?.merge_train?.state).toBe("bounced");
-    expect(String(card1.body_md)).toContain("Merge-train bounce: PR #2601");
+    expect(String(card1.body_md)).toContain("Merge-train bounce (CONFLICT): PR #2601");
     expect(String(card1.body_md)).toContain("- `packages/worker/src/kb/do.ts`");
     expect(String(card1.body_md)).toContain("- `packages/contracts/src/mcp.ts`");
     expect(String(card1.body_md)).toContain("INVALID at the new head");

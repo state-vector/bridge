@@ -87,8 +87,12 @@ import {
   classifyRequiredRuns,
   decideTrainGate,
   trainBounceBrief,
+  classifyBounce,
   trainStopAskTitle,
   trainLandedCloseNote,
+  releaseHold,
+  trainProxyEvent,
+  PROXY_WAIT_HOLD_RESULT_CLASS,
   type TrainLease,
   type LeaseAction,
   type MainCheckRun,
@@ -294,12 +298,24 @@ export class KnowledgeHub {
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
         meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
+        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
       );
       if (now - lastTs <= staleMs) continue;
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
       );
       if (openAsk) continue;
+      // BR#4067 — typed-proxy preservation: silence must not destroy a machine
+      // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
+      // or one parked on a typed await / bound ask is PARKED blocked — the
+      // reason names the silence, the wait meta survives, the proxy owns the
+      // exit (the PR #257 class: releases severed queue slots and stranded
+      // the cards). result_class exempts the hold from abandonment scoring.
+      const hold = releaseHold(meta);
+      if (hold) {
+        await this.transition(this.holdParkBody(r.id, meta, hold, `no update for >${staleMin}m`), "system:watchdog");
+        continue;
+      }
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
       // BR#3352: classify the release from the session trail. A silent task
@@ -369,6 +385,14 @@ export class KnowledgeHub {
          );
         if (activeVerify) continue; // a verifier is on it — give them time
         const hours = Math.round(age / 3_600_000);
+        // BR#4067 — the same typed-proxy law for the review-stall bounce: a
+        // card the train owns or that parks on a typed wait is HELD, never
+        // released — the bounce destroys the queue slot it sits in.
+        const hold = releaseHold(meta);
+        if (hold) {
+          await this.transition(this.holdParkBody(r.id, meta, hold, `review stalled ${hours}h`), "system:watchdog");
+          continue;
+        }
         const findings = `watchdog: review stalled ${hours}h — no verifier picked up the verification round. No adverse findings; resolve whatever the last gate/review named and hand off again, or let the work re-enter the pool.`;
         await this.transition({ id: r.id, to: "in_progress", note: findings }, "system:watchdog");
         await this.transition({ id: r.id, to: "todo", note: "released to the pool after a stalled review round (watchdog)" }, "system:watchdog");
@@ -391,6 +415,23 @@ export class KnowledgeHub {
       const b = meta.blocked;
       if (b?.class !== "subprocess" || typeof b.deadline_ts !== "number") continue;
       if (b.deadline_ts > now) continue;
+      // BR#4067 — the lapsed window releases the SUBPROCESS declaration, not
+      // a machine wait: a card that (also) carries train/typed-wait state
+      // stays parked, the wait meta untouched.
+      const hold = releaseHold(meta);
+      if (hold) {
+        meta.blocked = {
+          ...(meta.blocked ?? {}),
+          reason: `declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed, but the card carries ${hold} — release held (BR#4067)`,
+        };
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(meta), now, now, r.id,
+        );
+        this.audit("system:watchdog", "release_held", r.id, { hold, from: "blocked", window: b.budget_minutes ?? null });
+        this.version(r.id, "system:watchdog", "note", `subprocess window lapsed but release HELD — ${hold} (BR#4067)`, { hold });
+        continue;
+      }
       const wasDoing = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       // legacy lapsed window: stalled, not blocked — straight to todo
       delete meta.blocked;
@@ -1072,6 +1113,11 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       let d: any = {};
       try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
       if (d?.result_class === "completed_result_lost") s.result_lost++;
+      else if (d?.result_class === PROXY_WAIT_HOLD_RESULT_CLASS) {
+        // BR#4067: a hold-park preserves a machine wait (train queue slot /
+        // typed await / bound ask) — it is neither an abandonment nor a lost
+        // run, so no counter moves.
+      }
       else s.abandoned++;
     }
     for (const r of this.state.storage.sql.exec(
@@ -2665,8 +2711,24 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           const pm = JSON.parse(parent.meta ?? "{}");
           const parkReason = [String(pm.blocked?.reason ?? ""), String(pm.blocked_reason ?? "")].find((r) => r) ?? "";
           if (parent.status === "in_progress") {
-            this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is in_progress — a bounced card is not re-queued by a verify close; the bounce stands until a fresh verify accepts the new head (BR#3659 defect 2)" });
-            this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on a bounced (in_progress) card did not re-queue it — the bounce stands", {});
+            // BR#4067 self-heal: an in_progress parent stands UNLESS the train
+            // itself bounced it non-conflict (a coverage/gate-kind bounce left
+            // nothing for impl to repair — this fresh verify accept IS the
+            // re-acceptance; re-queue instead of stranding the card: the PR
+            // #257 class). A CONFLICT bounce is real impl repair (BR#3659
+            // defect 2), and a card never bounced by the train is a live
+            // claim the hub must not hijack — both stand.
+            const bt = (pm.merge_train ?? {}) as Record<string, unknown>;
+            const trainBounced = bt.state === "bounced";
+            const realConflict = bt.bounce_kind === "conflict"
+              || (Array.isArray(bt.conflict_files) && (bt.conflict_files as string[]).length > 0);
+            if (!trainBounced || realConflict) {
+              this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
+              this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
+            } else {
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+              this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
+            }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
@@ -3672,8 +3734,19 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       );
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
+        let cleared = false;
         if (sm.awaiting_ask?.ask_id === id) {
           delete sm.awaiting_ask;
+          cleared = true;
+        }
+        // BR#4067: the paired typed await points at THIS ask — answered means
+        // SATISFIED. Leaving it stamped would make every later machine release
+        // path hold the card forever on a wait that already resolved.
+        if (sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id) {
+          delete sm.blocked.await_event;
+          cleared = true;
+        }
+        if (cleared) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
         if (subject.status === "blocked") {
@@ -3696,10 +3769,13 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "superseded", note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
+              // human_verdict: the human's answered-ask decision — the system
+              // actor is only the pen. The release-holds guards (BR#4067)
+              // exempt it: a human may release what a machine wait holds.
+              await this.transition({ id: subject.id, to: "superseded", human_verdict: true, note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "superseded";
             } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "todo", note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
+              await this.transition({ id: subject.id, to: "todo", human_verdict: true, note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "todo";
             } else {
               taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
@@ -4043,6 +4119,39 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     };
   }
 
+  /** BR#4067 — the freshest hub ping from the card's claiming session. A
+   *  dispatched runner run pings on orient/claim even while its stdout is
+   *  quiet, so a fresh ping means the run is plausibly still in flight and
+   *  the silence-release must wait it out (grace extension, #205-consistent:
+   *  liveness = ANY real signal, never a shorter window). */
+  private sessionPing(meta: any): number {
+    const name = meta?.session ? String(meta.session) : "";
+    if (!name) return 0;
+    try {
+      return Number(this.one(`SELECT MAX(last_seen_ts) AS ts FROM sessions WHERE name = ?`, name)?.ts ?? 0) || 0;
+    } catch { return 0; }
+  }
+
+  /** BR#4067 — the hold-park transition body: blocked (never todo), the
+   *  silence named, the typed wait preserved or re-derived. The typed
+   *  await_event keeps the blocked-needs-typed-await gate honest; when none
+   *  is derivable the merge_train flag marks it a machine-managed park with
+   *  its own trip-wires. result_class "proxy_wait_hold" exempts the park
+   *  from abandonment scoring — a hold preserves state, nothing was lost. */
+  private holdParkBody(id: string, meta: any, hold: string, staleDesc: string) {
+    const aw = validateAwaitEvent(meta?.blocked?.await_event)
+      ?? trainProxyEvent(meta)
+      ?? (meta?.awaiting_ask?.ask_id ? { event: "ask" as const, ask_id: String(meta.awaiting_ask.ask_id) } : null);
+    return {
+      id,
+      to: "blocked",
+      note: `silence-release held (watchdog): ${staleDesc}, but the card carries ${hold} — parked on the typed proxy, not released (BR#4067)`,
+      unblock_condition: aw ? describeAwaitEvent(aw) : hold,
+      ...(aw ? { await_event: aw } : { merge_train: true }),
+      result_class: PROXY_WAIT_HOLD_RESULT_CLASS,
+    };
+  }
+
   /**
    * Reaper: runs at orient (check-in). Blocked-abandoned tasks:
    *  - OWN tasks: activity within the stale window → prompt to check in
@@ -4153,6 +4262,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         continue;
       }
       meta.attempt = { by: ownerLabel, at: now, attempts };
+      // BR#4067 — the reassignment must not destroy a machine wait: train
+      // queue slots / typed awaits / bound asks survive the reaper (the card
+      // stays blocked, its proxy intact). The attempt still counts, so a held
+      // card that keeps cycling still reaches the rework-loop escalation above.
+      const hold = releaseHold(meta);
+      if (hold) {
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(meta), now, now, t.id,
+        );
+        this.audit("system:reaper", "release_held", t.id, { prev_owner: ownerLabel, attempts, hold });
+        this.version(t.id, "system:reaper", "note", `reassignment HELD — the card carries ${hold} (BR#4067)`, { prev_owner: ownerLabel, attempts, hold });
+        out.push(
+          `${t.id} "${t.title}" release HELD: ${hold} — parked (attempt ${attempts} recorded, still counting toward the rework loop).`,
+        );
+        continue;
+      }
       delete meta.blocked;
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = 'todo', owner = '', tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -5116,12 +5242,41 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (!pr) throw new Error("train:bounced needs pr");
       const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
       const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
+      const defect = String(body.defect ?? "").trim();
+      const mergeState = String(body.merge_state ?? "").trim();
+      // BR#4066 — the bounce KIND decides everything downstream: which brief
+      // renders, who owns the next leg, whether the accept-hook may re-queue.
+      const bounceKind = (["coverage", "conflict", "gate"] as const).includes(body.bounce_kind)
+        ? (body.bounce_kind as "coverage" | "conflict" | "gate")
+        : classifyBounce(defect, conflictFiles);
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id });
-      // blocked→in_progress with the fix-up brief; resolution invalidates the
-      // verdict — the card re-enters the queue only after a fresh verify.
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, kind: bounceKind, defect, mergeStateStatus: mergeState });
+      // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
+      // a bounced merge-ready card is the board's highest-value work — one
+      // mechanical/human leg from landing — and must not re-enter at default
+      // priority and starve). One meta write, before the transition.
+      const now2 = Date.now();
+      const nextMeta = {
+        ...cm,
+        boosted: now2,
+        merge_train: {
+          ...(cm.merge_train ?? {}),
+          state: "bounced",
+          bounce_kind: bounceKind,
+          defect: defect.slice(0, 300) || undefined,
+          conflict_files: conflictFiles,
+          bounced_at: now2,
+          pr,
+          repo,
+        },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
+      // blocked→in_progress with the kind-aware brief. coverage bounces carry
+      // NO repair for impl — the card immediately re-enters review below and a
+      // fresh verify duty re-checks the live head (the 30s stamp-race class
+      // self-heals: verify re-accepts → accept-hook re-queues → train merges).
       await this.transition(
         {
           id: taskId,
@@ -5131,11 +5286,35 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // session as its implementer (misattribution + a spurious
           // review-separation refusal on a same-session re-verify)
           session: "",
-          note: `merge-train bounce — PR #${pr} conflicts with base${conflictFiles.length ? ` (${conflictFiles.length} file(s))` : ""}`,
+          note: bounceKind === "conflict"
+            ? `merge-train bounce (CONFLICT) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
+            : bounceKind === "coverage"
+              ? `merge-train bounce (VERDICT COVERAGE) — PR #${pr} head not covered by the verdict; no conflict exists`
+              : `merge-train bounce (GATE) — PR #${pr}: ${defect.slice(0, 160) || "mechanical gate leg failed"}`,
           body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
         },
         actor,
       );
+      // BR#4066/67 self-heal: a coverage bounce fabricated impl work (there is
+      // nothing to repair) and the watchdog then punished the resulting
+      // silence by releasing the card — the exact queue-slot destruction
+      // fixed above. Instead: straight back into review; the standard
+      // in_review handoff auto-spawns a fresh verify duty.
+      if (bounceKind === "coverage") {
+        try {
+          await this.transition(
+            {
+              id: taskId,
+              to: "in_review",
+              session: "",
+              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train`,
+            },
+            actor,
+          );
+        } catch (e) {
+          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; impl re-enters review manually` });
+        }
+      }
       cm.merge_train = { ...(cm.merge_train ?? {}), state: "bounced", pr, bounced_at: now };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       meta.currently = null;

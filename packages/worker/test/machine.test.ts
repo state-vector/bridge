@@ -1125,3 +1125,77 @@ describe("tag inertness (BR#2983)", () => {
     expect(invariants({ type: "question", status: "todo", meta: {} })).toEqual([]);
   });
 });
+
+// BR#4067 — queue-slot durability: a machine silence-release must never
+// destroy merge-train state (the PR #257 class: verify accepted, watchdog
+// released the queued card to todo, nothing re-queued it).
+describe("release-holds-train-queue (BR#4067)", () => {
+  const queuedMeta = {
+    merge_train: { state: "queued", pr: 257, repo: "state-vector/bridge" },
+    pr: { repo: "state-vector/bridge", number: 257, head_sha_at_acceptance: "a".repeat(40) },
+  };
+
+  it("system actor releasing a queued card is refused with the proxy named", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: queuedMeta as any }), baseCtx());
+    expect(msg).toMatch(/merge-train queued.*pr_merged/s);
+  });
+
+  it("awaiting-ci holds too", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "hub:proxy-watch", meta: { ...queuedMeta, merge_train: { state: "awaiting-ci" } } as any }), baseCtx());
+    expect(msg).toMatch(/merge-train awaiting-ci/);
+  });
+
+  it("bounced holds too — the release that destroyed BR#4067 itself (in_progress, train-bounced, silent)", async () => {
+    const bounced = {
+      merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "conflict" },
+      pr: { repo: "state-vector/bridge", number: 259 },
+    };
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: bounced as any }), baseCtx());
+    expect(msg).toMatch(/merge-train bounced \(typed await pr_merged state-vector\/bridge#259\)/);
+  });
+
+  it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: { blocked: { reason: "parked", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 257 } } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/typed await_event \(pr_merged\).*machine release must not destroy the wait/s);
+  });
+
+  it("a bound ask holds — the answer owns the exit", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:reaper",
+      meta: { blocked: { reason: "parked" }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/bound ask \(ASK-1\).*machine release must not destroy the wait/s);
+  });
+
+  it("humans and owners release freely — the guard is machine-actor only", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "web:rayh", owner: "web:rayh", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds-train-queue|merge-train queued/);
+  });
+
+  it("humans also release silent in_progress train cards freely (rule-9)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "some-agent", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a human's answered-ask verdict rides the system pen freely (BR#3912 typed RELEASE)", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:question(ray)",
+      body: { human_verdict: true },
+      meta: { blocked: { reason: "parked", await_event: { event: "ask", ask_id: "ASK-1" } }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a blocked card with NO train state releases as before", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: { blocked: { reason: "parked" } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/merge-train/);
+  });
+
+  it("a silent in_progress card with no machine wait releases as before (the sweeps own the todo path)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: { last_progress: { ts: 1 } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+});
