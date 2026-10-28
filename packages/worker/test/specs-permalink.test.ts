@@ -52,32 +52,27 @@ describe("cardIdFromPathSegment (the route parser)", () => {
   });
 
   it("returns null for garbage — caller shows the board, not an error", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(cardIdFromPathSegment("weird")).toBe(null);
     expect(cardIdFromPathSegment("TASK-latest")).toBe(null);
     expect(cardIdFromPathSegment("BR-")).toBe(null);
-    expect(warn).not.toHaveBeenCalled(); // ordinary non-matches stay quiet
   });
 
-  it("surfaces a malformed escape — null per contract, but logged, never silent", () => {
+  it("is total: undecodable escapes are a null VALUE — never a throw, never a log", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(cardIdFromPathSegment("%zz")).toBe(null);
-    expect(warn).toHaveBeenCalledOnce();
-    expect(String(warn.mock.calls[0]?.[0])).toContain("unparseable segment");
-    expect(String(warn.mock.calls[0]?.[0])).toContain("%zz");
-  });
-
-  it("surfaces a well-formed-looking but undecodable escape (lone surrogate)", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(cardIdFromPathSegment("%ED%A0%80")).toBe(null);
-    expect(warn).toHaveBeenCalledOnce();
-  });
-
-  it("does not log for well-formed segments", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(cardIdFromPathSegment("BR-3990")).toBe("BR#3990");
-    expect(cardIdFromPathSegment("BR%233990")).toBe("BR#3990");
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(cardIdFromPathSegment("%zz")).toBe(null); // bad hex
+    expect(cardIdFromPathSegment("TASK-00%7")).toBe(null); // truncated escape
+    expect(cardIdFromPathSegment("%ED%A0%80")).toBe(null); // UTF-16 surrogate half
+    expect(cardIdFromPathSegment("%C3%28")).toBe(null); // invalid continuation byte
+    expect(cardIdFromPathSegment("%C0%AF")).toBe(null); // overlong encoding
     expect(warn).not.toHaveBeenCalled();
+    expect(err).not.toHaveBeenCalled();
+  });
+
+  it("decodes valid UTF-8 escape runs exactly like decodeURIComponent", () => {
+    expect(cardIdFromPathSegment("TASK%2D007")).toBe("TASK-007"); // %-encoded dash
+    expect(cardIdFromPathSegment("BR%233990")).toBe("BR#3990"); // encoded literal
+    expect(cardIdFromPathSegment("BR-3990")).toBe("BR#3990"); // raw passes through
   });
 
   it("round-trips through cardPath", () => {
