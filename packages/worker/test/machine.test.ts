@@ -281,6 +281,88 @@ describe("loop regressions", () => {
     ).toBeNull();
   });
 
+  it("BR#4062: EVERY closed-set atom parks through the gate — typed param AND machine-proxy prose", async () => {
+    const cases: { label: string; ev: Record<string, unknown>; prose: string }[] = [
+      {
+        label: "pr_merged", ev: { event: "pr_merged", repo: "state-vector/bridge", n: 253 },
+        prose: "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=253): PR https://github.com/state-vector/bridge/pull/253 merges (mergeCommit non-null) AND main CI green after.",
+      },
+      {
+        label: "br_pr_merged", ev: { event: "br_pr_merged", id: "BR#4015" },
+        prose: "Machine proxy (typed await_event br_pr_merged id=BR#4015): the card's fix PR lands on the train.",
+      },
+      {
+        label: "issue_closed", ev: { event: "issue_closed", repo: "state-vector/superpositional", n: 1258 },
+        prose: "Machine proxy (typed await_event issue_closed repo=state-vector/superpositional n=1258): the upstream report closes after the operator purge.",
+      },
+      {
+        label: "br_done", ev: { event: "br_done", id: "BR#3819" },
+        prose: "Machine proxy (typed await_event br_done id=BR#3819): BR#3819 done.",
+      },
+      {
+        label: "run_success", ev: { event: "run_success", repo: "state-vector/bridge", run_id: "403581" },
+        prose: "Machine proxy (typed await_event run_success repo=state-vector/bridge run_id=40358175346): the nightly completes green after the deploy.",
+      },
+      {
+        label: "pr_checks_green", ev: { event: "pr_checks_green", repo: "state-vector/bridge", n: 257 },
+        prose: "Machine proxy (typed await_event pr_checks_green repo=state-vector/bridge n=257): every check settles on the head.",
+      },
+      {
+        label: "deployed", ev: { event: "deployed", commit: "5d53c1e" },
+        prose: "Machine proxy (typed await_event deployed commit=5d53c1e): the hub serves this commit.",
+      },
+      {
+        label: "ask", ev: { event: "ask", ask_id: "BR#4061" },
+        prose: "Machine proxy (typed await_event ask ask_id=BR#4061): re-entry waits on the ruling.",
+      },
+      {
+        label: "time", ev: { event: "time", until_ts: 1793673600000 },
+        prose: "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer.",
+      },
+    ];
+    for (const c of cases) {
+      expect(
+        await check(input({ status: "in_progress", to: "blocked", body: { note: "parked", await_event: c.ev } }), baseCtx()),
+        `typed param: ${c.label}`,
+      ).toBeNull();
+      expect(
+        await check(input({ status: "in_progress", to: "blocked", body: { note: "parked", unblock_condition: c.prose } }), baseCtx()),
+        `prose shim: ${c.label}`,
+      ).toBeNull();
+    }
+  });
+
+  it("BR#4062 repro: the takeover session's verbatim rejected parks now pass", async () => {
+    // {event:"time"} epoch-ms — REJECTED from MCP on 2026-10-28, must pass
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on a typed timer for the fresh-verify render",
+        unblock_condition: "Machine proxy (typed await_event time until_ts=1793673600000): Machine proxy (typed await_event time until_ts=1793673600000): the fresh-verify render gate re-parks the card → then a FRESH session closes BR#2637 done citing the render.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // ISO variant — the prose shim normalizes ISO until_ts to epoch ms
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on a typed timer",
+        unblock_condition: "Machine proxy (typed await_event time until_ts=2026-11-04T00:00:00Z): re-entry at the render slot.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // {event:"ask"} bound to an OPEN ask — REJECTED from MCP on 2026-10-28, must pass
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on the ruling",
+        unblock_condition: "Machine proxy (typed await_event ask ask_id=BR#4061): Machine proxy (typed await_event ask ask_id=BR#4061): Ask BR#4061 answered → the board task re-enters the pool when unblocked.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // the pr_merged control that already passed stays passing (no multi-atom regression)
+    expect(
+      await check(input({ id: "BR#3935", status: "in_progress", to: "blocked", body: {
+        note: "parked on the merge",
+        unblock_condition: "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=253): PR https://github.com/state-vector/bridge/pull/253 merges (mergeCommit non-null) AND main CI green after. Serialized merge train merges #253 at head.",
+      } }), baseCtx()),
+    ).toBeNull();
+  });
+
   it("every rule has a name and the set is stable (table drift alarm)", () => {
     expect(RULES.map((r) => r.name).sort()).toEqual(
       [
@@ -1133,7 +1215,7 @@ describe("typed-await gate classification (BR#3738)", () => {
   // as a NUMBER} → gate refused; the corrected string retry succeeded 32s
   // later — the gate, not the park, was rejected. Both fold as 'other' here
   // until this fix.
-  const BLOCKED_NEEDS_TYPED_AWAIT = `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578) [rule: blocked-needs-typed-await]`;
+  const BLOCKED_NEEDS_TYPED_AWAIT = `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}. Pass it as the transition's await_event param (bridge_transition takes it directly; until_ts is epoch ms), or cite it in prose as "typed await_event <event> key=value" (BR#4062), or bind an ask via ask_agent — the human leg. Free text alone is annotation, never an exit condition (BR#3578) [rule: blocked-needs-typed-await]`;
   const MALFORMED_AWAIT_EVENT = `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC} [rule: blocked-needs-typed-await]`;
 
   it("classifies the two fail-closed typed-await park gates", () => {
