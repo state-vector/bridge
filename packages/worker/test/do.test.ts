@@ -235,6 +235,93 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     expect(done.body.status).toBe("done");
   });
 
+  it("BR#3822: ask-bound auto-block stamps awaiting_ask before the fold — no unblock duty spawns, the answer resumes exactly once", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "ask-gate suppression source", qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+
+    const ask = await kbJson("/ask.create", {
+      question: "Keep the executor lease or release the card?",
+      options: ["KEEP — stay parked", "RELEASE — back to the pool"],
+      reason: "BR#3822 regression fixture",
+      to: "human",
+      artefact_id: t.id,
+    });
+    expect(ask.status).toBe(200);
+
+    // the card auto-blocked, and the marker is ON THE CARD — the key the
+    // machine's unblock-spawn gate reads at fold time; pre-fix this never
+    // existed here, so every ask-bound block leaked a racing sweep duty
+    // (BR#3798 → 3799+3800, BR#3505 → 3506)
+    const parked = await kbJson("/get", { id: t.id });
+    expect(parked.body.status).toBe("blocked");
+    expect(parked.body.meta.awaiting_ask?.ask_id).toBe(ask.body.id);
+    expect(parked.body.meta.blocked?.await_event?.event).toBe("ask");
+
+    // suppression: no unblock/sweep duty child spawned with the block
+    const parkedRels = await kbJson("/relations", { id: t.id });
+    const parkedChildren = (parkedRels.body.relations ?? []).filter((r: any) => r.dir === "in");
+    const parkedDuties: any[] = [];
+    for (const r of parkedChildren) {
+      const c = await kbJson("/get", { id: r.artefact_id });
+      if (c.body.type === "task" && c.body.roles.includes("unblock") && !["done", "superseded"].includes(c.body.status)) {
+        parkedDuties.push(c.body.id);
+      }
+    }
+    expect(parkedDuties).toEqual([]);
+
+    // answering the ask resumes the card exactly once and clears the marker
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "KEEP — stay parked" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.task_status).toBe("in_progress");
+
+    const resumed = await kbJson("/get", { id: t.id });
+    expect(resumed.body.status).toBe("in_progress");
+    expect(resumed.body.meta.awaiting_ask).toBeUndefined();
+
+    const hist = await kbJson("/get_history", { id: t.id });
+    const resumes = (hist.body.versions ?? []).filter((v: any) => v.action === "transition" && /resumed/.test(String(v.summary ?? "")));
+    expect(resumes).toHaveLength(1);
+
+    // still no unblock duty anywhere on the card, before or after the answer
+    const finalRels = await kbJson("/relations", { id: t.id });
+    const finalChildren = (finalRels.body.relations ?? []).filter((r: any) => r.dir === "in");
+    for (const r of finalChildren) {
+      const c = await kbJson("/get", { id: r.artefact_id });
+      if (c.body.type === "task") expect(c.body.roles.includes("unblock")).toBe(false);
+    }
+  });
+
+  it("BR#3822: a rejected ask-bound park PROPAGATES the failure and rolls the marker back (PR #229 review finding)", async () => {
+    // verdict duties (roles [review]) cannot enter blocked — the fold rejects
+    // the park, and askCreate must surface that rejection to the caller, not
+    // convert it into a success-shaped ask with no park and a leaked marker
+    // (the failure-handling finding that sank PR #229).
+    const { body: t } = await kbJson("/create", { type: "task", title: "ask-gate failure path", roles: ["review"], qualified: true });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+
+    const ask = await kbJson("/ask.create", {
+      question: "Should the verifier park this card?",
+      options: ["PARK", "GO"],
+      reason: "BR#3822 failure-path fixture",
+      to: "human",
+      artefact_id: t.id,
+    });
+    expect(ask.status).toBe(400);
+    expect(String(ask.body.error)).toContain("verdict-no-blocked");
+
+    // the marker rolled back — a live card carries no awaiting_ask residue
+    const card = await kbJson("/get", { id: t.id });
+    expect(card.body.status).toBe("in_progress");
+    expect(card.body.meta.awaiting_ask).toBeUndefined();
+
+    // and the failed attempt spawned no unblock duty
+    const rels = await kbJson("/relations", { id: t.id });
+    for (const r of (rels.body.relations ?? []).filter((x: any) => x.dir === "in")) {
+      const c = await kbJson("/get", { id: r.artefact_id });
+      if (c.body.type === "task") expect(c.body.roles.includes("unblock")).toBe(false);
+    }
+  });
+
   it("board payload carries type + roles for UI kind derivation and tag filters", async () => {
     const r = await kb("/board");
     const b = (await r.json()) as any;

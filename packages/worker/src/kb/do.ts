@@ -3463,12 +3463,52 @@ export class KnowledgeHub {
           // no-dead-end rule holds and askAnswer's resume leg finds it parked
           // with a live path out (this flip previously hard-failed: the
           // transition went out with a note but no unblock condition).
-          await this.transition({
-            id: artefactId, to: "blocked",
-            note: `blocked on ${to}: ${question.slice(0, 100)}`,
-            unblock_condition: `answer ask ${id}`,
-            await_event: { event: "ask", ask_id: id },
-          }, actor);
+          // BR#3822: the awaiting_ask marker MUST be on the card BEFORE the
+          // fold — doTransition loads the row at fold entry and the machine's
+          // unblock-spawn gate reads meta.awaiting_ask from that snapshot to
+          // skip the duty ("a spawned child would race the answer"); a stamp
+          // after the transition lands too late, so every ask-bound block
+          // leaked a racing sweep duty (BR#3798 → 3799+3800, BR#3505 → 3506).
+          // Shape matches every reader: askAnswer's cleanup
+          // (awaiting_ask?.ask_id === id → delete), the sweep's ask-resolution
+          // cleanup and the reaper's annotation + loop-ask stamp.
+          const sm = JSON.parse(row.meta ?? "{}");
+          sm.awaiting_ask = { ...(sm.awaiting_ask ?? {}), ask_id: id, ts: Date.now() };
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), artefactId,
+          );
+          try {
+            await this.transition({
+              id: artefactId, to: "blocked",
+              note: `blocked on ${to}: ${question.slice(0, 100)}`,
+              unblock_condition: `answer ask ${id}`,
+              await_event: { event: "ask", ask_id: id },
+            }, actor);
+          } catch (e) {
+            // the fold rejected the park — roll OUR OWN marker back so a
+            // leaked awaiting_ask can't suppress the spawn gate on the card's
+            // NEXT real block (or make the reaper annotate a live task as
+            // waiting on an ask that isn't). Only our own: a concurrent ask
+            // may have re-stamped the key for itself. Rollback is best-effort
+            // and audited — the fold's rejection is the error the caller must
+            // see, so this leg never converts a failed ask into a success
+            // (the failure-handling finding that sank PR #229).
+            try {
+              const cur = this.one(`SELECT meta FROM artefacts WHERE id = ?`, artefactId);
+              const cm = cur ? JSON.parse(cur.meta ?? "{}") : null;
+              if (cm?.awaiting_ask?.ask_id === id) {
+                delete cm.awaiting_ask;
+                this.state.storage.sql.exec(
+                  `UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), artefactId,
+                );
+              }
+            } catch (re) {
+              this.audit(actor, "ask_marker_rollback_failed", artefactId || null, {
+                ask_id: id, error: String((re as Error)?.message ?? re).slice(0, 300),
+              });
+            }
+            throw e;
+          }
           taskStatus = "blocked";
         }
       }
