@@ -54,7 +54,9 @@ export function buildClaimLocallyPrompt({ task, ask }: ClaimLocallyInput): strin
   return lines.join("\n");
 }
 
-async function copyText(text: string): Promise<boolean> {
+/** Clipboard write with a legacy fallback — shared with CopyContextBtn
+ *  (BR#4015); export, don't duplicate. */
+export async function copyText(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
   } catch { /* fall through to legacy path */ }
