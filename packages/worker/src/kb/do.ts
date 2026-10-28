@@ -40,6 +40,8 @@ import {
   checkLimits,
   ftsQuery,
   formatId,
+  FEEDBACK_TITLE_PREFIX,
+  tallyConsensus,
   generateAuthToken,
   hashAuthToken,
   idSeq,
@@ -1866,7 +1868,45 @@ export class KnowledgeHub {
     // (BR#3516 §1: the hub holds no VCS credentials — enrichment is an
     // executor/agent concern, worker-local creds defended by doctor).
     if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
-    return { id, type, status };
+    // consensus round: a proposed decision invites agent feedback. A question-kind
+    // round task is auto-spawned child_of the decision — the same pattern as the
+    // Verify spawn on in_review (BR#903). The round is a collection surface, not
+    // a gate: acceptance stays human-authoritative (the doTransition gate holds),
+    // and the round never blocks the decision's acceptance. Recursion guard: the
+    // round is a TASK, so its own create() never re-enters this branch; the
+    // meta marker additionally lets internal paths mint decisions without a round.
+    let feedbackRoundId: string | undefined;
+    if (type === "decision" && createMeta.feedback_round !== true) {
+      const round = await this.create(
+        {
+          type: "task",
+          title: `${FEEDBACK_TITLE_PREFIX} ${title}`.slice(0, LIMITS.title),
+          body_md: [
+            `Feedback round for decision ${id} — "${title}".`,
+            "",
+            `Proposed decisions collect agent consensus before the human decides. Read the decision (get_artefact ${id}), then contribute on THIS round via log_progress:`,
+            `- Begin your note with "agree" or "disagree" and give your reasons. Any number of agents contribute additively; one log per position.`,
+            "",
+            `The round informs the human — it does not gate them: acceptance stays human-authoritative. The tally (agree · disagree · contributors) surfaces in orient (decisions_awaiting_consensus) and the For Me view.`,
+          ].join("\n"),
+          tags: ["question"],
+          meta: { kind: "question", feedback_for: id, feedback_round: true },
+          project,
+        },
+        actor,
+      );
+      feedbackRoundId = round.id;
+      // child_of across types is a deliberate raw insert: the PUBLIC relation
+      // grammar keeps child_of task→task (flat task graph), but the consensus
+      // round is system-linked to its decision — the same door the Verify
+      // spawn uses (auto-spawns never round-trip the link endpoint).
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+        round.id, id, ts,
+      );
+      this.audit(actor, "create", round.id, { type: "task", auto: "consensus", parent: id });
+    }
+    return { id, type, status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}) };
   }
 
   /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
@@ -1990,7 +2030,17 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql
       .exec(`SELECT * FROM artefacts ${where} ORDER BY updated_ts DESC LIMIT ?`, ...params, Math.min(Number(body.limit ?? 50), 200))
       .toArray();
-    return { artefacts: rows.map((r) => this.shape(r)) };
+    const artefacts = rows.map((r) => this.shape(r));
+    // consensus enrichment (BR#903): proposed decisions carry their open
+    // feedback round + tally so the human plane (For Me) renders it without
+    // N+1 client fetches. Rows without an open round stay unmarked.
+    for (const a of artefacts) {
+      if (a.type === "decision" && a.status === "proposed") {
+        const c = this.consensusFor(a.id);
+        if (c) a.consensus = c;
+      }
+    }
+    return { artefacts };
   }
 
   /** Hybrid: FTS5 keyword + embedding cosine, merged. Falls back to FTS-only when AI is unavailable. */
@@ -2816,8 +2866,8 @@ export class KnowledgeHub {
           // drowned the pool was 3-6 cards per parent).
           const kids = this.state.storage.sql.exec(
             `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE ? ORDER BY c.updated_ts DESC`,
-            id, `%"${fx.tag}"%`,
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
+            id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
           kids.forEach((v, i) => {
             if (fx.keep_newest && i === 0) return;
@@ -3017,7 +3067,11 @@ export class KnowledgeHub {
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
     const context_pct = pct(body.context_pct);
-    const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
+    // contributions to question tasks (consensus rounds, open questions) land
+    // additively without claiming the card — flagged so the reply carries the
+    // "answered, not claimed" postscript
+    let questionContribution = false;
+    const row = this.one(`SELECT id, type, status, meta, tags, roles FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
     const m = this.settingsMap();
@@ -3043,22 +3097,24 @@ export class KnowledgeHub {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
       // otherwise say WHY instead of silently logging into a card that never moves.
       const tRoles: string[] = parseTags(row.roles);
-      // questions: contributions never claim — the author closes with an ADR
-      if (row.type === "question") {
-        return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: "contribution logged on a question — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task).",
-        };
+      // question-type artefacts and question-kind tasks (consensus rounds,
+      // BR#903): contributions never claim — the author closes with an ADR.
+      // The contribution still PERSISTS below (version row + last_progress): a
+      // question thread that dropped its logs would be a black hole —
+      // consensus rounds live on exactly this channel.
+      if (row.type === "question" || parseTags(row.tags).includes("question") || meta.kind === "question") {
+        questionContribution = true;
+      } else {
+        const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
+        const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
+        if (!q.ok) {
+          return {
+            id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
+            note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
+          };
+        }
+        await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
       }
-      const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
-      const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
-      if (!q.ok) {
-        return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
-        };
-      }
-      await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
     }
     // (A) declared grace: a silence window for a long op, made while still
     // running. Requires a will (what the silence is FOR). Cleared by the next
@@ -3103,6 +3159,9 @@ export class KnowledgeHub {
     return {
       id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct,
       grace_until: graceUntil, instructions,
+      ...(questionContribution
+        ? { note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task)." }
+        : {}),
     };
   }
 
@@ -3252,6 +3311,37 @@ export class KnowledgeHub {
       artefactId, Math.min(limit, 200),
     ).toArray().map((r: any) => ({ ...r, data: JSON.parse(r.data ?? "{}") }));
     return { artefact_id: artefactId, versions: rows };
+  }
+
+  /**
+   * The open feedback round of a decision + its consensus tally (BR#903).
+   * The round is the newest open question-kind child_of the decision; the
+   * tally comes from its progress contributions (log_progress notes).
+   * Returns undefined when the decision has no open round.
+   */
+  private consensusFor(decisionId: string) {
+    const round = this.one(
+      `SELECT c.id AS id, c.title AS title, c.status AS status, c.updated_ts AS updated_ts
+       FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+         AND c.status IN ('todo','in_progress','blocked')
+         AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
+       ORDER BY c.updated_ts DESC LIMIT 1`, decisionId,
+    );
+    if (!round) return undefined;
+    const entries = this.state.storage.sql.exec(
+      `SELECT actor, summary FROM artefact_versions WHERE artefact_id = ? AND action = 'progress' ORDER BY seq ASC`,
+      round.id,
+    ).toArray() as any[];
+    const tally = tallyConsensus(entries.map((e) => ({ actor: e.actor, note: e.summary })));
+    return {
+      round_id: round.id,
+      round_title: round.title,
+      round_status: round.status,
+      round_ts: round.updated_ts,
+      contributions: entries.length,
+      ...tally,
+    };
   }
 
   // ---------- identity, sessions, asks, settings, orient ----------
@@ -3789,6 +3879,36 @@ export class KnowledgeHub {
        ORDER BY created_ts DESC LIMIT 10`,
       label, ...askPlaceholders,
     ).toArray();
+    // decisions_awaiting_consensus (BR#903): proposed decisions with an open
+    // feedback round — the actionable "review requested" signal the pool only
+    // carried passively before. Ranked by recency, shaped like pending_asks:
+    // every agent is invited to read and contribute (agree/disagree + reasons
+    // via log_progress on the round); the human still decides.
+    const decisionsAwaiting = (this.state.storage.sql.exec(
+      `SELECT d.id, d.title, d.owner, d.created_ts, d.updated_ts
+       FROM relations r
+       JOIN artefacts d ON d.id = r.dst_id AND d.type = 'decision' AND d.status = 'proposed'
+       JOIN artefacts c ON c.id = r.src_id AND c.type = 'task' AND c.status IN ('todo','in_progress','blocked')
+       WHERE r.relation = 'child_of'
+         AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
+       GROUP BY d.id ORDER BY d.updated_ts DESC LIMIT 10`,
+    ).toArray() as any[]).map((d) => {
+      const c = this.consensusFor(d.id);
+      return {
+        decision_id: d.id,
+        title: d.title,
+        proposed_by: d.owner || undefined,
+        proposed_ts: d.created_ts,
+        round_id: c?.round_id,
+        round_title: c?.round_title,
+        agree: c?.agree ?? 0,
+        disagree: c?.disagree ?? 0,
+        other: c?.other ?? 0,
+        contributions: c?.contributions ?? 0,
+        contributors: c?.contributors ?? [],
+        how: `read the decision (${d.id}) + its round, contribute via log_progress {id: "${c?.round_id ?? ""}", did: "agree|disagree — reasons"} — informs the human, does not gate them`,
+      };
+    });
     const settings = this.settingsMap();
     const projectName = settings.project_name || "Superpositional";
     // my_tasks for a gateway includes the work of the agents it dispatched
@@ -4017,6 +4137,7 @@ export class KnowledgeHub {
       steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
+      decisions_awaiting_consensus: decisionsAwaiting.length ? decisionsAwaiting : undefined,
       action_required: actionRequired.length || verificationNotices.length
         ? [...actionRequired, ...verificationNotices]
         : undefined,

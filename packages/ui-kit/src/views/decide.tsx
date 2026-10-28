@@ -108,6 +108,69 @@ export function Comment({ v }: { v: HistoryEntry }) {
   );
 }
 
+/** Verdict chip for a consensus contribution — mirrors the server's
+ *  tallyConsensus heuristic (dissent always surfaces). */
+function contributionVerdict(note: string): { label: string; tone: "urgent" | "done" | "scope" } {
+  const negated = /\b(?:not|no|can't|cannot|won't|don't|doesn't|didn't|never)\b[\w\s,'’-]{0,40}?\bagree/i.test(note);
+  if (/\bdisagree/i.test(note) || negated) return { label: "disagree", tone: "urgent" };
+  if (/\b(?:agree|concur|endorse|support)/i.test(note)) return { label: "agree", tone: "done" };
+  return { label: "note", tone: "scope" };
+}
+
+/** Tally line under a decision row: agree · disagree · contributors (BR#903). */
+export function ConsensusLine({ c }: { c: NonNullable<KbArtefact["consensus"]> }) {
+  return (
+    <p className="consensus-line">
+      <Chip tone="scope">CONSENSUS</Chip>
+      <span className="why-line">
+        {c.agree} agree · {c.disagree} disagree
+        {c.other > 0 ? ` · ${c.other} notes` : ""}
+        {" · "}{c.contributors.length} contributor{c.contributors.length === 1 ? "" : "s"}
+      </span>
+    </p>
+  );
+}
+
+/** Contributions on the decision's feedback round — the reasons behind the tally. */
+export function ConsensusSection({ c }: { c: NonNullable<KbArtefact["consensus"]> }) {
+  const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  useEffect(() => {
+    let dead = false;
+    kbApi.history(c.round_id)
+      .then((r) => {
+        if (dead) return;
+        const contribs = (r.versions ?? []).filter((v) => v.action === "progress").reverse();
+        setEntries(contribs as HistoryEntry[]);
+      })
+      .catch(() => { if (!dead) setEntries([]); });
+    return () => { dead = true; };
+  }, [c.round_id, c.round_ts]);
+
+  return (
+    <>
+      <h3 className="forme-sub">Agent consensus · {c.agree} agree · {c.disagree} disagree</h3>
+      <div className="forme-comments">
+        {entries === null && <p className="empty">loading…</p>}
+        {entries !== null && entries.length === 0 && <p className="empty">no agent contributions yet — the round is open</p>}
+        {(entries ?? []).map((v) => {
+          const note = (v.data?.note as string | undefined) ?? v.summary;
+          const verdict = contributionVerdict(note ?? "");
+          return (
+            <div key={v.seq} className="resp">
+              <div className="ask-chips">
+                <Chip tone={verdict.tone}>{verdict.label.toUpperCase()}</Chip>
+                <span className="resp-actor">{v.actor}</span>
+                <span className="why-line">{rel(v.ts)}</span>
+              </div>
+              <div className="resp-body md-body" dangerouslySetInnerHTML={{ __html: md(note ?? "") }} />
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 export function useDecisionAct(
   d: KbArtefact,
   onDone: (id: string) => void,
@@ -269,6 +332,8 @@ export function DecisionPopover({ d, onClose, onChanged, holding = false, onAct,
             </>
           );
         })()}
+
+        {d.consensus && <ConsensusSection c={d.consensus} />}
 
         <h3 className="forme-sub">Comments</h3>
         <div className="forme-comments">
