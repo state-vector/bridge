@@ -271,6 +271,11 @@ export class KnowledgeHub {
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(frame); } catch { this.wsSendFail++; /* hibernated client gone — counted (BR#4212) */ }
     }
+    // BR#4362 follow-up: every mutation drops the HTTP board cache — read-
+    // after-write must reflect the write (a 2s-stale board after a claim is
+    // a correctness bug, not a performance trade; the storm protection is
+    // the invalidation, not the staleness).
+    this.boardCache = null;
     // coalesced state push: ≥1s between builds; the burst's tail mutation is
     // flushed by the alarm tail-flush below (≤60s worst case, events already
     // delivered per-event above)
