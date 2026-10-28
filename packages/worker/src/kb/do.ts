@@ -75,6 +75,7 @@ import {
   type LaneSpec,
   leaseDecide,
   mergeTrainQueue,
+  renewProgressDecide,
   trainLegs,
   trainLegLanded,
   trainLegsRemaining,
@@ -123,6 +124,7 @@ import {
   awaitEventToAtom,
   describeAwaitEvent,
   deployedSatisfied,
+  AWAIT_GRAMMAR_DOC,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -758,10 +760,23 @@ export class KnowledgeHub {
               && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
             const ask = await this.askCreate({
               to: "ray",
-              question: `Blocked card ${r.id} awaits nothing the machine can read — re-scope it, or release it back to the pool?`,
-              reason: "the exit condition is prose the hub cannot parse (BR#3578 migration): parked cards awaiting nothing are impossible now — this one needs a human ruling",
-              options: ["RE-SCOPE — I'll rewrite the exit condition", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-              details: `"${r.title}" is parked ${unparseable ? "on machine-looking text that parsed to no atom" : "text-only"}: "${cond.slice(0, 240)}". Under BR#3578 every blocked card awaits a typed event, an open ask, or a timer — give this one one, or release it.`,
+              // Plain-English rewrite (BR#4023, Ray 2026-10-28): the migration
+              // ask must be answerable without a translator — what the card is,
+              // why it cannot auto-resume, and what each option concretely does.
+              question: `Blocked card ${r.id} ("${String(r.title).slice(0, 80)}") can't auto-resume — its resume condition is prose the hub can't check. Re-scope, release, or drop it?`,
+              reason: "a blocked card only auto-resumes on a checkable condition (a PR merging, an issue closing, another card finishing, a CI run going green, a timer, an answered ask); this card's condition is ordinary prose, so it would sit parked forever without a human decision",
+              options: [
+                "RE-SCOPE — rewrite its resume condition as a checkable event (e.g. \"PR #N merges\")",
+                "RELEASE — send it back to the agent pool unchanged",
+                "SUPERSEDE — drop the card",
+              ],
+              details: `"${r.title}" is parked with this resume condition: "${cond.slice(0, 240)}".
+
+Why this needs a human: the hub re-checks blocked cards every sweep, but only against conditions it can evaluate mechanically — a PR merging, an issue closing, another card finishing, a CI run going green, a deploy landing, a timer elapsing, or a bound ask being answered. This card's condition is ordinary prose, so the hub can never tell when it is satisfied; left alone it sits parked forever.
+
+- RE-SCOPE: rewrite the resume condition as a checkable event. Grammar (closed set): ${AWAIT_GRAMMAR_DOC}
+- RELEASE: send the card back to the pool unchanged — an agent must pick it up and move it manually.
+- SUPERSEDE: drop the card (only if the work is moot, done elsewhere, or duplicated).`,
               artefact_id: r.id,
             }, "hub:proxy-watch").catch(() => null);
             if (ask) {
@@ -4197,10 +4212,25 @@ export class KnowledgeHub {
         // await onto the card once the ask id exists.
         void this.askCreate({
           to: "ray",
-          question: `Rework loop on ${t.id} "${t.title.slice(0, 80)}" — the release→claim→stall cycle is now invalid (it failed ${attempts} times). What do you want to do with it?`,
-          reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) — re-running repeats the claim→stall cycle`,
-          options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue. The last release reason names what keeps rejecting the handoff. Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
+          // Plain-English rewrite (BR#4023): the rework-loop ask states the
+          // fact (stuck, N failed attempts), the consequence (re-release
+          // repeats the cycle), and what each option concretely does.
+          question: `Card ${t.id} is stuck in a rework loop (${attempts} failed attempts) — fix its brief, re-release it, or drop it?`,
+          reason: `${attempts} dispatch attempts ended without completion (last: ${reason.slice(0, 120)}) — each re-release repeats the same claim→stall cycle, so this needs a human decision`,
+          options: [
+            "RE-SCOPE — rewrite the card's brief, then release it normally",
+            "RELEASE — back to the pool as-is",
+            "SUPERSEDE — drop the card",
+          ],
+          details: `"${t.title}" (${t.id}) has failed ${attempts} dispatch attempts. Last release reason: "${reason.slice(0, 200)}".
+
+What this means: agents keep picking the card up and stalling the same way — re-releasing it unchanged just repeats the cycle. Check the attempt history on the card before answering.
+
+- RE-SCOPE: fix the card's brief (title, body, exit condition) so the next attempt can actually succeed, then release it.
+- RELEASE: back to the pool unchanged — reasonable only if the past failures were environmental and are now fixed.
+- SUPERSEDE: drop it — the work is moot, done elsewhere, or not worth the loop.
+
+Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
           artefact_id: t.id,
         }, "system:reaper")
           .then((loopAsk) => {
@@ -4996,6 +5026,13 @@ export class KnowledgeHub {
     else if (currently) {
       const who = lease ? ` by ${lease.holder}` : "";
       reason = `merge-train: leased${who} — awaiting CI on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr})`;
+    } else if (meta.zombie) {
+      // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
+      // free until the next acquire clears the stamp (board visibility).
+      const z = meta.zombie;
+      const mins = Math.max(1, Math.round(Number(z.age_ms ?? 0) / 60_000));
+      const queued = Number(z.queue_len ?? 0);
+      reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
     } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
     else reason = "merge-train: awaiting an available gateway";
     if (meta.blocked?.reason !== reason) {
@@ -5049,7 +5086,31 @@ export class KnowledgeHub {
     const now = Date.now();
     const decided = leaseDecide(meta.lease ?? null, now, holder, action);
     if (decided.ok === false) throw Object.assign(new Error(decided.reason), { lease_conflict: true });
+    // ---- zombie eviction (BR#4129 — the hub half of proof-of-progress,
+    // gateway half rode PR #263): a renewal on a NON-EMPTY queue whose action
+    // note is frozen past TRAIN_PROGRESS_STALE_MS is denied and the lease
+    // expires, so the next gateway's acquire wins within one tick. A missing
+    // proof (legacy `{}` renewals) is UNKNOWN — allowed + loud audit while
+    // the deprecation window runs (BR#4104 retires those senders). ----
+    if (action === "renew") {
+      const queue = this.laneQueue(repo);
+      const progress = renewProgressDecide(body.progress ?? null, holder, queue.length);
+      if (progress.ok === false) {
+        const proofNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
+        meta.lease = null; // expire — takeover within one tick
+        meta.zombie = { holder, at: now, age_ms: progress.stale_ms, queue_len: queue.length, last_progress: proofNote };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
+        const reason = this.laneSyncReason(lane.id, meta, now);
+        this.audit(actor, "train:lease_evicted", lane.id, { lane: laneKey(repo, base), holder, stale_ms: progress.stale_ms, queue_len: queue.length, reason });
+        this.version(lane.id, actor, "train:lease_evicted", `renewal denied — ${progress.reason}`, { lease: null, zombie: meta.zombie, reason });
+        throw Object.assign(new Error(progress.reason), { lease_conflict: true });
+      }
+      if (progress.verdict === "unknown" && queue.length > 0) {
+        this.audit(actor, "train:lease_renew_no_progress_proof", lane.id, { lane: laneKey(repo, base), holder, queue_len: queue.length, note: "legacy renewal carries no progress payload — allowed (deprecation window, BR#4129)" });
+      }
+    }
     meta.lease = decided.lease;
+    if (action === "acquire") meta.zombie = null; // fresh holder — the eviction stamp did its job
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
     if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null)) {
@@ -5541,6 +5602,26 @@ export class KnowledgeHub {
     this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? " (re-queued, stamp refreshed)" : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }
 
+  /** The lane's derived queue — COMPUTED (mergeTrainQueue over blocked,
+   *  merge-train-stamped cards), never stored (BR#3516 §7). Shared by the
+   *  status snapshot and the renew-arm zombie check (BR#4129). */
+  private laneQueue(repo: string) {
+    const cards = this.state.storage.sql.exec(
+      `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+    ).toArray() as any[];
+    return mergeTrainQueue(
+      cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
+    ).filter((c) => {
+      const cm = cards.find((x) => x.id === c.id);
+      // a card rides exactly the lanes that own one of its UNLANDED legs
+      // (BR#3659 — and this replaces the old filter that read
+      // meta.merge_train.repo, a field nothing ever set, so every queued
+      // card matched every lane)
+      return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo);
+    });
+  }
+
   /** train.status — the lane + derived-queue snapshot (GET /train mirrors
    *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. */
   private async trainStatus(body: any): Promise<any> {
@@ -5555,20 +5636,7 @@ export class KnowledgeHub {
       const lane = laneOfMeta(meta);
       if (!lane) continue;
       if (repoFilter && lane.repo !== repoFilter) continue;
-      const cards = this.state.storage.sql.exec(
-        `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
-         AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
-      ).toArray() as any[];
-      const queue = mergeTrainQueue(
-        cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
-      ).filter((c) => {
-        const cm = cards.find((x) => x.id === c.id);
-        // a card rides exactly the lanes that own one of its UNLANDED legs
-        // (BR#3659 — and this replaces the old filter that read
-        // meta.merge_train.repo, a field nothing ever set, so every queued
-        // card matched every lane)
-        return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), lane.repo);
-      });
+      const queue = this.laneQueue(lane.repo);
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,

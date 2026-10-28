@@ -977,9 +977,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .kind-pill.kp-question { color: var(--startup); background: color-mix(in srgb, var(--startup) 14%, transparent); }
 .kind-pill.kp-research { color: var(--text-dim); background: color-mix(in srgb, var(--text) 10%, transparent); }
 
-/* hyperlinked task refs inside titles / snippets */
-.task-ref { color: var(--accent); cursor: pointer; font-weight: 600; }
+/* hyperlinked task refs inside titles / snippets (real <a> since BR#4015 —
+   the class styles both the in-panel nav anchors and bare permalinks) */
+.task-ref { color: var(--accent); cursor: pointer; font-weight: 600; text-decoration: none; }
 .task-ref:hover { text-decoration: underline; }
+
+/* auto-linked external refs: bare URLs, owner/repo#N, PR/issue #N (BR#4015) */
+.ref-link { color: var(--accent); text-decoration: none; word-break: break-all; }
+.ref-link:hover { text-decoration: underline; }
+
+/* detail panel: copy-prompt-context row (BR#4015) */
+.detail-actions { display: flex; gap: 6px; margin: -4px 0 10px; justify-content: flex-end; }
 
 /* dependency graph (TaskDetail) */
 .dep-graph { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px; overflow-x: auto; }

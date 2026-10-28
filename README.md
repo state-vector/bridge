@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
+bridge doctor            # checks config, token, agent CLIs + agent profiles, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -100,7 +100,7 @@ bridge logs --json          # raw JSON for scripts
 
 The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
-Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. When a model is pinned, `bridge doctor` also fetches the hub's `/v1/models` proxy (same Bearer token as its other probes): a pinned id the proxy doesn't serve is a named FAIL (it would fail every dispatch), while a hub that doesn't serve the route yet only warns. The hub serves that route from its model registry — the `MODEL_IDS` var in `packages/worker/wrangler.toml` `[vars]` (comma-separated, e.g. `"sp-gateway/glm-5.3-flash,glm-4.7"`); an empty registry is an honest named FAIL for every pinned model until you set it. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
+Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. Models are the agent CLI's business, not the hub's: the runner injects the pinned id into the agent CLI's own config, and the CLI resolves it against its own provider config — `bridge doctor` reports the pin (and warns when unset) but does not validate it against anything hub-side. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
@@ -389,7 +389,7 @@ are the whole contract, enforced server-side (`askCreate` /
   click is the answer, and it closes the question `done`.
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
-`TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
+the ref scanner in `packages/ui-kit/src/views/refs.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
 open ask with its options as one-click buttons, every ask-band row (verdict, decision,
@@ -425,6 +425,31 @@ shared-checkout discipline (worktree off fresh origin/main, explicit-path stagin
 in_review, verify separation, human legs escalate to you. The button only copies text —
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
+
+**Refs are hyperlinks, not copy-paste bait (BR#4015).** Every rendered surface — titles,
+bodies, blocked reasons, resume conditions, history, comments, decision verdicts —
+auto-links what used to be dead text: `BR#NNN` / `TASK-NNN` become real anchors on the
+permalink path (`/card/BR-4015`; a plain click navigates in place, cmd/ctrl-click or
+middle-click opens the permalink in a new tab, and the href copies as a URL); bare
+`https://…` URLs open in a new tab; `owner/repo#N` links to GitHub; and `PR #N` /
+`issue #N` / `GH#N` / bare `#N` link when the card's own context names a repo
+(`meta.provenance.repo`) — never a guessed repo. Text inside existing links and code
+spans is never re-linked, and running the scanner twice changes nothing. Where a plain
+click lands depends on the surface reading it: in the **webapp** it opens the card's
+detail panel (in-panel navigation inside the panel; the permalink route elsewhere), in
+the **desktop app** it opens the card in its own OS window (the shell registers a card
+opener at boot — detail windows already did this; popover bodies and comments now do
+too), and a permalink opened **from outside** (chat, MCP payload `url`s) opens in the
+browser, straight onto the card after sign-in.
+
+**Copy prompt context (BR#4015).** The task detail panel carries a **Copy prompt
+context** button, for every artefact type: one click puts a paste-ready context block on
+the clipboard — the permalink, type/status/owner/session/project, tags, blocked reason +
+resume conditions, last progress + gauges, PR provenance, description, and recent
+history (dispatch/heartbeat noise filtered) — ending with the honest line: the summary
+may be stale, check the card live (`get_artefact`) before acting. Like Claim locally it
+is a prompt producer only — it mutates nothing — and on clipboard failure the block
+opens in a fallback window instead of being lost.
 
 ## Blocked cards await something typed (BR#3578)
 
@@ -515,7 +540,8 @@ is an opportunistic executor. The identity law is enforced at the write boundary
 execute only under the worker-class credential (detached-cody); a personally-authed
 gateway reconciles and reports read-only, then stands down LOUDLY from write legs and
 releases the lease. Lease renewals carry proof-of-progress (last ledger action + age),
-so a live-but-zombie holder is detectable hub-side (eviction law: follow-up).
+and the hub consumes it (BR#4129): a holder whose action note freezes while cards queue
+is evicted — see the lease law below.
 
 `bridge train` remains the standalone form of the same module (decision BR#3880 —
 install is the unit: no Node, no script file). It runs on any machine that has `gh`
@@ -572,6 +598,17 @@ included) as "unmergeable — CONFLICTING".
   token cannot forge another machine's lease. A lapsed lease is cleared by the hub's
   credential-free train-watch sweep and the next gateway reconciles from live GitHub —
   a crashed executor cannot wedge the lane.
+- **Zombie eviction (BR#4129)**: every renewal carries proof-of-progress — the
+  holder's last ledger action and its age. On a **non-empty queue**, a renewal whose
+  action note is frozen past 10 minutes (`TRAIN_PROGRESS_STALE_MS`) is DENIED and the
+  lease expires immediately, so the next gateway's acquire wins within one tick; the
+  lane card shows `zombie holder evicted — <holder> made no progress for Xm on a
+  non-empty queue` until a fresh holder takes over, and the eviction is audited
+  (`train:lease_evicted`). A live holder never trips this: every legitimate tick on a
+  non-empty queue either acts (a CI-poll note refreshes the action every tick) or
+  releases the lease, and an **empty queue always renews** (idle holding is harmless).
+  Legacy executors that send `{}` renewals carry no proof — treated as UNKNOWN
+  (allowed + a loud audit line) while the deprecation window runs.
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, CI settling on the merge commit before the next head enters.

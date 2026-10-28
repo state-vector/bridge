@@ -642,7 +642,9 @@ pub fn self_provision(
 /// self-heal (hermes-class boxes never could). The hub matches by principal
 /// ONLY (never label — the theft class) and rate-limits per row; the
 /// response's secret becomes our credential and its epoch the vend epoch.
-fn repair_by_principal(
+/// Irrecoverable rows are NAMED: the error text carries "re-pair required"
+/// (principal unknown, revoked, or reset) — the ONLY wipe-legal signal.
+pub fn repair_by_principal(
     client: &reqwest::blocking::Client,
     url: &str,
 ) -> Result<DispatchConfig, String> {
@@ -3853,6 +3855,17 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 // reaching here are orient's — "bridge {status} on /mcp" —
                 // so the prefix match cannot hit task IDs.)
                 if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
+                    // BR#4113: a failed repair is NOT a provably-dead
+                    // credential. Wipe ONLY when the hub NAMES it dead
+                    // ("re-pair required" — principal unknown, revoked, or
+                    // reset). Transient failures (hub 5xx, network blip,
+                    // the per-row repair rate limiter) keep the credential
+                    // in the store and retry next tick — keychain.rs's own
+                    // law ("deleted only when provably dead") held until
+                    // this ladder broke it, wiping headless gateways on any
+                    // blip and forcing a human device-flow re-pair.
+                    let mut repaired = false;
+                    let mut provably_dead = false;
                     {
                         match reqwest::blocking::Client::builder()
                             .timeout(Duration::from_secs(30))
@@ -3866,12 +3879,16 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                                         eprintln!("[dispatch] {msg}");
                                         snap_activity(&snap, "dispatch", &msg);
                                         write_runner_state(&snap);
-                                        continue;
+                                        repaired = true;
                                     }
                                     Err(pe) => {
                                         eprintln!("[dispatch] principal repair failed: {pe}");
                                         snap_activity(&snap, "error", &format!("principal repair failed: {pe}"));
+                                        provably_dead = pe.contains("re-pair required");
                                         // desktop fallback: human-plane self-provision
+                                        // (attempted on every principal-repair failure —
+                                        // a rate-limited principal row can still
+                                        // self-provision through a live web session)
                                         match crate::session::load() {
                                             Some(s) => match self_provision(&client, &cfg.url, &s.value) {
                                                 Ok(fresh) => {
@@ -3880,7 +3897,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                                                     eprintln!("[dispatch] {msg}");
                                                     snap_activity(&snap, "dispatch", &msg);
                                                     write_runner_state(&snap);
-                                                    continue;
+                                                    repaired = true;
                                                 }
                                                 Err(se) => {
                                                     eprintln!("[dispatch] self-provision repair failed: {se}");
@@ -3888,8 +3905,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                                                 }
                                             },
                                             None => {
-                                                eprintln!("[dispatch] no web session on this device — human-plane repair unavailable (headless)");
-                                                snap_activity(&snap, "error", "no web session — human-plane repair unavailable (headless)");
+                                                if !provably_dead {
+                                                    eprintln!("[dispatch] no web session on this device — human-plane repair unavailable (headless); keeping the credential, retrying principal repair next tick");
+                                                    snap_activity(&snap, "error", "principal repair failed (transient) — no web session (headless); credential kept, retrying next tick");
+                                                }
                                             }
                                         }
                                     }
@@ -3901,17 +3920,28 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                             }
                         }
                     }
-                    // BR#2532: same guided-surface treatment as the identity
-                    // gate — the reason rides the snapshot, not just the log.
-                    let msg = "signed out automatically — the hub rejected this device's token (revoked, expired, or rotated away) and the one-time repair failed. Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
-                    eprintln!("[dispatch] {msg} (hub said: {e})");
-                    snap_logout(&snap, msg);
-                    logout_core(&stop, &running, &snap, true);
-                    if let Ok(mut g) = last_error.lock() {
-                        *g = Some(msg.to_string());
+                    if repaired {
+                        continue;
                     }
-                    did_logout = true;
-                    break;
+                    if !provably_dead {
+                        // transient: keep the credential, keep looping — the
+                        // generic ERROR log below names it and the loop sleeps
+                        if let Ok(mut g) = last_error.lock() {
+                            *g = Some(format!("token refresh failed (transient, credential kept): {e}"));
+                        }
+                    } else {
+                        // BR#2532: same guided-surface treatment as the identity
+                        // gate — the reason rides the snapshot, not just the log.
+                        let msg = "signed out automatically — the hub named this device's credential dead (revoked, expired, or rotated away). Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
+                        eprintln!("[dispatch] {msg} (hub said: {e})");
+                        snap_logout(&snap, msg);
+                        logout_core(&stop, &running, &snap, true);
+                        if let Ok(mut g) = last_error.lock() {
+                            *g = Some(msg.to_string());
+                        }
+                        did_logout = true;
+                        break;
+                    }
                 }
                 eprintln!("[dispatch] ERROR: {e}");
                 snap_activity(&snap, "error", &e);
