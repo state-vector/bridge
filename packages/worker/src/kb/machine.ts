@@ -13,7 +13,7 @@
 // Applied(effects) | Rejection{code, rule, message}. Effects (spawn, escalate,
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
-import { parseTags, validateTransition } from "./core";
+import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -416,6 +416,44 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // ---- the law: edge shape first, then the table, first fail wins ----
   const base = validateTransition(i.type as any, i.status, i.to);
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
+  // system sweeps) must never destroy merge-train state or a typed wait. A
+  // card the train owns (meta.merge_train queued/awaiting-ci/bounced with a
+  // live PR leg) is parked on the typed pr_merged proxy; a card with a typed
+  // await_event or a bound ask parks on that wait — the proxy watch / the
+  // answer owns the exit, not the staleness sweep. Humans and owners still
+  // release freely (rule-9 / web). The sweeps hold BEFORE attempting a todo
+  // release (they park blocked); this backstop catches any machine-actor
+  // path that slips past them. A human_verdict body flag (the answered-ask
+  // dispatch — the human's typed/clicked RELEASE riding a system actor as
+  // its pen) is exempt: the human decided, the machine only typed.
+  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? "")) && !i.body?.human_verdict) {
+    const m = metaOf(i.meta);
+    const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
+    const st = String(mtq.state ?? "");
+    const pr = trainPrLeg(m);
+    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr) {
+      const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-train-queue",
+        message: `card is merge-train ${st} (typed await pr_merged ${repo}#${pr}) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool.`,
+      };
+    }
+    const hold = releaseHold(m);
+    if (hold) {
+      const aw = m.blocked?.await_event
+        ? `typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")})`
+        : `bound ask (${String(m.awaiting_ask?.ask_id ?? "")})`;
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-typed-await",
+        message: `card parks on a ${aw} — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release.`,
+      };
+    }
+  }
   for (const r of RULES) {
     if (!r.when(i)) continue;
     const err = await r.guard(i, c);
@@ -554,14 +592,27 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // declarations are silence-on-a-working-task, not a block; unblock duties
   // don't spawn their own kind. Merge-train parks (BR#3516 §2) are
   // machine-managed: the train itself is the unblock path, and a spawned
-  // child would race the executor's CAS lease — suppressed via merge_train.
+  // child would race the executor's CAS lease. The train's OWN transitions
+  // mark the park with body.merge_train; agent re-parks follow the
+  // verify-duty contract instead, which marks it in the NOTE ("merge-train:
+  // queued — …" — the canonical prefix the verify template in do.ts
+  // instructs). Missing the agent flavor made every re-queue spawn an
+  // unblock child that the next bounce superseded (keep_newest: false) and
+  // the re-park after it flood-guarded on the stale stamp — spawn →
+  // supersede → flood-skip → threshold-1 breach card, one loop per train
+  // bounce (specimen BR#3990 rounds 4→6, breach BR#4135). Scope: the SPAWN
+  // gate only — the typed-await exemption (blocked-needs-typed-await) stays
+  // keyed on body.merge_train so prose cannot dodge the grammar by
+  // prefixing a note (BR#3578 fail-closed).
+  const mergeTrainPark =
+    Boolean(i.body?.merge_train) || /^merge-train:/i.test(String(i.body?.note ?? "").trimStart());
   if (
     i.to === "blocked" &&
     r !== "unblock" &&
     !meta.awaiting_ask &&
     !i.body?.awaiting_ask_id &&
     i.body?.class !== "subprocess" &&
-    !i.body?.merge_train
+    !mergeTrainPark
   ) {
     const open = await c.openUnblockChild();
     if (open) {

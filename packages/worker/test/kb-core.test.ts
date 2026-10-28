@@ -438,3 +438,56 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
     expect(out).toEqual({ type: "task", tags: ["gtm", "deploy-train"], roles: [], meta: { a: 1 }, changed: false });
   });
 });
+
+import { releaseHold, trainPrLeg, trainProxyEvent, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
+
+// BR#4067 — the typed-proxy hold predicate: every watchdog release path
+// consults this one function. The PR #257/BR#4015 class: a card carrying a
+// live machine wait (train queue slot, typed await, bound ask) was released
+// to todo and the wait state was destroyed.
+describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
+  it("train queued/awaiting-ci/bounced on a live PR leg hold", () => {
+    for (const state of ["queued", "awaiting-ci", "bounced"]) {
+      const meta = { merge_train: { state, pr: 259, repo: "state-vector/bridge" } };
+      expect(releaseHold(meta)).toMatch(new RegExp(`merge-train ${state} on PR state-vector/bridge#259`));
+    }
+  });
+
+  it("train state WITHOUT a resolvable PR leg does not hold (nothing to preserve)", () => {
+    expect(releaseHold({ merge_train: { state: "bounced" } })).toBeNull();
+    expect(releaseHold({ merge_train: { state: "queued", pr: 0 } })).toBeNull();
+  });
+
+  it("the PR leg resolves from every stamp shape (pr.number, prs[0], merge_train.pr)", () => {
+    expect(trainPrLeg({ pr: { number: 7 } })).toBe(7);
+    expect(trainPrLeg({ prs: [{ number: 9 }] })).toBe(9);
+    expect(trainPrLeg({ merge_train: { pr: 11 } })).toBe(11);
+    expect(trainPrLeg({})).toBe(0);
+  });
+
+  it("trainProxyEvent derives the pr_merged typed await from the live leg", () => {
+    expect(trainProxyEvent({ pr: { repo: "o/r", number: 5 } })).toEqual({ event: "pr_merged", repo: "o/r", n: 5 });
+    expect(trainProxyEvent({ merge_train: { pr: 5 } })).toBeNull(); // no repo → not derivable
+    expect(trainProxyEvent({ pr: { repo: "bad repo", number: 5 } })).toBeNull();
+  });
+
+  it("a typed await_event holds, naming its kind", () => {
+    expect(releaseHold({ blocked: { reason: "x", await_event: { event: "pr_checks_green", repo: "o/r", n: 1 } } })).toMatch(/typed await_event \(pr_checks_green\)/);
+  });
+
+  it("a bound ask holds, naming the ask", () => {
+    expect(releaseHold({ awaiting_ask: { ask_id: "ASK-9" } })).toMatch(/bound ask \(ASK-9\)/);
+  });
+
+  it("cards with no machine wait release freely", () => {
+    expect(releaseHold(null)).toBeNull();
+    expect(releaseHold({})).toBeNull();
+    expect(releaseHold({ blocked: { reason: "merge-train: queued" } })).toBeNull(); // prose reason alone is not state
+    expect(releaseHold({ merge_train: { state: "landed" }, pr: { number: 1 } })).toBeNull(); // landed is the machine's own close path
+    expect(releaseHold({ merge_train: { state: "unbound" }, pr: { number: 1 } })).toBeNull();
+  });
+
+  it("the hold result-class is the abandonment-scoring exemption stamp", () => {
+    expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+  });
+});

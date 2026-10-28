@@ -27,6 +27,7 @@ export {
   normTs, rel, clock, rankDecisions, actorEvents, latestTaskId,
   boardsOf, myAnswers, presenceLabel, kindOf, TASK_REF_RE,
 } from "./server/views";
+export { setCardLinkOpener, getCardLinkOpener } from "./views/refs";
 export { DashboardSummary } from "./views/Dashboard";
 export {
   TaskDetail, TaskStateCard, SentimentBar, RefText,

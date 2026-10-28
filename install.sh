@@ -108,7 +108,8 @@ cat <<EOF
        $INSTALL_DIR/$BIN pair https://hub.fleetbridge.run
 
   3. Set a model per agent in ~/.bridge/config.json ("models") — the runner
-     refuses to dispatch without one. `bridge doctor` tells you if it's right.
+     refuses to dispatch without one. Models resolve via the agent CLI's own
+     provider config; `bridge doctor` warns when a pin is missing.
 
   4. Run forever (linux):
        $INSTALL_DIR/$BIN service install
