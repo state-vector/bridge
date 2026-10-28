@@ -4,9 +4,11 @@ import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
 import { md, AskOptions, askKernel } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
-import { kindOf, rel, TASK_REF_RE } from "../server/views";
+import { kindOf, rel } from "../server/views";
+import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
 import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
+import { CopyContextBtn } from "./copyContext";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -83,15 +85,53 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
 }
 
 
-/** Show the kernel of a long text; full text behind a "more" toggle. */
-export function LongText({ text, limit }: { text: string | undefined; limit: number }) {
+/** Delegated click on a linkified container: card refs (a[data-task-ref]) on
+ *  a plain left click resolve local handler → shell opener (desktop: open an
+ *  OS window) → browser default (follow the permalink href). Modified clicks
+ *  (cmd/ctrl/shift/alt/middle) always fall through, so the browser does what
+ *  the href promises — new tab, copy link address (BR#4015). */
+function refClickNav(onOpen?: (id: string) => void) {
+  return (e: React.MouseEvent<HTMLElement>) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    const a = (e.target as HTMLElement | null)?.closest?.("a[data-task-ref]");
+    if (!a) return;
+    const id = a.getAttribute("data-task-ref");
+    if (!id) return;
+    const open = onOpen ?? getCardLinkOpener();
+    if (!open) return;
+    e.preventDefault();
+    e.stopPropagation();
+    open(id);
+  };
+}
+
+/** Linkified plain text (BR#4015): card refs as real anchors, URLs and
+ *  github refs auto-linked. No markdown — titles, facts. */
+export function RefText({ text, onOpen }: { text: string; onOpen?: (id: string) => void }) {
+  return (
+    <span
+      onClick={refClickNav(onOpen)}
+      dangerouslySetInnerHTML={{ __html: linkifyHtml(escHtml(text)) }}
+    />
+  );
+}
+
+/** Show the kernel of a long text; full text behind a "more" toggle. Both
+ *  halves render linkified — blocked reasons are the ref-dense text there is. */
+export function LongText({ text, limit, onOpen }: { text: string | undefined; limit: number; onOpen?: (id: string) => void }) {
   const t = (text ?? "").trim();
   if (!t) return null;
-  if (t.length <= limit) return <span>{t}</span>;
+  const linked = (s: string) => (
+    <span
+      onClick={refClickNav(onOpen)}
+      dangerouslySetInnerHTML={{ __html: linkifyHtml(escHtml(s)) }}
+    />
+  );
+  if (t.length <= limit) return linked(t);
   return (
     <details className="longtext">
       <summary>{t.slice(0, limit).trimEnd()}… <span className="lt-toggle">more</span></summary>
-      <span className="lt-full">{t}</span>
+      <span className="lt-full">{linked(t)}</span>
     </details>
   );
 }
@@ -113,21 +153,17 @@ function trunc(s: string | undefined, n: number): string {
 }
 
 
-/** Markdown rendered for reading, with task refs (BR#12, TASK-007) as links. */
-export function MdRef({ text, onOpen }: { text: string | undefined; onOpen?: (id: string) => void }) {
-  const html = md(text ?? "");
+/** Markdown rendered for reading, linkified (BR#4015): card refs navigate
+ *  in-panel (delegated click), URLs + github refs open in a new tab.
+ *  `repo` resolves PR/issue-number refs (card meta.provenance.repo). */
+export function MdRef({ text, onOpen, repo }: { text: string | undefined; onOpen?: (id: string) => void; repo?: string }) {
+  const html = linkifyHtml(md(text ?? ""), { repo });
   if (!html.trim()) return null;
-  const parts = html.split(TASK_REF_RE);
   return (
-    <>
-      {parts.map((p, i) =>
-        /^(BR#\d+|TASK-\d+)$/.test(p) ? (
-          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen?.(p); }}>{p}</span>
-        ) : (
-          <span key={i} dangerouslySetInnerHTML={{ __html: p }} />
-        ),
-      )}
-    </>
+    <span
+      onClick={refClickNav(onOpen)}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
   );
 }
 
@@ -162,7 +198,7 @@ interface TaskMeta {
 /** Full state of the item: identity, gauges, structured meta, facts. Read-only —
  *  the forms (progress / status) live further down; this is the display half.
  *  Shared with KnowledgeView (any artefact type gets the same treatment). */
-export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string }; onChanged?: () => void }) {
+export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: TaskMeta; status_ts?: number; project?: string; created_by?: string }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const m = (task.meta ?? {}) as TaskMeta;
   const lp = m.last_progress;
   const [ask, setAsk] = useState<KbAsk | null>(null);
@@ -256,13 +292,13 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
       )}
       {m.blocked && (
         <div className="task-blocked-info">
-          <div className="progress-note"><b>why blocked:</b> <LongText text={m.blocked.reason} limit={220} /></div>
+          <div className="progress-note"><b>why blocked:</b> <LongText text={m.blocked.reason} limit={220} onOpen={onOpen} /></div>
           {(splitConditions(m.blocked.unblock_condition).length > 0) && (
             <div className="progress-note">
               <b>resumes when:</b>
               <ol className="cond-list">
                 {splitConditions(m.blocked.unblock_condition).map((c, i) => (
-                  <li key={i}><LongText text={c} limit={160} /></li>
+                  <li key={i}><LongText text={c} limit={160} onOpen={onOpen} /></li>
                 ))}
               </ol>
             </div>
@@ -342,7 +378,7 @@ export function TaskStateCard({ task, onChanged }: { task: KbArtefact & { meta?:
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
-function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void }) {
+function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const ask = task.meta?.ask ?? {};
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -374,7 +410,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
       {ask.reason && (
         <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
       )}
-      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={() => onChanged?.()} /></div>
+      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={onOpen} repo={task.meta?.provenance?.repo} /></div>
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}
@@ -535,6 +571,12 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
             : <RefText text={task?.title ?? taskId} onOpen={nav} />}
         </h2>
 
+        {task && (
+          <div className="detail-actions">
+            <CopyContextBtn task={task as any} versions={versions} />
+          </div>
+        )}
+
         {taskErr && (
           <div className="detail-block">
             <span className="k-err">load task failed: {taskErr}</span>{" "}
@@ -549,10 +591,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           </div>
         )}
 
-        {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} />}
+        {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />}
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
-          <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
+          <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />
         )}
 
         {task?.meta?.last_progress?.note && (
@@ -581,7 +623,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
                 </Btn>
               </>
             ) : (
-              <div className="md-body know-body"><MdRef text={body || "—"} onOpen={nav} /></div>
+              <div className="md-body know-body"><MdRef text={body || "—"} onOpen={nav} repo={(task?.meta as any)?.provenance?.repo} /></div>
             )}
           </div>
         )}
@@ -602,7 +644,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
                   <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={HISTORY_LABEL[v.action] ?? v.action}>
                     {HISTORY_LABEL[v.action] ?? v.action}
                   </Chip>
-                  <span className="progress-note md-body"><MdRef text={v.summary} onOpen={nav} /></span>
+                  <span className="progress-note md-body"><MdRef text={v.summary} onOpen={nav} repo={(task?.meta as any)?.provenance?.repo} /></span>
                   <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
                 </div>
               ))}
@@ -638,22 +680,6 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
           {msg && <span className="ok" style={{ marginLeft: 8 }}>{msg}</span>}
         </div>
       </aside>
-    </>
-  );
-}
-
-/** Render text with task references (BR#12, TASK-007) as clickable links. */
-export function RefText({ text, onOpen }: { text: string; onOpen: (id: string) => void }) {
-  const parts = text.split(TASK_REF_RE);
-  return (
-    <>
-      {parts.map((p, i) =>
-        /^(BR#\d+|TASK-\d+)$/.test(p) ? (
-          <span key={i} className="task-ref" title={`open ${p}`} onClick={(e) => { e.stopPropagation(); onOpen(p); }}>{p}</span>
-        ) : (
-          <span key={i}>{p}</span>
-        ),
-      )}
     </>
   );
 }

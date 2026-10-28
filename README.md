@@ -374,7 +374,7 @@ are the whole contract, enforced server-side (`askCreate` /
   click is the answer, and it closes the question `done`.
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
-`TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
+the ref scanner in `packages/ui-kit/src/views/refs.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
 open ask with its options as one-click buttons, every ask-band row (verdict, decision,
@@ -410,6 +410,31 @@ shared-checkout discipline (worktree off fresh origin/main, explicit-path stagin
 in_review, verify separation, human legs escalate to you. The button only copies text —
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
+
+**Refs are hyperlinks, not copy-paste bait (BR#4015).** Every rendered surface — titles,
+bodies, blocked reasons, resume conditions, history, comments, decision verdicts —
+auto-links what used to be dead text: `BR#NNN` / `TASK-NNN` become real anchors on the
+permalink path (`/card/BR-4015`; a plain click navigates in place, cmd/ctrl-click or
+middle-click opens the permalink in a new tab, and the href copies as a URL); bare
+`https://…` URLs open in a new tab; `owner/repo#N` links to GitHub; and `PR #N` /
+`issue #N` / `GH#N` / bare `#N` link when the card's own context names a repo
+(`meta.provenance.repo`) — never a guessed repo. Text inside existing links and code
+spans is never re-linked, and running the scanner twice changes nothing. Where a plain
+click lands depends on the surface reading it: in the **webapp** it opens the card's
+detail panel (in-panel navigation inside the panel; the permalink route elsewhere), in
+the **desktop app** it opens the card in its own OS window (the shell registers a card
+opener at boot — detail windows already did this; popover bodies and comments now do
+too), and a permalink opened **from outside** (chat, MCP payload `url`s) opens in the
+browser, straight onto the card after sign-in.
+
+**Copy prompt context (BR#4015).** The task detail panel carries a **Copy prompt
+context** button, for every artefact type: one click puts a paste-ready context block on
+the clipboard — the permalink, type/status/owner/session/project, tags, blocked reason +
+resume conditions, last progress + gauges, PR provenance, description, and recent
+history (dispatch/heartbeat noise filtered) — ending with the honest line: the summary
+may be stale, check the card live (`get_artefact`) before acting. Like Claim locally it
+is a prompt producer only — it mutates nothing — and on clipboard failure the block
+opens in a fallback window instead of being lost.
 
 ## Blocked cards await something typed (BR#3578)
 
