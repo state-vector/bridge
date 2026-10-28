@@ -40,6 +40,8 @@ import {
   checkLimits,
   ftsQuery,
   formatId,
+  FEEDBACK_TITLE_PREFIX,
+  tallyConsensus,
   generateAuthToken,
   hashAuthToken,
   idSeq,
@@ -87,8 +89,12 @@ import {
   classifyRequiredRuns,
   decideTrainGate,
   trainBounceBrief,
+  classifyBounce,
   trainStopAskTitle,
   trainLandedCloseNote,
+  releaseHold,
+  trainProxyEvent,
+  PROXY_WAIT_HOLD_RESULT_CLASS,
   type TrainLease,
   type LeaseAction,
   type MainCheckRun,
@@ -120,6 +126,7 @@ import {
   awaitEventToAtom,
   describeAwaitEvent,
   deployedSatisfied,
+  AWAIT_GRAMMAR_DOC,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -305,12 +312,24 @@ export class KnowledgeHub {
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
         meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
+        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
       );
       if (now - lastTs <= staleMs) continue;
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
       );
       if (openAsk) continue;
+      // BR#4067 — typed-proxy preservation: silence must not destroy a machine
+      // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
+      // or one parked on a typed await / bound ask is PARKED blocked — the
+      // reason names the silence, the wait meta survives, the proxy owns the
+      // exit (the PR #257 class: releases severed queue slots and stranded
+      // the cards). result_class exempts the hold from abandonment scoring.
+      const hold = releaseHold(meta);
+      if (hold) {
+        await this.transition(this.holdParkBody(r.id, meta, hold, `no update for >${staleMin}m`), "system:watchdog");
+        continue;
+      }
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
       // BR#3352: classify the release from the session trail. A silent task
@@ -380,6 +399,14 @@ export class KnowledgeHub {
          );
         if (activeVerify) continue; // a verifier is on it — give them time
         const hours = Math.round(age / 3_600_000);
+        // BR#4067 — the same typed-proxy law for the review-stall bounce: a
+        // card the train owns or that parks on a typed wait is HELD, never
+        // released — the bounce destroys the queue slot it sits in.
+        const hold = releaseHold(meta);
+        if (hold) {
+          await this.transition(this.holdParkBody(r.id, meta, hold, `review stalled ${hours}h`), "system:watchdog");
+          continue;
+        }
         const findings = `watchdog: review stalled ${hours}h — no verifier picked up the verification round. No adverse findings; resolve whatever the last gate/review named and hand off again, or let the work re-enter the pool.`;
         await this.transition({ id: r.id, to: "in_progress", note: findings }, "system:watchdog");
         await this.transition({ id: r.id, to: "todo", note: "released to the pool after a stalled review round (watchdog)" }, "system:watchdog");
@@ -402,6 +429,23 @@ export class KnowledgeHub {
       const b = meta.blocked;
       if (b?.class !== "subprocess" || typeof b.deadline_ts !== "number") continue;
       if (b.deadline_ts > now) continue;
+      // BR#4067 — the lapsed window releases the SUBPROCESS declaration, not
+      // a machine wait: a card that (also) carries train/typed-wait state
+      // stays parked, the wait meta untouched.
+      const hold = releaseHold(meta);
+      if (hold) {
+        meta.blocked = {
+          ...(meta.blocked ?? {}),
+          reason: `declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed, but the card carries ${hold} — release held (BR#4067)`,
+        };
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(meta), now, now, r.id,
+        );
+        this.audit("system:watchdog", "release_held", r.id, { hold, from: "blocked", window: b.budget_minutes ?? null });
+        this.version(r.id, "system:watchdog", "note", `subprocess window lapsed but release HELD — ${hold} (BR#4067)`, { hold });
+        continue;
+      }
       const wasDoing = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       // legacy lapsed window: stalled, not blocked — straight to todo
       delete meta.blocked;
@@ -740,10 +784,23 @@ export class KnowledgeHub {
               && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
             const ask = await this.askCreate({
               to: "ray",
-              question: `Blocked card ${r.id} awaits nothing the machine can read — re-scope it, or release it back to the pool?`,
-              reason: "the exit condition is prose the hub cannot parse (BR#3578 migration): parked cards awaiting nothing are impossible now — this one needs a human ruling",
-              options: ["RE-SCOPE — I'll rewrite the exit condition", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-              details: `"${r.title}" is parked ${unparseable ? "on machine-looking text that parsed to no atom" : "text-only"}: "${cond.slice(0, 240)}". Under BR#3578 every blocked card awaits a typed event, an open ask, or a timer — give this one one, or release it.`,
+              // Plain-English rewrite (BR#4023, Ray 2026-10-28): the migration
+              // ask must be answerable without a translator — what the card is,
+              // why it cannot auto-resume, and what each option concretely does.
+              question: `Blocked card ${r.id} ("${String(r.title).slice(0, 80)}") can't auto-resume — its resume condition is prose the hub can't check. Re-scope, release, or drop it?`,
+              reason: "a blocked card only auto-resumes on a checkable condition (a PR merging, an issue closing, another card finishing, a CI run going green, a timer, an answered ask); this card's condition is ordinary prose, so it would sit parked forever without a human decision",
+              options: [
+                "RE-SCOPE — rewrite its resume condition as a checkable event (e.g. \"PR #N merges\")",
+                "RELEASE — send it back to the agent pool unchanged",
+                "SUPERSEDE — drop the card",
+              ],
+              details: `"${r.title}" is parked with this resume condition: "${cond.slice(0, 240)}".
+
+Why this needs a human: the hub re-checks blocked cards every sweep, but only against conditions it can evaluate mechanically — a PR merging, an issue closing, another card finishing, a CI run going green, a deploy landing, a timer elapsing, or a bound ask being answered. This card's condition is ordinary prose, so the hub can never tell when it is satisfied; left alone it sits parked forever.
+
+- RE-SCOPE: rewrite the resume condition as a checkable event. Grammar (closed set): ${AWAIT_GRAMMAR_DOC}
+- RELEASE: send the card back to the pool unchanged — an agent must pick it up and move it manually.
+- SUPERSEDE: drop the card (only if the work is moot, done elsewhere, or duplicated).`,
               artefact_id: r.id,
             }, "hub:proxy-watch").catch(() => null);
             if (ask) {
@@ -1080,6 +1137,11 @@ export class KnowledgeHub {
       let d: any = {};
       try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
       if (d?.result_class === "completed_result_lost") s.result_lost++;
+      else if (d?.result_class === PROXY_WAIT_HOLD_RESULT_CLASS) {
+        // BR#4067: a hold-park preserves a machine wait (train queue slot /
+        // typed await / bound ask) — it is neither an abandonment nor a lost
+        // run, so no counter moves.
+      }
       else s.abandoned++;
     }
     for (const r of this.state.storage.sql.exec(
@@ -1936,7 +1998,45 @@ export class KnowledgeHub {
     // (BR#3516 §1: the hub holds no VCS credentials — enrichment is an
     // executor/agent concern, worker-local creds defended by doctor).
     if (type === "progress") await this.progressHeartbeat(body.meta, title, actor);
-    return { id, type, status };
+    // consensus round: a proposed decision invites agent feedback. A question-kind
+    // round task is auto-spawned child_of the decision — the same pattern as the
+    // Verify spawn on in_review (BR#903). The round is a collection surface, not
+    // a gate: acceptance stays human-authoritative (the doTransition gate holds),
+    // and the round never blocks the decision's acceptance. Recursion guard: the
+    // round is a TASK, so its own create() never re-enters this branch; the
+    // meta marker additionally lets internal paths mint decisions without a round.
+    let feedbackRoundId: string | undefined;
+    if (type === "decision" && createMeta.feedback_round !== true) {
+      const round = await this.create(
+        {
+          type: "task",
+          title: `${FEEDBACK_TITLE_PREFIX} ${title}`.slice(0, LIMITS.title),
+          body_md: [
+            `Feedback round for decision ${id} — "${title}".`,
+            "",
+            `Proposed decisions collect agent consensus before the human decides. Read the decision (get_artefact ${id}), then contribute on THIS round via log_progress:`,
+            `- Begin your note with "agree" or "disagree" and give your reasons. Any number of agents contribute additively; one log per position.`,
+            "",
+            `The round informs the human — it does not gate them: acceptance stays human-authoritative. The tally (agree · disagree · contributors) surfaces in orient (decisions_awaiting_consensus) and the For Me view.`,
+          ].join("\n"),
+          tags: ["question"],
+          meta: { kind: "question", feedback_for: id, feedback_round: true },
+          project,
+        },
+        actor,
+      );
+      feedbackRoundId = round.id;
+      // child_of across types is a deliberate raw insert: the PUBLIC relation
+      // grammar keeps child_of task→task (flat task graph), but the consensus
+      // round is system-linked to its decision — the same door the Verify
+      // spawn uses (auto-spawns never round-trip the link endpoint).
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+        round.id, id, ts,
+      );
+      this.audit(actor, "create", round.id, { type: "task", auto: "consensus", parent: id });
+    }
+    return { id, type, status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}) };
   }
 
   /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
@@ -2060,7 +2160,17 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql
       .exec(`SELECT * FROM artefacts ${where} ORDER BY updated_ts DESC LIMIT ?`, ...params, Math.min(Number(body.limit ?? 50), 200))
       .toArray();
-    return { artefacts: rows.map((r) => this.shape(r)) };
+    const artefacts = rows.map((r) => this.shape(r));
+    // consensus enrichment (BR#903): proposed decisions carry their open
+    // feedback round + tally so the human plane (For Me) renders it without
+    // N+1 client fetches. Rows without an open round stay unmarked.
+    for (const a of artefacts) {
+      if (a.type === "decision" && a.status === "proposed") {
+        const c = this.consensusFor(a.id);
+        if (c) a.consensus = c;
+      }
+    }
+    return { artefacts };
   }
 
   /** Hybrid: FTS5 keyword + embedding cosine, merged. Falls back to FTS-only when AI is unavailable. */
@@ -2721,8 +2831,24 @@ export class KnowledgeHub {
           const pm = JSON.parse(parent.meta ?? "{}");
           const parkReason = [String(pm.blocked?.reason ?? ""), String(pm.blocked_reason ?? "")].find((r) => r) ?? "";
           if (parent.status === "in_progress") {
-            this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is in_progress — a bounced card is not re-queued by a verify close; the bounce stands until a fresh verify accepts the new head (BR#3659 defect 2)" });
-            this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on a bounced (in_progress) card did not re-queue it — the bounce stands", {});
+            // BR#4067 self-heal: an in_progress parent stands UNLESS the train
+            // itself bounced it non-conflict (a coverage/gate-kind bounce left
+            // nothing for impl to repair — this fresh verify accept IS the
+            // re-acceptance; re-queue instead of stranding the card: the PR
+            // #257 class). A CONFLICT bounce is real impl repair (BR#3659
+            // defect 2), and a card never bounced by the train is a live
+            // claim the hub must not hijack — both stand.
+            const bt = (pm.merge_train ?? {}) as Record<string, unknown>;
+            const trainBounced = bt.state === "bounced";
+            const realConflict = bt.bounce_kind === "conflict"
+              || (Array.isArray(bt.conflict_files) && (bt.conflict_files as string[]).length > 0);
+            if (!trainBounced || realConflict) {
+              this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
+              this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
+            } else {
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+              this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
+            }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
@@ -2886,8 +3012,8 @@ export class KnowledgeHub {
           // drowned the pool was 3-6 cards per parent).
           const kids = this.state.storage.sql.exec(
             `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE ? ORDER BY c.updated_ts DESC`,
-            id, `%"${fx.tag}"%`,
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
+            id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
           kids.forEach((v, i) => {
             if (fx.keep_newest && i === 0) return;
@@ -3116,7 +3242,11 @@ export class KnowledgeHub {
     const confidence_pct = pct(body.confidence_pct);
     const risk_pct = pct(body.risk_pct);
     const context_pct = pct(body.context_pct);
-    const row = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, id);
+    // contributions to question tasks (consensus rounds, open questions) land
+    // additively without claiming the card — flagged so the reply carries the
+    // "answered, not claimed" postscript
+    let questionContribution = false;
+    const row = this.one(`SELECT id, type, status, meta, tags, roles FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const meta = JSON.parse(row.meta ?? "{}");
     const m = this.settingsMap();
@@ -3142,22 +3272,24 @@ export class KnowledgeHub {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
       // otherwise say WHY instead of silently logging into a card that never moves.
       const tRoles: string[] = parseTags(row.roles);
-      // questions: contributions never claim — the author closes with an ADR
-      if (row.type === "question") {
-        return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: "contribution logged on a question — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from this task).",
-        };
+      // question-type artefacts and question-kind tasks (consensus rounds,
+      // BR#903): contributions never claim — the author closes with an ADR.
+      // The contribution still PERSISTS below (version row + last_progress): a
+      // question thread that dropped its logs would be a black hole —
+      // consensus rounds live on exactly this channel.
+      if (row.type === "question" || parseTags(row.tags).includes("question") || meta.kind === "question") {
+        questionContribution = true;
+      } else {
+        const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
+        const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
+        if (!q.ok) {
+          return {
+            id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
+            note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
+          };
+        }
+        await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
       }
-      const isQualifier = tRoles.includes("analysis") || tRoles.includes("review") || tRoles.includes("unblock");
-      const q = isQualifier ? { ok: true } : this.qualifyCheck(row, "analysis");
-      if (!q.ok) {
-        return {
-          id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct, instructions,
-          note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
-        };
-      }
-      await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
     }
     // (A) declared grace: a silence window for a long op, made while still
     // running. Requires a will (what the silence is FOR). Cleared by the next
@@ -3202,6 +3334,9 @@ export class KnowledgeHub {
     return {
       id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct,
       grace_until: graceUntil, instructions,
+      ...(questionContribution
+        ? { note_postscript: "contribution logged on a question task — questions are answered, not claimed. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task)." }
+        : {}),
     };
   }
 
@@ -3351,6 +3486,37 @@ export class KnowledgeHub {
       artefactId, Math.min(limit, 200),
     ).toArray().map((r: any) => ({ ...r, data: JSON.parse(r.data ?? "{}") }));
     return { artefact_id: artefactId, versions: rows };
+  }
+
+  /**
+   * The open feedback round of a decision + its consensus tally (BR#903).
+   * The round is the newest open question-kind child_of the decision; the
+   * tally comes from its progress contributions (log_progress notes).
+   * Returns undefined when the decision has no open round.
+   */
+  private consensusFor(decisionId: string) {
+    const round = this.one(
+      `SELECT c.id AS id, c.title AS title, c.status AS status, c.updated_ts AS updated_ts
+       FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+         AND c.status IN ('todo','in_progress','blocked')
+         AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
+       ORDER BY c.updated_ts DESC LIMIT 1`, decisionId,
+    );
+    if (!round) return undefined;
+    const entries = this.state.storage.sql.exec(
+      `SELECT actor, summary FROM artefact_versions WHERE artefact_id = ? AND action = 'progress' ORDER BY seq ASC`,
+      round.id,
+    ).toArray() as any[];
+    const tally = tallyConsensus(entries.map((e) => ({ actor: e.actor, note: e.summary })));
+    return {
+      round_id: round.id,
+      round_title: round.title,
+      round_status: round.status,
+      round_ts: round.updated_ts,
+      contributions: entries.length,
+      ...tally,
+    };
   }
 
   // ---------- identity, sessions, asks, settings, orient ----------
@@ -3757,8 +3923,19 @@ export class KnowledgeHub {
       );
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
+        let cleared = false;
         if (sm.awaiting_ask?.ask_id === id) {
           delete sm.awaiting_ask;
+          cleared = true;
+        }
+        // BR#4067: the paired typed await points at THIS ask — answered means
+        // SATISFIED. Leaving it stamped would make every later machine release
+        // path hold the card forever on a wait that already resolved.
+        if (sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id) {
+          delete sm.blocked.await_event;
+          cleared = true;
+        }
+        if (cleared) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
         if (subject.status === "blocked") {
@@ -3781,10 +3958,13 @@ export class KnowledgeHub {
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "superseded", note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
+              // human_verdict: the human's answered-ask decision — the system
+              // actor is only the pen. The release-holds guards (BR#4067)
+              // exempt it: a human may release what a machine wait holds.
+              await this.transition({ id: subject.id, to: "superseded", human_verdict: true, note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "superseded";
             } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "todo", note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
+              await this.transition({ id: subject.id, to: "todo", human_verdict: true, note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "todo";
             } else {
               taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
@@ -3888,6 +4068,36 @@ export class KnowledgeHub {
        ORDER BY created_ts DESC LIMIT 10`,
       label, ...askPlaceholders,
     ).toArray();
+    // decisions_awaiting_consensus (BR#903): proposed decisions with an open
+    // feedback round — the actionable "review requested" signal the pool only
+    // carried passively before. Ranked by recency, shaped like pending_asks:
+    // every agent is invited to read and contribute (agree/disagree + reasons
+    // via log_progress on the round); the human still decides.
+    const decisionsAwaiting = (this.state.storage.sql.exec(
+      `SELECT d.id, d.title, d.owner, d.created_ts, d.updated_ts
+       FROM relations r
+       JOIN artefacts d ON d.id = r.dst_id AND d.type = 'decision' AND d.status = 'proposed'
+       JOIN artefacts c ON c.id = r.src_id AND c.type = 'task' AND c.status IN ('todo','in_progress','blocked')
+       WHERE r.relation = 'child_of'
+         AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
+       GROUP BY d.id ORDER BY d.updated_ts DESC LIMIT 10`,
+    ).toArray() as any[]).map((d) => {
+      const c = this.consensusFor(d.id);
+      return {
+        decision_id: d.id,
+        title: d.title,
+        proposed_by: d.owner || undefined,
+        proposed_ts: d.created_ts,
+        round_id: c?.round_id,
+        round_title: c?.round_title,
+        agree: c?.agree ?? 0,
+        disagree: c?.disagree ?? 0,
+        other: c?.other ?? 0,
+        contributions: c?.contributions ?? 0,
+        contributors: c?.contributors ?? [],
+        how: `read the decision (${d.id}) + its round, contribute via log_progress {id: "${c?.round_id ?? ""}", did: "agree|disagree — reasons"} — informs the human, does not gate them`,
+      };
+    });
     const settings = this.settingsMap();
     const projectName = settings.project_name || "Superpositional";
     // my_tasks for a gateway includes the work of the agents it dispatched
@@ -4116,6 +4326,7 @@ export class KnowledgeHub {
       steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
+      decisions_awaiting_consensus: decisionsAwaiting.length ? decisionsAwaiting : undefined,
       action_required: actionRequired.length || verificationNotices.length
         ? [...actionRequired, ...verificationNotices]
         : undefined,
@@ -4125,6 +4336,39 @@ export class KnowledgeHub {
       // gauge_debt" aborts every dispatch tick). Empty array = healthy board.
       gauge_debt: gaugeDebt,
       my_score,
+    };
+  }
+
+  /** BR#4067 — the freshest hub ping from the card's claiming session. A
+   *  dispatched runner run pings on orient/claim even while its stdout is
+   *  quiet, so a fresh ping means the run is plausibly still in flight and
+   *  the silence-release must wait it out (grace extension, #205-consistent:
+   *  liveness = ANY real signal, never a shorter window). */
+  private sessionPing(meta: any): number {
+    const name = meta?.session ? String(meta.session) : "";
+    if (!name) return 0;
+    try {
+      return Number(this.one(`SELECT MAX(last_seen_ts) AS ts FROM sessions WHERE name = ?`, name)?.ts ?? 0) || 0;
+    } catch { return 0; }
+  }
+
+  /** BR#4067 — the hold-park transition body: blocked (never todo), the
+   *  silence named, the typed wait preserved or re-derived. The typed
+   *  await_event keeps the blocked-needs-typed-await gate honest; when none
+   *  is derivable the merge_train flag marks it a machine-managed park with
+   *  its own trip-wires. result_class "proxy_wait_hold" exempts the park
+   *  from abandonment scoring — a hold preserves state, nothing was lost. */
+  private holdParkBody(id: string, meta: any, hold: string, staleDesc: string) {
+    const aw = validateAwaitEvent(meta?.blocked?.await_event)
+      ?? trainProxyEvent(meta)
+      ?? (meta?.awaiting_ask?.ask_id ? { event: "ask" as const, ask_id: String(meta.awaiting_ask.ask_id) } : null);
+    return {
+      id,
+      to: "blocked",
+      note: `silence-release held (watchdog): ${staleDesc}, but the card carries ${hold} — parked on the typed proxy, not released (BR#4067)`,
+      unblock_condition: aw ? describeAwaitEvent(aw) : hold,
+      ...(aw ? { await_event: aw } : { merge_train: true }),
+      result_class: PROXY_WAIT_HOLD_RESULT_CLASS,
     };
   }
 
@@ -4188,10 +4432,25 @@ export class KnowledgeHub {
         // await onto the card once the ask id exists.
         void this.askCreate({
           to: "ray",
-          question: `Rework loop on ${t.id} "${t.title.slice(0, 80)}" — the release→claim→stall cycle is now invalid (it failed ${attempts} times). What do you want to do with it?`,
-          reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) — re-running repeats the claim→stall cycle`,
-          options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue. The last release reason names what keeps rejecting the handoff. Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
+          // Plain-English rewrite (BR#4023): the rework-loop ask states the
+          // fact (stuck, N failed attempts), the consequence (re-release
+          // repeats the cycle), and what each option concretely does.
+          question: `Card ${t.id} is stuck in a rework loop (${attempts} failed attempts) — fix its brief, re-release it, or drop it?`,
+          reason: `${attempts} dispatch attempts ended without completion (last: ${reason.slice(0, 120)}) — each re-release repeats the same claim→stall cycle, so this needs a human decision`,
+          options: [
+            "RE-SCOPE — rewrite the card's brief, then release it normally",
+            "RELEASE — back to the pool as-is",
+            "SUPERSEDE — drop the card",
+          ],
+          details: `"${t.title}" (${t.id}) has failed ${attempts} dispatch attempts. Last release reason: "${reason.slice(0, 200)}".
+
+What this means: agents keep picking the card up and stalling the same way — re-releasing it unchanged just repeats the cycle. Check the attempt history on the card before answering.
+
+- RE-SCOPE: fix the card's brief (title, body, exit condition) so the next attempt can actually succeed, then release it.
+- RELEASE: back to the pool unchanged — reasonable only if the past failures were environmental and are now fixed.
+- SUPERSEDE: drop it — the work is moot, done elsewhere, or not worth the loop.
+
+Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
           artefact_id: t.id,
         }, "system:reaper")
           .then((loopAsk) => {
@@ -4223,6 +4482,23 @@ export class KnowledgeHub {
         continue;
       }
       meta.attempt = { by: ownerLabel, at: now, attempts };
+      // BR#4067 — the reassignment must not destroy a machine wait: train
+      // queue slots / typed awaits / bound asks survive the reaper (the card
+      // stays blocked, its proxy intact). The attempt still counts, so a held
+      // card that keeps cycling still reaches the rework-loop escalation above.
+      const hold = releaseHold(meta);
+      if (hold) {
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(meta), now, now, t.id,
+        );
+        this.audit("system:reaper", "release_held", t.id, { prev_owner: ownerLabel, attempts, hold });
+        this.version(t.id, "system:reaper", "note", `reassignment HELD — the card carries ${hold} (BR#4067)`, { prev_owner: ownerLabel, attempts, hold });
+        out.push(
+          `${t.id} "${t.title}" release HELD: ${hold} — parked (attempt ${attempts} recorded, still counting toward the rework loop).`,
+        );
+        continue;
+      }
       delete meta.blocked;
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = 'todo', owner = '', tags = ?, meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -5186,12 +5462,41 @@ export class KnowledgeHub {
       if (!pr) throw new Error("train:bounced needs pr");
       const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
       const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
+      const defect = String(body.defect ?? "").trim();
+      const mergeState = String(body.merge_state ?? "").trim();
+      // BR#4066 — the bounce KIND decides everything downstream: which brief
+      // renders, who owns the next leg, whether the accept-hook may re-queue.
+      const bounceKind = (["coverage", "conflict", "gate"] as const).includes(body.bounce_kind)
+        ? (body.bounce_kind as "coverage" | "conflict" | "gate")
+        : classifyBounce(defect, conflictFiles);
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id });
-      // blocked→in_progress with the fix-up brief; resolution invalidates the
-      // verdict — the card re-enters the queue only after a fresh verify.
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, kind: bounceKind, defect, mergeStateStatus: mergeState });
+      // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
+      // a bounced merge-ready card is the board's highest-value work — one
+      // mechanical/human leg from landing — and must not re-enter at default
+      // priority and starve). One meta write, before the transition.
+      const now2 = Date.now();
+      const nextMeta = {
+        ...cm,
+        boosted: now2,
+        merge_train: {
+          ...(cm.merge_train ?? {}),
+          state: "bounced",
+          bounce_kind: bounceKind,
+          defect: defect.slice(0, 300) || undefined,
+          conflict_files: conflictFiles,
+          bounced_at: now2,
+          pr,
+          repo,
+        },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
+      // blocked→in_progress with the kind-aware brief. coverage bounces carry
+      // NO repair for impl — the card immediately re-enters review below and a
+      // fresh verify duty re-checks the live head (the 30s stamp-race class
+      // self-heals: verify re-accepts → accept-hook re-queues → train merges).
       await this.transition(
         {
           id: taskId,
@@ -5201,11 +5506,35 @@ export class KnowledgeHub {
           // session as its implementer (misattribution + a spurious
           // review-separation refusal on a same-session re-verify)
           session: "",
-          note: `merge-train bounce — PR #${pr} conflicts with base${conflictFiles.length ? ` (${conflictFiles.length} file(s))` : ""}`,
+          note: bounceKind === "conflict"
+            ? `merge-train bounce (CONFLICT) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
+            : bounceKind === "coverage"
+              ? `merge-train bounce (VERDICT COVERAGE) — PR #${pr} head not covered by the verdict; no conflict exists`
+              : `merge-train bounce (GATE) — PR #${pr}: ${defect.slice(0, 160) || "mechanical gate leg failed"}`,
           body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
         },
         actor,
       );
+      // BR#4066/67 self-heal: a coverage bounce fabricated impl work (there is
+      // nothing to repair) and the watchdog then punished the resulting
+      // silence by releasing the card — the exact queue-slot destruction
+      // fixed above. Instead: straight back into review; the standard
+      // in_review handoff auto-spawns a fresh verify duty.
+      if (bounceKind === "coverage") {
+        try {
+          await this.transition(
+            {
+              id: taskId,
+              to: "in_review",
+              session: "",
+              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train`,
+            },
+            actor,
+          );
+        } catch (e) {
+          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; impl re-enters review manually` });
+        }
+      }
       cm.merge_train = { ...(cm.merge_train ?? {}), state: "bounced", pr, bounced_at: now };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       meta.currently = null;

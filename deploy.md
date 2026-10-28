@@ -172,6 +172,28 @@ place via `train.lane`); stop-the-line asks land on the card in `train_alarm_sin
 (default BR#3124). The lease / carry / bounce / stop-the-line contract is in README
 ("The merge train").
 
+## 8 · Hub self-canary (BR#4177) — daily, red alarm to the sink
+
+The deployed hub gets a synthetic end-to-end canary: duty spawn→delivery,
+flip-on-event, train-queue visibility (BR#4079 contract), reconcile accounting
+(BR#4170). One command, cron-friendly, red files a deduped ask to the alarm sink
+(`train_alarm_sink_id`, default BR#3124):
+
+```bash
+export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
+export BRIDGE_TOKEN=<token from the Connect tab>
+~/.local/bin/bridge canary        # one pass: exit 0 green · 1 red (alarm filed) · 2 config
+```
+
+Daily schedule — launchd on macOS (`~/Library/LaunchAgents/bridge.canary.plist`,
+`StartCalendarInterval` hour 6) or cron anywhere
+(`0 6 * * * ~/.local/bin/bridge canary >> ~/.bridge/canary.log 2>&1`).
+Reds page the bridge lane via the sink ask; **greens matter too** — every run stamps
+a `[hub-canary]` progress artefact, and 48h of silence on that feed means the canary
+itself is dead. Fixtures self-clean (tagged `[canary]`, retired to `blocked` with an
+inert 30-day timer; at most two inert fixtures accumulate per run). See README
+("The hub self-canary") for the four legs and what each one catches.
+
 ## Rollback / kill switch
 
 - `wrangler delete` removes the worker + DO state.

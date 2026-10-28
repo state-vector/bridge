@@ -493,9 +493,17 @@ describe("executor contract: Applied(effects) | Rejection{code,rule,message}", (
     ]);
   });
 
-  it("non-task artefacts carry no effects", async () => {
+  it("non-task artefacts carry no effects — except a decision's consensus-round close (BR#903)", async () => {
+    // a decision resolving (superseded here) closes its auto-spawned feedback
+    // round: exactly one supersede_children effect, tag "question" — the round
+    // informed the human, it never gated them
     const v = ok(await decide(input({ type: "decision", status: "proposed", to: "superseded", actor: "web:ray" }), baseCtx()));
-    expect(v.effects).toEqual([]);
+    expect(v.effects).toEqual([
+      { kind: "supersede_children", parent: "BR#1", tag: "question", keep_newest: false, cause: "BR#1 superseded — consensus round closed (the human decided; the round informed, it never gated)" },
+    ]);
+    // every other non-task type stays effect-free
+    const steering = ok(await decide(input({ type: "steering", status: "draft", to: "active", actor: "web:ray" }), baseCtx()));
+    expect(steering.effects).toEqual([]);
   });
 });
 
@@ -583,6 +591,64 @@ describe("effects decided executor-side (F4)", () => {
     const unblockDuty = await decide(input({ status: "in_progress", to: "blocked", roles: ["unblock"], body: { note: "n", unblock_condition: "u" } }), baseCtx());
     expect(unblockDuty.ok).toBe(false);
     if (unblockDuty.ok === false) expect(unblockDuty.rule).toBe("verdict-no-blocked");
+  });
+
+  it("merge-train parks never spawn unblock children — the train's flag OR the agent re-queue's canonical note (BR#4135)", async () => {
+    // BR#3516 §2: the train itself is the unblock path; a spawned child
+    // would race the executor's CAS lease. The train's own park carries the
+    // typed flag —
+    const trainPark = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "queued on the merge train", merge_train: true, unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(trainPark.effects).toEqual([]);
+    // — while agent re-parks follow the verify-duty contract, which marks the
+    // park in the note. Specimen BR#3990 rounds 4→6: the note flavor was
+    // missed, so every re-queue spawned an unblock child the next bounce
+    // superseded and the re-park after it flood-guarded — one breach card
+    // (BR#4135) per bounce cycle.
+    const agentRequeue = ok(
+      await decide(
+        input({
+          status: "in_review",
+          to: "blocked",
+          body: { note: "merge-train: queued — verify RE-ACCEPT at the unchanged live head", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(agentRequeue.effects).toEqual([]);
+    // any merge-train note flavor counts on a blocked park (bounce KINDs, BR#4066)
+    const stopped = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "merge-train: stopped — lane halted", unblock_condition: "PR https://github.com/a/b/pull/11 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(stopped.effects).toEqual([]);
+    // the suppression is SCOPED to the spawn gate: a plain park with the same
+    // exit condition still spawns its unblock round
+    const plain = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(plain.effects[0].kind).toBe("spawn_unblock");
   });
 
   it("parent movement supersedes ephemeral children; a bounce keeps the newest verify round", async () => {
@@ -1123,5 +1189,79 @@ describe("tag inertness (BR#2983)", () => {
   it("question invariants: in_progress on a question is a breach", () => {
     expect(invariants({ type: "question", status: "in_progress", meta: {} }).length).toBeGreaterThan(0);
     expect(invariants({ type: "question", status: "todo", meta: {} })).toEqual([]);
+  });
+});
+
+// BR#4067 — queue-slot durability: a machine silence-release must never
+// destroy merge-train state (the PR #257 class: verify accepted, watchdog
+// released the queued card to todo, nothing re-queued it).
+describe("release-holds-train-queue (BR#4067)", () => {
+  const queuedMeta = {
+    merge_train: { state: "queued", pr: 257, repo: "state-vector/bridge" },
+    pr: { repo: "state-vector/bridge", number: 257, head_sha_at_acceptance: "a".repeat(40) },
+  };
+
+  it("system actor releasing a queued card is refused with the proxy named", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: queuedMeta as any }), baseCtx());
+    expect(msg).toMatch(/merge-train queued.*pr_merged/s);
+  });
+
+  it("awaiting-ci holds too", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "hub:proxy-watch", meta: { ...queuedMeta, merge_train: { state: "awaiting-ci" } } as any }), baseCtx());
+    expect(msg).toMatch(/merge-train awaiting-ci/);
+  });
+
+  it("bounced holds too — the release that destroyed BR#4067 itself (in_progress, train-bounced, silent)", async () => {
+    const bounced = {
+      merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "conflict" },
+      pr: { repo: "state-vector/bridge", number: 259 },
+    };
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: bounced as any }), baseCtx());
+    expect(msg).toMatch(/merge-train bounced \(typed await pr_merged state-vector\/bridge#259\)/);
+  });
+
+  it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: { blocked: { reason: "parked", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 257 } } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/typed await_event \(pr_merged\).*machine release must not destroy the wait/s);
+  });
+
+  it("a bound ask holds — the answer owns the exit", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:reaper",
+      meta: { blocked: { reason: "parked" }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/bound ask \(ASK-1\).*machine release must not destroy the wait/s);
+  });
+
+  it("humans and owners release freely — the guard is machine-actor only", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "web:rayh", owner: "web:rayh", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds-train-queue|merge-train queued/);
+  });
+
+  it("humans also release silent in_progress train cards freely (rule-9)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "some-agent", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a human's answered-ask verdict rides the system pen freely (BR#3912 typed RELEASE)", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:question(ray)",
+      body: { human_verdict: true },
+      meta: { blocked: { reason: "parked", await_event: { event: "ask", ask_id: "ASK-1" } }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a blocked card with NO train state releases as before", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: { blocked: { reason: "parked" } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/merge-train/);
+  });
+
+  it("a silent in_progress card with no machine wait releases as before (the sweeps own the todo path)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: { last_progress: { ts: 1 } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
   });
 });

@@ -7,6 +7,8 @@
  * are legal.
  */
 
+import type { AwaitEvent } from "./closure";
+
 export const ARTEFACT_TYPES = [
   "steering",
   "goal",
@@ -367,7 +369,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
@@ -461,6 +463,46 @@ export function parseTags(raw: unknown): string[] {
     return [];
   };
   return unwrap(v, 0);
+}
+
+// ---------- decision consensus rounds ----------
+
+/** Title prefix of the auto-spawned feedback round for a proposed decision. */
+export const FEEDBACK_TITLE_PREFIX = "Feedback:";
+
+export interface ConsensusTally {
+  agree: number;
+  disagree: number;
+  /** contributions carrying neither a verdict (questions, context, caveats) */
+  other: number;
+  /** distinct contributors across all contributions */
+  contributors: string[];
+}
+
+/**
+ * Tally a decision's feedback round from its contributions (log_progress notes
+ * on the round task). The convention the round invites: begin the note with
+ * "agree" or "disagree" + reasons. Parsing is tolerant: any "disagree" wins
+ * (dissent must always surface to the human), a negated agree ("don't agree")
+ * counts as disagree too, an affirmative (agree/concur/endorse/support) counts
+ * as agree, anything else is a neutral contribution. Contributors = distinct
+ * actors. This is a signal for the human, not the truth — the reasons are
+ * always readable on the round itself.
+ */
+export function tallyConsensus(entries: Array<{ actor?: unknown; note?: unknown }> | null | undefined): ConsensusTally {
+  const tally: ConsensusTally = { agree: 0, disagree: 0, other: 0, contributors: [] };
+  const people = new Set<string>();
+  for (const e of entries ?? []) {
+    const note = String(e?.note ?? "");
+    if (!note.trim()) continue;
+    const negated = /\b(?:not|no|can't|cannot|won't|don't|doesn't|didn't|never)\b[\w\s,'’-]{0,40}?\bagree/i.test(note);
+    if (/\bdisagree/i.test(note) || negated) tally.disagree++;
+    else if (/\b(?:agree|concur|endorse|support)/i.test(note)) tally.agree++;
+    else tally.other++;
+    if (e?.actor) people.add(String(e.actor));
+  }
+  tally.contributors = [...people];
+  return tally;
 }
 
 // ---------- limits ----------
@@ -1287,6 +1329,61 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
     .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
 }
 
+// ---- typed-proxy preservation (BR#4067) ----
+
+/** result_class stamped on a watchdog hold-park (a silence that would have
+ *  released a card carrying a machine wait). The score side exempts it — a
+ *  hold preserves state, it is neither an abandonment nor a lost run. */
+export const PROXY_WAIT_HOLD_RESULT_CLASS = "proxy_wait_hold";
+
+/** The PR leg a card's merge-train state points at, from any of the shapes
+ *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).
+ *  0 when none resolves. */
+export function trainPrLeg(meta: any): number {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const fromPr = (m.pr as any)?.number;
+  const fromPrs = Array.isArray(m.prs) && m.prs.length ? (m.prs[0] as any)?.number : undefined;
+  return Number(fromPr ?? fromPrs ?? mt.pr ?? 0) || 0;
+}
+
+/** The typed await a train-owned card parks on — the pr_merged proxy derived
+ *  from its live PR leg. Null when the leg lacks a well-formed repo/number
+ *  (callers then fall back to the machine-managed park flag). */
+export function trainProxyEvent(meta: any): AwaitEvent | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
+  const n = trainPrLeg(meta);
+  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+}
+
+/** BR#4067 — does a release path need to HOLD? Returns the hold description
+ *  when the card carries machine-wait state — a merge-train queue slot
+ *  (queued/awaiting-ci/bounced on a live PR leg), a typed await_event, or a
+ *  bound ask — and null when a release may proceed. Every watchdog release
+ *  path (stall sweep, review sweep, lapsed subprocess, reaper reassign) and
+ *  the machine's machine-actor backstop consult this one predicate: the
+ *  PR #257 class is a card released to todo while its wait state (queue
+ *  slot, proxy, ask) was still live. */
+export function releaseHold(meta: any): string | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced") {
+    const pr = trainPrLeg(meta);
+    if (pr) {
+      const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
+      return `merge-train ${st} on PR ${repo}#${pr} — the typed pr_merged proxy owns the exit`;
+    }
+  }
+  if (m.blocked?.await_event && typeof m.blocked.await_event === "object")
+    return `a typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")}) — the proxy watch owns the exit`;
+  if (m.awaiting_ask)
+    return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
+  return null;
+}
+
 // ---- carry-record law (BR#3516 §5) ----
 
 /** One machine-clean head move: `update-branch` (server-side, bought CI, no
@@ -1584,25 +1681,75 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
 
-/** train:bounced fix-up brief: the conflict files ride in, the verdict is
- *  INVALID at the new head, re-verify then re-queue at the back. */
+/** Bounce kinds (BR#4066): the executor's bounce has three distinct causes
+ *  with different next owners — conflating them produced the "every bounce
+ *  says conflicts" lie that sent impl hunting phantom conflicts.
+ *  - coverage: the live head is not covered by the accepted verdict (authored
+ *    push past the stamp, or a stale card read racing the accept-hook). NO
+ *    conflict exists. Next owner: the verify pool (auto re-enter review).
+ *  - conflict: trial-merge found real conflict files. Next owner: impl
+ *    repair leg.
+ *  - gate: a mechanical gate leg failed (mergeStateStatus, head checks…).
+ *    Next owner: whoever the named defect says. */
+export type TrainBounceKind = "coverage" | "conflict" | "gate";
+
+/** Classify a bounce from its facts — used by the executor payload path and
+ *  pinned by tests. Files present ⇒ conflict, always; the coverage defect is
+ *  the gate's own phrasing ("not covered by the accepted verdict"). */
+export function classifyBounce(defect: string, conflictFiles: string[]): TrainBounceKind {
+  if (conflictFiles.length) return "conflict";
+  if (/not covered by the accepted verdict/i.test(defect)) return "coverage";
+  return "gate";
+}
+
+/** train:bounced fix-up brief, KIND-AWARE (BR#4066): each kind names its
+ *  actual cause and its next owner; only a conflict bounce claims conflicts. */
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
   headSha: string | null;
   conflictFiles: string[];
   verdictId: string | null;
+  kind?: TrainBounceKind;
+  defect?: string;
+  mergeStateStatus?: string;
 }): string {
+  const kind = input.kind ?? classifyBounce(input.defect ?? "", input.conflictFiles);
+  const head = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
+  const pr = `PR #${input.prNumber} (${input.repo})`;
+  const law = `**Law (BR#3516 §5):** machine-clean carries, human-resolved invalidates.`;
+  if (kind === "coverage") {
+    return [
+      `Merge-train bounce (VERDICT COVERAGE): ${pr}${head} — the live head is not covered by the accepted verdict${input.verdictId ? ` (${input.verdictId})` : ""}. No conflict exists${input.defect ? ` — gate said: ${input.defect}` : ""}.`,
+      ``,
+      `**Next owner: the verify pool.** The card re-enters review; a fresh verify duty re-checks the live head (usually unchanged — a stale card read racing the accept-hook stamp, or an authored push) and the accept re-queues the train at the BACK. Impl has no repair leg unless that verify finds one.`,
+      ``,
+      law,
+    ].join("\n");
+  }
+  if (kind === "gate") {
+    return [
+      `Merge-train bounce (GATE): ${pr}${head} — a mechanical gate leg failed.`,
+      ``,
+      `**Defect:** ${input.defect || "(executor supplied no defect text — report this)"}${input.mergeStateStatus ? ` (mergeStateStatus=${input.mergeStateStatus})` : ""}`,
+      ``,
+      `**Next owner: the defect names it** (rebase / re-sign / fix the named check), then re-enter review; the train re-queues once a fresh verify accepts.`,
+      ``,
+      law,
+    ].join("\n");
+  }
   const files = input.conflictFiles.length
     ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
-    : "- (no file list supplied — run the trial rebase locally to enumerate)";
+    : `- **(CONFLICT BOUNCE WITHOUT A FILE LIST — executor defect: the trial merge must supply the files; report this)**`;
   return [
-    `Merge-train bounce: PR #${input.prNumber} (${input.repo}) conflicts with its base${input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : ""}.`,
+    `Merge-train bounce (CONFLICT): ${pr} conflicts with its base${head}.`,
     ``,
     `**Conflicting files:**`,
     files,
     ``,
-    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head — machine-clean carries, human-resolved invalidates. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    `**Next owner: impl repair leg (core.ts standing order).** Conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    ``,
+    law,
   ].join("\n");
 }
 

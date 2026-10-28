@@ -49,6 +49,12 @@ mod train;
 #[path = "../../desktop/src-tauri/src/train_gate.rs"]
 mod train_gate;
 
+/// The hub self-canary (BR#4177): `bridge canary [--once]` — a daily
+/// synthetic end-to-end lifecycle against the deployed hub (duty
+/// spawn→delivery, flip-on-event, queue visibility, reconcile accounting),
+/// red alarm to the alarm sink. Cron-friendly, same shape as `train --once`.
+mod canary;
+
 use dispatch::DispatchConfig;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -142,6 +148,11 @@ fn main() {
         "train" => {
             // native merge-train executor (BR#3879): `bridge train [--once]`
             std::process::exit(train::run(&args[2..]));
+        }
+        "canary" => {
+            // hub self-canary (BR#4177): `bridge canary [--once]` — single
+            // lifecycle pass; cron re-runs it daily.
+            std::process::exit(canary::run(&args[2..]));
         }
         "doctor" => {
             let bad = doctor();
@@ -1099,10 +1110,15 @@ USAGE:
   bridge agent install   install the bridge agent persona into opencode
   bridge agent check     verify the installed persona matches this version
   bridge service install write a systemd user unit (linux) — run forever, restart on failure
+  bridge canary [--once] hub self-canary (BR#4177): synthetic lifecycle vs the deployed hub;
+                         red alarm to the sink (BR#3124). Cron daily:
+                         --sink BR#3124    alarm sink card (default BR#3124)
+                         --fixture-pr N    fake PR number for the queue fixture (default 999901)
   --max-sessions N       cap concurrent agent sessions (default 1)
 
 ENV:
   BRIDGE_URL, BRIDGE_TOKEN, BRIDGE_WORKDIR, BRIDGE_AGENT, BRIDGE_POLL_SECS, BRIDGE_MAX_SESSIONS
+  CANARY_SINK_ID, CANARY_FIXTURE_PR (canary overrides, same as the flags above)
 
 State: ~/.bridge/config.json (auth) · ~/.bridge/dispatch/ (ephemeral runner state)
 The hub owns all authoritative state — killing the runner leaves nothing inconsistent.
