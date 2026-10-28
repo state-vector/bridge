@@ -131,30 +131,46 @@ npm run build -w @bridge/desktop         # → src-tauri/target/release/bundle/m
   notification permission.
 
 
-## 7 · Merge-train executor (BR#3516)
+## 7 · Merge-train executor (BR#3516, gateway-native since BR#4104)
 
 The hub holds **no VCS credentials** — every GitHub fact is fed to it by the merge-train
-executor running on your own machine. On the box that merges (any machine with a clone
-of the target repo):
+executor running on your own machines. Since BR#4104 the executor is **part of the
+gateway**: the desktop app and the headless `bridge` runner both spawn the train tick
+beside their dispatch loop (own thread, 45s default cadence). Any gateway on a stock
+build is an opportunistic executor — the per-lane CAS lease (5-minute TTL) picks the
+holder; a crashed or sleeping gateway's lease lapses and the next gateway reconciles
+from live GitHub state. There is **nothing to hand-install**: no systemd unit, no
+`~/.local/train-bin` — the train updates ride the normal gateway deploy path. (Retired
+2026-10-28: cody's hand-installed `merge-train-bridge` / `merge-train-super` units on
+ip-172-31-1-230 — disable them with
+`systemctl --user disable --now merge-train-bridge merge-train-super` if still present.)
 
 ```bash
 # prerequisites — `bridge doctor` checks each and names the fix:
 #   gh authed WITH the `repo` scope   (fix: gh auth refresh -h github.com -s repo)
-#   git (the executor is native — `bridge train` ships inside the CLI; no Node)
-cd /path/to/target-repo-clone        # the repo the train drives
-export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
-export BRIDGE_TOKEN=<token from the Connect tab>
-~/.local/bin/bridge train            # 45s tick loop
-~/.local/bin/bridge train --once     # cron-friendly single tick
+#   git (the executor is native — ships inside the gateway binary; no Node)
+# that's it: the running gateway IS the train.
 ```
 
-Optional env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
-`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD` (`merge | squash |
-rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone; default cwd); flag
-`--lane <repo>@<base>` drives one lane only. Keep it alive like the runner
-(systemd / launchd / `nohup`) or run `--once` from cron. It merges via `gh` as whatever
-identity that `gh` is authed as — use the detached-cody credential per BR#3181, never a
-personal one.
+Identity law (BR#3181, enforced in-process): the tick probes its gh identity class
+before any GitHub write — merge / update-branch / close legs execute only under the
+worker-class credential (default `detached-cody`). A personally-authed gateway (e.g.
+rayh's keyring gh) still reconciles and reports, then refuses the write legs LOUDLY and
+releases the lease for a worker gateway. Lease renewals carry proof-of-progress (last
+ledger action + age) — the hub distinguishes a live holder from a zombie and enforces
+it (BR#4129): on a non-empty queue a note frozen past 10 minutes denies the renewal and
+expires the lease for the next gateway.
+
+Standalone mode (headless boxes without the runner, cron): the same module runs as
+`bridge train [--once]` — see README ("The merge train") for the full env/flag table.
+
+Optional env (both modes): `MERGE_TRAIN_ENABLED=0` (kill switch for the daemon leg),
+`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_HOLDER` (lease label, default
+`merge-train@<gateway-label|host>`), `MERGE_TRAIN_LANES` (comma-sep `repo@base`
+allowlist; default every lane the hub reports), `MERGE_TRAIN_WORKDIR` (fixed clone;
+default managed clone cache `~/.bridge/train/<owner>/<repo>`), `MERGE_TRAIN_METHOD`
+(`merge | squash | rebase`, default `merge`), `MERGE_TRAIN_WORKER_IDENTITIES`
+(worker-class gh logins, default `detached-cody`).
 
 Lane config (required workflows + typical CI minutes) lives in admin settings
 (`train_lane`, a JSON map keyed `"repo@base"`; the executor/operator refreshes it in

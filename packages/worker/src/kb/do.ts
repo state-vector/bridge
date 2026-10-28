@@ -75,6 +75,7 @@ import {
   type LaneSpec,
   leaseDecide,
   mergeTrainQueue,
+  renewProgressDecide,
   trainLegs,
   trainLegLanded,
   trainLegsRemaining,
@@ -3463,12 +3464,52 @@ export class KnowledgeHub {
           // no-dead-end rule holds and askAnswer's resume leg finds it parked
           // with a live path out (this flip previously hard-failed: the
           // transition went out with a note but no unblock condition).
-          await this.transition({
-            id: artefactId, to: "blocked",
-            note: `blocked on ${to}: ${question.slice(0, 100)}`,
-            unblock_condition: `answer ask ${id}`,
-            await_event: { event: "ask", ask_id: id },
-          }, actor);
+          // BR#3822: the awaiting_ask marker MUST be on the card BEFORE the
+          // fold — doTransition loads the row at fold entry and the machine's
+          // unblock-spawn gate reads meta.awaiting_ask from that snapshot to
+          // skip the duty ("a spawned child would race the answer"); a stamp
+          // after the transition lands too late, so every ask-bound block
+          // leaked a racing sweep duty (BR#3798 → 3799+3800, BR#3505 → 3506).
+          // Shape matches every reader: askAnswer's cleanup
+          // (awaiting_ask?.ask_id === id → delete), the sweep's ask-resolution
+          // cleanup and the reaper's annotation + loop-ask stamp.
+          const sm = JSON.parse(row.meta ?? "{}");
+          sm.awaiting_ask = { ...(sm.awaiting_ask ?? {}), ask_id: id, ts: Date.now() };
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), artefactId,
+          );
+          try {
+            await this.transition({
+              id: artefactId, to: "blocked",
+              note: `blocked on ${to}: ${question.slice(0, 100)}`,
+              unblock_condition: `answer ask ${id}`,
+              await_event: { event: "ask", ask_id: id },
+            }, actor);
+          } catch (e) {
+            // the fold rejected the park — roll OUR OWN marker back so a
+            // leaked awaiting_ask can't suppress the spawn gate on the card's
+            // NEXT real block (or make the reaper annotate a live task as
+            // waiting on an ask that isn't). Only our own: a concurrent ask
+            // may have re-stamped the key for itself. Rollback is best-effort
+            // and audited — the fold's rejection is the error the caller must
+            // see, so this leg never converts a failed ask into a success
+            // (the failure-handling finding that sank PR #229).
+            try {
+              const cur = this.one(`SELECT meta FROM artefacts WHERE id = ?`, artefactId);
+              const cm = cur ? JSON.parse(cur.meta ?? "{}") : null;
+              if (cm?.awaiting_ask?.ask_id === id) {
+                delete cm.awaiting_ask;
+                this.state.storage.sql.exec(
+                  `UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), artefactId,
+                );
+              }
+            } catch (re) {
+              this.audit(actor, "ask_marker_rollback_failed", artefactId || null, {
+                ask_id: id, error: String((re as Error)?.message ?? re).slice(0, 300),
+              });
+            }
+            throw e;
+          }
           taskStatus = "blocked";
         }
       }
@@ -4830,6 +4871,13 @@ export class KnowledgeHub {
     else if (currently) {
       const who = lease ? ` by ${lease.holder}` : "";
       reason = `merge-train: leased${who} — awaiting CI on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr})`;
+    } else if (meta.zombie) {
+      // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
+      // free until the next acquire clears the stamp (board visibility).
+      const z = meta.zombie;
+      const mins = Math.max(1, Math.round(Number(z.age_ms ?? 0) / 60_000));
+      const queued = Number(z.queue_len ?? 0);
+      reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
     } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
     else reason = "merge-train: awaiting an available gateway";
     if (meta.blocked?.reason !== reason) {
@@ -4883,7 +4931,31 @@ export class KnowledgeHub {
     const now = Date.now();
     const decided = leaseDecide(meta.lease ?? null, now, holder, action);
     if (decided.ok === false) throw Object.assign(new Error(decided.reason), { lease_conflict: true });
+    // ---- zombie eviction (BR#4129 — the hub half of proof-of-progress,
+    // gateway half rode PR #263): a renewal on a NON-EMPTY queue whose action
+    // note is frozen past TRAIN_PROGRESS_STALE_MS is denied and the lease
+    // expires, so the next gateway's acquire wins within one tick. A missing
+    // proof (legacy `{}` renewals) is UNKNOWN — allowed + loud audit while
+    // the deprecation window runs (BR#4104 retires those senders). ----
+    if (action === "renew") {
+      const queue = this.laneQueue(repo);
+      const progress = renewProgressDecide(body.progress ?? null, holder, queue.length);
+      if (progress.ok === false) {
+        const proofNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
+        meta.lease = null; // expire — takeover within one tick
+        meta.zombie = { holder, at: now, age_ms: progress.stale_ms, queue_len: queue.length, last_progress: proofNote };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
+        const reason = this.laneSyncReason(lane.id, meta, now);
+        this.audit(actor, "train:lease_evicted", lane.id, { lane: laneKey(repo, base), holder, stale_ms: progress.stale_ms, queue_len: queue.length, reason });
+        this.version(lane.id, actor, "train:lease_evicted", `renewal denied — ${progress.reason}`, { lease: null, zombie: meta.zombie, reason });
+        throw Object.assign(new Error(progress.reason), { lease_conflict: true });
+      }
+      if (progress.verdict === "unknown" && queue.length > 0) {
+        this.audit(actor, "train:lease_renew_no_progress_proof", lane.id, { lane: laneKey(repo, base), holder, queue_len: queue.length, note: "legacy renewal carries no progress payload — allowed (deprecation window, BR#4129)" });
+      }
+    }
     meta.lease = decided.lease;
+    if (action === "acquire") meta.zombie = null; // fresh holder — the eviction stamp did its job
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
     if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null)) {
@@ -5322,6 +5394,26 @@ export class KnowledgeHub {
     this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? " (re-queued, stamp refreshed)" : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }
 
+  /** The lane's derived queue — COMPUTED (mergeTrainQueue over blocked,
+   *  merge-train-stamped cards), never stored (BR#3516 §7). Shared by the
+   *  status snapshot and the renew-arm zombie check (BR#4129). */
+  private laneQueue(repo: string) {
+    const cards = this.state.storage.sql.exec(
+      `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+    ).toArray() as any[];
+    return mergeTrainQueue(
+      cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
+    ).filter((c) => {
+      const cm = cards.find((x) => x.id === c.id);
+      // a card rides exactly the lanes that own one of its UNLANDED legs
+      // (BR#3659 — and this replaces the old filter that read
+      // meta.merge_train.repo, a field nothing ever set, so every queued
+      // card matched every lane)
+      return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo);
+    });
+  }
+
   /** train.status — the lane + derived-queue snapshot (GET /train mirrors
    *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. */
   private async trainStatus(body: any): Promise<any> {
@@ -5336,20 +5428,7 @@ export class KnowledgeHub {
       const lane = laneOfMeta(meta);
       if (!lane) continue;
       if (repoFilter && lane.repo !== repoFilter) continue;
-      const cards = this.state.storage.sql.exec(
-        `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
-         AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
-      ).toArray() as any[];
-      const queue = mergeTrainQueue(
-        cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
-      ).filter((c) => {
-        const cm = cards.find((x) => x.id === c.id);
-        // a card rides exactly the lanes that own one of its UNLANDED legs
-        // (BR#3659 — and this replaces the old filter that read
-        // meta.merge_train.repo, a field nothing ever set, so every queued
-        // card matched every lane)
-        return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), lane.repo);
-      });
+      const queue = this.laneQueue(lane.repo);
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
