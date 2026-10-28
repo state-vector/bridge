@@ -127,6 +127,7 @@ import {
   describeAwaitEvent,
   deployedSatisfied,
   AWAIT_GRAMMAR_DOC,
+  isSelfAwait,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -745,7 +746,11 @@ export class KnowledgeHub {
           atoms = parsed.atoms;
           unparseable = parsed.unparseable;
           const derived = awaitEventFromAtoms(atoms);
-          if (derived) {
+          // BR#3986: never self-migrate a self-referential await onto a card
+          // — {br_done, <the card itself>} deadlocks (BR#136). Conjunctions
+          // (N atoms) derive null and stay text: the sweep evaluates EVERY
+          // atom and flips only when all hold.
+          if (derived && !isSelfAwait(r.id, derived)) {
             meta.blocked = { ...(meta.blocked ?? {}), await_event: derived };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
           }
@@ -800,7 +805,11 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
             { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
           continue;
         }
-        if (!results.some((x) => x.ok)) {
+        // conjunction law (the parser's own contract): EVERY atom must hold
+        // before the flip — a park on "A done AND B done" must not fire on A
+        // alone (BR#3986: the pre-fix parser made this moot by truncating to
+        // the first atom; with all atoms collected, all must evaluate TRUE).
+        if (!results.every((x) => x.ok)) {
           this.stampProxyCheck(r.id, meta, now, "false", null, prev,
             { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
           continue;
@@ -2562,9 +2571,11 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       if (!meta.blocked) {
         // BR#3578: store the TYPED await (the guard validated one exists or
         // exempted a machine-managed park). Free text is optional annotation,
-        // derived from the structured event when absent.
-        const aw = validateAwaitEvent(body.await_event)
+        // derived from the structured event when absent. BR#3986: a derived
+        // await naming the card itself is a deadlock (BR#136) — store none.
+        const aw0 = validateAwaitEvent(body.await_event)
           ?? awaitEventFromAtoms(parseProxyCondition(String(body.unblock_condition ?? "")).atoms);
+        const aw = aw0 && isSelfAwait(id, aw0) ? null : aw0;
         meta.blocked = {
           reason: String(body.note ?? body.reason ?? "").trim(),
           unblock_condition: String(body.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : ""),
