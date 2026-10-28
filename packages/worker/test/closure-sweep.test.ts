@@ -322,3 +322,52 @@ describe("askInbox addressee routing (real DO)", () => {
     expect((mine2.body?.inbox ?? []).map((x: any) => x.id)).toContain(String(toSession.body.id));
   });
 });
+
+// ---------- (BR#4062) ask/time prose parks type at the door, sweep first-class ----------
+
+describe("BR#4062 — ask/time prose parks type at the door and sweep first-class (real DO)", () => {
+  it("a timer prose park (the takeover repro) types at the door and the sweep WAITS, honest", async () => {
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 time-prose drill", qualified: true, session: "drill-4062-time" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-time", session: "drill-4062-time" });
+    // THE regression: this exact park shape REJECTED from MCP on 2026-10-28
+    const blk = await block(pid, "drill-4062-time",
+      "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer → then a FRESH session closes it done.",
+      "parked on a typed timer (BR#4062 repro)");
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const parked = await taskById(pid);
+    expect(parked.status).toBe("blocked");
+    // the typed event self-stamped at the door (not just text)
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: 1793673600000 });
+
+    const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 400 * 60_000 });
+    expect(s.body.error).toBeUndefined();
+    const after = await taskById(pid);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting"); // first-class timer leg — not "unparseable"
+    expect(String(after.meta?.proxy_check?.detail)).toContain("timer until");
+  });
+
+  it("an ask prose park types to {event:ask}; the sweep waits while the ask is OPEN", async () => {
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 ask-prose drill", qualified: true, session: "drill-4062-ask" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-ask", session: "drill-4062-ask" });
+    const ask = await kbJson("/ask.create", {
+      to: "ray", question: "4062 drill ruling?", reason: "drill",
+      options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(ask.status).toBe(200);
+    const askId = String(ask.body.id);
+    const blk = await block(pid, "drill-4062-ask",
+      `Machine proxy (typed await_event ask ask_id=${askId}): the ruling gates re-entry.`,
+      "parked on the ruling (BR#4062 repro)");
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const parked = await taskById(pid);
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "ask", ask_id: askId });
+
+    const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 460 * 60_000 });
+    expect(s.body.error).toBeUndefined();
+    const after = await taskById(pid);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting");
+    expect(String(after.meta?.proxy_check?.detail)).toContain(`awaiting ask ${askId}`);
+  });
+});

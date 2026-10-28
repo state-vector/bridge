@@ -119,6 +119,7 @@ import {
   awaitEventToAtom,
   describeAwaitEvent,
   deployedSatisfied,
+  type AwaitEvent,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -621,6 +622,12 @@ export class KnowledgeHub {
           return { ok: false, receipt: "hub has no version stamp (pre-[build]-hook deploy) — atom cannot flip" };
         }
       }
+      case "ask":
+      case "time":
+        // BR#4062: board-local typed legs — the sweep evaluates them
+        // first-class (evalTypedAskTimeLeg) BEFORE the atom path ever sees
+        // them; reaching here means a multi-atom conjunction mixed one in.
+        return { ok: false, receipt: `ask/time leg ${atom.askId ?? atom.untilTs} evaluates on its own (typed leg, not a GitHub atom)` };
     }
   }
 
@@ -670,21 +677,7 @@ export class KnowledgeHub {
         // elapsed timer flips exactly like a machine atom (spawn the duty;
         // the duty re-verifies first-hand).
         if (aw && (aw.event === "ask" || aw.event === "time")) {
-          const fired = aw.event === "time"
-            ? now >= aw.until_ts
-            : (() => {
-                const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
-                return !a || a.status === "done" || a.status === "superseded";
-              })();
-          if (!fired) {
-            this.stampProxyCheck(r.id, meta, now, "waiting",
-              aw.event === "time" ? `timer until ${new Date(aw.until_ts).toISOString()}` : `awaiting ask ${aw.ask_id}`, prev);
-            continue;
-          }
-          const receipt = aw.event === "time"
-            ? `timer elapsed (until_ts ${aw.until_ts}, checked ${new Date(now).toISOString()})`
-            : `ask ${aw.ask_id} answered/closed`;
-          await this.spawnProxyDuty(r, meta, now, prev, cond, [`${describeAwaitEvent(aw)} → ${receipt}`]);
+          await this.evalTypedAskTimeLeg(r, meta, aw, cond, now, prev);
           continue;
         }
 
@@ -703,6 +696,13 @@ export class KnowledgeHub {
           if (derived) {
             meta.blocked = { ...(meta.blocked ?? {}), await_event: derived };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            // BR#4062: a prose park that derives an ask/time leg is now typed
+            // — evaluate it FIRST-CLASS this tick (board-local legs the
+            // GitHub-atom evaluator below cannot read), not a sweep later.
+            if (derived.event === "ask" || derived.event === "time") {
+              await this.evalTypedAskTimeLeg(r, meta, derived, cond, now, prev);
+              continue;
+            }
           }
         }
         if (!atoms.length) {
@@ -753,6 +753,33 @@ export class KnowledgeHub {
         this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 300) });
       }
     }
+  }
+
+  /** BR#3578 typed ask/time legs, evaluated first-class: an answered ask or
+   *  an elapsed timer flips exactly like a machine atom (spawn the duty; the
+   *  duty re-verifies first-hand). Shared by the typed-`await_event` path and
+   *  BR#4062's prose-derived migration — these board-local legs are exactly
+   *  the ones the GitHub-atom evaluator cannot read. */
+  private async evalTypedAskTimeLeg(
+    r: any, meta: any, aw: AwaitEvent, cond: string, now: number, prev: any,
+  ): Promise<void> {
+    if (aw.event === "time") {
+      if (now < aw.until_ts) {
+        this.stampProxyCheck(r.id, meta, now, "waiting", `timer until ${new Date(aw.until_ts).toISOString()}`, prev);
+        return;
+      }
+      await this.spawnProxyDuty(r, meta, now, prev, cond,
+        [`timer elapsed (until_ts ${aw.until_ts}, checked ${new Date(now).toISOString()})`]);
+      return;
+    }
+    // narrowed: the ask leg — an OPEN ask waits; answered/superseded/vanished fires
+    if (aw.event !== "ask") return; // machine-event legs never route here (guarded by the callers)
+    const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
+    if (a && a.status !== "done" && a.status !== "superseded") {
+      this.stampProxyCheck(r.id, meta, now, "waiting", `awaiting ask ${aw.ask_id}`, prev);
+      return;
+    }
+    await this.spawnProxyDuty(r, meta, now, prev, cond, [`${describeAwaitEvent(aw)} → ask ${aw.ask_id} answered/closed`]);
   }
 
   /** BR#3361a / BR#3578: the flip — the exit condition held TRUE; spawn the
