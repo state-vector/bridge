@@ -87,6 +87,13 @@ const isTask = (i: RuleInput) => i.type === "task";
 const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
 const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
 const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
+/** BR#4295: the receipts shape hasReceipts accepts — one source of truth for
+ *  the guard's rejection text (so an agent obeying it verbatim passes on the
+ *  retry, never flails: each rejection is a breach event) and for every
+ *  unblock-duty spawn template (do.ts), so future duties close first-try.
+ *  Specimen BR#3735/BR#4291: the old message invited "the check you ran" and
+ *  "the unblock verdict" — prose the matcher can never accept. */
+export const RECEIPTS_DOC = "any URL, or one of the verdict tokens (PR / merged / passed / unblocked / still blocked)";
 
 /** SQL rows carry meta as a JSON string; tests and callers may pass objects.
  *  Parse tolerantly either way — garbage parses as empty, never throws. */
@@ -373,7 +380,7 @@ export const RULES: Rule[] = [
     guard: (i) =>
       hasReceipts(noteOf(i))
         ? null
-        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`,
+        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — the note must cite receipts: ${RECEIPTS_DOC}.`,
   },
   {
     name: "review-separation-of-duties",
@@ -791,8 +798,30 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
  *  categories"): it reads as what it is, a classifier GAP, not a mystery
  *  defect. The fold's card states the action for it (add a pattern or fix
  *  the flow), so an unclassified pile points at breachClass itself. */
+/** BR#4295: rule name → breach class for rejections that carry the audited
+ *  " [rule: <name>]" tag (do.ts appends it to every guard rejection; it
+ *  survives the 300-char audit slice for short messages). Only the gates
+ *  whose message-ladder classification was wrong or unreachable need an
+ *  entry — everything else keeps classifying through the stems below. */
+const RULE_BREACH_CLASSES: Record<string, string> = {
+  // the receipts gate's own message embeds "PR link", so the ladder's
+  // earlier "pr link" test folded EVERY verdict-done-needs-receipts
+  // rejection as gate:review-needs-pr — the dedicated class was unreachable
+  // for its own gate (specimens BR#3735, BR#4291/BR#4294).
+  "verdict-done-needs-receipts": "gate:verdict-receipts",
+  "review-needs-pr": "gate:review-needs-pr",
+  // accepted classification ruling BR#3430: ownership-gate rejections are
+  // the claim_race family — observable, never a breach.
+  "release-needs-ownership": "claim_race",
+};
+
 export function breachClass(reason: string): string {
   const r = reason.toLowerCase();
+  // BR#4295: the audited rule tag classifies FIRST. Anchored at the end —
+  // a tag cut mid-way by the 300-char slice fails this match and falls
+  // through to the message ladder, exactly like a suffix-less legacy reason.
+  const ruleTag = r.match(/\[rule: ([a-z0-9-]+)\]$/);
+  if (ruleTag && RULE_BREACH_CLASSES[ruleTag[1]]) return RULE_BREACH_CLASSES[ruleTag[1]];
   // BR#3337: lifecycle-edge rejections are claim races — two dispatchers
   // raced for one card and the lifecycle table refused the double-claim
   // (`task: 'in_progress' → 'in_progress' not allowed (allowed: …)` /
