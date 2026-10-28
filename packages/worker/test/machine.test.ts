@@ -493,9 +493,17 @@ describe("executor contract: Applied(effects) | Rejection{code,rule,message}", (
     ]);
   });
 
-  it("non-task artefacts carry no effects", async () => {
+  it("non-task artefacts carry no effects — except a decision's consensus-round close (BR#903)", async () => {
+    // a decision resolving (superseded here) closes its auto-spawned feedback
+    // round: exactly one supersede_children effect, tag "question" — the round
+    // informed the human, it never gated them
     const v = ok(await decide(input({ type: "decision", status: "proposed", to: "superseded", actor: "web:ray" }), baseCtx()));
-    expect(v.effects).toEqual([]);
+    expect(v.effects).toEqual([
+      { kind: "supersede_children", parent: "BR#1", tag: "question", keep_newest: false, cause: "BR#1 superseded — consensus round closed (the human decided; the round informed, it never gated)" },
+    ]);
+    // every other non-task type stays effect-free
+    const steering = ok(await decide(input({ type: "steering", status: "draft", to: "active", actor: "web:ray" }), baseCtx()));
+    expect(steering.effects).toEqual([]);
   });
 });
 

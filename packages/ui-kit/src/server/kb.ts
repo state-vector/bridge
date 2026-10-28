@@ -25,6 +25,21 @@ export interface KbArtefact {
   status_ts?: number;
   /** parent task id, projected by board() from child_of relations */
   part_of?: string;
+  /** proposed decisions only — the open feedback round + agent consensus tally (BR#903) */
+  consensus?: KbConsensus;
+}
+
+/** Consensus round of a proposed decision: contributions are log_progress notes on the round task. */
+export interface KbConsensus {
+  round_id: string;
+  round_title: string;
+  round_status: string;
+  round_ts: number;
+  contributions: number;
+  agree: number;
+  disagree: number;
+  other: number;
+  contributors: string[];
 }
 
 export interface KbEvent {

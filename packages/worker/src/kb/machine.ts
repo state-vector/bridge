@@ -173,7 +173,7 @@ export type Effect =
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
   | { kind: "skip_unblock_spawn"; parent: string; reason: string }
-  | { kind: "supersede_children"; parent: string; tag: "review" | "unblock"; keep_newest: boolean; cause: string }
+  | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "release_redirect"; attempts: number; silent_cycles: number };
 
@@ -459,7 +459,18 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     const err = await r.guard(i, c);
     if (err) return { ok: false, code: "guard-failed", rule: r.name, message: err };
   }
-  if (i.type !== "task") return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: [] };
+  if (i.type !== "task") {
+    // decisions: the auto-spawned consensus round (BR#903) is ephemeral the
+    // same way verify/unblock rounds are — when the decision resolves
+    // (accepted, or superseded: the human decided), the round closes. The
+    // tally + reasons stay in the round's history; the decision's acceptance
+    // is never gated by the round.
+    const fx: Effect[] =
+      i.type === "decision" && (i.to === "accepted" || i.to === "superseded")
+        ? [{ kind: "supersede_children", parent: i.id, tag: "question", keep_newest: false, cause: `${i.id} ${i.to} — consensus round closed (the human decided; the round informed, it never gated)` }]
+        : [];
+    return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: fx };
+  }
 
   // ---- effects: every spawn/escalate/stamp/supersede decision lives here ----
   const now = i.now ?? Date.now();

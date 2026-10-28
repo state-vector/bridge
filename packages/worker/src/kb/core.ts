@@ -369,7 +369,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
@@ -463,6 +463,46 @@ export function parseTags(raw: unknown): string[] {
     return [];
   };
   return unwrap(v, 0);
+}
+
+// ---------- decision consensus rounds ----------
+
+/** Title prefix of the auto-spawned feedback round for a proposed decision. */
+export const FEEDBACK_TITLE_PREFIX = "Feedback:";
+
+export interface ConsensusTally {
+  agree: number;
+  disagree: number;
+  /** contributions carrying neither a verdict (questions, context, caveats) */
+  other: number;
+  /** distinct contributors across all contributions */
+  contributors: string[];
+}
+
+/**
+ * Tally a decision's feedback round from its contributions (log_progress notes
+ * on the round task). The convention the round invites: begin the note with
+ * "agree" or "disagree" + reasons. Parsing is tolerant: any "disagree" wins
+ * (dissent must always surface to the human), a negated agree ("don't agree")
+ * counts as disagree too, an affirmative (agree/concur/endorse/support) counts
+ * as agree, anything else is a neutral contribution. Contributors = distinct
+ * actors. This is a signal for the human, not the truth — the reasons are
+ * always readable on the round itself.
+ */
+export function tallyConsensus(entries: Array<{ actor?: unknown; note?: unknown }> | null | undefined): ConsensusTally {
+  const tally: ConsensusTally = { agree: 0, disagree: 0, other: 0, contributors: [] };
+  const people = new Set<string>();
+  for (const e of entries ?? []) {
+    const note = String(e?.note ?? "");
+    if (!note.trim()) continue;
+    const negated = /\b(?:not|no|can't|cannot|won't|don't|doesn't|didn't|never)\b[\w\s,'’-]{0,40}?\bagree/i.test(note);
+    if (/\bdisagree/i.test(note) || negated) tally.disagree++;
+    else if (/\b(?:agree|concur|endorse|support)/i.test(note)) tally.agree++;
+    else tally.other++;
+    if (e?.actor) people.add(String(e.actor));
+  }
+  tally.contributors = [...people];
+  return tally;
 }
 
 // ---------- limits ----------
