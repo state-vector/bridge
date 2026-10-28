@@ -89,7 +89,7 @@ import {
   classifyRequiredRuns,
   decideTrainGate,
   trainBounceBrief,
-  classifyBounce,
+  resolveTrainBounceKind,
   trainStopAskTitle,
   trainLandedCloseNote,
   releaseHold,
@@ -5374,17 +5374,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (!pr) throw new Error("train:bounced needs pr");
       const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
       const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
-      const defect = String(body.defect ?? "").trim();
-      const mergeState = String(body.merge_state ?? "").trim();
-      // BR#4066 — the bounce KIND decides everything downstream: which brief
-      // renders, who owns the next leg, whether the accept-hook may re-queue.
-      const bounceKind = (["coverage", "conflict", "gate"] as const).includes(body.bounce_kind)
-        ? (body.bounce_kind as "coverage" | "conflict" | "gate")
-        : classifyBounce(defect, conflictFiles);
+      const bounceKindRaw = body.bounce_kind != null ? String(body.bounce_kind).trim().toLowerCase() : "";
+      if (bounceKindRaw && !["coverage", "conflict", "gate"].includes(bounceKindRaw))
+        throw new Error(`train:bounced bounce_kind must be coverage | conflict | gate (got "${bounceKindRaw}")`);
+      const defect = body.reason != null ? String(body.reason) : null;
+      const mergeStateStatus = body.merge_state_status != null ? String(body.merge_state_status) : null;
+      const bounceKind = resolveTrainBounceKind({ bounceKind: bounceKindRaw || null, conflictFiles, defect });
+      // FAIL LOUD (BR#4066): a conflict bounce without the enumerated file
+      // list is the "(no file list supplied)" dead-end — refuse to render it.
+      if (bounceKind === "conflict" && !conflictFiles.length)
+        throw new Error("train:bounced (conflict) without conflict_files — the executor must enumerate the trial-merge conflicts; refusing to render a file-less conflict brief (BR#4066)");
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, kind: bounceKind, defect, mergeStateStatus: mergeState });
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
+      const bounceNote =
+        bounceKind === "coverage"
+          ? `merge-train bounce (coverage) — PR #${pr} head moved past the accepted verdict; re-verify at the new head`
+          : bounceKind === "gate"
+            ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
+            : `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`;
       // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
       // a bounced merge-ready card is the board's highest-value work — one
       // mechanical/human leg from landing — and must not re-enter at default
@@ -5397,7 +5406,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ...(cm.merge_train ?? {}),
           state: "bounced",
           bounce_kind: bounceKind,
-          defect: defect.slice(0, 300) || undefined,
+          defect: (defect ?? "").slice(0, 300) || undefined,
           conflict_files: conflictFiles,
           bounced_at: now2,
           pr,
@@ -5405,10 +5414,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         },
       };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
-      // blocked→in_progress with the kind-aware brief. coverage bounces carry
-      // NO repair for impl — the card immediately re-enters review below and a
-      // fresh verify duty re-checks the live head (the 30s stamp-race class
-      // self-heals: verify re-accepts → accept-hook re-queues → train merges).
+      // blocked→in_progress with the fix-up brief; resolution invalidates the
+      // verdict — the card re-enters the queue only after a fresh verify.
       await this.transition(
         {
           id: taskId,
@@ -5418,11 +5425,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // session as its implementer (misattribution + a spurious
           // review-separation refusal on a same-session re-verify)
           session: "",
-          note: bounceKind === "conflict"
-            ? `merge-train bounce (CONFLICT) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
-            : bounceKind === "coverage"
-              ? `merge-train bounce (VERDICT COVERAGE) — PR #${pr} head not covered by the verdict; no conflict exists`
-              : `merge-train bounce (GATE) — PR #${pr}: ${defect.slice(0, 160) || "mechanical gate leg failed"}`,
+          note: bounceNote,
           body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
         },
         actor,
@@ -5451,9 +5454,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       meta.currently = null;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: taskId, conflict_files: conflictFiles }, taskId);
-      this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced — ${conflictFiles.length} conflicting file(s); re-verify then re-queue at the back`, { reason });
-      return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, conflict_files: conflictFiles, reason };
+      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
+      const laneNote =
+        bounceKind === "coverage"
+          ? `PR #${pr} bounced (coverage) — head moved past the accepted verdict; the verify pool re-verifies at the new head`
+          : bounceKind === "gate"
+            ? `PR #${pr} bounced (gate) — named defect; impl fixes it, then re-verify and re-queue at the back`
+            : `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`;
+      this.version(lane.id, actor, `train:${kind}`, laneNote, { reason });
+      return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason };
     }
 
     if (kind === "stopped") {

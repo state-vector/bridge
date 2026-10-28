@@ -142,10 +142,13 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     expect(decideMergeAction(base({ cardStatus: "done" })).kind).toBe("skip");
   });
 
-  it("mergeable=false (conflicts) -> mechanical BOUNCE with the exact defect", () => {
+  it("mergeable=false (conflicts) -> mechanical BOUNCE with the exact defect, kind CONFLICT (BR#4066)", () => {
     const a = decideMergeAction(base({ mergeable: false, mergeStateStatus: "dirty" }));
     expect(a.kind).toBe("bounce");
-    if (a.kind === "bounce") expect(a.defect).toContain("unmergeable");
+    if (a.kind === "bounce") {
+      expect(a.defect).toContain("unmergeable");
+      expect(a.bounceKind).toBe("conflict");
+    }
     expect(a.kind === "bounce" && a.defect).toContain("Rebase");
   });
 
@@ -155,10 +158,13 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     if (a.kind === "skip") expect(a.reason).toContain("computing");
   });
 
-  it("mergeStateStatus not clean/unstable -> mechanical bounce naming the state", () => {
+  it("mergeStateStatus not clean/unstable -> mechanical bounce naming the state, kind GATE (BR#4066)", () => {
     const a = decideMergeAction(base({ mergeStateStatus: "blocked" }));
     expect(a.kind).toBe("bounce");
-    if (a.kind === "bounce") expect(a.defect).toContain("blocked");
+    if (a.kind === "bounce") {
+      expect(a.defect).toContain("blocked");
+      expect(a.bounceKind).toBe("gate");
+    }
   });
 
   it("unsigned commits are the HUMAN LEG, not a mechanical bounce (5c class rule)", () => {
@@ -178,10 +184,13 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     expect(decideMergeAction(base({ baseVerdict: "empty" })).kind).toBe("skip");
   });
 
-  it("head substance check RED -> bounce when the card is in_review", () => {
+  it("head substance check RED -> bounce when the card is in_review, kind GATE (BR#4066)", () => {
     const a = decideMergeAction(base({ headChecks: [run(1, "Test", "failure")] }));
     expect(a.kind).toBe("bounce");
-    if (a.kind === "bounce") expect(a.defect).toContain("Test");
+    if (a.kind === "bounce") {
+      expect(a.defect).toContain("Test");
+      expect(a.bounceKind).toBe("gate");
+    }
   });
 
   it("head substance check RED but card NOT in_review -> note only (the sweep never steals a claim)", () => {
@@ -200,12 +209,13 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     if (a.kind === "skip") expect(a.reason).toContain("unsettled");
   });
 
-  it("head moved past the accepted verify verdict (card in_review) -> bounce to re-verify", () => {
+  it("head moved past the accepted verify verdict (card in_review) -> bounce to re-verify, kind COVERAGE (BR#4066)", () => {
     const a = decideMergeAction(base({ verifyAcceptedOnHead: false }));
     expect(a.kind).toBe("bounce");
     if (a.kind === "bounce") {
       expect(a.defect).toContain(SHA.slice(0, 9));
       expect(a.defect).toContain("re-verify");
+      expect(a.bounceKind).toBe("coverage");
     }
   });
 
@@ -277,7 +287,7 @@ const gateMerge = (head: string): MergeAction => ({
   kind: "merge",
   receipt: `PR #7 merged by the standing merge sweep (BR#3033): head ${head.slice(0, 9)} — 5c gate pass, verify accepted on head`,
 });
-const gateBounce = (defect: string): MergeAction => ({ kind: "bounce", defect });
+const gateBounce = (defect: string, bounceKind: "coverage" | "conflict" | "gate" = "conflict"): MergeAction => ({ kind: "bounce", defect, bounceKind });
 const gateSkip = (why: string): MergeAction => ({ kind: "skip", reason: why });
 const gateHumanLeg = (why: string): MergeAction => ({ kind: "human_leg", reason: why });
 
