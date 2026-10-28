@@ -869,7 +869,7 @@ describe("trainBounceBrief kinds (BR#4066)", () => {
   });
 
   it("conflict bounce without files fails LOUD (executor defect), not the old shrug", () => {
-    const b = trainBounceBrief({ ...base, conflictFiles: [], kind: "conflict" } as any);
+    const b = trainBounceBrief({ ...base, conflictFiles: [], bounceKind: "conflict" });
     expect(b).toContain("CONFLICT BOUNCE WITHOUT A FILE LIST");
   });
 

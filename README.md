@@ -728,6 +728,34 @@ main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI
 (unknown past 3× typical classifies red — the train never waits forever). Lane identity
 is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
 
+## The knowledge channel: typed faults, never HTML (BR#4212)
+
+Every arm of the knowledge channel — the DO fetch entry, the worker's
+`/api/kb/*`, `/api/kb-machine/*`, `/api/kb/admin/*` proxies, and `/mcp` — is a
+catch-all: a storage-layer fault answers **typed JSON** with
+`result_class: "infra_storage_fault"` (HTTP 503), never an uncaught throw, a CF
+HTML error page, or a mislabeled `401 unauthorized`. Before BR#4212 (incident
+BR#4117) one DO storage fault took the whole entry down uncaught: the runtime
+served HTML 500s where JSON acks belong, writes were silently lost, and
+`/mcp`'s catch relabeled infrastructure failures as "unknown or revoked token"
+— a storage storm read as an auth storm. The classification law since:
+**infra faults retry (503), auth rejections 401, and the two never masquerade
+as each other.** Only the three genuine identify rejections (`missing bearer`,
+`unknown auth token`, `auth token revoked`) produce a 401.
+
+The watchdog's view is machine-checkable via `GET /stats` (or
+`POST stats`): the response carries a `channel` block — per-route `ok`/`err`
+counters with `write_ok_rate` over the write ops, `entry_faults` (which
+storage stage faulted, how often, how recently), `ws_send_fail` (failed
+fanout sends, the in-DO proxy for clientDisconnected), and `last_flush` (the
+alarm tick's persisted snapshot — counters reset at isolate boot,
+`window_started_ts` says when). "Channel down" is thus a readable predicate
+(error rate + fault recency), not inferred from silence — phantom stalls are
+distinguishable from real ones. The DO alarm failure policy: degrade + retry
+— a faulted re-arm never throws out of `alarm()` (a throwing alarm loses its
+schedule entirely); the next fetch entry re-arms via the null-or-stale guard,
+and the sweep rides the 60s alarm retry chain.
+
 ## The hub self-canary: daily synthetic lifecycle (BR#4177)
 
 The hub is coordination infrastructure — it gets the same treatment the product gets:

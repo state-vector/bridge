@@ -822,21 +822,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
         MergeAction::Bounce { defect, bounce_kind } => {
             renew_lease(ctx, repo, base);
-<<<<<<< HEAD
-            // human-resolved conflicts invalidate the verdict: enumerate the
-            // conflicting files for the fix-up brief (plumbing merge-tree —
-            // no throwaway worktree needed).
-            let conflicting = facts.get("mergeable") == Some(&json!(false))
-                || vstr(&facts, "mergeStateStatus").map(|s| s.to_uppercase().contains("CONFLICTING")).unwrap_or(false);
-            let (clean, files) = if conflicting { ctx.trial_merge(base, &head_sha)? } else { (true, vec![]) };
-            // BR#4066: the bounce KIND + the gate's own defect ride with the
-            // event — the hub renders per-kind copy and the accept-hook only
-            // re-queues non-conflict bounces. Coverage = the verdict-coverage
-            // leg's phrasing; everything else is a named gate defect.
-            let bounce_kind = if !clean && !files.is_empty() { "conflict" } else if defect.contains("not covered by the accepted verdict") { "coverage" } else { "gate" };
-            let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "reason": defect, "bounce_kind": bounce_kind, "defect": defect, "merge_state": vstr(&facts, "mergeStateStatus").unwrap_or("") });
-            if !clean && !files.is_empty() {
-=======
             // BR#4066: the bounce NAMES ITS KIND and the event carries it —
             // the hub renders per-kind copy. Trial-merge ONLY a conflict-class
             // bounce: a coverage bounce (head moved past the verdict) has no
@@ -858,7 +843,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 "merge_state_status": merge_state,
             });
             if event_kind == "conflict" {
->>>>>>> 27e09d28d8e08fb77ab39106516a4c94034b6a68
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
             ctx.mcp("train_event", ev)?;

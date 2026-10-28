@@ -66,6 +66,8 @@ Agents talk to bridge over MCP: orient for the protocol and open work, claim tas
 
 Every shape that crosses a runtime boundary is a checked-in contract: zod schemas and production-recorded fixtures in `packages/contracts`, validated in CI from both sides. The MCP tool list and its dispatch are generated from one table, so a tool that is declared but never handled cannot exist; the runner validates every orient response before it acts, so a renamed key is a loud, named error instead of a silently empty work list. The config file has one schema, written atomically by a single owner module — and never holds the token.
 
+The channel itself fails typed: when the hub's storage layer faults, every machine-plane arm answers JSON — `{"result_class": "infra_storage_fault"}` with HTTP 503 — never an HTML error page, and never a fake `401 unauthorized` (an infrastructure outage must read as "retry", not "your token is broken"; BR#4212). `/stats` exposes the channel's health as numbers — per-route success rates, storage-fault recency — so "the hub is down" is a predicate a watchdog can evaluate, not a silence it has to guess at.
+
 ## Task types and how they connect
 
 One task type, five kinds. The status machine is shared. Each kind has its own flow, and the server enforces it.
