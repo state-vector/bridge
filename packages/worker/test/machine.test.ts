@@ -1244,6 +1244,63 @@ describe("typed-await gate classification (BR#3738)", () => {
   });
 });
 
+// ---------- BR#4295: the verdict-done receipts gate — its own class, an honest message ----------
+
+describe("verdict-receipts gate classification + note shape (BR#4295)", () => {
+  // Specimen BR#4291 (breach card BR#4294, sample verbatim): the rejection as
+  // the audit stores it — the guard's message plus the " [rule: …]" suffix
+  // do.ts appends to every gate rejection, well under the 300-char slice.
+  // The holder's closing note was honest findings prose (quoted
+  // still 'blocked', "NO_UNBLOCK", no URL) → zero hasReceipts matches →
+  // 3 rejections in 18s, every one folded as gate:review-needs-pr because
+  // the gate's OWN message embeds "PR link" and breachClass tested that
+  // stem first — the dedicated class was unreachable for its own gate.
+  const VERDICT_RECEIPTS_REJECTION =
+    "unblock BR#4291 cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict). [rule: verdict-done-needs-receipts]";
+
+  it("classifies receipts rejections under their OWN class — the audited rule tag wins over the message's 'pr link' stem", () => {
+    expect(breachClass(VERDICT_RECEIPTS_REJECTION)).toBe("gate:verdict-receipts");
+    expect(breachClass(VERDICT_RECEIPTS_REJECTION.slice(0, 300))).toBe("gate:verdict-receipts"); // survives the audit slice
+  });
+
+  it("maps the tagged gates suffix-first; the message ladder stays the fallback for suffix-less legacy reasons", () => {
+    expect(
+      breachClass("moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call) [rule: review-needs-pr]"),
+    ).toBe("gate:review-needs-pr");
+    expect(
+      breachClass("task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. [rule: release-needs-ownership]"),
+    ).toBe("claim_race");
+    // suffix-less legacy reason → message stem, unchanged
+    expect(breachClass("review BR#1 cannot complete without receipts")).toBe("gate:verdict-receipts");
+  });
+
+  it("the guard's rejection teaches the shape hasReceipts actually accepts", async () => {
+    const msg = await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note: "verdict NO_UNBLOCK, still 'blocked'" } }), baseCtx());
+    expect(msg).toContain("cannot complete without receipts");
+    expect(msg).toContain("URL"); // a bare URL suffices
+    expect(msg).toContain("still blocked"); // the exact token — quoted 'blocked' or "unblock verdict" never match
+  });
+
+  it("hasReceipts accepts a URL and the bare verdict tokens; near-miss prose still rejects", async () => {
+    for (const note of [
+      "verified: https://github.com/x/y/pull/1 merged", // any URL
+      "BR#3311 still blocked — the hub proxy TRUE was the timer atom only", // bare token, exactly what BR#4291 needed
+      "PR merged",
+      "passed",
+      "unblocked",
+    ]) {
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must pass: ${note}`).toBeNull();
+    }
+    for (const note of [
+      "still 'blocked'", // quoted — not the token (the BR#4291 specimen)
+      "unblock verdict: NO_UNBLOCK", // no -ed, preceded by non-space
+      "the check I ran looks clean", // honest prose, zero tokens
+    ]) {
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must reject: ${note}`).toContain("cannot complete without receipts");
+    }
+  });
+});
+
 // ---------- seeded random walk: legal sequences preserve invariants ----------
 
 describe("random walk (seeded)", () => {
