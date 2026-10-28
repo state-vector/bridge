@@ -27,6 +27,9 @@ mod dispatch;
 #[path = "../../desktop/src-tauri/src/keychain.rs"]
 #[allow(dead_code)]
 mod keychain;
+// single logging mechanism (BR#4400) — vendored verbatim, same law as above
+#[path = "../../desktop/src-tauri/src/logging.rs"]
+mod logging;
 #[path = "../../desktop/src-tauri/src/opencode.rs"]
 mod opencode;
 #[path = "../../desktop/src-tauri/src/scm.rs"]
@@ -78,23 +81,23 @@ fn main() {
                     eprintln!("usage: bridge pair <hub-url>   (or set BRIDGE_URL)");
                     std::process::exit(2);
                 });
-            eprintln!("[bridge] pairing against {url} — approve at {url}/pair");
+            logging::emit("cli", &url, "pairing against hub — approve at /pair on the same URL");
             // run_loop pairs from BRIDGE_URL — the CLI knows the URL from the
             // arg, not the env; hand it over or pairing dead-ends immediately.
             std::env::set_var("BRIDGE_URL", &url);
             let mut cfg = match dispatch::pair_device(&url) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[bridge] pairing failed: {e}");
+                    logging::emit("cli", &url, &format!("error: pairing failed: {e}"));
                     std::process::exit(1);
                 }
             };
-            eprintln!("[bridge] paired — token saved");
+            logging::emit("cli", &url, "paired — token saved");
             onboard(&mut cfg);
             if let Err(e) = cfg.save() {
-                eprintln!("[bridge] config save failed: {e}");
+                logging::emit("cli", &url, &format!("error: config save failed: {e}"));
             }
-            eprintln!("[bridge] onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
+            logging::emit("cli", &url, "onboarding complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
             run(Some(cfg));
         }
         "status" => {
@@ -114,7 +117,7 @@ fn main() {
             let store = store::TokenStore::open();
             let had = !store.principal().is_empty();
             if let Err(e) = store.reset_principal() {
-                eprintln!("[bridge] reset-principal failed: {e}");
+                logging::emit("cli", "", &format!("error: reset-principal failed: {e}"));
                 std::process::exit(1);
             }
             println!(
@@ -140,7 +143,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[bridge] agent {sub} failed: {e}");
+                    logging::emit("cli", "", &format!("error: agent {sub} failed: {e}"));
                     std::process::exit(1);
                 }
             }
@@ -177,7 +180,7 @@ fn main() {
         }
         "service" => {
             if let Err(e) = service_install() {
-                eprintln!("[bridge] service install failed: {e}");
+                logging::emit("cli", "", &format!("error: service install failed: {e}"));
                 std::process::exit(1);
             }
         }
@@ -203,15 +206,15 @@ fn main() {
                     let mut cfg = match dispatch::pair_device(&url) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("[bridge] pairing failed: {e}");
+                            logging::emit("cli", &url, &format!("error: pairing failed: {e}"));
                             std::process::exit(1);
                         }
                     };
                     onboard(&mut cfg);
                     if let Err(e) = cfg.save() {
-                        eprintln!("[bridge] config save failed: {e}");
+                        logging::emit("cli", &url, &format!("error: config save failed: {e}"));
                     }
-                    eprintln!("[bridge] setup complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
+                    logging::emit("cli", &url, "setup complete — starting the runner (Ctrl-C to stop; `bridge service install` to run forever)");
                     run(Some(cfg));
                 }
             }
@@ -249,7 +252,7 @@ fn run(cfg: Option<DispatchConfig>) {
                         println!("\n== gateway token re-vended by device principal — starting the runner ==\n");
                     }
                     Err(pe) => {
-                        eprintln!("[bridge] principal repair failed: {pe}");
+                        logging::emit("cli", &url, &format!("error: principal repair failed: {pe}"));
                     }
                 }
                 if !healed {
@@ -258,13 +261,13 @@ fn run(cfg: Option<DispatchConfig>) {
                         Ok(fresh) => {
                             *c = fresh;
                             if let Err(e) = c.save() {
-                                eprintln!("[bridge] WARNING: config save failed after repair-pair: {e}");
+                                logging::emit("cli", &url, &format!("warning: config save failed after repair-pair: {e}"));
                             }
                             println!("\n== paired — starting the runner ==\n");
                         }
                         Err(e) => {
-                            eprintln!("[bridge] automatic pairing failed: {e}");
-                            eprintln!("[bridge] fix the credential and start again: bridge pair {url}");
+                            logging::emit("cli", &url, &format!("error: automatic pairing failed: {e}"));
+                            logging::emit("cli", &url, &format!("fix the credential and start again: bridge pair {url}"));
                             std::process::exit(1);
                         }
                     }
@@ -367,7 +370,7 @@ fn bin_detected(bin: &str) -> bool {
 fn onboard(cfg: &mut DispatchConfig) {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if !tty {
-        eprintln!("[bridge] non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends are required; models are optional (CLI defaults apply)).");
+        logging::emit("cli", "", "non-interactive — skipping onboarding. `bridge doctor` lists what's still missing (agent backends are required; models are optional (CLI defaults apply)).");
         return;
     }
     println!("\n== onboard: which agents will drive tasks on this machine? ==\n");
@@ -694,7 +697,7 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
                     eprintln!("bridge logs: {MAX_CONSECUTIVE_FAILURES} consecutive hub failures — giving up. Last error: {e}");
                     std::process::exit(1);
                 }
-                eprintln!("[logs] {e} — retrying ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})");
+                logging::emit("cli", "", &format!("logs follow: {e} — retrying ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"));
             }
         }
         std::thread::sleep(poll_secs);

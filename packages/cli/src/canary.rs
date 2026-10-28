@@ -723,7 +723,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut ctx = match Ctx::resolve(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[hub-canary] fatal: {e}");
+            crate::logging::emit("canary", "", &format!("fatal: {e}"));
             return 2;
         }
     };

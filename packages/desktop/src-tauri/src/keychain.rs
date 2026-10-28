@@ -99,7 +99,7 @@ mod imp {
             }
             Err(e) if e.code() == ERR_MISSING_ENTITLEMENT => {
                 FALLBACK.store(true, Ordering::Relaxed);
-                eprintln!("[keychain] unsigned binary — data protection keychain unavailable, using ~/.bridge/gateway-token (0600)");
+                crate::logging::emit("keychain", "", "unsigned binary — data protection keychain unavailable, using ~/.bridge/gateway-token (0600)");
                 file::save_token(secret)
             }
             Err(e) => Err(format!("keychain write failed: {e}")),

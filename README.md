@@ -100,6 +100,16 @@ bridge logs --json          # raw JSON for scripts
 
 The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
+**Runner log format** (BR#4400): every operator-visible line from the runner — dispatch loop, in-process merge-train leg, store/session/keychain, CLI, canary — flows through one mechanism with one shape:
+
+```
+[2026-10-28T22:32:25Z] [train] [state-vector/bridge@main] queue: BR#4363 → BR#4362 → BR#3822
+[2026-10-28T22:33:10Z] [dispatch] [BR#4371] 21m in · heartbeat text…
+[2026-10-28T22:33:12Z] [train] tick error: hub rpc error (train_lease): kb temporarily unavailable — retry
+```
+
+Fields: `[<iso-utc>]` `[<subsystem>]` (`train | dispatch | pair | store | session | keychain | cli | canary`) `[<scope>]` (the lane, card, or workspace the line is about — omitted when process-global), then free text where event-style prefixes (`queue:`, `lease:`, `error:`) are the convention. The desktop gateway and the `bridge` CLI compile the same module (`packages/desktop/src-tauri/src/logging.rs`), so both binaries emit identically.
+
 Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. Models are the agent CLI's business, not the hub's: the runner injects the pinned id into the agent CLI's own config, and the CLI resolves it against its own provider config — `bridge doctor` reports the pin (and warns when unset) but does not validate it against anything hub-side. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
