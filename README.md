@@ -358,10 +358,13 @@ owners still release freely.
 
 **The train is visible on the board**: the Top view opens with a **merge trains** panel —
 one row per `repo@base` lane showing which machine holds the CAS lane lease (holder +
-heartbeat age, colour-graded against the 5-minute TTL), the in-flight merge phase, the
-derived queue (queued card ids, click to open), and any stop-the-line flag. Data comes from
-`GET /api/kb/train` (the hub's train.status snapshot), polled every 30s against the 45s tick.
-An idle lane reads honestly: `lock free`, `awaiting an available gateway`.
+heartbeat age, colour-graded against the 5-minute TTL), what the train is working on right
+now (in-flight phase + PR, and how long it has been in that phase), the merge throughput
+over trailing windows (`N/h · M/24h` from the train_events ledger) with the executor's last
+ledger event and the machine that did it, the derived queue (depth + head + queued card
+ids, click to open), and any stop-the-line flag. Data comes from `GET /api/kb/train` (the
+hub's train.status snapshot), polled every 30s against the 45s tick. An idle lane reads
+honestly: `lock free`, `awaiting an available gateway`.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>

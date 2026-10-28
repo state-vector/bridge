@@ -224,4 +224,17 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
+
+  it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {
+    // in-flight phase + duration (since the merge stamped merged_at)
+    expect(trainPanelSrc).toMatch(/l\.currently\.phase/);
+    expect(trainPanelSrc).toMatch(/age\(l\.currently\.merged_at, now\)/);
+    // queue depth with the head named
+    expect(trainPanelSrc).toMatch(/depth \{l\.queue\.length\}/);
+    expect(trainPanelSrc).toContain("head ${l.queue[0].id}");
+    // throughput rate over trailing windows + the last ledger event
+    expect(trainPanelSrc).toMatch(/l\.activity\.merged_1h/);
+    expect(trainPanelSrc).toContain("/24h");
+    expect(trainPanelSrc).toMatch(/l\.activity\.last_event\.kind/);
+  });
 });

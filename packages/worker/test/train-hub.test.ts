@@ -227,6 +227,17 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(hist.map((e: any) => e.kind)).toEqual(expect.arrayContaining(["merged", "landed"]));
     expect(hist.find((e: any) => e.kind === "landed").gateway).toBe("gw-1");
     expect(hist.find((e: any) => e.kind === "merged").task_id).toBe(card);
+
+    // the Top-view train panel's activity block: throughput over trailing
+    // windows + the last ledger event with gateway attribution
+    const act = (await laneSnap(repo)).activity;
+    expect(act).toBeTruthy();
+    expect(act.merged_1h).toBeGreaterThanOrEqual(1);
+    expect(act.merged_24h).toBeGreaterThanOrEqual(1);
+    expect(act.last_merge_ts).toBeGreaterThan(0);
+    expect(act.last_event.kind).toBe("landed");
+    expect(act.last_event.gateway).toBe("gw-1");
+    expect(act.last_event.task_id).toBe(card);
   });
 
   it("a merge-tree conflict bounces the head card with the fix-up brief (verdict INVALID) and the queue advances", async () => {

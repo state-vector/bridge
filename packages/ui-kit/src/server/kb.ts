@@ -154,11 +154,18 @@ export interface KbTrainLane {
   lane: string;
   card: string;
   lease: KbTrainLease | null;
-  currently: { phase?: string; merge_sha?: string; pr?: number } | null;
+  currently: { phase?: string; merge_sha?: string; pr?: number; head_sha?: string; merged_at?: number; task_id?: string } | null;
   stop: { sha?: string; reason?: string; at?: number; pr?: number } | null;
   required_workflows?: string[];
   reason?: string;
   queue: { id: string; priority: "critical" | "normal" }[];
+  /** executor activity (hub-computed over the train_events ledger) */
+  activity?: {
+    merged_1h: number;
+    merged_24h: number;
+    last_merge_ts: number | null;
+    last_event: { ts: number; kind: string; pr?: number; task_id?: string; gateway?: string } | null;
+  };
 }
 
 const base = () => getKbHubConfig().url;

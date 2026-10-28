@@ -87,15 +87,30 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             <Chip pill tone="muted" title="no gateway holds this lane's CAS lease — a tick will acquire it">lock free</Chip>
           )}
           {l.currently && (
-            <span className="train-currently" title={`in-flight merge: ${JSON.stringify(l.currently)}`}>
-              <Chip pill tone="live">{l.currently.phase ?? "merging"}</Chip>
+            <span className="train-currently" title={`in-flight: ${JSON.stringify(l.currently)}`}>
+              <Chip pill tone={l.currently.phase === "stopped" ? "err" : "live"}>{l.currently.phase ?? "merging"}</Chip>
               {l.currently.pr ? <a className="train-pr" href={`https://github.com/${l.lane.split("@")[0]}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{l.currently.pr}</a> : null}
+              {l.currently.merged_at ? (
+                <span className="train-dur top-num" title={`in this phase since ${new Date(l.currently.merged_at).toLocaleTimeString()}`}>
+                  {age(l.currently.merged_at, now)}
+                </span>
+              ) : null}
             </span>
           )}
-          {l.queue.length > 0 && (
-            <span className="train-queue" title="derived queue (hub-computed, oldest first) — click a card to open it">
-              <span className="train-queue-label top-num">{l.queue.length} queued</span>
-              {l.queue.map((q) => (
+          {l.activity && (
+            <span className="train-tp top-num" title="merge throughput over trailing windows (train_events ledger) — last event: what the executor did most recently, and from which machine">
+              <span className="train-tp-rate">▸ {l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
+              {l.activity.last_event && (
+                <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · task ${l.activity.last_event.task_id ?? "—"}`}>
+                  last: {l.activity.last_event.kind}
+                  {l.activity.last_event.pr ? ` #${l.activity.last_event.pr}` : ""} {age(l.activity.last_event.ts, now)} ago
+                </span>
+              )}
+            </span>
+          )}
+          <span className="train-queue" title="derived queue (hub-computed, oldest first) — click a card to open it">
+            <span className="train-queue-label top-num">depth {l.queue.length}{l.queue.length > 0 ? ` · head ${l.queue[0].id}` : ""}</span>
+            {l.queue.map((q) => (
                 <Chip
                   key={q.id}
                   tone={q.priority === "critical" ? "urgent" : "scope"}
@@ -106,8 +121,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   {q.id}
                 </Chip>
               ))}
-            </span>
-          )}
+          </span>
           {l.stop && (
             <Chip pill tone="err" title={`stop-the-line: ${l.stop.reason ?? ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`}>
               ⛔ stop-the-line
