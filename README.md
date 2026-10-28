@@ -127,9 +127,10 @@ builds; `~/.bridge/gateway-token`, mode 0600, on unsigned dev builds and
 Linux), and the device principal is write-once at `~/.bridge/principal`
 (0600) — `bridge reset-principal` is the only local clear. The principal is
 the device credential and anchors identity: the hub vends it on first pairing
-(24 random bytes, generated once, never regenerated), the device presents it
-on every pairing and desktop login, and re-pairing or re-login rotates the
-gateway token in place against it — the hostname is a display label only:
+(`dev_` + 24 random bytes hex, generated once, never regenerated), the device
+presents it on every pairing and desktop login, and re-pairing or re-login
+rotates the gateway token in place against it — the hostname is a display
+label only:
 
 **Rotation is graceful and self-healing (BR#3787)** — a gateway is never
 killed by a rotation and never needs a manual re-pair:
@@ -163,6 +164,19 @@ killed by a rotation and never needs a manual re-pair:
   principal forces a human re-pair; an admin revoke parks the gateway loudly
   (it claims nothing) instead of stopping it silently. Repairs are
   rate-limited per token (6/hour) so a crash loop can't mint infinitely.
+
+**Owner columns render labels, never anchors (BR#4262)** — the owner stored on
+a card is the **principal** (the matching anchor); every display surface
+(board, orient, get_artefact, my-tasks) resolves it through a render-time join
+to the owning token's **label**, falling back to the stored value verbatim
+when no token row matches (legacy `system:*` owners, hand-minted labels).
+Matching never uses the rendered label. And the namespaces never impersonate
+each other: new principals are vended `dev_`-shaped (`generatePrincipalId` —
+a principal can never be mistaken for a `bkw_` token; existing principals are
+not migrated), and every label door (`token.rename`, pair approve,
+`agent.provision`, human mint) rejects `bkw_`/`dev_`-prefixed labels — the
+2026-10-28/29 incident was a token-shaped string pasted as a label that then
+rendered into owner columns.
 
 ```jsonc
 {

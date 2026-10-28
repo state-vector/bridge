@@ -226,6 +226,35 @@ export function generateAuthToken(ws?: string | null): string {
   return isWsSlug(ws) ? `bkw_${ws}_${hex}` : `bkw_${hex}`;
 }
 
+/**
+ * BR#4262 identity rendering law — the PRINCIPAL is an anchor, never a
+ * credential: it vends with its own `dev_` namespace so it can never be
+ * mistaken for a `bkw_` auth token (the 2026-10-28/29 incident was a
+ * token-shaped principal rendered into an owner column). Same entropy as
+ * generateAuthToken (24 CSPRNG bytes hex); the prefix is the namespace, not
+ * a workspace. generateAuthToken stays secrets-only; existing principals are
+ * NOT migrated (re-shaping anchors breaks matching).
+ */
+export function generatePrincipalId(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `dev_${hex}`;
+}
+
+/**
+ * BR#4262 namespace separation — labels must never impersonate the credential
+ * (`bkw_…`) or principal (`dev_…`) namespaces. A token-shaped label rendered
+ * in an owner column is indistinguishable from a leaked secret; the incident
+ * row (`bkw_9938…` as a LABEL) existed only because the 64-char cap first
+ * admitted the paste. Enforced at every label door (token.rename, pair
+ * approve, agentProvision, tokenMint).
+ */
+export function assertHumanLabel(label: string): void {
+  if (/^(bkw|dev)_/.test(label))
+    throw new Error(`label '${label}' is rejected: the 'bkw_' / 'dev_' prefixes are reserved namespaces (auth tokens / principals) — labels must never impersonate credentials (BR#4262)`);
+}
+
 export async function hashAuthToken(secret: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");

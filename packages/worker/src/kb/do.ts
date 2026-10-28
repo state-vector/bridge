@@ -37,12 +37,14 @@ import {
   SETTINGS_KEYS,
   ASK_ANSWERED,
   ASK_OPEN,
+  assertHumanLabel,
   checkLimits,
   ftsQuery,
   formatId,
   FEEDBACK_TITLE_PREFIX,
   tallyConsensus,
   generateAuthToken,
+  generatePrincipalId,
   hashAuthToken,
   idSeq,
   isArtefactType,
@@ -173,6 +175,19 @@ function reconcileTrackingBody(repo: string, pr: number, title: string | null, w
  *  infinitely; past the limit the device parks and retries later. */
 export const TOKEN_REPAIR_LIMIT = 6;
 export const TOKEN_REPAIR_WINDOW_MS = 60 * 60 * 1000;
+
+/** BR#4262 identity rendering law — the display expression for the owner
+ *  column. The owner at REST is the PRINCIPAL (the anchor — claims stamp it,
+ *  every WHERE/matching path keys on it); READS resolve it to the owning
+ *  token's LABEL via this render-time join. Rows with no matching token row
+ *  (legacy `system:*` owners, hand-minted labels, empty owner) render the
+ *  stored value verbatim. When several token rows share a principal, the
+ *  live, most-recently-seen row's label wins — deterministic, display only.
+ *  Requires the outer artefacts table aliased `a`. */
+const OWNER_DISPLAY_SQL = `COALESCE(
+  (SELECT t.label FROM auth_tokens t WHERE t.principal = a.owner
+   ORDER BY (t.revoked_ts IS NULL) DESC, COALESCE(t.last_seen_ts, t.created_ts) DESC LIMIT 1),
+  a.owner)`;
 
 import {
   ROOT_BLOCKER_TAG,
@@ -947,9 +962,12 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
   }
 
   async board() {
+    // owner renders via the BR#4262 render-time join (principal at rest →
+    // label on display); matching below stays on ids/meta, never owner text
     const tasks = this.state.storage.sql.exec(
-      `SELECT id, type, title, status, owner, tags, roles, meta, body_md, status_ts, created_ts, updated_ts, project FROM artefacts
-       WHERE type IN ('task','question') ORDER BY updated_ts DESC LIMIT 200`,
+      `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
+       FROM artefacts a
+       WHERE a.type IN ('task','question') ORDER BY a.updated_ts DESC LIMIT 200`,
     ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
@@ -1723,6 +1741,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       const identity = await this.identify(String(body.bearer ?? ""));
       const newLabel = String(body.label ?? "").trim();
       if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
+      assertHumanLabel(newLabel); // BR#4262 — never impersonate the bkw_/dev_ namespaces
       const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
       if (!old) throw new Error("auth token not found");
       if (newLabel !== old.label) {
@@ -4082,8 +4101,9 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     const openStatuses = ["draft", "proposed", "active", "open", "todo", "in_progress", "blocked"];
     const marks = openStatuses.map(() => "?").join(",");
     const open = this.state.storage.sql.exec(
-      `SELECT id, type, title, status, owner, meta, updated_ts FROM artefacts
-       WHERE status IN (${marks}) ORDER BY updated_ts DESC LIMIT 30`,
+      `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.meta, a.updated_ts
+       FROM artefacts a
+       WHERE a.status IN (${marks}) ORDER BY a.updated_ts DESC LIMIT 30`,
       ...openStatuses,
     ).toArray().map((t: any) => {
       // agents orienting need the blocked context inline — the exit condition
@@ -4139,7 +4159,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       return {
         decision_id: d.id,
         title: d.title,
-        proposed_by: d.owner || undefined,
+        proposed_by: this.displayOwner(d.owner) || undefined,
         proposed_ts: d.created_ts,
         round_id: c?.round_id,
         round_title: c?.round_title,
@@ -4164,12 +4184,17 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     // `tags` rides my_tasks items (BR#2844 contract): the runner reads
     // role:* off them to route resumes — for months it read a key the hub
     // never sent (the silent-zero class); the contract now pins it.
+    // Matching keys on the STORED owner (label glob + principal — BR#4262:
+    // display never leaks into matching); the owner column in the payload is
+    // the render-time join display.
     const myTasks = this.state.storage.sql.exec(
-      `SELECT id, title, status, tags FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-       AND (owner = ? OR substr(owner, 1, length(?) + 1) = ? || '/'
-            OR owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
-            OR owner = ?)
-       ORDER BY updated_ts DESC LIMIT 10`,
+      `SELECT a.id, a.title, a.status, a.tags, ${OWNER_DISPLAY_SQL} AS owner
+       FROM artefacts a
+       WHERE a.type = 'task' AND a.status IN ('todo','in_progress','in_review','blocked')
+       AND (a.owner = ? OR substr(a.owner, 1, length(?) + 1) = ? || '/'
+            OR a.owner IN (SELECT agent FROM gateway_agents WHERE gateway = ?)
+            OR a.owner = ?)
+       ORDER BY a.updated_ts DESC LIMIT 10`,
       label, label, label, label, body.principal ?? null,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags) }));
     // dispatch surface: unclaimed todo tasks + BLOCKED tasks awaiting an agent
@@ -4802,6 +4827,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // _direct/* ownership can never be impersonated by a paired device
     if (/^_/.test(label)) throw new Error(`labels beginning with '_' are reserved system roots (got '${label}')`);
     if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
+    assertHumanLabel(label); // BR#4262 — never impersonate the bkw_/dev_ namespaces
     const member = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, ws, login);
     if (!member) throw new Error(`you are not a member of workspace '${ws}'`);
     // mint in the target workspace's DO (registers hash → ws in the central
@@ -4867,6 +4893,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (!this.isGatewayActor(caller)) throw new Error(`agent provisioning requires a gateway-class caller ('${caller}' does not carry the gateway tag)`);
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error(`agent label '${label}' must be 2-64 chars [a-zA-Z0-9._/-]`);
+    assertHumanLabel(label); // BR#4262 — never impersonate the bkw_/dev_ namespaces
     // a namespaced label (<gateway>/<agent>) may only live under the
     // provisioning gateway's own prefix — otherwise an agent label could
     // squat inside another gateway's ownership glob
@@ -4988,9 +5015,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       id = own.id as string;
       await register(hash, (vended ?? principal) || null);
     } else {
-      // first provision: the hub VENDS the device credential (one random
-      // generation approach — generateAuthToken is the only generator)
-      vended = principal || generateAuthToken();
+      // first provision: the hub VENDS the device credential. The principal is
+      // an anchor, never a credential — it vends with its own dev_ namespace
+      // (generatePrincipalId, BR#4262); generateAuthToken stays secrets-only
+      // so a principal can never be mistaken for a bkw_ token. Existing
+      // principals are NOT migrated (re-shaping anchors breaks matching).
+      vended = principal || generatePrincipalId();
       id = `at_${crypto.randomUUID().slice(0, 8)}`;
       let inserted = false;
       for (let attempt = 0; attempt < 20 && !inserted; attempt++) {
@@ -5035,6 +5065,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
+    assertHumanLabel(label); // BR#4262 — never impersonate the bkw_/dev_ namespaces
     // the only '/' allowed in a human-minted label is the reserved
     // _direct/ root — directly connected agents live there
     if (label.includes("/") && !label.startsWith("_direct/")) {
@@ -6475,8 +6506,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return this.state.storage.sql.exec(query, ...params).toArray()[0] ?? null;
   }
 
+  /** BR#4262 render-time join, single-row form (shape()'s payloads: get, list,
+   *  search, related, update echoes). Resolves a principal owner to its
+   *  token's label; anything else renders verbatim. Display only — every
+   *  matching path keeps the stored value. */
+  private displayOwner(owner: unknown): string {
+    const o = String(owner ?? "");
+    if (!o) return o;
+    const hit = this.one(
+      `SELECT label FROM auth_tokens WHERE principal = ?
+       ORDER BY (revoked_ts IS NULL) DESC, COALESCE(last_seen_ts, created_ts) DESC LIMIT 1`,
+      o,
+    ) as any;
+    return String(hit?.label ?? o);
+  }
+
   private shape(row: any): any {
-    return { ...row, meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
+    return { ...row, owner: this.displayOwner(row.owner), meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
   }
 
   private json(obj: unknown, status = 200) {

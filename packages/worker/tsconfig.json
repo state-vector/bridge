@@ -26,6 +26,7 @@
     // browser/DO typegraphs don't meet; the webapp's tsc + vitest cover it
     "test/verdict-supersede.test.ts",
     "test/rotation.test.ts",
+    "test/identity-render.test.ts",
     "test/spa-routing.test.ts"
   ]
 }
