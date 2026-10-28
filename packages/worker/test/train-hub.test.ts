@@ -473,4 +473,124 @@ describe("merge train DO drill (real bundled worker)", () => {
     });
     expect(idleRenew.body.error ?? "").toBe("");
   });
+
+  /** The open review-leg asks bound to a card (BR#4068 stamps them
+   *  review_leg on meta.ask). One live leg per (card, PR) — the dedupe
+   *  contract. */
+  async function reviewAsks(card: string): Promise<any[]> {
+    const { body } = await kbJson("/artefacts?type=question&limit=200");
+    return ((body.artefacts ?? []) as any[]).filter(
+      (a) => a.meta?.ask?.review_leg === true && String(a.title).includes(`(${card})`),
+    );
+  }
+
+  it("BR#4068 starvation law: a train:bounced card auto-boosts (priority 0) and the human review ask goes live in the SAME tick — no manual filing (BR#257 replay)", async () => {
+    const repo = "state-vector/lane-starve";
+    const HEAD = "b".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3101, head: HEAD, title: "IMPL: starvation-law drill" });
+    await acquire(repo, "gw-starve", { required_workflows: ["Test"] });
+
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-starve", pr: 3101, task_id: card,
+      head_sha: HEAD, conflict_files: ["packages/worker/src/kb/do.ts"],
+    });
+    expect(bounced.body.error ?? "", `train:bounced failed: ${JSON.stringify(bounced.body)}`).toBe("");
+
+    // leg 1: boosted to priority 0 by the bounce itself — the claim ranking
+    // (do.ts rank) and the Backlog ▲ read exactly this stamp
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.meta?.boosted).toBeGreaterThan(0);
+    expect(c.status).toBe("in_progress");
+    expect(c.meta?.merge_train?.state).toBe("bounced");
+    // the boost is on the audit chain, not a silent meta write
+    const h = JSON.stringify(await (await kbJson("/get_history", { id: card, limit: 10 })).body);
+    expect(h).toContain("boosted (priority 0 — train bounce");
+
+    // legs 2+3: the live human review ask — hub-filed, For Me-shaped
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    const ask = live[0];
+    expect(["todo", "in_progress", "blocked"]).toContain(ask.status);
+    expect(ask.meta.ask.to).toBe("human");
+    expect(ask.meta.ask.urgency).toBe("time-sensitive");
+    expect(ask.meta.ask.artefact_id).toBe(card);
+    expect(String(ask.title)).toContain("Review requested");
+    expect(String(ask.title)).toContain("one click from landed");
+    expect(String(ask.title).endsWith("?")).toBe(true);
+    expect(ask.meta.ask.options.length).toBeGreaterThanOrEqual(2);
+    expect(String(ask.body_md)).toContain("dismissed the stale GitHub review");
+    expect(String(ask.body_md)).toContain(`pull/3101`);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-starve" });
+  });
+
+  it("BR#4068: the review ask re-files DEDUPE-SAFE (one live leg, refreshed not duplicated) and the boost decays on re-queue — never auto-expired mid-repair", async () => {
+    const repo = "state-vector/lane-refile";
+    const H1 = "1".repeat(40), H1b = "2".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3201, head: H1, title: "IMPL: dedupe re-file drill" });
+    await acquire(repo, "gw-refile", { required_workflows: ["Test"] });
+
+    // bounce #1 — boosted + ask filed
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-refile", pr: 3201, task_id: card, head_sha: H1, conflict_files: ["a.ts"] })).body.error ?? "").toBe("");
+    expect((await reviewAsks(card)).length).toBe(1);
+
+    // repair: in_progress → in_review, fresh verify at the new head → re-queued
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `conflict resolved — PR https://github.com/${repo}/pull/3201` });
+    const v2 = await kbJson("/create", { type: "task", title: `VERIFY: re-file ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const v2id = String(v2.body.id);
+    await kbJson("/link", { src: v2id, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: v2id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    await kbJson("/transition", { id: v2id, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3201 head ${H1b}` });
+
+    // decay: re-entry cleared the bounce boost — the card is back in line
+    let c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.merge_train?.state).toBe("queued");
+    expect(c.meta?.boosted).toBeUndefined();
+
+    // bounce #2: the head moved past the verdict AGAIN. The open ask from #1
+    // is REFRESHED (the live leg), never duplicated.
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-refile", pr: 3201, task_id: card, head_sha: H1b, conflict_files: ["a.ts", "b.ts"] })).body.error ?? "").toBe("");
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    expect(live[0].meta.ask.refreshed_ts).toBeGreaterThan(0);
+    // …and the card re-boosted: still one mechanical leg from landed
+    c = (await kbJson("/get", { id: card })).body;
+    expect(c.meta?.boosted).toBeGreaterThan(0);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-refile" });
+  });
+
+  it("BR#4068: landing the card retires the live review ask — the unanswered ask never fences the landed close (done-open-children)", async () => {
+    const repo = "state-vector/lane-retire";
+    const HEAD = "3".repeat(40), M = "4".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3301, head: HEAD, title: "IMPL: leg-retire drill" });
+    await acquire(repo, "gw-retire", { required_workflows: ["Test"] });
+
+    // bounce → the ask lives → repair → re-queue → merge → green ⇒ landed close
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-retire", pr: 3301, task_id: card, head_sha: HEAD, conflict_files: ["x.ts"] })).body.error ?? "").toBe("");
+    expect((await reviewAsks(card)).length).toBe(1);
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `resolved — PR https://github.com/${repo}/pull/3301` });
+    const v = await kbJson("/create", { type: "task", title: `VERIFY: retire ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const vid = String(v.body.id);
+    await kbJson("/link", { src: vid, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: vid, to: "in_progress", actor: "drill-verifier", note: "re-verifying" });
+    await kbJson("/transition", { id: vid, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3301 head ${HEAD}` });
+    const merged = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-retire", pr: 3301, merge_sha: M, head_sha: HEAD, task_id: card });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const landed = await kbJson("/train.ci", { repo, base: "main", actor: "gw-retire", sha: M, checks: [check(41, "Test", "success")] });
+    expect(landed.body.decided).toBe("landed");
+
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("done");
+    expect(c.meta?.merge_train?.state).toBe("landed");
+    // the close retired the dead leg — the band never shows a landed card's ask
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    expect(live[0].status).toBe("done");
+    expect(live[0].meta.ask.answered_by).toBe("system:starvation-law");
+    expect(String(live[0].meta.ask.answer)).toContain("landed");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
+  });
 });

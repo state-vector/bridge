@@ -589,6 +589,19 @@ machine-clean carry chain:
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
   a fresh verify accepts the new head.
+- **Bounced cards cannot starve (BR#4068)** — a bounced card is the most valuable work
+  on the board: verified once, one mechanical leg (rebase) plus one human review from
+  landed. So the bounce itself (a) **auto-boosts the card to priority 0** — the same
+  `boosted` stamp the human ▲ boost writes, read by the claim ranking, the train rank
+  and the Backlog; it decays only when the card re-enters the train (re-queue), never
+  auto-expiring mid-repair — and (b) **re-files the human review ask**: a push
+  dismisses the stale GitHub review (GitHub law), so the head move past the accepted
+  verdict silently lapses the human leg. The hub re-posts the standing review ask
+  (deduped per card+PR — a re-bounce refreshes the live ask instead of duplicating it;
+  a new head move after an answer posts a fresh leg) so **For Me always shows the live
+  leg** as "Review requested … one click from landed?". The ask is a visibility device,
+  not work: it never fences the card's done, and the landed (or superseded) close
+  retires it automatically.
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects

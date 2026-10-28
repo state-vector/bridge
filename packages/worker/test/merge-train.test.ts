@@ -19,6 +19,8 @@ import {
   trainParseNoteLegs,
   trainQueueRemainingReason,
   trainStopAskTitle,
+  trainReviewAskTitle,
+  trainReviewAskDetails,
   verdictCoversHead,
   verdictCoversHeadLeg,
   TRAIN_CI_BOUND_MULTIPLIER,
@@ -417,6 +419,31 @@ describe("train event copy", () => {
     const bare = trainBounceBrief({ prNumber: 1, repo: "r", headSha: null, conflictFiles: [], verdictId: null });
     expect(bare).toContain("(no file list supplied");
     expect(bare).toContain("prior verdict is INVALID");
+  });
+
+  it("trainReviewAskTitle dedupes per (card, PR) — stable across re-bounces, carries the For Me phrasing, holds the ask contract (BR#4068)", () => {
+    const t = trainReviewAskTitle({ repo: "state-vector/bridge" }, 2476, "BR#257");
+    expect(t).toContain("Review requested");
+    expect(t).toContain("one click from landed");
+    expect(t).toContain("bridge#2476");
+    expect(t).toContain("(BR#257)");
+    expect(t.endsWith("?")).toBe(true);
+    expect(t.length).toBeLessThanOrEqual(240);
+    // the dedupe key: identical per (card, PR) so the identical-open-ask
+    // guard collapses re-bounces of the same leg onto the live ask
+    expect(trainReviewAskTitle({ repo: "state-vector/bridge" }, 2476, "BR#257")).toBe(t);
+    // a different leg is a different ask
+    expect(trainReviewAskTitle({ repo: "state-vector/bridge" }, 2477, "BR#257")).not.toBe(t);
+  });
+
+  it("trainReviewAskDetails names the lapse law and the live leg; no file list → say so honestly (BR#4068)", () => {
+    const d = trainReviewAskDetails({ repo: "state-vector/bridge", prNumber: 2476, taskId: "BR#257", headSha: "b".repeat(40), conflictFiles: ["src/a.ts"] });
+    expect(d).toContain("dismissed the stale GitHub review");
+    expect(d).toContain("priority 0");
+    expect(d).toContain("- `src/a.ts`");
+    expect(d).toContain("github.com/state-vector/bridge/pull/2476");
+    const bare = trainReviewAskDetails({ repo: "r", prNumber: 1, taskId: "BR#1", headSha: null, conflictFiles: [] });
+    expect(bare).toContain("the executor enumerates them on the trial rebase");
   });
 
   it("trainLandedCloseNote cites the PR, the gateway, and the machine proxy", () => {
