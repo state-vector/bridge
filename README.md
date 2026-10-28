@@ -115,7 +115,7 @@ Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
 - **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). Verify-verdict notifications state the ask ("Accept verification of BR#X? — verdict PASS"), not the raw receipts title. No runner required.
-- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade, or a token the hub rejects), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates.
+- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates. (A token the hub *rejects* mid-run is not a sign-out anymore — see the self-heal law below: the gateway parks loudly and recovers on its own, BR#4113.)
 
 ### Runner config file
 
@@ -147,11 +147,22 @@ killed by a rotation and never needs a manual re-pair:
   `x-bridge-token-epoch`; the runner re-vends its own row proactively at the
   next tick boundary when the epoch moves (`POST /api/token/repair`, agent
   plane — the principal is the credential, so **headless gateways self-heal
-  without a human session**). On a hard 401 the same repair runs first, the
-  desktop self-provision second, loud logout last — and every repair failure
-  reason is logged, never swallowed. Only a lost/revoked principal (or an
-  admin revoke) forces a human re-pair. Repairs are rate-limited per token
-  (6/hour) so a crash loop can't mint infinitely.
+  without a human session**). On a hard 401/403 the runner classifies the
+  failure and runs the **self-heal ladder** — keychain reload (another
+  process may have re-vended), principal repair, desktop self-provision —
+  with exponential backoff (5s doubling, 300s cap), and every repair failure
+  reason is logged, never swallowed. **Auth failure is never terminal while
+  desired state is "running" (BR#4113)**: there is no logout-and-halt path
+  left in the loop. If the ladder stays blocked the gateway PARKS LOUDLY — a
+  `needs attention` banner in the app (and `needs_attention` in
+  `~/.bridge/dispatch/runner.json`) — while it keeps polling and retrying on
+  the capped cadence, resuming dispatch on its own within one poll interval
+  the moment the hub accepts the device again (grace window, rollback, row
+  restore) — zero human action. Only the identity-law gate (a saved token
+  that is not gateway-class) signs the desktop out, and only a lost/revoked
+  principal forces a human re-pair; an admin revoke parks the gateway loudly
+  (it claims nothing) instead of stopping it silently. Repairs are
+  rate-limited per token (6/hour) so a crash loop can't mint infinitely.
 
 ```jsonc
 {
