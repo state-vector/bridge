@@ -1770,6 +1770,39 @@ export function trainBounceBrief(input: {
   ].join("\n");
 }
 
+/** BR#4068 starvation law — the standing human-review ask for a bounced
+ *  card. Deterministic per (card, PR): re-bounces of the same leg while the
+ *  ask is open dedupe (identical-open-ask guard); an ANSWERED ask re-posts
+ *  fresh, because a new head move past the verdict is a NEW live leg. The
+ *  title carries the For Me phrasing so the band reads the leg's state
+ *  ("review requested — one click from landed"). ≤240 chars, ends "?" —
+ *  the ask contract. */
+export function trainReviewAskTitle(lane: { repo: string }, prNumber: number, taskId: string): string {
+  return `Review requested on ${lane.repo}#${prNumber} (${taskId}) after a merge-train bounce — one click from landed?`;
+}
+
+/** The review ask's details: what bounced, why the human leg lapsed (a push
+ *  dismisses the stale GitHub review — GitHub law), and what the live leg
+ *  is. The refresh story rides here too: the ask re-files dedupe-safe on
+ *  every head move past the accepted verdict until the card re-enters the
+ *  train. */
+export function trainReviewAskDetails(input: { repo: string; prNumber: number; taskId: string; headSha: string | null; conflictFiles: string[] }): string {
+  const files = input.conflictFiles.length
+    ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
+    : "- (no file list supplied — the executor enumerates them on the trial rebase)";
+  return [
+    `The merge train bounced ${input.taskId}: PR ${input.repo}#${input.prNumber} no longer merges cleanly with its base${input.headSha ? ` (head ${input.headSha.slice(0, 9)})` : ""}.`,
+    ``,
+    `**Conflicting files:**`,
+    files,
+    ``,
+    `**Why this reaches you:** the push that moved the head past the accepted verdict dismissed the stale GitHub review, so the human review leg silently lapsed. The card is verified once and one mechanical leg (rebase) plus this review away from landing — it now rides priority 0 so it cannot starve (BR#4068).`,
+    ``,
+    `This ask is the live leg. It re-files (deduped) on every further head move until the card re-enters the train; answering it retires it.`,
+    `PR: https://github.com/${input.repo}/pull/${input.prNumber}`,
+  ].join("\n");
+}
+
 /** Deterministic stop-the-line ask title (ONE per red episode — the sha makes
  *  it unique; askCreate's identical-open-ask guard dedupes). ≤240 chars,
  *  ends "?" — the ask contract. */

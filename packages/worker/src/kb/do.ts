@@ -91,6 +91,8 @@ import {
   trainBounceBrief,
   resolveTrainBounceKind,
   trainStopAskTitle,
+  trainReviewAskTitle,
+  trainReviewAskDetails,
   trainLandedCloseNote,
   releaseHold,
   trainProxyEvent,
@@ -2458,10 +2460,18 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
            WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
           id,
         ),
+      // BR#4068: the bounce's live review-leg ask is a VISIBILITY DEVICE
+      // (the human leg re-filed on a head move), not decomposition work — it
+      // must never fence the parent's done. The train's landed close runs
+      // blocked→in_progress→done while the ask may sit unanswered; counting
+      // it as an open child would deadlock every one-click-from-landed card
+      // behind its own review ask. The ask is retired by the close itself
+      // (doTransition's retirement leg), so the band never shows a dead leg.
       openChildren: () =>
         this.one(
           `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')`,
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
+             AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')`,
           id,
         )?.n ?? 0,
       // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
@@ -2984,6 +2994,34 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           this.version(id, "system:churn-guard", "note", `release redirected to blocked — ${fx.attempts} attempts without completion`, { attempts: fx.attempts, silent_cycles: fx.silent_cycles });
           break;
         }
+      }
+    }
+    // BR#4068 starvation law — retire the LIVE-LEG asks of a card that is
+    // leaving the board. The bounce re-files the human review ask as a
+    // child_of question; open questions are children, and the done gate
+    // fences a parent with open children — so the train's landed close
+    // (blocked→in_progress→done) would bounce off done-open-children while
+    // the ask sat unanswered. When the subject lands or is superseded the
+    // leg is moot: auto-retire ONLY the asks this law filed (meta.ask
+    // .review_leg), leaving human asks, decisions and every other question
+    // child untouched.
+    if (row.type === "task" && (to === "done" || to === "superseded")) {
+      const openAsks = this.state.storage.sql.exec(
+        `SELECT c.id AS id, c.status AS status, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.type = 'question'`,
+        id,
+      ).toArray() as any[];
+      for (const ask of openAsks) {
+        const am = JSON.parse(ask.meta ?? "{}");
+        if (am.ask?.review_leg !== true || am.ask.answer) continue;
+        am.ask = { ...am.ask, answer: to === "superseded" ? "subject superseded — review leg retired (BR#4068)" : "subject landed — review leg retired (BR#4068)", answered_by: "system:starvation-law", answered_ts: ts };
+        const ansTs = Date.now();
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET meta = ?, status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
+          JSON.stringify(am), ansTs, ansTs, ask.id,
+        );
+        this.version(ask.id, "system:starvation-law", "transition", `answered by system:starvation-law: ${am.ask.answer}`, { from: ask.status, to: "done", answer: am.ask.answer });
+        this.audit("system:starvation-law", "ask", id, { review_leg_retired: ask.id, subject: id, to });
       }
     }
     // replay consistency: fold the version log forward and compare with the
@@ -3621,7 +3659,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         title: question.slice(0, 200),
         body_md: details || question,
         owner: "",
-        meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined } },
+        meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
       },
       actor,
     );
@@ -5394,6 +5432,53 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           : bounceKind === "gate"
             ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
             : `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`;
+      // BR#4068 starvation law (leg 2): the head move past the accepted
+      // verdict dismissed the stale GitHub review (GitHub law) — the human
+      // leg silently lapses and a one-leg-from-landed card sits. Re-post the
+      // standing review ask NOW, while the card is still blocked: askCreate
+      // auto-blocks an IN_PROGRESS subject, which would freeze the executor
+      // leg — the exact starvation this law kills. The identical-open-ask
+      // guard dedupes re-bounces of the same leg; an answered ask re-posts
+      // fresh (a new head move is a new live leg). For Me reads open asks,
+      // so the band shows the live leg with no manual filing (leg 3).
+      let reviewAskId: string | null = null;
+      let reviewAskDeduped = false;
+      const reviewAskTitle = trainReviewAskTitle({ repo }, pr, taskId);
+      try {
+        const res: any = await this.askCreate(
+          {
+            to: "human",
+            question: reviewAskTitle,
+            reason: "the head move past the accepted verdict dismissed the stale GitHub review — without a re-filed ask the human leg lapses silently and a card one mechanical leg from landed starves at default priority (BR#4068)",
+            details: trainReviewAskDetails({ repo, prNumber: pr, taskId, headSha, conflictFiles }),
+            options: ["Approved — it can re-queue", "Changes requested — see my review", "Not yet — will review soon"],
+            artefact_id: taskId,
+            urgency: "time-sensitive",
+            review_leg: true,
+          },
+          actor,
+        );
+        reviewAskId = res?.id ?? null;
+      } catch (e) {
+        // an identical ask is already open — that IS the live leg. Refresh it
+        // (bump the stamp so the band shows it as current) and carry on: the
+        // bounce must never lose to ask dedupe.
+        reviewAskDeduped = true;
+        const dup = this.one(
+          `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+             AND c.type = 'question' AND c.title = ? LIMIT 1`,
+          taskId, reviewAskTitle.slice(0, 200),
+        ) as any;
+        if (dup) {
+          const dm = JSON.parse(dup.meta ?? "{}");
+          dm.ask = { ...(dm.ask ?? {}), review_leg: true, refreshed_ts: now };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(dm), now, dup.id);
+          this.version(dup.id, actor, "update", "review ask refreshed — the head moved past the accepted verdict again (BR#4068)", {});
+          reviewAskId = dup.id;
+        }
+        this.audit(actor, "train:bounce_ask_deduped", lane.id, { task: taskId, pr, ask: reviewAskId, reason: String((e as Error)?.message ?? e).slice(0, 160) });
+      }
       // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
       // a bounced merge-ready card is the board's highest-value work — one
       // mechanical/human leg from landing — and must not re-enter at default
@@ -5408,6 +5493,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           bounce_kind: bounceKind,
           defect: (defect ?? "").slice(0, 300) || undefined,
           conflict_files: conflictFiles,
+          review_ask_id: reviewAskId ?? undefined,
+          review_ask_deduped: reviewAskDeduped || undefined,
           bounced_at: now2,
           pr,
           repo,
@@ -5450,8 +5537,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; impl re-enters review manually` });
         }
       }
-      cm.merge_train = { ...(cm.merge_train ?? {}), state: "bounced", pr, bounced_at: now };
+      cm.merge_train = nextMeta.merge_train;
+      // BR#4068 starvation law (leg 1): a bounced card is the most valuable
+      // work on the board — verified once, one mechanical leg from landed.
+      // Stamp the SAME boost the human boost writes; the rank seams already
+      // read it (claim ranking do.ts rank(), train rank core.ts, Backlog ▲).
+      // Decay is the accept hook's job: re-queue deletes it — never
+      // auto-expire mid-repair.
+      cm.boosted = now;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
+      this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, ask: reviewAskId });
+      this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
       meta.currently = null;
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
@@ -5716,6 +5812,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     meta.prs = withStampHeads;
     meta.pr = { ...(meta.pr ?? {}), repo: withStampHeads[0].repo, number: withStampHeads[0].number, head_sha_at_acceptance: withStampHeads[0].head_sha_at_acceptance, ...(withStampHeads[0].base ? { base: withStampHeads[0].base } : {}) };
     meta.merge_train = { ...(meta.merge_train ?? {}), state: "queued", at: Date.now(), pr: withStampHeads[0].number, repo: withStampHeads[0].repo, legs_total: withStampHeads.length };
+    // BR#4068 decay: the bounce boost survives the repair but not the
+    // re-entry — the card is back in line, so it re-joins the normal ranks
+    // (FIFO by queued-at). It was never auto-expired mid-repair.
+    if (meta.boosted) {
+      delete meta.boosted;
+      this.audit(actor, "unboost", parentId, { root: parentId, via: "train:queued" });
+      this.version(parentId, actor, "update", "boost decayed — re-queued on the merge train (BR#4068)", {});
+    }
     const alreadyQueued = parent.status === "blocked" && blockedReason().startsWith(MERGE_TRAIN_REASON_PREFIX);
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
     if (!alreadyQueued) {
