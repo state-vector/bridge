@@ -212,6 +212,13 @@ export class KnowledgeHub {
     const since = Number(new URL(request.url).searchParams.get("since") ?? 0);
     const recent = await this.eventsSince(since, 100);
     pair[1].send(JSON.stringify({ type: "kb.events", events: recent.events }));
+    // BR#4362: hydrate the board OVER THE SOCKET — the stream carries state,
+    // clients never poll. Cached snapshot (≤2s stale) is fine for hydration;
+    // live updates arrive as coalesced kb.board pushes below.
+    try {
+      const board = await this.boardPayload();
+      pair[1].send(JSON.stringify({ type: "kb.board", board }));
+    } catch { /* hydration falls back to the client's one-shot fetch */ }
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -224,10 +231,55 @@ export class KnowledgeHub {
 
   webSocketClose() {}
 
+  // BR#4362 push-driven board: the socket is the source of truth, never a
+  // doorbell. One coalesced snapshot per second max, no matter the mutation
+  // rate or the client count — the 2026-10-29 overload was every client
+  // refetching the FULL board per event (11 board GETs/sec on one DO).
+  private boardCache: { at: number; body: any } | null = null;
+  private boardLastPush = 0;
+  private boardDirty = false;
+  private boardBuilds = 0;
+  private boardPushes = 0;
+
+  /** Board payload with a 2s TTL for pull consumers (hydration, stragglers).
+   *  Push consumers force a fresh build so a push never carries a snapshot
+   *  that predates the mutation that triggered it. */
+  private async boardPayload(force = false): Promise<any> {
+    if (!force && this.boardCache && Date.now() - this.boardCache.at < 2000) return this.boardCache.body;
+    const body = await this.board();
+    this.boardBuilds++;
+    this.boardCache = { at: Date.now(), body };
+    return body;
+  }
+
+  /** Build once, send to every socket. Fire-and-forget on the mutation path —
+   *  a failing push never fails the write that triggered it. */
+  private pushBoardSnapshot(force = true): void {
+    this.boardPushes++;
+    this.boardPayload(force)
+      .then((board) => {
+        const frame = JSON.stringify({ type: "kb.board", board });
+        for (const ws of this.state.getWebSockets()) {
+          try { ws.send(frame); } catch { this.wsSendFail++; }
+        }
+      })
+      .catch(() => { /* counted as no push; the tail flush retries next tick */ });
+  }
+
   private broadcastEvent(ev: unknown) {
     const frame = JSON.stringify({ type: "kb.event", event: ev });
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(frame); } catch { this.wsSendFail++; /* hibernated client gone — counted (BR#4212) */ }
+    }
+    // coalesced state push: ≥1s between builds; the burst's tail mutation is
+    // flushed by the alarm tail-flush below (≤60s worst case, events already
+    // delivered per-event above)
+    if (!this.state.getWebSockets().length) return;
+    this.boardDirty = true;
+    if (Date.now() - this.boardLastPush >= 1000) {
+      this.boardLastPush = Date.now();
+      this.boardDirty = false;
+      this.pushBoardSnapshot();
     }
   }
 
@@ -257,6 +309,13 @@ export class KnowledgeHub {
       await this.state.storage.setAlarm(Date.now() + 60_000);
     } catch (e) {
       this.noteStorageFault("alarm_rearm", e);
+    }
+    // BR#4362: flush a burst's tail board push (the ≥1s coalescer in
+    // broadcastEvent may have swallowed the last mutation of a burst)
+    if (this.boardDirty && Date.now() - this.boardLastPush >= 1000) {
+      this.boardDirty = false;
+      this.boardLastPush = Date.now();
+      this.pushBoardSnapshot();
     }
     try {
       await this.alarmSweep();
@@ -1845,7 +1904,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-          case "/board": return this.json(await this.board());
+          case "/board": return this.json(await this.boardPayload());
           case "/stats": return this.json(await this.stats());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
@@ -3403,6 +3462,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         routes: this.routeStats,
         entry_faults: this.storageFaults,
         ws_send_fail: this.wsSendFail,
+        board: { builds: this.boardBuilds, pushes: this.boardPushes }, // BR#4362: push health — builds bounded ≤~1/s under storm
         last_flush: lastFlush,
       },
     };

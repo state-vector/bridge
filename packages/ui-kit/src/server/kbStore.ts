@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { connectKbWs, kbApi, KbAuthError } from "./kb";
+import { connectKbWs, kbApi, KbAuthError, wsPushAvailable } from "./kb";
 import type { KbArtefact, KbAuthToken, KbEvent, KbGatewayAgentEdge, KbProgress, KbSeriesPoint, KbSession } from "./kb";
 import { getKbHubConfig } from "./config";
 
@@ -97,14 +97,29 @@ export const useKb = create<KbState>((set, get) => ({
       set({ conn: "off" });
       return;
     }
+    // BR#4362 push-driven board — the stream carries state; no per-event
+    // refetch (the 2026-10-29 DO overload was exactly that storm). Push-mode
+    // shells (WS) apply kb.board snapshots verbatim. Poll-mode shells
+    // (desktop transport, no WS through the Rust host yet) coalesce an event
+    // burst into ONE board fetch, trailing-edge.
+    let pollRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const schedulePollRefresh = () => {
+      if (pollRefreshTimer) return;
+      pollRefreshTimer = setTimeout(() => {
+        pollRefreshTimer = null;
+        void get().refresh();
+      }, 1500);
+    };
     stopWs = connectKbWs(
       (ev) => {
         const s = get();
         if (s.events.some((e) => e.seq >= ev.seq)) return;
         set({ events: [ev, ...s.events].slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.seq) });
-        void s.refresh();
+        if (!wsPushAvailable()) schedulePollRefresh();
       },
+      (board) => set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [] }),
       (conn) => set({ conn }),
+      () => get().lastSeq,
     );
     void get().refresh();
     void get().refreshAdmin();
@@ -125,12 +140,9 @@ export const useKb = create<KbState>((set, get) => ({
     try {
       const board = await kbApi.board();
       set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [] });
-      const ev = await kbApi.events(get().lastSeq);
-      if (ev.events.length) {
-        const s = get();
-        const merged = [...ev.events.slice().reverse(), ...s.events.filter((e) => !ev.events.some((n) => n.seq === e.seq))];
-        set({ events: merged.slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.last_seq) });
-      }
+      // events are NOT re-pulled here (BR#4362): the stream owns events —
+      // WS accept replays since=lastSeq, the poll path tails them. Refresh is
+      // hydration + manual only.
       // a success clears its own context's stale error — without this the ⚠
       // is a fossil from the last transient failure (deploy window, edge
       // hiccup) that never goes away

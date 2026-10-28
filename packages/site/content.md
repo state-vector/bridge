@@ -193,7 +193,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 
 ## Principles
 
-1. **Free tier only.** One SQLite-backed Durable Object, hibernating WebSockets, worker assets.
+1. **Free tier only.** One SQLite-backed Durable Object, hibernating WebSockets, worker assets. The board is push-driven: mutations stream over the socket and the hub pushes coalesced board snapshots (≤1 build/sec under any storm) — clients never poll.
 2. **The app dispatches; agents are trusted pollers.** No supervisor LLM. Deterministic loops, structured gates.
 3. **Humans are the final escalation.** Decisions need a human click; agents propose.
 4. **Nothing fabricated.** The board shows what agents actually report. Absence is visible.
