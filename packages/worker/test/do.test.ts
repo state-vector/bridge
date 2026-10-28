@@ -269,8 +269,13 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     }
     expect(parkedDuties).toEqual([]);
 
-    // answering the ask resumes the card exactly once and clears the marker
-    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "KEEP — stay parked" });
+    // answering the ask resumes the card exactly once and clears the marker.
+    // Rebase conflict vs BR#3578/BR#3912 answer dispatch (landed while this
+    // PR was queued): an option-verb answer ("KEEP …") now actions the card —
+    // KEEPs it parked, the human owns the rewrite — so the generic resume
+    // under test here is the TYPED non-option answer ("a typed answer
+    // matching no option verb is still the generic resume").
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO — lease looks sound, carry on" });
     expect(ans.status).toBe(200);
     expect(ans.body.task_status).toBe("in_progress");
 
