@@ -226,6 +226,37 @@ export class KnowledgeHub {
   private boardBuilds = 0;
   private boardPushes = 0;
 
+  // BR#4397 pull-surface rate limits — a brake against pollers, never against
+  // push clients. The DO is single-threaded, so in-memory windows are exact.
+  // Key: the worker's x-kb-rate-key (web login or client IP); absent header
+  // (direct MCP/admin plane) ⇒ unlimited — the agent protocol's cadence is
+  // legitimate and orient/progress are not the overload vector.
+  private rlBuckets = new Map<string, number[]>();
+  private rlLimited = 0;
+
+  /** Sliding-window check. Returns a 429 Response when over the limit, else
+   *  null (call through). Over-limit responses name the push channel. */
+  private limited(route: string, max: number, windowMs: number, request?: Request): Response | null {
+    const key = request?.headers.get("x-kb-rate-key");
+    if (!key) return null;
+    const k = `${route}|${key}`;
+    const now = Date.now();
+    const arr = (this.rlBuckets.get(k) ?? []).filter((t) => now - t < windowMs);
+    if (arr.length >= max) {
+      this.rlBuckets.set(k, arr);
+      this.rlLimited++;
+      const retryAfter = Math.max(1, Math.ceil((windowMs - (now - arr[0])) / 1000));
+      return new Response(
+        JSON.stringify({ error: `rate limited: ${route} allows ${max}/min per client — the board is push-driven, use /kb-ws (kb.board snapshots + kb.event frames); pull is hydration-only`, retry_after: retryAfter }),
+        { status: 429, headers: { "content-type": "application/json", "retry-after": String(retryAfter), "cache-control": "no-store" } },
+      );
+    }
+    arr.push(now);
+    this.rlBuckets.set(k, arr);
+    if (this.rlBuckets.size > 5000) this.rlBuckets.clear(); // bounded by clients; crude prune is fine
+    return null;
+  }
+
   /** Board payload with a 2s TTL for pull consumers (hydration, stragglers).
    *  Push consumers force a fresh build so a push never carries a snapshot
    *  that predates the mutation that triggered it. */
@@ -1874,8 +1905,10 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
-          case "/events": return this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-          case "/board": return this.json(await this.boardPayload());
+          case "/events": return this.limited("events", 120, 60_000, request)
+            ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+          case "/board": return this.limited("board", 30, 60_000, request)
+            ?? this.json(await this.boardPayload());
           case "/stats": return this.json(await this.stats());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
@@ -3434,6 +3467,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         entry_faults: this.storageFaults,
         ws_send_fail: this.wsSendFail,
         board: { builds: this.boardBuilds, pushes: this.boardPushes }, // BR#4362: push health — builds bounded ≤~1/s under storm
+        rate_limited: this.rlLimited, // BR#4397: pull-surface 429s served
         last_flush: lastFlush,
       },
     };

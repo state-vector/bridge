@@ -206,7 +206,12 @@ export default {
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
-        return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(kbUrl + url.search, request)));
+        // BR#4397 rate-key: the DO limits pull surfaces per identity — web
+        // login when signed in, else client IP (bearer GETs key by IP too)
+        const rateKey = auth.login ? `web:${auth.login}` : `ip:${request.headers.get("cf-connecting-ip") ?? "anon"}`;
+        const fwd = new Request(kbUrl + url.search, request);
+        fwd.headers.set("x-kb-rate-key", rateKey);
+        return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(fwd)));
       }
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {

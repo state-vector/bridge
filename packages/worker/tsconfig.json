@@ -27,6 +27,7 @@
     "test/verdict-supersede.test.ts",
     "test/rotation.test.ts",
     "test/spa-routing.test.ts",
-    "test/push-board.test.ts"
+    "test/push-board.test.ts",
+    "test/rate-limit.test.ts"
   ]
 }

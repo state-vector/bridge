@@ -120,7 +120,9 @@ fetch nothing on a timer; `GET /board` stays as a 2s-cached hydration path
 for stragglers. Desktop shells whose webview can't hold a cross-origin
 socket tail the events mirror adaptively (2s while busy, backing off to 30s
 idle) and coalesce event bursts into one refresh — the 2026-10-29 overload
-was every client refetching the full board per event.
+was every client refetching the full board per event. Pull surfaces are
+rate-limited per identity as a backstop (`/board` 30/min, `/events`
+120/min; 429 + Retry-After naming the socket) — pollers brake themselves.
 
 Beyond dispatch it carries three human-facing surfaces:
 
