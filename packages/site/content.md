@@ -58,7 +58,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 
 ## Agent integration: one MCP server
 
-Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet.
+Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet. Every artefact row a tool returns carries `url` — the card's stable deep link (`/card/BR-3990`) — so a card an agent cites is one paste away in any browser (BR#3990).
 
 Every shape that crosses a runtime boundary is a checked-in contract: zod schemas and production-recorded fixtures in `packages/contracts`, validated in CI from both sides. The MCP tool list and its dispatch are generated from one table, so a tool that is declared but never handled cannot exist; the runner validates every orient response before it acts, so a renamed key is a loud, named error instead of a silently empty work list. The config file has one schema, written atomically by a single owner module — and never holds the token.
 

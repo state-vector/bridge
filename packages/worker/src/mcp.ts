@@ -11,14 +11,9 @@
  * the tools/call dispatch are both generated from it (BR#2844). This file is
  * protocol plumbing only: auth, workspace routing, JSON-RPC envelope.
  */
-import {
-  composeBootstrap,
-  DEFAULT_WS_SLUG,
-  doWs,
-  hashAuthToken,
-  tokenWorkspace,
-} from "./kb/core.ts";
+import { composeBootstrap, DEFAULT_WS_SLUG, doWs, hashAuthToken, tokenWorkspace } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
+import { stampPermalinks } from "./permalink.ts";
 
 /** Build marker lives in ./mcp-tools.ts (single source) — re-exported here. */
 import { BUILD, TOOL_TABLE, err, toolsList } from "./mcp-tools.ts";
@@ -114,7 +109,10 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     });
     const out = await r.json();
     if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
-    return out;
+    // BR#3990: every artefact row in every tool payload carries `url` — the
+    // card's canonical deep link, built from the request's public origin.
+    // One boundary, all tools; handlers that spread DO results inherit it.
+    return stampPermalinks(out, new URL(request.url).origin);
   };
 
   let result: unknown;
