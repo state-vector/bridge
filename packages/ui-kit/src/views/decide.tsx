@@ -3,6 +3,7 @@ import snarkdown from "snarkdown";
 import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
+import { linkifyHtml } from "./refs";
 import { useKb } from "../server/kbStore";
 import { ActionRow, Btn, Chip, type ChipTone, TextInput } from "./index-kit";
 
@@ -31,10 +32,13 @@ export function decisionFrame(d: KbArtefact): { kind: "verify" | "generic"; verd
 }
 
 /** snarkdown → sanitized-enough HTML: strip script/on* attrs (trusted-ish
- *  content — our own KB — but defence in depth costs one line). */
+ *  content — our own KB — but defence in depth costs one line). Refs are
+ *  linkified on top (BR#4015): card permalinks, bare URLs, github PR/issue
+ *  refs — so nobody has to copy-paste a link out of a card again. */
 export function md(src: string): string {
   const html = snarkdown(src ?? "");
-  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/ on\w+="[^"]*"/gi, "");
+  const clean = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/ on\w+="[^"]*"/gi, "");
+  return linkifyHtml(clean);
 }
 
 export interface HistoryEntry {
