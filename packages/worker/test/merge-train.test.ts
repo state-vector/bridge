@@ -8,6 +8,8 @@ import {
   mergeTrainQueue,
   normalizeGhMergeable,
   normalizeGhMergeState,
+  progressVerdict,
+  renewProgressDecide,
   trainBounceBrief,
   trainCardMatchesLane,
   trainLandedCloseNote,
@@ -23,6 +25,7 @@ import {
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_HEAD_STAMP_RE,
   TRAIN_LEASE_TTL_MS,
+  TRAIN_PROGRESS_STALE_MS,
   type MainCheckRun,
   type TrainLease,
 } from "../src/kb/core.ts";
@@ -105,6 +108,63 @@ describe("leaseDecide (the CAS check — read-check-write is atomic in the DO)",
     expect(leaseDecide(lease("gw-1", 0, 1000), 1000, "gw-2", "acquire").ok).toBe(true);
     expect(leaseDecide(lease("gw-1", 0, 1001), 1000, "gw-2", "acquire").ok).toBe(false);
     expect(at(1000)).toContain("1970");
+  });
+});
+
+// ---------- the renew-arm zombie check (proof-of-progress, BR#4129) ----------
+
+describe("renewProgressDecide (the hub half of proof-of-progress — deny renewal on a frozen note)", () => {
+  const proof = (note: string, age_ms: number, holder = "gw-1") => ({ progress: note, progress_age_ms: age_ms, holder });
+
+  it("STALE proof on a non-empty queue denies the renewal — the reason names holder, minutes, and queue depth", () => {
+    const d = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 4);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) {
+      expect(d.reason).toContain("zombie holder");
+      expect(d.reason).toContain("no progress for 180m");
+      expect(d.reason).toContain("non-empty queue (4 queued)");
+      expect(d.stale_ms).toBe(3 * 60 * 60_000);
+    }
+  });
+
+  it("STALE proof on an EMPTY queue allows the renewal — idle holding is harmless and correct", () => {
+    const d = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 0);
+    expect(d.ok).toBe(true);
+  });
+
+  it("FRESH proof on a non-empty queue allows the renewal — an awaiting-CI holder's note refreshes every tick, it never trips", () => {
+    const d = renewProgressDecide(proof("CI poll on abc123def: pending", 45_000), "gw-1", 2);
+    expect(d.ok).toBe(true);
+    if (d.ok) expect(d.verdict).toBe("fresh");
+  });
+
+  it("the staleness boundary is strict: age == bound is fresh, one ms more is stale (mirrors the TTL law)", () => {
+    expect(TRAIN_PROGRESS_STALE_MS).toBe(10 * MIN);
+    expect(renewProgressDecide(proof("CI poll on abc123def: pending", TRAIN_PROGRESS_STALE_MS), "gw-1", 2).ok).toBe(true);
+    expect(renewProgressDecide(proof("CI poll on abc123def: pending", TRAIN_PROGRESS_STALE_MS + 1), "gw-1", 2).ok).toBe(false);
+  });
+
+  it("missing or garbled proof is UNKNOWN — allowed (legacy `{}` renewals ride the deprecation window), never guessed stale", () => {
+    for (const p of [undefined, null, {}, { progress: "x" }, { progress_age_ms: 5000 }, { progress: "", progress_age_ms: -1 }, { progress: 42, progress_age_ms: 1e15 }]) {
+      const d = renewProgressDecide(p as any, "gw-1", 3);
+      expect(d.ok).toBe(true);
+      if (d.ok) expect(d.verdict).toBe("unknown");
+    }
+    expect(progressVerdict(null, "gw-1")).toBe("unknown");
+  });
+
+  it("a proof naming a DIFFERENT holder proves nothing about the renewer — UNKNOWN, allowed", () => {
+    expect(progressVerdict(proof("merged PR #263", 3 * 60 * 60_000, "gw-9"), "gw-1")).toBe("unknown");
+    expect(renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000, "gw-9"), "gw-1", 3).ok).toBe(true);
+  });
+
+  it("takeover after denial: the expired lease hands the lane to the next gateway's acquire (train handover law)", () => {
+    const denied = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 4);
+    expect(denied.ok).toBe(false);
+    // the DO cleared the lease on denial — the next acquire on a free lane wins
+    const takeover = leaseDecide(null, 1000, "gw-2", "acquire");
+    expect(takeover.ok).toBe(true);
+    if (takeover.ok) expect(takeover.lease?.holder).toBe("gw-2");
   });
 });
 
