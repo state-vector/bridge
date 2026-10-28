@@ -37,6 +37,16 @@ export function buildClaimLocallyPrompt({ task, ask }: ClaimLocallyInput): strin
   lines.push(`Take over this bridge task locally: ${task.id} — "${task.title}"`);
   lines.push("");
   lines.push(`Card state: ${task.type} · status ${task.status}${task.owner ? ` · owner ${task.owner}` : " · unclaimed"}${task.part_of ? ` · part of ${task.part_of}` : ""}${task.tags?.length ? ` · tags: ${task.tags.join(", ")}` : ""}`);
+  // BR#4023: surface the park state directly — a blocked card's reason and
+  // resume condition ARE the context a local agent needs first, and without
+  // this line they live in meta behind get_history archaeology.
+  const blocked = (task.meta as any)?.blocked ?? {};
+  if (blocked.reason) {
+    lines.push(`Blocked why: ${String(blocked.reason).trim()}`);
+  }
+  if (blocked.unblock_condition) {
+    lines.push(`Resume condition (what the hub checks to auto-resume this card): ${String(blocked.unblock_condition).trim()}`);
+  }
   if (task.body_md && task.body_md.trim() && task.body_md.trim() !== task.title) {
     lines.push("");
     lines.push("Card body (acceptance / spec — verify against live state):");
