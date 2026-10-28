@@ -96,6 +96,7 @@ import {
   trainLandedCloseNote,
   releaseHold,
   trainProxyEvent,
+  trainMergeReceipt,
   PROXY_WAIT_HOLD_RESULT_CLASS,
   type TrainLease,
   type LeaseAction,
@@ -343,124 +344,10 @@ export class KnowledgeHub {
         age_h: Math.round((now0 - Number(a.created_ts ?? 0)) / 3_600_000),
       });
     }
-    const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
-    const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
-    const staleMs = staleMin * 60_000;
-    const now = Date.now();
-    const rows = this.state.storage.sql.exec(
-      `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
-       WHERE type = 'task' AND status = 'in_progress'`,
-    ).toArray();
-    for (const r of rows as any[]) {
-      try {
-      const meta = JSON.parse(r.meta ?? "{}");
-      if (meta.awaiting_ask) {
-        // aging escalation: a task parked on a human answer must show its
-        // age, or the wait is invisible and unbounded. Annotate hourly;
-        // the release stays human-owned (an answered ask un-blocks it).
-        try {
-          let ask: { to_target?: string; created_ts: number } | undefined;
-          const derived = this.one(
-            `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
-             JOIN artefacts c ON c.id = r.src_id
-              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-                AND c.type = 'question' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
-          );
-          if (derived) {
-            const nm = JSON.parse(derived.cmeta ?? "{}");
-            ask = { to_target: nm.ask?.to, created_ts: derived.created_ts };
-          } else if (/^BR#\d+$/.test(String(meta.awaiting_ask.ask_id))) {
-            const node = this.one(`SELECT meta, created_ts, status FROM artefacts WHERE id = ? AND status IN ('todo','in_progress','blocked')`, meta.awaiting_ask.ask_id);
-            if (node) {
-              const nm = JSON.parse(node.meta ?? "{}");
-              ask = { to_target: nm.ask?.to, created_ts: node.created_ts };
-            }
-          } else {
-            const row = this.one(`SELECT to_target, created_ts FROM asks WHERE id = ? AND status = 'open'`, meta.awaiting_ask.ask_id);
-            if (row) ask = { to_target: row.to_target, created_ts: row.created_ts };
-          }
-          if (ask) {
-            const hours = Math.floor((now - ask.created_ts) / 3_600_000);
-            if (meta.awaiting_ask.annotated_h !== hours) {
-              meta.awaiting_ask.annotated_h = hours;
-              const base = String(meta.blocked?.reason ?? "").replace(/^⏳ blocked \d+h — .*? · /, "");
-              meta.blocked = { ...(meta.blocked ?? {}), reason: `⏳ blocked ${hours}h — awaiting ${ask.to_target ?? "human"} on ask ${meta.awaiting_ask.ask_id} · ${base}` };
-              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
-            }
-          }
-        } catch { /* annotation is best-effort */ }
-        continue;
-      }
-      // (A) declared grace: the agent stated a silence window — honor it until it lapses
-      if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
-      // (A2) declared subprocess window: the task is still in_progress, just
-      // quiet while a subprocess runs — watchdog paused until the budget lapses
-      if (meta.subprocess && typeof meta.subprocess.deadline_ts === "number") {
-        if (meta.subprocess.deadline_ts > now) continue;
-        // lapsed: the declaration is a lie — fall through to abandoned below
-      }
-      const lastTs = Math.max(
-        meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
-        meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
-        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
-      );
-      if (now - lastTs <= staleMs) continue;
-      const openAsk = this.one(
-        `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
-      );
-      if (openAsk) continue;
-      // BR#4067 — typed-proxy preservation: silence must not destroy a machine
-      // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
-      // or one parked on a typed await / bound ask is PARKED blocked — the
-      // reason names the silence, the wait meta survives, the proxy owns the
-      // exit (the PR #257 class: releases severed queue slots and stranded
-      // the cards). result_class exempts the hold from abandonment scoring.
-      const hold = releaseHold(meta);
-      if (hold) {
-        await this.transition(this.holdParkBody(r.id, meta, hold, `no update for >${staleMin}m`), "system:watchdog");
-        continue;
-      }
-      const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
-      const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
-      // BR#3352: classify the release from the session trail. A silent task
-      // whose trail proves landed side effects (GitHub PR/issue/commit
-      // receipts, or the runner's own completed_result_lost marker) is NOT an
-      // abandonment — the run happened and the report was lost between worker
-      // and hub. Recording the outcome class lets the score side exempt it
-      // and flags the delivery channel instead of punishing the agent.
-      let trail: ResultTrail | null = null;
-      try {
-        const notes = (this.state.storage.sql.exec(
-          `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
-          r.id,
-        ).toArray() as any[]).map((x) => String(x.summary ?? ""));
-        const sess = meta.session
-          ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session))
-          : null;
-        trail = detectResultTrail({
-          last_progress_note: meta.last_progress?.note,
-          recent_notes: notes,
-          worktree: sess?.worktree ?? null,
-          session: meta.session ?? null,
-        });
-      } catch { /* trail read is best-effort — classify as a plain stall on failure */ }
-      // STALLED, not blocked: silence means "we haven't heard from the agent"
-      // — blocked is reserved for the agent's own explicit "I cannot continue
-      // until X". Release straight to todo: the claim drops, the attempted tag
-      // records the try, and the next orient reassigns it. No blocked
-      // intermediate, no unblock-child spawn for silence.
-      await this.transition({
-        id: r.id, to: "todo",
-        note: trail
-          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
-          : `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
-        ...(trail ? { result_class: "completed_result_lost" } : {}),
-      }, "system:watchdog");
-      } catch (e) {
-        // one bad task must not kill the sweep — log and keep going
-        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
-      }
-    }
+    // (A) the in_progress stall sweep — BR#4282 moved the phase into its own
+    // method (stallSweep below) so the admin.stall_sweep drill runs it in
+    // isolation, mirroring admin.unblock_proxy_sweep.
+    await this.stallSweep(now0);
     // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
     // verdict. If no verifier ever picks the verification round up, the park is
     // permanent — the watchdog used to sweep only in_progress, so in_review
@@ -468,6 +355,7 @@ export class KnowledgeHub {
     // verify child actively running, bounce: in_review → in_progress (findings
     // note) → todo (released to the pool). The bounce supersedes the stale
     // verify round automatically.
+    const now = Date.now();
     const rs = this.one(`SELECT value FROM settings WHERE key = 'review_stale_minutes'`);
     const reviewStaleMin = rs ? Math.max(30, Math.min(2880, parseInt(rs.value, 10) || 360)) : 360;
     const reviewRows = this.state.storage.sql.exec(
@@ -494,6 +382,10 @@ export class KnowledgeHub {
         // released — the bounce destroys the queue slot it sits in.
         const hold = releaseHold(meta);
         if (hold) {
+          // BR#4282 — the same satisfied-atom route before this re-park: an
+          // in_review card whose pr leg already merged owes a done-close, not
+          // a re-armed proxy park.
+          if (await this.routeSatisfiedProxy(r, meta, now, `review stalled ${hours}h`)) continue;
           await this.transition(this.holdParkBody(r.id, meta, hold, `review stalled ${hours}h`), "system:watchdog");
           continue;
         }
@@ -636,6 +528,7 @@ export class KnowledgeHub {
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.next_alarm', ?)`,
       String(nextAlarm ?? 0),
     );
+    const staleMs = this.staleMinutes() * 60_000;
     const staleNow = this.one(
       `SELECT COUNT(*) AS n FROM artefacts WHERE type = 'task' AND status = 'in_progress'
        AND COALESCE(json_extract(meta, '$.last_progress.ts'), 0) < ?`,
@@ -661,6 +554,148 @@ export class KnowledgeHub {
       );
     } catch { /* recounted on the next tick */ }
   }
+
+  /** The (A) phase of the watchdog: silent in_progress cards (BR#4067 hold
+   *  semantics, BR#4282 route-to-exit). A card carrying a machine wait — a
+   *  merge-train slot, a typed proxy, a bound ask — is HELD, never released;
+   *  but the hold-park re-park runs ONLY after the satisfied-atom check: a
+   *  pr_merged proxy whose merge receipt is already on the board (the train's
+   *  own awaiting-ci stamp, or the provenance row) routes to the EXIT — the
+   *  owned done-close duty — instead of re-arming a satisfied proxy. A plain
+   *  silent card releases to the pool. Runs every alarm tick;
+   *  admin.stall_sweep drills it in isolation with a synthetic clock. */
+  private staleMinutes(): number {
+    const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+  }
+
+  private async stallSweep(nowIn: number) {
+    const staleMin = this.staleMinutes();
+    const staleMs = staleMin * 60_000;
+    const now = nowIn;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, owner, title, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status = 'in_progress'`,
+    ).toArray();
+    for (const r of rows as any[]) {
+      try {
+      const meta = JSON.parse(r.meta ?? "{}");
+      if (meta.awaiting_ask) {
+        // aging escalation: a task parked on a human answer must show its
+        // age, or the wait is invisible and unbounded. Annotate hourly;
+        // the release stays human-owned (an answered ask un-blocks it).
+        try {
+          let ask: { to_target?: string; created_ts: number } | undefined;
+          const derived = this.one(
+            `SELECT c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta FROM relations r
+             JOIN artefacts c ON c.id = r.src_id
+              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+                AND c.type = 'question' ORDER BY c.created_ts DESC LIMIT 1`, r.id,
+          );
+          if (derived) {
+            const nm = JSON.parse(derived.cmeta ?? "{}");
+            ask = { to_target: nm.ask?.to, created_ts: derived.created_ts };
+          } else if (/^BR#\d+$/.test(String(meta.awaiting_ask.ask_id))) {
+            const node = this.one(`SELECT meta, created_ts, status FROM artefacts WHERE id = ? AND status IN ('todo','in_progress','blocked')`, meta.awaiting_ask.ask_id);
+            if (node) {
+              const nm = JSON.parse(node.meta ?? "{}");
+              ask = { to_target: nm.ask?.to, created_ts: node.created_ts };
+            }
+          } else {
+            const row = this.one(`SELECT to_target, created_ts FROM asks WHERE id = ? AND status = 'open'`, meta.awaiting_ask.ask_id);
+            if (row) ask = { to_target: row.to_target, created_ts: row.created_ts };
+          }
+          if (ask) {
+            const hours = Math.floor((now - ask.created_ts) / 3_600_000);
+            if (meta.awaiting_ask.annotated_h !== hours) {
+              meta.awaiting_ask.annotated_h = hours;
+              const base = String(meta.blocked?.reason ?? "").replace(/^⏳ blocked \d+h — .*? · /, "");
+              meta.blocked = { ...(meta.blocked ?? {}), reason: `⏳ blocked ${hours}h — awaiting ${ask.to_target ?? "human"} on ask ${meta.awaiting_ask.ask_id} · ${base}` };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+            }
+          }
+        } catch { /* annotation is best-effort */ }
+        continue;
+      }
+      // (A) declared grace: the agent stated a silence window — honor it until it lapses
+      if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
+      // (A2) declared subprocess window: the task is still in_progress, just
+      // quiet while a subprocess runs — watchdog paused until the budget lapses
+      if (meta.subprocess && typeof meta.subprocess.deadline_ts === "number") {
+        if (meta.subprocess.deadline_ts > now) continue;
+        // lapsed: the declaration is a lie — fall through to abandoned below
+      }
+      const lastTs = Math.max(
+        meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
+        meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
+        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
+      );
+      if (now - lastTs <= staleMs) continue;
+      const openAsk = this.one(
+        `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
+      );
+      if (openAsk) continue;
+      // BR#4067 — typed-proxy preservation: silence must not destroy a machine
+      // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
+      // or one parked on a typed await / bound ask is PARKED blocked — the
+      // reason names the silence, the wait meta survives, the proxy owns the
+      // exit (the PR #257 class: releases severed queue slots and stranded
+      // the cards). result_class exempts the hold from abandonment scoring.
+      const hold = releaseHold(meta);
+      if (hold) {
+        // BR#4282 — atom-check BEFORE the re-park: a hold derived from a
+        // pr_merged proxy whose merge receipt is already on the board must
+        // route to the exit (the owned done-close duty), never re-block —
+        // re-arming a satisfied proxy is the BR#4023/4135/4177/4113 loop
+        // (silence → re-park on the satisfied atom → identical unblock round
+        // → flood-skip → threshold-1 breach card).
+        if (await this.routeSatisfiedProxy(r, meta, now, `no update for >${staleMin}m`)) continue;
+        await this.transition(this.holdParkBody(r.id, meta, hold, `no update for >${staleMin}m`), "system:watchdog");
+        continue;
+      }
+      const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
+      const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+      // BR#3352: classify the release from the session trail. A silent task
+      // whose trail proves landed side effects (GitHub PR/issue/commit
+      // receipts, or the runner's own completed_result_lost marker) is NOT an
+      // abandonment — the run happened and the report was lost between worker
+      // and hub. Recording the outcome class lets the score side exempt it
+      // and flags the delivery channel instead of punishing the agent.
+      let trail: ResultTrail | null = null;
+      try {
+        const notes = (this.state.storage.sql.exec(
+          `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
+          r.id,
+        ).toArray() as any[]).map((x) => String(x.summary ?? ""));
+        const sess = meta.session
+          ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session))
+          : null;
+        trail = detectResultTrail({
+          last_progress_note: meta.last_progress?.note,
+          recent_notes: notes,
+          worktree: sess?.worktree ?? null,
+          session: meta.session ?? null,
+        });
+      } catch { /* trail read is best-effort — classify as a plain stall on failure */ }
+      // STALLED, not blocked: silence means "we haven't heard from the agent"
+      // — blocked is reserved for the agent's own explicit "I cannot continue
+      // until X". Release straight to todo: the claim drops, the attempted tag
+      // records the try, and the next orient reassigns it. No blocked
+      // intermediate, no unblock-child spawn for silence.
+      await this.transition({
+        id: r.id, to: "todo",
+        note: trail
+          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
+          : `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+        ...(trail ? { result_class: "completed_result_lost" } : {}),
+      }, "system:watchdog");
+      } catch (e) {
+        // one bad task must not kill the sweep — log and keep going
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
+    }
+  }
+
 
   private settingValue(key: string, fallback: string): string {
     const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
@@ -996,7 +1031,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         type: "task",
         title: `Unblock: ${rootTitle.slice(0, 190)}`,
         session: "", // session-less spawn: the closer stamps it when they claim
-        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts (the done note itself must cite receipts — ${RECEIPTS_DOC}).\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
+        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts (the done note itself must cite receipts — ${RECEIPTS_DOC}).\n\nBR#4282 — if the parent is NOT blocked (it is in_progress or in_review: the exit flipped while it worked or while it awaited verify), do NOT resume it — it owes only the done-close. Order matters: close YOURSELF done citing the receipts first (the done-open-children gate needs the child closed), then transition ${r.id} → done citing the same receipts.\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
         roles: ["unblock"],
       },
       "hub:proxy-watch",
@@ -1978,6 +2013,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
+        case "admin.stall_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -1991,6 +2027,15 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
             await this.unblockProxySweep(Number(body.now ?? Date.now()));
             const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
             return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+          }
+          if (op === "admin.stall_sweep") {
+            // drill/liveness path for the in_progress stall sweep (BR#4282):
+            // runs ONLY the stall/hold/route phase — no ask expiry, no review
+            // sweep, no other watchdog phases. pass now=<future epoch ms> to
+            // make freshly-touched cards stale (the sweep has no cadence
+            // window of its own).
+            await this.stallSweep(Number(body.now ?? Date.now()));
+            return this.json({ ok: true });
           }
           // admin.stop_line_sweep / admin.merge_queue_sweep /
           // admin.provenance_sweep / admin.closure_audit_sweep DELETED with
@@ -3185,6 +3230,15 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
           break;
         }
         case "skip_unblock_spawn": {
+          if (fx.flood) {
+            // BR#4282: a flood-guard skip is the dedup WORKING — the round
+            // for this exact exit is already on the case. Audit observably,
+            // never fold a breach card: the breach fold raising
+            // spawn-while-open on the guard's own suppression was the
+            // BR#4023/4135/4177/4113 loop's detection noise.
+            this.audit(actor, "spawn_flood_skipped", id, { auto: "unblock", reason: fx.reason });
+            break;
+          }
           this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
           try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
           break;
@@ -4583,6 +4637,53 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       ...(aw ? { await_event: aw } : { merge_train: true }),
       result_class: PROXY_WAIT_HOLD_RESULT_CLASS,
     };
+  }
+
+  /** BR#4282 — the atom-check before a hold-park. The hub holds no VCS
+   *  credentials (BR#3516 §8), so a pr_merged proxy is unresolvable from
+   *  GitHub — but the train stamps the merge ON THE BOARD: the card's own
+   *  merge_train awaiting-ci stamp (written by every train:merged event) and
+   *  the provenance row. When either receipt exists for the proxy's leg, the
+   *  atom is ALREADY satisfied: spawn the unblock duty (caps + flood dedup
+   *  inside spawnProxyDuty) whose contract delivers the done-close — and
+   *  never hold-park the card blocked on the satisfied proxy. Returns true
+   *  when the card was routed (or is freshly routed — pacing), false when
+   *  the caller should hold-park as before (conservatism law: no receipt,
+   *  no route). */
+  private async routeSatisfiedProxy(r: any, meta: any, now: number, staleDesc: string): Promise<boolean> {
+    const aw = validateAwaitEvent(meta?.blocked?.await_event) ?? trainProxyEvent(meta);
+    if (!aw || aw.event !== "pr_merged") return false; // only pr legs carry board merge receipts
+    const repo = String((aw as any).repo ?? "");
+    const n = Number((aw as any).n ?? 0);
+    if (!repo || !n) return false;
+    // per-card pacing: a card just routed must not re-evaluate every tick
+    const prev = meta.proxy_check;
+    if (prev?.verdict === "true" && typeof prev?.at === "number" && now - prev.at < 5 * 60_000) return true;
+    const stamp = trainMergeReceipt(meta, repo, n);
+    let receipt: string | null = null;
+    if (stamp) {
+      receipt = `the card's merge-train stamp: PR ${repo}#${n} merged as ${String(stamp.merge_sha).slice(0, 9)} (state awaiting-ci${stamp.merged_at ? `, merged_at ${new Date(stamp.merged_at).toISOString()}` : ""})`;
+    } else {
+      const prov = this.one(
+        `SELECT merge_sha, merged_at FROM provenance WHERE repo = ? AND pr = ?`,
+        repo, n,
+      ) as any;
+      if (prov?.merge_sha) {
+        receipt = `provenance: PR ${repo}#${n} merged as ${String(prov.merge_sha).slice(0, 9)}${prov.merged_at ? ` (${new Date(prov.merged_at).toISOString()})` : ""}`;
+      }
+    }
+    if (!receipt) return false;
+    // the exit text keys the flood dedup: an OUTSTANDING round for this same
+    // condition is already on the case (spawnProxyDuty flood-skips it — no
+    // breach, no duplicate); a consumed/absent round issues fresh. A resume
+    // clears the stamp (machine.ts), so a post-resume silence spawns the
+    // owned done-close round instead of flooding for an hour.
+    const cond = String(meta.last_unblock_spawn?.exit ?? "").trim() || describeAwaitEvent(aw);
+    if (prev?.verdict !== "true") {
+      this.audit("hub:proxy-watch", "proxy_route", r.id, { stale: staleDesc, receipt });
+    }
+    await this.spawnProxyDuty(r, meta, now, prev, cond, [receipt]);
+    return true;
   }
 
   /**

@@ -365,7 +365,16 @@ destroy queue state: a card the train owns (`queued` / `awaiting-ci` / `bounced`
 leg), or one parked on a typed `await_event` or a bound ask, is never released to todo — the
 sweeps **park it `blocked` with the typed proxy intact** (the proxy owns its exit), and the
 machine-actor backstop refuses any release path that slips past them (BR#4067). Humans and
-owners still release freely.
+owners still release freely. The hold-park itself runs only AFTER an atom check (BR#4282):
+the hub holds no VCS credentials, so a `pr_merged` proxy is evaluated against BOARD receipts
+only — the train's own `awaiting-ci` stamp (with `merge_sha`) or the `provenance` row. A
+proxy that is already satisfied is never re-armed: instead of re-parking the card blocked,
+the sweep spawns the owned done-close duty — which, when the parent sits `in_progress` or
+`in_review`, closes ITSELF done first and then the parent (the exit flipped while the card
+worked; it owes a close, not a resume). The silence-re-park can also no longer loop: a
+flood-guard skip (`skip_unblock_spawn` with `flood: true`) is the dedup working and is
+audited without folding a breach card, and a resume consumes the unblock round so post-resume
+silence issues one fresh round instead of flooding for an hour.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>

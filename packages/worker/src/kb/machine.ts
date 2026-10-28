@@ -179,7 +179,7 @@ export type Effect =
   | { kind: "reuse_verify"; parent: string; verify: string }
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
-  | { kind: "skip_unblock_spawn"; parent: string; reason: string }
+  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean }
   | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "release_redirect"; attempts: number; silent_cycles: number };
@@ -595,6 +595,12 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
           ? `${i.id} bounced — unblock round closed`
           : `${i.id} → ${i.to} — unblock round closed`;
     effects.push({ kind: "supersede_children", parent: i.id, tag: "unblock", keep_newest: false, cause });
+    // BR#4282: a resume CONSUMES the round — the exit condition was verified
+    // and the card moved. Clear the stamp so a post-resume silence issues a
+    // FRESH round (the owned done-close) instead of flooding against a stamp
+    // whose round no longer exists. Dedup keeps suppressing duplicates of an
+    // UNCONSUMED round; a consumed one is not a duplicate.
+    if (i.to === "in_progress" && i.status === "blocked") patch.last_unblock_spawn = undefined;
   }
   if (i.to === "done" || (i.status === "in_review" && i.to === "in_progress")) {
     const isBounce = i.status === "in_review" && i.to === "in_progress";
@@ -645,6 +651,10 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
           kind: "skip_unblock_spawn",
           parent: i.id,
           reason: `unblock round issued ${Math.round((now - last.at) / 60_000)}m ago with the same exit condition — flood guard`,
+          // BR#4282: a flood skip is the dedup WORKING (the round for this
+          // exact exit is already on the case), not a double-spawn attempt —
+          // the executor audits it observably and never folds a breach card.
+          flood: true,
         });
       } else {
         effects.push({

@@ -681,6 +681,11 @@ describe("effects decided executor-side (F4)", () => {
     const v3 = ok(await decide(flooded, baseCtx()));
     expect(v3.effects[0].kind).toBe("skip_unblock_spawn");
     expect((v3.effects[0] as any).reason).toContain("flood guard");
+    // BR#4282: a flood skip is the dedup WORKING, not a spawn attempt — the
+    // flag lets the executor audit it without folding a breach card.
+    expect((v3.effects[0] as any).flood).toBe(true);
+    // the CAP skip is a different beast — a live child owns the round
+    expect((v2.effects[0] as any).flood).toBeUndefined();
 
     // a DIFFERENT exit condition is a new round, not a flood repeat
     const freshExit = input({
@@ -690,6 +695,26 @@ describe("effects decided executor-side (F4)", () => {
       meta: { last_unblock_spawn: { at: 1_000_000 - 10 * 60_000, exit: "PR https://github.com/a/b/pull/9 merged" } },
     });
     expect(ok(await decide(freshExit, baseCtx())).effects[0].kind).toBe("spawn_unblock");
+  });
+
+  it("a resume CONSUMES the unblock round — the stamp clears so post-resume silence issues a fresh round (BR#4282)", async () => {
+    const stamp = { at: 1_000_000 - 10 * 60_000, exit: "PR https://github.com/a/b/pull/9 merged" };
+    // blocked → in_progress: the duty verified the exit and moved the card —
+    // the round is spent; a stale stamp would flood-guard the OWNED done-close
+    // round the card now owes for the next 60m.
+    const resumed = ok(await decide(
+      input({ status: "blocked", to: "in_progress", body: { note: "exit condition verified — resuming" }, meta: { last_unblock_spawn: stamp } }),
+      baseCtx(),
+    ));
+    expect(resumed.meta_patch.last_unblock_spawn).toBeUndefined();
+    // any other edge leaves the stamp alone — the patch is the only channel
+    // that deletes it, so a park patch must not mention the key: an
+    // UNCONSUMED round still dedups.
+    const parked = ok(await decide(
+      input({ status: "in_progress", to: "blocked", body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/10 merged" }, meta: { last_unblock_spawn: stamp } }),
+      baseCtx(),
+    ));
+    expect("last_unblock_spawn" in parked.meta_patch).toBe(false);
   });
 
   it("ask-gates and subprocess declarations never spawn unblock children; unblock duties cannot even block", async () => {
