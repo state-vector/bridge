@@ -821,7 +821,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             let conflicting = facts.get("mergeable") == Some(&json!(false))
                 || vstr(&facts, "mergeStateStatus").map(|s| s.to_uppercase().contains("CONFLICTING")).unwrap_or(false);
             let (clean, files) = if conflicting { ctx.trial_merge(base, &head_sha)? } else { (true, vec![]) };
-            let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "reason": defect });
+            // BR#4066: the bounce KIND + the gate's own defect ride with the
+            // event — the hub renders per-kind copy and the accept-hook only
+            // re-queues non-conflict bounces. Coverage = the verdict-coverage
+            // leg's phrasing; everything else is a named gate defect.
+            let bounce_kind = if !clean && !files.is_empty() { "conflict" } else if defect.contains("not covered by the accepted verdict") { "coverage" } else { "gate" };
+            let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "reason": defect, "bounce_kind": bounce_kind, "defect": defect, "merge_state": vstr(&facts, "mergeStateStatus").unwrap_or("") });
             if !clean && !files.is_empty() {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
@@ -849,7 +854,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // (BR#3516 §5); if it conflicts, that's human-resolved.
                 let (clean, tm_files) = ctx.trial_merge(base, &head_sha)?;
                 if !clean {
-                    ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "reason": format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry") }))?;
+                    let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                    ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
                     log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
                     release_if_idle(ctx, key, repo, base)?;
                     return Ok(());

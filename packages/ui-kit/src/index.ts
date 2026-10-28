@@ -20,13 +20,14 @@ export {
 } from "./server/kb";
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
-  KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk,
+  KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk, KbConsensus,
 } from "./server/kb";
 export { useKb, kbConnected, setKbAuthEscalator, type BoardPrefs } from "./server/kbStore";
 export {
   normTs, rel, clock, rankDecisions, actorEvents, latestTaskId,
   boardsOf, myAnswers, presenceLabel, kindOf, TASK_REF_RE,
 } from "./server/views";
+export { setCardLinkOpener, getCardLinkOpener } from "./views/refs";
 export { DashboardSummary } from "./views/Dashboard";
 export {
   TaskDetail, TaskStateCard, SentimentBar, RefText,

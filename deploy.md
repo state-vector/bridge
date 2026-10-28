@@ -22,19 +22,13 @@ npx wrangler secret put BRIDGE_INGEST_TOKEN   # generate: openssl rand -hex 24 (
 
 ```
 
-**Model registry (`GET /v1/models`).** The hub serves its dispatchable model
-ids at `/v1/models` in OpenAI shape (`{"object":"list","data":[{"id":...}]}`);
-`bridge doctor` resolves every pinned backend model against it (a pinned id
-the registry doesn't list would fail every dispatch, so it's a named FAIL).
-The registry IS the `MODEL_IDS` var in `packages/worker/wrangler.toml`
-`[vars]` — comma-separated, e.g. `MODEL_IDS = "sp-gateway/glm-5.3-flash,glm-4.7"`.
-Set it in the file, not the dashboard: this file is the deploy truth and a
-push clobbers dashboard-only vars. Empty/unset = an honest empty list (every
-pinned model FAILs until you set it). The route is deliberately
-unauthenticated machine-plane (like `/api/pair/*` — doctor runs when pairing
-is broken) and MUST stay listed in `run_worker_first`: a route missing from
-that list is silently eaten by the SPA assets layer (BR#3885 — third
-incident of this class).
+**Model registry — REMOVED (BR#4252).** There is no hub-side model list and
+no model gateway: the hub never proxies inference — each agent CLI resolves
+its pinned model id against its own provider config. The former `/v1/models`
+route and its `MODEL_IDS` var are deleted; `bridge doctor` reports model
+pins as configuration only and does not validate them against the hub. Do
+not re-add either (the route shipped with an empty registry and FAILed every
+valid pin fleet-wide).
 
 ## 2. Human-plane auth (GitHub OAuth)
 
