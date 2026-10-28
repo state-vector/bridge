@@ -289,6 +289,26 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
   },
+  reconcile_schedule: {
+    description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_schedule,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.schedule", args), null, 1)),
+  },
+  reconcile_report: {
+    description: "Feed one daemon observation cycle: the repo's open PRs (raw `gh pr list --json` rows). The hub runs the join, applies every judgement (bind / ignore / spawn duties / reverse-close via provenance), records the accounting, and alarms when the invariant fails. Read-only on GitHub, write-only on the board.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_report,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.report", args), null, 1)),
+  },
+  reconcile_status: {
+    description: "The operator view of reconciliation: settings, recent accounting lines (the canary), the duty ledger, ignores, and PRs on the reverse-reconcile missing clock.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_status,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.status", args), null, 1)),
+  },
+  reconcile_ignore: {
+    description: "Rule one PR off the board WITH A REASON — the invariant's second disposition. {repo, pr, reason}; the report then accounts it as ignored-with-reason instead of alarming.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_ignore,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.ignore", args), null, 1)),
+  },
 });
 
 export type { ToolCtx, ToolName };

@@ -630,6 +630,48 @@ main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI
 (unknown past 3× typical classifies red — the train never waits forever). Lane identity
 is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
 
+## The board↔GitHub reconcile loop (BR#4170)
+
+The merge train accounts for PRs it *knows about*. The reconcile loop closes the gap:
+**every open reviewed PR must, at all times, be one of exactly three things on the board —
+bound to a card, ignored with a recorded reason, or in-flight on a spawned duty.** Anything
+else past the actionable age is an ALARM to the sink, never a silence (the #2466 class: a
+session died post-open and an APPROVED+MERGEABLE PR sat invisible for 34 hours, outside
+every stamp-gated mechanism).
+
+Division of labour is the credential split (BR#3499/BR#3507): the gateway daemon runs the
+read-only `gh pr list` leg and feeds raw observations via `reconcile_report`; the **hub**
+runs the join (`reconcile.ts`, pure), decides, and performs every board mutation. The
+daemon never writes the board; the hub never touches GitHub. A report per repo per cycle:
+
+- **bound** — an open card rides the PR (`meta.pr` / a `meta.prs` leg); queued cards are
+  the train's business and are never re-spawned at.
+- **ignored-with-reason** — `reconcile_ignore {repo, pr, reason}` rules a PR off the board
+  on the record; an ignore without a reason is refused (an ignore IS a reason).
+- **in-flight / spawn** — an orphan APPROVED+MERGEABLE PR past `verify_age_h` gets a
+  binding card (meta.pr projection, session-less) plus the **standard** 5c verify duty as
+  its child — the same template the normal in_review spawn uses, so ACCEPT queues the card
+  exactly as BR#4079 prescribes. Reconcile creates tracking cards and standard duties
+  only; it never queues, stamps, or merges.
+- **destination-blocked** (BLOCKED/BEHIND) binds WITHOUT a verify duty — a verify would
+  bounce on mergeability by construction; the duty comes when a later cycle sees CLEAN.
+- **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
+  repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
+  silently respawning over the corpse.
+
+**Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
+open list starts a missing clock; two consecutive misses with a provenance row close the
+zombie binding via the machine proxy (BR#3287 — the train stamped the merge); with NO
+provenance it spawns a ruling duty instead — someone rules, never silence.
+
+Knobs: `reconcile.enabled` / `RECONCILE_ENABLED` (default on),
+`reconcile.interval_secs` / `RECONCILE_INTERVAL_SECS` (default 1800, clamped 300..21600),
+`reconcile.repos` (CSV, default both bridge repos), `reconcile.verify_age_h` (2),
+`reconcile.disposition_age_h` (24), `reconcile_alarm_sink_id` (default BR#3124).
+`reconcile_status` is the operator view: settings, the accounting lines (the canary —
+`N open reviewed / N bound / N ignored-with-reason / N in-flight — N accounted`, ALARM
+tail on failure), the duty ledger, ignores, and the missing clock.
+
 ## PR provenance: who touched main, from bridge
 
 Every merge is attributable (BR#3287) — and under BR#3516 the stamping is

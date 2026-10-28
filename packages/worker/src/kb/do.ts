@@ -97,6 +97,16 @@ import {
 import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
 import { parseProvenanceSha } from "./provenance.ts";
 import {
+  accountingLine,
+  normalizePr,
+  reconcileJoin,
+  type ReconcileBinding,
+  type ReconcileDuty,
+  type ReconcileIgnore,
+  type ReconcileJudgement,
+  type ReconcilePr,
+} from "./reconcile.ts";
+import {
   decide,
   invariants as checkInvariants,
   detectBreaches,
@@ -130,6 +140,22 @@ import {
  *  sink the destination-green sweep used (BR#3124, infrastructure). Override
  *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
 const TRAIN_ALARM_SINK_ID = "BR#3124";
+
+/** The standard verify-duty body — the ONE 5c-gated template. The normal
+ *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
+ *  render through here, so the two spawn sites can never drift apart. */
+function verifyDutyBody(parentId: string, rootTitle: string, prLink: string): string {
+  return `Verification duty for ${parentId} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${parentId} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${parentId} to blocked with note \`merge-train: queued\` — the train gates it, merges it, waits out main CI, and closes it citing the mergeCommit (machine proxy: mergeCommit non-null AND main green).\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`;
+}
+
+/** Body for a reconcile-spawned binding card (BR#4170): the card's whole job
+ *  is to BE the board projection of one GitHub PR — meta.pr binds it, so the
+ *  invariant can see it. Everything after that rides the standard flow: when
+ *  the PR turns verify-eligible the hub spawns the standard verify duty as a
+ *  child of THIS card (BR#4079 — accept queues it; the train merges it). */
+function reconcileTrackingBody(repo: string, pr: number, title: string | null, why: string, url: string): string {
+  return `Reconcile binding card (BR#4170) — ${repo}#${pr}${title ? ` "${title}"` : ""}.\n\nGitHub is the source of truth for this PR; this card is its board projection (meta.pr binds them). Why it exists: ${why}\nPR: ${url}\n\nWhat happens next is automatic while the PR stays actionable: once it is approved+mergeable with a clean destination, the hub spawns the standard verify duty as a child of THIS card (5c gate) — its ACCEPT queues this card onto the merge train; the train merges and closes it. You never merge, never queue by hand.\n\nIf this PR should not be carried on the board at all, rule it off the record instead of closing silently: reconcile_ignore with {"repo": "${repo}", "pr": ${pr}, "reason": "<why>"} — the report then accounts it as ignored-with-reason.`;
+}
 
 /** BR#3787 layer 2 — repair rate limit: a device may re-vend its own row at
  *  most this many times per rolling hour. A crash loop must not mint
@@ -1256,6 +1282,50 @@ export class KnowledgeHub {
         detail TEXT -- JSON: reason, carry record, verdict citations
       );
       CREATE INDEX IF NOT EXISTS idx_train_events_lane ON train_events (repo, base, seq);
+      -- BR#4170 reconciliation — the hub's durable state for the board↔GitHub
+      -- invariant. Four small tables + the pure join in reconcile.ts:
+      -- reports  = one row per run (the accounting history, the alarm's receipt);
+      -- duties   = ONE row per repo+pr+kind EVER (the dedupe ledger — a dead
+      --   duty must never be silently respawned over, it must ALARM);
+      -- ignores  = explicit ignore-with-reason rulings (reconcile.ignore);
+      -- seen     = the reverse-reconcile clock per binding (two-consecutive-
+      --   missing guard against gh flake before any close).
+      CREATE TABLE IF NOT EXISTS reconcile_reports (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        actor TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        accounting TEXT NOT NULL, -- JSON ReconcileAccounting
+        line TEXT NOT NULL,       -- accountingLine(...) — the canary line
+        ok INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_reconcile_reports_repo ON reconcile_reports (repo, seq);
+      CREATE TABLE IF NOT EXISTS reconcile_duties (
+        repo TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        kind TEXT NOT NULL,       -- verify | disposition | reverse
+        duty_id TEXT NOT NULL,    -- the spawned duty card ('' while spawning)
+        card_status TEXT,         -- refreshed at read; NULL = card hard-deleted
+        created_ts INTEGER NOT NULL,
+        PRIMARY KEY (repo, pr, kind)
+      );
+      CREATE TABLE IF NOT EXISTS reconcile_ignores (
+        repo TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        by TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        PRIMARY KEY (repo, pr)
+      );
+      CREATE TABLE IF NOT EXISTS reconcile_seen (
+        repo TEXT NOT NULL,
+        pr INTEGER NOT NULL,
+        card TEXT NOT NULL,
+        missing INTEGER NOT NULL DEFAULT 0,
+        missing_ts INTEGER,
+        updated_ts INTEGER NOT NULL,
+        PRIMARY KEY (repo, pr)
+      );
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -1620,6 +1690,12 @@ export class KnowledgeHub {
         case "train.status": return this.json(await this.trainStatus(body));
         case "train.history": return this.json(await this.trainHistory(body));
         case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        // ---- reconcile (BR#4170): the gateway feeds observations, the hub
+        // decides and mutates — the board↔GitHub invariant ----
+        case "reconcile.schedule": return this.json(await this.reconcileSchedule(body, actor));
+        case "reconcile.report": return this.json(await this.reconcileReport(body, actor));
+        case "reconcile.status": return this.json(await this.reconcileStatus(body));
+        case "reconcile.ignore": return this.json(await this.reconcileIgnore(body, actor));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
@@ -2756,7 +2832,7 @@ export class KnowledgeHub {
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: `Verification duty for ${id} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${id} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${id} to blocked with note \`merge-train: queued\` — the train gates it, merges it, waits out main CI, and closes it citing the mergeCommit (machine proxy: mergeCommit non-null AND main green).\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`,
+              body_md: verifyDutyBody(id, rootTitle, prLink),
               roles: ["review"],
             },
             actor,
@@ -5457,6 +5533,405 @@ export class KnowledgeHub {
       ...args, Math.min(Number(body?.limit ?? 50), 200),
     ).toArray() as any[];
     return { events: rows.map((r) => ({ ...r, detail: JSON.parse(r.detail ?? "{}") })) };
+  }
+
+  // ---------- reconcile (BR#4170): the board↔GitHub invariant ----------
+  //
+  // The gateway daemon (train.rs) runs the read-only `gh pr list` and feeds
+  // observations via reconcile.report; this DO owns the join (reconcile.ts),
+  // the decisions, and every board mutation. The invariant: every open
+  // reviewed PR is bound / ignored-with-reason / in-flight within one cycle
+  // — anything else past the actionable age is an ALARM to the sink, never a
+  // silence (the #2466 class: 34h invisible).
+
+  /** The reconcile settings block — one reader for schedule/status/report.
+   *  Values are clamped where nonsense would break the invariant (a 0s
+   *  interval would hammer `gh`; a 0h age would alarm on fresh PRs). */
+  private reconcileSettings(): { enabled: boolean; interval_secs: number; repos: string[]; verify_age_h: number; disposition_age_h: number } {
+    const num = (key: string, dflt: number, lo: number, hi: number): number => {
+      const raw = Number(this.settingValue(key, String(dflt)));
+      return Number.isFinite(raw) ? Math.min(hi, Math.max(lo, raw)) : dflt;
+    };
+    return {
+      enabled: this.settingValue("reconcile.enabled", "1").trim() !== "0",
+      interval_secs: num("reconcile.interval_secs", 1800, 300, 21600),
+      repos: this.settingValue("reconcile.repos", "state-vector/bridge,state-vector/superpositional")
+        .split(",").map((s) => s.trim()).filter(Boolean),
+      verify_age_h: num("reconcile.verify_age_h", 2, 0, 720),
+      disposition_age_h: num("reconcile.disposition_age_h", 24, 0, 2160),
+    };
+  }
+
+  /** reconcile.schedule — view (no spec) or set (spec) the daemon-visible
+   *  schedule + thresholds. The daemon also has env knobs; these settings
+   *  are the hub-side record the status view reports. */
+  private async reconcileSchedule(body: any, actor: string): Promise<any> {
+    const spec = body?.spec;
+    if (spec && typeof spec === "object") {
+      const sets: [string, string][] = [];
+      if (spec.enabled !== undefined) sets.push(["reconcile.enabled", spec.enabled ? "1" : "0"]);
+      if (spec.interval_secs !== undefined) sets.push(["reconcile.interval_secs", String(Math.min(21600, Math.max(300, Number(spec.interval_secs) || 1800)))]);
+      if (spec.repos !== undefined) sets.push(["reconcile.repos", String(spec.repos)]);
+      if (spec.verify_age_h !== undefined) sets.push(["reconcile.verify_age_h", String(Math.min(720, Math.max(0, Number(spec.verify_age_h) || 0)))]);
+      if (spec.disposition_age_h !== undefined) sets.push(["reconcile.disposition_age_h", String(Math.min(2160, Math.max(0, Number(spec.disposition_age_h) || 0)))]);
+      for (const [k, v] of sets) {
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, k, v);
+      }
+      if (sets.length) this.audit(actor, "reconcile_schedule", null, { keys: sets.map(([k]) => k) });
+    }
+    return this.reconcileSettings();
+  }
+
+  /** reconcile.status — the operator view: settings, latest accounting,
+   *  the duty ledger, ignores, and the reverse-reconcile missing clock. */
+  private async reconcileStatus(body: any): Promise<any> {
+    const repo = String(body?.repo ?? "").trim();
+    const repoArgs = repo ? [repo] : [];
+    const where = repo ? "WHERE repo = ?" : "";
+    const reports = this.state.storage.sql.exec(
+      `SELECT seq, ts, actor, repo, accounting, line, ok FROM reconcile_reports ${where} ORDER BY seq DESC LIMIT ?`,
+      ...repoArgs, Math.min(Number(body?.limit ?? 10), 100),
+    ).toArray() as any[];
+    const duties = this.state.storage.sql.exec(
+      `SELECT repo, pr, kind, duty_id, card_status, created_ts FROM reconcile_duties ${where} ORDER BY created_ts DESC LIMIT 200`,
+      ...repoArgs,
+    ).toArray() as any[];
+    const ignores = this.state.storage.sql.exec(
+      `SELECT repo, pr, reason, by, created_ts FROM reconcile_ignores ${where} ORDER BY created_ts DESC LIMIT 200`,
+      ...repoArgs,
+    ).toArray() as any[];
+    const missing = this.state.storage.sql.exec(
+      `SELECT repo, pr, card, missing_ts FROM reconcile_seen ${repo ? "WHERE repo = ? AND missing = 1" : "WHERE missing = 1"} ORDER BY missing_ts DESC LIMIT 200`,
+      ...repoArgs,
+    ).toArray() as any[];
+    return {
+      settings: this.reconcileSettings(),
+      last_report: reports[0] ? { ...reports[0], accounting: JSON.parse(reports[0].accounting), ok: !!reports[0].ok } : null,
+      reports: reports.map((r) => ({ ...r, accounting: JSON.parse(r.accounting), ok: !!r.ok })),
+      duties,
+      ignores,
+      missing,
+    };
+  }
+
+  /** reconcile.ignore — record an ignore-with-reason for one PR. The
+   *  invariant's second disposition: a PR the board will never carry, ruled
+   *  so ON THE RECORD instead of by silence. An ignore IS a reason. */
+  private async reconcileIgnore(body: any, actor: string): Promise<any> {
+    const repo = String(body?.repo ?? "").trim();
+    const pr = Number(body?.pr);
+    const reason = String(body?.reason ?? "").trim();
+    if (!repo || !Number.isInteger(pr) || pr <= 0 || !reason) {
+      throw new Error("reconcile.ignore needs repo, pr (>0), and a non-empty reason — an ignore without a reason is just silence");
+    }
+    const now = Date.now();
+    this.state.storage.sql.exec(
+      `INSERT INTO reconcile_ignores (repo, pr, reason, by, created_ts) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(repo, pr) DO UPDATE SET reason = excluded.reason, by = excluded.by, created_ts = excluded.created_ts`,
+      repo, pr, reason.slice(0, 500), actor, now,
+    );
+    this.audit(actor, "reconcile_ignore", null, { repo, pr, reason: reason.slice(0, 200) });
+    return { ok: true, repo, pr, reason: reason.slice(0, 500) };
+  }
+
+  /** Create (or reuse) the tracking card that projects one PR onto the board
+   *  — meta.pr is the binding the join reads. Reuses an existing OPEN card
+   *  for the same (repo, pr) so a re-report can never double-project. */
+  private async reconcileTrackingCard(repo: string, pr: number, title: string | null, why: string, actor: string, now: number): Promise<string> {
+    const existing = this.one(
+      `SELECT id FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+       AND json_extract(meta, '$.pr.repo') = ? AND CAST(json_extract(meta, '$.pr.number') AS INTEGER) = ? LIMIT 1`,
+      repo, pr,
+    ) as any;
+    if (existing) return String(existing.id);
+    const created = await this.create(
+      {
+        type: "task",
+        title: `${repo}#${pr} — reconcile${title ? `: ${title}` : ""}`.slice(0, 200),
+        session: "", // machine-created: anonymous, no session may own a projection
+        body_md: reconcileTrackingBody(repo, pr, title, why, `https://github.com/${repo}/pull/${pr}`),
+        meta: { pr: { repo, number: pr } },
+        roles: ["impl"], // a projection card is impl-shaped (roles are structural lanes)
+      },
+      actor,
+    );
+    this.audit(actor, "create", created.id, { type: "task", auto: "reconcile-tracking", pr: `${repo}#${pr}`, why });
+    return created.id;
+  }
+
+  /** Spawn the STANDARD verify duty (the shared 5c template) as a child of
+   *  `parentId`, ledgered FIRST — the reconcile_duties row is the dedupe, so
+   *  a second report (or a racing cycle) can never double-spawn one PR's
+   *  verify. Returns the duty card id, or null when the ledger already has
+   *  this PR's verify (one per PR ever — a dead one alarms, not respawns). */
+  private async reconcileSpawnVerify(repo: string, pr: number, parentId: string, actor: string, now: number): Promise<string | null> {
+    const held = this.one(`SELECT duty_id FROM reconcile_duties WHERE repo = ? AND pr = ? AND kind = 'verify'`, repo, pr) as any;
+    if (held) return null;
+    this.state.storage.sql.exec(
+      `INSERT INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, 'verify', '', NULL, ?)`,
+      repo, pr, now,
+    );
+    const parent = this.one(`SELECT id, title, meta FROM artefacts WHERE id = ?`, parentId) as any;
+    if (!parent) return null;
+    const pm = JSON.parse(parent.meta ?? "{}");
+    const rootTitle = String(parent.title ?? `PR #${pr}`).replace(/^(?:Verify:\s*)+/, "");
+    const stamp = (pm.pr ?? {}) as { repo?: unknown; number?: unknown };
+    const prLink: string =
+      typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
+        ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
+        : `https://github.com/${repo}/pull/${pr}`;
+    const created = await this.create(
+      {
+        type: "task",
+        title: `Verify: ${rootTitle.slice(0, 200)}`,
+        session: "", // machine spawn: a FRESH session must verify (separation of duties)
+        body_md: verifyDutyBody(parentId, rootTitle, prLink),
+        roles: ["review"],
+      },
+      actor,
+    );
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+      created.id, parentId, now,
+    );
+    this.state.storage.sql.exec(
+      `UPDATE reconcile_duties SET duty_id = ?, card_status = 'todo' WHERE repo = ? AND pr = ? AND kind = 'verify'`,
+      created.id, repo, pr,
+    );
+    this.audit(actor, "create", created.id, { type: "task", auto: "reconcile-verify", parent: parentId, pr: `${repo}#${pr}` });
+    return created.id;
+  }
+
+  /** Ledger a non-verify duty (disposition / reverse) — INSERT OR IGNORE so
+   *  the one-per-PR-ever rule holds across reports. */
+  private reconcileLedgerDuty(repo: string, pr: number, kind: "disposition" | "reverse", dutyId: string, now: number): void {
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, ?, ?, 'todo', ?)`,
+      repo, pr, kind, dutyId, now,
+    );
+  }
+
+  /** reconcile.report — one daemon observation cycle for one repo. Runs the
+   *  pure join (reconcile.ts), APPLIES every judgement (spawns, clock
+   *  updates, provenance closes, alarm), records the accounting line, and
+   *  returns the run result. Idempotent per (repo, pr, kind). */
+  private async reconcileReport(body: any, actor: string): Promise<any> {
+    const repo = String(body?.repo ?? "").trim();
+    if (!repo) throw new Error("reconcile.report needs repo");
+    const rawPrs = Array.isArray(body?.prs) ? body.prs : [];
+    const prs: ReconcilePr[] = rawPrs.map(normalizePr).filter((p): p is ReconcilePr => p !== null);
+    const now = Date.now();
+    const cfg = this.reconcileSettings();
+    const titleByPr = new Map(prs.map((p) => [p.number, p.title]));
+
+    // ---- board projection: open cards bound to this repo via a PR leg ----
+    const openCards = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')`,
+    ).toArray() as any[];
+    const openPrs = new Set(prs.map((p) => p.number));
+    const bindings: ReconcileBinding[] = [];
+    for (const row of openCards) {
+      const meta = JSON.parse(row.meta ?? "{}");
+      const legs = [
+        { number: Number((meta.pr ?? {}).number), repo: String((meta.pr ?? {}).repo ?? "") },
+        ...(Array.isArray(meta.prs) ? meta.prs : []).map((l: any) => ({ number: Number(l?.number), repo: String(l?.repo ?? "") })),
+      ];
+      for (const leg of legs) {
+        if (leg.repo !== repo || !Number.isInteger(leg.number) || leg.number <= 0) continue;
+        const seen = this.one(`SELECT missing FROM reconcile_seen WHERE repo = ? AND pr = ?`, repo, leg.number) as any;
+        const prov = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, repo, leg.number) as any;
+        bindings.push({
+          card: String(row.id),
+          status: String(row.status),
+          pr: leg.number,
+          open_verify_children: this.openVerifyChildren(String(row.id)),
+          queued: String(row.status) === "blocked" && Number((meta.merge_train ?? {}).pr ?? 0) > 0,
+          missing: !openPrs.has(leg.number),
+          missing_set_before_report: !!seen && Number(seen.missing) === 1,
+          provenance: prov ? { merge_sha: String(prov.merge_sha), signer: String(prov.signer) } : null,
+        });
+      }
+    }
+
+    // ---- duty ledger, with each duty card's LIVE status ----
+    const duties: ReconcileDuty[] = (this.state.storage.sql.exec(
+      `SELECT pr, kind, duty_id FROM reconcile_duties WHERE repo = ?`,
+      repo,
+    ).toArray() as any[]).map((d) => {
+      const card = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(d.duty_id)) as any;
+      return { pr: Number(d.pr), kind: d.kind, duty_id: String(d.duty_id), card_status: card ? String(card.status) : null };
+    });
+    const ignores: ReconcileIgnore[] = (this.state.storage.sql.exec(
+      `SELECT pr, reason FROM reconcile_ignores WHERE repo = ?`,
+      repo,
+    ).toArray() as any[]).map((i) => ({ pr: Number(i.pr), reason: String(i.reason) }));
+
+    const { judgements, accounting } = reconcileJoin({
+      repo,
+      prs,
+      bindings,
+      ignores,
+      duties,
+      cfg: {
+        now,
+        verify_age_ms: cfg.verify_age_h * 3_600_000,
+        disposition_age_ms: cfg.disposition_age_h * 3_600_000,
+      },
+    });
+
+    // ---- apply ----
+    const spawned: { pr: number; action: string; card: string; duty?: string | null }[] = [];
+    for (const j of judgements as ReconcileJudgement[]) {
+      const a = j.decision;
+      switch (a.action) {
+        case "seen": {
+          this.state.storage.sql.exec(
+            `INSERT INTO reconcile_seen (repo, pr, card, missing, missing_ts, updated_ts) VALUES (?, ?, ?, 0, NULL, ?)
+             ON CONFLICT(repo, pr) DO UPDATE SET missing = 0, missing_ts = NULL, updated_ts = excluded.updated_ts, card = excluded.card`,
+            repo, j.pr, a.card, now,
+          );
+          break;
+        }
+        case "mark_missing": {
+          this.state.storage.sql.exec(
+            `INSERT INTO reconcile_seen (repo, pr, card, missing, missing_ts, updated_ts) VALUES (?, ?, ?, 1, ?, ?)
+             ON CONFLICT(repo, pr) DO UPDATE SET missing = 1, missing_ts = excluded.missing_ts, updated_ts = excluded.updated_ts, card = excluded.card`,
+            repo, j.pr, a.card, now, now,
+          );
+          break;
+        }
+        case "spawn_verify": {
+          // card given → the standard duty on the EXISTING bound card (never
+          // a second card); card null → orphan: project it first, then duty.
+          const parent = a.card ?? await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "approved+mergeable and unbound — the board projection was missing (the #2466 class)", actor, now);
+          const duty = await this.reconcileSpawnVerify(repo, j.pr, parent, actor, now);
+          spawned.push({ pr: j.pr, action: "verify", card: parent, duty });
+          break;
+        }
+        case "spawn_tracking": {
+          const card = await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "approved but destination-blocked — bound so it is visible; the verify duty comes when the base greens", actor, now);
+          spawned.push({ pr: j.pr, action: "tracking", card });
+          break;
+        }
+        case "spawn_disposition": {
+          const card = await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "changes requested / conflicting past the disposition age — fix the PR, or rule it off the board (reconcile.ignore)", actor, now);
+          this.reconcileLedgerDuty(repo, j.pr, "disposition", card, now);
+          spawned.push({ pr: j.pr, action: "disposition", card });
+          break;
+        }
+        case "spawn_reverse": {
+          // The PR left open state with NO provenance row: spawn a ruling
+          // duty as a child of the zombie binding card. Never meta.pr on the
+          // ruling card itself — it is a duty ABOUT a binding, not a
+          // projection (a second binding would double-count the PR).
+          const b = bindings.find((x) => x.pr === j.pr);
+          const boundCard = b?.card ?? "no-open-binding-card";
+          const created = await this.create(
+            {
+              type: "task",
+              title: `Reverse-reconcile: ${repo}#${j.pr} left the open list unrecorded`.slice(0, 200),
+              session: "", // machine spawn: a FRESH session must rule
+              body_md: `Reverse-reconcile duty (BR#4170) — ${repo}#${j.pr} vanished from \`gh pr list\` with NO provenance row, but board card ${boundCard} still binds it.\n\nRule what happened, on the record:\n1. gh pr view ${j.pr} --repo ${repo} --json state,mergedAt,mergeCommit — was it MERGED (outside the train), CLOSED unmerged, or is the disappearance a gh/API flake?\n2. MERGED outside the train: close ${boundCard} done citing the merge commit sha + URL (the human merge is the receipt; provenance stays unstamped — that is the train-signer's job).\n3. CLOSED unmerged: close ${boundCard} done citing the close receipt. FLAKE (still open): record findings via log_progress on ${boundCard} and close yourself done — next report re-binds normally.\n4. Never close ${boundCard} without a receipt, never delete it — a silent close here is exactly the failure this duty exists to prevent (BR#3287).`,
+              roles: ["review"],
+            },
+            actor,
+          );
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+            created.id, boundCard, now,
+          );
+          this.reconcileLedgerDuty(repo, j.pr, "reverse", created.id, now);
+          this.audit(actor, "create", created.id, { type: "task", auto: "reconcile-reverse", parent: boundCard, pr: `${repo}#${j.pr}` });
+          spawned.push({ pr: j.pr, action: "reverse", card: created.id });
+          break;
+        }
+        case "reverse_close": {
+          // Two consecutive misses + a provenance row: the train stamped the
+          // merge — close the zombie binding via the machine proxy (the same
+          // unblock-then-close the landed flow uses; BR#3287 provenance).
+          try {
+            const card = this.one(`SELECT id, status FROM artefacts WHERE id = ?`, a.card) as any;
+            if (card && card.status !== "done" && card.status !== "superseded") {
+              // unpark via the machine-managed transition (trip-wires
+              // suppressed for merge_train moves) from ANY open status — a
+              // zombie binding can sit todo, in_progress, or blocked
+              if (card.status !== "in_progress") {
+                await this.transition({ id: a.card, to: "in_progress", session: "", note: "reconcile: provenance close — unpark the card for the machine proxy", merge_train: true }, actor);
+              }
+              await this.transition(
+                { id: a.card, to: "done", session: "", note: `reconcile: ${repo}#${j.pr} left the open list and the provenance row stamps the merge (${a.merge_sha.slice(0, 9)} by ${a.signer}) — closing the zombie binding on the machine proxy (BR#3287/BR#4170)` },
+                actor,
+              );
+            }
+          } catch (e) {
+            // the machine gate refused (open verify children, closure legs) —
+            // record, alarm-below-covers it, and never force a close
+            this.audit(actor, "reconcile_reverse_close_failed", a.card, { pr: `${repo}#${j.pr}`, error: String((e as Error).message ?? e).slice(0, 300) });
+          }
+          break;
+        }
+        default:
+          break; // bound / inflight / ignored / grace / alarm_unaccounted: no mutation here
+      }
+    }
+
+    // ---- record the run ----
+    const line = accountingLine(accounting);
+    this.state.storage.sql.exec(
+      `INSERT INTO reconcile_reports (ts, actor, repo, accounting, line, ok) VALUES (?, ?, ?, ?, ?, ?)`,
+      now, actor, repo, JSON.stringify(accounting), line, accounting.ok ? 1 : 0,
+    );
+
+    // ---- alarm when the invariant failed: ONE ask per class (the PR-set
+    // title makes identical re-reports dedupe; a changed set re-alarms) ----
+    const unaccounted = (judgements as ReconcileJudgement[]).filter((j) => j.decision.action === "alarm_unaccounted");
+    if (!accounting.ok && unaccounted.length) {
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: `reconcile ALARM ${repo}: ${unaccounted.map((j) => `#${j.pr}`).join(", ")} unaccounted — bind, ignore-with-reason, or revive?`,
+            reason: "every open reviewed PR must be bound / ignored / in-flight within one cycle (BR#4170) — these are none of the three past the actionable age",
+            details: [
+              `Accounting: ${line}`,
+              ...unaccounted.map((j) => {
+                const d = j.decision as { action: "alarm_unaccounted"; why: string };
+                return `PR #${j.pr}: ${d.why} — ${j.reason}`;
+              }),
+              `Fix: bind each PR to its card (or ignore it with reconcile.ignore), or revive the dead duty — then the next report goes green.`,
+            ].join("\n\n"),
+            options: ["On it — binding now", "Ignore these PRs (with reasons)", "Investigate the dead duties"],
+            artefact_id: this.settingValue("reconcile_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        // an identical ask is already open for this episode — that IS one per class
+        this.audit(actor, "reconcile:alarm_deduped", null, { repo, error: String((e as Error).message ?? e).slice(0, 160) });
+      }
+    }
+    this.audit(actor, "reconcile_report", null, { repo, line, ok: accounting.ok, spawned: spawned.length });
+
+    return {
+      ok: accounting.ok,
+      line,
+      accounting,
+      spawned,
+      unaccounted: unaccounted.map((j) => ({ pr: j.pr, why: (j.decision as { why: string }).why })),
+    };
+  }
+
+  /** Open review-role children of one card — the "a verify is already in
+   *  flight via the normal flow" signal for the join. */
+  private openVerifyChildren(cardId: string): number {
+    return Number(
+      this.one(
+        `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"review"%'`,
+        cardId,
+      )?.n ?? 0,
+    );
   }
 
   // ---------- helpers ----------
