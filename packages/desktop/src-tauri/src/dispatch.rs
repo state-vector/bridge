@@ -687,6 +687,154 @@ pub fn repair_by_principal(
     Ok(cfg)
 }
 
+/// BR#4113 — the two classes a hub-call failure can be. Auth failures
+/// (401/403: the hub rejected this device's credential — revoked, expired, or
+/// rotated away) are repairable by the self-heal ladder and are NEVER
+/// terminal while desired state is "running". Everything else (hub
+/// unreachable mid-deploy, 5xx, 429, timeouts, MCP-level errors) is
+/// transient: back off, keep polling — the hub may just be deploying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HubErrClass {
+    Auth,
+    Transient,
+}
+
+fn classify_hub_error(e: &str) -> HubErrClass {
+    // "bridge {status} on /mcp" is mcp_call_session's shape; "hub 401:" is
+    // the pairing/session-plane shape. 401 = the token is dead; 403 = the
+    // identity was refused — a re-vend usually won't change a 403 either,
+    // but it is the same repairable-by-ladder class, and parking loudly
+    // beats a silent permanent stall either way.
+    if e.starts_with("bridge 401 ")
+        || e.starts_with("bridge 403 ")
+        || e.starts_with("hub 401:")
+        || e.starts_with("hub 403:")
+    {
+        HubErrClass::Auth
+    } else {
+        HubErrClass::Transient
+    }
+}
+
+/// BR#4113 — bounded self-heal pacing for auth failures. The repair ladder
+/// (keychain reload → re-vend by principal → self-provision) is attempted
+/// with exponential backoff; after AUTH_PARK_ATTEMPTS failed ladder runs the
+/// gateway PARKS LOUDLY — a needs-attention notice on the snapshot and UI —
+/// and keeps polling on the capped cadence. It never logs out and never
+/// breaks the loop while desired state is "running": a hub-side heal
+/// (rotation grace, rollback, row restore) is picked up by the next poll and
+/// dispatch resumes within one poll interval, zero human action.
+struct AuthHeal {
+    /// consecutive FAILED ladder runs
+    streak: u32,
+    last_attempt: Option<Instant>,
+    parked: bool,
+}
+
+/// What run_loop should do about auth this iteration.
+enum HealStep {
+    /// run the repair ladder now
+    Attempt,
+    /// not yet due — keep polling quietly
+    Wait,
+}
+
+/// Backoff between ladder runs: 5s doubling, capped at AUTH_BACKOFF_CAP_SECS.
+fn auth_backoff_secs(failed_runs: u32) -> u64 {
+    // failed_runs = 1 after the first failure → first retry after 5s
+    let shift = failed_runs.saturating_sub(1).min(6);
+    (5u64 << shift).min(AUTH_BACKOFF_CAP_SECS)
+}
+
+const AUTH_BACKOFF_CAP_SECS: u64 = 300;
+const AUTH_PARK_ATTEMPTS: u32 = 5;
+
+impl AuthHeal {
+    fn new() -> Self {
+        AuthHeal { streak: 0, last_attempt: None, parked: false }
+    }
+
+    /// An auth-classified tick error. Decides whether a ladder run is due.
+    fn on_auth_failure(&mut self, now: Instant) -> HealStep {
+        if let Some(t) = self.last_attempt {
+            if now.duration_since(t).as_secs() < auth_backoff_secs(self.streak.max(1)) {
+                return HealStep::Wait;
+            }
+        }
+        self.last_attempt = Some(now);
+        self.streak = self.streak.saturating_add(1);
+        if self.streak >= AUTH_PARK_ATTEMPTS {
+            self.parked = true;
+        }
+        HealStep::Attempt
+    }
+
+    /// A ladder leg succeeded — the hub re-vended this device. Fully re-arm.
+    fn on_repair_success(&mut self) {
+        *self = AuthHeal::new();
+    }
+
+    /// The hub accepted our token again without a repair (rollback, grace
+    /// window re-opened, row restored) — same re-arm.
+    fn on_hub_accepted(&mut self) {
+        if self.streak > 0 || self.parked {
+            *self = AuthHeal::new();
+        }
+    }
+}
+
+/// BR#4113 — one run of the auth self-heal ladder, in escalating order:
+/// (1) reload the credential from the store — another process on this device
+/// (the headless runner, a second window) may have re-vended the keychain
+/// token after this loop started; (2) agent-plane re-vend by principal
+/// (`repair_by_principal` — the rotate reflex, works headless); (3) human-
+/// plane self-provision (the login is the approval; desktop only). Returns
+/// the fresh config on the first leg that vends. Every failed leg is NAMED
+/// in the returned reasons — logged and snapshotted by the caller, never
+/// swallowed (the 2026-10-27 incidents: "repair failed" with zero why).
+fn auth_repair_ladder(cfg: &DispatchConfig) -> Result<DispatchConfig, Vec<String>> {
+    let mut failures: Vec<String> = Vec::new();
+    // (1) keychain reload — adopt a token another process re-vended
+    match DispatchConfig::resolve() {
+        Some(fresh) if !fresh.token.is_empty() && fresh.token != cfg.token => {
+            return Ok(fresh);
+        }
+        Some(_) => failures.push("keychain token unchanged — re-vending".to_string()),
+        None => failures.push("no resolvable config in the store — keychain reload skipped".to_string()),
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(be) => {
+            failures.push(format!("repair client build failed: {be}"));
+            return Err(failures);
+        }
+    };
+    // (2) agent-plane re-vend by principal — headless-safe
+    match repair_by_principal(&client, &cfg.url) {
+        Ok(fresh) => return Ok(fresh),
+        Err(pe) => failures.push(format!("principal repair: {pe}")),
+    }
+    // (3) human-plane self-provision — the desktop's web session is the approval
+    match crate::session::load() {
+        Some(s) => match self_provision(&client, &cfg.url, &s.value) {
+            Ok(fresh) => Ok(fresh),
+            Err(se) => {
+                failures.push(format!("self-provision: {se}"));
+                Err(failures)
+            }
+        },
+        None => {
+            failures.push(
+                "no web session on this device — human-plane repair unavailable (headless)".to_string(),
+            );
+            Err(failures)
+        }
+    }
+}
+
 /// Resolve the config and require a vendored token. The machine-plane board
 /// endpoints currently answer empty-token requests, so an unpaired desktop
 /// would keep rendering board data after logout — refuse client-side instead.
@@ -1015,11 +1163,19 @@ pub struct DispatchSnapshot {
     pub in_flight: Vec<InFlightView>,
     pub activity: Vec<DispatchActivity>, // newest first, capped
     // BR#2532: set when the runner INVOLUNTARILY signs the desktop out
-    // (identity-law run gate, hub-rejected token). The pair screen renders it
+    // (identity-law run gate). The pair screen renders it
     // as a guided notice — what happened, that nothing was lost, one click to
     // re-pair — instead of leaving a silent logout in the dispatch log.
     pub logout_reason: Option<String>,
     pub logout_ts: Option<u64>,
+    // BR#4113: sustained auth-failure park. The loop STAYS RUNNING (desired
+    // state "running") while the hub rejects this device's credential — it
+    // keeps polling and retrying the repair ladder on a capped cadence, and
+    // resumes on its own the moment the hub accepts the device again. The
+    // reason is surfaced loudly here (UI banner + runner.json) — never a
+    // quiet stop, never a credential wipe.
+    pub needs_attention: Option<String>,
+    pub needs_attention_ts: Option<u64>,
 }
 
 pub type SharedSnapshot = Arc<Mutex<DispatchSnapshot>>;
@@ -1080,6 +1236,27 @@ fn snap_logout_clear(snap: &SharedSnapshot) {
     }
 }
 
+/// BR#4113: raise the loud needs-attention park (sustained auth failure).
+fn snap_needs_attention(snap: &SharedSnapshot, msg: &str) {
+    if let Ok(mut s) = snap.lock() {
+        s.needs_attention = Some(msg.to_string());
+        s.needs_attention_ts = Some(now_ms());
+    }
+    snap_activity(snap, "error", msg);
+}
+
+/// BR#4113: clear the park — the hub accepted this device again (repair
+/// succeeded, or a poll got through). The very next write_runner_state
+/// persists the cleared field.
+fn snap_needs_attention_clear(snap: &SharedSnapshot) {
+    if let Ok(mut s) = snap.lock() {
+        if s.needs_attention.is_some() {
+            s.needs_attention = None;
+            s.needs_attention_ts = None;
+        }
+    }
+}
+
 /// BR#2532: after an auto-logout the loop is STOPPED, so `dispatch_snapshot`
 /// serves the external (headless flat-file) snapshot — which knows nothing of
 /// the in-memory notice. Overlay it so the pair screen can still guide the
@@ -1096,6 +1273,28 @@ pub fn overlay_logout_notice(snap: &SharedSnapshot, v: &mut serde_json::Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.insert("logout_reason".into(), serde_json::Value::String(reason));
         obj.insert("logout_ts".into(), serde_json::json!(ts));
+    }
+}
+
+/// BR#4113: same overlay treatment for the needs-attention park — a loop that
+/// is still RUNNING (so dispatch_snapshot serves the external flat file in
+/// the observing-desktop case) must still surface WHY it is not dispatching
+/// when the flat file predates the park. `v` may be Null.
+pub fn overlay_needs_attention(snap: &SharedSnapshot, v: &mut serde_json::Value) {
+    let (reason, ts) = match snap
+        .lock()
+        .ok()
+        .map(|s| (s.needs_attention.clone(), s.needs_attention_ts))
+    {
+        Some((Some(r), ts)) => (r, ts.unwrap_or(0)),
+        _ => return,
+    };
+    if !v.is_object() {
+        *v = serde_json::json!({ "running": true });
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("needs_attention".into(), serde_json::Value::String(reason));
+        obj.insert("needs_attention_ts".into(), serde_json::json!(ts));
     }
 }
 
@@ -1156,6 +1355,11 @@ fn write_runner_state(snap: &SharedSnapshot) {
             // can't see our in-memory notice. Null after a user logout.
             "logout_reason": s.logout_reason,
             "logout_ts": s.logout_ts,
+            // BR#4113: the sustained-auth-failure park rides the same file —
+            // an observing desktop (or `bridge status`) sees WHY the gateway
+            // is connected but not dispatching. Null when healthy.
+            "needs_attention": s.needs_attention,
+            "needs_attention_ts": s.needs_attention_ts,
         });
         let _ = std::fs::write(dir.join("runner.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
     }
@@ -3336,6 +3540,10 @@ fn tick(
     // incident that emptied the work lists) is now a loud tick error naming
     // the drift, not an empty candidate list that looks like a quiet board.
     orient_contract_error(&orient)?;
+    // BR#4113: orient got through — the hub accepted this device's token.
+    // Clear any sustained-auth-failure park; run_loop re-arms its heal
+    // pacing from this flag on the Ok arm.
+    snap_needs_attention_clear(snap);
     let policy = orient
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -3780,12 +3988,21 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.workdir = Some(cfg.workdir.clone());
         s.max_sessions = cfg.max_sessions;
     }
-    let mut did_logout = false;
-    // Self-healing law (BR#2840, BR#3787): a hub-rejected token gets a repair
-    // LADDER — agent-plane principal repair (headless-safe), then desktop
-    // self-provision (human plane), then loud logout with the reason. Every
-    // failure reason is logged; a successful repair re-arms for the NEXT
-    // rotation. Never silent, never snap-only.
+    // Self-healing law (BR#2840, BR#3787, BR#4113): a hub-rejected token gets
+    // a repair LADDER — keychain reload (another process may have re-vended),
+    // agent-plane principal repair (headless-safe), then desktop
+    // self-provision (human plane). Bounded: exponential backoff 5s→300s,
+    // then a LOUD needs-attention park — but the loop STAYS RUNNING while
+    // desired state is "running": it keeps polling (each poll re-detects a
+    // hub-side heal) and retries the ladder on the capped cadence, resuming
+    // dispatch on its own the moment the hub accepts this device again.
+    // Never a silent permanent stop, never a credential wipe, never a
+    // wait-for-a-human halt. Every failure reason is logged; a successful
+    // repair re-arms for the NEXT rotation. (The old "loud logout last" tail
+    // and its did_logout footer died with BR#4113: the loop no longer
+    // self-logs-out — the identity-law gate returns before this footer, and
+    // auth failures park instead of exiting.)
+    let mut heal = AuthHeal::new();
     let mut cfg = cfg;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -3841,112 +4058,81 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 for msg in msgs {
                     eprintln!("[dispatch] {msg}");
                 }
+                // BR#4113: tick clears the needs-attention flag when its
+                // orient gets through — the hub accepted our token again
+                // (rotation grace, rollback, row restore). Re-arm the heal
+                // pacing to match; the next tick dispatches normally.
+                let hub_accepted = snap
+                    .lock()
+                    .ok()
+                    .map(|s| s.needs_attention.is_none())
+                    .unwrap_or(false);
+                if hub_accepted {
+                    heal.on_hub_accepted();
+                }
             }
             Err(e) => {
-                // A hub-rejected token (401: revoked/expired/rotated away) is
-                // not retryable as-is — but before giving up, repair. Ladder
-                // (BR#3787): (1) agent-plane repair by principal — the
-                // durable device credential, works HEADLESS; (2) the desktop
-                // human-plane self-provision (the login is the approval);
-                // (3) loud logout, clear the dead credential, await the next
-                // login. Every failure reason is LOGGED and snapshotted —
-                // never swallowed (the 2026-10-27 incidents said "the
-                // one-time repair failed" with zero why). (Tick errors
-                // reaching here are orient's — "bridge {status} on /mcp" —
-                // so the prefix match cannot hit task IDs.)
-                if e.starts_with("bridge 401 ") || e.starts_with("hub 401:") {
-                    // BR#4113: a failed repair is NOT a provably-dead
-                    // credential. Wipe ONLY when the hub NAMES it dead
-                    // ("re-pair required" — principal unknown, revoked, or
-                    // reset). Transient failures (hub 5xx, network blip,
-                    // the per-row repair rate limiter) keep the credential
-                    // in the store and retry next tick — keychain.rs's own
-                    // law ("deleted only when provably dead") held until
-                    // this ladder broke it, wiping headless gateways on any
-                    // blip and forcing a human device-flow re-pair.
-                    let mut repaired = false;
-                    let mut provably_dead = false;
-                    {
-                        match reqwest::blocking::Client::builder()
-                            .timeout(Duration::from_secs(30))
-                            .build()
-                        {
-                            Ok(client) => {
-                                match repair_by_principal(&client, &cfg.url) {
-                                    Ok(fresh) => {
-                                        cfg = fresh;
-                                        let msg = "gateway token repaired — re-vended by principal (agent plane) after hub 401".to_string();
-                                        eprintln!("[dispatch] {msg}");
-                                        snap_activity(&snap, "dispatch", &msg);
-                                        write_runner_state(&snap);
-                                        repaired = true;
+                // BR#4113 — classify first. Auth failures (401/403: revoked,
+                // expired, rotated away) run the bounded self-heal ladder and
+                // NEVER stop the loop while desired state is "running".
+                // Everything else is transient (the hub may just be
+                // deploying): log, snapshot, keep polling.
+                match classify_hub_error(&e) {
+                    HubErrClass::Transient => {
+                        eprintln!("[dispatch] ERROR: {e}");
+                        snap_activity(&snap, "error", &e);
+                        if let Ok(mut g) = last_error.lock() {
+                            *g = Some(e);
+                        }
+                    }
+                    HubErrClass::Auth => match heal.on_auth_failure(Instant::now()) {
+                        HealStep::Wait => {
+                            // backoff cadence — keep polling quietly; the
+                            // poll itself is the hub-side-heal detector
+                        }
+                        HealStep::Attempt => match auth_repair_ladder(&cfg) {
+                            Ok(fresh) => {
+                                cfg = fresh;
+                                let was_parked = heal.parked;
+                                heal.on_repair_success();
+                                snap_needs_attention_clear(&snap);
+                                let msg = if was_parked {
+                                    "gateway self-healed — credential re-vended after sustained hub auth rejection; parked state cleared, dispatch resumes now".to_string()
+                                } else {
+                                    "gateway self-healed — credential re-vended after hub auth rejection; dispatch resumes now".to_string()
+                                };
+                                eprintln!("[dispatch] {msg}");
+                                snap_activity(&snap, "dispatch", &msg);
+                                if let Ok(mut g) = last_error.lock() {
+                                    *g = None;
+                                }
+                                write_runner_state(&snap);
+                                continue; // immediate re-tick with the fresh credential
+                            }
+                            Err(failures) => {
+                                for f in &failures {
+                                    eprintln!("[dispatch] self-heal ladder: {f}");
+                                    snap_activity(&snap, "error", &format!("self-heal ladder: {f}"));
+                                }
+                                // park EXACTLY once per episode — on the run
+                                // that crosses the threshold
+                                if heal.parked && heal.streak == AUTH_PARK_ATTEMPTS {
+                                    let msg = format!(
+                                        "needs attention — the hub has rejected this device's credential through {} self-heal attempts (last: {}). The gateway STAYS connected (desired state \"running\") and keeps retrying every {}s: it resumes dispatch on its own the moment the hub accepts this device again — rotation grace, rollback, or row restore; zero human action. To fix by hand now: sign in (re-vends this device's token) or re-pair. Nothing was lost: hub URL and settings are kept.",
+                                        heal.streak,
+                                        failures.last().map(|s| s.as_str()).unwrap_or("unknown"),
+                                        AUTH_BACKOFF_CAP_SECS
+                                    );
+                                    eprintln!("[dispatch] PARKED: {msg}");
+                                    snap_needs_attention(&snap, &msg);
+                                    if let Ok(mut g) = last_error.lock() {
+                                        *g = Some(msg);
                                     }
-                                    Err(pe) => {
-                                        eprintln!("[dispatch] principal repair failed: {pe}");
-                                        snap_activity(&snap, "error", &format!("principal repair failed: {pe}"));
-                                        provably_dead = pe.contains("re-pair required");
-                                        // desktop fallback: human-plane self-provision
-                                        // (attempted on every principal-repair failure —
-                                        // a rate-limited principal row can still
-                                        // self-provision through a live web session)
-                                        match crate::session::load() {
-                                            Some(s) => match self_provision(&client, &cfg.url, &s.value) {
-                                                Ok(fresh) => {
-                                                    cfg = fresh;
-                                                    let msg = "gateway token repaired — re-vended by self-provision (human plane) after hub 401".to_string();
-                                                    eprintln!("[dispatch] {msg}");
-                                                    snap_activity(&snap, "dispatch", &msg);
-                                                    write_runner_state(&snap);
-                                                    repaired = true;
-                                                }
-                                                Err(se) => {
-                                                    eprintln!("[dispatch] self-provision repair failed: {se}");
-                                                    snap_activity(&snap, "error", &format!("self-provision repair failed: {se}"));
-                                                }
-                                            },
-                                            None => {
-                                                if !provably_dead {
-                                                    eprintln!("[dispatch] no web session on this device — human-plane repair unavailable (headless); keeping the credential, retrying principal repair next tick");
-                                                    snap_activity(&snap, "error", "principal repair failed (transient) — no web session (headless); credential kept, retrying next tick");
-                                                }
-                                            }
-                                        }
-                                    }
+                                    write_runner_state(&snap);
                                 }
                             }
-                            Err(be) => {
-                                eprintln!("[dispatch] repair client build failed: {be}");
-                                snap_activity(&snap, "error", &format!("repair client build failed: {be}"));
-                            }
-                        }
-                    }
-                    if repaired {
-                        continue;
-                    }
-                    if !provably_dead {
-                        // transient: keep the credential, keep looping — the
-                        // generic ERROR log below names it and the loop sleeps
-                        if let Ok(mut g) = last_error.lock() {
-                            *g = Some(format!("token refresh failed (transient, credential kept): {e}"));
-                        }
-                    } else {
-                        // BR#2532: same guided-surface treatment as the identity
-                        // gate — the reason rides the snapshot, not just the log.
-                        let msg = "signed out automatically — the hub named this device's credential dead (revoked, expired, or rotated away). Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
-                        eprintln!("[dispatch] {msg} (hub said: {e})");
-                        snap_logout(&snap, msg);
-                        logout_core(&stop, &running, &snap, true);
-                        if let Ok(mut g) = last_error.lock() {
-                            *g = Some(msg.to_string());
-                        }
-                        did_logout = true;
-                        break;
-                    }
-                }
-                eprintln!("[dispatch] ERROR: {e}");
-                snap_activity(&snap, "error", &e);
-                if let Ok(mut g) = last_error.lock() {
-                    *g = Some(e);
+                        },
+                    },
                 }
             }
         }
@@ -3965,11 +4151,11 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     if let Ok(mut s) = snap.lock() {
         s.running = false;
         s.in_flight = Vec::new();
+        // BR#4113: a stop-signal exit is NOT a logout — if a needs-attention
+        // park was up, it survives the stop so the UI still says why the
+        // gateway is not dispatching.
     }
-    // a logout erased the derived state — do not resurrect runner.json here
-    if !did_logout {
-        write_runner_state(&snap);
-    }
+    write_runner_state(&snap);
     eprintln!("[dispatch] loop stopped");
 }
 
@@ -4020,6 +4206,10 @@ pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(
     // was fixed (re-pair) or the user restarted deliberately (BR#2532). If
     // the pairing is still unqualified, run_loop re-records it immediately.
     snap_logout_clear(&state.snapshot);
+    // BR#4113: same for a stale needs-attention park — a deliberate start is
+    // a fresh episode; if the hub still rejects the token, run_loop re-parks
+    // on its own cadence.
+    snap_needs_attention_clear(&state.snapshot);
     let stop = state.stop.clone();
     let running = state.running.clone();
     let last_error = state.last_error.clone();
@@ -4441,16 +4631,20 @@ mod tests {
 
     #[test]
     fn auto_logout_records_a_guided_notice_not_just_a_log_line() {
-        // BR#2532: the identity-law run gate (and the hub-401 logout) must
-        // record a structured notice the pair screen can render — naming the
-        // law and the one-click re-pair path — instead of leaving the reason
-        // in stderr/last_error, which the UI never reads.
+        // BR#2532: the identity-law run gate must record a structured notice
+        // the pair screen can render — naming the law and the one-click
+        // re-pair path — instead of leaving the reason in stderr/last_error,
+        // which the UI never reads.
+        // BR#4113 supersedes the second former site (hub-401 logout): the
+        // loop no longer signs the desktop out on a rejected token at all —
+        // it parks with needs_attention. Exactly ONE auto-logout remains.
         let src = include_str!("dispatch.rs");
         // needles assembled from parts so this alarm cannot match itself
         let notice_call = format!("snap_{}(&snap", "logout");
-        assert!(
-            src.matches(&notice_call).count() >= 2,
-            "both auto-logout sites (identity-law gate + hub-401) must record the structured notice"
+        assert_eq!(
+            src.matches(&notice_call).count(),
+            1,
+            "exactly one auto-logout site remains (the identity-law gate) — hub-401 parks instead of logging out (BR#4113)"
         );
         assert!(
             src.contains(&format!("overlay_{}out_notice", "log")),
@@ -4466,8 +4660,103 @@ mod tests {
             .lines()
             .filter(|l| l.contains(&msg_kw) && l.contains(&keeps) && l.contains(&kept))
             .count()
-            >= 2;
-        assert!(keeps_named, "both auto-logout reasons must say what re-pairing keeps (hub URL + settings)");
+            >= 1;
+        assert!(keeps_named, "the auto-logout reason must say what re-pairing keeps (hub URL + settings)");
+    }
+
+    #[test]
+    fn hub_auth_failures_never_stop_the_loop_and_park_loudly() {
+        // BR#4113: the loop's auth-failure path must NOT log out, must NOT
+        // clear the credential, and must NOT break the loop while desired
+        // state is "running" — it runs the bounded ladder and parks with a
+        // loud needs-attention notice. This pins the exact defect from
+        // tonight's token-rotation fallout (loop stopped → manual reconnect).
+        let src = include_str!("dispatch.rs");
+        let terminal = format!("the one-time repair {}d", "faile");
+        assert!(
+            !src.contains(&terminal),
+            "the terminal 'one-time repair failed → logout + break' path must stay dead — auth failures park and keep polling (BR#4113)"
+        );
+        for needle in [
+            "fn auth_repair_ladder",
+            "fn classify_hub_error",
+            "fn snap_needs_attention",
+            "PARKED:",
+            "HealStep::Attempt",
+        ] {
+            assert!(src.contains(needle), "BR#4113 machinery missing: {needle}");
+        }
+    }
+
+    #[test]
+    fn classify_hub_error_sorts_auth_from_transient() {
+        // BR#4113: 401/403 (revoked/expired/rotated/refused) are the
+        // repairable auth class; unreachable hubs, 5xx, 429 and MCP-level
+        // errors are transient — back off and keep polling.
+        assert_eq!(classify_hub_error("bridge 401 Unauthorized on /mcp"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("bridge 403 Forbidden on /mcp"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("hub 401: token invalid"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("hub 403: identity refused"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("bridge unreachable: connection refused"), HubErrClass::Transient);
+        assert_eq!(classify_hub_error("bridge 500 on /mcp"), HubErrClass::Transient);
+        assert_eq!(classify_hub_error("bridge 429 on /mcp"), HubErrClass::Transient);
+        assert_eq!(classify_hub_error("bridge 302 on /mcp"), HubErrClass::Transient);
+        assert_eq!(classify_hub_error("mcp error -32000: board busy"), HubErrClass::Transient);
+        // a task id that merely CONTAINS 401 must not classify as auth
+        assert_eq!(classify_hub_error("task BR#4011 rejected"), HubErrClass::Transient);
+    }
+
+    #[test]
+    fn auth_backoff_is_bounded_and_escalating() {
+        // BR#4113: 5s doubling capped at 300s — bounded hammering, unbounded
+        // patience.
+        assert_eq!(auth_backoff_secs(1), 5);
+        assert_eq!(auth_backoff_secs(2), 10);
+        assert_eq!(auth_backoff_secs(3), 20);
+        assert_eq!(auth_backoff_secs(4), 40);
+        assert_eq!(auth_backoff_secs(7), AUTH_BACKOFF_CAP_SECS);
+        assert_eq!(auth_backoff_secs(50), AUTH_BACKOFF_CAP_SECS);
+        for n in 1..40 {
+            assert!(auth_backoff_secs(n) <= AUTH_BACKOFF_CAP_SECS);
+        }
+    }
+
+    #[test]
+    fn auth_heal_paces_attempts_parks_once_and_rearms() {
+        // BR#4113: the ladder attempts immediately, then on the backoff
+        // cadence; after AUTH_PARK_ATTEMPTS failed runs it is parked (and
+        // STAYS parked — no refire) while still retrying on the capped
+        // cadence; success fully re-arms.
+        let mut heal = AuthHeal::new();
+        let t0 = Instant::now();
+        assert!(matches!(heal.on_auth_failure(t0), HealStep::Attempt));
+        assert!(!heal.parked);
+        // too soon → Wait (the loop keeps polling)
+        assert!(matches!(heal.on_auth_failure(t0 + Duration::from_secs(1)), HealStep::Wait));
+        // after the backoff window → next attempt; keep failing to the threshold
+        let mut t = t0;
+        for i in 2..=AUTH_PARK_ATTEMPTS {
+            t += Duration::from_secs(auth_backoff_secs(i as u32 - 1));
+            assert!(matches!(heal.on_auth_failure(t), HealStep::Attempt), "run {i}");
+        }
+        assert_eq!(heal.streak, AUTH_PARK_ATTEMPTS);
+        assert!(heal.parked, "sustained failure must park");
+        // parked ≠ stopped: after the capped cadence the ladder still fires
+        t += Duration::from_secs(AUTH_BACKOFF_CAP_SECS);
+        assert!(matches!(heal.on_auth_failure(t), HealStep::Attempt));
+        assert!(heal.parked, "still parked while failures continue");
+        // a repair success fully re-arms
+        heal.on_repair_success();
+        assert!(!heal.parked);
+        assert_eq!(heal.streak, 0);
+        // and a hub-side acceptance (tick got through) re-arms mid-episode
+        assert!(matches!(heal.on_auth_failure(t), HealStep::Attempt));
+        heal.on_hub_accepted();
+        assert_eq!(heal.streak, 0);
+        assert!(!heal.parked);
+        // hub-accepted with nothing pending is a no-op (no state churn)
+        heal.on_hub_accepted();
+        assert_eq!(heal.streak, 0);
     }
 
     // ---- BR#3185: identity profiles -----------------------------------------
