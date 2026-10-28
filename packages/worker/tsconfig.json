@@ -26,6 +26,8 @@
     // browser/DO typegraphs don't meet; the webapp's tsc + vitest cover it
     "test/verdict-supersede.test.ts",
     "test/rotation.test.ts",
-    "test/models-route.test.ts"
+    "test/models-route.test.ts",
+    // BR#3942: same rig as do.test.ts (miniflare + workerd fetch types)
+    "test/ask-escalation.test.ts"
   ]
 }

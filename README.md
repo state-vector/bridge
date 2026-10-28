@@ -380,6 +380,18 @@ ask you are acting on. `urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
 
+**Asks to offline agents escalate to you (BR#3942).** An ask addressed to an agent identity
+that sits unanswered past `ask_escalation_minutes` (a setting, default 30, clamped 5–240)
+while that identity is offline — no direct token or gateway-dispatch edge seen in the last
+10 minutes, or never seen at all — is escalated by the watchdog to the human planes: the
+**same** ask node is stamped `escalated` (one re-route, never a duplicate ask), the ask band
+and For Me render an **ESCALATED — addressee offline** chip with the proof attached, and the
+row shows the addressee's presence (`offline · last seen Nm ago` / `never seen`) so a stalled
+card tells you who it is waiting on and whether that identity is even alive. The original
+options stay on the ask and answering it resumes the blocked subject as usual.
+Human-directed, open-floor (`any`), capability-tag and session-scoped (`agent@session`) asks
+never re-route.
+
 **Human comments post from every web surface.** The comment boxes (task detail's
 "Comment / steer", the decision popover, discussion replies) all write to the card's
 history through the same door agents use — the web plane maps `POST /api/kb/progress` to

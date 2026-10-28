@@ -25,6 +25,10 @@ export interface KbArtefact {
   status_ts?: number;
   /** parent task id, projected by board() from child_of relations */
   part_of?: string;
+  /** BR#3942 — addressee presence for ask rows (question nodes only):
+   *  projected by board() so the human planes can show
+   *  "asked to X (offline, N min ago)" with no extra permission. */
+  ask_target?: { online: boolean; last_seen_ts: number | null; source: "token" | "gateway" | "unknown" };
 }
 
 export interface KbEvent {

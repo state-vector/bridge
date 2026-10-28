@@ -705,6 +705,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ab-prior { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 10px; margin-left: 8px; padding: 0; }
 .ab-prior:hover { color: var(--accent); }
 .ab-prior-line { font-size: 10px; color: var(--text-faint); margin-left: 2px; }
+/* BR#3942 — ask addressee presence: the dead-addressee warning reads at a glance */
+.ab-offline { color: var(--amber, #c77700); font-weight: 600; }
 .ab-meta { font-size: 10.5px; color: var(--text-faint); text-align: right; }
 .ab-actions { display: flex; gap: 4px; align-items: center; }
 
