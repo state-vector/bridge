@@ -114,4 +114,19 @@ describe("BR#4362 push-driven board", () => {
     const after = (await stats()).channel?.board?.builds ?? 0;
     expect(after - before).toBeLessThanOrEqual(1);
   });
+
+  it("mutation invalidates the cache: read-after-write reflects the write immediately", async () => {
+    // prime the cache
+    const first = await (await kb("/board")).json();
+    expect(first.tasks).toBeDefined();
+    // mutate
+    const t = await kbJson("/create", { type: "task", title: "cache invalidation drill" });
+    await kbJson("/transition", { id: t.body.id, to: "in_progress", note: "claim" });
+    // immediate read (<2s TTL) MUST see the mutation — stale-after-write is
+    // the identity-render CI break of 2026-10-29
+    const second = await (await kb("/board")).json();
+    const row = second.tasks.find((x: any) => x.id === t.body.id);
+    expect(row).toBeTruthy();
+    expect(row.status).toBe("in_progress");
+  });
 });
