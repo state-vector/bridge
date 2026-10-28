@@ -26,5 +26,8 @@ sessions/
 packages/webapp/dist/
 packages/worker/src/__version.json
 
+# worker test-suite dry-run output (wrangler --outdir) — build exhaust, never tracked
+.kb-bundle/
+
 # per-session throwaway worktrees (embedded repos — never part of the source tree)
 .worktrees/
