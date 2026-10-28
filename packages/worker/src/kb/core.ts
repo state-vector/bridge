@@ -890,13 +890,19 @@ export type MergeCandidateInput = {
   verifyAcceptedAny: boolean;
 };
 
+/** WHY a train bounce happened (BR#4066): the bounce brief's copy — and the
+ *  next owner it names — follow the kind. Every bounce names its KIND; a
+ *  brief that renders every bounce as "conflicts with its base" lies on a
+ *  coverage bounce (no conflicts exist) and buries a gate defect. */
+export type TrainBounceKind = "coverage" | "conflict" | "gate";
+
 /** What the sweep should DO with one candidate. Mechanical defects bounce the
  *  card when it is in_review (returning to its author); otherwise they are a
  *  progress note — the sweep never steals a claim. */
 export type MergeAction =
   | { kind: "merge"; receipt: string }
   | { kind: "close_superseded"; reason: string }
-  | { kind: "bounce"; defect: string }
+  | { kind: "bounce"; defect: string; bounceKind: TrainBounceKind }
   | { kind: "note"; reason: string }
   | { kind: "skip"; reason: string }
   | { kind: "human_leg"; reason: string };
@@ -916,10 +922,10 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
   // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23)
   if (i.mergeable !== true) {
     if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability — not yet, skip this tick" };
-    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue` };
+    return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`, bounceKind: "conflict" };
   }
   if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
-    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter` };
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
   // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
   const unverified = i.commits.filter((c) => !c.verified);
   if (unverified.length)
@@ -932,7 +938,7 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
   if (head.verdict === "red") {
     const names = head.red.map((r) => r.name).join(", ");
     return i.cardStatus === "in_review"
-      ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl` }
+      ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
       : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
   }
   if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) — not yet, skip this tick` };
@@ -940,7 +946,7 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
   //     Head moved past an accepted verdict → the sweep's own bounce
   //     (re-verify on head change triggers the normal verify pool).
   if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
-    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)` };
+    return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)`, bounceKind: "coverage" };
   if (!i.verifyAcceptedOnHead)
     return { kind: "skip", reason: `no accepted verify verdict covering head ${short} — the verify pool owns the verdict; the sweep merges only verified PRs` };
   return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} — 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
@@ -1559,6 +1565,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     return {
       kind: "bounce",
       defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${legNumber} stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+      bounceKind: "coverage",
     };
   }
   const gate = decideMergeAction({
@@ -1584,25 +1591,85 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
 
-/** train:bounced fix-up brief: the conflict files ride in, the verdict is
- *  INVALID at the new head, re-verify then re-queue at the back. */
+/** Legacy-executor shim (BR#4066): executors predating the bounce_kind field
+ *  still name coverage in their defect text — these phrases only ever appear
+ *  on a coverage bounce (the verdict-coverage rows of decideMergeAction /
+ *  decideTrainGate). Matched case-insensitively against the defect. */
+export const TRAIN_COVERAGE_DEFECT_RE =
+  /moved past the (accepted )?(verify )?verdict|not covered by the accepted verdict|re-verify (at )?the new head/i;
+
+/** The ONE place a train bounce's kind is decided (BR#4066): an explicit
+ *  bounce_kind from the executor wins; otherwise infer from what the legacy
+ *  event carries — conflict files mean conflict, coverage defect text means
+ *  coverage, anything else is a gate defect. The inference never MANUFACTURES
+ *  conflict language: a kindless file-less event renders as the honest gate
+ *  copy, never as "conflicts with its base". */
+export function resolveTrainBounceKind(input: {
+  bounceKind?: string | null;
+  conflictFiles?: string[];
+  defect?: string | null;
+}): TrainBounceKind {
+  const k = String(input.bounceKind ?? "").trim().toLowerCase();
+  if (k === "coverage" || k === "conflict" || k === "gate") return k;
+  if ((input.conflictFiles ?? []).length) return "conflict";
+  if (input.defect && TRAIN_COVERAGE_DEFECT_RE.test(input.defect)) return "coverage";
+  return "gate";
+}
+
+/** train:bounced fix-up brief — per bounce KIND (BR#4066). A coverage bounce
+ *  names the authored head-move and hands the card to the verify pool (no
+ *  conflict language, no file list — none exist). A conflict bounce lists the
+ *  files and names the impl repair leg. A gate bounce quotes the named
+ *  defect. The prior brief rendered EVERY bounce as "conflicts with its base
+ *  … (no file list supplied)", which sent impl hunting for conflicts that
+ *  were never there. */
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
   headSha: string | null;
   conflictFiles: string[];
   verdictId: string | null;
+  /** explicit kind from the executor; absent → resolved from the event
+   *  (resolveTrainBounceKind) so legacy executors still render honestly */
+  bounceKind?: TrainBounceKind | string | null;
+  mergeStateStatus?: string | null;
+  /** the gate's defect text (the train_event's reason) */
+  defect?: string | null;
 }): string {
+  const kind = resolveTrainBounceKind(input);
+  const at = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
+  const verdict = input.verdictId ? ` (${input.verdictId})` : "";
+  if (kind === "coverage") {
+    return [
+      `Merge-train bounce (coverage): PR #${input.prNumber} (${input.repo}) head moved past the accepted verify verdict${at} — the push was authored; this is NOT a merge conflict (no conflicting files exist).`,
+      ``,
+      `**Next owner: the verify pool** — re-verify at the new head.`,
+      ``,
+      `**Law (BR#3516 §5):** an authored push invalidates the prior verdict${verdict} at the new head — machine-clean carries, human-resolved invalidates. Once a fresh verify accepts the new head, the train re-queues the card at the BACK.`,
+    ].join("\n");
+  }
+  if (kind === "gate") {
+    const defect = (input.defect ?? "").trim();
+    return [
+      `Merge-train bounce (gate): PR #${input.prNumber} (${input.repo}) failed the mechanical merge gate${at}.${input.mergeStateStatus ? ` mergeStateStatus=${String(input.mergeStateStatus).toUpperCase()}.` : ""}`,
+      ``,
+      `**Defect:** ${defect || "(executor reported no defect text)"}`,
+      ``,
+      `**Next owner: impl** — fix the named defect (rebase / re-sign / re-approve as it names), re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head (BR#3516 §5).`,
+    ].join("\n");
+  }
   const files = input.conflictFiles.length
     ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
     : "- (no file list supplied — run the trial rebase locally to enumerate)";
   return [
-    `Merge-train bounce: PR #${input.prNumber} (${input.repo}) conflicts with its base${input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : ""}.`,
+    `Merge-train bounce (conflict): PR #${input.prNumber} (${input.repo}) conflicts with its base${at}.`,
     ``,
     `**Conflicting files:**`,
     files,
     ``,
-    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head — machine-clean carries, human-resolved invalidates. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    `**Next owner: the impl repair leg** — resolve the conflict, push, re-enter review.`,
+    ``,
+    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${verdict} is INVALID at the new head — machine-clean carries, human-resolved invalidates. The train re-queues at the BACK once a fresh verify accepts the new head.`,
   ].join("\n");
 }
 

@@ -759,7 +759,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     let (kind, detail) = match &gate {
         MergeAction::Merge { .. } => ("merge", String::new()),
         MergeAction::CloseSuperseded { reason } => ("close_superseded", format!(" — {reason}")),
-        MergeAction::Bounce { defect } => ("bounce", format!(" — {defect}")),
+        MergeAction::Bounce { defect, bounce_kind } => ("bounce", format!(" [{}] — {defect}", bounce_kind.as_str())),
         MergeAction::Note { reason } => ("note", format!(" — {reason}")),
         MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
         MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
@@ -813,26 +813,39 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             release_if_idle(ctx, key, repo, base)?;
             Ok(())
         }
-        MergeAction::Bounce { defect } => {
+        MergeAction::Bounce { defect, bounce_kind } => {
             renew_lease(ctx, repo, base);
-            // human-resolved conflicts invalidate the verdict: enumerate the
-            // conflicting files for the fix-up brief (plumbing merge-tree —
-            // no throwaway worktree needed).
-            let conflicting = facts.get("mergeable") == Some(&json!(false))
-                || vstr(&facts, "mergeStateStatus").map(|s| s.to_uppercase().contains("CONFLICTING")).unwrap_or(false);
-            let (clean, files) = if conflicting { ctx.trial_merge(base, &head_sha)? } else { (true, vec![]) };
-            let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "reason": defect });
-            if !clean && !files.is_empty() {
+            // BR#4066: the bounce NAMES ITS KIND and the event carries it —
+            // the hub renders per-kind copy. Trial-merge ONLY a conflict-class
+            // bounce: a coverage bounce (head moved past the verdict) has no
+            // conflicts to enumerate and a gate defect already names the
+            // truth — trial-merging those manufactured the "conflicts with
+            // its base (no file list supplied)" lie the hub used to render.
+            let trial = if bounce_kind == crate::train_gate::BounceKind::Conflict {
+                Some(ctx.trial_merge(base, &head_sha)?)
+            } else {
+                None
+            };
+            let (clean, files) = trial.unwrap_or((true, vec![]));
+            let event_kind = crate::train_gate::bounce_event_kind(&bounce_kind, clean, files.len());
+            let merge_state = vstr(&facts, "mergeStateStatus").unwrap_or("").to_string();
+            let mut ev = json!({
+                "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id,
+                "head_sha": head_sha, "reason": defect,
+                "bounce_kind": event_kind,
+                "merge_state_status": merge_state,
+            });
+            if event_kind == "conflict" {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
             ctx.mcp("train_event", ev)?;
-            ctx.note(&format!("bounced PR #{pr} — {}", trunc(&defect, 120)));
-            let files_note = if !clean && !files.is_empty() {
-                format!("conflicts in {} file(s): {}{}", files.len(), files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if files.len() > 5 { ", …" } else { "" })
-            } else {
-                defect.clone()
+            ctx.note(&format!("bounced PR #{pr} [{}] — {}", event_kind, trunc(&defect, 120)));
+            let files_note = match event_kind {
+                "conflict" => format!("conflicts in {} file(s): {}{}", files.len(), files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if files.len() > 5 { ", …" } else { "" }),
+                "coverage" => "head moved past the accepted verdict — the verify pool re-verifies at the new head".to_string(),
+                _ => defect.clone(),
             };
-            log(Some(key), &format!("PR #{pr} bounced — {files_note}"));
+            log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
             release_if_idle(ctx, key, repo, base)?;
             Ok(())
         }

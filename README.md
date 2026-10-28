@@ -594,6 +594,17 @@ machine-clean carry chain:
   round enforces (rule 5c), now executed by the train. Human-leg defects
   (signing-environment, external mirrors) file ONE class ask per episode, never one per
   PR.
+- **Every bounce names its KIND (BR#4066)** — and the kind picks the brief's copy and
+  the next owner it cites. **Coverage**: the head moved past the accepted verify
+  verdict (an authored push; no conflicts exist) → the brief says so and hands the card
+  to the verify pool to re-verify at the new head — no conflict language, no file list.
+  **Conflict**: trial-merge conflicts → the enumerated file list rides (a conflict
+  bounce without it is refused outright — the "(no file list supplied)" dead-end cannot
+  render), and the impl repair leg owns the resolve. **Gate**: a mechanical defect
+  (`mergeStateStatus`, red head checks) → the defect is quoted verbatim and impl fixes
+  the named defect. The executor trial-merges only a conflict-class bounce — a coverage
+  or gate bounce never runs a trial rebase, so a stale `mergeable=false` read (BR#3712
+  class) lands as a gate bounce naming the stale state, never as a file-less conflict.
 - **Multi-PR cards are legs, gated per leg (BR#3659)**: a card queued with several PRs
   is a list of legs (`meta.prs`; `meta.pr` stays the first leg for legacy readers).
   Coverage is judged per leg (`verdictCoversHeadLeg` — one leg's stamp/carry never
