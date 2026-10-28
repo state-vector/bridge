@@ -35,34 +35,31 @@ export default {
     // Workspace resolves via the same registry lookup MCP uses, then forwards.
     if (url.pathname === "/api/kb-machine/rename") {
       const body = await request.json().catch(() => ({}));
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/token.rename", {
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
+      return kbGuard("kb.token.rename", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/token.rename", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ bearer, label: body.label }),
-      });
+      }));
     }
     if (url.pathname === "/api/kb-machine/revoke") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("ok"); }
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/token.self_revoke", {
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err; // infra must NOT read as the idempotent "ok" end-state (silent write loss)
+      return kbGuard("kb.token.self_revoke", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/token.self_revoke", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ bearer }),
-      });
+      }));
     }
     if (url.pathname === "/api/kb-machine/stats") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/stats");
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
+      return kbGuard("kb.stats", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/stats"));
     }
     // machine-plane list mirror (bearer): lets runners/scripts enumerate artefacts
     // without a browser cookie — same DO list op the webapp uses, via the GET
@@ -79,72 +76,78 @@ export default {
       }
     }
     if (url.pathname === "/api/kb-machine/list") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" });
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
+      return kbGuard("kb.artefacts", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" }));
     }
     // machine-plane transition (bearer): bounded — only decisions may move, and
     // only between proposed/accepted/rejected/superseded. Human-authoritative
     // accept still routes as actor "web:*" from the paired gateway identity.
     if (url.pathname === "/api/kb-machine/act") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
       const body = await request.json().catch(() => ({}));
       if (body.op !== "transition" || body.type !== undefined)
         return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/transition", {
+      return kbGuard("kb.transition", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/transition", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...body, actor: "web:desktop" }),
-      });
+      }));
     }
 
     // machine-plane search mirror (bearer): desktop/console clients retrieve
     // knowledge without a browser cookie — same DO search op the webapp uses
     // (GET /search reads q/type/limit from query params there).
     if (url.pathname === "/api/kb-machine/search") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
-      return env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" });
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
+      return kbGuard("kb.search", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" }));
     }
 
     // machine-plane agent provisioning (bearer): a GATEWAY-class token mints
     // (or rotates) an agent token for a worker it spawns — per agent, not per
     // session. The secret flows back once; the gateway stores it.
     if (url.pathname === "/api/kb-machine/provision") {
-      const { resolveTokenWs } = await import("./mcp.ts");
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      let ws;
-      try { ws = await resolveTokenWs(env, bearer); } catch { return new Response("unauthorized", { status: 401 }); }
+      const r = await kbMachineResolveWs(env, bearer);
+      if (r.err) return r.err;
       const body = await request.json().catch(() => ({}));
-      const kbId = env.KB.get(env.KB.idFromName(doWs(ws)));
-      const ident = await kbId.fetch("https://kb/auth.identify", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ bearer }),
-      }).then((r) => r.json()).catch(() => null);
+      const kbId = env.KB.get(env.KB.idFromName(doWs(r.ws)));
+      // BR#4212: classified infra-vs-auth — a faulted identify is 503 infra,
+      // never "unauthorized"
+      let ident = null, identInfra = false;
+      try {
+        const ir = await kbId.fetch("https://kb/auth.identify", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ bearer }),
+        });
+        ident = await ir.json().catch(() => null);
+        if (!ir.ok) { if (ir.status >= 500) identInfra = true; ident = null; }
+      } catch { identInfra = true; }
+      if (identInfra) return kbInfra503("kb.auth.identify", new Error("identify faulted"));
       if (!ident?.label) return new Response("unauthorized", { status: 401 });
       // gateway is a token TRAIT (the gateway tag), not a naming convention —
       // the label is free-form, so class is read from the tag
       const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
       if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
-      return kbId.fetch("https://kb/agent.provision", {
+      return kbGuard("kb.agent.provision", kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
-      });
+      }));
     }
 
     if (url.pathname === "/mcp") {
-      return handleMcp(request, env);
+      // BR#4212: handleMcp returns typed JSON from every path; the guard makes
+      // "HTML never escapes the machine plane" structural, not per-path.
+      return kbGuard("mcp", handleMcp(request, env));
     }
 
     // Knowledge realtime (human plane, cookie | gateway bearer): KB event fanout.
@@ -215,22 +218,22 @@ export default {
           : sub === "bootstrap" ? "https://kb/bootstrap"
           : null;
         if (!kbUrl) return kbCors(new Response("not found", { status: 404 }));
-        return kbCors(await env.KB.get(kbId).fetch(kbUrl + url.search, request));
+        return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(kbUrl + url.search, request)));
       }
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
-        return kbCors(env.KB.get(kbId).fetch("https://kb/ask.reframe", {
+        return kbCors(await kbGuard("kb.ask.reframe", env.KB.get(kbId).fetch("https://kb/ask.reframe", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-        }));
+        })));
       }
       if (sub === "purge_smoke" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
-        return kbCors(env.KB.get(kbId).fetch("https://kb/purge_smoke", {
+        return kbCors(await kbGuard("kb.purge_smoke", env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-        }));
+        })));
       }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
@@ -241,11 +244,11 @@ export default {
         // no underscore so the dot-mapping passed it through and the DO 404'd
         // "unknown op progress" — every human comment from the web UI failed.
         const doOp = { progress: "progress.log" }[op] ?? op;
-        return kbCors(await env.KB.get(kbId).fetch(`https://kb/${doOp.replace(/_/g, ".")}`, {
+        return kbCors(await kbGuard("kb." + doOp, env.KB.get(kbId).fetch(`https://kb/${doOp.replace(/_/g, ".")}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        }));
+        })));
       }
     }
 
@@ -273,11 +276,11 @@ export default {
       if (!kbUrl) return new Response("not found", { status: 404 });
       const body = await request.json().catch(() => ({}));
       if (op === "tokens") body.ws = auth.ws; // minted tokens scoped to the caller's workspace
-      return kbHub.fetch(kbUrl, {
+      return kbGuard("kb.admin." + op, kbHub.fetch(kbUrl, {
         method: request.method === "GET" ? "POST" : "POST",
         headers: { "content-type": "application/json", "x-kb-admin": "1" },
         body: JSON.stringify(body),
-      });
+      }));
     }
 
     // Human plane. Auth mode: GitHub OAuth (HMAC session cookie), or Cloudflare
@@ -537,6 +540,44 @@ function kbCors(r) {
 }
 function kbPreflight() {
   return kbCors(new Response(null, { status: 204 }));
+}
+
+// BR#4212 — the knowledge channel's DO-proxy arms are catch-alls: a DO that
+// throws (storage-fault storm) or a runtime error page must surface as TYPED
+// JSON (result_class "infra_storage_fault", HTTP 503) — never an uncaught
+// worker throw (which the runtime renders as a CF HTML 500 page) and never a
+// relayed HTML body. This is the arm half of the DO-entry contract whose
+// wrapper lives in kb/do.ts (fetch).
+function kbInfra503(stage, e) {
+  return json(
+    { error: `kb storage fault at ${stage} — retry`, result_class: "infra_storage_fault", stage },
+    503,
+  );
+}
+async function kbGuard(stage, p) {
+  let res;
+  try {
+    res = await p;
+  } catch (e) {
+    return kbInfra503(stage, e);
+  }
+  const ct = res.headers?.get?.("content-type") ?? "";
+  if (res.status >= 500 && !ct.includes("application/json")) {
+    // runtime/DO error page (HTML) — convert, never relay HTML to machines
+    return kbInfra503(stage, new Error(`upstream status ${res.status}`));
+  }
+  return res;
+}
+/** BR#4212: kb-machine ws resolution — infra faults (registry DO storage
+ *  path) are 503 typed, NEVER 401 "unauthorized": the BR#4117 mislabel class
+ *  that converted storage storms into auth storms. */
+async function kbMachineResolveWs(env, bearer) {
+  const { resolveTokenWs } = await import("./mcp.ts");
+  try {
+    return { ws: await resolveTokenWs(env, bearer) };
+  } catch (e) {
+    return { err: kbInfra503("kb.registry", e) };
+  }
 }
 
 async function checkAuth(request, env) {
