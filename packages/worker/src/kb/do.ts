@@ -119,6 +119,7 @@ import {
   awaitEventToAtom,
   describeAwaitEvent,
   deployedSatisfied,
+  AWAIT_GRAMMAR_DOC,
   type CloseLeg,
   type ProxyAtom,
 } from "./closure.ts";
@@ -717,10 +718,23 @@ export class KnowledgeHub {
               && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
             const ask = await this.askCreate({
               to: "ray",
-              question: `Blocked card ${r.id} awaits nothing the machine can read — re-scope it, or release it back to the pool?`,
-              reason: "the exit condition is prose the hub cannot parse (BR#3578 migration): parked cards awaiting nothing are impossible now — this one needs a human ruling",
-              options: ["RE-SCOPE — I'll rewrite the exit condition", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-              details: `"${r.title}" is parked ${unparseable ? "on machine-looking text that parsed to no atom" : "text-only"}: "${cond.slice(0, 240)}". Under BR#3578 every blocked card awaits a typed event, an open ask, or a timer — give this one one, or release it.`,
+              // Plain-English rewrite (BR#4023, Ray 2026-10-28): the migration
+              // ask must be answerable without a translator — what the card is,
+              // why it cannot auto-resume, and what each option concretely does.
+              question: `Blocked card ${r.id} ("${String(r.title).slice(0, 80)}") can't auto-resume — its resume condition is prose the hub can't check. Re-scope, release, or drop it?`,
+              reason: "a blocked card only auto-resumes on a checkable condition (a PR merging, an issue closing, another card finishing, a CI run going green, a timer, an answered ask); this card's condition is ordinary prose, so it would sit parked forever without a human decision",
+              options: [
+                "RE-SCOPE — rewrite its resume condition as a checkable event (e.g. \"PR #N merges\")",
+                "RELEASE — send it back to the agent pool unchanged",
+                "SUPERSEDE — drop the card",
+              ],
+              details: `"${r.title}" is parked with this resume condition: "${cond.slice(0, 240)}".
+
+Why this needs a human: the hub re-checks blocked cards every sweep, but only against conditions it can evaluate mechanically — a PR merging, an issue closing, another card finishing, a CI run going green, a deploy landing, a timer elapsing, or a bound ask being answered. This card's condition is ordinary prose, so the hub can never tell when it is satisfied; left alone it sits parked forever.
+
+- RE-SCOPE: rewrite the resume condition as a checkable event. Grammar (closed set): ${AWAIT_GRAMMAR_DOC}
+- RELEASE: send the card back to the pool unchanged — an agent must pick it up and move it manually.
+- SUPERSEDE: drop the card (only if the work is moot, done elsewhere, or duplicated).`,
               artefact_id: r.id,
             }, "hub:proxy-watch").catch(() => null);
             if (ask) {
@@ -4048,10 +4062,25 @@ export class KnowledgeHub {
         // await onto the card once the ask id exists.
         void this.askCreate({
           to: "ray",
-          question: `Rework loop on ${t.id} "${t.title.slice(0, 80)}" — the release→claim→stall cycle is now invalid (it failed ${attempts} times). What do you want to do with it?`,
-          reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) — re-running repeats the claim→stall cycle`,
-          options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue. The last release reason names what keeps rejecting the handoff. Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
+          // Plain-English rewrite (BR#4023): the rework-loop ask states the
+          // fact (stuck, N failed attempts), the consequence (re-release
+          // repeats the cycle), and what each option concretely does.
+          question: `Card ${t.id} is stuck in a rework loop (${attempts} failed attempts) — fix its brief, re-release it, or drop it?`,
+          reason: `${attempts} dispatch attempts ended without completion (last: ${reason.slice(0, 120)}) — each re-release repeats the same claim→stall cycle, so this needs a human decision`,
+          options: [
+            "RE-SCOPE — rewrite the card's brief, then release it normally",
+            "RELEASE — back to the pool as-is",
+            "SUPERSEDE — drop the card",
+          ],
+          details: `"${t.title}" (${t.id}) has failed ${attempts} dispatch attempts. Last release reason: "${reason.slice(0, 200)}".
+
+What this means: agents keep picking the card up and stalling the same way — re-releasing it unchanged just repeats the cycle. Check the attempt history on the card before answering.
+
+- RE-SCOPE: fix the card's brief (title, body, exit condition) so the next attempt can actually succeed, then release it.
+- RELEASE: back to the pool unchanged — reasonable only if the past failures were environmental and are now fixed.
+- SUPERSEDE: drop it — the work is moot, done elsewhere, or not worth the loop.
+
+Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
           artefact_id: t.id,
         }, "system:reaper")
           .then((loopAsk) => {
