@@ -466,11 +466,7 @@ opens in a fallback window instead of being lost.
 
 ## Blocked cards await something typed (BR#3578)
 
-<<<<<<< HEAD
-A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. Conjunction conditions parse whole (BR#3986): every `BR#N done` / `PR #N merged` / `GH#N closed` on a line yields its atom, and the proxy watch flips only when **every** atom evaluates TRUE — never on the first alone. Two park shapes are refused loud at the door: text that parses to **multiple atoms** (a park awaits one typed leg — name it in `await_event` and carry the rest as prose; multi-atom text never self-migrates, breach class `gate:multi-atom-condition`), and a **self-referential await** — a card naming its own done (`br_done`/`br_pr_merged` on itself) can never fire while blocked, the BR#136 deadlock (breach class `gate:self-referential-await`). The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
-=======
-A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time — and that includes the ask/time legs (BR#4062): the machine-proxy prose convention (`Machine proxy (typed await_event ask ask_id=BR#N): …`, `(typed await_event time until_ts=<epoch ms>)` — ISO timestamps normalize to epoch ms) parses to the same typed event the `await_event` param carries, and the gate's rejection names the param when nothing parses. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty — prose-derived ask/time parks self-migrate to the typed event and evaluate first-class like any typed park. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
->>>>>>> cd206dff0db28e4756959e90a34986048ee22547
+A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time — and that includes the ask/time legs (BR#4062): the machine-proxy prose convention (`Machine proxy (typed await_event ask ask_id=BR#N): …`, `(typed await_event time until_ts=<epoch ms>)` — ISO timestamps normalize to epoch ms) parses to the same typed event the `await_event` param carries, and the gate's rejection names the param when nothing parses. Conjunction conditions parse whole (BR#3986): every `BR#N done` / `PR #N merged` / `GH#N closed` on a line yields its atom, and the proxy watch flips only when **every** atom evaluates TRUE — never on the first alone. Two park shapes are refused loud at the door: text that parses to **multiple atoms** (a park awaits one typed leg — name it in `await_event` and carry the rest as prose; multi-atom text never self-migrates, breach class `gate:multi-atom-condition`), and a **self-referential await** — a card naming its own done (`br_done`/`br_pr_merged` on itself) can never fire while blocked, the BR#136 deadlock (breach class `gate:self-referential-await`). The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty — prose-derived ask/time parks self-migrate to the typed event and evaluate first-class like any typed park. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
 
 ## Destination-green: the stop-the-line gate
 
@@ -645,7 +641,6 @@ machine-clean carry chain:
   changed under the verdict → the verdict is INVALID at the new head: the executor
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
-<<<<<<< HEAD
   a fresh verify accepts the new head. A bounce and its re-queue are machine-managed
   round trips: a train park — the train's own `merge_train` flag, or an agent re-queue
   following the verify contract's canonical `merge-train: queued` note — never spawns
@@ -653,7 +648,6 @@ machine-clean carry chain:
   only be superseded by the next bounce, with the re-park after it flood-guarded on
   the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
   BR#4135).
-=======
   a fresh verify accepts the new head.
 - **Bounced cards cannot starve (BR#4068)** — a bounced card is the most valuable work
   on the board: verified once, one mechanical leg (rebase) plus one human review from
@@ -668,7 +662,6 @@ machine-clean carry chain:
   leg** as "Review requested … one click from landed?". The ask is a visibility device,
   not work: it never fences the card's done, and the landed (or superseded) close
   retires it automatically.
->>>>>>> 5cd3314620d6a9ab8fdf14b1c504f3f10b54e3b8
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
@@ -768,6 +761,47 @@ typed timer (inert: never fires, never claimable, never queued). Task→supersed
 not a client-legal edge (core.ts LIFECYCLES), so retirement — not deletion — keeps the
 board free of fixture accumulation without loosening the state machine. At most two
 inert blocked fixtures accumulate per run.
+## The board↔GitHub reconcile loop (BR#4170)
+
+The merge train accounts for PRs it *knows about*. The reconcile loop closes the gap:
+**every open reviewed PR must, at all times, be one of exactly three things on the board —
+bound to a card, ignored with a recorded reason, or in-flight on a spawned duty.** Anything
+else past the actionable age is an ALARM to the sink, never a silence (the #2466 class: a
+session died post-open and an APPROVED+MERGEABLE PR sat invisible for 34 hours, outside
+every stamp-gated mechanism).
+
+Division of labour is the credential split (BR#3499/BR#3507): the gateway daemon runs the
+read-only `gh pr list` leg and feeds raw observations via `reconcile_report`; the **hub**
+runs the join (`reconcile.ts`, pure), decides, and performs every board mutation. The
+daemon never writes the board; the hub never touches GitHub. A report per repo per cycle:
+
+- **bound** — an open card rides the PR (`meta.pr` / a `meta.prs` leg); queued cards are
+  the train's business and are never re-spawned at.
+- **ignored-with-reason** — `reconcile_ignore {repo, pr, reason}` rules a PR off the board
+  on the record; an ignore without a reason is refused (an ignore IS a reason).
+- **in-flight / spawn** — an orphan APPROVED+MERGEABLE PR past `verify_age_h` gets a
+  binding card (meta.pr projection, session-less) plus the **standard** 5c verify duty as
+  its child — the same template the normal in_review spawn uses, so ACCEPT queues the card
+  exactly as BR#4079 prescribes. Reconcile creates tracking cards and standard duties
+  only; it never queues, stamps, or merges.
+- **destination-blocked** (BLOCKED/BEHIND) binds WITHOUT a verify duty — a verify would
+  bounce on mergeability by construction; the duty comes when a later cycle sees CLEAN.
+- **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
+  repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
+  silently respawning over the corpse.
+
+**Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
+open list starts a missing clock; two consecutive misses with a provenance row close the
+zombie binding via the machine proxy (BR#3287 — the train stamped the merge); with NO
+provenance it spawns a ruling duty instead — someone rules, never silence.
+
+Knobs: `reconcile.enabled` / `RECONCILE_ENABLED` (default on),
+`reconcile.interval_secs` / `RECONCILE_INTERVAL_SECS` (default 1800, clamped 300..21600),
+`reconcile.repos` (CSV, default both bridge repos), `reconcile.verify_age_h` (2),
+`reconcile.disposition_age_h` (24), `reconcile_alarm_sink_id` (default BR#3124).
+`reconcile_status` is the operator view: settings, the accounting lines (the canary —
+`N open reviewed / N bound / N ignored-with-reason / N in-flight — N accounted`, ALARM
+tail on failure), the duty ledger, ignores, and the missing clock.
 
 ## PR provenance: who touched main, from bridge
 

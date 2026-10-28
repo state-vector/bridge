@@ -95,6 +95,13 @@ fn clamp_interval_secs(v: u64) -> u64 {
     v.clamp(5, 240)
 }
 
+/// BR#4170 reconcile cadence: clamped so the read-only `gh pr list` leg can
+/// neither hammer GitHub (≥ 5 min) nor let the board↔GitHub invariant go
+/// stale for a day (≤ 6 h).
+fn clamp_reconcile_interval_secs(v: u64) -> u64 {
+    v.clamp(300, 21_600)
+}
+
 /// Managed clone-cache path for a lane repo: base/owner/name — one clone per
 /// repo per gateway, shared by every lane of that repo.
 fn cache_dir(base: &str, repo: &str) -> PathBuf {
@@ -1014,12 +1021,17 @@ pub struct DaemonTrainConfig {
     pub lanes: Vec<String>,
     pub workdir_override: Option<String>,
     pub enabled: bool,
+    /// BR#4170: the read-only reconcile leg (board↔GitHub). On by default;
+    /// RECONCILE_ENABLED=0 turns it off independently of the train leg.
+    pub reconcile_enabled: bool,
+    pub reconcile_interval_ms: u64,
 }
 
 impl DaemonTrainConfig {
     pub fn from_runner(hub: &str, token: &str, label: Option<&str>) -> Self {
         let ident = label.map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(short_host);
         let interval_secs: u64 = std::env::var("MERGE_TRAIN_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(45);
+        let reconcile_secs: u64 = std::env::var("RECONCILE_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800);
         Self {
             hub: hub.trim_end_matches('/').to_string(),
             token: token.to_string(),
@@ -1030,6 +1042,8 @@ impl DaemonTrainConfig {
             lanes: parse_identities(&std::env::var("MERGE_TRAIN_LANES").unwrap_or_default()),
             workdir_override: std::env::var("MERGE_TRAIN_WORKDIR").ok().filter(|s| !s.is_empty()),
             enabled: env_enabled(std::env::var("MERGE_TRAIN_ENABLED").ok()),
+            reconcile_enabled: env_enabled(std::env::var("RECONCILE_ENABLED").ok()),
+            reconcile_interval_ms: clamp_reconcile_interval_secs(reconcile_secs) * 1000,
         }
     }
 }
@@ -1091,10 +1105,11 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     log(
         None,
         &format!(
-            "gateway train leg up — holder={} interval={}s lanes={} (in-process, identity-gated per BR#3181)",
+            "gateway train leg up — holder={} interval={}s lanes={} reconcile={} (in-process, identity-gated per BR#3181)",
             cfg.holder,
             cfg.interval_ms / 1000,
-            if cfg.lanes.is_empty() { "all".to_string() } else { cfg.lanes.join(",") }
+            if cfg.lanes.is_empty() { "all".to_string() } else { cfg.lanes.join(",") },
+            if cfg.reconcile_enabled { format!("on/{}s", cfg.reconcile_interval_ms / 1000) } else { "off".to_string() }
         ),
     );
     let mut ctx = match ctx_for_daemon(&cfg) {
@@ -1107,6 +1122,7 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     let mut preflighted = false;
     let mut failures: u32 = 0;
     let mut ticks: u64 = 0;
+    let mut last_reconcile: Option<std::time::Instant> = None;
     loop {
         // sleep in small slices so stop is responsive (same law as run_loop)
         let wake = std::time::Instant::now() + Duration::from_millis(cfg.interval_ms);
@@ -1167,9 +1183,76 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
                 log(None, &format!("tick PANIC (leg survives): {}", trunc(&msg, 300)));
             }
         }
+        // BR#4170: the read-only board↔GitHub reconcile leg — its own cadence
+        // beside the train tick, same survivability rules (a panicking pass
+        // must not kill the leg; the hub owns every decision and mutation).
+        if cfg.reconcile_enabled {
+            let due = last_reconcile
+                .map(|t| t.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms))
+                .unwrap_or(true);
+            if due {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reconcile_pass(&mut ctx)));
+                match r {
+                    Ok(Ok(lines)) => {
+                        last_reconcile = Some(std::time::Instant::now());
+                        for l in lines {
+                            log(None, &l);
+                        }
+                    }
+                    Ok(Err(e)) => log(None, &format!("[reconcile] pass failed (retries next cadence): {}", trunc(&e, 300))),
+                    Err(p) => {
+                        let msg = p.downcast_ref::<String>().cloned().unwrap_or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_else(|| "panic".into()));
+                        log(None, &format!("[reconcile] pass PANIC (leg survives): {}", trunc(&msg, 300)));
+                    }
+                }
+            }
+        }
         if failures > 0 {
             failures = failures.saturating_sub(1); // a completed tick heals the breaker
         }
+    }
+}
+
+/// BR#4170 — one reconcile pass: for each repo the hub's schedule lists, run
+/// the read-only `gh pr list` and feed the observations to the hub. The
+/// DAEMON only observes (identity read-only; it never writes the board) —
+/// the HUB runs the join, decides, mutates, and alarms (reconcile.report).
+fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
+    let schedule = ctx.mcp("reconcile_schedule", json!({}))?;
+    if schedule.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(vec!["[reconcile] disabled by hub schedule — skipping".into()]);
+    }
+    let repos: Vec<String> = schedule
+        .get("repos")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|r| r.as_str().map(String::from)).filter(|s| !s.trim().is_empty()).collect())
+        .unwrap_or_default();
+    if repos.is_empty() {
+        return Ok(vec!["[reconcile] hub schedule lists no repos — skipping".into()]);
+    }
+    let mut lines = Vec::new();
+    for repo in repos {
+        // Read-only by construction: `gh pr list` is the ONLY GitHub call
+        // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
+        // board authority and the hub holds no VCS credentials).
+        let rows = ctx.gh_json(&[
+            "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
+            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
+        ])?;
+        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
+        let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
+        let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        lines.push(format!("[reconcile] {repo}: {line}{}", if ok { String::new() } else { " — ALARM routed to the sink".to_string() }));
+    }
+    Ok(lines)
+}
+
+/// Pass the `gh pr list` rows through to the hub unchanged (the hub
+/// normalizes and drops junk rows) — the daemon never decides what a PR is.
+fn pr_payload(rows: &Value) -> Value {
+    match rows {
+        Value::Array(a) => Value::Array(a.iter().filter(|r| r.is_object()).cloned().collect()),
+        _ => Value::Array(Vec::new()),
     }
 }
 
@@ -1424,5 +1507,57 @@ mod tests {
         assert_eq!(names, vec!["train_lease", "train_lease", "get_artefact", "train_status", "train_lease"]);
         let acquire2 = call_args(&recorded[1]);
         assert_eq!(acquire2.get("action").and_then(|v| v.as_str()), Some("acquire"));
+    }
+
+    // ---------- BR#4170: the reconcile leg ----------
+
+    #[test]
+    fn reconcile_interval_clamp_bounds_and_default() {
+        // the read-only leg may neither hammer GitHub nor go stale for a day
+        assert_eq!(clamp_reconcile_interval_secs(1800), 1800);
+        assert_eq!(clamp_reconcile_interval_secs(0), 300);
+        assert_eq!(clamp_reconcile_interval_secs(299), 300);
+        assert_eq!(clamp_reconcile_interval_secs(21_600), 21_600);
+        assert_eq!(clamp_reconcile_interval_secs(u64::MAX), 21_600);
+    }
+
+    #[test]
+    fn reconcile_config_defaults_on_with_30min_cadence() {
+        // SEQUENTIAL env mutations (same-process tests share env): the two
+        // from_runner reads below must never interleave with each other.
+        // Absent env → the leg is ON (the invariant must not depend on the
+        // gateway operator remembering it exists) at the default 1800s.
+        std::env::remove_var("RECONCILE_ENABLED");
+        let cfg = DaemonTrainConfig::from_runner("http://hub.test", "tok", Some("unit"));
+        assert!(cfg.reconcile_enabled, "reconcile defaults ON");
+        assert_eq!(cfg.reconcile_interval_ms, 1800 * 1000);
+        // the off switch is independent of the train leg's
+        std::env::set_var("RECONCILE_ENABLED", "0");
+        let cfg = DaemonTrainConfig::from_runner("http://hub.test", "tok", Some("unit"));
+        assert!(!cfg.reconcile_enabled);
+        assert!(cfg.enabled, "train leg unaffected");
+        std::env::remove_var("RECONCILE_ENABLED");
+    }
+
+    #[test]
+    fn pr_payload_passes_rows_through_and_drops_junk() {
+        // the daemon never decides what a PR is — objects ride unchanged,
+        // everything else is dropped (the hub's normalizePr would too, but
+        // the leg must not ship noise)
+        let rows = json!([
+            { "number": 7, "title": "x", "reviewDecision": "APPROVED" },
+            "garbage",
+            42,
+            null,
+            { "number": 9 }
+        ]);
+        let out = pr_payload(&rows);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].get("number").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(arr[1].get("number").and_then(|v| v.as_i64()), Some(9));
+        // a non-array gh answer ships as an empty payload, never an error —
+        // the hub's join decides what that means (a full missing sweep!)
+        assert_eq!(pr_payload(&json!("oops")).as_array().unwrap().len(), 0);
     }
 }

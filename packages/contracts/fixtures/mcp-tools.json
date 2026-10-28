@@ -64,6 +64,29 @@
       "required": []
     },
     {
+      "name": "reconcile_ignore",
+      "required": [
+        "pr",
+        "reason",
+        "repo"
+      ]
+    },
+    {
+      "name": "reconcile_report",
+      "required": [
+        "prs",
+        "repo"
+      ]
+    },
+    {
+      "name": "reconcile_schedule",
+      "required": []
+    },
+    {
+      "name": "reconcile_status",
+      "required": []
+    },
+    {
       "name": "related_artefacts",
       "required": [
         "id"
