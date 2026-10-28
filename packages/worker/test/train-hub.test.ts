@@ -243,28 +243,108 @@ describe("merge train DO drill (real bundled worker)", () => {
     });
     expect(merged.body.error ?? "").toBe("");
 
-    // the executor's trial rebase hit conflicts → bounce with the file list
+    // the executor's trial rebase hit conflicts → bounce with the file list,
+    // NAMING THE KIND (BR#4066: every bounce carries coverage|conflict|gate)
     const bounced = await kbJson("/train.event", {
       repo, base: "main", kind: "bounced", actor: "gw-b", pr: 2601, head_sha: "b".repeat(40),
+      bounce_kind: "conflict", merge_state_status: "dirty",
       conflict_files: ["packages/worker/src/kb/do.ts", "packages/contracts/src/mcp.ts"],
     });
     expect(bounced.body.error ?? "", `train:bounced failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.task).toBe(c1);
+    expect(bounced.body.bounce_kind).toBe("conflict");
 
     const card1 = (await kbJson("/get", { id: c1 })).body;
     expect(card1.status).toBe("in_progress");
     expect(card1.meta?.merge_train?.state).toBe("bounced");
-    expect(String(card1.body_md)).toContain("Merge-train bounce (CONFLICT): PR #2601");
+    expect(String(card1.body_md)).toContain("Merge-train bounce (conflict): PR #2601");
     expect(String(card1.body_md)).toContain("- `packages/worker/src/kb/do.ts`");
     expect(String(card1.body_md)).toContain("- `packages/contracts/src/mcp.ts`");
     expect(String(card1.body_md)).toContain("INVALID at the new head");
+    expect(String(card1.body_md)).toContain("the impl repair leg");
     expect(String(card1.body_md)).toContain("machine-clean carries, human-resolved invalidates");
     expect(String(card1.body_md)).toContain("re-queues at the BACK");
+    // the transition note names the kind too — not a generic "conflicts with base"
+    const bounceHist = (await kbJson("/get_history", { id: c1, limit: 5 })).body;
+    expect(JSON.stringify(bounceHist)).toContain("merge-train bounce (conflict) — PR #2601 conflicts with base (2 file(s))");
 
     // the lane freed; the follower is now the whole queue
     const after = await laneSnap(repo);
     expect(after.currently).toBeNull();
     expect(after.queue.map((x: any) => x.id)).toEqual([c2]);
+  });
+
+  it("a COVERAGE bounce (head moved past the accepted verdict, BR#4066) renders the verify-pool brief — NO conflict language, no file list", async () => {
+    const repo = "state-vector/lane-coverage";
+    const c1 = await queueViaAccept({ repo, pr: 2611, head: "e".repeat(40), title: "IMPL: coverage bounce drill" });
+    await acquire(repo, "gw-c", { required_workflows: ["Test"] });
+    // an authored push moved the head past the stamp: no conflicts exist
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-c", pr: 2611, head_sha: "e".repeat(40), task_id: c1,
+      bounce_kind: "coverage", merge_state_status: "clean",
+      reason: `PR #2611 live head ${"e".repeat(40)} is not covered by the accepted verdict (leg 1 stamped ${"e".repeat(9)}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+    });
+    expect(bounced.body.error ?? "", `coverage bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
+    expect(bounced.body.bounce_kind).toBe("coverage");
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("in_progress");
+    const brief = String(card1.body_md);
+    expect(brief).toContain("Merge-train bounce (coverage): PR #2611");
+    expect(brief).toContain("head moved past the accepted verify verdict");
+    expect(brief).toContain("the push was authored");
+    expect(brief).toContain("NOT a merge conflict");
+    expect(brief).toContain("the verify pool");
+    // the lie that sent impl hunting for nonexistent conflicts is GONE:
+    expect(brief).not.toContain("conflicts with its base");
+    expect(brief).not.toContain("Conflicting files");
+    expect(brief).not.toContain("no file list supplied");
+    const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 5 })).body);
+    expect(hist).toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict; re-verify at the new head");
+  });
+
+  it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
+    const repo = "state-vector/lane-gate";
+    const c1 = await queueViaAccept({ repo, pr: 2621, head: "f".repeat(40), title: "IMPL: gate bounce drill" });
+    await acquire(repo, "gw-g", { required_workflows: ["Test"] });
+    const defect = "PR #2621 head check RED: Test. Fix or bounce to impl";
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-g", pr: 2621, head_sha: "f".repeat(40), task_id: c1,
+      bounce_kind: "gate", merge_state_status: "blocked", reason: defect,
+    });
+    expect(bounced.body.error ?? "", `gate bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
+    expect(bounced.body.bounce_kind).toBe("gate");
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("in_progress");
+    const brief = String(card1.body_md);
+    expect(brief).toContain("Merge-train bounce (gate): PR #2621");
+    expect(brief).toContain("mergeStateStatus=BLOCKED");
+    expect(brief).toContain(`**Defect:** ${defect}`);
+    expect(brief).toContain("**Next owner: impl**");
+    expect(brief).not.toContain("conflicts with its base");
+    expect(brief).not.toContain("Conflicting files");
+  });
+
+  it("a conflict bounce WITHOUT the file list FAILS LOUD (BR#4066) — no brief, no transition, the lie cannot render", async () => {
+    const repo = "state-vector/lane-nofiles";
+    const c1 = await queueViaAccept({ repo, pr: 2631, head: "a".repeat(40), title: "IMPL: fileless conflict drill" });
+    await acquire(repo, "gw-n", { required_workflows: ["Test"] });
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-n", pr: 2631, head_sha: "a".repeat(40), task_id: c1,
+      bounce_kind: "conflict", merge_state_status: "dirty",
+      // NO conflict_files — the executor omitted the trial-merge enumeration
+    });
+    expect(bounced.body.error ?? "", "a file-less conflict bounce must fail loud").toContain("without conflict_files");
+    // the card was NOT bounced: still queued/blocked, no brief appended
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("blocked");
+    expect(String(card1.body_md)).not.toContain("Merge-train bounce");
+    // and a garbage kind is rejected too
+    const garbage = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-n", pr: 2631, head_sha: "a".repeat(40),
+      bounce_kind: "rebase-needed",
+    });
+    expect(garbage.body.error ?? "").toContain("bounce_kind must be coverage | conflict | gate");
+    expect((await kbJson("/get", { id: c1 })).body.status).toBe("blocked");
   });
 
   it("a verify close with no `head <sha>` stamp does NOT queue — the card is stamped unbound, fail-closed", async () => {
