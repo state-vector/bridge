@@ -95,6 +95,9 @@ fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_
     // Overlay the in-memory logout notice so the pair screen can guide the
     // re-pair instead of the logout living only in the dispatch log.
     dispatch::overlay_logout_notice(&state.snapshot, &mut v);
+    // BR#4113: overlay the needs-attention park the same way — a RUNNING
+    // external loop's park must still say why nothing is dispatching.
+    dispatch::overlay_needs_attention(&state.snapshot, &mut v);
     v
 }
 

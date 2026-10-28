@@ -39,6 +39,8 @@ interface Snapshot {
   activity: Activity[];
   logout_reason?: string | null; // set when the run gate auto-signs-out (BR#2532) — rendered on the pair screen
   logout_ts?: number | null;
+  needs_attention?: string | null; // sustained-auth-failure park (BR#4113) — the loop stays running; banner explains
+  needs_attention_ts?: number | null;
 }
 /** Mirrors dispatch.rs DispatchConfig (serde). */
 interface Cfg {
@@ -430,6 +432,20 @@ export function App() {
         </nav>
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
+
+      {/* BR#4113: sustained-auth-failure park — the loop is still RUNNING and
+          will self-heal when the hub accepts this device again; the banner
+          says so loudly instead of a silent not-dispatching state. */}
+      {snap?.needs_attention && (
+        <div style={{
+          margin: "10px 16px 0", padding: "10px 12px", borderRadius: 8,
+          border: "1px solid #b8860b", background: "rgba(184, 134, 11, 0.12)",
+        }}>
+          <span className="k-err" style={{ display: "block", whiteSpace: "pre-wrap" }}>
+            ⚠ needs attention — {snap.needs_attention}
+          </span>
+        </div>
+      )}
 
             {page === "top" && (
         <TopView
