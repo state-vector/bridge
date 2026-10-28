@@ -562,3 +562,71 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
     expect(mine).toHaveLength(1); // the closed card only
   });
 });
+
+describe("typed answers dispatch like the option click (BR#3912 type-your-own)", () => {
+  // A rework-loop ask (reaper shape): a blocked subject + an ask whose options
+  // carry action verbs. The typed path must read the same dispatch law as the
+  // click path: verb-matched answers action the subject, everything else is
+  // the generic rule-6 resume. Before the verb-match fix, "RE-SCOPE: <scope>"
+  // missed the 12-char prefix of "RE-SCOPE — I'll rewrite…" and generic-resumed
+  // the parked card — silently restarting the loop the reaper had stopped.
+  const OPTIONS = ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"];
+
+  async function parkedSubjectWithAsk(title: string) {
+    const { body: subject } = await kbJson("/create", { type: "task", title });
+    // rule-6 parking: askCreate flips an IN_PROGRESS subject to blocked-on-ask
+    await kbJson("/transition", { id: subject.id, to: "in_progress", note: "claim" });
+    const { body: ask } = await kbJson("/ask.create", {
+      to: "ray",
+      question: `Rework loop on ${subject.id} "${title}" — the release→claim→stall cycle is now invalid (it failed 20 times). What do you want to do with it?`,
+      reason: "20 dispatch attempts without completion — re-running repeats the claim→stall cycle",
+      options: OPTIONS,
+      artefact_id: subject.id,
+    });
+    expect(ask.id).toMatch(/^BR#\d+$/);
+    const got = await kbJson("/get", { id: subject.id });
+    expect(got.body.status).toBe("blocked"); // askCreate parked the subject
+    return { subject, ask };
+  }
+
+  it("typed 'RE-SCOPE: …' keeps the subject parked (human owns the rewrite)", async () => {
+    const { subject, ask } = await parkedSubjectWithAsk("rework re-scope typed");
+    const { body } = await kbJson("/ask.answer", { id: ask.id, answer: "RE-SCOPE: hunt the churn guard instead — new scope below" });
+    expect(body.task_status).toBe("blocked");
+    const got = await kbJson("/get", { id: subject.id });
+    expect(got.body.status).toBe("blocked");
+    // the typed text is recorded with the ASK node, exactly like a click
+    const askNode = await kbJson("/get", { id: ask.id });
+    expect(String(askNode.body.meta?.ask?.answer ?? "")).toContain("hunt the churn guard");
+  });
+
+  it("typed 'RELEASE …' pools the parked subject (blocked → todo is a legal edge)", async () => {
+    const b = await parkedSubjectWithAsk("rework release typed");
+    const { body: bodyB } = await kbJson("/ask.answer", { id: b.ask.id, answer: "RELEASE — retry on a fresh worker" });
+    expect(bodyB.task_status).toBe("todo");
+    const got = await kbJson("/get", { id: b.subject.id });
+    expect(got.body.status).toBe("todo");
+  });
+
+  it("a typed answer matching no option verb is still the generic resume", async () => {
+    const { subject, ask } = await parkedSubjectWithAsk("rework free-form typed");
+    const { body } = await kbJson("/ask.answer", { id: ask.id, answer: "the gate is gone, retry as-is" });
+    expect(body.task_status).toBe("in_progress");
+    const got = await kbJson("/get", { id: subject.id });
+    expect(got.body.status).toBe("in_progress");
+  });
+
+  it("the reaper's rework-loop ask names the invalid cycle and the card (BR#3912 wording)", async () => {
+    const { ask } = await parkedSubjectWithAsk("rework ask wording");
+    const got = await kbJson("/get", { id: ask.id });
+    expect(String(got.body.title)).toContain("now invalid");
+    expect(String(got.body.title)).toContain("What do you want to do with it?");
+  });
+  // NOTE (BR#3912, filed separately): the SUPERSEDE dispatch leg is structurally
+  // dead — core.ts LIFECYCLES gives tasks NO edge to 'superseded' from any
+  // status, so askAnswer's `transition(to: "superseded")` on a parked subject
+  // always throws AFTER the answer is recorded (ask closed done, subject stuck
+  // blocked, caller sees a 500). Fixing it means a lifecycle-law change
+  // (who may drop parked cards) — owned by the typed-ask-options lane
+  // (BR#3848), not smuggled into this UI fix.
+});

@@ -4,7 +4,7 @@ import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, askKernel } from "./decide";
-import { Btn, Chip } from "./index-kit";
+import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
@@ -180,13 +180,17 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
   pending?: boolean; onPending?: (on: boolean) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [customOpen, setCustomOpen] = useState(false);
+  const [custom, setCustom] = useState("");
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
 
   // the subject BY NAME — an id alone doesn't say what the ask is about
   const subject = useKb((s) => s.tasks.find((t) => t.id === nodeAsk.part_of));
   // rows point, the detail view acts: option buttons answer inline (one click,
-  // no typing); free-text answering lives in the node's detail view
+  // no typing); the last row is "type your own" — a free-text answer recorded
+  // with the ask exactly like a click (BR#3912: "RE-SCOPE — I'll rewrite the
+  // card myself" must not be click-only, the rewrite starts in the answer)
   const answer = async (a: string) => {
     onPending?.(true);
     setBusy(true);
@@ -213,6 +217,25 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
         </span>
         {(ask.options ?? []).length > 0 && (
           <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
+        )}
+        {customOpen ? (
+          <div className="ask-opt-row">
+            <TextInput
+              autoFocus
+              value={custom}
+              placeholder="or answer in your own words…"
+              onChange={(e) => setCustom(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && custom.trim() && !busy) void answer(custom); }}
+            />
+            <Btn size="sm" variant="accept" disabled={busy || !custom.trim()} onClick={() => void answer(custom)}>Answer</Btn>
+          </div>
+        ) : (
+          <div className={`ask-opt-row ${busy ? "disabled" : ""}`}
+            title="answer in your own words — recorded with the ask, same as a click"
+            onClick={() => !busy && setCustomOpen(true)}>
+            <Btn size="sm" disabled={busy}>✎</Btn>
+            <span className="ask-opt-text">type your own answer…</span>
+          </div>
         )}
       </span>
       <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
