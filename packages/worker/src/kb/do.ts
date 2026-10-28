@@ -211,7 +211,7 @@ export class KnowledgeHub {
   private broadcastEvent(ev: unknown) {
     const frame = JSON.stringify({ type: "kb.event", event: ev });
     for (const ws of this.state.getWebSockets()) {
-      try { ws.send(frame); } catch { /* hibernated client gone */ }
+      try { ws.send(frame); } catch { this.wsSendFail++; /* hibernated client gone — counted (BR#4212) */ }
     }
   }
 
@@ -228,8 +228,20 @@ export class KnowledgeHub {
    *  now+60s unconditionally (this jumps past any poisoned timestamp), then
    *  run the sweep inside a catch-all that logs. The alarm can never go
    *  silent, and can never stay stuck in the past. */
+  /** BR#4212 alarm-handler failure policy — DEGRADE + RETRY, never take the
+   *  entry down. The re-arm setAlarm can itself fault (storage storm): catch,
+   *  count, keep going — a throwing alarm() loses its schedule entirely, so
+   *  this handler never throws. If the re-arm faulted, the schedule self-heals
+   *  via the fetch-entry null-or-stale guard on the next request, and the
+   *  sweep below still runs this tick. The sweep rides the DO alarm retry
+   *  chain: a faulting tick is logged (alarm_error audit) and retried next
+   *  tick at the 60s cadence. */
   async alarm() {
-    await this.state.storage.setAlarm(Date.now() + 60_000);
+    try {
+      await this.state.storage.setAlarm(Date.now() + 60_000);
+    } catch (e) {
+      this.noteStorageFault("alarm_rearm", e);
+    }
     try {
       await this.alarmSweep();
     } catch (e) {
@@ -578,6 +590,16 @@ export class KnowledgeHub {
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
       JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks, root_blocker_rollup: rollup ?? null }),
     );
+    // BR#4212: persist the channel counters once per tick so an isolate
+    // restart loses at most one minute of channel stats (/stats.channel reads
+    // the live in-memory counters, with this as last_flush). Best-effort —
+    // a fault here must never kill the sweep.
+    try {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('channel_stats', ?)`,
+        JSON.stringify({ ts: now, routes: this.routeStats, entry_faults: this.storageFaults, ws_send_fail: this.wsSendFail }),
+      );
+    } catch { /* recounted on the next tick */ }
   }
 
   private settingValue(key: string, fallback: string): string {
@@ -1684,15 +1706,59 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     this.state.storage.sql.exec(`UPDATE artefacts SET owner = '' WHERE type = 'task' AND status = 'todo' AND owner != ''`);
   }
 
+  // ---------- BR#4212: the fetch entry NEVER throws ----------
+  // Root cause of the 2026-10-28 HTML-500 storm (incident BR#4117): the
+  // storage-path calls below ran OUTSIDE every try/catch, so one storage-layer
+  // fault took the whole DO entry down uncaught — the worker's /api/kb/* arms
+  // had no catch either, and the runtime served CF HTML 500 pages where JSON
+  // acks belong (silent write loss, clientDisconnected storms, watchdog
+  // phantom-silence churn). Contract since this fix:
+  //   - a storage fault that makes the op unserviceable (ensureSchema) returns
+  //     TYPED JSON 5xx: { error, result_class: "infra_storage_fault", stage }
+  //     (result_class convention from PR #205) — never an uncaught throw;
+  //   - an alarm-guard fault DEGRADES: the request proceeds (a faulted re-arm
+  //     must not drop the write it raced with); the next successful entry
+  //     re-arms via the same null-or-stale guard, and the fault is counted in
+  //     /stats.channel.entry_faults;
+  //   - anything that still escapes the op-level catch-alls lands in the
+  //     last-resort catch → typed JSON 503. HTML never escapes this class.
   async fetch(request: Request): Promise<Response> {
-    await this.ensureSchema();
+    const route = `${request.method} ${new URL(request.url).pathname}`;
+    let status = 503;
+    try {
+      const res = await this.doFetch(request);
+      status = res.status;
+      return res;
+    } catch (e) {
+      this.noteStorageFault("dispatch", e);
+      return this.json(
+        { error: "kb storage fault — the operation did not land; retry", result_class: "infra_storage_fault", stage: "dispatch" },
+        503,
+      );
+    } finally {
+      this.noteRoute(route, status < 500);
+    }
+  }
+
+  private async doFetch(request: Request): Promise<Response> {
+    try {
+      await this.ensureSchema();
+    } catch (e) {
+      return this.storageFaultResponse("ensure_schema", e);
+    }
     // alarm health: null = not scheduled; a timestamp far in the PAST = a stale
     // alarm the runtime dropped without invoking (observed live: getAlarm stuck
     // 42h in the past, so this arm-guard never re-armed and the watchdog went
     // silent for a day). Either way, arm a fresh tick.
-    const alarmAt = await this.state.storage.getAlarm();
-    if (alarmAt === null || alarmAt < Date.now()) {
-      await this.state.storage.setAlarm(Date.now() + 15_000);
+    try {
+      const alarmAt = await this.state.storage.getAlarm();
+      if (alarmAt === null || alarmAt < Date.now()) {
+        await this.state.storage.setAlarm(Date.now() + 15_000);
+      }
+    } catch (e) {
+      // degrade, don't fail the request — the re-arm self-heals on the next
+      // entry; the fault is counted for the watchdog's channel-health probe
+      this.noteStorageFault("alarm_rearm", e);
     }
     const url = new URL(request.url);
 
@@ -1706,7 +1772,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     // Same write-law as mint (BR#2455): charset, uniqueness, and the gw-*
     // class boundary — a token can never rename across the class line.
     if (url.pathname === "/token.self_revoke") {
-      const body: any = await request.json();
+      const body: any = await request.json().catch(() => ({}));
       let identity;
       try {
         identity = await this.identify(String(body.bearer ?? ""));
@@ -1719,7 +1785,7 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       return this.json({ ok: true, revoked: identity.label });
     }
     if (url.pathname === "/token.rename") {
-      const body: any = await request.json();
+      const body: any = await request.json().catch(() => ({}));
       const identity = await this.identify(String(body.bearer ?? ""));
       const newLabel = String(body.label ?? "").trim();
       if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
@@ -1764,7 +1830,11 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
 
     const op = url.pathname.slice(1);
     let body: any = {};
-    if (request.method === "POST") body = await request.json();
+    if (request.method === "POST") {
+      // BR#4212: a malformed body is a 400, not an entry-level throw (it used
+      // to escape every catch and read as a channel outage)
+      try { body = await request.json(); } catch { return this.json({ error: "bad json" }, 400); }
+    }
     const isAdmin = request.headers.get("x-kb-admin") === "1";
     const actor = String(body.actor ?? "mcp");
 
@@ -3276,7 +3346,36 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         ...(sweep ? JSON.parse(sweep.value) : {}),
       };
     } catch { /* older sweep shape */ }
-    return { counts: byType, watchdog };
+    // BR#4212 channel health: per-route ok/err + storage-fault counters, so
+    // "channel down" is MACHINE-CHECKABLE by the watchdog (write success rate
+    // + fault recency) instead of inferred from silence — phantom stalls
+    // distinguishable from real ones (feeds BR#4067's typed-proxy parks).
+    // clientDisconnected itself is a CF-analytics metric invisible inside the
+    // DO; the in-DO proxies are the route error rate, entry_faults, and
+    // ws_send_fail (failed hibernating-WS fanout sends). last_flush is the
+    // alarm tick's persisted snapshot — in-memory counters reset at isolate
+    // boot (window_started_ts says when).
+    let writeOk = 0, writeErr = 0;
+    for (const [route, rec] of Object.entries(this.routeStats)) {
+      if (!route.startsWith("POST")) continue;
+      writeOk += rec.ok; writeErr += rec.err;
+    }
+    const flushedRow = this.one(`SELECT value FROM settings WHERE key = 'channel_stats'`);
+    let lastFlush: any = null;
+    try { lastFlush = flushedRow ? JSON.parse(flushedRow.value) : null; } catch { /* old shape */ }
+    return {
+      counts: byType,
+      watchdog,
+      channel: {
+        window_started_ts: this.routeStatsStarted,
+        write_ops: { ok: writeOk, err: writeErr },
+        ...(writeOk + writeErr > 0 ? { write_ok_rate: Math.round((writeOk / (writeOk + writeErr)) * 1000) / 1000 } : {}),
+        routes: this.routeStats,
+        entry_faults: this.storageFaults,
+        ws_send_fail: this.wsSendFail,
+        last_flush: lastFlush,
+      },
+    };
   }
 
   /**
@@ -6484,6 +6583,37 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       status,
       headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
+  }
+
+  // ---------- BR#4212 channel-health counters ----------
+  // In-memory per-route + storage-fault counters, surfaced in /stats.channel.
+  // A storage fault is counted WHERE it happens (ensure_schema | alarm_rearm |
+  // dispatch) and ALWAYS yields typed JSON — the "uncaught throw → CF HTML
+  // 500" class is structurally dead.
+  private routeStats: Record<string, { ok: number; err: number; last_err_ts: number }> = {};
+  private routeStatsStarted = Date.now();
+  private storageFaults: Record<string, { n: number; last_ts: number; last_error: string }> = {};
+  private wsSendFail = 0;
+
+  private noteRoute(route: string, ok: boolean) {
+    const rec = (this.routeStats[route] ??= { ok: 0, err: 0, last_err_ts: 0 });
+    if (ok) rec.ok++;
+    else { rec.err++; rec.last_err_ts = Date.now(); }
+  }
+
+  private noteStorageFault(stage: string, e: unknown) {
+    const rec = (this.storageFaults[stage] ??= { n: 0, last_ts: 0, last_error: "" });
+    rec.n++; rec.last_ts = Date.now();
+    rec.last_error = String((e as Error)?.message ?? e).slice(0, 200);
+    console.log(`kb storage fault (${stage}):`, rec.last_error);
+  }
+
+  private storageFaultResponse(stage: string, e: unknown): Response {
+    this.noteStorageFault(stage, e);
+    return this.json(
+      { error: `kb storage fault at ${stage} — the operation did not land; retry`, result_class: "infra_storage_fault", stage },
+      503,
+    );
   }
 }
 
