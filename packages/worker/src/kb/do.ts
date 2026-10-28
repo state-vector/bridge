@@ -3403,8 +3403,20 @@ export class KnowledgeHub {
     const details = String(body.details ?? "").trim();
     // WHY IT'S ESCALATED is not optional for human-directed asks: "merge PR
     // #84?" is unanswerable without "review is red but rebuttable per guidance".
-    const reason = String(body.reason ?? "").trim().slice(0, 400);
+    // (Was .slice(0, 400): the cap chopped human asks mid-sentence — BR#3997
+    // and BR#3983 both ended mid-clause ("includes Name; " / "sits gate-bl"),
+    // which is exactly the unreadable-ask failure Ray bounced back. 1200 with
+    // the narrative living in details below.)
+    const reason = String(body.reason ?? "").trim().slice(0, 1200);
     if (!reason && (to === "human" || to === "ray")) throw new Error("asks to a human must state why they are escalated instead of automatic (reason: '…')");
+    // PLAIN-READING BAR (2026-10-28, Ray directive): a human-directed ask must
+    // be answerable on its own — what is this about, current state, why it
+    // needs a human. details is that brief (rendered as markdown under the
+    // question); without it an ask degrades to BR#-reference soup nobody can
+    // act on. Agent-directed asks may stay light.
+    if ((to === "human" || to === "ray") && !details) {
+      throw new Error("human-directed asks require details: a self-contained brief (what this is about, current state, why it needs a human) — gloss every BR#/PR# reference in one clause instead of bare references");
+    }
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
@@ -3441,7 +3453,10 @@ export class KnowledgeHub {
       {
         type: "question",
         title: question.slice(0, 200),
-        body_md: details || question,
+        // the artefact body must read whole even when details were skipped
+        // (agent-directed asks): embed the reason so the detail view carries
+        // the why, never just the bare question.
+        body_md: details || (reason ? `${question}\n\nWHY ESCALATED: ${reason}` : question),
         owner: "",
         meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined } },
       },

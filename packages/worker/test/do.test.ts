@@ -220,9 +220,20 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "integration: merge the roles column PR?",
       options: ["GO — merge", "NO-GO — hold"],
       reason: "integration test coverage",
+      details: "Adds a roles column to tasks so review-gated cards dispatch only to review-role agents. PR is green; this ask covers the go/no-go on merging it.",
       to: "human",
     });
     expect(ask.status).toBe(200);
+    // human-directed asks require the plain-reading brief (details) — bare
+    // reference soup is rejected at the door
+    const bare = await kbJson("/ask.create", {
+      question: "integration: merge the roles column PR without a brief?",
+      options: ["GO — merge", "NO-GO — hold"],
+      reason: "integration test coverage",
+      to: "human",
+    });
+    expect(bare.status).toBe(400);
+    expect(String(bare.body.error)).toContain("details");
     const node = await kbJson("/get", { id: ask.body.id });
     expect(node.body.type).toBe("question");
     expect(node.body.tags).toEqual([]);

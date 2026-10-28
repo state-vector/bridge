@@ -359,16 +359,21 @@ answered via the ask band or progress entries, closed to done/superseded — nev
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
-`in_progress`. Three fields are the whole contract, enforced server-side (`askCreate` /
+`in_progress`. The fields are the whole contract, enforced server-side (`askCreate` /
 `askAnswer` in `packages/worker/src/kb/do.ts`):
 
 - **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes
   the node title. Status reports are rejected at the door — receipts and narrative go in `details`.
+- **`details` — the plain-reading brief.** Mandatory on human-directed asks (rejected without
+  it): what the subject is, the current state, why it needs a human — every BR#/PR# reference
+  glossed in one clause. An ask must be answerable without opening another card.
 - **`reason` — the why_escalated.** Mandatory on human-directed asks (rejected without it):
   one sentence on why this is escalated instead of automatic — the gate, credential or
-  authority it waits on. ≤400 chars.
+  authority it waits on. ≤1200 chars; renders as the ask's one-line why (never chopped
+  mid-clause — the full story stays in `details`).
 - **`options` — the decision.** 2–8 one-click answers (rejected with fewer): the recorded
-  click is the answer, and it closes the question `done`.
+  click is the answer, and it closes the question `done`. When the asker recommends an
+  option it is **first** and prefixed `(Recommended)` — the first button is the recommendation.
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
 `TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like

@@ -286,7 +286,8 @@ describe("askInbox addressee routing (real DO)", () => {
     const toHuman = await kbJson("/ask.create", {
       to: "ray", question: "Human ruling drill?",
       reason: "drill — human-directed ask must never land in an agent inbox",
-      options: ["GO", "NO-GO"], artefact_id: null,
+      details: "Inbox-routing drill: a ray-directed ask must surface on the human planes only, never in agent inboxes.",
+      options: ["(Recommended) GO", "NO-GO"], artefact_id: null,
     });
     expect(toHuman.status, JSON.stringify(toHuman.body)).toBe(200);
     const toAny = await kbJson("/ask.create", {
