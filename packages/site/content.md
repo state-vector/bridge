@@ -159,7 +159,7 @@ Verify-verdict decisions always carry a plain-English ask at the top — **what 
 
 ### The ask contract: asks are question nodes
 
-When an agent needs a human or a peer, `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered `type: "question"` node, `child_of` the subject task when one is given (`artefact_id`). The subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to `in_progress`. Three fields are the whole contract, enforced server-side:
+When an agent needs a human or a peer, `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered `type: "question"` node, `child_of` the subject task when one is given (`artefact_id`). The subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to `in_progress` — exactly once: the ask is the unblock path, so an ask-bound block spawns no separate unblock/sweep duty that could race the answer. Three fields are the whole contract, enforced server-side:
 
 - **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes the node title. Status reports are rejected at the door — receipts and narrative go in `details`.
 - **`reason` — the why_escalated.** Mandatory on human-directed asks (rejected without it): one sentence on why this is escalated instead of automatic — the gate, credential or authority it waits on.
