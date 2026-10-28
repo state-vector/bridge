@@ -1154,6 +1154,69 @@ export function leaseDecide(
   return { ok: true, lease: null, note: "lease released" };
 }
 
+// ---- zombie eviction (BR#4129 — the hub half of proof-of-progress) ----
+// The 2026-10-28 incident: a live holder renewed the lease for hours, took
+// zero actions, and the queue starved behind it (the CAS did its job — too
+// well). Every renewal since PR #263 carries the holder's last ledger action
+// and its age; the HUB consumes it here: on a non-empty queue, a renewal
+// whose action note is frozen past the staleness bound is denied and the
+// lease expires, so the next gateway's acquire wins within a tick.
+
+/** Progress-note staleness bound. Must EXCEED every legitimate note gap:
+ *  the executor tick is ~45s and every non-empty-queue tick path either
+ *  acts (CI poll / bounce / merge — `ctx.note` refreshes the action) or
+ *  releases the lease, and the lease TTL (5 min) already caps how long a
+ *  renewal can outlive its last heartbeat — so >10 min of renewals with a
+ *  frozen note is a zombie by construction (the incident froze for hours).
+ *  Empty queue ⇒ never checked (idle holding is harmless and correct). */
+export const TRAIN_PROGRESS_STALE_MS = 10 * 60_000;
+
+/** The proof-of-progress payload the gateway rides on every `renew`
+ *  (train.rs renew_lease). Unknown-shape ⇒ UNKNOWN (old executors send
+ *  `{}` renewals — deprecation window while BR#4104 retires them). */
+export type LeaseProgressProof = { progress?: unknown; progress_age_ms?: unknown; holder?: unknown };
+
+export type ProgressVerdict = "fresh" | "stale" | "unknown";
+
+/** Judge the proof. UNKNOWN unless the payload is well-formed AND names this
+ *  holder (a proof about someone else proves nothing about the renewer) —
+ *  fail-open to UNKNOWN, never guess a stale. */
+export function progressVerdict(proof: LeaseProgressProof | null | undefined, holder: string): ProgressVerdict {
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) return "unknown";
+  const age = (proof as any).progress_age_ms;
+  const note = (proof as any).progress;
+  const who = (proof as any).holder;
+  if (typeof age !== "number" || !Number.isFinite(age) || age < 0) return "unknown";
+  if (typeof note !== "string" || !note.trim()) return "unknown";
+  if (typeof who === "string" && who.trim() && who !== holder) return "unknown";
+  return age > TRAIN_PROGRESS_STALE_MS ? "stale" : "fresh";
+}
+
+/** THE renew-arm zombie check — pure so the eviction law is unit-testable
+ *  (the DO supplies the derived queue length and throws the lease_conflict).
+ *  Non-empty queue + STALE proof ⇒ deny (the reason names holder, minutes,
+ *  and queue depth for the lane card). Empty queue ⇒ always allow (idle
+ *  holding is harmless). UNKNOWN (missing/garbled proof, legacy `{}`) ⇒
+ *  allow with the verdict surfaced so the DO can audit it loudly. */
+export function renewProgressDecide(
+  proof: LeaseProgressProof | null | undefined,
+  holder: string,
+  queue_len: number,
+): { ok: true; verdict: ProgressVerdict; note: string } | { ok: false; reason: string; stale_ms: number } {
+  const verdict = progressVerdict(proof, holder);
+  if (queue_len <= 0) return { ok: true, verdict, note: "queue empty — idle holding is harmless; renewal allowed" };
+  if (verdict === "stale") {
+    const stale_ms = Math.max(0, Math.floor(Number((proof as any).progress_age_ms)));
+    const mins = Math.max(1, Math.round(stale_ms / 60_000));
+    return {
+      ok: false,
+      reason: `zombie holder — no progress for ${mins}m on non-empty queue (${queue_len} queued) — lease expired, acquire fresh`,
+      stale_ms,
+    };
+  }
+  return { ok: true, verdict, note: verdict === "unknown" ? "renewal allowed — no progress proof (legacy executor, deprecation window)" : "renewal allowed — progress fresh" };
+}
+
 /** Lane identity: ONE standing lane card per (repo, base). Config, never
  *  hardcoded (BR#3516 §1): required workflows + CI bound ride meta.lane. */
 export type LaneSpec = {
