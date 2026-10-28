@@ -37,7 +37,7 @@ to human, redirect releases). It never invents legality or a spawn decision.
 - **done (analysis)** releases the parent's claim if the same session holds it — impl needs a fresh session.
 - **done (any parent)** blocked while open children exist.
 - **todo (release)** only owner/human/system (`release-needs-ownership` table row); agents can't dump each other's work. Stamps `attempted` + attempt count. The executor decides churn: verdict duties escalate to a human at 3 releases (or 3 zero-output watchdog cycles folded from the version log); impl/analysis releases redirect to `blocked` at 5 (or 5 silent cycles). Completion resets the counter.
-- **blocked** requires reason + unblock_condition. `subprocess` class requires `budget_minutes` (1–1440) and auto-reclaims on expiry. Blocked spawns an unblock child — capped at ONE open per parent (reuse over respawn, plus a 60m same-exit flood guard), decided by the executor.
+- **blocked** requires reason + unblock_condition. `subprocess` class requires `budget_minutes` (1–1440) and auto-reclaims on expiry. Blocked spawns an unblock child — capped at ONE open per parent (reuse over respawn, plus a 60m same-exit flood guard), decided by the executor. Merge-train parks spawn nothing: the train is the unblock path (BR#3516 §2) — both the train's own `merge_train` flag and an agent re-queue's canonical `merge-train:` note suppress the spawn (BR#4135: the missed note flavor made every re-queue spawn a child the next bounce superseded, and the re-park after it flood-guard on the stale stamp — a breach card per bounce cycle).
 - **claim** stamps session attribution (first-wins); system actors can't steal claims; review bounces return to the author, not the pool.
 
 ## Breach door + replay
