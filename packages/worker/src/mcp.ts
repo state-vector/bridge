@@ -41,11 +41,29 @@ export async function resolveTokenWs(env: any, bearer: string): Promise<string> 
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ hash }),
   });
-  const out = (await r.json().catch(() => ({}))) as { ws?: string | null };
+  const out = (await r.json().catch(() => ({}))) as { ws?: string | null; result_class?: string };
+  if (!r.ok) {
+    // BR#4212: a registry storage fault is INFRASTRUCTURE, not an auth
+    // verdict — surface it typed. (This used to degrade to the default
+    // workspace and let the token 401 downstream: the mislabel that turned
+    // storage storms into "unauthorized" 401 storms.)
+    const e: any = new Error(`kb registry unavailable (status ${r.status})`);
+    e.result_class = out.result_class ?? "infra_storage_fault";
+    e.status = r.status;
+    throw e;
+  }
   const ws = out.ws ?? DEFAULT_WS_SLUG;
   if (wsRouteCache.size < 1000) wsRouteCache.set(hash, ws);
   return ws;
 }
+
+/** BR#4212: the only identify rejections that carry an AUTH meaning. Anything
+ *  else reaching these catches (storage faults, DO resets, timeouts) is
+ *  infrastructure and must 503 — never masquerade as "unauthorized". */
+const AUTH_REJECTIONS = /^(missing bearer|unknown auth token|auth token revoked)/;
+const isInfraFault = (e: any) =>
+  e?.result_class === "infra_storage_fault" || (typeof e?.status === "number" && e.status >= 500) ||
+  (e instanceof Error && !AUTH_REJECTIONS.test(e.message ?? ""));
 
 export async function handleMcp(request: Request, env: any): Promise<Response> {
   if (request.method !== "POST") {
@@ -74,12 +92,23 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     ws = bearer === (env.BRIDGE_INGEST_TOKEN ?? env.FLOWS_INGEST_TOKEN)
       ? DEFAULT_WS_SLUG
       : await resolveTokenWs(env, bearer);
-  } catch {
-    // unknown/revoked bearer: a clean JSON-RPC 401, not an unhandled throw
-    // (unhandled = CF HTML error page, which reads as "the service is down")
+  } catch (e) {
+    // BR#4212: this path carries NO auth verdict — a failure here is the
+    // registry/routing infrastructure (DO storage fault, reset, timeout).
+    // The old catch mislabeled every one of those as "unauthorized: unknown
+    // or revoked token" (JSON-RPC 401), converting storage storms into 401
+    // storms during BR#4117. Typed infra → 503; a clean JSON-RPC error, never
+    // an unhandled throw (which the runtime renders as an HTML error page).
     return json(
-      { jsonrpc: "2.0", id: null, error: { code: -32001, message: "unauthorized: unknown or revoked token" } },
-      401,
+      {
+        jsonrpc: "2.0", id: msg.id ?? null,
+        error: {
+          code: -32000,
+          message: `kb temporarily unavailable — retry (${String((e as Error).message ?? e).slice(0, 200)})`,
+          data: { result_class: (e as any).result_class ?? "infra_storage_fault" },
+        },
+      },
+      503,
     );
   }
   const hub = env.KB.get(env.KB.idFromName(doWs(ws)));
@@ -93,6 +122,24 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
       identity = await kb(hub, "auth.identify", { bearer });
     }
   } catch (e) {
+    // BR#4212: classified infra-vs-auth outcome. Genuine token rejections
+    // ("unknown auth token" / "auth token revoked" / "missing bearer") keep
+    // the clean JSON-RPC 401; storage faults and other infrastructure
+    // failures are 503 infra — a storage storm must never read as
+    // "unauthorized".
+    if (isInfraFault(e)) {
+      return json(
+        {
+          jsonrpc: "2.0", id: msg.id ?? null,
+          error: {
+            code: -32000,
+            message: "kb temporarily unavailable — retry",
+            data: { result_class: (e as any).result_class ?? "infra_storage_fault" },
+          },
+        },
+        503,
+      );
+    }
     return json(
       { jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32001, message: String((e as Error).message) } },
       401,
@@ -108,7 +155,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
       body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id }),
     });
     const out = await r.json();
-    if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
+    if (!r.ok) throw kbError(op, r.status, out);
     // BR#3990: every artefact row in every tool payload carries `url` — the
     // card's canonical deep link, built from the request's public origin.
     // One boundary, all tools; handlers that spread DO results inherit it.
@@ -147,6 +194,22 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     }
   } catch (e) {
     const message = String((e as Error).message ?? e);
+    // BR#4212: infrastructure faults are SERVER errors, not tool errors —
+    // flagged typed (HTTP 503 + result_class) so clients/watchdogs can
+    // distinguish "retry the channel" from "the tool failed".
+    if (isInfraFault(e)) {
+      return json(
+        {
+          jsonrpc: "2.0", id: msg.id ?? null,
+          error: {
+            code: -32000,
+            message: "kb temporarily unavailable — retry",
+            data: { result_class: (e as any).result_class ?? "infra_storage_fault" },
+          },
+        },
+        503,
+      );
+    }
     if (msg.method === "tools/call") {
       result = {
         content: [{ type: "text", text: `ERROR: ${message}\nFix the cause and retry. Read the error — it states the required fix.` }],
@@ -173,6 +236,18 @@ interface Ctx {
   sessionName: string;
 }
 
+/** BR#4212: DO errors ride typed — result_class + HTTP status survive the
+ *  throw so the catches above can classify infra (retry, 503) vs auth/tool
+ *  failure (the old plain-Error throw flattened every DO fault into whatever
+ *  the nearest catch guessed). */
+function kbError(op: string, status: number, out: any): any {
+  const e: any = new Error(out?.error ?? `kb ${op} failed`);
+  e.status = status;
+  if (out?.result_class) e.result_class = out.result_class;
+  else if (status >= 500) e.result_class = "infra_storage_fault";
+  return e;
+}
+
 async function kb(hub: any, op: string, payload: object) {
   const r = await hub.fetch(`https://kb/${op}`, {
     method: "POST",
@@ -180,7 +255,7 @@ async function kb(hub: any, op: string, payload: object) {
     body: JSON.stringify(payload),
   });
   const out = await r.json();
-  if (!r.ok) throw new Error((out as any).error ?? `kb ${op} failed`);
+  if (!r.ok) throw kbError(op, r.status, out);
   return out;
 }
 
