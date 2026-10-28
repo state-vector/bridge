@@ -3629,9 +3629,15 @@ export class KnowledgeHub {
           // (the answered ask is the record; the marker prevents re-ask spam).
           // Without dispatch semantics this is the generic rule-6 resume.
           const isMigrationAsk = String(sm.blocked?.await_migration_ask ?? "") === id;
+          // typed answers (BR#3912 type-your-own) must dispatch like the
+          // button click on the same option: match the option's verb token,
+          // not its first 12 chars — "RE-SCOPE: <new scope>" stays a
+          // human-owned park exactly like "RE-SCOPE — I'll rewrite…", and a
+          // typed "SUPERSEDE: x" drops instead of silently resuming
           const optHit = (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
-            .some((o) => /^(RELEASE|CANCEL|SUPERSEDE)\b/i.test(String(o ?? "").trim())
-              && answer.trim().toLowerCase().startsWith(String(o).trim().slice(0, 12).toLowerCase()));
+            .map((o) => String(o ?? "").trim().split(/\s+/)[0] ?? "")
+            .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
+            .some((verb) => answer.trim().toLowerCase().startsWith(verb.toLowerCase()));
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
@@ -4042,10 +4048,10 @@ export class KnowledgeHub {
         // await onto the card once the ask id exists.
         void this.askCreate({
           to: "ray",
-          question: `Rework loop on ${t.id} — re-scope it, or release it back to the pool?`,
+          question: `Rework loop on ${t.id} "${t.title.slice(0, 80)}" — the release→claim→stall cycle is now invalid (it failed ${attempts} times). What do you want to do with it?`,
           reason: `${attempts} dispatch attempts without completion (last: ${reason.slice(0, 120)}) — re-running repeats the claim→stall cycle`,
           options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
-          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue.`,
+          details: `Rework loop: ${attempts} attempts. Review the attempt history (get_history ${t.id}) before answering — fix what keeps failing, re-scope, or deliberately continue. The last release reason names what keeps rejecting the handoff. Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
           artefact_id: t.id,
         }, "system:reaper")
           .then((loopAsk) => {

@@ -374,9 +374,15 @@ Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, ta
 `TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
-open ask with its options as one-click buttons, and every ask-band row (verdict, decision,
+open ask with its options as one-click buttons, every ask-band row (verdict, decision,
 node ask) shows its own BR# id as a mono chip next to the rel time — you always know which
-ask you are acting on. `urgency` is an ask vocabulary, not a
+ask you are acting on — and each node-ask row ends with a **type your own answer…** row
+that opens a text input: the typed text is recorded with the ask exactly like a click
+(BR#3912 — an option that promises a rewrite, like "RE-SCOPE — I'll rewrite the card
+myself", needs somewhere to write it). Typed answers follow the same dispatch law as
+clicks: an answer starting with a RE-SCOPE/KEEP option verb keeps the subject parked,
+RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resumes it.
+`urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
 
