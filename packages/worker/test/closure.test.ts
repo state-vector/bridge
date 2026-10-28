@@ -178,10 +178,12 @@ describe("parseProxyCondition conjunctions — every match per line (BR#3986)", 
   });
 });
 
-describe("isSelfAwait — the self-referential park deadlock guard (BR#3986/BR#136)", () => {
-  it("br_done/br_pr_merged naming the parked card is self", () => {
+describe("isSelfAwait — the self-referential park deadlock guard (BR#3986/BR#136; br_pr_merged exempt per BR#3620)", () => {
+  it("br_done naming the parked card is self", () => {
     expect(isSelfAwait("BR#136", { event: "br_done", id: "BR#136" })).toBe(true);
-    expect(isSelfAwait("BR#136", { event: "br_pr_merged", id: "BR#136" })).toBe(true);
+  });
+  it("a self br_pr_merged is NOT self — the train stamps its provenance row while the card is blocked (BR#3620's merge-train flip)", () => {
+    expect(isSelfAwait("BR#136", { event: "br_pr_merged", id: "BR#136" })).toBe(false);
   });
   it("other cards' br_done and every other event kind is not", () => {
     expect(isSelfAwait("BR#136", { event: "br_done", id: "BR#135" })).toBe(false);

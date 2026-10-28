@@ -502,7 +502,9 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     expect(c2.status, `park-round close failed: ${JSON.stringify(c2.body)}`).toBe(200);
 
     // sweep 1: the ruling card is still todo → verdict false, nothing spawns
-    const sweep1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 101 * 60_000 });
+    // (times sit AFTER the BR#4062 drills' sweeps below — one shared DO, the
+    // sweep's last-tick pacing means later-running drills need later clocks)
+    const sweep1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 501 * 60_000 });
     expect(sweep1.status, JSON.stringify(sweep1.body)).toBeLessThan(500);
     expect(sweep1.body.error).toBeUndefined();
     expect((await taskById(aid)).meta?.proxy_check?.verdict).toBe("false");
@@ -512,7 +514,7 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     await kbJson("/transition", { id: qid, to: "done", actor: "web:rayh", session: "web", note: "GO — Option A" });
 
     // sweep 2: flip — verdict true, fresh duty spawned with the receipt
-    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 117 * 60_000 });
+    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 517 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const aNow = await taskById(aid);
     expect(aNow.meta?.proxy_check?.verdict).toBe("true");
@@ -557,7 +559,7 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
       expect(c4.status, `park-round close failed (${prefix}): ${JSON.stringify(c4.body)}`).toBe(200);
     }
 
-    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 133 * 60_000 });
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 533 * 60_000 });
     expect(sweep.body.error).toBeUndefined();
     for (const id of [p1id, p2id]) {
       const now = await taskById(id);

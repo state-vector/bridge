@@ -208,11 +208,17 @@ export function parseProxyCondition(text: string): ParsedCondition {
     // ask/question card left todo (done/superseded). The BR#3423 class:
     // parked on a human ruling that answered days ago, with no atom kind to
     // read it, so the whole condition stamped unparseable and the card never
-    // moved (BR#3620). Requires a continuation after the verb ("answered with
-    // GO") so the bare derived annotation "ask BR#N answered" keeps
-    // re-deriving the typed ask atom (BR#4062) instead of double-parsing.
-    for (const m of line.matchAll(/\b(?:ask\s+)?BR#(\d+)\s+(?:is\s+)?(?:now\s+)?(?:answered|decided|resolved)\b(?=\s+\S)/gi)) {
-      push({ kind: "br_answered", repo: null, brId: `BR#${m[1]}` });
+    // moved (BR#3620). Skipped on a line that already carries the TYPED ask
+    // leg (BR#4062's derived-annotation park shape: "…(typed await_event ask
+    // ask_id=BR#N)…: Ask BR#N answered → …") — that leg is evaluated
+    // first-class and the tail is annotation on the SAME condition, not a
+    // second atom. Requires a continuation after the verb ("answered with
+    // GO") so the BARE derived annotation "ask BR#N answered" still
+    // re-derives the typed ask atom alone.
+    if (!/\btyped\s+await_event\s+ask\b/i.test(line)) {
+      for (const m of line.matchAll(/\b(?:ask\s+)?BR#(\d+)\s+(?:is\s+)?(?:now\s+)?(?:answered|decided|resolved)\b(?=\s+\S)/gi)) {
+        push({ kind: "br_answered", repo: null, brId: `BR#${m[1]}` });
+      }
     }
 
     // run_success: "run <id> … SUCCESS / green" — every run on the line.
@@ -534,11 +540,14 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
 }
 
 /** Self-referential await (BR#3986 / the BR#136 deadlock): a card awaiting
- *  its own done can never fire — the typed event's subject only reaches that
- *  state AFTER the card unblocks, so the park deadlocks silently. Pure +
- *  exported for the park gate and the regression tests. */
+ *  its own DONE can never fire — the typed event's subject only reaches that
+ *  state AFTER the card unblocks, so the park deadlocks silently. br_pr_merged
+ *  is EXEMPT (BR#3620): its eval is ledger-native — the train stamps the
+ *  provenance row (task_id) at merge time, while the card is still blocked —
+ *  which is exactly how a merge-train card flips. Pure + exported for the
+ *  park gate and the regression tests. */
 export function isSelfAwait(cardId: string, e: AwaitEvent): boolean {
-  return (e.event === "br_done" || e.event === "br_pr_merged") && e.id === cardId;
+  return e.event === "br_done" && e.id === cardId;
 }
 
 /** Whether the hub's OWN deployed commit satisfies a `deployed` atom: prefix
