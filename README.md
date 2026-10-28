@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the gateway identity is labelled with the hostname slug (e.g. `macbookpro`) and tagged with the gateway class, which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
+Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. The device declares its class at pair/start (a runner pairs as a gateway — there is no checkbox) and its label is pre-filled with the bare hostname slug (e.g. `macbookpro`), editable and display-only — the label is never identity. The gateway class comes from the token's gateway tag, not the name, and Connect lists gateways under Gateways with the agents they dispatched, separate from your interactive agents.
 
 Prefer building from source?
 
@@ -237,8 +237,10 @@ Notes:
   boundary — gateway tokens are infrastructure labelled with the hostname slug
   (e.g. `macbookpro`) and tagged with the gateway class; they are never task
   owners, and agent labels (`opencode-ray`) never take the gateway tag. The
-  boundary is enforced at mint, pairing, rename and
-  tag-edit time: a mis-named token is rejected, not rendered wrong. Connect
+  token (its principal) anchors identity: the class is the gateway **tag** on
+  the token, never a name convention — labels are free-form display and
+  nothing gates on a label shape (a label held by another device's credential
+  is a collision, not a naming violation). Connect
   shows gateways with the agents they dispatched, attributed agents nested
   under their gateway. Dispatched work is attributed to the agent the gateway
   dispatched as, named `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or
