@@ -418,4 +418,59 @@ describe("merge train DO drill (real bundled worker)", () => {
     ]);
     expect(c.meta?.merge_train?.legs_total).toBe(2);
   });
+
+  it("BR#4129 zombie eviction: a renewal with a frozen progress note on a non-empty queue is denied and EXPIRES — the next gateway's acquire takes over within a tick; legacy `{}` renewals still pass", async () => {
+    const repo = "state-vector/lane-zombie";
+    // a verify-accepted card queues — the lane's derived queue is non-empty
+    const cardId = await queueViaAccept({ repo, pr: 3101, head: "a".repeat(40), title: "IMPL: zombie eviction drill" });
+    expect((await laneSnap(repo)).queue.map((x: any) => x.id)).toContain(cardId);
+
+    // the zombie acquires, then renews carrying its FROZEN action note (hours old)
+    const a = await acquire(repo, "gw-zombie");
+    expect(a.body.error ?? "").toBe("");
+    const denied = await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-zombie",
+      progress: { progress: "merged PR #3100", progress_age_ms: 3 * 60 * 60_000, holder: "gw-zombie" },
+    });
+    expect(denied.status).toBe(400);
+    expect(String(denied.body.error)).toContain("zombie holder");
+    expect(String(denied.body.error)).toContain("no progress for 180m");
+    expect(String(denied.body.error)).toContain("non-empty queue (1 queued)");
+
+    // the lease EXPIRED on denial and the lane card says why (board visibility)
+    const snap = await laneSnap(repo);
+    expect(snap.lease).toBeNull();
+    expect(String(snap.reason)).toContain("zombie holder evicted");
+    expect(String(snap.reason)).toContain("gw-zombie");
+    // the eviction is on the lane's audit trail (the handover receipt)
+    const hist = await kbJson(`/history?id=${encodeURIComponent(snap.card)}`);
+    const notes = JSON.stringify(hist.body ?? {});
+    expect(notes).toContain("train:lease_evicted");
+
+    // takeover: the next gateway's acquire WINS the now-free lane
+    const takeover = await acquire(repo, "gw-2");
+    expect(takeover.body.error ?? "").toBe("");
+    expect(takeover.body.lease.holder).toBe("gw-2");
+
+    // a FRESH proof renews fine on the non-empty queue (awaiting-CI law —
+    // the CI-poll note refreshes every tick, it never trips)
+    const fresh = await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-2",
+      progress: { progress: "CI poll on abc123def: pending", progress_age_ms: 45_000, holder: "gw-2" },
+    });
+    expect(fresh.body.error ?? "").toBe("");
+    // a legacy `{}` renewal (no proof) is UNKNOWN — allowed on the non-empty
+    // queue while the deprecation window runs (BR#4104 retires the senders)
+    const legacy = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-2", progress: {} });
+    expect(legacy.body.error ?? "").toBe("");
+
+    // empty queue ⇒ even a frozen note renews — idle holding is harmless
+    const idleRepo = "state-vector/lane-zombie-idle";
+    expect((await acquire(idleRepo, "gw-idle")).body.error ?? "").toBe("");
+    const idleRenew = await kbJson("/train.lease", {
+      repo: idleRepo, base: "main", action: "renew", actor: "gw-idle",
+      progress: { progress: "merged PR #1", progress_age_ms: 3 * 60 * 60_000, holder: "gw-idle" },
+    });
+    expect(idleRenew.body.error ?? "").toBe("");
+  });
 });

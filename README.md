@@ -500,7 +500,8 @@ is an opportunistic executor. The identity law is enforced at the write boundary
 execute only under the worker-class credential (detached-cody); a personally-authed
 gateway reconciles and reports read-only, then stands down LOUDLY from write legs and
 releases the lease. Lease renewals carry proof-of-progress (last ledger action + age),
-so a live-but-zombie holder is detectable hub-side (eviction law: follow-up).
+and the hub consumes it (BR#4129): a holder whose action note freezes while cards queue
+is evicted — see the lease law below.
 
 `bridge train` remains the standalone form of the same module (decision BR#3880 —
 install is the unit: no Node, no script file). It runs on any machine that has `gh`
@@ -557,6 +558,17 @@ included) as "unmergeable — CONFLICTING".
   token cannot forge another machine's lease. A lapsed lease is cleared by the hub's
   credential-free train-watch sweep and the next gateway reconciles from live GitHub —
   a crashed executor cannot wedge the lane.
+- **Zombie eviction (BR#4129)**: every renewal carries proof-of-progress — the
+  holder's last ledger action and its age. On a **non-empty queue**, a renewal whose
+  action note is frozen past 10 minutes (`TRAIN_PROGRESS_STALE_MS`) is DENIED and the
+  lease expires immediately, so the next gateway's acquire wins within one tick; the
+  lane card shows `zombie holder evicted — <holder> made no progress for Xm on a
+  non-empty queue` until a fresh holder takes over, and the eviction is audited
+  (`train:lease_evicted`). A live holder never trips this: every legitimate tick on a
+  non-empty queue either acts (a CI-poll note refreshes the action every tick) or
+  releases the lease, and an **empty queue always renews** (idle holding is harmless).
+  Legacy executors that send `{}` renewals carry no proof — treated as UNKNOWN
+  (allowed + a loud audit line) while the deprecation window runs.
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, CI settling on the merge commit before the next head enters.

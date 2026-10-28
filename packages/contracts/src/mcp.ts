@@ -145,6 +145,17 @@ export const TOOL_ARG_SCHEMAS = {
     required_workflows: z.array(z.string()).optional(),
     ci_typical_minutes: z.number().optional(),
     line_green: z.boolean().optional(),
+    // proof-of-progress (BR#4104 wire, BR#4129 hub consumption): the renewing
+    // holder's last ledger action + its age. Absent on legacy renewals — the
+    // hub treats that as UNKNOWN (allow + audit) while the deprecation
+    // window runs; on a non-empty queue a STALE note denies the renewal.
+    progress: z
+      .looseObject({
+        progress: z.string().optional(),
+        progress_age_ms: z.number().optional(),
+        holder: z.string().optional(),
+      })
+      .optional(),
   }),
   train_event: z.looseObject({
     repo: z.string(),

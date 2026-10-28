@@ -157,7 +157,9 @@ before any GitHub write — merge / update-branch / close legs execute only unde
 worker-class credential (default `detached-cody`). A personally-authed gateway (e.g.
 rayh's keyring gh) still reconciles and reports, then refuses the write legs LOUDLY and
 releases the lease for a worker gateway. Lease renewals carry proof-of-progress (last
-ledger action + age) — the hub can distinguish a live holder from a zombie.
+ledger action + age) — the hub distinguishes a live holder from a zombie and enforces
+it (BR#4129): on a non-empty queue a note frozen past 10 minutes denies the renewal and
+expires the lease for the next gateway.
 
 Standalone mode (headless boxes without the runner, cron): the same module runs as
 `bridge train [--once]` — see README ("The merge train") for the full env/flag table.
