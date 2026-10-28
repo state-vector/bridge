@@ -424,8 +424,10 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // answer owns the exit, not the staleness sweep. Humans and owners still
   // release freely (rule-9 / web). The sweeps hold BEFORE attempting a todo
   // release (they park blocked); this backstop catches any machine-actor
-  // path that slips past them.
-  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? ""))) {
+  // path that slips past them. A human_verdict body flag (the answered-ask
+  // dispatch — the human's typed/clicked RELEASE riding a system actor as
+  // its pen) is exempt: the human decided, the machine only typed.
+  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? "")) && !i.body?.human_verdict) {
     const m = metaOf(i.meta);
     const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
     const st = String(mtq.state ?? "");

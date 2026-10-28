@@ -3719,8 +3719,19 @@ export class KnowledgeHub {
       );
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
+        let cleared = false;
         if (sm.awaiting_ask?.ask_id === id) {
           delete sm.awaiting_ask;
+          cleared = true;
+        }
+        // BR#4067: the paired typed await points at THIS ask — answered means
+        // SATISFIED. Leaving it stamped would make every later machine release
+        // path hold the card forever on a wait that already resolved.
+        if (sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id) {
+          delete sm.blocked.await_event;
+          cleared = true;
+        }
+        if (cleared) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
         if (subject.status === "blocked") {
@@ -3743,10 +3754,13 @@ export class KnowledgeHub {
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "superseded", note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
+              // human_verdict: the human's answered-ask decision — the system
+              // actor is only the pen. The release-holds guards (BR#4067)
+              // exempt it: a human may release what a machine wait holds.
+              await this.transition({ id: subject.id, to: "superseded", human_verdict: true, note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "superseded";
             } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
-              await this.transition({ id: subject.id, to: "todo", note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
+              await this.transition({ id: subject.id, to: "todo", human_verdict: true, note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "todo";
             } else {
               taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite

@@ -1180,6 +1180,15 @@ describe("release-holds-train-queue (BR#4067)", () => {
     expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
   });
 
+  it("a human's answered-ask verdict rides the system pen freely (BR#3912 typed RELEASE)", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:question(ray)",
+      body: { human_verdict: true },
+      meta: { blocked: { reason: "parked", await_event: { event: "ask", ask_id: "ASK-1" } }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
   it("a blocked card with NO train state releases as before", async () => {
     const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: { blocked: { reason: "parked" } } as any }), baseCtx());
     expect(typeof msg === "string" ? msg : "").not.toMatch(/merge-train/);
