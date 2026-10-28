@@ -485,11 +485,27 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
-`bridge train` is native to the CLI (decision BR#3880 — install is the unit:
-no Node, no script file). It runs on any machine that has `gh` (authed, with the
-`repo` scope), `git` and a clone of the target repo. The gate is one LAW with two
-fixture-locked implementations (`decideTrainGate`: TypeScript hub-side, Rust
-executor-side — mirrored test fixtures pin them in lockstep):
+Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
+original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
+share one dispatch core — spawns the train tick beside its dispatch loop and contends
+the lane lease exactly like the standalone command below. First-to-lease wins per lane;
+a holder that dies lapses its 5-minute lease and the next gateway reconciles from live
+GitHub state. **No hand-installed systemd unit, no separate binary to update**: the
+train updates ride the normal gateway deploy path, and every gateway on a stock build
+is an opportunistic executor. The identity law is enforced at the write boundary
+(BR#3181): the tick probes its gh identity class — merge / update-branch / close legs
+execute only under the worker-class credential (detached-cody); a personally-authed
+gateway reconciles and reports read-only, then stands down LOUDLY from write legs and
+releases the lease. Lease renewals carry proof-of-progress (last ledger action + age),
+so a live-but-zombie holder is detectable hub-side (eviction law: follow-up).
+
+`bridge train` remains the standalone form of the same module (decision BR#3880 —
+install is the unit: no Node, no script file). It runs on any machine that has `gh`
+(authed, with the `repo` scope), `git` and a clone of the target repo — or, with no
+`MERGE_TRAIN_WORKDIR`, it manages its own clone cache (`~/.bridge/train/<owner>/<repo>`)
+like the daemon leg does. The gate is one LAW with two fixture-locked implementations
+(`decideTrainGate`: TypeScript hub-side, Rust executor-side — mirrored test fixtures
+pin them in lockstep):
 
 ```bash
 cd /path/to/repo-clone                 # the repo the train drives (MERGE_TRAIN_WORKDIR)
@@ -499,16 +515,18 @@ export BRIDGE_TOKEN=<token from the Connect tab>
 ~/.local/bin/bridge train --once   # single tick (cron-friendly)
 ```
 
-Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
-`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD` (`merge | squash |
-rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone, default cwd). Flags:
-`--lane <repo>@<base>` (drive one lane only), `--once`, `--interval <secs>`,
-`--method <m>`. `bridge doctor` gates the prerequisites (gh present + authed + `repo`
-scope, git — each failure names the fix); the executor re-probes the cheap ones
-every start. Keep it alive like the runner
-(systemd / launchd / `nohup`) or run `--once` from cron. It merges as whatever identity
-that `gh` is authed as — use the detached-cody credential per BR#3181, never a personal
-one.
+Env (standalone and daemon leg alike): `MERGE_TRAIN_HOLDER` (lease label, default
+`merge-train@<host>`), `MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD`
+(`merge | squash | rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone; default
+cwd standalone / managed clone cache in the daemon), `MERGE_TRAIN_LANES` (comma-sep
+`repo@base` allowlist; default every lane the hub reports),
+`MERGE_TRAIN_WORKER_IDENTITIES` (worker-class gh logins, default `detached-cody`),
+`MERGE_TRAIN_ENABLED=0` (kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
+(drive one lane only), `--once`, `--interval <secs>`, `--method <m>`. `bridge doctor`
+gates the prerequisites (gh present + authed + `repo` scope, git — each failure names
+the fix); the executor re-probes the cheap ones every start. It merges as whatever
+identity that `gh` is authed as — the identity gate refuses the write legs unless that
+is the worker-class credential per BR#3181, never a personal one.
 
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub

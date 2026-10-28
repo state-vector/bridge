@@ -40,8 +40,13 @@ mod store;
 mod transport;
 
 /// The native merge-train executor (BR#3879, decision BR#3880 — install is
-/// the unit): `bridge train [--once]`, replacing bridge train.
+/// the unit): `bridge train [--once]`, replacing bridge train. Since BR#4104
+/// the module's home is the desktop crate beside the dispatch core it plugs
+/// into (the gateway daemon runs the train tick in-process); the CLI vendors
+/// it verbatim — same single-source-of-truth law as dispatch.rs above.
+#[path = "../../desktop/src-tauri/src/train.rs"]
 mod train;
+#[path = "../../desktop/src-tauri/src/train_gate.rs"]
 mod train_gate;
 
 use dispatch::DispatchConfig;

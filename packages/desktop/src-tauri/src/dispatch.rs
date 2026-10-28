@@ -3743,6 +3743,16 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
+    // BR#4104 — gateway-native merge train: this daemon IS an opportunistic
+    // train executor now (BR#3516 edge-executor law, Ray-directed 2026-10-28).
+    // The leg runs on its own thread at MERGE_TRAIN_INTERVAL_SECS (45s
+    // default), contends the per-lane CAS lease exactly like `bridge train`,
+    // and enforces the identity law itself: write legs only under the
+    // worker-class gh credential — a personally-authed gateway reconciles and
+    // reports, then stands down LOUDLY from merge legs (BR#3181). Lease
+    // renewals carry proof-of-progress; MERGE_TRAIN_ENABLED=0 disables
+    // (deploy.md §7).
+    crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), stop.clone());
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
