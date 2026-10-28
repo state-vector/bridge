@@ -410,7 +410,13 @@ middle-click opens the permalink in a new tab, and the href copies as a URL); ba
 `https://…` URLs open in a new tab; `owner/repo#N` links to GitHub; and `PR #N` /
 `issue #N` / `GH#N` / bare `#N` link when the card's own context names a repo
 (`meta.provenance.repo`) — never a guessed repo. Text inside existing links and code
-spans is never re-linked, and running the scanner twice changes nothing.
+spans is never re-linked, and running the scanner twice changes nothing. Where a plain
+click lands depends on the surface reading it: in the **webapp** it opens the card's
+detail panel (in-panel navigation inside the panel; the permalink route elsewhere), in
+the **desktop app** it opens the card in its own OS window (the shell registers a card
+opener at boot — detail windows already did this; popover bodies and comments now do
+too), and a permalink opened **from outside** (chat, MCP payload `url`s) opens in the
+browser, straight onto the card after sign-in.
 
 **Copy prompt context (BR#4015).** The task detail panel carries a **Copy prompt
 context** button, for every artefact type: one click puts a paste-ready context block on

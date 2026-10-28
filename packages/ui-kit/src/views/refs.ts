@@ -89,6 +89,27 @@ export interface LinkifyOpts {
   repo?: string;
 }
 
+/* ---- card-link shell seam (BR#4015 follow-up, Ray: "open in webapp for
+ *   BR-links, in windows in desktop app, in browser when opening from external")
+ *
+ *   A card ref's href is always the webapp permalink (/card/BR-N, #254) — the
+ *   browser target. Views with a local handler (detail panel) delegate plain
+ *   clicks to it (SPA nav). Where NO local handler exists (decision popover
+ *   bodies, comments) a plain click follows the href by default — right in a
+ *   browser, wrong inside the Tauri shell, which doesn't serve /card/*.
+ *   The desktop registers an opener here at boot so those clicks open the
+ *   card in its own OS window instead. */
+
+let cardLinkOpener: ((id: string) => void) | null = null;
+
+export function setCardLinkOpener(fn: ((id: string) => void) | null): void {
+  cardLinkOpener = fn;
+}
+
+export function getCardLinkOpener(): ((id: string) => void) | null {
+  return cardLinkOpener;
+}
+
 /** Linkify refs in a rendered-HTML string. Text-level, segment-scoped,
  *  idempotent. Returns HTML — render with dangerouslySetInnerHTML. */
 export function linkifyHtml(html: string, opts: LinkifyOpts = {}): string {

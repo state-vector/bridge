@@ -13,8 +13,10 @@ import { describe, expect, it } from "vitest";
 import {
   cardPath,
   escHtml,
+  getCardLinkOpener,
   linkifyHtml,
   mayContainRefs,
+  setCardLinkOpener,
 } from "../../ui-kit/src/views/refs.ts";
 import {
   buildPromptContext,
@@ -184,5 +186,19 @@ describe("splitConditionsText", () => {
     ]);
     expect(splitConditionsText("just one bar")).toEqual(["just one bar"]);
     expect(splitConditionsText(undefined)).toEqual([]);
+  });
+});
+
+describe("card-link shell seam (desktop windows / webapp modal / browser)", () => {
+  it("starts null — plain clicks follow the permalink href (webapp/browser default)", () => {
+    expect(getCardLinkOpener()).toBeNull();
+  });
+
+  it("registers, hands back the fn, and clears on null", () => {
+    const opener = (id: string) => void id;
+    setCardLinkOpener(opener);
+    expect(getCardLinkOpener()).toBe(opener);
+    setCardLinkOpener(null);
+    expect(getCardLinkOpener()).toBeNull();
   });
 });

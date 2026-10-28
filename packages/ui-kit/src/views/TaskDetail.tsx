@@ -5,7 +5,7 @@ import type { KbAsk } from "../server/kb";
 import { md, AskOptions, askKernel } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
-import { linkifyHtml, escHtml } from "./refs";
+import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
 import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
@@ -85,19 +85,23 @@ export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
 }
 
 
-/** Delegated click on a linkified container: card refs (a[data-task-ref])
- *  navigate in-panel (SPA) on a plain left click; modified clicks
- *  (cmd/ctrl/shift/alt/middle) fall through, so the browser does what the
- *  href promises — new tab, copy link address (BR#4015). */
-function refClickNav(onOpen: (id: string) => void) {
+/** Delegated click on a linkified container: card refs (a[data-task-ref]) on
+ *  a plain left click resolve local handler → shell opener (desktop: open an
+ *  OS window) → browser default (follow the permalink href). Modified clicks
+ *  (cmd/ctrl/shift/alt/middle) always fall through, so the browser does what
+ *  the href promises — new tab, copy link address (BR#4015). */
+function refClickNav(onOpen?: (id: string) => void) {
   return (e: React.MouseEvent<HTMLElement>) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
     const a = (e.target as HTMLElement | null)?.closest?.("a[data-task-ref]");
     if (!a) return;
+    const id = a.getAttribute("data-task-ref");
+    if (!id) return;
+    const open = onOpen ?? getCardLinkOpener();
+    if (!open) return;
     e.preventDefault();
     e.stopPropagation();
-    const id = a.getAttribute("data-task-ref");
-    if (id) onOpen(id);
+    open(id);
   };
 }
 
@@ -106,7 +110,7 @@ function refClickNav(onOpen: (id: string) => void) {
 export function RefText({ text, onOpen }: { text: string; onOpen?: (id: string) => void }) {
   return (
     <span
-      onClick={onOpen ? refClickNav(onOpen) : undefined}
+      onClick={refClickNav(onOpen)}
       dangerouslySetInnerHTML={{ __html: linkifyHtml(escHtml(text)) }}
     />
   );
@@ -119,7 +123,7 @@ export function LongText({ text, limit, onOpen }: { text: string | undefined; li
   if (!t) return null;
   const linked = (s: string) => (
     <span
-      onClick={onOpen ? refClickNav(onOpen) : undefined}
+      onClick={refClickNav(onOpen)}
       dangerouslySetInnerHTML={{ __html: linkifyHtml(escHtml(s)) }}
     />
   );
@@ -157,7 +161,7 @@ export function MdRef({ text, onOpen, repo }: { text: string | undefined; onOpen
   if (!html.trim()) return null;
   return (
     <span
-      onClick={onOpen ? refClickNav(onOpen) : undefined}
+      onClick={refClickNav(onOpen)}
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
@@ -374,7 +378,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
-function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void }) {
+function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const ask = task.meta?.ask ?? {};
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -406,7 +410,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
       {ask.reason && (
         <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
       )}
-      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={() => onChanged?.()} repo={task.meta?.provenance?.repo} /></div>
+      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={onOpen} repo={task.meta?.provenance?.repo} /></div>
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}
@@ -590,7 +594,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />}
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
-          <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} />
+          <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />
         )}
 
         {task?.meta?.last_progress?.note && (
