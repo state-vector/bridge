@@ -107,20 +107,13 @@ describe("label guard at the four doors (real DO)", () => {
     const t = await kbJson("/admin.mint", { label: "guard-rename-dev", tags: [] });
     expect(t.body.secret).toBeTruthy();
     for (const label of [TOKEN_LABEL, PRINCIPAL_LABEL]) {
-      // the rename door sits before the POST op-switch — its rejection
-      // THROWS (a rejected fetch in the direct-DO rig, a 500 through the
-      // worker plane). Either way the message must name the namespace law.
-      let threw: unknown;
-      try {
-        await kb("/token.rename", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-kb-admin": "1" },
-          body: JSON.stringify({ bearer: t.body.secret, label }),
-        });
-      } catch (e) {
-        threw = e;
-      }
-      expect(String(threw)).toMatch(/reserved namespaces/);
+      // the rename door sits before the POST op-switch (no op-level catch),
+      // so it answers TYPED 400 with the message itself (BR#4212 boundary:
+      // a guard rejection must never render as the generic infra 503) —
+      // same assertion shape as the sibling doors
+      const { status, body } = await kbJson("/token.rename", { bearer: t.body.secret, label });
+      expect(status).toBeLessThan(500);
+      expect(body.error).toMatch(/reserved namespaces/);
     }
     const ok = await kbJson("/token.rename", { bearer: t.body.secret, label: "guard-rename-dev-2" });
     expect(ok.body.error).toBeUndefined();

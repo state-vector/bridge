@@ -1804,23 +1804,33 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     }
     if (url.pathname === "/token.rename") {
       const body: any = await request.json().catch(() => ({}));
-      const identity = await this.identify(String(body.bearer ?? ""));
-      const newLabel = String(body.label ?? "").trim();
-      if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
-      assertHumanLabel(newLabel); // BR#4262 — never impersonate the bkw_/dev_ namespaces
-      const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
-      if (!old) throw new Error("auth token not found");
-      if (newLabel !== old.label) {
-        if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, newLabel)) throw new Error(`label '${newLabel}' already exists`);
+      try {
+        const identity = await this.identify(String(body.bearer ?? ""));
+        const newLabel = String(body.label ?? "").trim();
+        if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(newLabel)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
+        assertHumanLabel(newLabel); // BR#4262 — never impersonate the bkw_/dev_ namespaces
+        const old = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ?`, identity.token_id);
+        if (!old) throw new Error("auth token not found");
+        if (newLabel !== old.label) {
+          if (this.one(`SELECT id FROM auth_tokens WHERE label = ?`, newLabel)) throw new Error(`label '${newLabel}' already exists`);
+        }
+        this.state.storage.sql.exec(
+          `UPDATE auth_tokens SET label = ? WHERE id = ?`,
+          newLabel, identity.token_id,
+        );
+        // tasks owned by the old label are NOT reassigned — the agent can
+        // release-and-re-claim them, which is the normal flow. But audit it.
+        this.audit(identity.label, "rename", null, { from: old.label, to: newLabel });
+        return this.json({ ok: true, from: old.label, to: newLabel });
+      } catch (e) {
+        // this door sits BEFORE the POST op-switch (no op-level catch), so a
+        // bare throw lands in the BR#4212 dispatch boundary and renders as a
+        // generic infra_storage_fault 503 — a validation rejection is not a
+        // storage fault (retrying cannot help), and swallowing the message
+        // violates the guard's "clear error" law (BR#4262). Same contract as
+        // the GET arm below: typed 400 with the message, never a naked 500.
+        return this.json({ error: String((e as Error)?.message ?? e) }, 400);
       }
-      this.state.storage.sql.exec(
-        `UPDATE auth_tokens SET label = ? WHERE id = ?`,
-        newLabel, identity.token_id,
-      );
-      // tasks owned by the old label are NOT reassigned — the agent can
-      // release-and-re-claim them, which is the normal flow. But audit it.
-      this.audit(identity.label, "rename", null, { from: old.label, to: newLabel });
-      return this.json({ ok: true, from: old.label, to: newLabel });
     }
 
     // human-plane GET mirror — the same error contract as the POST arm: a
