@@ -1125,3 +1125,33 @@ describe("tag inertness (BR#2983)", () => {
     expect(invariants({ type: "question", status: "todo", meta: {} })).toEqual([]);
   });
 });
+
+// BR#4067 — queue-slot durability: a machine silence-release must never
+// destroy merge-train state (the PR #257 class: verify accepted, watchdog
+// released the queued card to todo, nothing re-queued it).
+describe("release-holds-train-queue (BR#4067)", () => {
+  const queuedMeta = {
+    merge_train: { state: "queued", pr: 257, repo: "state-vector/bridge" },
+    pr: { repo: "state-vector/bridge", number: 257, head_sha_at_acceptance: "a".repeat(40) },
+  };
+
+  it("system actor releasing a queued card is refused with the proxy named", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: queuedMeta as any }), baseCtx());
+    expect(msg).toMatch(/merge-train queued.*pr_merged/s);
+  });
+
+  it("awaiting-ci holds too", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "hub:proxy-watch", meta: { ...queuedMeta, merge_train: { state: "awaiting-ci" } } as any }), baseCtx());
+    expect(msg).toMatch(/merge-train awaiting-ci/);
+  });
+
+  it("humans and owners release freely — the guard is machine-actor only", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "web:rayh", owner: "web:rayh", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds-train-queue|merge-train queued/);
+  });
+
+  it("a blocked card with NO train state releases as before", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: { blocked: { reason: "parked" } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/merge-train/);
+  });
+});

@@ -192,7 +192,7 @@ Join the hosted waitlist: open a discussion titled "waitlist" at github.com/stat
 
 ## Status
 
-Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, the serialized merge train (credential-free hub + gateway-native executor, BR#3516/BR#4104), role playbooks (analysis / impl / review) with per-hub overrides, knowledge search, self-hosting. Coming soon: mobile app, hosted version.
+Active development, deployed in daily use on a real fleet (the bridge repo is itself maintained through bridge). Live today: hub + web UI, MCP protocol, gateway CLI + desktop app, watchdog, verification gates, the serialized merge train (credential-free hub + gateway-native executor, BR#3516/BR#4104; kind-labelled bounces + durable queue slots + auto-boost on bounce, BR#4066/67/68), role playbooks (analysis / impl / review) with per-hub overrides, knowledge search, self-hosting. Coming soon: mobile app, hosted version.
 
 - Protocol + docs: https://github.com/state-vector/bridge
 - License: Apache-2.0

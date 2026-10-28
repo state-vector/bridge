@@ -416,6 +416,26 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // ---- the law: edge shape first, then the table, first fail wins ----
   const base = validateTransition(i.type as any, i.status, i.to);
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
+  // system sweeps) must never destroy merge-train state. A card the train
+  // owns (meta.merge_train queued/awaiting-ci with a live PR leg) is parked
+  // on the typed pr_merged proxy — the proxy watch owns its exit, not the
+  // staleness sweep. Humans and owners still release freely (rule-9 / web).
+  if (i.type === "task" && i.to === "todo" && i.status === "blocked" && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? ""))) {
+    const mtq = ((metaOf(i.meta).merge_train ?? {}) as Record<string, unknown>);
+    if (mtq.state === "queued" || mtq.state === "awaiting-ci") {
+      const m = metaOf(i.meta);
+      const pr = (m.pr as any)?.number ?? (Array.isArray(m.prs) ? ((m.prs as any[])[0]?.number ?? 0) : 0);
+      if (pr) {
+        return {
+          ok: false,
+          code: "guard-failed",
+          rule: "release-holds-train-queue",
+          message: `card is merge-train ${String(mtq.state)} (typed await pr_merged ${String((m.pr as any)?.repo ?? "repo")}#${pr}) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool.`,
+        };
+      }
+    }
+  }
   for (const r of RULES) {
     if (!r.when(i)) continue;
     const err = await r.guard(i, c);

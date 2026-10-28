@@ -1521,25 +1521,75 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
 
-/** train:bounced fix-up brief: the conflict files ride in, the verdict is
- *  INVALID at the new head, re-verify then re-queue at the back. */
+/** Bounce kinds (BR#4066): the executor's bounce has three distinct causes
+ *  with different next owners — conflating them produced the "every bounce
+ *  says conflicts" lie that sent impl hunting phantom conflicts.
+ *  - coverage: the live head is not covered by the accepted verdict (authored
+ *    push past the stamp, or a stale card read racing the accept-hook). NO
+ *    conflict exists. Next owner: the verify pool (auto re-enter review).
+ *  - conflict: trial-merge found real conflict files. Next owner: impl
+ *    repair leg.
+ *  - gate: a mechanical gate leg failed (mergeStateStatus, head checks…).
+ *    Next owner: whoever the named defect says. */
+export type TrainBounceKind = "coverage" | "conflict" | "gate";
+
+/** Classify a bounce from its facts — used by the executor payload path and
+ *  pinned by tests. Files present ⇒ conflict, always; the coverage defect is
+ *  the gate's own phrasing ("not covered by the accepted verdict"). */
+export function classifyBounce(defect: string, conflictFiles: string[]): TrainBounceKind {
+  if (conflictFiles.length) return "conflict";
+  if (/not covered by the accepted verdict/i.test(defect)) return "coverage";
+  return "gate";
+}
+
+/** train:bounced fix-up brief, KIND-AWARE (BR#4066): each kind names its
+ *  actual cause and its next owner; only a conflict bounce claims conflicts. */
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
   headSha: string | null;
   conflictFiles: string[];
   verdictId: string | null;
+  kind?: TrainBounceKind;
+  defect?: string;
+  mergeStateStatus?: string;
 }): string {
+  const kind = input.kind ?? classifyBounce(input.defect ?? "", input.conflictFiles);
+  const head = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
+  const pr = `PR #${input.prNumber} (${input.repo})`;
+  const law = `**Law (BR#3516 §5):** machine-clean carries, human-resolved invalidates.`;
+  if (kind === "coverage") {
+    return [
+      `Merge-train bounce (VERDICT COVERAGE): ${pr}${head} — the live head is not covered by the accepted verdict${input.verdictId ? ` (${input.verdictId})` : ""}. No conflict exists${input.defect ? ` — gate said: ${input.defect}` : ""}.`,
+      ``,
+      `**Next owner: the verify pool.** The card re-enters review; a fresh verify duty re-checks the live head (usually unchanged — a stale card read racing the accept-hook stamp, or an authored push) and the accept re-queues the train at the BACK. Impl has no repair leg unless that verify finds one.`,
+      ``,
+      law,
+    ].join("\n");
+  }
+  if (kind === "gate") {
+    return [
+      `Merge-train bounce (GATE): ${pr}${head} — a mechanical gate leg failed.`,
+      ``,
+      `**Defect:** ${input.defect || "(executor supplied no defect text — report this)"}${input.mergeStateStatus ? ` (mergeStateStatus=${input.mergeStateStatus})` : ""}`,
+      ``,
+      `**Next owner: the defect names it** (rebase / re-sign / fix the named check), then re-enter review; the train re-queues once a fresh verify accepts.`,
+      ``,
+      law,
+    ].join("\n");
+  }
   const files = input.conflictFiles.length
     ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
-    : "- (no file list supplied — run the trial rebase locally to enumerate)";
+    : `- **(CONFLICT BOUNCE WITHOUT A FILE LIST — executor defect: the trial merge must supply the files; report this)**`;
   return [
-    `Merge-train bounce: PR #${input.prNumber} (${input.repo}) conflicts with its base${input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : ""}.`,
+    `Merge-train bounce (CONFLICT): ${pr} conflicts with its base${head}.`,
     ``,
     `**Conflicting files:**`,
     files,
     ``,
-    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head — machine-clean carries, human-resolved invalidates. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    `**Next owner: impl repair leg (core.ts standing order).** Conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    ``,
+    law,
   ].join("\n");
 }
 

@@ -328,6 +328,18 @@ never stacks); loop until the train merges and closes. Impl owns mergeability
 the reviewer's); the train owns mergeability *enforcement* (a conflicting, red or unsigned
 PR is bounced with the exact defect — never merged silently).
 
+**Bounces name their kind, and the queue is durable** (BR#4066/4067/4068): a train bounce is
+one of three kinds with different next owners — **conflict** (trial-merge files listed; impl
+repair leg), **coverage** (the live head isn't covered by the accepted verdict — no conflict
+exists; the card immediately re-enters review and a fresh verify duty re-checks the head, so
+the stamp-race class self-heals), or **gate** (the named mechanical defect). The hub stamps
+the kind, defect and files on the card and **boosts it to priority 0** — a bounced
+merge-ready card is the board's highest-value work and must not re-enter at default priority
+and starve. A fresh verify accept on a non-conflict bounce re-queues the train automatically
+(no agent hands the card back). And machine silence-releases (watchdog sweeps) can no longer
+destroy queue state: a card the train owns (queued / awaiting-ci on the typed `pr_merged`
+proxy) is refused release — the proxy owns its exit. Humans and owners still release freely.
+
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
 head <sha>` — and the hub queues one **leg** per PR (`meta.prs`; pairing is

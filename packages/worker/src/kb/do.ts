@@ -86,6 +86,7 @@ import {
   classifyRequiredRuns,
   decideTrainGate,
   trainBounceBrief,
+  classifyBounce,
   trainStopAskTitle,
   trainLandedCloseNote,
   type TrainLease,
@@ -2650,8 +2651,24 @@ export class KnowledgeHub {
           const pm = JSON.parse(parent.meta ?? "{}");
           const parkReason = [String(pm.blocked?.reason ?? ""), String(pm.blocked_reason ?? "")].find((r) => r) ?? "";
           if (parent.status === "in_progress") {
-            this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is in_progress — a bounced card is not re-queued by a verify close; the bounce stands until a fresh verify accepts the new head (BR#3659 defect 2)" });
-            this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on a bounced (in_progress) card did not re-queue it — the bounce stands", {});
+            // BR#4067 self-heal: an in_progress parent stands UNLESS the train
+            // itself bounced it non-conflict (a coverage/gate-kind bounce left
+            // nothing for impl to repair — this fresh verify accept IS the
+            // re-acceptance; re-queue instead of stranding the card: the PR
+            // #257 class). A CONFLICT bounce is real impl repair (BR#3659
+            // defect 2), and a card never bounced by the train is a live
+            // claim the hub must not hijack — both stand.
+            const bt = (pm.merge_train ?? {}) as Record<string, unknown>;
+            const trainBounced = bt.state === "bounced";
+            const realConflict = bt.bounce_kind === "conflict"
+              || (Array.isArray(bt.conflict_files) && (bt.conflict_files as string[]).length > 0);
+            if (!trainBounced || realConflict) {
+              this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
+              this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
+            } else {
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+              this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
+            }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
@@ -5055,12 +5072,41 @@ export class KnowledgeHub {
       if (!pr) throw new Error("train:bounced needs pr");
       const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
       const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
+      const defect = String(body.defect ?? "").trim();
+      const mergeState = String(body.merge_state ?? "").trim();
+      // BR#4066 — the bounce KIND decides everything downstream: which brief
+      // renders, who owns the next leg, whether the accept-hook may re-queue.
+      const bounceKind = (["coverage", "conflict", "gate"] as const).includes(body.bounce_kind)
+        ? (body.bounce_kind as "coverage" | "conflict" | "gate")
+        : classifyBounce(defect, conflictFiles);
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id });
-      // blocked→in_progress with the fix-up brief; resolution invalidates the
-      // verdict — the card re-enters the queue only after a fresh verify.
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, kind: bounceKind, defect, mergeStateStatus: mergeState });
+      // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
+      // a bounced merge-ready card is the board's highest-value work — one
+      // mechanical/human leg from landing — and must not re-enter at default
+      // priority and starve). One meta write, before the transition.
+      const now2 = Date.now();
+      const nextMeta = {
+        ...cm,
+        boosted: now2,
+        merge_train: {
+          ...(cm.merge_train ?? {}),
+          state: "bounced",
+          bounce_kind: bounceKind,
+          defect: defect.slice(0, 300) || undefined,
+          conflict_files: conflictFiles,
+          bounced_at: now2,
+          pr,
+          repo,
+        },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
+      // blocked→in_progress with the kind-aware brief. coverage bounces carry
+      // NO repair for impl — the card immediately re-enters review below and a
+      // fresh verify duty re-checks the live head (the 30s stamp-race class
+      // self-heals: verify re-accepts → accept-hook re-queues → train merges).
       await this.transition(
         {
           id: taskId,
@@ -5070,11 +5116,35 @@ export class KnowledgeHub {
           // session as its implementer (misattribution + a spurious
           // review-separation refusal on a same-session re-verify)
           session: "",
-          note: `merge-train bounce — PR #${pr} conflicts with base${conflictFiles.length ? ` (${conflictFiles.length} file(s))` : ""}`,
+          note: bounceKind === "conflict"
+            ? `merge-train bounce (CONFLICT) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
+            : bounceKind === "coverage"
+              ? `merge-train bounce (VERDICT COVERAGE) — PR #${pr} head not covered by the verdict; no conflict exists`
+              : `merge-train bounce (GATE) — PR #${pr}: ${defect.slice(0, 160) || "mechanical gate leg failed"}`,
           body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
         },
         actor,
       );
+      // BR#4066/67 self-heal: a coverage bounce fabricated impl work (there is
+      // nothing to repair) and the watchdog then punished the resulting
+      // silence by releasing the card — the exact queue-slot destruction
+      // fixed above. Instead: straight back into review; the standard
+      // in_review handoff auto-spawns a fresh verify duty.
+      if (bounceKind === "coverage") {
+        try {
+          await this.transition(
+            {
+              id: taskId,
+              to: "in_review",
+              session: "",
+              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train`,
+            },
+            actor,
+          );
+        } catch (e) {
+          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; impl re-enters review manually` });
+        }
+      }
       cm.merge_train = { ...(cm.merge_train ?? {}), state: "bounced", pr, bounced_at: now };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       meta.currently = null;
