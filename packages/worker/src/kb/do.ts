@@ -1941,7 +1941,13 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         default: return this.json({ error: `unknown op ${op}` }, 404);
       }
     } catch (e) {
-      return this.json({ error: String((e as Error).message ?? e) }, 400);
+      // BR#4390: pass a typed result_class through when the thrower stamped
+      // one (machine gate refusals: "gate_rejected") — an untyped 400 here
+      // used to be indistinguishable from noise at the client, and the MCP
+      // layer's fallback classified it as infra. A 400-classified op
+      // rejection is the hub REFUSING, never the hub being down.
+      const rc = (e as any)?.result_class;
+      return this.json({ error: String((e as Error).message ?? e), ...(rc ? { result_class: rc } : {}) }, 400);
     }
   }
 
@@ -2720,7 +2726,19 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
       this.ruleCtx(row, body, id, tTags),
     );
-    if (verdict.ok === false) throw new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+    if (verdict.ok === false) {
+      // BR#4390: a machine refusal (illegal edge or guard) rides TYPED —
+      // result_class "gate_rejected" survives the op catch-all below into the
+      // response body, so clients can machine-tell "the hub refused" from
+      // "the hub is down". Before this stamp the refusal was an untyped 400
+      // that the MCP layer re-wrapped as a retryable infra 503 — the
+      // BR#4068/BR#3822 class: deterministic refusals read as "kb temporarily
+      // unavailable — retry" and duty sessions burned dozens of futile
+      // retries on a transition that could never succeed.
+      const err: any = new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+      err.result_class = "gate_rejected";
+      throw err;
+    }
     // (B) subprocess class: a declared block on a long/handed-off op, with a
     // budget. The watchdog pauses until the budget lapses; past it the
     // subprocess = declared silence while STILL WORKING: the task stays

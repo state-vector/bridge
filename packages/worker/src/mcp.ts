@@ -61,9 +61,21 @@ export async function resolveTokenWs(env: any, bearer: string): Promise<string> 
  *  else reaching these catches (storage faults, DO resets, timeouts) is
  *  infrastructure and must 503 — never masquerade as "unauthorized". */
 const AUTH_REJECTIONS = /^(missing bearer|unknown auth token|auth token revoked)/;
-const isInfraFault = (e: any) =>
-  e?.result_class === "infra_storage_fault" || (typeof e?.status === "number" && e.status >= 500) ||
-  (e instanceof Error && !AUTH_REJECTIONS.test(e.message ?? ""));
+// BR#4390: a CLASSIFIED DO response (kbError stamped .status on it) is
+// trusted as-is — 4xx is the hub REFUSING (gate rejection, bad input) and
+// must surface as a tool error carrying the refusal message, never be
+// re-wrapped as a retryable infra 503. The old clause-3 fallback read every
+// non-auth Error as infra, so deterministic machine refusals came back as
+// "kb temporarily unavailable — retry" (result_class infra_storage_fault) —
+// the BR#4068/BR#3822 fault class: two duty sessions burned ~25 futile
+// retries on a blocked→done that the lifecycle table refuses by law.
+// Infra stays: typed infra_storage_fault, 5xx, and UNCLASSIFIED throws
+// (no .status — the DO-reset / HTML-error-page class BR#4212 wrote this for).
+const isInfraFault = (e: any) => {
+  if (e?.result_class === "infra_storage_fault") return true;
+  if (typeof e?.status === "number") return e.status >= 500;
+  return e instanceof Error && !AUTH_REJECTIONS.test(e.message ?? "");
+};
 
 export async function handleMcp(request: Request, env: any): Promise<Response> {
   if (request.method !== "POST") {
