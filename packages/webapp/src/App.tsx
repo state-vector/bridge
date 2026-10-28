@@ -9,7 +9,8 @@ import { PairView } from "./components/PairView";
 import { TopView } from "./components/TopView";
 import { WorkspacePicker } from "./components/WorkspacePicker";
 import type { WsFrame } from "@bridge/specs";
-import { Btn, Chip, StatusLights } from "@bridge/ui-kit";
+import { cardIdFromPathSegment, cardPath } from "@bridge/specs";
+import { Btn, Chip, StatusLights, TaskDetail } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "@bridge/ui-kit/tokens.css";
@@ -77,6 +78,18 @@ function SignIn() {
   );
 }
 
+// ---------- card permalinks (BR#3990) ----------
+// /card/BR-3990 (any artefact id, dash or # form) opens that card's detail
+// panel; opening/closing a card keeps the URL in sync, so every card view is
+// a shareable, stable link. The SPA fallback serves index.html for the path,
+// and sign-in returns to it (cookie + back-here render), so deep links work
+// straight from chat/PR/MCP-payload pastes.
+
+function cardIdFromLocation(): string | null {
+  const m = /^\/card\/([^/]+)\/?$/.exec(window.location.pathname);
+  return m ? cardIdFromPathSegment(m[1]) : null;
+}
+
 export default function App() {
   const conn = useBridge((s) => s.conn);
   const selectedId = useBridge((s) => s.selectedId);
@@ -86,6 +99,20 @@ export default function App() {
   const dismissOverlay = useBridge((s) => s.dismissOverlay);
   const selectDecision = useBridge((s) => s.selectDecision);
   const [tab, setTab] = useState<Tab>("top");
+  // deep-linked / opened card — one state, URL-synced (BR#3990)
+  const [cardId, setCardId] = useState<string | null>(cardIdFromLocation);
+
+  useEffect(() => {
+    const onPop = () => setCardId(cardIdFromLocation());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const openCard = (id: string | null) => {
+    setCardId(id);
+    const path = (id && cardPath(id)) || "/";
+    if (window.location.pathname !== path) window.history.pushState(null, "", path);
+  };
 
   useEffect(() => {
     connectHub({
@@ -124,14 +151,17 @@ export default function App() {
         </div>
       )}
       <main className="main">
-        {tab === "top" && <TopView />}
-        {tab === "backlog" && <BacklogView />}
-        {tab === "completed" && <CompletedView />}
+        {tab === "top" && <TopView openTask={openCard} />}
+        {tab === "backlog" && <BacklogView openTask={openCard} />}
+        {tab === "completed" && <CompletedView openTask={openCard} />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}
         {tab === "discussions" && <DiscussionsView />}
         {tab === "connect" && <ConnectView />}
       </main>
+      {cardId && (
+        <TaskDetail taskId={cardId} onClose={() => openCard(null)} onOpen={(id) => openCard(id)} />
+      )}
       {selectedId && <DecisionDetail />}
       {overlay && (
         <div className="overlay-backdrop">
