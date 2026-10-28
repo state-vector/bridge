@@ -177,3 +177,51 @@ describe("BandNodeAskRow offers a typed answer as the last option (BR#3912)", ()
     expect(body).toMatch(/!custom\.trim\(\) \|\| !busy|custom\.trim\(\) && !busy/);
   });
 });
+
+describe("GET /api/kb/train — the merge-train mirror (Top panel leg 1)", () => {
+  it("mirrors the DO's train.status snapshot: {lanes: []} on a fresh DO, 200 with the allowlist mapping", async () => {
+    // before index.js mapped the sub, this was the route's bare 404 "not found"
+    const res = await api("/api/kb/train");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(Array.isArray(body.lanes)).toBe(true);
+    expect(body.lanes).toEqual([]);
+  });
+
+  it("forwards the repo filter query to the DO (lane filtering stays server-side)", async () => {
+    const res = await api("/api/kb/train?repo=state-vector/bridge");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(Array.isArray(body.lanes)).toBe(true);
+  });
+});
+
+describe("Top view renders the merge-train panel first (train panel legs 2+3)", () => {
+  // Source assertions on the real views (no UI rig exists — repo convention):
+  // the panel must sit at the very top of Top (before the dashboard strip) and
+  // must surface WHICH MACHINE holds each lane's CAS lease + the queued cards.
+  const topViewSrc = readFileSync(new URL("../../ui-kit/src/views/TopView.tsx", import.meta.url).pathname, "utf8");
+  const trainPanelSrc = readFileSync(new URL("../../ui-kit/src/views/TrainPanel.tsx", import.meta.url).pathname, "utf8");
+
+  it("renders TrainPanel as the first panel in top-wrap (above DashboardSummary)", () => {
+    expect(topViewSrc).toContain("<TrainPanel");
+    expect(topViewSrc.indexOf("<TrainPanel")).toBeGreaterThan(-1);
+    expect(topViewSrc.indexOf("<TrainPanel")).toBeLessThan(topViewSrc.indexOf("<DashboardSummary"));
+  });
+
+  it("shows the CAS lock holder machine with a live heartbeat age per lane", () => {
+    expect(trainPanelSrc).toMatch(/l\.lease\?\.holder/);
+    expect(trainPanelSrc).toContain("lock ");
+    expect(trainPanelSrc).toMatch(/age\(l\.lease\.heartbeat_ts, now\)/);
+    // the free case is explicit, never blank
+    expect(trainPanelSrc).toContain("lock free");
+  });
+
+  it("renders the derived queue as clickable card chips with the lane's stop-the-line flag", () => {
+    expect(trainPanelSrc).toMatch(/l\.queue\.map/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
+    expect(trainPanelSrc).toContain("stop-the-line");
+    // errors surface in-panel — nothing in the kit may swallow an error
+    expect(trainPanelSrc).toMatch(/train status unavailable/);
+  });
+});

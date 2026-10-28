@@ -356,6 +356,13 @@ sweeps **park it `blocked` with the typed proxy intact** (the proxy owns its exi
 machine-actor backstop refuses any release path that slips past them (BR#4067). Humans and
 owners still release freely.
 
+**The train is visible on the board**: the Top view opens with a **merge trains** panel —
+one row per `repo@base` lane showing which machine holds the CAS lane lease (holder +
+heartbeat age, colour-graded against the 5-minute TTL), the in-flight merge phase, the
+derived queue (queued card ids, click to open), and any stop-the-line flag. Data comes from
+`GET /api/kb/train` (the hub's train.status snapshot), polled every 30s against the 45s tick.
+An idle lane reads honestly: `lock free`, `awaiting an available gateway`.
+
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
 head <sha>` — and the hub queues one **leg** per PR (`meta.prs`; pairing is

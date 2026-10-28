@@ -201,6 +201,7 @@ export default {
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
+          : sub === "train" ? "https://kb/train"
           : sub === "metrics/throughput" ? "https://kb/metrics.throughput"
           : sub === "provenance" ? "https://kb/provenance"
           : sub === "bootstrap" ? "https://kb/bootstrap"
