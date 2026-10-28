@@ -7,6 +7,8 @@
  * are legal.
  */
 
+import type { AwaitEvent } from "./closure";
+
 export const ARTEFACT_TYPES = [
   "steering",
   "goal",
@@ -1154,6 +1156,69 @@ export function leaseDecide(
   return { ok: true, lease: null, note: "lease released" };
 }
 
+// ---- zombie eviction (BR#4129 — the hub half of proof-of-progress) ----
+// The 2026-10-28 incident: a live holder renewed the lease for hours, took
+// zero actions, and the queue starved behind it (the CAS did its job — too
+// well). Every renewal since PR #263 carries the holder's last ledger action
+// and its age; the HUB consumes it here: on a non-empty queue, a renewal
+// whose action note is frozen past the staleness bound is denied and the
+// lease expires, so the next gateway's acquire wins within a tick.
+
+/** Progress-note staleness bound. Must EXCEED every legitimate note gap:
+ *  the executor tick is ~45s and every non-empty-queue tick path either
+ *  acts (CI poll / bounce / merge — `ctx.note` refreshes the action) or
+ *  releases the lease, and the lease TTL (5 min) already caps how long a
+ *  renewal can outlive its last heartbeat — so >10 min of renewals with a
+ *  frozen note is a zombie by construction (the incident froze for hours).
+ *  Empty queue ⇒ never checked (idle holding is harmless and correct). */
+export const TRAIN_PROGRESS_STALE_MS = 10 * 60_000;
+
+/** The proof-of-progress payload the gateway rides on every `renew`
+ *  (train.rs renew_lease). Unknown-shape ⇒ UNKNOWN (old executors send
+ *  `{}` renewals — deprecation window while BR#4104 retires them). */
+export type LeaseProgressProof = { progress?: unknown; progress_age_ms?: unknown; holder?: unknown };
+
+export type ProgressVerdict = "fresh" | "stale" | "unknown";
+
+/** Judge the proof. UNKNOWN unless the payload is well-formed AND names this
+ *  holder (a proof about someone else proves nothing about the renewer) —
+ *  fail-open to UNKNOWN, never guess a stale. */
+export function progressVerdict(proof: LeaseProgressProof | null | undefined, holder: string): ProgressVerdict {
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) return "unknown";
+  const age = (proof as any).progress_age_ms;
+  const note = (proof as any).progress;
+  const who = (proof as any).holder;
+  if (typeof age !== "number" || !Number.isFinite(age) || age < 0) return "unknown";
+  if (typeof note !== "string" || !note.trim()) return "unknown";
+  if (typeof who === "string" && who.trim() && who !== holder) return "unknown";
+  return age > TRAIN_PROGRESS_STALE_MS ? "stale" : "fresh";
+}
+
+/** THE renew-arm zombie check — pure so the eviction law is unit-testable
+ *  (the DO supplies the derived queue length and throws the lease_conflict).
+ *  Non-empty queue + STALE proof ⇒ deny (the reason names holder, minutes,
+ *  and queue depth for the lane card). Empty queue ⇒ always allow (idle
+ *  holding is harmless). UNKNOWN (missing/garbled proof, legacy `{}`) ⇒
+ *  allow with the verdict surfaced so the DO can audit it loudly. */
+export function renewProgressDecide(
+  proof: LeaseProgressProof | null | undefined,
+  holder: string,
+  queue_len: number,
+): { ok: true; verdict: ProgressVerdict; note: string } | { ok: false; reason: string; stale_ms: number } {
+  const verdict = progressVerdict(proof, holder);
+  if (queue_len <= 0) return { ok: true, verdict, note: "queue empty — idle holding is harmless; renewal allowed" };
+  if (verdict === "stale") {
+    const stale_ms = Math.max(0, Math.floor(Number((proof as any).progress_age_ms)));
+    const mins = Math.max(1, Math.round(stale_ms / 60_000));
+    return {
+      ok: false,
+      reason: `zombie holder — no progress for ${mins}m on non-empty queue (${queue_len} queued) — lease expired, acquire fresh`,
+      stale_ms,
+    };
+  }
+  return { ok: true, verdict, note: verdict === "unknown" ? "renewal allowed — no progress proof (legacy executor, deprecation window)" : "renewal allowed — progress fresh" };
+}
+
 /** Lane identity: ONE standing lane card per (repo, base). Config, never
  *  hardcoded (BR#3516 §1): required workflows + CI bound ride meta.lane. */
 export type LaneSpec = {
@@ -1222,6 +1287,61 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
   return [...queued]
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
     .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
+}
+
+// ---- typed-proxy preservation (BR#4067) ----
+
+/** result_class stamped on a watchdog hold-park (a silence that would have
+ *  released a card carrying a machine wait). The score side exempts it — a
+ *  hold preserves state, it is neither an abandonment nor a lost run. */
+export const PROXY_WAIT_HOLD_RESULT_CLASS = "proxy_wait_hold";
+
+/** The PR leg a card's merge-train state points at, from any of the shapes
+ *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).
+ *  0 when none resolves. */
+export function trainPrLeg(meta: any): number {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const fromPr = (m.pr as any)?.number;
+  const fromPrs = Array.isArray(m.prs) && m.prs.length ? (m.prs[0] as any)?.number : undefined;
+  return Number(fromPr ?? fromPrs ?? mt.pr ?? 0) || 0;
+}
+
+/** The typed await a train-owned card parks on — the pr_merged proxy derived
+ *  from its live PR leg. Null when the leg lacks a well-formed repo/number
+ *  (callers then fall back to the machine-managed park flag). */
+export function trainProxyEvent(meta: any): AwaitEvent | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
+  const n = trainPrLeg(meta);
+  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+}
+
+/** BR#4067 — does a release path need to HOLD? Returns the hold description
+ *  when the card carries machine-wait state — a merge-train queue slot
+ *  (queued/awaiting-ci/bounced on a live PR leg), a typed await_event, or a
+ *  bound ask — and null when a release may proceed. Every watchdog release
+ *  path (stall sweep, review sweep, lapsed subprocess, reaper reassign) and
+ *  the machine's machine-actor backstop consult this one predicate: the
+ *  PR #257 class is a card released to todo while its wait state (queue
+ *  slot, proxy, ask) was still live. */
+export function releaseHold(meta: any): string | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced") {
+    const pr = trainPrLeg(meta);
+    if (pr) {
+      const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
+      return `merge-train ${st} on PR ${repo}#${pr} — the typed pr_merged proxy owns the exit`;
+    }
+  }
+  if (m.blocked?.await_event && typeof m.blocked.await_event === "object")
+    return `a typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")}) — the proxy watch owns the exit`;
+  if (m.awaiting_ask)
+    return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
+  return null;
 }
 
 // ---- carry-record law (BR#3516 §5) ----
@@ -1521,25 +1641,75 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
 
-/** train:bounced fix-up brief: the conflict files ride in, the verdict is
- *  INVALID at the new head, re-verify then re-queue at the back. */
+/** Bounce kinds (BR#4066): the executor's bounce has three distinct causes
+ *  with different next owners — conflating them produced the "every bounce
+ *  says conflicts" lie that sent impl hunting phantom conflicts.
+ *  - coverage: the live head is not covered by the accepted verdict (authored
+ *    push past the stamp, or a stale card read racing the accept-hook). NO
+ *    conflict exists. Next owner: the verify pool (auto re-enter review).
+ *  - conflict: trial-merge found real conflict files. Next owner: impl
+ *    repair leg.
+ *  - gate: a mechanical gate leg failed (mergeStateStatus, head checks…).
+ *    Next owner: whoever the named defect says. */
+export type TrainBounceKind = "coverage" | "conflict" | "gate";
+
+/** Classify a bounce from its facts — used by the executor payload path and
+ *  pinned by tests. Files present ⇒ conflict, always; the coverage defect is
+ *  the gate's own phrasing ("not covered by the accepted verdict"). */
+export function classifyBounce(defect: string, conflictFiles: string[]): TrainBounceKind {
+  if (conflictFiles.length) return "conflict";
+  if (/not covered by the accepted verdict/i.test(defect)) return "coverage";
+  return "gate";
+}
+
+/** train:bounced fix-up brief, KIND-AWARE (BR#4066): each kind names its
+ *  actual cause and its next owner; only a conflict bounce claims conflicts. */
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
   headSha: string | null;
   conflictFiles: string[];
   verdictId: string | null;
+  kind?: TrainBounceKind;
+  defect?: string;
+  mergeStateStatus?: string;
 }): string {
+  const kind = input.kind ?? classifyBounce(input.defect ?? "", input.conflictFiles);
+  const head = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
+  const pr = `PR #${input.prNumber} (${input.repo})`;
+  const law = `**Law (BR#3516 §5):** machine-clean carries, human-resolved invalidates.`;
+  if (kind === "coverage") {
+    return [
+      `Merge-train bounce (VERDICT COVERAGE): ${pr}${head} — the live head is not covered by the accepted verdict${input.verdictId ? ` (${input.verdictId})` : ""}. No conflict exists${input.defect ? ` — gate said: ${input.defect}` : ""}.`,
+      ``,
+      `**Next owner: the verify pool.** The card re-enters review; a fresh verify duty re-checks the live head (usually unchanged — a stale card read racing the accept-hook stamp, or an authored push) and the accept re-queues the train at the BACK. Impl has no repair leg unless that verify finds one.`,
+      ``,
+      law,
+    ].join("\n");
+  }
+  if (kind === "gate") {
+    return [
+      `Merge-train bounce (GATE): ${pr}${head} — a mechanical gate leg failed.`,
+      ``,
+      `**Defect:** ${input.defect || "(executor supplied no defect text — report this)"}${input.mergeStateStatus ? ` (mergeStateStatus=${input.mergeStateStatus})` : ""}`,
+      ``,
+      `**Next owner: the defect names it** (rebase / re-sign / fix the named check), then re-enter review; the train re-queues once a fresh verify accepts.`,
+      ``,
+      law,
+    ].join("\n");
+  }
   const files = input.conflictFiles.length
     ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
-    : "- (no file list supplied — run the trial rebase locally to enumerate)";
+    : `- **(CONFLICT BOUNCE WITHOUT A FILE LIST — executor defect: the trial merge must supply the files; report this)**`;
   return [
-    `Merge-train bounce: PR #${input.prNumber} (${input.repo}) conflicts with its base${input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : ""}.`,
+    `Merge-train bounce (CONFLICT): ${pr} conflicts with its base${head}.`,
     ``,
     `**Conflicting files:**`,
     files,
     ``,
-    `**Law (BR#3516 §5):** conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head — machine-clean carries, human-resolved invalidates. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    `**Next owner: impl repair leg (core.ts standing order).** Conflict resolution is authored code ⇒ the prior verdict${input.verdictId ? ` (${input.verdictId})` : ""} is INVALID at the new head. Resolve the conflict, push, re-enter review; the train re-queues at the BACK once a fresh verify accepts the new head.`,
+    ``,
+    law,
   ].join("\n");
 }
 

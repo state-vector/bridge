@@ -8,7 +8,10 @@ import {
   mergeTrainQueue,
   normalizeGhMergeable,
   normalizeGhMergeState,
+  progressVerdict,
+  renewProgressDecide,
   trainBounceBrief,
+  classifyBounce,
   trainCardMatchesLane,
   trainLandedCloseNote,
   trainLegLanded,
@@ -23,6 +26,7 @@ import {
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_HEAD_STAMP_RE,
   TRAIN_LEASE_TTL_MS,
+  TRAIN_PROGRESS_STALE_MS,
   type MainCheckRun,
   type TrainLease,
 } from "../src/kb/core.ts";
@@ -105,6 +109,63 @@ describe("leaseDecide (the CAS check — read-check-write is atomic in the DO)",
     expect(leaseDecide(lease("gw-1", 0, 1000), 1000, "gw-2", "acquire").ok).toBe(true);
     expect(leaseDecide(lease("gw-1", 0, 1001), 1000, "gw-2", "acquire").ok).toBe(false);
     expect(at(1000)).toContain("1970");
+  });
+});
+
+// ---------- the renew-arm zombie check (proof-of-progress, BR#4129) ----------
+
+describe("renewProgressDecide (the hub half of proof-of-progress — deny renewal on a frozen note)", () => {
+  const proof = (note: string, age_ms: number, holder = "gw-1") => ({ progress: note, progress_age_ms: age_ms, holder });
+
+  it("STALE proof on a non-empty queue denies the renewal — the reason names holder, minutes, and queue depth", () => {
+    const d = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 4);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) {
+      expect(d.reason).toContain("zombie holder");
+      expect(d.reason).toContain("no progress for 180m");
+      expect(d.reason).toContain("non-empty queue (4 queued)");
+      expect(d.stale_ms).toBe(3 * 60 * 60_000);
+    }
+  });
+
+  it("STALE proof on an EMPTY queue allows the renewal — idle holding is harmless and correct", () => {
+    const d = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 0);
+    expect(d.ok).toBe(true);
+  });
+
+  it("FRESH proof on a non-empty queue allows the renewal — an awaiting-CI holder's note refreshes every tick, it never trips", () => {
+    const d = renewProgressDecide(proof("CI poll on abc123def: pending", 45_000), "gw-1", 2);
+    expect(d.ok).toBe(true);
+    if (d.ok) expect(d.verdict).toBe("fresh");
+  });
+
+  it("the staleness boundary is strict: age == bound is fresh, one ms more is stale (mirrors the TTL law)", () => {
+    expect(TRAIN_PROGRESS_STALE_MS).toBe(10 * MIN);
+    expect(renewProgressDecide(proof("CI poll on abc123def: pending", TRAIN_PROGRESS_STALE_MS), "gw-1", 2).ok).toBe(true);
+    expect(renewProgressDecide(proof("CI poll on abc123def: pending", TRAIN_PROGRESS_STALE_MS + 1), "gw-1", 2).ok).toBe(false);
+  });
+
+  it("missing or garbled proof is UNKNOWN — allowed (legacy `{}` renewals ride the deprecation window), never guessed stale", () => {
+    for (const p of [undefined, null, {}, { progress: "x" }, { progress_age_ms: 5000 }, { progress: "", progress_age_ms: -1 }, { progress: 42, progress_age_ms: 1e15 }]) {
+      const d = renewProgressDecide(p as any, "gw-1", 3);
+      expect(d.ok).toBe(true);
+      if (d.ok) expect(d.verdict).toBe("unknown");
+    }
+    expect(progressVerdict(null, "gw-1")).toBe("unknown");
+  });
+
+  it("a proof naming a DIFFERENT holder proves nothing about the renewer — UNKNOWN, allowed", () => {
+    expect(progressVerdict(proof("merged PR #263", 3 * 60 * 60_000, "gw-9"), "gw-1")).toBe("unknown");
+    expect(renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000, "gw-9"), "gw-1", 3).ok).toBe(true);
+  });
+
+  it("takeover after denial: the expired lease hands the lane to the next gateway's acquire (train handover law)", () => {
+    const denied = renewProgressDecide(proof("merged PR #263", 3 * 60 * 60_000), "gw-1", 4);
+    expect(denied.ok).toBe(false);
+    // the DO cleared the lease on denial — the next acquire on a free lane wins
+    const takeover = leaseDecide(null, 1000, "gw-2", "acquire");
+    expect(takeover.ok).toBe(true);
+    if (takeover.ok) expect(takeover.lease?.holder).toBe("gw-2");
   });
 });
 
@@ -354,9 +415,11 @@ describe("train event copy", () => {
     expect(b).toContain("(BR#9) is INVALID at the new head");
     expect(b).toContain("machine-clean carries, human-resolved invalidates");
     expect(b).toContain("re-queues at the BACK");
+    // BR#4066: bare (no kind, no defect, no files) classifies as GATE —
+    // conflict language is never fabricated for a bounce with no files.
     const bare = trainBounceBrief({ prNumber: 1, repo: "r", headSha: null, conflictFiles: [], verdictId: null });
-    expect(bare).toContain("(no file list supplied");
-    expect(bare).toContain("prior verdict is INVALID");
+    expect(bare).toContain("(GATE)");
+    expect(bare).not.toMatch(/conflicts with its base/);
   });
 
   it("trainLandedCloseNote cites the PR, the gateway, and the machine proxy", () => {
@@ -692,5 +755,36 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     if (behind.kind === "bounce") expect(behind.defect).toContain("mergeStateStatus=behind");
     // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
     expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
+  });
+});
+
+// BR#4066 — bounce KINDS: coverage / conflict / gate briefs name their cause
+// and next owner; only a conflict bounce claims conflicts.
+describe("trainBounceBrief kinds (BR#4066)", () => {
+  const base = { prNumber: 2601, repo: "state-vector/bridge", headSha: "b".repeat(40), verdictId: "BR#9" };
+
+  it("coverage bounce: no conflict language, verify pool owns the next leg", () => {
+    const b = trainBounceBrief({ ...base, conflictFiles: [], kind: "coverage", defect: "PR #2601 live head bbb is not covered by the accepted verdict (leg 1 stamped aaa)" });
+    expect(b).toContain("VERDICT COVERAGE");
+    expect(b).not.toContain("Conflicting files");
+    expect(b).not.toMatch(/conflicts with its base/);
+    expect(b).toContain("verify pool");
+  });
+
+  it("gate bounce: the gate's own defect renders, never conflict copy", () => {
+    const b = trainBounceBrief({ ...base, conflictFiles: [], kind: "gate", defect: "PR #2601 mergeStateStatus=behind — not clean", mergeStateStatus: "behind" });
+    expect(b).toContain("mergeStateStatus=behind");
+    expect(b).not.toMatch(/conflicts with its base/);
+  });
+
+  it("conflict bounce without files fails LOUD (executor defect), not the old shrug", () => {
+    const b = trainBounceBrief({ ...base, conflictFiles: [], kind: "conflict" });
+    expect(b).toContain("CONFLICT BOUNCE WITHOUT A FILE LIST");
+  });
+
+  it("classifyBounce: files win, coverage phrasing second, else gate", () => {
+    expect(classifyBounce("x", ["a.ts"])).toBe("conflict");
+    expect(classifyBounce("head is not covered by the accepted verdict (leg 1)", [])).toBe("coverage");
+    expect(classifyBounce("mergeStateStatus=dirty", [])).toBe("gate");
   });
 });
