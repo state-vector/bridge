@@ -72,8 +72,45 @@ export function App() {
 
   useEffect(() => {
     void load();
-    const t = setInterval(() => void load(), 15000);
-    return () => clearInterval(t);
+    // BR#4362: push, not poll — the socket carries board state (kb.board
+    // snapshots) + events; decisions reload is debounced per burst. Falls
+    // back to nothing: if the socket dies, reconnect-with-backoff rehydrates.
+    const base = (localStorage.getItem(LS.url)?.replace(/\/$/, "") || window.location.origin).replace(/^http/, "ws");
+    let stopped = false;
+    let backoff = 2000;
+    let decisionsTimer: ReturnType<typeof setTimeout> | null = null;
+    const dial = () => {
+      if (stopped) return;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(`${base}/kb-ws?since=0`);
+      } catch { setTimeout(dial, backoff); backoff = Math.min(backoff * 2, 30000); return; }
+      ws.onopen = () => { backoff = 2000; };
+      ws.onmessage = (e) => {
+        try {
+          const f = JSON.parse(e.data);
+          if (f.type === "kb.board" && f.board) {
+            setBoard(f.board as Board);
+            if (!decisionsTimer) {
+              decisionsTimer = setTimeout(() => {
+                decisionsTimer = null;
+                void load();
+              }, 1500);
+            }
+          }
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => {
+        if (stopped) return;
+        setTimeout(dial, backoff);
+        backoff = Math.min(backoff * 2, 30000);
+      };
+      ws.onerror = () => ws.close();
+    };
+    dial();
+    return () => {
+      stopped = true;
+    };
   }, []);
 
   const act = async (d: Decision, action: "unblocked" | "completed") => {
