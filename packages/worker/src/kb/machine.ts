@@ -539,7 +539,17 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
     const st = String(mtq.state ?? "");
     const pr = trainPrLeg(m);
-    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr) {
+    // BR#4494 carve-out: the stall sweep's bounce re-entry demote. Bounced is
+    // the ONE train state whose next leg the train does NOT own — it handed
+    // the leg back to the board (re-entry is a fresh verify/impl round), so
+    // the demote to a claimable todo destroys no queue slot; the train meta
+    // rides along and the fresh accept re-queues. Keyed on the explicit body
+    // flag the sweep sets + in_progress (a live re-entry, never a park) +
+    // state bounced — queued/awaiting-ci stay protected even with a forged
+    // flag, and so does a bounced card parked BLOCKED.
+    const demoteReentry =
+      st === "bounced" && i.status === "in_progress" && i.body?.demote_bounced_reentry === true;
+    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr && !demoteReentry) {
       const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
       return {
         ok: false,
@@ -549,7 +559,7 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       };
     }
     const hold = releaseHold(m);
-    if (hold) {
+    if (hold && !demoteReentry) {
       const aw = m.blocked?.await_event
         ? `typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")})`
         : `bound ask (${String(m.awaiting_ask?.ask_id ?? "")})`;

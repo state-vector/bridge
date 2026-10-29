@@ -290,8 +290,15 @@ describe("merge train DO drill (real bundled worker)", () => {
     // BR#4428: the coverage-bounce self-heal re-enters review — and the
     // re-entry note must carry the PR link, or the review-needs-pr gate
     // rejects it and the card strands in_progress with a breach event per
-    // bounce (the gate:review-needs-pr storm on BR#4363).
+    // bounce (the gate:review-needs-pr storm on BR#4363). BR#4494: the
+    // handoff must also leave an OWNED re-verify duty — the standard
+    // in_review spawn; if the re-entry is ever gate-rejected again, the
+    // watchdog bounce re-entry demote releases the card claimable.
     expect(card1.status).toBe("in_review");
+    const verifyDuty = ((await kbJson("/list", { type: "task", limit: 200 })).body?.artefacts ?? [])
+      .find((a: any) => a.title === "Verify: IMPL: coverage bounce drill" && ["todo", "in_progress", "blocked"].includes(a.status));
+    expect(verifyDuty, "the coverage self-heal must leave an OWNED re-verify duty").toBeTruthy();
+    expect(String(verifyDuty.body_md)).toContain("https://github.com/state-vector/lane-coverage/pull/2611");
     const brief = String(card1.body_md);
     expect(brief).toContain("Merge-train bounce (coverage): PR #2611");
     expect(brief).toContain("head moved past the accepted verify verdict");
