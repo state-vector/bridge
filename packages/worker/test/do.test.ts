@@ -327,6 +327,46 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     }
   });
 
+  it("SUPERSEDE answer on a parked subject DROPS it (BR#3913 — the dispatch leg was a 500: no lifecycle edge to superseded)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#3913 supersede dispatch target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Rework loop on the card — drop it?",
+      options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
+      reason: "churn guard rework loop",
+      to: "human",
+    });
+    expect(ask.status).toBe(200);
+    // ask.create parked the subject blocked-on-ask (typed await on the ask node)
+    const parked = await kbJson("/get", { id: t.id });
+    expect(parked.body.status).toBe("blocked");
+    // the answer actions the card: SUPERSEDE drops it. Before BR#3913 the
+    // answer + question-done committed, then the transition threw
+    // `task: 'blocked' → 'superseded' not allowed` — a 500 with the subject stuck.
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "SUPERSEDE — drop it", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.error).toBeUndefined();
+    expect(ans.body.task_status).toBe("superseded");
+    const after = await kbJson("/get", { id: t.id });
+    expect(after.body.status).toBe("superseded");
+  });
+
+  it("a bare agent session cannot supersede a parked card via transition (BR#3913 authority guard)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#3913 agent-supersede refused" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const blocked = await kbJson("/transition", {
+      id: t.id, to: "blocked",
+      note: "awaiting direction",
+      await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 1 },
+    });
+    expect(blocked.status).toBe(200);
+    const sup = await kbJson("/transition", { id: t.id, to: "superseded", note: "dropping this", actor: "some-agent-session" });
+    expect(sup.status).toBe(400);
+    expect(String(sup.body.error)).toContain("supersede-authority");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("blocked"); // unchanged
+  });
+
   it("board payload carries type + roles for UI kind derivation and tag filters", async () => {
     const r = await kb("/board");
     const b = (await r.json()) as any;

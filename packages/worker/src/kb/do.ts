@@ -96,6 +96,14 @@ import {
   trainLandedCloseNote,
   releaseHold,
   trainProxyEvent,
+  // prose-card disposition ladder (BR#4416)
+  decideProseDisposition,
+  proseClassAskTitle,
+  proseAlarmAskTitle,
+  PROSE_CLASS_AMBIGUOUS,
+  PROSE_CLASS_QUIET_MS,
+  type ProseLeg,
+  type ProseLegVerdict,
   PROXY_WAIT_HOLD_RESULT_CLASS,
   type TrainLease,
   type LeaseAction,
@@ -838,6 +846,13 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql.exec(
       `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
     ).toArray() as any[];
+    // BR#4416 per-pass prose tally + the class-ask / alarm collectors. The
+    // class ask is filed AFTER the loop so ONE ask names every card of the
+    // class found this pass (never one per card).
+    const prose: {
+      flip: number; restore: number; release: number; escalate: number; prose: number;
+      classCards: { id: string; title: string; fact: string }[];
+    } = { flip: 0, restore: 0, release: 0, escalate: 0, prose: 0, classCards: [] };
     for (const r of rows) {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
@@ -887,57 +902,20 @@ export class KnowledgeHub {
           }
         }
         if (!atoms.length) {
-          // BR#3620: an existing migration ask IS a typed await — wire it so
-          // its resolution flips the card through the ask branch. The legacy
-          // hole: the ask was recorded, answered, and the card never moved
-          // because the free-text condition stayed unread.
-          if (bmeta.await_migration_ask && !bmeta.await_event) {
-            meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "ask", ask_id: bmeta.await_migration_ask } };
-            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
-            this.stampProxyCheck(r.id, meta, now, "waiting", `awaiting ask ${bmeta.await_migration_ask} (migration ask wired as the typed await)`, prev);
-            continue;
-          }
-          // BR#3578 migration: a legacy blocked card awaiting NOTHING (no
-          // typed event, no atoms, no bound ask) becomes an ACTIVE ask to the
-          // human — once per card, never once per sweep. Cards whose
-          // root_blocker is still open skip: the root owns the human leg.
-          // EXCEPTION (BR#3620): a card that is its OWN root (the root-blocker
-          // rollup stamped root_key on the root card itself) owns nobody's
-          // leg but its own — it gets the migration ask like any other.
-          const selfRooted = String(meta.root_blocker ?? "") === r.id;
-          const rooted = !selfRooted && meta.root_blocker
-            ? this.one(`SELECT status FROM artefacts WHERE id = ?`, String(meta.root_blocker))
-            : null;
-          if (!meta.awaiting_ask?.ask_id && !bmeta.await_migration_ask
-              && (!rooted || !["todo", "in_progress", "blocked"].includes(rooted.status))) {
-            const ask = await this.askCreate({
-              to: "ray",
-              // Plain-English rewrite (BR#4023, Ray 2026-10-28): the migration
-              // ask must be answerable without a translator — what the card is,
-              // why it cannot auto-resume, and what each option concretely does.
-              question: `Blocked card ${r.id} ("${String(r.title).slice(0, 80)}") can't auto-resume — its resume condition is prose the hub can't check. Re-scope, release, or drop it?`,
-              reason: "a blocked card only auto-resumes on a checkable condition (a PR merging, an issue closing, another card finishing, a CI run going green, a timer, an answered ask); this card's condition is ordinary prose, so it would sit parked forever without a human decision",
-              options: [
-                "RE-SCOPE — rewrite its resume condition as a checkable event (e.g. \"PR #N merges\")",
-                "RELEASE — send it back to the agent pool unchanged",
-                "SUPERSEDE — drop the card",
-              ],
-              details: `"${r.title}" is parked with this resume condition: "${cond.slice(0, 240)}".
-
-Why this needs a human: the hub re-checks blocked cards every sweep, but only against conditions it can evaluate mechanically — a PR merging, an issue closing, another card finishing, a CI run going green, a deploy landing, a timer elapsing, or a bound ask being answered. This card's condition is ordinary prose, so the hub can never tell when it is satisfied; left alone it sits parked forever.
-
-- RE-SCOPE: rewrite the resume condition as a checkable event. Grammar (closed set): ${AWAIT_GRAMMAR_DOC}
-- RELEASE: send the card back to the pool unchanged — an agent must pick it up and move it manually.
-- SUPERSEDE: drop the card (only if the work is moot, done elsewhere, or duplicated).`,
-              artefact_id: r.id,
-            }, "hub:proxy-watch").catch(() => null);
-            if (ask) {
-              meta.blocked = { ...(meta.blocked ?? {}), await_migration_ask: ask.id, await_event: { event: "ask", ask_id: ask.id } };
-              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
-            }
-          }
-          this.stampProxyCheck(r.id, meta, now, unparseable ? "unparseable" : "no_atoms",
-            unparseable ? "condition mentions machine state but no atom parsed — never auto-flips (migrated to an ask)" : "no machine atoms — migrated to an ask", prev);
+          // BR#4416 prose-card disposition ladder. This branch used to be the
+          // ask factory: every prose park became a per-card "awaits nothing
+          // the machine can read" ask to the human — moot when the card's own
+          // machine state held the exit receipt (BR#4170: PR MERGED, human
+          // asked anyway), mechanical when a typed leg was recoverable from
+          // meta. The ladder resolves what the machine can prove and asks a
+          // human ONLY for genuine ambiguity, ONE ask per class per day.
+          // (BR#4364 reconcile: this supersedes the BR#3578/BR#3620 per-card
+          // migration-ask factory this branch once carried — the ladder's
+          // recoverProseLegs already treats an existing migration ask
+          // (blocked.await_migration_ask) as a typed leg and flips the card
+          // when it is answered, so BR#3620's answered-ask exit is preserved
+          // through the ladder, not the per-card ask.)
+          await this.proseLadder(r, meta, cond, now, prev, unparseable, prose);
           continue;
         }
         const results: { atom: ProxyAtom; ok: boolean; receipt: string }[] = [];
@@ -965,6 +943,149 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         this.audit("hub:proxy-watch", "sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 300) });
       }
     }
+    // BR#4416 post-pass: file the ONE class ask (if rung 4 fired), emit the
+    // prose_blocked_count canary, and arm the population alarm when the
+    // count is nonzero after the BR#4248 generator-kill has deployed.
+    await this.prosePassEmit(prose, now);
+  }
+
+  /** BR#4416 post-pass emission: the class ask, the prose_blocked_count
+   *  settings row + audit line (board health, visible in /stats), and the
+   *  one-per-episode population alarm at the sink. */
+  private async prosePassEmit(
+    prose: { flip: number; restore: number; release: number; escalate: number; prose: number; classCards: { id: string; title: string; fact: string }[] },
+    now: number,
+  ): Promise<void> {
+    // ---- the ONE class ask (rung 4), deduped by stamp + identical-open guard
+    if (prose.classCards.length > 0) {
+      const classKey = `prose_migration_${PROSE_CLASS_AMBIGUOUS}`;
+      const last = Number(this.settingValue(classKey, "0")) || 0;
+      if (now - last >= PROSE_CLASS_QUIET_MS) {
+        try {
+          const ask = await this.askCreate(
+            {
+              to: "ray",
+              question: proseClassAskTitle(prose.classCards.map((c) => c.id)),
+              reason: `these ${prose.classCards.length} blocked card(s) are parked on pure prose with no machine leg anywhere in their state, and they are runner/human-owned — the sweep may not re-scope them; ONE ask covers the class (BR#4416, never one per card)`,
+              details: [
+                ...prose.classCards.map((c) => `- ${c.id} "${c.title}" — ${c.fact}`),
+                ``,
+                `Grammar for a RE-SCOPE (closed set): ${AWAIT_GRAMMAR_DOC}`,
+              ].join("\n"),
+              options: [
+                "RE-SCOPE — I'll rewrite each card's resume condition as a checkable event",
+                "RELEASE — send these cards back to the pool unchanged",
+                "SUPERSEDE — drop the named cards",
+              ],
+              artefact_id: prose.classCards[0].id,
+            },
+            "hub:proxy-watch",
+          );
+          this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('${classKey}', ?)`, String(now));
+          // stamp every class card with the ask as its typed leg — they leave
+          // the prose population the moment the ask exists (the answer owns
+          // the exit, exactly like a bound ask).
+          for (const c of prose.classCards) {
+            try {
+              const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, c.id) as any;
+              if (!row?.meta) continue;
+              const meta = JSON.parse(row.meta);
+              meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "ask", ask_id: ask.id } };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), c.id);
+              this.audit("hub:proxy-watch", "prose_class_ask_stamp", c.id, { ask: ask.id });
+            } catch { /* the typed path re-reads meta next pass anyway */ }
+          }
+        } catch (e) {
+          // an identical ask is already open for this class — that IS one per class
+          this.audit("hub:proxy-watch", "prose_class_ask_deduped", prose.classCards[0].id, { detail: String((e as Error).message ?? e).slice(0, 200) });
+        }
+      }
+    }
+    // ---- the canary: every pass emits prose_blocked_count (board health)
+    const report = {
+      ts: now,
+      prose_blocked: prose.prose,
+      auto_flipped: prose.flip,
+      auto_restored: prose.restore,
+      released_todo: prose.release,
+      class_escalations: prose.escalate,
+    };
+    try {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('prose_blocked_count', ?)`,
+        JSON.stringify(report),
+      );
+    } catch { /* best-effort: the audit line still carries the tally */ }
+    this.audit("hub:proxy-watch", "prose_sweep", "watchdog", report);
+    // ---- the population alarm: prose parks AFTER the BR#4248 generator-kill
+    //      (PR #275) has merged AND deployed = incident, one per episode.
+    if (prose.prose > 0) await this.proseAlarmIfArmed(prose, now);
+  }
+
+  /** BR#4416 population alarm: prose_blocked_count > 0 after BR#4248 deploys
+   *  is an incident — ONE alarm at the sink naming the cards + the writer
+   *  each card's state names, deduped per episode. Never per-card asks: the
+   *  count is a canary, not an inbox. */
+  private async proseAlarmIfArmed(
+    prose: { prose: number; classCards: { id: string; title: string; fact: string }[] },
+    now: number,
+  ): Promise<void> {
+    const prov = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, "state-vector/bridge", 275) as any;
+    if (!prov?.merge_sha) return; // generator-kill not merged yet — the ladder is draining the pre-deploy backlog
+    let deployed = false;
+    try {
+      const v = (await import("../__version.json")) as { commit?: string };
+      deployed = deployedSatisfied(String(v.commit ?? ""), String(prov.merge_sha));
+    } catch { deployed = false; }
+    if (!deployed) return; // merged but not deployed: the drain continues, no incident yet
+    const last = Number(this.settingValue("prose_alarm_ts", "0")) || 0;
+    if (now - last < PROSE_CLASS_QUIET_MS) return; // one alarm per episode per day
+    const summaries = this.proseAlarmSummaries();
+    try {
+      await this.askCreate(
+        {
+          to: "human",
+          question: proseAlarmAskTitle(summaries),
+          reason: `prose_blocked_count=${prose.prose} after the BR#4248 generator-kill deployed — a writer is still minting prose parks (the population canary, BR#4416); this is the ONE class alarm, not per-card asks`,
+          details: summaries.length
+            ? `Cards still parked on unparseable prose with no machine leg, and the writer each card's own state names:\n${summaries.map((s) => `- ${s}`).join("\n")}`
+            : `prose_blocked_count=${prose.prose} this pass; per-card detail rides the prose_check audit lines.`,
+          options: [
+            "Investigating — will find and fix the writer",
+            "Known backlog — draining manually",
+            "False positive — these cards have legs",
+          ],
+          artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+          urgency: "time-sensitive",
+        },
+        "hub:proxy-watch",
+      );
+      this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('prose_alarm_ts', ?)`, String(now));
+    } catch (e) {
+      // an identical alarm is already open for this episode — that IS once
+      this.audit("hub:proxy-watch", "prose_alarm_deduped", "watchdog", { detail: String((e as Error).message ?? e).slice(0, 200) });
+    }
+  }
+
+  /** Per-card summaries for the alarm: card id + the writer its own state
+   *  names (meta.session) + why it is still prose. Board-local reads only. */
+  private proseAlarmSummaries(): string[] {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    ).toArray() as any[];
+    const out: string[] = [];
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const bmeta = meta.blocked ?? {};
+        if (validateAwaitEvent(bmeta.await_event)) continue; // typed — not prose
+        const cond = String(bmeta.unblock_condition ?? "").trim();
+        if (!cond) continue;
+        if (!this.recoverProseLegs(String(r.id), meta).length)
+          out.push(`${r.id} "${String(r.title ?? "").slice(0, 60)}" (writer: ${String(meta.session ?? "unknown")}; condition: "${cond.slice(0, 80)}")`);
+      } catch { /* skip malformed */ }
+    }
+    return out;
   }
 
   /** BR#3578 typed ask/time legs, evaluated first-class: an answered ask or
@@ -992,6 +1113,173 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
       return;
     }
     await this.spawnProxyDuty(r, meta, now, prev, cond, [`${describeAwaitEvent(aw)} → ask ${aw.ask_id} answered/closed`]);
+  }
+
+  // ---------- prose-card disposition ladder (BR#4416) ----------
+
+  /** BR#4416 rung-1/2 leg recovery from the card's OWN machine state — never
+   *  from re-parsing the prose (the prose already failed to parse; that is
+   *  why this code is running). Precedence: bound ask > PR leg (train stamp,
+   *  meta.pr, meta.prs) > open root blocker. A self-referential root is
+   *  skipped (the BR#136 deadlock law). Zero GitHub calls. */
+  private recoverProseLegs(id: string, meta: any): ProseLeg[] {
+    const legs: ProseLeg[] = [];
+    const seen = new Set<string>();
+    const push = (leg: ProseLeg) => {
+      const target =
+        leg.kind === "pr_merged" ? `${leg.repo}#${leg.n}`
+        : leg.kind === "ask" ? leg.ask_id
+        : leg.kind === "br_done" ? leg.id
+        : String(leg.until_ts);
+      const key = `${leg.kind}|${target}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      legs.push(leg);
+    };
+    const askId = String(meta.awaiting_ask?.ask_id ?? meta.blocked?.await_migration_ask ?? "").trim();
+    if (askId) push({ kind: "ask", ask_id: askId });
+    const mt = (meta.merge_train ?? {}) as Record<string, unknown>;
+    if (Number(mt.pr ?? 0) > 0 && typeof mt.repo === "string" && mt.repo)
+      push({ kind: "pr_merged", repo: String(mt.repo), n: Number(mt.pr) });
+    const mpr = meta.pr as Record<string, unknown> | undefined;
+    if (mpr && Number(mpr.number ?? 0) > 0 && typeof mpr.repo === "string" && mpr.repo)
+      push({ kind: "pr_merged", repo: String(mpr.repo), n: Number(mpr.number) });
+    for (const p of Array.isArray(meta.prs) ? meta.prs : []) {
+      const l = p as Record<string, unknown>;
+      if (l && typeof l.repo === "string" && l.repo && Number(l.number ?? 0) > 0)
+        push({ kind: "pr_merged", repo: String(l.repo), n: Number(l.number) });
+    }
+    const root = String(meta.root_blocker ?? "").trim();
+    if (root && root !== id && /^BR#\d+$/.test(root)) push({ kind: "br_done", id: root });
+    return legs;
+  }
+
+  /** BR#4416 board-local verdict for one recovered leg — ZERO GitHub calls
+   *  (BR#3287: the provenance/train ledger is the merge proof; asks and card
+   *  states are SQL reads; a vanished ask fires, same law as
+   *  evalTypedAskTimeLeg). */
+  private async evalProseLeg(leg: ProseLeg): Promise<ProseLegVerdict> {
+    switch (leg.kind) {
+      case "ask": {
+        const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, leg.ask_id);
+        if (!a) return { leg, ok: true, receipt: `ask ${leg.ask_id} no longer on the board — nothing left to wait for` };
+        const done = a.status === "done" || a.status === "superseded";
+        return { leg, ok: done, receipt: done ? `ask ${leg.ask_id} ${a.status} — the answer is in` : `ask ${leg.ask_id} still ${a.status}` };
+      }
+      case "pr_merged": {
+        const prov = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, leg.repo, leg.n) as any;
+        if (prov?.merge_sha)
+          return { leg, ok: true, receipt: `provenance ledger: ${leg.repo}#${leg.n} merged as ${String(prov.merge_sha).slice(0, 9)} (BR#3287)` };
+        const ev = this.one(`SELECT seq FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' LIMIT 1`, leg.repo, leg.n);
+        if (ev) return { leg, ok: true, receipt: `train ledger: ${leg.repo}#${leg.n} has a merged event` };
+        return { leg, ok: false, receipt: `${leg.repo}#${leg.n} has no provenance/train-ledger merge row — not merged as far as the board knows` };
+      }
+      case "br_done": {
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, leg.id);
+        if (!row) return { leg, ok: false, receipt: `${leg.id} not found on this board` };
+        const done = row.status === "done" || row.status === "superseded";
+        return { leg, ok: done, receipt: `${leg.id} status=${row.status}` };
+      }
+      case "time":
+        return { leg, ok: Date.now() >= leg.until_ts, receipt: `timer until ${new Date(leg.until_ts).toISOString()}` };
+    }
+  }
+
+  /** BR#4416 rung-3 restriction: the sweep may not release this card to the
+   *  pool — runner/human-owned, or a scope a human qualified. Supersede-vs-
+   *  continue on such a card is a genuine human ruling (rung 4), not the
+   *  churn guard's park (rung 3). Knob: `prose_protected_owners` (CSV). */
+  private proseReleaseRestricted(meta: any): boolean {
+    const csv = this.settingValue("prose_protected_owners", "opencode-ray,ip-172-31-1-230-opencode");
+    const protectedOwners = csv.split(",").map((s) => s.trim()).filter(Boolean);
+    const isProtected = (v: unknown) => {
+      const s = String(v ?? "").trim();
+      if (!s) return false;
+      return protectedOwners.some((p) => s === p || s.startsWith(`${p}/`));
+    };
+    const q = (meta.qualification ?? {}) as Record<string, unknown>;
+    return isProtected(meta.owner) || (String(q.state ?? "") === "qualified" && isProtected(q.by));
+  }
+
+  /** BR#4416: the ladder itself — decides one no-atom park from the card's
+   *  OWN machine state and acts. (1) provably true → the card's own promised
+   *  exit fires (spawnProxyDuty; NO ask); (2) a typed leg is recoverable →
+   *  restore meta.blocked.await_event (NO ask); (3) no leg → release to todo
+   *  for re-scope (NO ask); (4) genuine ambiguity on a protected card → the
+   *  ONE per-day class ask (filed post-pass so it names the whole class).
+   *  Pure table: decideProseDisposition (pinned in machine.test.ts). */
+  private async proseLadder(
+    r: any, meta: any, cond: string, now: number, prev: any, unparseable: boolean,
+    prose: { flip: number; restore: number; release: number; escalate: number; prose: number; classCards: { id: string; title: string; fact: string }[] },
+  ): Promise<void> {
+    const id = String(r.id);
+    const verdicts: ProseLegVerdict[] = [];
+    for (const leg of this.recoverProseLegs(id, meta)) verdicts.push(await this.evalProseLeg(leg));
+    const classKey = `prose_migration_${PROSE_CLASS_AMBIGUOUS}`;
+    const lastRaw = this.settingValue(classKey, "");
+    const d = decideProseDisposition({
+      cardId: id,
+      title: String(r.title ?? id),
+      now,
+      legs: verdicts,
+      releaseRestricted: this.proseReleaseRestricted(meta),
+      lastClassAskTs: lastRaw ? Number(lastRaw) || null : null,
+      classAskQuietMs: PROSE_CLASS_QUIET_MS,
+    });
+    switch (d.kind) {
+      case "flip": {
+        prose.flip++;
+        await this.spawnProxyDuty(r, meta, now, prev, cond, [
+          `${d.receipt} — BR#4416 rung 1: the machine-stamped leg already holds; the exit fires per the card's own promise, no ask filed`,
+        ]);
+        break;
+      }
+      case "restore": {
+        prose.restore++;
+        meta.blocked = { ...(meta.blocked ?? {}), await_event: d.await_event };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+        this.stampProxyCheck(id, meta, now, "waiting", `BR#4416 rung 2: typed leg restored (${describeAwaitEvent(d.await_event)}) — ${d.receipt}`, prev);
+        this.audit("hub:proxy-watch", "prose_restore", id, { leg: d.leg, receipt: d.receipt });
+        break;
+      }
+      case "release": {
+        prose.release++;
+        const attempts = Number(meta.attempt?.attempts ?? 0);
+        const churn = attempts
+          ? ` Churn context: ${attempts} prior release(s), last: ${String(meta.attempt?.last_reason ?? "").slice(0, 160)}.`
+          : "";
+        try {
+          await this.transition({
+            id, to: "todo", session: "",
+            note: `BR#4416 prose ladder rung 3: parked on pure prose (proxy_check no_atoms) with no machine leg anywhere in card state — released to the pool for re-scope per the BR#3578 no-leg law.${churn} Re-block ONLY with a typed await — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`,
+          }, "system:proxy-watch"); // system:* = OWNER_RELEASE_EXEMPT (machinery); the release-hold backstop still gated typed-wait holds
+          this.audit("hub:proxy-watch", "prose_release", id, { reason: d.reason });
+        } catch (e) {
+          // release refused at a gate — the park stands; count it so the canary sees it
+          prose.prose++;
+          this.audit("hub:proxy-watch", "prose_release_refused", id, { error: String((e as Error).message ?? e).slice(0, 200) });
+        }
+        break;
+      }
+      case "escalate_class": {
+        prose.escalate++;
+        prose.classCards.push({
+          id,
+          title: String(r.title ?? id).slice(0, 120),
+          fact: `parked on: "${cond.slice(0, 160)}"; PR state: ${meta.pr && Number((meta.pr as any).number ?? 0) > 0 ? `${String((meta.pr as any).repo)}#${Number((meta.pr as any).number)}` : Array.isArray(meta.prs) && meta.prs.length ? JSON.stringify(meta.prs).slice(0, 80) : "none in card state"}; park line: ${String(meta.blocked?.reason ?? "").slice(0, 120) || "n/a"}; writer: ${String(meta.session ?? "unknown")}`,
+        });
+        this.stampProxyCheck(id, meta, now, unparseable ? "unparseable" : "no_atoms",
+          unparseable ? "condition mentions machine state but no atom parsed — rung-4 class ask collects it (BR#4416)" : "no machine atoms — rung-4 class ask collects it (BR#4416)", prev);
+        break;
+      }
+      case "waiting": {
+        // inside the class-ask quiet window (or a concurrent pass holds it):
+        // still prose until the ask lands — the canary sees it
+        prose.prose++;
+        this.stampProxyCheck(id, meta, now, "waiting", `BR#4416: ${d.receipt}`, prev);
+        break;
+      }
+    }
   }
 
   /** BR#3361a / BR#3578: the flip — the exit condition held TRUE; spawn the
@@ -3427,6 +3715,9 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
     ).toArray();
     const tick = this.one(`SELECT value FROM settings WHERE key = 'watchdog.last_tick'`);
     const sweep = this.one(`SELECT value FROM settings WHERE key = 'watchdog.sweep'`);
+    const proseRow = this.one(`SELECT value FROM settings WHERE key = 'prose_blocked_count'`);
+    let prose_blocked: Record<string, unknown> | undefined;
+    try { prose_blocked = proseRow ? JSON.parse(String(proseRow.value)) : undefined; } catch { /* old shape */ }
     const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
     let watchdog: Record<string, unknown> | undefined;
     try {
@@ -3439,6 +3730,8 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         recent_events: recent.map((e) => ({ op: e.op, age_min: Math.round((Date.now() - Number(e.ts)) / 60000) })),
         open_asks: openAsks,
         ...(sweep ? JSON.parse(sweep.value) : {}),
+        // BR#4416: the prose-park population canary, emitted every proxy sweep
+        prose_blocked_count: prose_blocked,
       };
     } catch { /* older sweep shape */ }
     // BR#4212 channel health: per-route ok/err + storage-fault counters, so
