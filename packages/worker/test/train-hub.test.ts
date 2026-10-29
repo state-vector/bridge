@@ -298,7 +298,11 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.error ?? "", `coverage bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.bounce_kind).toBe("coverage");
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    // BR#4428: the coverage-bounce self-heal re-enters review — and the
+    // re-entry note must carry the PR link, or the review-needs-pr gate
+    // rejects it and the card strands in_progress with a breach event per
+    // bounce (the gate:review-needs-pr storm on BR#4363).
+    expect(card1.status).toBe("in_review");
     const brief = String(card1.body_md);
     expect(brief).toContain("Merge-train bounce (coverage): PR #2611");
     expect(brief).toContain("head moved past the accepted verify verdict");
@@ -309,8 +313,13 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(brief).not.toContain("conflicts with its base");
     expect(brief).not.toContain("Conflicting files");
     expect(brief).not.toContain("no file list supplied");
-    const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 5 })).body);
+    const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 8 })).body);
     expect(hist).toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict; re-verify at the new head");
+    // the self-heal re-entry note itself satisfies the gate it faces: the PR
+    // link is IN the note (BR#4428 — a link-less re-entry is a guaranteed
+    // review-needs-pr rejection, folded as a breach event on every bounce)
+    expect(hist).toContain("coverage-bounce self-heal (BR#4066/67)");
+    expect(hist).toContain(`https://github.com/${repo}/pull/2611`);
   });
 
   it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
