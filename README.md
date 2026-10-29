@@ -460,9 +460,9 @@ the same way (BR#4702): once the BR#2893 escalation stands, further capped attem
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
 card, carries the recurring block to the human ledger.
 The trains panel is honest about capability: a held lock names its machine; an idle lane
-ticked by a merge-capable gateway inside the 15-minute window shows
-`train ready · <machine> · tick Xm ago`; only a lane with no recent capable tick says
-`no gateway ticking` / `awaiting an available gateway`.
+ticked by a merge-capable gateway inside the 15-minute window shows the pill
+`train ready` (the tooltip names the machine and its last tick age); only a lane with no
+capable tick inside the window says the muted pill `no gateway`.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
