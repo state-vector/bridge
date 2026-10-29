@@ -375,7 +375,22 @@ pub fn decide_merge_action(
         return MergeAction::Skip { reason: "linked card already done — nothing to merge under it".into() };
     }
     let short = &head_sha[..head_sha.len().min(9)];
-    // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23)
+    // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23).
+    //     BR#4685: GitHub computes mergeability ASYNC — right after a base
+    //     merge the state reads null/UNKNOWN and `mergeable` rides the same
+    //     recomputation, so an answer is definitive only when the state
+    //     names itself. An unanswered state is a clock, never a defect: the
+    //     executor backoff-polls before this gate, and here it waits this
+    //     tick — never a bounce, and never a merge on an unconfirmed state
+    //     (the old null-state fall-through). The 2026-10-28 ledger is the
+    //     receipt: PRs #279/#281 bounced 28× with merge_state_status:null.
+    let state = merge_state_status.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    if state.as_deref().map_or(true, |s| s == "unknown") {
+        return MergeAction::Skip {
+            reason: format!("PR #{pr_number} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)"),
+        };
+    }
+    let state = state.unwrap_or_default();
     if mergeable != Some(true) {
         if mergeable.is_none() {
             return MergeAction::Skip { reason: "GitHub still computing mergeability — not yet, skip this tick".into() };
@@ -385,13 +400,11 @@ pub fn decide_merge_action(
             bounce_kind: BounceKind::Conflict,
         };
     }
-    if let Some(state) = merge_state_status.filter(|s| !s.is_empty()) {
-        if state != "clean" && state != "unstable" {
-            return MergeAction::Bounce {
-                defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter"),
-                bounce_kind: BounceKind::Gate,
-            };
-        }
+    if state != "clean" && state != "unstable" {
+        return MergeAction::Bounce {
+            defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter"),
+            bounce_kind: BounceKind::Gate,
+        };
     }
     // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
     let unverified = commits.iter().filter(|(_, v)| !v).count();
@@ -588,6 +601,64 @@ mod tests {
         assert!(matches!(
             decide_merge_action(1, &"a".repeat(40), None, &g, Some(true), Some("clean"), &[ok(1)], &[run(1, "ci", Some("success"))], true, true),
             MergeAction::Merge { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_state_polls_never_bounces_br4685() {
+        // BR#4685: an unanswered mergeStateStatus (null/""/UNKNOWN) is "not yet
+        // computed" — UNKNOWN × N polls → no bounce event, whatever the
+        // mergeable field reads (it rides the same async recomputation, so a
+        // false read beside an unanswered state is a stale read, the
+        // 2026-10-28 ledger class). A merge on an unconfirmed state is
+        // equally off the table — the old null-state fall-through is closed.
+        let ok = |n: i64| (format!("{n:040x}"), true);
+        let g = MainVerdict::Green;
+        for state in [None, Some(""), Some("unknown"), Some("UNKNOWN")] {
+            for mergeable in [None, Some(true), Some(false)] {
+                let a = decide_merge_action(281, &"a".repeat(40), None, &g, mergeable, state, &[ok(1)], &[], true, true);
+                assert!(matches!(a, MergeAction::Skip { .. }), "state={state:?} mergeable={mergeable:?} must poll/wait, got {a:?}");
+            }
+        }
+        // definitive states keep their rows: dirty conflict-bounces, blocked
+        // gate-bounces (the answered world is unchanged)
+        assert!(matches!(
+            decide_merge_action(1, &"a".repeat(40), None, &g, Some(false), Some("dirty"), &[ok(1)], &[], true, true),
+            MergeAction::Bounce { bounce_kind: BounceKind::Conflict, .. }
+        ));
+        assert!(matches!(
+            decide_merge_action(1, &"a".repeat(40), None, &g, Some(true), Some("blocked"), &[ok(1)], &[], true, true),
+            MergeAction::Bounce { bounce_kind: BounceKind::Gate, .. }
+        ));
+    }
+
+    #[test]
+    fn ledger_replay_2026_10_28_zero_null_state_bounces() {
+        // Acceptance (BR#4685): the 2026-10-28 ledger replayed against this
+        // gate yields zero null-state bounces. Rows lifted from train_events
+        // (state-vector/bridge, seq 136-162, 2026-10-28T00:52Z→07:00Z): PRs
+        // #279 (BR#4263) / #281 (BR#4282) bounced 28× with
+        // merge_state_status:null — every "CONFLICTING" row of the loop
+        // trial-merged CLEAN (conflict_files: []), i.e. stale mergeability
+        // reads while GitHub recomputed after base merges.
+        let g = MainVerdict::Green;
+        let sha279 = "1bb7e4670e2a21420528ee9d1b154658afb69d02";
+        let sha281 = "9391ea4a9822c01dc40cd021dac25b3d8877c0e2";
+        let rows: [(i64, &str, Option<bool>, Option<&str>); 4] = [
+            (281, sha281, Some(false), None), // seq 157: "unmergeable — CONFLICTING", null state, clean trial
+            (279, sha279, Some(false), None), // seq 159: same class
+            (279, sha279, Some(true), None),  // seq 162: gate bounce, null state stamp
+            (281, sha281, Some(true), None),  // the old fail-open: green-but-unanswered used to MERGE
+        ];
+        for (pr, sha, mergeable, state) in rows {
+            let a = decide_merge_action(pr, sha, None, &g, mergeable, state, &[(sha.to_string(), true)], &[], true, true);
+            assert!(matches!(a, MergeAction::Skip { .. }), "ledger row PR #{pr} (mergeable={mergeable:?}, state={state:?}) must poll/wait, got {a:?}");
+        }
+        // control: the same PR with a DEFINITIVE dirty state still bounces —
+        // the fix narrows to the unanswered class; real defects stay defects.
+        assert!(matches!(
+            decide_merge_action(281, sha281, None, &g, Some(false), Some("dirty"), &[(sha281.to_string(), true)], &[], true, true),
+            MergeAction::Bounce { bounce_kind: BounceKind::Conflict, .. }
         ));
     }
 

@@ -1024,13 +1024,24 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
     return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
 
   const short = i.headSha.slice(0, 9);
-  // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23)
+  // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23).
+  //     BR#4685: GitHub computes mergeability ASYNC — an unanswered
+  //     mergeStateStatus (null/UNKNOWN; typical right after a base merge)
+  //     means no answer yet, and the `mergeable` field rides the same
+  //     recomputation, so a false read beside an unanswered state is a stale
+  //     read. Wait (the executor backoff-polls before this gate) — never a
+  //     bounce, and never a merge on an unconfirmed state (the old
+  //     null-state fall-through). The 2026-10-28 ledger is the receipt:
+  //     PRs #279/#281 bounced 28× with merge_state_status:null.
+  const state = typeof i.mergeStateStatus === "string" ? i.mergeStateStatus.trim().toLowerCase() : "";
+  if (!state || state === "unknown")
+    return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)` };
   if (i.mergeable !== true) {
     if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability — not yet, skip this tick" };
     return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`, bounceKind: "conflict" };
   }
-  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
-    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
+  if (state !== "clean" && state !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
   // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
   const unverified = i.commits.filter((c) => !c.verified);
   if (unverified.length)
@@ -1933,7 +1944,11 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  branch still mergeable; the merge leg owns the machine-clean
  *  update-branch) and WAITS on blocked-with-pending-head-checks (strict
  *  branch protection re-runs the required checks on the head after every
- *  carry). decideMergeAction, the shared law, stays clean/unstable. */
+ *  carry). decideMergeAction, the shared law, stays clean/unstable.
+ *  BR#4685: an unanswered mergeStateStatus (null/UNKNOWN) means GitHub is
+ *  still computing — the executor backoff-polls (15/30/60s, lease-bounded)
+ *  before this gate and the shared law waits on it: never a bounce, never
+ *  a merge on an unconfirmed state. */
 export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (i.cardStatus === "superseded")
     return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
