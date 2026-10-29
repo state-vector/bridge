@@ -158,6 +158,20 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     if (a.kind === "skip") expect(a.reason).toContain("computing");
   });
 
+  it("BR#4685: an unanswered mergeStateStatus (null/UNKNOWN) polls — never a bounce, never a merge on an unconfirmed state", () => {
+    // the mergeable field rides the same async recomputation, so EVERY shape
+    // waits: even a false read beside an unanswered state is a stale read
+    // (the 2026-10-28 ledger bounced PRs #279/#281 28× exactly this way),
+    // and green-but-unanswered must not merge either (the old null fail-open)
+    for (const mergeStateStatus of [null, "", "unknown", "UNKNOWN"]) {
+      for (const mergeable of [null, true, false]) {
+        const a = decideMergeAction(base({ mergeable, mergeStateStatus }));
+        expect(a.kind).toBe("skip");
+        if (a.kind === "skip") expect(a.reason).toContain("BR#4685");
+      }
+    }
+  });
+
   it("mergeStateStatus not clean/unstable -> mechanical bounce naming the state, kind GATE (BR#4066)", () => {
     const a = decideMergeAction(base({ mergeStateStatus: "blocked" }));
     expect(a.kind).toBe("bounce");

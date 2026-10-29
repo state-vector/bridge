@@ -433,6 +433,42 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     const d = decideTrainGate(clean({ baseVerdict: "red" }));
     expect(d.kind).not.toBe("merge");
   });
+
+  it("BR#4685: UNKNOWN × N polls → no bounce event — the compose waits on an unanswered state", () => {
+    // the acceptance pin: poll the gate N times over UNKNOWN/null states and
+    // no bounce ever fires; the mergeable field riding the same recomputation
+    // changes nothing (a false read beside an unanswered state is a stale read)
+    for (let poll = 1; poll <= 6; poll++) {
+      const d = decideTrainGate(clean({
+        mergeable: poll % 2 ? true : false,
+        mergeStateStatus: poll % 3 ? "unknown" : null,
+      }));
+      expect(d.kind).toBe("skip");
+      if (d.kind === "skip") expect(d.reason).toContain("BR#4685");
+    }
+  });
+
+  it("BR#4685 ledger replay: the 2026-10-28 null-state rows (PRs #279/#281) yield zero bounces against this gate", () => {
+    // rows lifted from train_events (state-vector/bridge, seq 136-162,
+    // 2026-10-28): bounced 28× with merge_state_status:null — every
+    // "CONFLICTING" row trial-merged CLEAN (stale reads mid-recomputation)
+    const sha279 = "1bb7e4670e2a21420528ee9d1b154658afb69d02";
+    const sha281 = "9391ea4a9822c01dc40cd021dac25b3d8877c0e2";
+    const row = (pr: number, headSha: string, mergeable: boolean | null) =>
+      clean({ prNumber: pr, headSha, cardMeta: { pr: { head_sha_at_acceptance: headSha.slice(0, 9) } }, mergeable, mergeStateStatus: null, commits: [{ sha: headSha, verified: true }] });
+    for (const [pr, sha, mergeable] of [
+      [281, sha281, false],
+      [279, sha279, false],
+      [279, sha279, true],
+      [281, sha281, true], // the old fail-open: green-but-unanswered used to merge
+    ] as const) {
+      expect(decideTrainGate(row(pr, sha, mergeable)).kind).toBe("skip");
+    }
+    // control: a DEFINITIVE dirty state still bounces — real defects stay
+    const dirty = decideTrainGate(clean({ mergeable: false, mergeStateStatus: "dirty" }));
+    expect(dirty.kind).toBe("bounce");
+    if (dirty.kind === "bounce") expect(dirty.bounceKind).toBe("conflict");
+  });
 });
 
 // ---------- ask/brief copy (the ask contract: ≤240 chars, ends "?") ----------

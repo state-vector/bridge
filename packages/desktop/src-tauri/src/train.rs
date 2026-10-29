@@ -104,6 +104,37 @@ fn clamp_reconcile_interval_secs(v: u64) -> u64 {
     v.clamp(300, 21_600)
 }
 
+/// L1.1 (BR#4685): the mergeability backoff-poll ladder, in seconds. MERGE_TRAIN_POLL_SECS
+/// overrides ("15,30,60" shape); anything unparsable/empty keeps the default.
+fn parse_poll_secs(raw: &str) -> Vec<u64> {
+    let parsed: Vec<u64> = raw.split(',').filter_map(|s| s.trim().parse::<u64>().ok()).collect();
+    if parsed.is_empty() {
+        vec![15, 30, 60]
+    } else {
+        parsed
+    }
+}
+
+fn mergeability_poll_secs() -> Vec<u64> {
+    parse_poll_secs(&std::env::var("MERGE_TRAIN_POLL_SECS").unwrap_or_default())
+}
+
+/// L1.1 (BR#4685): has GitHub ANSWERED the mergeability question? The state
+/// is the answer — null/"" (computing) or "unknown" (GraphQL UNKNOWN) is not
+/// an answer, and the `mergeable` field rides the same async recomputation,
+/// so neither field is definitive until the state names itself. Facts are
+/// normalized at the boundary (pr_facts), so comparison is lowercase; the
+/// normalizer is idempotent, so raw uppercase shapes work too (tests).
+fn mergeability_definitive(facts: &Value) -> bool {
+    match normalize_gh_merge_state(facts.get("mergeStateStatus").unwrap_or(&Value::Null)) {
+        Some(s) => {
+            let s = s.trim();
+            !s.is_empty() && s != "unknown"
+        }
+        None => false,
+    }
+}
+
 /// Managed clone-cache path for a lane repo: base/owner/name — one clone per
 /// repo per gateway, shared by every lane of that repo.
 fn cache_dir(base: &str, repo: &str) -> PathBuf {
@@ -844,7 +875,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
             continue;
         }
-        let facts = ctx.pr_facts(repo, pr)?;
+        let mut facts = ctx.pr_facts(repo, pr)?;
+        // L1.1 (BR#4685): poll, don't bounce. An unanswered mergeStateStatus
+        // (null/UNKNOWN — GitHub computing, typical right after a base merge)
+        // is backoff-polled inside this tick — bounded by the lease heartbeat
+        // (renewed around every wait) — until GitHub answers. The gate below
+        // bounces ONLY on definitive DIRTY/CONFLICTING; a merge/closure that
+        // lands mid-poll reconciles through the arms below instead of gating.
+        if !mergeability_definitive(&facts) {
+            log(Some(key), &format!("queue[{qi}] PR #{pr} mergeStateStatus not yet computed — backoff-polling before the gate (BR#4685, lease-bounded)"));
+            for wait in mergeability_poll_secs() {
+                renew_lease(ctx, repo, base);
+                std::thread::sleep(Duration::from_secs(wait));
+                renew_lease(ctx, repo, base);
+                facts = ctx.pr_facts(repo, pr)?;
+                let st = vstr(&facts, "state").unwrap_or("");
+                if st == "MERGED" || st == "CLOSED" || mergeability_definitive(&facts) {
+                    break;
+                }
+            }
+        }
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
             // reconcile: merged on GitHub, no train event (crash between merge and
             // event) — stamp it and let the CI poll take over next tick.
@@ -1669,6 +1719,32 @@ mod tests {
         assert_eq!(cache_dir(base, "owner/repo"), PathBuf::from("/tmp/bridge-train-test/owner/repo"));
         assert_eq!(cache_dir(base, "owner/../repo"), PathBuf::from("/tmp/bridge-train-test/owner/repo"));
         assert_eq!(cache_dir(base, "a/b/c"), PathBuf::from("/tmp/bridge-train-test/a/b/c"));
+    }
+
+    #[test]
+    fn mergeability_definitive_keys_on_the_state_answer_br4685() {
+        // unanswered: missing field / null / "" / unknown / UNKNOWN — GitHub
+        // has not answered, poll (never bounce, never merge)
+        assert!(!mergeability_definitive(&json!({ "state": "OPEN" })));
+        assert!(!mergeability_definitive(&json!({ "mergeStateStatus": null })));
+        assert!(!mergeability_definitive(&json!({ "mergeStateStatus": "" })));
+        assert!(!mergeability_definitive(&json!({ "mergeStateStatus": "unknown" })));
+        assert!(!mergeability_definitive(&json!({ "mergeStateStatus": "UNKNOWN" }))); // raw pre-normalization shape
+        // definitive: any NAMED state answers — including the bad ones (the
+        // gate owns those rows; polling is only for the unanswered class)
+        for s in ["clean", "CLEAN", "dirty", "behind", "blocked", "unstable"] {
+            assert!(mergeability_definitive(&json!({ "mergeStateStatus": s })), "answered: {s}");
+        }
+    }
+
+    #[test]
+    fn poll_ladder_parses_and_defaults_br4685() {
+        assert_eq!(parse_poll_secs("15,30,60"), vec![15, 30, 60]);
+        assert_eq!(parse_poll_secs(" 5 , 10 "), vec![5, 10]);
+        assert_eq!(parse_poll_secs("0,0,0"), vec![0, 0, 0]); // tests collapse the waits
+        assert_eq!(parse_poll_secs(""), vec![15, 30, 60]); // never an empty ladder
+        assert_eq!(parse_poll_secs("garbage"), vec![15, 30, 60]);
+        assert_eq!(parse_poll_secs("garbage,,7"), vec![7]);
     }
 
     #[test]
