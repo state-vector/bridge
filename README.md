@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 bridge pair https://bridge.<your-subdomain>.workers.dev
 ```
 
-Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. When approving, tick **this device is a gateway** — the gateway identity is labelled with the hostname slug (e.g. `macbookpro`) and tagged with the gateway class, which Connect lists under Gateways with the agents it dispatched, separate from your interactive agents.
+Pairing prints a device code — approve it in the web UI (`/pair`) and the runner starts. It stays running; `bridge status` shows what it's doing. Useful env: `BRIDGE_MAX_SESSIONS` (WIP limit), `BRIDGE_WORKDIR`, `BRIDGE_AGENT` (opencode agent name), `OPENCODE_BIN`. The device declares its class at pair/start (a runner pairs as a gateway — there is no checkbox) and its label is pre-filled with the bare hostname slug (e.g. `macbookpro`), editable and display-only — the label is never identity. The gateway class comes from the token's gateway tag, not the name, and Connect lists gateways under Gateways with the agents they dispatched, separate from your interactive agents.
 
 Prefer building from source?
 
@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, per-agent models (each pinned id must resolve via the hub's /v1/models proxy), agent CLIs, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
+bridge doctor            # checks config, token, agent CLIs + agent profiles, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -100,7 +100,7 @@ bridge logs --json          # raw JSON for scripts
 
 The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
-Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. When a model is pinned, `bridge doctor` also fetches the hub's `/v1/models` proxy (same Bearer token as its other probes): a pinned id the proxy doesn't serve is a named FAIL (it would fail every dispatch), while a hub that doesn't serve the route yet only warns. The hub serves that route from its model registry — the `MODEL_IDS` var in `packages/worker/wrangler.toml` `[vars]` (comma-separated, e.g. `"sp-gateway/glm-5.3-flash,glm-4.7"`); an empty registry is an honest named FAIL for every pinned model until you set it. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
+Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)) installed and authenticated — `bridge doctor` verifies. Per-agent models are required (`"models"` in `~/.bridge/config.json`); the runner refuses to dispatch without them. Models are the agent CLI's business, not the hub's: the runner injects the pinned id into the agent CLI's own config, and the CLI resolves it against its own provider config — `bridge doctor` reports the pin (and warns when unset) but does not validate it against anything hub-side. `~/.bridge/config.json` is the knob surface: `max_sessions`, `backends`, `agent`, `poll_secs`, `timeout_mins`, `model` overrides.
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
@@ -111,11 +111,22 @@ layer — the desktop opens a live WebSocket to the hub with its paired
 gateway-class token (bearer on `/api/kb/*` + `/kb-ws`; admin routes stay
 cookie-only), so both surfaces always look and update identically.
 
+**The board is push-driven — no polling (BR#4362).** The socket carries
+state, not just a doorbell: every mutation streams a `kb.event` frame, and
+the hub pushes a coalesced `kb.board` snapshot (at most one board build per
+second, no matter the mutation rate or how many clients are connected) plus
+a hydration snapshot on connect. Clients apply frames to their store and
+fetch nothing on a timer; `GET /board` stays as a 2s-cached hydration path
+for stragglers. Desktop shells whose webview can't hold a cross-origin
+socket tail the events mirror adaptively (2s while busy, backing off to 30s
+idle) and coalesce event bursts into one refresh — the 2026-10-29 overload
+was every client refetching the full board per event.
+
 Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.
 - **Decision notifications** — the app watches the inbox and raises an OS notification whenever a new proposed decision arrives (the click jumps to For you). Verify-verdict notifications state the ask ("Accept verification of BR#X? — verdict PASS"), not the raw receipts title. No runner required.
-- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade, or a token the hub rejects), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates.
+- **Guided sign-back-in** — if the run gate signs the desktop out (the identity law reserves gateway dispatch for gateway-class tokens: a pre-gateway token surviving an app upgrade), the sign-in screen says so in plain language — what happened, that nothing was lost (hub URL and settings are kept), and that signing back in is one click: the browser opens itself, and the vended gateway-class token re-associates with the same stable device id. Legacy board rows keep their labels; only this device's token rotates. (A token the hub *rejects* mid-run is not a sign-out anymore — see the self-heal law below: the gateway parks loudly and recovers on its own, BR#4113.)
 
 ### Runner config file
 
@@ -147,11 +158,22 @@ killed by a rotation and never needs a manual re-pair:
   `x-bridge-token-epoch`; the runner re-vends its own row proactively at the
   next tick boundary when the epoch moves (`POST /api/token/repair`, agent
   plane — the principal is the credential, so **headless gateways self-heal
-  without a human session**). On a hard 401 the same repair runs first, the
-  desktop self-provision second, loud logout last — and every repair failure
-  reason is logged, never swallowed. Only a lost/revoked principal (or an
-  admin revoke) forces a human re-pair. Repairs are rate-limited per token
-  (6/hour) so a crash loop can't mint infinitely.
+  without a human session**). On a hard 401/403 the runner classifies the
+  failure and runs the **self-heal ladder** — keychain reload (another
+  process may have re-vended), principal repair, desktop self-provision —
+  with exponential backoff (5s doubling, 300s cap), and every repair failure
+  reason is logged, never swallowed. **Auth failure is never terminal while
+  desired state is "running" (BR#4113)**: there is no logout-and-halt path
+  left in the loop. If the ladder stays blocked the gateway PARKS LOUDLY — a
+  `needs attention` banner in the app (and `needs_attention` in
+  `~/.bridge/dispatch/runner.json`) — while it keeps polling and retrying on
+  the capped cadence, resuming dispatch on its own within one poll interval
+  the moment the hub accepts the device again (grace window, rollback, row
+  restore) — zero human action. Only the identity-law gate (a saved token
+  that is not gateway-class) signs the desktop out, and only a lost/revoked
+  principal forces a human re-pair; an admin revoke parks the gateway loudly
+  (it claims nothing) instead of stopping it silently. Repairs are
+  rate-limited per token (6/hour) so a crash loop can't mint infinitely.
 
 ```jsonc
 {
@@ -237,8 +259,10 @@ Notes:
   boundary — gateway tokens are infrastructure labelled with the hostname slug
   (e.g. `macbookpro`) and tagged with the gateway class; they are never task
   owners, and agent labels (`opencode-ray`) never take the gateway tag. The
-  boundary is enforced at mint, pairing, rename and
-  tag-edit time: a mis-named token is rejected, not rendered wrong. Connect
+  token (its principal) anchors identity: the class is the gateway **tag** on
+  the token, never a name convention — labels are free-form display and
+  nothing gates on a label shape (a label held by another device's credential
+  is a collision, not a naming violation). Connect
   shows gateways with the agents they dispatched, attributed agents nested
   under their gateway. Dispatched work is attributed to the agent the gateway
   dispatched as, named `<hostname>-<backend>` (e.g. `macbookpro-opencode`) or
@@ -296,7 +320,7 @@ agent CLI resolves **its own ambient config** — a dispatch host needs this
 entry for whichever CLI the runner drives, or dispatched sessions start
 toolless.
 
-Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, and the agent's own behavioural score.
+Mint agent tokens in the web UI under **Connect**. Agents call `orient` first — it returns the protocol card, open work, decisions awaiting consensus, and the agent's own behavioural score. Every artefact row an MCP tool returns carries `url` — the card's canonical deep link (`https://<hub>/card/BR-3990`) — so an agent citing a card can hand a human the link that opens it (BR#3990).
 
 **Receipts match the deliverable type**: dispatched verify/analysis/unblock
 sessions deliver findings and receipts **on the board** (progress notes and
@@ -327,6 +351,30 @@ never stacks); loop until the train merges and closes. Impl owns mergeability
 *preparation* (rebase before every in_review — a conflicting PR is the impl's defect, not
 the reviewer's); the train owns mergeability *enforcement* (a conflicting, red or unsigned
 PR is bounced with the exact defect — never merged silently).
+
+**Bounces name their kind, and the queue is durable** (BR#4066/4067/4068): a train bounce is
+one of three kinds with different next owners — **conflict** (trial-merge files listed; impl
+repair leg), **coverage** (the live head isn't covered by the accepted verdict — no conflict
+exists; the card immediately re-enters review and a fresh verify duty re-checks the head, so
+the stamp-race class self-heals), or **gate** (the named mechanical defect). The hub stamps
+the kind, defect and files on the card and **boosts it to priority 0** — a bounced
+merge-ready card is the board's highest-value work and must not re-enter at default priority
+and starve. A fresh verify accept on a non-conflict bounce re-queues the train automatically
+(no agent hands the card back). And machine silence-releases (watchdog sweeps) can no longer
+destroy queue state: a card the train owns (`queued` / `awaiting-ci` / `bounced` on a live PR
+leg), or one parked on a typed `await_event` or a bound ask, is never released to todo — the
+sweeps **park it `blocked` with the typed proxy intact** (the proxy owns its exit), and the
+machine-actor backstop refuses any release path that slips past them (BR#4067). Humans and
+owners still release freely. The hold-park itself runs only AFTER an atom check (BR#4282):
+the hub holds no VCS credentials, so a `pr_merged` proxy is evaluated against BOARD receipts
+only — the train's own `awaiting-ci` stamp (with `merge_sha`) or the `provenance` row. A
+proxy that is already satisfied is never re-armed: instead of re-parking the card blocked,
+the sweep spawns the owned done-close duty — which, when the parent sits `in_progress` or
+`in_review`, closes ITSELF done first and then the parent (the exit flipped while the card
+worked; it owes a close, not a resume). The silence-re-park can also no longer loop: a
+flood-guard skip (`skip_unblock_spawn` with `flood: true`) is the dedup working and is
+audited without folding a breach card, and a resume consumes the unblock round so post-resume
+silence issues one fresh round instead of flooding for an hour.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -359,7 +407,10 @@ answered via the ask band or progress entries, closed to done/superseded — nev
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
-`in_progress`. Three fields are the whole contract, enforced server-side (`askCreate` /
+`in_progress` — exactly once: the ask is the unblock path, so an ask-bound block spawns
+no separate unblock/sweep duty that could race the answer (the card carries an
+`awaiting_ask` marker the machine's spawn gate reads; answering clears it). Three fields
+are the whole contract, enforced server-side (`askCreate` /
 `askAnswer` in `packages/worker/src/kb/do.ts`):
 
 - **`question` — the summary.** One answerable sentence ending in `?`, ≤240 chars; it becomes
@@ -371,12 +422,18 @@ subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes i
   click is the answer, and it closes the question `done`.
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
-`TASK_REF_RE` in `packages/ui-kit/src/server/views.ts`) and resolve via `get_artefact` like
+the ref scanner in `packages/ui-kit/src/views/refs.ts`) and resolve via `get_artefact` like
 any artefact. `answer_ask` takes the question node's BR# id — there are no separate `ASK-*`
 artefact ids. Humans answer in the app: the ask band in Top (web + desktop) renders every
-open ask with its options as one-click buttons, and every ask-band row (verdict, decision,
+open ask with its options as one-click buttons, every ask-band row (verdict, decision,
 node ask) shows its own BR# id as a mono chip next to the rel time — you always know which
-ask you are acting on. `urgency` is an ask vocabulary, not a
+ask you are acting on — and each node-ask row ends with a **type your own answer…** row
+that opens a text input: the typed text is recorded with the ask exactly like a click
+(BR#3912 — an option that promises a rewrite, like "RE-SCOPE — I'll rewrite the card
+myself", needs somewhere to write it). Typed answers follow the same dispatch law as
+clicks: an answer starting with a RE-SCOPE/KEEP option verb keeps the subject parked,
+RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resumes it.
+`urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
 
@@ -402,9 +459,34 @@ in_review, verify separation, human legs escalate to you. The button only copies
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
 
+**Refs are hyperlinks, not copy-paste bait (BR#4015).** Every rendered surface — titles,
+bodies, blocked reasons, resume conditions, history, comments, decision verdicts —
+auto-links what used to be dead text: `BR#NNN` / `TASK-NNN` become real anchors on the
+permalink path (`/card/BR-4015`; a plain click navigates in place, cmd/ctrl-click or
+middle-click opens the permalink in a new tab, and the href copies as a URL); bare
+`https://…` URLs open in a new tab; `owner/repo#N` links to GitHub; and `PR #N` /
+`issue #N` / `GH#N` / bare `#N` link when the card's own context names a repo
+(`meta.provenance.repo`) — never a guessed repo. Text inside existing links and code
+spans is never re-linked, and running the scanner twice changes nothing. Where a plain
+click lands depends on the surface reading it: in the **webapp** it opens the card's
+detail panel (in-panel navigation inside the panel; the permalink route elsewhere), in
+the **desktop app** it opens the card in its own OS window (the shell registers a card
+opener at boot — detail windows already did this; popover bodies and comments now do
+too), and a permalink opened **from outside** (chat, MCP payload `url`s) opens in the
+browser, straight onto the card after sign-in.
+
+**Copy prompt context (BR#4015).** The task detail panel carries a **Copy prompt
+context** button, for every artefact type: one click puts a paste-ready context block on
+the clipboard — the permalink, type/status/owner/session/project, tags, blocked reason +
+resume conditions, last progress + gauges, PR provenance, description, and recent
+history (dispatch/heartbeat noise filtered) — ending with the honest line: the summary
+may be stale, check the card live (`get_artefact`) before acting. Like Claim locally it
+is a prompt producer only — it mutates nothing — and on clipboard failure the block
+opens in a fallback window instead of being lost.
+
 ## Blocked cards await something typed (BR#3578)
 
-A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time. The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty. Legacy prose-only cards are migrated: parseable → typed, awaiting-nothing → one active ask per card (never re-asked). **Answering a migration ask actions the card**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE/KEEP → a deliberate human-owned park (the answered ask is the record). MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
+A blocked card without something it is *awaiting* is structurally impossible. `transition {to: "blocked"}` requires a reason AND a **typed `await_event`** from a closed grammar — a machine event (`pr_merged`, `br_pr_merged`, `issue_closed`, `br_done`, `run_success`, `pr_checks_green`), an **open ask** (`ask` — the active human leg, in For Me), or a **timer** (`time`). Verdict-duty tasks (`role:review` / `role:unblock`) are refused at this door entirely — they can never park: their silence is declared with `log_progress` grace, and "cannot proceed" is itself the verdict (BR#4392). Free text (`unblock_condition`) is optional human-friendly annotation, derived from the structure when absent; text that parses cleanly to one atom is auto-typed at write time — and that includes the ask/time legs (BR#4062): the machine-proxy prose convention (`Machine proxy (typed await_event ask ask_id=BR#N): …`, `(typed await_event time until_ts=<epoch ms>)` — ISO timestamps normalize to epoch ms) parses to the same typed event the `await_event` param carries, and the gate's rejection names the param when nothing parses. Conjunction conditions parse whole (BR#3986): every `BR#N done` / `PR #N merged` / `GH#N closed` on a line yields its atom, and the proxy watch flips only when **every** atom evaluates TRUE — never on the first alone. Two park shapes are refused loud at the door: text that parses to **multiple atoms** (a park awaits one typed leg — name it in `await_event` and carry the rest as prose; multi-atom text never self-migrates, breach class `gate:multi-atom-condition`), and a **self-referential await** — a card naming its own done (`br_done`/`br_pr_merged` on itself) can never fire while blocked, the BR#136 deadlock (breach class `gate:self-referential-await`). The hub's proxy watch re-checks machine events every 15 min and spawns the unblock duty on the flip; an answered ask auto-resumes its subject; an elapsed timer fires the duty — prose-derived ask/time parks self-migrate to the typed event and evaluate first-class like any typed park. Legacy prose-only cards run the **disposition ladder** (`decideProseDisposition`, BR#4416 — the machine resolves what it can prove from the card's own state, and a human is asked only for genuine ambiguity, never one ask per card): a park whose machine state already holds the exit proof (a provenance/train-ledger merge row, an answered bound ask, a terminal root blocker) **auto-flips per its own promise** — no ask exists (the BR#4170 class: a PR sat MERGED while a human was asked to re-scope); a park with a recoverable typed leg (meta PRs, train stamps, an open bound ask, an open root blocker) is **re-typed in place** and re-enters the normal typed path; a park with no machine leg at all is **released to todo** for re-scope (the BR#3578 no-leg law — the churn guard's park is not a human decision), except runner/human-owned or human-qualified cards, where supersede-vs-continue is genuinely yours: those collect into **ONE class ask per day** with each card's facts and consequence-naming options. Every sweep pass emits `prose_blocked_count` (visible in `/stats` and the `prose_sweep` audit line); after the BR#4248 generator-kill has merged and deployed, a nonzero count is an incident — ONE deduped alarm at the sink naming the cards and the writer that minted them, never per-card asks. **Answering the class ask actions every card it names**: RELEASE/CANCEL → released to the pool, SUPERSEDE → dropped, RE-SCOPE → each card re-blocks with a typed await (the answered ask is the record). The SUPERSEDE drop is the one `blocked → superseded` edge (BR#3913): it exists exactly for the answered ask — the answer is the authorisation — and for the web; a bare agent session cannot take it (`transition {to: "superseded"}` from a session is refused by the `supersede-authority` law row), and a drop closes the card's open unblock/verify rounds. MCP `transition` takes `await_event` (validated fail-closed; the schema lives in `packages/contracts/src/mcp.ts`, the grammar in `packages/worker/src/kb/closure.ts`).
 
 ## Destination-green: the stop-the-line gate
 
@@ -479,11 +561,28 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
-`bridge train` is native to the CLI (decision BR#3880 — install is the unit:
-no Node, no script file). It runs on any machine that has `gh` (authed, with the
-`repo` scope), `git` and a clone of the target repo. The gate is one LAW with two
-fixture-locked implementations (`decideTrainGate`: TypeScript hub-side, Rust
-executor-side — mirrored test fixtures pin them in lockstep):
+Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
+original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
+share one dispatch core — spawns the train tick beside its dispatch loop and contends
+the lane lease exactly like the standalone command below. First-to-lease wins per lane;
+a holder that dies lapses its 5-minute lease and the next gateway reconciles from live
+GitHub state. **No hand-installed systemd unit, no separate binary to update**: the
+train updates ride the normal gateway deploy path, and every gateway on a stock build
+is an opportunistic executor. The identity law is enforced at the write boundary
+(BR#3181): the tick probes its gh identity class — merge / update-branch / close legs
+execute only under the worker-class credential (detached-cody); a personally-authed
+gateway reconciles and reports read-only, then stands down LOUDLY from write legs and
+releases the lease. Lease renewals carry proof-of-progress (last ledger action + age),
+and the hub consumes it (BR#4129): a holder whose action note freezes while cards queue
+is evicted — see the lease law below.
+
+`bridge train` remains the standalone form of the same module (decision BR#3880 —
+install is the unit: no Node, no script file). It runs on any machine that has `gh`
+(authed, with the `repo` scope), `git` and a clone of the target repo — or, with no
+`MERGE_TRAIN_WORKDIR`, it manages its own clone cache (`~/.bridge/train/<owner>/<repo>`)
+like the daemon leg does. The gate is one LAW with two fixture-locked implementations
+(`decideTrainGate`: TypeScript hub-side, Rust executor-side — mirrored test fixtures
+pin them in lockstep):
 
 ```bash
 cd /path/to/repo-clone                 # the repo the train drives (MERGE_TRAIN_WORKDIR)
@@ -493,16 +592,18 @@ export BRIDGE_TOKEN=<token from the Connect tab>
 ~/.local/bin/bridge train --once   # single tick (cron-friendly)
 ```
 
-Env: `MERGE_TRAIN_HOLDER` (lease label, default `merge-train@<host>`),
-`MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD` (`merge | squash |
-rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone, default cwd). Flags:
-`--lane <repo>@<base>` (drive one lane only), `--once`, `--interval <secs>`,
-`--method <m>`. `bridge doctor` gates the prerequisites (gh present + authed + `repo`
-scope, git — each failure names the fix); the executor re-probes the cheap ones
-every start. Keep it alive like the runner
-(systemd / launchd / `nohup`) or run `--once` from cron. It merges as whatever identity
-that `gh` is authed as — use the detached-cody credential per BR#3181, never a personal
-one.
+Env (standalone and daemon leg alike): `MERGE_TRAIN_HOLDER` (lease label, default
+`merge-train@<host>`), `MERGE_TRAIN_INTERVAL_SECS` (default 45), `MERGE_TRAIN_METHOD`
+(`merge | squash | rebase`, default `merge`), `MERGE_TRAIN_WORKDIR` (the clone; default
+cwd standalone / managed clone cache in the daemon), `MERGE_TRAIN_LANES` (comma-sep
+`repo@base` allowlist; default every lane the hub reports),
+`MERGE_TRAIN_WORKER_IDENTITIES` (worker-class gh logins, default `detached-cody`),
+`MERGE_TRAIN_ENABLED=0` (kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
+(drive one lane only), `--once`, `--interval <secs>`, `--method <m>`. `bridge doctor`
+gates the prerequisites (gh present + authed + `repo` scope, git — each failure names
+the fix); the executor re-probes the cheap ones every start. It merges as whatever
+identity that `gh` is authed as — the identity gate refuses the write legs unless that
+is the worker-class credential per BR#3181, never a personal one.
 
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
@@ -530,6 +631,17 @@ included) as "unmergeable — CONFLICTING".
   token cannot forge another machine's lease. A lapsed lease is cleared by the hub's
   credential-free train-watch sweep and the next gateway reconciles from live GitHub —
   a crashed executor cannot wedge the lane.
+- **Zombie eviction (BR#4129)**: every renewal carries proof-of-progress — the
+  holder's last ledger action and its age. On a **non-empty queue**, a renewal whose
+  action note is frozen past 10 minutes (`TRAIN_PROGRESS_STALE_MS`) is DENIED and the
+  lease expires immediately, so the next gateway's acquire wins within one tick; the
+  lane card shows `zombie holder evicted — <holder> made no progress for Xm on a
+  non-empty queue` until a fresh holder takes over, and the eviction is audited
+  (`train:lease_evicted`). A live holder never trips this: every legitimate tick on a
+  non-empty queue either acts (a CI-poll note refreshes the action every tick) or
+  releases the lease, and an **empty queue always renews** (idle holding is harmless).
+  Legacy executors that send `{}` renewals carry no proof — treated as UNKNOWN
+  (allowed + a loud audit line) while the deprecation window runs.
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, CI settling on the merge commit before the next head enters.
@@ -549,12 +661,43 @@ machine-clean carry chain:
   changed under the verdict → the verdict is INVALID at the new head: the executor
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
+  a fresh verify accepts the new head. A bounce and its re-queue are machine-managed
+  round trips: a train park — the train's own `merge_train` flag, or an agent re-queue
+  following the verify contract's canonical `merge-train: queued` note — never spawns
+  an unblock child. The train is the unblock path (BR#3516 §2); a spawned child would
+  only be superseded by the next bounce, with the re-park after it flood-guarded on
+  the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
+  BR#4135).
   a fresh verify accepts the new head.
+- **Bounced cards cannot starve (BR#4068)** — a bounced card is the most valuable work
+  on the board: verified once, one mechanical leg (rebase) plus one human review from
+  landed. So the bounce itself (a) **auto-boosts the card to priority 0** — the same
+  `boosted` stamp the human ▲ boost writes, read by the claim ranking, the train rank
+  and the Backlog; it decays only when the card re-enters the train (re-queue), never
+  auto-expiring mid-repair — and (b) **re-files the human review ask**: a push
+  dismisses the stale GitHub review (GitHub law), so the head move past the accepted
+  verdict silently lapses the human leg. The hub re-posts the standing review ask
+  (deduped per card+PR — a re-bounce refreshes the live ask instead of duplicating it;
+  a new head move after an answer posts a fresh leg) so **For Me always shows the live
+  leg** as "Review requested … one click from landed?". The ask is a visibility device,
+  not work: it never fences the card's done, and the landed (or superseded) close
+  retires it automatically.
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
   (signing-environment, external mirrors) file ONE class ask per episode, never one per
   PR.
+- **Every bounce names its KIND (BR#4066)** — and the kind picks the brief's copy and
+  the next owner it cites. **Coverage**: the head moved past the accepted verify
+  verdict (an authored push; no conflicts exist) → the brief says so and hands the card
+  to the verify pool to re-verify at the new head — no conflict language, no file list.
+  **Conflict**: trial-merge conflicts → the enumerated file list rides (a conflict
+  bounce without it is refused outright — the "(no file list supplied)" dead-end cannot
+  render), and the impl repair leg owns the resolve. **Gate**: a mechanical defect
+  (`mergeStateStatus`, red head checks) → the defect is quoted verbatim and impl fixes
+  the named defect. The executor trial-merges only a conflict-class bounce — a coverage
+  or gate bounce never runs a trial rebase, so a stale `mergeable=false` read (BR#3712
+  class) lands as a gate bounce naming the stale state, never as a file-less conflict.
 - **Multi-PR cards are legs, gated per leg (BR#3659)**: a card queued with several PRs
   is a list of legs (`meta.prs`; `meta.pr` stays the first leg for legacy readers).
   Coverage is judged per leg (`verdictCoversHeadLeg` — one leg's stamp/carry never
@@ -590,6 +733,123 @@ runs on the merge commit) · `train.lane` (ensure / configure) · `train.history
 main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI bound
 (unknown past 3× typical classifies red — the train never waits forever). Lane identity
 is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
+
+## The knowledge channel: typed faults, never HTML (BR#4212)
+
+Every arm of the knowledge channel — the DO fetch entry, the worker's
+`/api/kb/*`, `/api/kb-machine/*`, `/api/kb/admin/*` proxies, and `/mcp` — is a
+catch-all: a storage-layer fault answers **typed JSON** with
+`result_class: "infra_storage_fault"` (HTTP 503), never an uncaught throw, a CF
+HTML error page, or a mislabeled `401 unauthorized`. Before BR#4212 (incident
+BR#4117) one DO storage fault took the whole entry down uncaught: the runtime
+served HTML 500s where JSON acks belong, writes were silently lost, and
+`/mcp`'s catch relabeled infrastructure failures as "unknown or revoked token"
+— a storage storm read as an auth storm. The classification law since:
+**infra faults retry (503), auth rejections 401, and the two never masquerade
+as each other.** Only the three genuine identify rejections (`missing bearer`,
+`unknown auth token`, `auth token revoked`) produce a 401.
+
+The watchdog's view is machine-checkable via `GET /stats` (or
+`POST stats`): the response carries a `channel` block — per-route `ok`/`err`
+counters with `write_ok_rate` over the write ops, `entry_faults` (which
+storage stage faulted, how often, how recently), `ws_send_fail` (failed
+fanout sends, the in-DO proxy for clientDisconnected), and `last_flush` (the
+alarm tick's persisted snapshot — counters reset at isolate boot,
+`window_started_ts` says when). "Channel down" is thus a readable predicate
+(error rate + fault recency), not inferred from silence — phantom stalls are
+distinguishable from real ones. The DO alarm failure policy: degrade + retry
+— a faulted re-arm never throws out of `alarm()` (a throwing alarm loses its
+schedule entirely); the next fetch entry re-arms via the null-or-stale guard,
+and the sweep rides the 60s alarm retry chain.
+
+## The hub self-canary: daily synthetic lifecycle (BR#4177)
+
+The hub is coordination infrastructure — it gets the same treatment the product gets:
+its load-bearing paths get a **synthetic end-to-end canary**, run daily, red alarm to
+the alarm sink. `bridge canary` is a single cron-friendly lifecycle pass against the
+**deployed hub** (same MCP surface as every agent, same `BRIDGE_URL`/`BRIDGE_TOKEN`):
+
+```bash
+export BRIDGE_URL=https://bridge.<your-subdomain>.workers.dev
+export BRIDGE_TOKEN=<token from the Connect tab>
+~/.local/bin/bridge canary          # one full pass (typ. 15–25 min; worst case ~65)
+# cron/launchd daily — exit 0 = green, 1 = red (filed alarm), 2 = config fatal
+```
+
+Four legs, each named for a failure class actually observed:
+
+1. **Duty spawn → dispatch → delivery** — a qualified synthetic task must be claimed
+   by a runner within 10 minutes and deliver its marker to the board within 10 more.
+   Catches the "result delivered late/lost" class (two observed in a single week).
+2. **Flip-on-event** — a synthetic card parks on a typed `{event:"time"}` await; the
+   unblock proxy sweep must flip it within two sweep cycles, no human action. Catches
+   the stale-ledger class (BR#3620 family: resolutions hidden for a day). The
+   `pr_merged`/`run_success` flavors of the same mechanism fire daily on the real
+   train; the canary uses the timer flavor because the hub holds no GitHub
+   credentials by design (BR#3516) — non-lane GitHub facts are never fed to it.
+3. **Queue visibility** — a fixture carrying the BR#4079 canonical stamp
+   (`merge_train.pr>0` + `merge-train:` reason, `blocked`) must appear in the
+   **derived** train queue, then vanish the moment it retires. Catches the
+   clobbered-stamp class (BR#3912). The fixture cites an obviously-fake PR
+   (`999901`); if a train tick ever lands on it, the executor's `gh pr view` fails
+   harmlessly before any gate — one lost tick, zero board writes.
+4. **Reconcile accounting** — BR#4170's report must run green (every PR accounted).
+   Armed but skipping until that lane lands its report surface; a missing dependency
+   is not a red.
+
+**Red path**: one deduped ask per failing leg class, bound to the alarm sink
+(`train_alarm_sink_id`, default BR#3124) — the same child-ask pattern the train's
+stop-the-line uses, so a stuck class pages once, not daily. **Green path**: a
+`[hub-canary]` progress artefact stamps every run; **48 hours of silence on that feed
+is the canary's own liveness alarm** (a canary that stops running must be observable
+too).
+
+Fixtures self-clean by law: tagged `[canary]`, retired to `blocked` with a 30-day
+typed timer (inert: never fires, never claimable, never queued). Task→superseded is
+not a client-legal edge (core.ts LIFECYCLES), so retirement — not deletion — keeps the
+board free of fixture accumulation without loosening the state machine. At most two
+inert blocked fixtures accumulate per run.
+## The board↔GitHub reconcile loop (BR#4170)
+
+The merge train accounts for PRs it *knows about*. The reconcile loop closes the gap:
+**every open reviewed PR must, at all times, be one of exactly three things on the board —
+bound to a card, ignored with a recorded reason, or in-flight on a spawned duty.** Anything
+else past the actionable age is an ALARM to the sink, never a silence (the #2466 class: a
+session died post-open and an APPROVED+MERGEABLE PR sat invisible for 34 hours, outside
+every stamp-gated mechanism).
+
+Division of labour is the credential split (BR#3499/BR#3507): the gateway daemon runs the
+read-only `gh pr list` leg and feeds raw observations via `reconcile_report`; the **hub**
+runs the join (`reconcile.ts`, pure), decides, and performs every board mutation. The
+daemon never writes the board; the hub never touches GitHub. A report per repo per cycle:
+
+- **bound** — an open card rides the PR (`meta.pr` / a `meta.prs` leg); queued cards are
+  the train's business and are never re-spawned at.
+- **ignored-with-reason** — `reconcile_ignore {repo, pr, reason}` rules a PR off the board
+  on the record; an ignore without a reason is refused (an ignore IS a reason).
+- **in-flight / spawn** — an orphan APPROVED+MERGEABLE PR past `verify_age_h` gets a
+  binding card (meta.pr projection, session-less) plus the **standard** 5c verify duty as
+  its child — the same template the normal in_review spawn uses, so ACCEPT queues the card
+  exactly as BR#4079 prescribes. Reconcile creates tracking cards and standard duties
+  only; it never queues, stamps, or merges.
+- **destination-blocked** (BLOCKED/BEHIND) binds WITHOUT a verify duty — a verify would
+  bounce on mergeability by construction; the duty comes when a later cycle sees CLEAN.
+- **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
+  repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
+  silently respawning over the corpse.
+
+**Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
+open list starts a missing clock; two consecutive misses with a provenance row close the
+zombie binding via the machine proxy (BR#3287 — the train stamped the merge); with NO
+provenance it spawns a ruling duty instead — someone rules, never silence.
+
+Knobs: `reconcile.enabled` / `RECONCILE_ENABLED` (default on),
+`reconcile.interval_secs` / `RECONCILE_INTERVAL_SECS` (default 1800, clamped 300..21600),
+`reconcile.repos` (CSV, default both bridge repos), `reconcile.verify_age_h` (2),
+`reconcile.disposition_age_h` (24), `reconcile_alarm_sink_id` (default BR#3124).
+`reconcile_status` is the operator view: settings, the accounting lines (the canary —
+`N open reviewed / N bound / N ignored-with-reason / N in-flight — N accounted`, ALARM
+tail on failure), the duty ledger, ignores, and the missing clock.
 
 ## PR provenance: who touched main, from bridge
 
@@ -670,15 +930,17 @@ landed / stopped / bounced flows, the stop-the-line ask).
 
 ## 5 · Use it
 
-- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject), **Knowledge** (search), **Discussions** (question threads)
+- Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject — each shows the agent consensus tally and the reasons), **Knowledge** (search), **Discussions** (question threads)
+- **Every card has a stable URL (BR#3990)**: `/card/BR-3990` deep-links straight to that card's detail panel, and opening or closing a card in the Board keeps the URL in sync — any card view is a shareable link (browser-back steps back out). The dash form is canonical (`BR#3990` → `/card/BR-3990`); the route also accepts `BR%233990` and the bare number. The same URLs ride the MCP payloads: artefact rows returned by `orient`, `search_knowledge`, `get_artefact` (+ `see_also`), `related_artefacts` and `asks` carry `url` (ask rows also `artefact_url` for their bound card), built from the hub origin — an agent citing a card can hand you a link that opens it.
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
 - **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
 - **Progress gauges persist until updated**: a `log_progress` post that omits gauge fields (`completion_pct`, `confidence_pct`, `risk_pct`, `context_pct`) preserves the previous gauges on the card — gauge-less posts (heartbeats, relay lines, auto-notes) never clobber them, and the freshest gauge-bearing call wins.
-- **The watchdog keeps states moving**: silent agents are released back to the pool, an `in_review` park past `review_stale_minutes` (default 360) with no verifier running bounces and releases too, and gate-rejection blocks are reaped after 24h. Unblock tasks close directly with their verdict — they are never reviewed. A silent task whose trail proves landed side effects (GitHub PR/commit receipts, or the runner's own `completed_result_lost` marker) is released as `completed_result_lost`, not abandoned: the run happened and the report was lost between worker and hub. The class never penalizes the agent's behaviour score — the delivery channel is flagged instead (BR#3352).
+- **The watchdog keeps states moving**: silent agents are released back to the pool, an `in_review` park past `review_stale_minutes` (default 360) with no verifier running bounces and releases too, and gate-rejection blocks are reaped after 24h. Unblock tasks close directly with their verdict — they are never reviewed. A silent task whose trail proves landed side effects (GitHub PR/commit receipts, or the runner's own `completed_result_lost` marker) is released as `completed_result_lost`, not abandoned: the run happened and the report was lost between worker and hub. The class never penalizes the agent's behaviour score — the delivery channel is flagged instead (BR#3352). **Silence never destroys a machine wait** (BR#4067): a card whose meta carries a live wait — a merge-train queue slot (`queued` / `awaiting-ci` / `bounced` on a live PR leg), a typed `await_event`, or a bound ask — is **parked `blocked`, never released to todo**, by every release path (stall sweep, review-stall sweep, lapsed subprocess, reaper reassign, and the machine-actor backstop in the transition gate). The park names the silence in its reason and preserves the wait meta intact — the typed proxy (e.g. `pr_merged`) still owns the exit, so the proxy watch flips the card when the wait resolves. A hold parks with result class `proxy_wait_hold`, which is exempt from abandonment scoring — holding a wait is neither a lost run nor a dump. A dispatched run also gets grace: the claiming session's freshest hub ping counts as a liveness signal, so a run that is plausibly still in flight is not swept while quiet. Rework-loop escalation is unchanged: a held card's attempt counter keeps counting, so a card that cycles still reaches the human-ask park at 5 attempts.
 - **Blocker rollup**: when ≥3 blocked cards share one machine-detectable root cause, the watchdog sweep auto-creates ONE boosted `ROOT BLOCKER` task — *investigate → fix → one approval* — and every queued card points at it (`meta.root_blocker` + a `child_of` link, so the board shows the tree and the boost cascades to all of them). Today's machine-detectable roots: a `github.com/.../pull/N` URL in the card's unblock condition (the one unmerged PR everything queues behind) and red/broken/failing-`main` language (the never-merge-onto-red-main class). Idempotent: cards already pointing at an open root are left alone, re-runs create no duplicates. A root closes only by an agent or human with receipts that the root cause is gone — the sweep never auto-closes it, and a later cluster of the same root opens a NEW root rather than reusing a done one.
 - Anything needing a human lands in **For Me**
 - **For Me never jumps (BR#3457)**: acting on a proposed decision (accept, or reject — which routes to supersede-with-reason, the decision lifecycle's only exit for a verdict that doesn't hold) pins the card to the bottom of its section with an `actioning…` chip and dead buttons; the card leaves the list only when a refetch confirms the server flipped it, and an error returns it to its slot with the reason inline. Server-side, one actionable verdict per target, ever: a newer verify-verdict for a target supersedes still-proposed older rounds at create, and the human's accept/reject sweeps any leftover proposed sibling (legacy stacked rounds included) — accepting a stacked group removes exactly one verdict and the card can never regrow.
-- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738).
+- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738), and the verdict-done receipts gate classifies as `gate:verdict-receipts` — a rejection carrying the audited ` [rule: <name>]` tag classifies by its rule name FIRST (the gate's own message embeds "PR link", which the older message-stem ladder mis-folded as `gate:review-needs-pr`, leaving the receipts class unreachable for its own gate; specimens BR#3735, BR#4291), with the stems kept as the fallback for suffix-less legacy reasons (BR#4295). The receipts gate's rejection and every unblock-duty spawn template now teach the accepted note shape — any URL, or one of the verdict tokens (`PR` / `merged` / `passed` / `unblocked` / `still blocked`) — so a duty holder closing with honest findings prose passes on the first try instead of burning rejections (each rejection is a breach event) reverse-engineering the matcher from source (BR#4295). And the bootstrap teaches every dispatched session the retry law that keeps the loops from forming at all (rule 4c + a mirrored PROTOCOL CARD clause, BR#4474): a 5xx / `infra_storage_fault` is retryable — same transition, backoff, heartbeat — while a SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child", "malformed") is TERMINAL for that attempt — stop, read what it names, resolve the named precondition or take a lifecycle-legal edge; retrying a gate-rejected transition cannot succeed and every retry is an audited breach event (the 2026-10-28/29 storage-fault era uncorked four `gate:open-children` cards in 18 minutes from exactly these loops — BR#4403, BR#4473).
+- **Decisions collect consensus (BR#903)**: proposing a decision auto-spawns a `Feedback:` round (a question task) — agents contribute agree/disagree with reasons via `log_progress`; orient surfaces the open rounds (`decisions_awaiting_consensus`) and For Me shows the tally next to your accept/reject buttons. The round informs you; it never gates you.
 
 
 ## Local development

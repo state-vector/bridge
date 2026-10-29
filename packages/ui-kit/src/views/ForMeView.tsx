@@ -19,7 +19,7 @@ import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
  *  Server-side, one actionable verdict per target: the group cannot regrow.
  */
 
-import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
+import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions, ConsensusLine } from "./decide";
 import {
   beginHold,
   groupBusy,
@@ -67,6 +67,7 @@ function DecisionRow({ d, onDone, held, onAct, onFail }: {
             : d.title;
         })()}
       </h3>
+      {d.consensus && <ConsensusLine c={d.consensus} />}
       <ActionRow>
         {(() => {
           const f = decisionFrame(d);
@@ -117,6 +118,7 @@ function VerdictGroupRow({ latest, prior, onDone, held, onAct, onFail }: {
       <h3 className="ask-question" onClick={() => void 0}>
         {(verdict === "bounce" ? `Bounce ${target}` : `Accept verification of ${target}`).slice(0, 110)}
       </h3>
+      {latest.consensus && <ConsensusLine c={latest.consensus} />}
       {prior.length > 0 && (
         <p className="why-line" style={{ margin: "2px 0" }}>
           <Btn size="sm" style={{ fontSize: "10.5px", padding: "1px 8px" }} onClick={() => setShowPrior(!showPrior)}>
@@ -147,6 +149,7 @@ function VerdictActions({ d, onDone, held, onAct, onFail }: {
   const verdict = String((d.meta as any)?.verdict ?? "").toLowerCase() === "bounce";
   return (
     <>
+      {d.consensus && <ConsensusLine c={d.consensus} />}
       <ActionRow>
         <Btn variant="accept" disabled={busyNow} onClick={() => void act("accepted")}>{verdict ? "Bounce it" : "Accept"}</Btn>
         <Btn variant="reject" disabled={busyNow} onClick={() => void act("rejected")}>Reject</Btn>

@@ -190,6 +190,102 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
   });
 });
 
+// ---------- (a2) BR#3986: multi-atom conjunctions + the self-await fence ----------
+
+describe("BR#3986 — multi-atom conjunctions + self-await migration fence (real DO)", () => {
+  const mkLeg = async (title: string, session: string, done: boolean) => {
+    // analysis-role leg: done skips the review gate for analysis children and
+    // never passes through in_review (in_review auto-spawns a verify child,
+    // which would trip done-open-children) — the drill flips board state only
+    const r = await kbJson("/create", { type: "task", title, qualified: true, roles: ["analysis"], session });
+    const id = String(r.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: session, session });
+    if (done) {
+      const d = await kbJson("/transition", { id, to: "done", actor: session, session, note: "done — drill leg verified first-hand" });
+      expect(d.status, JSON.stringify(d.body)).toBe(200);
+    }
+    return id;
+  };
+
+  it("a legacy conjunction park evaluates EVERY atom — the flip waits for BOTH legs; nothing self-migrates", async () => {
+    const legA = await mkLeg("DRILL 3986 leg A", "drill-3986-a", true);
+    const legB = await mkLeg("DRILL 3986 leg B", "drill-3986-b", false);
+    // the parked card parks LEGALLY on a placeholder atom (the conjunction
+    // text is refused at the door post-fix), the park-time round is closed,
+    // then the blocked record's text is swapped to the legacy conjunction —
+    // exactly the pre-fix card state the BR#3557 park is in today
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 3986 conjunction drill", qualified: true, session: "drill-3986-exec" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-3986-exec", session: "drill-3986-exec" });
+    const blk = await block(pid, "drill-3986-exec", "BR#999995 done", "parked on the conjunction (placeholder leg)");
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const round = (await unblockDuties()).find((x: any) => x.title === "Unblock: IMPL: 3986 conjunction drill");
+    expect(round, "the park-time round must spawn").toBeTruthy();
+    await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-3986-u", session: "drill-3986-u" });
+    const rd = await kbJson("/transition", {
+      id: round.id, to: "done", actor: "drill-3986-u",
+      note: "checked the condition first-hand — still blocked at check time (findings); placeholder leg does not exist",
+    });
+    expect(rd.status, JSON.stringify(rd.body)).toBe(200);
+    const row0 = await taskById(pid);
+    expect(row0.status).toBe("blocked");
+    const cond = `${legA} done AND ${legB} done`;
+    const up = await kbJson("/update", {
+      id: pid, session: "drill-3986-exec",
+      // legacy shape: pre-BR#3578 cards carry NO typed await — clear the
+      // placeholder's self-migrated event so the sweep reads the text
+      meta: { ...row0.meta, blocked: { ...row0.meta.blocked, unblock_condition: cond, await_event: undefined } },
+    });
+    expect(up.status, JSON.stringify(up.body)).toBe(200);
+
+    // sweep 1: only legA is done — the conjunction must NOT flip (pre-fix it
+    // gated on the first atom alone and would have flipped HERE). Timestamps
+    // ride past the earlier suites' sweeps (the global pacer drops calls
+    // older than the last sweep).
+    const s1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 200 * 60_000 });
+    expect(s1.body.error).toBeUndefined();
+    let now = await taskById(pid);
+    expect(now.meta?.blocked?.await_event).toBeUndefined(); // N atoms never self-migrate
+    expect(now.meta?.proxy_check?.verdict).toBe("false");
+    expect(now.meta?.proxy_check?.atoms).toHaveLength(2);
+    expect(now.meta?.proxy_check?.spawned).toBeUndefined();
+
+    // leg B completes → the conjunction flips → the duty spawns
+    await kbJson("/transition", { id: legB, to: "in_progress", actor: "drill-3986-b", session: "drill-3986-b" });
+    const d = await kbJson("/transition", { id: legB, to: "done", actor: "drill-3986-b", session: "drill-3986-b", note: "done — drill leg verified first-hand" });
+    expect(d.status, JSON.stringify(d.body)).toBe(200);
+    const s2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 260 * 60_000 });
+    expect(s2.body.error).toBeUndefined();
+    now = await taskById(pid);
+    expect(now.meta?.proxy_check?.verdict).toBe("true");
+    const duty = (await unblockDuties()).find((x: any) => x.title === "Unblock: IMPL: 3986 conjunction drill");
+    expect(duty, "the conjunction-flip duty must spawn once both atoms hold").toBeTruthy();
+    expect(duty.status).toBe("todo");
+  });
+
+  it("a legacy self-referential park never self-migrates the deadlock await (the BR#136 class)", async () => {
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 3986 self-await drill", qualified: true, session: "drill-3986-self" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-3986-self", session: "drill-3986-self" });
+    // bound-ask park (the ask is the human leg) whose free text names the
+    // card's own done — the BR#136 park shape. The writer must NOT stamp the
+    // derived self-await.
+    const blk = await kbJson("/transition", {
+      id: pid, to: "blocked", actor: "drill-3986-self", session: "drill-3986-self",
+      note: "parked on a human ruling", awaiting_ask_id: "ASK-drill-3986",
+      unblock_condition: `transitions ${pid} done`,
+    });
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 320 * 60_000 });
+    expect(s.body.error).toBeUndefined();
+    const now = await taskById(pid);
+    // pre-fix, the single self-naming atom self-migrated into
+    // await_event {br_done, <the card>} — a park that can never fire
+    expect(now.meta?.blocked?.await_event).toBeUndefined();
+    expect(now.meta?.proxy_check?.verdict).toBe("false"); // still blocked on itself
+  });
+});
+
 // ---------- (b) terminal close-leg ownership ----------
 
 describe("done-close-legs auto-derivation (real DO)", () => {
@@ -320,5 +416,154 @@ describe("askInbox addressee routing (real DO)", () => {
     expect(toSession.status).toBe(200);
     const mine2 = await kbJson("/ask.inbox", { label: "drill-dd-agent" });
     expect((mine2.body?.inbox ?? []).map((x: any) => x.id)).toContain(String(toSession.body.id));
+  });
+});
+
+// ---------- (BR#4062) ask/time prose parks type at the door, sweep first-class ----------
+
+describe("BR#4062 — ask/time prose parks type at the door and sweep first-class (real DO)", () => {
+  it("a timer prose park (the takeover repro) types at the door and the sweep WAITS, honest", async () => {
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 time-prose drill", qualified: true, session: "drill-4062-time" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-time", session: "drill-4062-time" });
+    // THE regression: this exact park shape REJECTED from MCP on 2026-10-28
+    const blk = await block(pid, "drill-4062-time",
+      "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer → then a FRESH session closes it done.",
+      "parked on a typed timer (BR#4062 repro)");
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const parked = await taskById(pid);
+    expect(parked.status).toBe("blocked");
+    // the typed event self-stamped at the door (not just text)
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: 1793673600000 });
+
+    const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 400 * 60_000 });
+    expect(s.body.error).toBeUndefined();
+    const after = await taskById(pid);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting"); // first-class timer leg — not "unparseable"
+    expect(String(after.meta?.proxy_check?.detail)).toContain("timer until");
+  });
+
+  it("an ask prose park types to {event:ask}; the sweep waits while the ask is OPEN", async () => {
+    const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 ask-prose drill", qualified: true, session: "drill-4062-ask" });
+    const pid = String(r.body.id);
+    await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-ask", session: "drill-4062-ask" });
+    const ask = await kbJson("/ask.create", {
+      to: "ray", question: "4062 drill ruling?", reason: "drill",
+      options: ["GO", "NO-GO"], artefact_id: null,
+    });
+    expect(ask.status).toBe(200);
+    const askId = String(ask.body.id);
+    const blk = await block(pid, "drill-4062-ask",
+      `Machine proxy (typed await_event ask ask_id=${askId}): the ruling gates re-entry.`,
+      "parked on the ruling (BR#4062 repro)");
+    expect(blk.status, JSON.stringify(blk.body)).toBe(200);
+    const parked = await taskById(pid);
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "ask", ask_id: askId });
+
+    const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 460 * 60_000 });
+    expect(s.body.error).toBeUndefined();
+    const after = await taskById(pid);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting");
+    expect(String(after.meta?.proxy_check?.detail)).toContain(`awaiting ask ${askId}`);
+  });
+});
+
+// ---------- (f) BR#4282 — the silence-release loop ----------
+
+describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)", () => {
+  it("a silent in_progress card whose pr leg ALREADY merged is never re-parked blocked: resume consumed the old round, the sweep spawns the OWNED done-close duty, and the duty's close order lands the parent done", async () => {
+    // 1. the specimen: an impl card parked on a typed pr_merged proxy. The
+    // park-time machine round spawns (transition law, unchanged) and stamps
+    // its exit condition.
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4282 drill", qualified: true, session: "drill-exec-br4282" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4282", session: "drill-exec-br4282" });
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br4282", session: "drill-exec-br4282",
+      note: "parked on the merge gate",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2400 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2400 },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    const parked = await taskById(id);
+    expect(String(parked.meta?.last_unblock_spawn?.exit)).toContain("pull/2400 merged");
+    const parkRound = (await unblockDuties()).find((x: any) =>
+      x.title.startsWith("Unblock: IMPL: br4282 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(parkRound, "the park-time unblock round must exist").toBeTruthy();
+
+    // 2. the duty verifies the exit from the BOARD — the train merged the leg —
+    // and resumes the parent (blocked → in_progress). PR 2400 is open in the
+    // canned GitHub on purpose: the hub must NOT be able to lean on GitHub
+    // state here (BR#3516) — only board receipts count.
+    const resumed = await kbJson("/transition", {
+      id, to: "in_progress", actor: "drill-exec-u4282", session: "drill-exec-u4282",
+      note: "exit condition verified on the train — leg merged, resuming",
+    });
+    expect(resumed.status, `resume failed: ${JSON.stringify(resumed.body)}`).toBe(200);
+
+    // the resume CONSUMED the round: the stamp cleared, the park round closed.
+    // This is the anti-flood half of the fix: post-resume silence must issue a
+    // FRESH (owned) round, not flood-guard against a stamp whose round is gone.
+    const live = await taskById(id);
+    expect(live.status).toBe("in_progress");
+    expect(live.meta?.last_unblock_spawn).toBeUndefined();
+
+    // 3. the train's own receipt, exactly what train:merged stamps (do.ts):
+    // awaiting-ci + merge sha. The hub holds no VCS credentials — this is the
+    // only merge proof it can read.
+    const sha = "4282feedface4282feedface4282feedface4282";
+    const withReceipt = await kbJson("/update", {
+      id, actor: "drill-exec-br4282",
+      meta: {
+        ...(live.meta ?? {}),
+        merge_train: { state: "awaiting-ci", pr: 2400, repo: "state-vector/superpositional", merge_sha: sha, merged_at: t0 + 60_000 },
+      },
+    });
+    expect(withReceipt.status, `receipt stamp failed: ${JSON.stringify(withReceipt.body)}`).toBe(200);
+
+    // 4. the card goes silent past the stale window. The OLD code re-parked it
+    // blocked on the ALREADY-SATISFIED proxy (re-deriving the await from
+    // trainProxyEvent, never evaluating the atom) and re-issued an identical
+    // round → flood-skip → threshold-1 spawn-while-open breach.
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 11 * 60_000 });
+    expect(sweep.status, `stall sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+
+    // NEVER blocked: the satisfied atom routed to the exit instead
+    const after = await taskById(id);
+    expect(after.status, "the satisfied card must never re-park blocked").toBe("in_progress");
+    expect(after.meta?.blocked).toBeUndefined();
+    expect(after.meta?.proxy_check?.verdict).toBe("true");
+    expect(after.meta?.proxy_check?.spawn_skipped).toBeUndefined();
+
+    // the OWNED done-close round: a fresh Unblock duty carrying the machine
+    // proxy receipt and the BR#4282 close-order contract (parent in_progress →
+    // it owes a done-close, NOT a resume)
+    const rounds = (await unblockDuties()).filter((x: any) =>
+      x.title.startsWith("Unblock: IMPL: br4282 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(rounds.length, `expected exactly 1 open round, got ${JSON.stringify(rounds.map((r: any) => [r.id, r.status]))}`).toBe(1);
+    const round = rounds[0];
+    expect(round.roles).toContain("unblock");
+    expect(String(round.body_md)).toContain("MACHINE PROXY");
+    expect(String(round.body_md)).toContain(sha.slice(0, 9));
+    expect(String(round.body_md)).toContain("BR#4282");
+    expect(String(round.body_md)).toContain("close YOURSELF done");
+
+    // 5. the contract executes: the duty closes ITSELF done first (receipts
+    // cited — the done-open-children gate needs the child closed), then the
+    // parent's done lands with the same receipts. Owned, terminal, no breach.
+    await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-exec-closer4282", session: "drill-exec-closer4282" });
+    const roundDone = await kbJson("/transition", {
+      id: round.id, to: "done", actor: "drill-exec-closer4282",
+      note: "verified on the board receipts: PR 2400 merged as 4282feedf (train awaiting-ci stamp, BR#4282) — closing the parent done",
+    });
+    expect(roundDone.status, `duty done failed: ${JSON.stringify(roundDone.body)}`).toBe(200);
+    const parentDone = await kbJson("/transition", {
+      id, to: "done", actor: "drill-exec-closer4282",
+      note: "closed via the unblock duty: PR https://github.com/state-vector/superpositional/pull/2400 merged as 4282feedf (board merge receipt)",
+    });
+    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
+    expect((await taskById(id)).status).toBe("done");
   });
 });

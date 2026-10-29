@@ -290,11 +290,52 @@ pub fn normalize_gh_merge_state(v: &Value) -> Option<String> {
 
 // ---------- the gate (core.ts MergeAction 896, decideMergeAction 907, decideTrainGate 1486) ----------
 
+/// WHY a bounce happened (core.ts TrainBounceKind, BR#4066): the bounce brief
+/// the hub renders — and the next owner it names — follows the kind. A brief
+/// that renders every bounce as "conflicts with its base" lies on a coverage
+/// bounce (no conflicts exist) and buries a gate defect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BounceKind {
+    /// head moved past the accepted verify verdict (authored push) — no
+    /// conflicts exist; the verify pool re-verifies at the new head
+    Coverage,
+    /// trial-merge conflicts — the enumerated file list MUST ride the event
+    Conflict,
+    /// mechanical gate defect (mergeStateStatus / head checks / a stale
+    /// mergeable read) — the defect text names the truth
+    Gate,
+}
+
+impl BounceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BounceKind::Coverage => "coverage",
+            BounceKind::Conflict => "conflict",
+            BounceKind::Gate => "gate",
+        }
+    }
+}
+
+/// The executor's train_event bounce_kind (train.rs), refined from the gate's
+/// classification by the trial-merge ground truth (BR#4066): a CONFLICT-class
+/// bounce whose trial merge came back CLEAN was a stale GitHub mergeable read
+/// (BR#3712 class) — it lands as a gate bounce naming the stale state, never
+/// as a file-less conflict (the hub fail-louds on those). Coverage and gate
+/// pass through untouched; neither runs a trial merge.
+pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize) -> &'static str {
+    match gate {
+        BounceKind::Coverage => "coverage",
+        BounceKind::Gate => "gate",
+        BounceKind::Conflict if !trial_clean && files_len > 0 => "conflict",
+        BounceKind::Conflict => "gate",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MergeAction {
     Merge { receipt: String },
     CloseSuperseded { reason: String },
-    Bounce { defect: String },
+    Bounce { defect: String, bounce_kind: BounceKind },
     Note { reason: String },
     Skip { reason: String },
     HumanLeg { reason: String },
@@ -341,12 +382,14 @@ pub fn decide_merge_action(
         }
         return MergeAction::Bounce {
             defect: format!("PR #{pr_number} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue"),
+            bounce_kind: BounceKind::Conflict,
         };
     }
     if let Some(state) = merge_state_status.filter(|s| !s.is_empty()) {
         if state != "clean" && state != "unstable" {
             return MergeAction::Bounce {
                 defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter"),
+                bounce_kind: BounceKind::Gate,
             };
         }
     }
@@ -369,7 +412,7 @@ pub fn decide_merge_action(
     if head.verdict == MainVerdict::Red {
         let names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
         return if card_status == Some("in_review") {
-            MergeAction::Bounce { defect: format!("PR #{pr_number} head check RED: {names}. Fix or bounce to impl") }
+            MergeAction::Bounce { defect: format!("PR #{pr_number} head check RED: {names}. Fix or bounce to impl"), bounce_kind: BounceKind::Gate }
         } else {
             MergeAction::Note {
                 reason: format!("PR #{pr_number} head check RED: {names} — card not in_review, no bounce; the linked session owns it"),
@@ -385,6 +428,7 @@ pub fn decide_merge_action(
     if card_status == Some("in_review") && verify_accepted_any && !verify_accepted_on_head {
         return MergeAction::Bounce {
             defect: format!("PR #{pr_number} head {short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)"),
+            bounce_kind: BounceKind::Coverage,
         };
     }
     if !verify_accepted_on_head {
@@ -426,6 +470,7 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 L = leg_number,
                 s = stamped
             ),
+            bounce_kind: BounceKind::Coverage,
         };
     }
     let gate = decide_merge_action(
@@ -575,15 +620,35 @@ mod tests {
             leg_number: Some(1),
         });
         match gate {
-            MergeAction::Bounce { defect } => assert_eq!(
-                defect,
-                format!(
-                    "PR #7 live head {h} is not covered by the accepted verdict (leg 1 stamped 123456789, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head",
-                    h = &head[..9]
-                )
-            ),
+            MergeAction::Bounce { defect, bounce_kind } => {
+                assert_eq!(
+                    defect,
+                    format!(
+                        "PR #7 live head {h} is not covered by the accepted verdict (leg 1 stamped 123456789, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head",
+                        h = &head[..9]
+                    )
+                );
+                // the bounce NAMES its kind (BR#4066): a coverage bounce — the
+                // hub's brief must not render conflict language for it
+                assert_eq!(bounce_kind, BounceKind::Coverage);
+            }
             other => panic!("expected bounce, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bounce_event_kind_refines_conflict_by_trial_merge_truth() {
+        use BounceKind::{Conflict, Coverage, Gate};
+        // gate said conflict + dirty trial merge with files → a real conflict
+        assert_eq!(bounce_event_kind(&Conflict, false, 3), "conflict");
+        // gate said conflict but the trial merge is CLEAN → a stale GitHub
+        // mergeable read (BR#3712 class) — lands as gate, never a file-less
+        // conflict (the hub fail-louds on those)
+        assert_eq!(bounce_event_kind(&Conflict, true, 0), "gate");
+        assert_eq!(bounce_event_kind(&Conflict, false, 0), "gate");
+        // coverage and gate pass through untouched — neither trial-merges
+        assert_eq!(bounce_event_kind(&Coverage, true, 0), "coverage");
+        assert_eq!(bounce_event_kind(&Gate, true, 0), "gate");
     }
 
     #[test]

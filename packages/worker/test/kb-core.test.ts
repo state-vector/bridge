@@ -137,6 +137,38 @@ describe("limits", () => {
   });
 });
 
+import { tallyConsensus } from "../src/kb/core.ts";
+
+describe("decision consensus tally (BR#903)", () => {
+  it("counts agree / disagree / neutral, contributors distinct", () => {
+    const t = tallyConsensus([
+      { actor: "a1", note: "agree — the round pattern mirrors Verify children" },
+      { actor: "a2", note: "disagree — asks already cover this; reasons: dup channel" },
+      { actor: "a1", note: "agree" },
+      { actor: "a3", note: "what happens to the round when the decision is superseded?" },
+    ]);
+    expect(t.agree).toBe(2);
+    expect(t.disagree).toBe(1);
+    expect(t.other).toBe(1);
+    expect(t.contributors).toEqual(["a1", "a2", "a3"]);
+  });
+
+  it("dissent always surfaces: disagree beats agree, negated agree counts as disagree", () => {
+    expect(tallyConsensus([{ note: "disagree with the gate" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "I don't agree with the marker approach" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "cannot agree with this as written" }]).disagree).toBe(1);
+    expect(tallyConsensus([{ note: "I don't agree, I disagree" }]).disagree).toBe(1);
+  });
+
+  it("affirmatives in the wild count as agree; empty/null entries are safe", () => {
+    expect(tallyConsensus([{ note: "I concur with the proposal" }]).agree).toBe(1);
+    expect(tallyConsensus([{ note: "endorse — ship it" }]).agree).toBe(1);
+    expect(tallyConsensus([])).toEqual({ agree: 0, disagree: 0, other: 0, contributors: [] });
+    expect(tallyConsensus(null)).toEqual({ agree: 0, disagree: 0, other: 0, contributors: [] });
+    expect(tallyConsensus([{ note: "" }, { note: "   " }]).other).toBe(0);
+  });
+});
+
 import { cosine, hybridMerge } from "../src/kb/core.ts";
 
 describe("semantic helpers", () => {
@@ -404,5 +436,108 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
   it("pure user tags: unchanged, not a migration", () => {
     const out = splitSystemTags("task", ["gtm", "deploy-train"], { a: 1 }, 1);
     expect(out).toEqual({ type: "task", tags: ["gtm", "deploy-train"], roles: [], meta: { a: 1 }, changed: false });
+  });
+});
+
+import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
+
+// BR#4067 — the typed-proxy hold predicate: every watchdog release path
+// consults this one function. The PR #257/BR#4015 class: a card carrying a
+// live machine wait (train queue slot, typed await, bound ask) was released
+// to todo and the wait state was destroyed.
+describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
+  it("train queued/awaiting-ci/bounced on a live PR leg hold", () => {
+    for (const state of ["queued", "awaiting-ci", "bounced"]) {
+      const meta = { merge_train: { state, pr: 259, repo: "state-vector/bridge" } };
+      expect(releaseHold(meta)).toMatch(new RegExp(`merge-train ${state} on PR state-vector/bridge#259`));
+    }
+  });
+
+  it("train state WITHOUT a resolvable PR leg does not hold (nothing to preserve)", () => {
+    expect(releaseHold({ merge_train: { state: "bounced" } })).toBeNull();
+    expect(releaseHold({ merge_train: { state: "queued", pr: 0 } })).toBeNull();
+  });
+
+  it("the PR leg resolves from every stamp shape (pr.number, prs[0], merge_train.pr)", () => {
+    expect(trainPrLeg({ pr: { number: 7 } })).toBe(7);
+    expect(trainPrLeg({ prs: [{ number: 9 }] })).toBe(9);
+    expect(trainPrLeg({ merge_train: { pr: 11 } })).toBe(11);
+    expect(trainPrLeg({})).toBe(0);
+  });
+
+  it("trainProxyEvent derives the pr_merged typed await from the live leg", () => {
+    expect(trainProxyEvent({ pr: { repo: "o/r", number: 5 } })).toEqual({ event: "pr_merged", repo: "o/r", n: 5 });
+    expect(trainProxyEvent({ merge_train: { pr: 5 } })).toBeNull(); // no repo → not derivable
+    expect(trainProxyEvent({ pr: { repo: "bad repo", number: 5 } })).toBeNull();
+  });
+
+  it("a typed await_event holds, naming its kind", () => {
+    expect(releaseHold({ blocked: { reason: "x", await_event: { event: "pr_checks_green", repo: "o/r", n: 1 } } })).toMatch(/typed await_event \(pr_checks_green\)/);
+  });
+
+  it("a bound ask holds, naming the ask", () => {
+    expect(releaseHold({ awaiting_ask: { ask_id: "ASK-9" } })).toMatch(/bound ask \(ASK-9\)/);
+  });
+
+  it("cards with no machine wait release freely", () => {
+    expect(releaseHold(null)).toBeNull();
+    expect(releaseHold({})).toBeNull();
+    expect(releaseHold({ blocked: { reason: "merge-train: queued" } })).toBeNull(); // prose reason alone is not state
+    expect(releaseHold({ merge_train: { state: "landed" }, pr: { number: 1 } })).toBeNull(); // landed is the machine's own close path
+    expect(releaseHold({ merge_train: { state: "unbound" }, pr: { number: 1 } })).toBeNull();
+  });
+
+  it("the hold result-class is the abandonment-scoring exemption stamp", () => {
+    expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+  });
+});
+
+// BR#4282 — the board's own merge receipt: the hub holds no VCS credentials
+// (BR#3516 §8), so a pr_merged proxy's satisfied-atom check consults ONLY the
+// stamps the train itself wrote (awaiting-ci state / per-leg merge_sha).
+describe("trainMergeReceipt — board-native pr_merged receipt (BR#4282)", () => {
+  const sha = "32e12f20985ee77ea17ebe458b2b8f0ec43af77e";
+
+  it("the train's awaiting-ci stamp is a receipt for its own PR leg", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 259, repo: "state-vector/bridge", merge_sha: sha, merged_at: 1_234 } };
+    expect(trainMergeReceipt(meta, "state-vector/bridge", 259)).toEqual({ merge_sha: sha, merged_at: 1_234 });
+  });
+
+  it("a per-leg merge_sha (merge_train.legs[n]) is a receipt too — and wins over the state stamp", () => {
+    const meta = {
+      merge_train: {
+        state: "awaiting-ci", pr: 260, repo: "o/r", merge_sha: "state-sha", merged_at: 9,
+        legs: { "259": { merge_sha: sha, merged_at: 5 } },
+      },
+    };
+    expect(trainMergeReceipt(meta, "o/r", 259)).toEqual({ merge_sha: sha, merged_at: 5 });
+  });
+
+  it("a missing merged_at degrades to 0 — the sha is the proof", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 7, repo: "o/r", merge_sha: sha } };
+    expect(trainMergeReceipt(meta, "o/r", 7)).toEqual({ merge_sha: sha, merged_at: 0 });
+  });
+
+  it("no receipt without the awaiting-ci state — queued/bounced/landed prove nothing", () => {
+    for (const state of ["queued", "bounced", "landed", ""]) {
+      const meta = { merge_train: { state, pr: 259, repo: "o/r", merge_sha: sha } };
+      expect(trainMergeReceipt(meta, "o/r", 259)).toBeNull();
+    }
+  });
+
+  it("no receipt for a DIFFERENT PR, a missing sha, or a missing card", () => {
+    expect(trainMergeReceipt({ merge_train: { state: "awaiting-ci", pr: 260, repo: "o/r", merge_sha: sha } }, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt({ merge_train: { state: "awaiting-ci", pr: 259, repo: "o/r", merge_sha: "" } }, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt({}, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt(null, "o/r", 259)).toBeNull();
+  });
+
+  it("the receipt must be for the repo the proxy names — no cross-repo smear", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 259, repo: "o/r", merge_sha: sha } };
+    expect(trainMergeReceipt(meta, "other/repo", 259)).toBeNull();
+    // the card's pr stamp outranks merge_train.repo for identity
+    const both = { pr: { repo: "o/r", number: 259 }, merge_train: { state: "awaiting-ci", pr: 259, repo: "p/q", merge_sha: sha } };
+    expect(trainMergeReceipt(both, "o/r", 259)).toEqual({ merge_sha: sha, merged_at: 0 });
+    expect(trainMergeReceipt(both, "p/q", 259)).toBeNull();
   });
 });

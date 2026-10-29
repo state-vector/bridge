@@ -3,6 +3,7 @@ import {
   deployedSatisfied,
   doneWhenSection,
   legLabel,
+  isSelfAwait,
   parseCloseLegs,
   parseClosureReceipt,
   parseProxyCondition,
@@ -84,6 +85,75 @@ describe("parseProxyCondition (machine-checkable atoms from real conditions)", (
     const { atoms, unparseable } = parseProxyCondition("waiting on Ray's merge decision, will resume after");
     expect(atoms).toHaveLength(0);
     expect(unparseable).toBe(false);
+  });
+});
+
+describe("parseProxyCondition conjunctions — every match per line (BR#3986)", () => {
+  it("BR#3557's swallowed conjunction: one line, TWO br_done atoms — pre-fix the parser returned the first only", () => {
+    const { atoms, unparseable } = parseProxyCondition("BR#3945 done AND BR#3946 done");
+    expect(unparseable).toBe(false);
+    expect(atoms.map((a) => a.brId)).toEqual(["BR#3945", "BR#3946"]);
+    for (const a of atoms) expect(a.kind).toBe("br_done");
+  });
+
+  it("multi-kind line: pr_merged AND br_done both parse (no cross-kind swallow)", () => {
+    const { atoms } = parseProxyCondition(
+      "PR https://github.com/state-vector/bridge/pull/253 mergeCommit non-null AND BR#3935 done",
+    );
+    expect(atoms).toHaveLength(2);
+    expect(atoms[0]).toMatchObject({ kind: "pr_merged", repo: "state-vector/bridge", number: 253 });
+    expect(atoms[1]).toMatchObject({ kind: "br_done", brId: "BR#3935" });
+  });
+
+  it("pr_merged conjunction: two PRs on one line", () => {
+    const { atoms } = parseProxyCondition("PR #10 mergeCommit non-null AND PR #11 mergeCommit non-null");
+    expect(atoms.map((a) => a.number)).toEqual([10, 11]);
+  });
+
+  it("issue_closed conjunction: two GH# on one line", () => {
+    const { atoms } = parseProxyCondition("GH#1980 closed and GH#1255 closed");
+    expect(atoms.map((a) => a.number)).toEqual([1980, 1255]);
+    for (const a of atoms) expect(a.kind).toBe("issue_closed");
+  });
+
+  it("run_success conjunction: two runs on one line", () => {
+    const { atoms } = parseProxyCondition("run 123456 SUCCESS and run 234567 green");
+    expect(atoms.map((a) => a.runId)).toEqual(["123456", "234567"]);
+    for (const a of atoms) expect(a.kind).toBe("run_success");
+  });
+
+  it("pr_checks_green conjunction: two green-check legs on one line", () => {
+    const { atoms } = parseProxyCondition(
+      "a fresh green check run on PR #12 (head), and a fresh green check run on PR #13 (head)",
+    );
+    expect(atoms.filter((a) => a.kind === "pr_checks_green").map((a) => a.number)).toEqual([12, 13]);
+  });
+
+  it("the same target twice on one line is ONE atom (kind+target dedupe)", () => {
+    const { atoms } = parseProxyCondition("BR#3945 done (BR#3945 done confirmed)");
+    expect(atoms).toHaveLength(1);
+  });
+
+  it("a repeated atom on a later line dedupes without falsely stamping unparseable", () => {
+    const { atoms, unparseable } = parseProxyCondition("BR#3945 done;\nBR#3945 done again");
+    expect(unparseable).toBe(false);
+    expect(atoms).toHaveLength(1);
+  });
+
+  it("multi-atom conjunctions never self-migrate (awaitEventFromAtoms stays null — sweep evaluates every atom)", () => {
+    expect(awaitEventFromAtoms(parseProxyCondition("BR#3945 done AND BR#3946 done").atoms)).toBeNull();
+  });
+});
+
+describe("isSelfAwait — the self-referential park deadlock guard (BR#3986/BR#136)", () => {
+  it("br_done/br_pr_merged naming the parked card is self", () => {
+    expect(isSelfAwait("BR#136", { event: "br_done", id: "BR#136" })).toBe(true);
+    expect(isSelfAwait("BR#136", { event: "br_pr_merged", id: "BR#136" })).toBe(true);
+  });
+  it("other cards' br_done and every other event kind is not", () => {
+    expect(isSelfAwait("BR#136", { event: "br_done", id: "BR#135" })).toBe(false);
+    expect(isSelfAwait("BR#136", { event: "pr_merged", repo: "o/r", n: 1 })).toBe(false);
+    expect(isSelfAwait("BR#136", { event: "ask", ask_id: "ASK-x" })).toBe(false);
   });
 });
 
@@ -228,5 +298,57 @@ describe("validateAwaitEvent (BR#3578 closed grammar)", () => {
     expect(deployedSatisfied("unknown", "34416e2")).toBe(false); // pre-build-hook stamp
     expect(deployedSatisfied(null, "34416e2")).toBe(false);
     expect(deployedSatisfied(full, "zzzzzzz")).toBe(false); // not hex → can never flip
+  });
+});
+
+describe("parseProxyCondition ask/time atoms (BR#4062)", () => {
+  it("the typed-await prose convention parses ask and time atoms", () => {
+    const ask = parseProxyCondition("Machine proxy (typed await_event ask ask_id=BR#4061): the ruling gates re-entry.");
+    expect(ask.unparseable).toBe(false);
+    expect(ask.atoms).toEqual([expect.objectContaining({ kind: "ask", askId: "BR#4061" })]);
+
+    const time = parseProxyCondition("Machine proxy (typed await_event time until_ts=1793673600000): re-entry at the timer.");
+    expect(time.unparseable).toBe(false);
+    expect(time.atoms).toEqual([expect.objectContaining({ kind: "time", untilTs: 1793673600000 })]);
+  });
+
+  it("typed-await prose naming a machine kind yields the SAME atom as the English phrase (one condition, deduped)", () => {
+    const { atoms, unparseable } = parseProxyCondition(
+      "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=253): PR https://github.com/state-vector/bridge/pull/253 merges (mergeCommit non-null) AND main CI green after.",
+    );
+    expect(unparseable).toBe(false);
+    expect(atoms).toHaveLength(1);
+    expect(atoms[0]).toMatchObject({ kind: "pr_merged", repo: "state-vector/bridge", number: 253 });
+  });
+
+  it("ISO until_ts normalizes to epoch ms (BR#3796's tripping hazard, prose leg)", () => {
+    const { atoms, unparseable } = parseProxyCondition(
+      "Machine proxy (typed await_event time until_ts=2026-11-04T00:00:00Z): re-entry at the render slot.",
+    );
+    expect(unparseable).toBe(false);
+    expect(atoms).toEqual([expect.objectContaining({ kind: "time", untilTs: Date.parse("2026-11-04T00:00:00Z") })]);
+  });
+
+  it("grammar-naming prose that parses to nothing stamps UNPARSEABLE (never silently ignored)", () => {
+    const bad = parseProxyCondition("Machine proxy (typed await_event vibes mood=good): not a closed-set atom.");
+    expect(bad.unparseable).toBe(true);
+    expect(bad.atoms).toHaveLength(0);
+  });
+
+  it("derived-annotation shapes re-derive: 'timer elapsed (until_ts N)' and 'ask BR#N answered'", () => {
+    const t = parseProxyCondition("timer elapsed (until_ts 1793673600000)");
+    expect(t.unparseable).toBe(false);
+    expect(t.atoms).toEqual([expect.objectContaining({ kind: "time", untilTs: 1793673600000 })]);
+
+    const a = parseProxyCondition("Ask BR#4061 answered");
+    expect(a.unparseable).toBe(false);
+    expect(a.atoms).toEqual([expect.objectContaining({ kind: "ask", askId: "BR#4061" })]);
+  });
+
+  it("awaitEventFromAtoms maps ask/time atoms to the typed events", () => {
+    expect(awaitEventFromAtoms(parseProxyCondition("Machine proxy (typed await_event ask ask_id=BR#4061): x").atoms))
+      .toEqual({ event: "ask", ask_id: "BR#4061" });
+    expect(awaitEventFromAtoms(parseProxyCondition("Machine proxy (typed await_event time until_ts=1793673600000): x").atoms))
+      .toEqual({ event: "time", until_ts: 1793673600000 });
   });
 });
