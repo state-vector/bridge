@@ -974,6 +974,33 @@ fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
     out
 }
 
+/// BR#4694 (L4.3): is this card the train canary's synthetic fixture?
+/// The canary stamps `meta.canary=true` on its card; the `train-canary` tag
+/// is accepted as a legacy/alias marker. Canary rides ride the REAL lane but
+/// their ledger events are tagged `canary=true` (throughput metrics exclude
+/// them) and they never file human-leg asks — they test mechanics, not
+/// judgment; their own watcher (`bridge train-canary`) owns the alarm.
+pub fn card_is_canary(card: &Value) -> bool {
+    if card.pointer("/meta/canary").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    card.get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| tags.iter().filter_map(|t| t.as_str()).any(|t| t == "train-canary"))
+        .unwrap_or(false)
+}
+
+/// The `"canary": true` stamp for train_event bodies (BR#4694): inserted
+/// only when true — a missing key means "not canary" to legacy hubs, and the
+/// ledger's metrics filter keys on the key's presence.
+fn stamp_canary(ev: &mut Value, canary: bool) {
+    if canary {
+        if let Some(map) = ev.as_object_mut() {
+            map.insert("canary".into(), json!(true));
+        }
+    }
+}
+
 fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
@@ -1404,6 +1431,9 @@ struct BatchCandidate {
     pr: i64,
     head_sha: String,
     root_fix: bool,
+    /// BR#4694: rides phase A → phase C so the merged ledger event is
+    /// stamped canary=true (throughput metrics exclude canary rows).
+    canary: bool,
 }
 
 // ---- BR#5633: the Awaiting-park sweep ---------------------------------
@@ -2381,6 +2411,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let card = ctx.mcp("get_artefact", json!({ "id": head_id }))?;
         let card_meta = card.get("meta").cloned().unwrap_or(json!({}));
         let card_status = card.get("status").and_then(|v| v.as_str()).map(String::from);
+        // BR#4694: the canary fixture rides the real lane, but its events are
+        // ledger-tagged and its mechanical failures never page a human.
+        let canary = card_is_canary(&card);
         // BR#3659: the card is a LIST of legs (meta.prs; meta.pr stays the first
         // for legacy readers). THIS lane drives the first UNLANDED, UNPARKED
         // leg whose repo is this lane's — BR#4934: a leg stamped awaiting-ci
@@ -2413,13 +2446,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             if all_landed && last_landed.map(|l| l.repo == repo).unwrap_or(false) && card_status.as_deref() == Some("blocked") {
                 let last = last_landed.unwrap();
                 renew_lease(ctx, repo, base);
-                ctx.mcp("train_event", json!({
+                let mut ev = json!({
                     "repo": repo, "base": base, "kind": "merged", "pr": last.number,
                     "merge_sha": card_meta.pointer(&format!("/merge_train/legs/{}/merge_sha", last.number)).and_then(|v| v.as_str())
                         .or_else(|| card_meta.pointer("/merge_train/merge_sha").and_then(|v| v.as_str())),
                     "task_id": head_id, "signer": ctx.holder,
                     "reason": "reconcile: all legs landed but the card never closed (crash between merge and landed) — re-stamped",
-                }))?;
+                });
+                stamp_canary(&mut ev, canary);
+                ctx.mcp("train_event", ev)?;
                 ctx.note(&format!("reconcile: re-stamped landed card {head_id}"));
                 log(Some(key), &format!("reconcile: card {head_id} all legs landed — re-stamped PR #{} for the landed close", last.number));
                 release_if_idle(ctx, key, repo, base)?;
@@ -2521,7 +2556,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
             renew_lease(ctx, repo, base);
-            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
+            let mut ev = json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" });
+            stamp_canary(&mut ev, canary);
+            ctx.mcp("train_event", ev)?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
             continue;
@@ -2838,6 +2875,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     return Ok(());
                 }
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
+                // BR#4694: the canary NEVER files a human leg — a mechanical
+                // defect in a synthetic fixture pages its own watcher (red
+                // alarm to the sink), not a human; filing here would double-page.
+                if canary {
+                    renew_lease(ctx, repo, base);
+                    ctx.note(&format!("canary human-leg withheld: {reason}"));
+                    log(Some(key), &format!("CANARY: human leg withheld ({reason}) — the train-canary watcher owns the alarm"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
                 renew_lease(ctx, repo, base);
                 ctx.mcp("ask_agent", json!({
                     "to": "human",
@@ -2894,6 +2941,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if event_kind == "conflict" {
                     ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
                 }
+                stamp_canary(&mut ev, canary);
                 ctx.mcp("train_event", ev)?;
                 ctx.note(&format!("bounced PR #{pr} [{}] — {}", event_kind, trunc(&defect, 120)));
                 let files_note = match event_kind {
@@ -2912,6 +2960,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // per-member merge leg is Ray's 2026-10-30 law (mergeable ⇒
                 // merge directly; update-branch only on strict-protection
                 // refusal), applied at the phase C write boundary below.
+                // BR#4694: the canary flag rides the candidate — phase C
+                // stamps the merged ledger event canary=true (metrics
+                // exclude it); gate-time bounces are stamped above.
                 candidates.push(BatchCandidate {
                     qi,
                     head_id: head_id.clone(),
@@ -2920,8 +2971,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     pr,
                     head_sha: head_sha.clone(),
                     root_fix,
+                    canary,
                 });
-                continue;
             }
         }
     }
@@ -3258,6 +3309,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         if cand.root_fix {
             merged_ev.as_object_mut().unwrap().insert("root_fix".into(), json!(true));
         }
+        // BR#4694: canary fixtures stamp their landing canary=true — the
+        // metrics filter excludes them from merges/h; a missing key means
+        // "not canary" to legacy hubs.
+        stamp_canary(&mut merged_ev, cand.canary);
         ctx.mcp("train_event", merged_ev)?;
         tip_sha = merge_sha.clone();
         // BR#5190: the fast-track receipt rides the merged note when this
@@ -5560,6 +5615,30 @@ mod tests {
         ctx.identity_probed_ms = now_ms().saturating_sub(6 * 60_000);
         assert!(!ctx.write_allowed(), "outside the window the gate must re-probe gh (which cannot classify the sentinel as Worker)");
         assert!(ctx.identity_probed_ms >= now_ms().saturating_sub(5_000), "the re-probe must refresh the probe clock");
+    }
+
+    // ---------- BR#4694: the train canary ----------
+
+    #[test]
+    fn canary_card_detected_by_meta_or_tag_never_by_default() {
+        // the canary stamps meta.canary=true on its fixture card; the
+        // train-canary tag is the accepted alias. Anything else is NOT canary.
+        assert!(card_is_canary(&json!({ "meta": { "canary": true } })));
+        assert!(card_is_canary(&json!({ "tags": ["merge-train", "train-canary"], "meta": {} })));
+        assert!(!card_is_canary(&json!({ "meta": { "canary": false } })), "explicit false is not canary");
+        assert!(!card_is_canary(&json!({ "meta": {} })));
+        assert!(!card_is_canary(&json!({})));
+        assert!(!card_is_canary(&json!({ "tags": ["canary"] })), "the hub self-canary tag (BR#4177) must not trip the train canary");
+    }
+
+    #[test]
+    fn canary_event_stamp_appears_only_when_canary() {
+        let mut plain = json!({ "repo": "r", "kind": "merged", "pr": 7 });
+        stamp_canary(&mut plain, false);
+        assert!(plain.get("canary").is_none(), "a missing key means not-canary (legacy hubs + metrics filter key on presence)");
+        let mut ev = json!({ "repo": "r", "kind": "merged", "pr": 7 });
+        stamp_canary(&mut ev, true);
+        assert_eq!(ev.get("canary"), Some(&json!(true)));
     }
 
     // ---------- BR#4170: the reconcile leg ----------
