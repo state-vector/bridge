@@ -467,3 +467,103 @@ describe("BR#4062 — ask/time prose parks type at the door and sweep first-clas
     expect(String(after.meta?.proxy_check?.detail)).toContain(`awaiting ask ${askId}`);
   });
 });
+
+// ---------- (f) BR#4282 — the silence-release loop ----------
+
+describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)", () => {
+  it("a silent in_progress card whose pr leg ALREADY merged is never re-parked blocked: resume consumed the old round, the sweep spawns the OWNED done-close duty, and the duty's close order lands the parent done", async () => {
+    // 1. the specimen: an impl card parked on a typed pr_merged proxy. The
+    // park-time machine round spawns (transition law, unchanged) and stamps
+    // its exit condition.
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4282 drill", qualified: true, session: "drill-exec-br4282" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4282", session: "drill-exec-br4282" });
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br4282", session: "drill-exec-br4282",
+      note: "parked on the merge gate",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2400 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2400 },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    const parked = await taskById(id);
+    expect(String(parked.meta?.last_unblock_spawn?.exit)).toContain("pull/2400 merged");
+    const parkRound = (await unblockDuties()).find((x: any) =>
+      x.title.startsWith("Unblock: IMPL: br4282 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(parkRound, "the park-time unblock round must exist").toBeTruthy();
+
+    // 2. the duty verifies the exit from the BOARD — the train merged the leg —
+    // and resumes the parent (blocked → in_progress). PR 2400 is open in the
+    // canned GitHub on purpose: the hub must NOT be able to lean on GitHub
+    // state here (BR#3516) — only board receipts count.
+    const resumed = await kbJson("/transition", {
+      id, to: "in_progress", actor: "drill-exec-u4282", session: "drill-exec-u4282",
+      note: "exit condition verified on the train — leg merged, resuming",
+    });
+    expect(resumed.status, `resume failed: ${JSON.stringify(resumed.body)}`).toBe(200);
+
+    // the resume CONSUMED the round: the stamp cleared, the park round closed.
+    // This is the anti-flood half of the fix: post-resume silence must issue a
+    // FRESH (owned) round, not flood-guard against a stamp whose round is gone.
+    const live = await taskById(id);
+    expect(live.status).toBe("in_progress");
+    expect(live.meta?.last_unblock_spawn).toBeUndefined();
+
+    // 3. the train's own receipt, exactly what train:merged stamps (do.ts):
+    // awaiting-ci + merge sha. The hub holds no VCS credentials — this is the
+    // only merge proof it can read.
+    const sha = "4282feedface4282feedface4282feedface4282";
+    const withReceipt = await kbJson("/update", {
+      id, actor: "drill-exec-br4282",
+      meta: {
+        ...(live.meta ?? {}),
+        merge_train: { state: "awaiting-ci", pr: 2400, repo: "state-vector/superpositional", merge_sha: sha, merged_at: t0 + 60_000 },
+      },
+    });
+    expect(withReceipt.status, `receipt stamp failed: ${JSON.stringify(withReceipt.body)}`).toBe(200);
+
+    // 4. the card goes silent past the stale window. The OLD code re-parked it
+    // blocked on the ALREADY-SATISFIED proxy (re-deriving the await from
+    // trainProxyEvent, never evaluating the atom) and re-issued an identical
+    // round → flood-skip → threshold-1 spawn-while-open breach.
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 11 * 60_000 });
+    expect(sweep.status, `stall sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+
+    // NEVER blocked: the satisfied atom routed to the exit instead
+    const after = await taskById(id);
+    expect(after.status, "the satisfied card must never re-park blocked").toBe("in_progress");
+    expect(after.meta?.blocked).toBeUndefined();
+    expect(after.meta?.proxy_check?.verdict).toBe("true");
+    expect(after.meta?.proxy_check?.spawn_skipped).toBeUndefined();
+
+    // the OWNED done-close round: a fresh Unblock duty carrying the machine
+    // proxy receipt and the BR#4282 close-order contract (parent in_progress →
+    // it owes a done-close, NOT a resume)
+    const rounds = (await unblockDuties()).filter((x: any) =>
+      x.title.startsWith("Unblock: IMPL: br4282 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(rounds.length, `expected exactly 1 open round, got ${JSON.stringify(rounds.map((r: any) => [r.id, r.status]))}`).toBe(1);
+    const round = rounds[0];
+    expect(round.roles).toContain("unblock");
+    expect(String(round.body_md)).toContain("MACHINE PROXY");
+    expect(String(round.body_md)).toContain(sha.slice(0, 9));
+    expect(String(round.body_md)).toContain("BR#4282");
+    expect(String(round.body_md)).toContain("close YOURSELF done");
+
+    // 5. the contract executes: the duty closes ITSELF done first (receipts
+    // cited — the done-open-children gate needs the child closed), then the
+    // parent's done lands with the same receipts. Owned, terminal, no breach.
+    await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-exec-closer4282", session: "drill-exec-closer4282" });
+    const roundDone = await kbJson("/transition", {
+      id: round.id, to: "done", actor: "drill-exec-closer4282",
+      note: "verified on the board receipts: PR 2400 merged as 4282feedf (train awaiting-ci stamp, BR#4282) — closing the parent done",
+    });
+    expect(roundDone.status, `duty done failed: ${JSON.stringify(roundDone.body)}`).toBe(200);
+    const parentDone = await kbJson("/transition", {
+      id, to: "done", actor: "drill-exec-closer4282",
+      note: "closed via the unblock duty: PR https://github.com/state-vector/superpositional/pull/2400 merged as 4282feedf (board merge receipt)",
+    });
+    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
+    expect((await taskById(id)).status).toBe("done");
+  });
+});

@@ -439,7 +439,7 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
   });
 });
 
-import { releaseHold, trainPrLeg, trainProxyEvent, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
+import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
 
 // BR#4067 — the typed-proxy hold predicate: every watchdog release path
 // consults this one function. The PR #257/BR#4015 class: a card carrying a
@@ -489,5 +489,55 @@ describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
 
   it("the hold result-class is the abandonment-scoring exemption stamp", () => {
     expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+  });
+});
+
+// BR#4282 — the board's own merge receipt: the hub holds no VCS credentials
+// (BR#3516 §8), so a pr_merged proxy's satisfied-atom check consults ONLY the
+// stamps the train itself wrote (awaiting-ci state / per-leg merge_sha).
+describe("trainMergeReceipt — board-native pr_merged receipt (BR#4282)", () => {
+  const sha = "32e12f20985ee77ea17ebe458b2b8f0ec43af77e";
+
+  it("the train's awaiting-ci stamp is a receipt for its own PR leg", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 259, repo: "state-vector/bridge", merge_sha: sha, merged_at: 1_234 } };
+    expect(trainMergeReceipt(meta, "state-vector/bridge", 259)).toEqual({ merge_sha: sha, merged_at: 1_234 });
+  });
+
+  it("a per-leg merge_sha (merge_train.legs[n]) is a receipt too — and wins over the state stamp", () => {
+    const meta = {
+      merge_train: {
+        state: "awaiting-ci", pr: 260, repo: "o/r", merge_sha: "state-sha", merged_at: 9,
+        legs: { "259": { merge_sha: sha, merged_at: 5 } },
+      },
+    };
+    expect(trainMergeReceipt(meta, "o/r", 259)).toEqual({ merge_sha: sha, merged_at: 5 });
+  });
+
+  it("a missing merged_at degrades to 0 — the sha is the proof", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 7, repo: "o/r", merge_sha: sha } };
+    expect(trainMergeReceipt(meta, "o/r", 7)).toEqual({ merge_sha: sha, merged_at: 0 });
+  });
+
+  it("no receipt without the awaiting-ci state — queued/bounced/landed prove nothing", () => {
+    for (const state of ["queued", "bounced", "landed", ""]) {
+      const meta = { merge_train: { state, pr: 259, repo: "o/r", merge_sha: sha } };
+      expect(trainMergeReceipt(meta, "o/r", 259)).toBeNull();
+    }
+  });
+
+  it("no receipt for a DIFFERENT PR, a missing sha, or a missing card", () => {
+    expect(trainMergeReceipt({ merge_train: { state: "awaiting-ci", pr: 260, repo: "o/r", merge_sha: sha } }, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt({ merge_train: { state: "awaiting-ci", pr: 259, repo: "o/r", merge_sha: "" } }, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt({}, "o/r", 259)).toBeNull();
+    expect(trainMergeReceipt(null, "o/r", 259)).toBeNull();
+  });
+
+  it("the receipt must be for the repo the proxy names — no cross-repo smear", () => {
+    const meta = { merge_train: { state: "awaiting-ci", pr: 259, repo: "o/r", merge_sha: sha } };
+    expect(trainMergeReceipt(meta, "other/repo", 259)).toBeNull();
+    // the card's pr stamp outranks merge_train.repo for identity
+    const both = { pr: { repo: "o/r", number: 259 }, merge_train: { state: "awaiting-ci", pr: 259, repo: "p/q", merge_sha: sha } };
+    expect(trainMergeReceipt(both, "o/r", 259)).toEqual({ merge_sha: sha, merged_at: 0 });
+    expect(trainMergeReceipt(both, "p/q", 259)).toBeNull();
   });
 });

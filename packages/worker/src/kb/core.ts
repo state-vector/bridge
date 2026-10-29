@@ -1533,6 +1533,39 @@ export function trainProxyEvent(meta: any): AwaitEvent | null {
   return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
 }
 
+/** BR#4282 — the card's OWN merge-train stamp proving its pr_merged leg has
+ *  ALREADY merged: `merge_train.state = "awaiting-ci"` (or a per-leg entry)
+ *  with a non-null merge_sha, exactly what train:merged writes (do.ts). The
+ *  hub holds no VCS credentials (BR#3516 §8) — this board stamp (plus the
+ *  provenance row, which needs the DB) is the only hub-readable receipt that
+ *  the atom is satisfied, so a hold-park must consult it BEFORE re-arming the
+ *  proxy. Null when the card carries no merge receipt for (repo, n). */
+export function trainMergeReceipt(
+  meta: any,
+  repo: string,
+  n: number,
+): { merge_sha: string; merged_at: number } | null {
+  const m = meta ?? {};
+  const mt = (m.merge_train ?? {}) as Record<string, unknown>;
+  const leg = (mt.legs as Record<string, { merge_sha?: unknown; merged_at?: unknown }> | undefined)?.[String(n)];
+  const fromLeg =
+    leg && typeof leg.merge_sha === "string" && leg.merge_sha
+      ? { merge_sha: leg.merge_sha, merged_at: Number(leg.merged_at ?? 0) || 0 }
+      : null;
+  const fromState =
+    String(mt.state ?? "") === "awaiting-ci" &&
+    Number(mt.pr ?? 0) === Number(n) &&
+    typeof mt.merge_sha === "string" &&
+    mt.merge_sha
+      ? { merge_sha: mt.merge_sha, merged_at: Number(mt.merged_at ?? 0) || 0 }
+      : null;
+  const hit = fromLeg ?? fromState;
+  if (!hit) return null;
+  // the receipt must be for the leg the proxy actually names
+  const legRepo = String((m.pr as any)?.repo ?? mt.repo ?? "");
+  return legRepo === repo ? hit : null;
+}
+
 /** BR#4067 — does a release path need to HOLD? Returns the hold description
  *  when the card carries machine-wait state — a merge-train queue slot
  *  (queued/awaiting-ci/bounced on a live PR leg), a typed await_event, or a
