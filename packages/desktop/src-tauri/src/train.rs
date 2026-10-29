@@ -51,7 +51,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::logging::{emit, now_ms, prefer_stdout};
+use crate::logging::{emit, iso, now_ms, prefer_stdout};
 
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -205,6 +205,10 @@ struct Ctx {
     last_action: String,
     /// When `last_action` happened (ms epoch).
     last_action_ms: u64,
+    // ---- token-rot visibility (BR#4754) ----
+    /// The lane card id train_status last reported (the one-per-episode
+    /// token-rot note lands there after a self-healed blind episode).
+    last_lane_card: Option<String>,
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -283,6 +287,7 @@ impl Ctx {
             base_probe: true,
             last_action: "executor started".into(),
             last_action_ms: now_ms(),
+            last_lane_card: None,
         })
     }
 
@@ -1558,6 +1563,11 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
             log(Some(&key), "lane retired (lane card closed) — skipping (BR#4977)");
             continue;
         }
+        // BR#4754: remember the lane card — the one-per-episode token-rot
+        // note lands there when a blind episode self-heals.
+        if let Some(c) = lane.get("card").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            ctx.last_lane_card = Some(c.to_string());
+        }
         // Daemon mode resolves the workdir per lane from the managed clone
         // cache (or the MERGE_TRAIN_WORKDIR override) before driving it.
         if ctx.in_process {
@@ -1600,19 +1610,212 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
     if ctx.once {
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
-            return 1;
-        }
-        return 0;
+        return once_run(&mut ctx);
     }
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     loop {
         let started = now_ms();
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+        match tick(&mut ctx) {
+            Ok(()) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — report it once so the
+                // board learns WHY the lane went quiet (the token-rot class),
+                // not just that it did.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
+            Err(e) => {
+                log(None, &format!("tick failed: {}", trunc(&e, 300)));
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // BR#4754: fail LOUDLY and exit non-zero — a supervisor
+                        // (systemd/launchd/nohup loop) restarts a fresh process
+                        // that re-resolves the store and re-runs the ladder with
+                        // a clean slate; the pre-fix loop instead ticked blindly
+                        // forever (1,684 silent failures on the super lane).
+                        let (since, ticks) = match blind.as_ref() {
+                            Some(b) => (b.since_ms, b.ticks),
+                            None => (now_ms(), 0),
+                        };
+                        log(
+                            None,
+                            &format!(
+                                "TOKEN-BLIND — EXITING (exit 1): the hub rejected this executor's credential for {} tick(s) since {} and the auth ladder (store reload + principal re-vend) failed {} consecutive runs. A supervisor restart picks up fresh credentials; if the principal itself is dead, the operator must re-pair (`bridge pair <hub-url>`).",
+                                ticks,
+                                iso(since),
+                                heal.streak,
+                            ),
+                        );
+                        return 1;
+                    }
+                }
+            }
         }
         let spent = now_ms() - started;
         std::thread::sleep(Duration::from_millis(ctx.interval_ms.saturating_sub(spent).max(1000)));
+    }
+}
+
+/// `--once`: one tick, one ladder attempt on an auth-class failure (cron
+/// re-runs pick up the healed pairing). Exit 0 on a clean tick, else 1.
+fn once_run(ctx: &mut Ctx) -> i32 {
+    match tick(ctx) {
+        Ok(()) => 0,
+        Err(e) => {
+            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+            if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                log(None, "auth-class failure — one ladder attempt before giving up");
+                if try_auth_ladder(ctx, &mut crate::dispatch::AuthHeal::new()) {
+                    return match tick(ctx) {
+                        Ok(()) => 0,
+                        Err(e2) => {
+                            log(None, &format!("tick failed after re-vend: {}", trunc(&e2, 300)));
+                            1
+                        }
+                    };
+                }
+            }
+            1
+        }
+    }
+}
+
+/// BR#4754 — a token-rot episode: consecutive auth-class tick failures since
+/// `since_ms`. Cleared by the first successful tick (which also fires the
+/// one-per-episode board note once the episode is worth naming).
+struct BlindStreak {
+    since_ms: u64,
+    ticks: u32,
+}
+
+/// A blind episode shorter than this is a hiccup (a single rotated mid-flight
+/// tick), not an outage — it does not earn a board note.
+const BLIND_NOTE_MIN_TICKS: u32 = 3;
+
+/// What the daemon loop should do after an auth-classified tick failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthOutcome {
+    /// stay in the loop (ladder attempted or paced out)
+    Continue,
+    /// the ladder is exhausted — exit loudly (standalone daemon only)
+    Park,
+}
+
+/// Shared auth failure path for BOTH daemon loops: the caller has already
+/// classified the error auth-class and streaked it; this paces (the hub
+/// rate-limits /api/token/repair at 6/h per row — an unpaced ladder in a 45s
+/// loop would burn the mint budget in minutes) and attempts the ladder when
+/// due. Returns Park when AUTH_PARK_ATTEMPTS consecutive ladder runs failed.
+fn on_tick_auth_failure(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal, e: &str) -> AuthOutcome {
+    if crate::dispatch::classify_hub_error(e) != crate::dispatch::HubErrClass::Auth {
+        return AuthOutcome::Continue;
+    }
+    match heal.on_auth_failure(std::time::Instant::now()) {
+        crate::dispatch::HealStep::Wait => AuthOutcome::Continue,
+        crate::dispatch::HealStep::Attempt => {
+            if try_auth_ladder(ctx, heal) {
+                AuthOutcome::Continue
+            } else if heal.streak >= crate::dispatch::AUTH_PARK_ATTEMPTS {
+                AuthOutcome::Park
+            } else {
+                AuthOutcome::Continue
+            }
+        }
+    }
+}
+
+/// One run of the BR#4754 auth ladder when a hub call comes back
+/// auth-rejected. True = the ctx now carries a fresh pairing.
+/// `Ok`/`Err` reasons are logged by the caller — never swallowed (the 2026-10-27
+/// incidents: "repair failed" with zero why).
+fn try_auth_ladder(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal) -> bool {
+    match auth_ladder_with(&ctx.hub, &ctx.token, &|| crate::dispatch::DispatchConfig::resolve()) {
+        Ok((hub, token)) => {
+            ctx.hub = hub;
+            ctx.token = token;
+            heal.on_repair_success();
+            log(None, "hub rejected the stored token — the auth ladder re-vended the pairing; re-ticking");
+            true
+        }
+        Err(why) => {
+            log(
+                None,
+                &format!(
+                    "auth ladder failed (attempt {}/{}): {}",
+                    heal.streak,
+                    crate::dispatch::AUTH_PARK_ATTEMPTS,
+                    trunc(&why.join("; "), 240)
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// BR#4754 — the train executor's auth self-heal ladder (the BR#4113
+/// ladder's train-leg twin). A token-blind daemon cannot ask the hub for
+/// ANYTHING under the dead bearer — but the repair route authenticates by
+/// PRINCIPAL (the durable device credential, BR#2711 §2), so self-heal is
+/// possible while fully blind: (1) reload the store — another process on
+/// this device (the runner's dispatch loop) may have re-vended the token;
+/// (2) agent-plane re-vend by principal (`repair_by_principal` —
+/// headless-safe, and it PERSISTS the fresh secret to the store so a
+/// supervisor-restarted process resolves it directly). The human-plane leg
+/// is desktop-only by design. Returns the fresh (hub, token) to adopt.
+/// The store leg is injected (see `auth_ladder_with`) so unit tests stay
+/// machine-independent.
+fn auth_ladder_with(
+    prev_url: &str,
+    prev_token: &str,
+    store: &dyn Fn() -> Option<crate::dispatch::DispatchConfig>,
+) -> Result<(String, String), Vec<String>> {
+    let mut failures: Vec<String> = Vec::new();
+    match store() {
+        Some(fresh) if !fresh.token.is_empty() && fresh.token != prev_token => {
+            return Ok((fresh.url, fresh.token));
+        }
+        Some(_) => failures.push("store token unchanged".into()),
+        None => failures.push("no resolvable config in the store".into()),
+    }
+    let client = match reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            failures.push(format!("repair client build failed: {e}"));
+            return Err(failures);
+        }
+    };
+    match crate::dispatch::repair_by_principal(&client, prev_url) {
+        Ok(cfg) => Ok((cfg.url, cfg.token)),
+        Err(e) => {
+            failures.push(format!("principal repair: {e}"));
+            Err(failures)
+        }
+    }
+}
+
+/// BR#4754 — the board-visible half of the token-rot fix. A token-blind
+/// daemon is board-MUTE by construction (every hub write needs the bearer
+/// the hub just rejected), so the alarm cannot fire mid-blind; what CAN
+/// reach the board is the retroactive note once the ladder heals: one
+/// log_progress per episode on the lane card naming the class, the window,
+/// and the remedy — so the board holds the CAUSE, not just a lease-less lane.
+fn board_note_token_rot(ctx: &mut Ctx, streak: &BlindStreak) {
+    let Some(card) = ctx.last_lane_card.clone() else {
+        return;
+    };
+    let did = format!(
+        "token-rot episode: {} tick(s) failed 'unknown auth token' since {} — the executor self-healed via the auth ladder (store reload / principal re-vend, BR#4754) and the lane tick resumed",
+        streak.ticks,
+        iso(streak.since_ms)
+    );
+    if let Err(e) = ctx.mcp("log_progress", json!({ "id": card, "did": did, "will": "none — the executor is ticking again", "sentiment": "neutral" })) {
+        log(None, &format!("token-rot board note failed (non-fatal): {}", trunc(&e, 160)));
     }
 }
 
@@ -1961,6 +2164,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         base_probe: true,
         last_action: "gateway leg tick".into(),
         last_action_ms: now_ms(),
+        last_lane_card: None,
     })
 }
 
@@ -1987,6 +2191,11 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     let mut preflighted = false;
     let mut failures: u32 = 0;
     let mut ticks: u64 = 0;
+    // BR#4754: the same paced auth ladder the standalone daemon runs —
+    // role:"train" nodes have NO dispatch loop, so this leg is the only
+    // thing that can re-vend a rotated pairing on those hosts.
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     let mut last_reconcile: Option<std::time::Instant> = None;
     loop {
         // sleep in small slices so stop is responsive (same law as run_loop)
@@ -2040,15 +2249,32 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
         // loudly, continue — the lease TTL reconciles any half-state.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(&mut ctx)));
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — name it on the lane
+                // card (once per episode) so the board holds the CAUSE.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 failures += 1;
-                if e.contains("401") {
-                    // the pairing rotated under us — rebuild from the
-                    // keychain/config and let the next tick retry
-                    if let Ok(fresh) = ctx_for_daemon(&cfg) {
-                        ctx = fresh;
-                        log(None, "gateway token rotated — train leg re-vended its pairing");
+                // BR#4754: the old sniff (`e.contains("401")`) missed the
+                // JSON-RPC shape the hub actually returns for a dead token
+                // ("unknown auth token" — no HTTP status in the string), so a
+                // rotated pairing stayed broken here too on role:"train"
+                // nodes (no dispatch loop to refresh the store). Classified
+                // + paced ladder now; the leg NEVER exits its host.
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // the leg itself survives — it just stops hammering
+                        // the ladder; the capped cadence keeps retrying (the
+                        // dispatch loop's park path owns the loud surface)
+                        log(None, "auth ladder exhausted — the train leg keeps ticking on the capped cadence (host loop owns the park/alarm surface)");
                     }
                 }
                 log(None, &format!("tick failed: {}", trunc(&e, 300)));
@@ -2451,6 +2677,87 @@ mod tests {
         assert!(nolabel.holder.starts_with("merge-train@"));
     }
 
+    // ---- BR#4754: token rot is auth-class, heals through the ladder, and
+    // ---- parks LOUDLY when the ladder is exhausted ----
+
+    #[test]
+    fn token_rot_jsonrpc_errors_classify_auth() {
+        // The incident shape (1,684 consecutive super-lane failures): mcp()
+        // wraps the hub's error TEXT and a rotted token carries no HTTP
+        // status — the old `contains("401")` sniff and the status-prefix
+        // classifier patterns both missed it.
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_status): unknown auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_lease): invalid auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+    }
+
+    #[test]
+    fn lane_lease_contention_stays_transient() {
+        // NOT auth: the token is fine, another executor holds the lane.
+        assert_eq!(
+            crate::dispatch::classify_hub_error(
+                "hub rpc error (train_lease): lane lease held live by merge-train@other — stand down this tick"
+            ),
+            crate::dispatch::HubErrClass::Transient
+        );
+    }
+
+    #[test]
+    fn auth_ladder_failure_names_every_failed_leg() {
+        // Store leg injected to None (dev machines hold a REAL pairing — an
+        // un-injected store leg makes this test machine-dependent), repair
+        // leg aimed at a dead port: BOTH legs must be NAMED in the reasons —
+        // never a bare "repair failed" (the 2026-10-27 class).
+        let errs = auth_ladder_with("http://127.0.0.1:9", "sentinel-store-token", &||
+            None::<crate::dispatch::DispatchConfig>)
+            .expect_err("unreachable hub must fail the ladder");
+        let joined = errs.join("; ");
+        assert!(joined.contains("no resolvable config in the store"), "names the store leg: {joined}");
+        assert!(joined.contains("principal repair:"), "names the principal-repair leg: {joined}");
+    }
+
+    #[test]
+    fn auth_ladder_adopts_a_changed_store_token() {
+        // Leg 1: another process (the runner's dispatch loop) re-vended the
+        // store token — the ladder adopts it WITHOUT hitting the repair route.
+        let fresh = crate::dispatch::DispatchConfig {
+            url: "https://hub.example".into(),
+            token: "fresh-from-store".into(),
+            ..crate::dispatch::default_config()
+        };
+        let (hub, token) = auth_ladder_with("https://hub.example", "stale-snapshot", &move || {
+            Some(fresh.clone())
+        })
+        .expect("a changed store token is a completed ladder");
+        assert_eq!(token, "fresh-from-store");
+        assert_eq!(hub, "https://hub.example");
+    }
+
+    #[test]
+    fn both_daemon_loops_wire_the_ladder_and_park_loudly() {
+        // Source-scan pin (the dispatch.rs convention): the standalone run()
+        // loop AND the in-process daemon loop must classify auth errors,
+        // run the injected ladder, pace it, and the standalone must exit
+        // non-zero when the ladder is exhausted — a regression to the silent
+        // tick-forever loop is the exact Oct-29 incident.
+        let src = include_str!("train.rs");
+        for needle in [
+            "fn auth_ladder_with",
+            "fn on_tick_auth_failure",
+            "AuthOutcome::Park",
+            "TOKEN-BLIND — EXITING (exit 1)",
+            "fn board_note_token_rot",
+            "BLIND_NOTE_MIN_TICKS",
+        ] {
+            assert!(src.contains(needle), "BR#4754 machinery missing: {needle}");
+        }
+    }
+
     // ---- the gate law, restated: writes flow only through worker creds ----
 
     #[test]
@@ -2564,6 +2871,7 @@ mod tests {
             base_probe: false, // hermetic drills — the base probe shells out to gh
             last_action: "test".into(),
             last_action_ms: now_ms(),
+            last_lane_card: None,
         }
     }
 
@@ -2869,6 +3177,7 @@ mod tests {
                 base_probe: false, // local git-plumbing verdicts only — no gh
                 last_action: String::new(),
                 last_action_ms: now_ms(),
+                last_lane_card: None,
             }
         }
     }

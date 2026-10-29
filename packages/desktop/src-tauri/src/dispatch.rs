@@ -725,12 +725,16 @@ pub fn repair_by_principal(
 /// unreachable mid-deploy, 5xx, 429, timeouts, MCP-level errors) is
 /// transient: back off, keep polling — the hub may just be deploying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HubErrClass {
+pub(crate) enum HubErrClass {
     Auth,
     Transient,
 }
 
-fn classify_hub_error(e: &str) -> HubErrClass {
+/// The repairable-vs-transient decision point. Consumed by BOTH hub-call
+/// loops on this device — the dispatch loop (below) and the merge-train
+/// executor (train.rs, vendored into the CLI) — so one classification law
+/// governs every hub caller (BR#4754 made it crate-visible for the train leg).
+pub(crate) fn classify_hub_error(e: &str) -> HubErrClass {
     // "bridge {status} on /mcp" is mcp_call_session's shape; "hub 401:" is
     // the pairing/session-plane shape. 401 = the token is dead; 403 = the
     // identity was refused — a re-vend usually won't change a 403 either,
@@ -741,10 +745,18 @@ fn classify_hub_error(e: &str) -> HubErrClass {
         || e.starts_with("hub 401:")
         || e.starts_with("hub 403:")
     {
-        HubErrClass::Auth
-    } else {
-        HubErrClass::Transient
+        return HubErrClass::Auth;
     }
+    // BR#4754 — the train executor's shape: train.rs mcp() wraps every
+    // JSON-RPC error as "hub rpc error (tool): <message>", and a dead/rotted
+    // token surfaces as the hub's message text with NO HTTP status anywhere
+    // in the string ("unknown auth token" — the Oct-29 blind-daemon
+    // incident). Same repairable-by-ladder class: the token is rejected,
+    // everything else about the hub is fine.
+    if e.contains("unknown auth token") || e.contains("invalid auth token") {
+        return HubErrClass::Auth;
+    }
+    HubErrClass::Transient
 }
 
 /// BR#4113 — bounded self-heal pacing for auth failures. The repair ladder
@@ -755,15 +767,20 @@ fn classify_hub_error(e: &str) -> HubErrClass {
 /// breaks the loop while desired state is "running": a hub-side heal
 /// (rotation grace, rollback, row restore) is picked up by the next poll and
 /// dispatch resumes within one poll interval, zero human action.
-struct AuthHeal {
+///
+/// crate-visible (BR#4754): the merge-train executor (train.rs) reuses the
+/// SAME pacing + park threshold for its daemon loops — one mechanism, two
+/// consumers; the hub rate-limits `/api/token/repair` per row (6/h), so an
+/// unpaced ladder in a 45s tick loop would burn the mint budget in minutes.
+pub(crate) struct AuthHeal {
     /// consecutive FAILED ladder runs
-    streak: u32,
+    pub(crate) streak: u32,
     last_attempt: Option<Instant>,
     parked: bool,
 }
 
 /// What run_loop should do about auth this iteration.
-enum HealStep {
+pub(crate) enum HealStep {
     /// run the repair ladder now
     Attempt,
     /// not yet due — keep polling quietly
@@ -771,22 +788,22 @@ enum HealStep {
 }
 
 /// Backoff between ladder runs: 5s doubling, capped at AUTH_BACKOFF_CAP_SECS.
-fn auth_backoff_secs(failed_runs: u32) -> u64 {
+pub(crate) fn auth_backoff_secs(failed_runs: u32) -> u64 {
     // failed_runs = 1 after the first failure → first retry after 5s
     let shift = failed_runs.saturating_sub(1).min(6);
     (5u64 << shift).min(AUTH_BACKOFF_CAP_SECS)
 }
 
-const AUTH_BACKOFF_CAP_SECS: u64 = 300;
-const AUTH_PARK_ATTEMPTS: u32 = 5;
+pub(crate) const AUTH_BACKOFF_CAP_SECS: u64 = 300;
+pub(crate) const AUTH_PARK_ATTEMPTS: u32 = 5;
 
 impl AuthHeal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         AuthHeal { streak: 0, last_attempt: None, parked: false }
     }
 
     /// An auth-classified tick error. Decides whether a ladder run is due.
-    fn on_auth_failure(&mut self, now: Instant) -> HealStep {
+    pub(crate) fn on_auth_failure(&mut self, now: Instant) -> HealStep {
         if let Some(t) = self.last_attempt {
             if now.duration_since(t).as_secs() < auth_backoff_secs(self.streak.max(1)) {
                 return HealStep::Wait;
@@ -801,13 +818,13 @@ impl AuthHeal {
     }
 
     /// A ladder leg succeeded — the hub re-vended this device. Fully re-arm.
-    fn on_repair_success(&mut self) {
+    pub(crate) fn on_repair_success(&mut self) {
         *self = AuthHeal::new();
     }
 
     /// The hub accepted our token again without a repair (rollback, grace
     /// window re-opened, row restored) — same re-arm.
-    fn on_hub_accepted(&mut self) {
+    pub(crate) fn on_hub_accepted(&mut self) {
         if self.streak > 0 || self.parked {
             *self = AuthHeal::new();
         }
@@ -4966,6 +4983,20 @@ mod tests {
         assert_eq!(classify_hub_error("mcp error -32000: board busy"), HubErrClass::Transient);
         // a task id that merely CONTAINS 401 must not classify as auth
         assert_eq!(classify_hub_error("task BR#4011 rejected"), HubErrClass::Transient);
+        // BR#4754 — the train executor's JSON-RPC shape: mcp() wraps the hub's
+        // error TEXT ("hub rpc error (tool): <message>"), and a rotted token
+        // carries no HTTP status anywhere in the string. The Oct-29 incident:
+        // 1,684 consecutive ticks of exactly the first line, acted on by
+        // nothing because the old patterns never matched it.
+        assert_eq!(classify_hub_error("hub rpc error (train_status): unknown auth token"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("hub rpc error (train_lease): invalid auth token"), HubErrClass::Auth);
+        // lease contention / hub-side refusals are NOT auth — the token is fine
+        assert_eq!(
+            classify_hub_error(
+                "hub rpc error (train_lease): lane lease held live by merge-train@other until 2026-10-28T00:00:00Z — stand down this tick"
+            ),
+            HubErrClass::Transient
+        );
     }
 
     #[test]
