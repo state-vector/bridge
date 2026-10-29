@@ -215,11 +215,13 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/age\(l\.lease\.heartbeat_ts, now\)/);
     // the free case is explicit, never blank — and ready vs gateway-less are
     // DISTINCT states (2026-10-29, Ray): an idle lane names the machine that
-    // last ticked it; only a stale-capable lane reads as gateway-less
+    // last ticked it; only a stale-capable lane reads as gateway-less. Copy
+    // per the status-pill redesign: labels "train ready" / "no gateway" (the
+    // machine + tick age live in the pill's tooltip).
     expect(trainPanelSrc).not.toContain("lock free");
-    expect(trainPanelSrc).toContain("train ready · ");
+    expect(trainPanelSrc).toContain('"train ready"');
     expect(trainPanelSrc).toMatch(/l\.capable\?\.ready/);
-    expect(trainPanelSrc).toContain("no gateway ticking");
+    expect(trainPanelSrc).toContain('"no gateway"');
   });
 
   it("renders the derived queue as clickable card chips with the lane's stop-the-line flag", () => {
