@@ -94,7 +94,13 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
   const parkedReason = (t: any): string => {
     if (parkClassOf(t) === "sin-bin") return "churn/rework park — the watchdog drains it automatically; release early from Top's sin-bin";
     if (t.status === "blocked") return (t.meta?.blocked?.unblock_condition ?? "blocked — open the card, resolve or re-scope").slice(0, 90);
-    if (t.type === "question" || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
+    if (t.type === "question" || t.meta?.kind === "question") {
+      // BR#3911: a live human hold says who has it and that it self-heals
+      const c = t.meta?.human_claimed;
+      if (c && typeof c.expires_ts === "number" && c.expires_ts > Date.now())
+        return `${c.by || "a human"} has it in hand — auto-reopens when the hold expires`;
+      return "question — collect answers, the author closes it with a decision";
+    }
     if (t.meta?.operator_gated) return `operator gate: ${t.meta.operator_gated} — a human clears it`;
     return (t as any).claim_reason || "not dispatchable — see card";
   };
@@ -157,6 +163,13 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                       </span>
                     )}
                     {t.status === "in_review" && <span className="backlog-why"><Chip tone="warn">verify</Chip> awaiting a fresh verify session</span>}
+                    {t.type === "question" && (t.meta?.human_claimed?.expires_ts ?? 0) > Date.now() && (
+                      <span className="backlog-why">
+                        <Chip tone="scope" title={`${t.meta.human_claimed.by || "a human"} claimed this question — it leaves the agent pool and auto-reopens when the hold expires`}>
+                          in hand by {t.meta.human_claimed.by || "human"}
+                        </Chip>
+                      </span>
+                    )}
                   </span>
                   <span className="backlog-meta">
                     {g.showBoost && (

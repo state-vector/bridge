@@ -222,6 +222,17 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
       }
+      // BR#3911: question claim/release — the human-claim hold. Human plane
+      // ONLY: a gateway bearer cannot hold a question (the DO op re-checks the
+      // actor shape; this route is where the misconfigured path fails loudly).
+      if ((sub === "question_claim" || sub === "question_release") && request.method === "POST") {
+        if (auth.bearer) return kbCors(json({ error: "question claim is a human hold — a gateway bearer cannot hold a question; answer or contribute instead (protocol 6b)" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(env.KB.get(kbId).fetch(`https://kb/question.${sub === "question_claim" ? "claim" : "release"}`, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        }));
+      }
       if (sub === "purge_smoke" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;

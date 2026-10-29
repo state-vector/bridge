@@ -422,6 +422,16 @@ never change system behaviour — tagging a task `role:review` does nothing. **Q
 own artefact type** (`type: "question"`; asks create them automatically): open participation,
 answered via the ask band or progress entries, closed to done/superseded — never claimed.
 
+**Humans can hold a question** (BR#3911): on any open question card, **Claim — I'll handle it**
+(web + desktop, human session only) stamps a 10-minute hold (`human_claimed {by, ts, expires_ts}`)
+that dismisses the question from the agent pool — agent inboxes drop it, orient says
+`in hand by <you>`, and agent contributions get a stand-down postscript. Claim ≠ answer: protocol
+6b stands, the question still closes via your ADR. Answer or close before the window and the
+timer cancels; no-show and the watchdog sweep auto-reverts the hold, leaving an expiry note on
+the card (honest churn, never silent). Release puts it back early; agent claims on questions
+stay forbidden, and the runner claim path is untouched (the hold is a meta stamp, not a
+transition). Window: `question_claim_minutes` setting (default 10).
+
 ## The ask contract: asks are question nodes
 
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
