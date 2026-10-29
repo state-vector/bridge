@@ -6788,9 +6788,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   }
 
   /** train.status — the lane + derived-queue snapshot (GET /train mirrors
-   *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. */
+   *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. Each
+   *  lane also carries an activity block (Top-view train panel): merge
+   *  throughput over trailing 1h/24h, last merge age, and the lane's last
+   *  ledger event — all cheap indexed counts over train_events. */
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
+    const now = Date.now();
     const lanes = this.state.storage.sql.exec(
       `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL ORDER BY title`,
@@ -6802,6 +6806,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (!lane) continue;
       if (repoFilter && lane.repo !== repoFilter) continue;
       const queue = this.laneQueue(lane.repo);
+      const tp = this.state.storage.sql.exec(
+        `SELECT SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h1,
+                SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h24,
+                MAX(ts) AS last_merge_ts
+         FROM train_events WHERE kind = 'merged' AND repo = ? AND base = ?`,
+        now - 3_600_000, now - 86_400_000, lane.repo, lane.base,
+      ).toArray()[0] ?? {};
+      const lastEvent = this.state.storage.sql.exec(
+        `SELECT ts, kind, pr, task_id, gateway FROM train_events
+         WHERE repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+        lane.repo, lane.base,
+      ).toArray()[0] ?? null;
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -6811,6 +6827,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         required_workflows: lane.required_workflows,
         reason: String(meta.blocked?.reason ?? ""),
         queue,
+        activity: {
+          merged_1h: Number(tp.h1 ?? 0),
+          merged_24h: Number(tp.h24 ?? 0),
+          last_merge_ts: tp.last_merge_ts ?? null,
+          last_event: lastEvent ? { ts: lastEvent.ts, kind: lastEvent.kind, pr: lastEvent.pr, task_id: lastEvent.task_id, gateway: lastEvent.gateway } : null,
+        },
       });
     }
     return { lanes: out };

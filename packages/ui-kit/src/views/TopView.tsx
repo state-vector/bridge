@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
+import { TrainPanel } from "./TrainPanel";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf, parkClassOf, externalGateOf } from "../server/views";
@@ -261,6 +262,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   return (
     <div className="top-wrap">
+      <TrainPanel openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <div className="view-head">

@@ -142,6 +142,32 @@ export interface KbBoard {
   agents?: Array<{ label: string; score: number; grade: string; hints: string[] } & Record<string, number | string>>;
 }
 
+/** One merge-train lane of the train.status snapshot (GET /api/kb/train):
+ *  executor-fed CAS lease + in-flight phase, hub-computed derived queue. */
+export interface KbTrainLease {
+  holder: string;
+  heartbeat_ts: number;
+  expires_ts: number;
+}
+
+export interface KbTrainLane {
+  lane: string;
+  card: string;
+  lease: KbTrainLease | null;
+  currently: { phase?: string; merge_sha?: string; pr?: number; head_sha?: string; merged_at?: number; task_id?: string } | null;
+  stop: { sha?: string; reason?: string; at?: number; pr?: number } | null;
+  required_workflows?: string[];
+  reason?: string;
+  queue: { id: string; priority: "critical" | "normal" }[];
+  /** executor activity (hub-computed over the train_events ledger) */
+  activity?: {
+    merged_1h: number;
+    merged_24h: number;
+    last_merge_ts: number | null;
+    last_event: { ts: number; kind: string; pr?: number; task_id?: string; gateway?: string } | null;
+  };
+}
+
 const base = () => getKbHubConfig().url;
 
 /** Thrown when auth fails (missing/expired cookie or bad token) — the shell funnels these into its sign-in gate. */
@@ -193,6 +219,8 @@ export const kbApi = {
   search: (q: string) => j<{ artefacts: any[] }>(`/api/kb/search?q=${encodeURIComponent(q)}`),
   related: (id: string) => j<{ artefacts: KbArtefact[] }>(`/api/kb/related?id=${encodeURIComponent(id)}`),
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
+  // merge-train snapshot (all lanes) — lease holders + derived queue for the Top panel
+  train: () => j<{ lanes: KbTrainLane[] }>("/api/kb/train"),
   // human replies on a question thread — the same log_progress door agents use
   progress: (id: string, note: string, extra?: { will?: string; sentiment?: string }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),
