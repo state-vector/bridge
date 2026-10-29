@@ -394,7 +394,10 @@ worked; it owes a close, not a resume). The silence-re-park can also no longer l
 flood-guard skip (`skip_unblock_spawn` with `flood: true`) is the dedup working and is
 audited without folding a breach card, and a resume consumes the unblock round so post-resume
 silence issues one fresh round instead of flooding for an hour.
-honestly: `lock free`, `awaiting an available gateway`.
+The trains panel is honest about capability: a held lock names its machine; an idle lane
+ticked by a merge-capable gateway inside the 15-minute window shows
+`train ready · <machine> · tick Xm ago`; only a lane with no recent capable tick says
+`no gateway ticking` / `awaiting an available gateway`.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -666,7 +669,10 @@ included) as "unmergeable — CONFLICTING".
   honest reason `merge-train: awaiting an available gateway` (merges happen when your
   machines are on). The card's blocked reason is recomputed by the hub from the card's
   own meta — `idle` / `leased by X` / `awaiting CI on <sha> (PR #N)` / `STOPPED` /
-  `awaiting an available gateway` — so the board always shows the lane's truth.
+  `ready — last ticked by X Nm ago` (a merge-capable gateway ticked inside the
+  15-minute window — the train will take work the moment it is queued) /
+  `awaiting an available gateway` — so the board always shows the lane's truth, and an
+  empty queue never hides which machine is driving the train.
 - **The lease is CAS with a 5-minute TTL**: acquire → held across the whole queue
   (`merge-train: leased by X — idle` between items) → release. The hub stamps
   `holder = the authenticated actor`; the executor never supplies a holder, so a leaked

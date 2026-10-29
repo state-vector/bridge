@@ -175,6 +175,11 @@ import {
 const TRAIN_ALARM_SINK_ID = "BR#3124";
 /** BR#4489: a queued lane with no merge-capable lease inside this window is STARVED — panel red + alarm. */
 const TRAIN_STARVE_MS = 10 * 60_000;
+/** Ray 2026-10-29: a merge-capable lease op inside this window means the train is
+ *  READY — an idle lane shows which machine last ticked it and when, not a
+ *  vague "awaiting an available gateway"; readiness must be visible when
+ *  there is no work so the lane is trusted the moment work arrives. */
+const TRAIN_READY_MS = 15 * 60_000;
 
 /** The standard verify-duty body — the ONE 5c-gated template. The normal
  *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
@@ -6764,7 +6769,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const queued = Number(z.queue_len ?? 0);
       reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
     } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
-    else reason = "merge-train: awaiting an available gateway";
+    else {
+      // Ray 2026-10-29: idle no longer reads as a gateway shortage — a recent
+      // merge-capable tick means the train is READY (name the machine + age);
+      // only past TRAIN_READY_MS is the honest "awaiting" true.
+      const capAt = Number(meta.lane?.last_capable_lease_ts ?? 0);
+      const capHolder = String(meta.lane?.last_capable_holder ?? "");
+      const mins = Math.max(0, Math.round((now - capAt) / 60_000));
+      reason = capAt && capHolder && now - capAt < TRAIN_READY_MS
+        ? `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`
+        : "merge-train: awaiting an available gateway";
+    }
     if (meta.blocked?.reason !== reason) {
       meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run bridge train on a gateway (doctor-gated)" };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), laneId);
@@ -6850,7 +6865,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ...(meta.lane ?? {}),
       key: laneKey(repo, base),
       last_lease_ts: now,
-      ...(body.merge_capable === true ? { last_capable_lease_ts: now } : {}),
+      ...(body.merge_capable === true ? { last_capable_lease_ts: now, last_capable_holder: holder } : {}),
     };
     if (body.merge_capable === true && meta.lane.starved_since) {
       meta.lane.starved_since = null; // a capable executor is back — episode over
@@ -7552,6 +7567,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         lane.repo, lane.base,
       ).toArray()[0] ?? null;
       const starved = await this.laneStarvationTick(l, meta, lane, queue, now0);
+      const capableAt = Number(meta.lane?.last_capable_lease_ts ?? 0);
+      const capable = capableAt
+        ? { holder: String(meta.lane?.last_capable_holder ?? ""), at: capableAt, age_ms: now0 - capableAt, ready: now0 - capableAt < TRAIN_READY_MS }
+        : null;
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -7561,6 +7580,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         required_workflows: lane.required_workflows,
         reason: String(meta.blocked?.reason ?? ""),
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
+        capable,
         starved,
         queue,
         activity: {

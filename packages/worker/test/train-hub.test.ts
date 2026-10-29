@@ -157,6 +157,25 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(again.body.lease.holder).toBe("gw-2");
   });
 
+  it("idle ≠ gateway-less: a recent merge-capable tick marks the lane READY with the machine named (Ray 2026-10-29 — readiness visible with no work queued)", async () => {
+    const repo = "state-vector/lane-ready";
+    // fresh lane: no capable tick ever — the honest awaiting reason
+    await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    const fresh = await laneSnap(repo);
+    expect(fresh.reason).toBe("merge-train: awaiting an available gateway");
+    expect(fresh.capable).toBeNull();
+    // a merge-capable acquire+release (the gateway's idle-tick shape) → READY
+    const a = await acquire(repo, "gw-ready", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    const rel = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ready" });
+    expect(rel.body.error ?? "").toBe("");
+    const snap = await laneSnap(repo);
+    expect(snap.capable).toEqual(expect.objectContaining({ holder: "gw-ready", ready: true }));
+    expect(snap.capable.age_ms).toBeLessThan(15 * 60_000);
+    const cardMeta = (await kbJson("/get", { id: snap.card })).body.meta ?? {};
+    expect(String(cardMeta.blocked?.reason ?? "")).toBe("merge-train: ready — last ticked by gw-ready 0m ago");
+  });
+
   it("queued → merged → awaiting-CI → landed: the accept hook queues, the hub stamps provenance, and the card closes on the machine proxy", async () => {
     const repo = "state-vector/bridge";
     const HEAD = "a".repeat(40);

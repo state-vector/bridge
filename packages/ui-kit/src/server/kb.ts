@@ -162,6 +162,11 @@ export interface KbTrainLane {
   stop: { sha?: string; reason?: string; at?: number; pr?: number } | null;
   required_workflows?: string[];
   reason?: string;
+  last_capable_lease_ts?: number | null;
+  /** last merge-capable gateway tick — the machine the train will hand to
+   *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
+   *  still names WHO is driving it and that merges will start when work lands. */
+  capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
   queue: { id: string; priority: "critical" | "normal" }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {

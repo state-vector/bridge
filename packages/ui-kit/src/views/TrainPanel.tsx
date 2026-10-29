@@ -83,8 +83,18 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             >
               lock {l.lease.holder} · hb {age(l.lease.heartbeat_ts, now)}
             </Chip>
+          ) : l.capable?.ready ? (
+            <Chip
+              pill
+              tone="ok"
+              title={`train ready — merge-capable gateway ${l.capable.holder} ticked this lane ${age(l.capable.at, now)} ago; it acquires the lock on its next tick (every ~45s) once work is queued`}
+            >
+              train ready · {l.capable.holder} · tick {age(l.capable.at, now)} ago
+            </Chip>
           ) : (
-            <Chip pill tone="muted" title="no gateway holds this lane's CAS lease — a tick will acquire it">lock free</Chip>
+            <Chip pill tone="muted" title="no merge-capable gateway has ticked this lane inside the 15-minute window — merges wait until one runs (start a gateway / bridge train)">
+              no gateway ticking
+            </Chip>
           )}
           {l.currently && (
             <span className="train-currently" title={`in-flight: ${JSON.stringify(l.currently)}`}>
@@ -131,7 +141,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         </div>
       ))}
       {!error && lanes && lanes.length > 0 && lanes.every((l) => !hasSignal(l)) && (
-        <div className="muted-note train-all-idle">all lanes idle — no queued PRs, no lease held</div>
+        <div className="muted-note train-all-idle">all lanes idle — queues empty; a ready lane names the machine that takes the next head</div>
       )}
     </div>
   );
