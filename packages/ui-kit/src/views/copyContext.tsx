@@ -22,6 +22,9 @@ export function CopyContextBtn({ task, versions, size = "sm" }: {
   const onClick = async () => {
     const block = buildPromptContext(task, {
       versions,
+      // BR#4695: prefer the hub-stamped canonical permalink — the copy never
+      // carries the workers.dev fallback host, even when browsed via it.
+      permalink: typeof task.url === "string" ? task.url : undefined,
       origin: typeof window !== "undefined" ? window.location.origin : undefined,
     });
     const ok = await copyText(block);

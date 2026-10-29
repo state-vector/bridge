@@ -68,6 +68,9 @@ export interface PromptContextOpts {
   historyLimit?: number;
   /** origin for the absolute permalink (window.location.origin at the call site) */
   origin?: string;
+  /** hub-stamped absolute permalink — canonical origin regardless of ingress
+   *  (BR#4695); preferred over origin+path when present. */
+  permalink?: string;
 }
 
 /** One pasteable context block for `task`. Generic: any artefact type
@@ -81,7 +84,8 @@ export function buildPromptContext(
 
   lines.push(`Bridge card ${task.id}${task.title ? ` — "${task.title}"` : ""}`);
   const path = cardPath(task.id);
-  if (path && opts.origin) lines.push(`${opts.origin}${path}`);
+  if (path && opts.permalink) lines.push(opts.permalink);
+  else if (path && opts.origin) lines.push(`${opts.origin}${path}`);
   else if (path) lines.push(`(permalink: ${path})`);
 
   const bits = [

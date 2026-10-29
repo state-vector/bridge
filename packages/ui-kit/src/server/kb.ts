@@ -23,6 +23,10 @@ export interface KbArtefact {
   created_ts: number;
   updated_ts: number;
   status_ts?: number;
+  /** hub-stamped canonical permalink (/card/BR-NNNN on CANONICAL_ORIGIN,
+   *  BR#3990 stamper + BR#4695 canonical emission) — present on rows served
+   *  by the worker's MCP/API boundary, absent on locally-projected rows. */
+  url?: string;
   /** parent task id, projected by board() from child_of relations */
   part_of?: string;
   /** proposed decisions only — the open feedback round + agent consensus tally (BR#903) */

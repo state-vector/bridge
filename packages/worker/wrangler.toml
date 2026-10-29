@@ -60,6 +60,12 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/*", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
 
 [vars]
+# BR#4695: the origin stamped into every emitted artefact/permalink URL (MCP
+# `url`/`artefact_url` fields, UI copy-context permalinks). The routes above
+# make hub.fleetbridge.run canonical; the workers.dev ingress stays enabled
+# as a fallback (workers_dev above) but never appears in emitted links. A
+# fork deploying elsewhere MUST set this to its own public origin.
+CANONICAL_ORIGIN = "https://hub.fleetbridge.run"
 # BR#4252: MODEL_IDS (the fabricated model registry served at /v1/models) is
 # REMOVED — the hub is not a model gateway; models are the agent CLI's
 # business. Do not re-add.
