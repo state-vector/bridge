@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.6.0";
+export const BUILD = "0.7.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 

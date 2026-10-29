@@ -6,7 +6,7 @@
  * specs-permalink.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { stampPermalinks } from "../src/permalink.ts";
+import { emitOrigin, stampPermalinks } from "../src/permalink.ts";
 
 describe("stampPermalinks (the MCP payload stamper)", () => {
   const ORIGIN = "https://hub.fleetbridge.run";
@@ -77,5 +77,27 @@ describe("stampPermalinks (the MCP payload stamper)", () => {
     const once = JSON.stringify(payload);
     stampPermalinks(payload, ORIGIN);
     expect(JSON.stringify(payload)).toBe(once);
+  });
+});
+
+describe("emitOrigin (BR#4695 canonical link emission)", () => {
+  it("defaults to the canonical hub origin when CANONICAL_ORIGIN is unset/blank", () => {
+    expect(emitOrigin(undefined)).toBe("https://hub.fleetbridge.run");
+    expect(emitOrigin(null)).toBe("https://hub.fleetbridge.run");
+    expect(emitOrigin("")).toBe("https://hub.fleetbridge.run");
+    expect(emitOrigin("   ")).toBe("https://hub.fleetbridge.run");
+  });
+
+  it("prefers a configured CANONICAL_ORIGIN, trimmed", () => {
+    expect(emitOrigin("https://hub.example.com")).toBe("https://hub.example.com");
+    expect(emitOrigin("  https://hub.example.com  ")).toBe("https://hub.example.com");
+  });
+
+  it("emitted links carry the canonical origin regardless of ingress host", () => {
+    // the workers.dev fallback ingress serves requests, but never names
+    // itself in emitted urls — the stamp uses emitOrigin, not request.url
+    const payload = { open_artefacts: [{ id: "BR#4695", type: "task", title: "x", status: "in_progress" }] };
+    stampPermalinks(payload, emitOrigin(undefined));
+    expect((payload.open_artefacts[0] as any).url).toBe("https://hub.fleetbridge.run/card/BR-4695");
   });
 });

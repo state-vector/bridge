@@ -13,7 +13,7 @@
  */
 import { composeBootstrap, DEFAULT_WS_SLUG, doWs, hashAuthToken, tokenWorkspace } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
-import { stampPermalinks } from "./permalink.ts";
+import { emitOrigin, stampPermalinks } from "./permalink.ts";
 
 /** Build marker lives in ./mcp-tools.ts (single source) — re-exported here. */
 import { BUILD, TOOL_TABLE, err, toolsList } from "./mcp-tools.ts";
@@ -169,9 +169,12 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     const out = await r.json();
     if (!r.ok) throw kbError(op, r.status, out);
     // BR#3990: every artefact row in every tool payload carries `url` — the
-    // card's canonical deep link, built from the request's public origin.
+    // card's canonical deep link. BR#4695: the link origin is CANONICAL
+    // (CANONICAL_ORIGIN var, default hub.fleetbridge.run) — never the
+    // request's ingress host, so the workers.dev fallback keeps serving but
+    // never appears in emitted links.
     // One boundary, all tools; handlers that spread DO results inherit it.
-    return stampPermalinks(out, new URL(request.url).origin);
+    return stampPermalinks(out, emitOrigin(env?.CANONICAL_ORIGIN));
   };
 
   let result: unknown;

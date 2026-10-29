@@ -19,6 +19,26 @@
  */
 import { cardPath, isCardId } from "@bridge/specs";
 
+/**
+ * BR#4695 — the origin used for link EMISSION. The hub answers on two
+ * ingresses: the canonical hub.fleetbridge.run custom domain and the
+ * workers.dev fallback (kept SERVING after the 2026-10-27 NXDOMAIN). Links
+ * embedded in returned payloads must always carry the canonical origin,
+ * regardless of which ingress the request arrived on — a card link that
+ * says workers.dev sends users to the wrong origin.
+ *
+ * CANONICAL_ORIGIN (wrangler [vars], set to the canonical origin at deploy)
+ * overrides; the default IS the canonical origin, so emission is canonical
+ * even where the var is absent. A fork deploying elsewhere must set the var
+ * to its own public origin.
+ */
+export const DEFAULT_CANONICAL_ORIGIN = "https://hub.fleetbridge.run";
+
+export function emitOrigin(configured: unknown): string {
+  if (typeof configured === "string" && configured.trim()) return configured.trim();
+  return DEFAULT_CANONICAL_ORIGIN;
+}
+
 /** Subtrees that are free text / opaque data, never permalink candidates. */
 const SKIP_KEYS = new Set([
   "meta", "payload", "data",
