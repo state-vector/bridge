@@ -150,10 +150,19 @@ struct Ctx {
     session: String,
     /// Worker-class gh identities allowed to execute write legs (BR#3181).
     worker_identities: Vec<String>,
-    /// Probed identity class (cached when decided; Unknown re-probes per tick).
+    /// Probed identity class (cached ≤5 min — claim-time truth, not startup
+    /// truth; Unknown re-probes every tick).
     identity: Option<IdentityClass>,
+    /// When `identity` was probed (ms epoch) — drives the ≤5-min re-probe.
+    identity_probed_ms: u64,
     /// The identity label last announced — logs only on change.
     identity_announced: Option<String>,
+    /// BR#4489: a mid-merge permission refusal demotes the host for the
+    /// PROCESS LIFETIME — startup truth was runtime falsehood; gh could
+    /// still classify the login as a worker, so this gate is separate from
+    /// `identity` and never re-probes away.
+    demoted: Option<String>,
+    skip_log_ms: u64,
     /// Lane allowlist (`repo@base` keys). Empty = every lane the hub reports.
     lane_allow: Vec<String>,
     /// Fixed workdir (MERGE_TRAIN_WORKDIR). None → managed clone cache.
@@ -259,7 +268,10 @@ impl Ctx {
             session: SESSION.into(),
             worker_identities: worker_identities_from_env(),
             identity: None,
+            identity_probed_ms: 0,
             identity_announced: None,
+            demoted: None,
+            skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: workdir_env,
             last_action: "executor started".into(),
@@ -338,16 +350,27 @@ impl Ctx {
     }
 
     /// Probe (`gh api user --jq .login`) and classify this tick's gh
-    /// credential. Decided classes are cached for the process; Unknown
-    /// (gh broke / transient) re-probes every tick. Logs loudly on change —
-    /// the identity law must be VISIBLE, not ambient.
+    /// credential. Decided classes are cached ≤5 min (BR#4489: startup truth
+    /// is not runtime truth — the check re-runs at claim time on that
+    /// cadence); Unknown (gh broke / transient) re-probes every tick. Logs
+    /// loudly on change — the identity law must be VISIBLE, not ambient.
     fn ensure_identity(&mut self) -> IdentityClass {
+        const IDENTITY_CACHE_MS: u64 = 5 * 60_000;
         let decided = match &self.identity {
-            Some(c @ (IdentityClass::Worker(_) | IdentityClass::Personal(_))) => c.clone(),
+            Some(c @ (IdentityClass::Worker(_) | IdentityClass::Personal(_)))
+                if now_ms().saturating_sub(self.identity_probed_ms) < IDENTITY_CACHE_MS =>
+            {
+                c.clone()
+            }
             _ => {
                 let login = self.sh("gh", &["api", "user", "--jq", ".login"]).unwrap_or_default();
                 let class = classify_login(&login, &self.worker_identities);
+                self.identity_probed_ms = now_ms();
+                let changed = matches!(&self.identity, Some(prev) if *prev != class);
                 self.identity = Some(class.clone());
+                if changed {
+                    log(None, &format!("gh identity CHANGED mid-run → {class:?} — re-classified at claim time (≤5-min cache)"));
+                }
                 class
             }
         };
@@ -366,9 +389,37 @@ impl Ctx {
     /// THE identity gate (BR#3181): only a worker-class credential may execute
     /// GitHub write legs (merge / update-branch / close). Personal and
     /// unknown identities are refused — fail-closed — and the refusal is
-    /// loud, never silent.
+    /// loud, never silent. A demoted host (BR#4489: gh refused a write this
+    /// process had every reason to believe it could make) is refused
+    /// unconditionally for the process lifetime.
     fn write_allowed(&mut self) -> bool {
+        if self.demoted.is_some() {
+            return false;
+        }
         matches!(self.ensure_identity(), IdentityClass::Worker(_))
+    }
+
+    /// BR#4489 self-demotion: the capability claim was false at merge time —
+    /// never trust this process's classification again. The demote is
+    /// process-lifetime by construction (a fresh process re-classifies from
+    /// live gh, which is the recovery path: fix the credential, restart).
+    fn demote(&mut self, reason: &str) {
+        if self.demoted.is_none() {
+            log(None, &format!("SELF-DEMOTED: {reason} — this process will not claim the train lock again (restart the gateway after fixing the credential)"));
+        }
+        self.demoted = Some(reason.to_string());
+        self.identity_announced = None;
+    }
+
+    /// BR#4489: the incapable-host skip, logged on a slow throttle (once per
+    /// 10 min) — visible without spamming a 45s loop.
+    fn note_skip_throttled(&mut self, key: &str, reason: &str) {
+        let now = now_ms();
+        if now - self.skip_log_ms >= 10 * 60_000 {
+            self.skip_log_ms = now;
+            log(Some(key), reason);
+            self.note(reason);
+        }
     }
 
     /// Resolve the workdir for a lane's repo: the explicit override
@@ -597,7 +648,7 @@ fn renew_lease(ctx: &mut Ctx, repo: &str, base: &str) -> bool {
         "progress_age_ms": now_ms().saturating_sub(ctx.last_action_ms),
         "holder": ctx.holder,
     });
-    ctx.train_lease(repo, base, "renew", json!({ "progress": progress })).is_ok()
+    ctx.train_lease(repo, base, "renew", json!({ "progress": progress, "merge_capable": true })).is_ok()
 }
 
 /// Release only when nothing is in flight; an awaiting-CI lane keeps the
@@ -632,9 +683,20 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
         .unwrap_or_default();
     let typical_ms = lane.get("ci_typical_minutes").and_then(|v| v.as_u64()).unwrap_or(TRAIN_CI_TYPICAL_MINUTES) * 60_000;
 
+    // ---- BR#4489 capability honesty: a host that cannot merge does not
+    // contend the lock. Claiming without capability made the lane LOOK
+    // served while nothing could advance (the 2026-10-29 outage). The check
+    // re-probes gh on a ≤5-min cache at claim time; the skip logs on a
+    // slow throttle so the reason stays visible without spamming. ----
+    let capable = ctx.write_allowed();
+    if !capable {
+        ctx.note_skip_throttled(&key, "will not claim train lock as I cannot merge PRs (identity gate BR#3181 — bridge doctor names the fix)");
+        return;
+    }
+
     // ---- CAS lease (the hub decides; a conflict means ANOTHER live executor).
     // holder is ALWAYS the authenticated actor (the hub stamps it). ----
-    let lease = match ctx.train_lease(&repo, &base, "acquire", json!({ "required_workflows": required })) {
+    let lease = match ctx.train_lease(&repo, &base, "acquire", json!({ "required_workflows": required, "merge_capable": true })) {
         Ok(l) => l,
         Err(e) => {
             if e.contains("lane lease held live") {
@@ -648,8 +710,15 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     log(Some(&key), &format!("lease: {} (holder={})", vstr(&lease, "note").unwrap_or("acquired"), ctx.holder));
 
     if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms) {
-        // fail-closed: the lease lapses (5 min) and the next gateway
-        // reconciles from live GitHub. Never retry-blind inside the tick.
+        // BR#4489: a permission refusal mid-merge demotes the host for the
+        // process lifetime — startup truth was runtime falsehood; fail closed.
+        let low = e.to_lowercase();
+        if low.contains("403") || low.contains("permission") || low.contains("not authorized") {
+            ctx.demote("gh refused a merge write (403/permission)");
+        }
+        // fail-closed: the lease is released here (a demoted holder must not
+        // keep the lane parked) and the next gateway reconciles from live
+        // GitHub. Never retry-blind inside the tick.
         log(Some(&key), &format!("tick error: {}", trunc(&e, 300)));
         let _ = ctx.train_lease(&repo, &base, "release", json!({}));
         // The daemon leg must NEVER kill its host process (BR#4104): the
@@ -1167,7 +1236,10 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         session: cfg.session.clone(),
         worker_identities: worker_identities_from_env(),
         identity: None,
+        identity_probed_ms: 0,
         identity_announced: None,
+        demoted: None,
+        skip_log_ms: 0,
         lane_allow: cfg.lanes.clone(),
         workdir_override: cfg.workdir_override.clone(),
         last_action: "gateway leg tick".into(),
@@ -1507,8 +1579,11 @@ mod tests {
             in_process: true,
             session: "merge-train@test".into(),
             worker_identities: vec!["detached-cody".into()],
-            identity: None,
+            identity: Some(IdentityClass::Worker("detached-cody".into())), // test ctx: pre-classified worker — no live gh probe
+            identity_probed_ms: now_ms(),
             identity_announced: None,
+            demoted: None,
+            skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: None,
             last_action: "test".into(),
@@ -1556,6 +1631,8 @@ mod tests {
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         assert_eq!(names, vec!["train_lease", "get_artefact", "train_status", "train_lease", "train_lease"]);
+        // BR#4489: the acquire declares capability so the hub can starve-detect
+        assert_eq!(call_args(&recorded[0]).get("merge_capable"), Some(&json!(true)));
         // B's only call is the failed acquire — it never touched the lane.
         let b_acquire = recorded.last().unwrap();
         assert_eq!(call_args(b_acquire).get("action").and_then(|v| v.as_str()), Some("acquire"));
@@ -1582,6 +1659,73 @@ mod tests {
         assert_eq!(names, vec!["train_lease", "train_lease", "get_artefact", "train_status", "train_lease"]);
         let acquire2 = call_args(&recorded[1]);
         assert_eq!(acquire2.get("action").and_then(|v| v.as_str()), Some("acquire"));
+    }
+
+    #[test]
+    fn incapable_host_never_claims_the_lock_br4489() {
+        // A personally-classed gateway does not even contend: zero hub calls,
+        // the skip names itself (Ray's line), and no lease is taken.
+        let (hub, calls) = mock_hub(vec![]);
+        let mut ctx = test_ctx(&hub);
+        ctx.identity = Some(IdentityClass::Personal("rayh".into()));
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
+        assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
+    }
+
+    #[test]
+    fn classify_login_pins_the_identity_law_br4489() {
+        // The doctor and the claim-time gate share this decision point: a
+        // worker-allowlist login is Worker, anything else (including case
+        // variants and blanks) is Personal/Unknown — fail-closed.
+        let ids = vec!["detached-cody".to_string()];
+        assert_eq!(classify_login("detached-cody", &ids), IdentityClass::Worker("detached-cody".into()));
+        assert_eq!(classify_login("  Detached-Cody ", &ids), IdentityClass::Worker("Detached-Cody".into()), "classification is case-insensitive, label preserved");
+        assert_eq!(classify_login("rayh", &ids), IdentityClass::Personal("rayh".into()));
+        assert!(matches!(classify_login("", &ids), IdentityClass::Unknown(_)), "empty probe → Unknown (fail-closed, re-probes)");
+    }
+
+    #[test]
+    fn merge_403_self_demotes_for_the_process_lifetime_br4489() {
+        // A permission refusal mid-drive: the lease is released IMMEDIATELY
+        // (a demoted holder must not park the lane) and the very next tick
+        // claims nothing — the demote outlives any gh re-classification.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })), // acquire
+            Err("gh api repos/x/y/pulls/9: 403 Permission denied (resource not accessible by personal access token)".into()), // get_artefact refused
+            ok(json!({ "note": "lease released — write refused" })), // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        assert!(ctx.demoted.is_some(), "403 must demote the host");
+        drive_lane(&mut ctx, &lane()); // demoted: must not touch the hub at all
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_lease"],
+            "expected acquire → refused read → release, then ZERO calls from the demoted tick, got {names:?}"
+        );
+        let release = call_args(&recorded[2]);
+        assert_eq!(release.get("action").and_then(|v| v.as_str()), Some("release"), "the demote must release the lease, not let it lapse");
+    }
+
+    #[test]
+    fn identity_cache_reprobes_after_five_minutes_br4489() {
+        // The ≤5-min cache, deterministically: the allowlist is a sentinel no
+        // real gh login can match, so ANY probe classifies non-Worker. A fresh
+        // Worker classification must stand WITHOUT probing; a stale one MUST
+        // re-probe (and therefore refuse).
+        let (hub, _calls) = mock_hub(vec![]);
+        let mut ctx = test_ctx(&hub);
+        ctx.worker_identities = vec!["test-only-no-such-worker".into()];
+        ctx.identity = Some(IdentityClass::Worker("test-only-no-such-worker".into()));
+        ctx.identity_probed_ms = now_ms();
+        assert!(ctx.write_allowed(), "fresh classification is authoritative inside the window — a probe would have refused");
+        ctx.identity_probed_ms = now_ms().saturating_sub(6 * 60_000);
+        assert!(!ctx.write_allowed(), "outside the window the gate must re-probe gh (which cannot classify the sentinel as Worker)");
+        assert!(ctx.identity_probed_ms >= now_ms().saturating_sub(5_000), "the re-probe must refresh the probe clock");
     }
 
     // ---------- BR#4170: the reconcile leg ----------

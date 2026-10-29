@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh
 The runner is a long-lived process: keep it alive with systemd (linux) or a LaunchAgent / `nohup` (macOS).
 
 ```bash
-bridge doctor            # checks config, token, agent CLIs + agent profiles, git, and the merge-train executor prerequisites (gh authed + repo scope, git) — every failure names the fix
+bridge doctor            # checks config, token, agent CLIs + agent profiles, git, and the merge-train executor prerequisites (gh authed + repo scope + worker-class identity + lane-repo push, git) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
 bridge service install   # linux: writes a systemd user unit
 systemctl --user enable --now bridge
@@ -596,6 +596,19 @@ releases the lease. Lease renewals carry proof-of-progress (last ledger action +
 and the hub consumes it (BR#4129): a holder whose action note freezes while cards queue
 is evicted — see the lease law below.
 
+**Capability honesty (BR#4489, ADR BR#4487)**: a gateway that cannot merge does not
+pretend to serve the lane. `bridge doctor` classifies the host (`gh api user` against
+`MERGE_TRAIN_WORKER_IDENTITIES`) and checks push permission on the lane repos; an
+incapable host prints `will not claim train lock as I cannot merge PRs` and doctor exits
+with the merge-train leg flagged (non-fatal for non-train functions). At claim time the
+executor re-checks the classification on a ≤5-minute cache — startup truth is not
+runtime truth — and a non-capable host skips lane contention entirely (the skip logs
+once per 10 minutes, not every tick). If a merge write is refused mid-flight (403 /
+permission), the executor releases the lease immediately and **self-demotes for the
+process lifetime** — it will not claim the train lock again until the gateway restarts
+with a fixed credential. Leases carry `merge_capable`, so the hub can tell a served
+lane from a pretended one.
+
 `bridge train` remains the standalone form of the same module (decision BR#3880 —
 install is the unit: no Node, no script file). It runs on any machine that has `gh`
 (authed, with the `repo` scope), `git` and a clone of the target repo — or, with no
@@ -624,6 +637,13 @@ gates the prerequisites (gh present + authed + `repo` scope, git — each failur
 the fix); the executor re-probes the cheap ones every start. It merges as whatever
 identity that `gh` is authed as — the identity gate refuses the write legs unless that
 is the worker-class credential per BR#3181, never a personal one.
+
+**Dedicated merge node (`role: train`, BR#4489)**: a normal gateway in a named mode —
+set `"role": "train"` in the config (`~/.bridge/config.json`) or `BRIDGE_ROLE=train` in
+the environment, and the daemon skips task dispatch entirely while the connection and
+merge-train legs keep running. This is the redundancy model from the ADR: run N
+capable gateways (or one dedicated train node) — merges never move server-side. Default
+(absent role) is the unchanged opportunistic gateway.
 
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
@@ -667,6 +687,16 @@ included) as "unmergeable — CONFLICTING".
   releases the lease, and an **empty queue always renews** (idle holding is harmless).
   Legacy executors that send `{}` renewals carry no proof — treated as UNKNOWN
   (allowed + a loud audit line) while the deprecation window runs.
+- **Starvation alarm (BR#4489)**: a lane whose queue is non-empty with **no
+  merge-capable lease for >10 minutes** cannot advance — the executor outage class
+  where gateways tick (bounces flow) but merges stand down. The hub stamps the episode
+  (`meta.lane.starved_since`), broadcasts `lane.starved` on the WS push channel, marks
+  the lane `starved: {since, mins}` in `train_status` (the trains panel renders it red),
+  and files **one time-sensitive ask per episode** to the alarm sink — restart a
+  capable gateway, merge the head by hand, or waive. Judged both on `train.status`
+  reads and proactively on the hub's alarm sweep, so a dead train is loud even with
+  zero panel readers. Recovery is automatic: the first capable lease (or the queue
+  draining) clears the starved state.
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, CI settling on the merge commit before the next head enters.

@@ -705,3 +705,86 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
   });
 });
+
+describe("BR#4489 starvation — capability-aware lane health", () => {
+  it("merge_capable leases stamp the capable clock; a non-capable lease does not", async () => {
+    const repo = "state-vector/starve-capable";
+    const a = await acquire(repo, "gw-cody", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    const lane0 = await laneSnap(repo);
+    expect(lane0.last_capable_lease_ts).toBeGreaterThan(0);
+    const stamped = lane0.last_capable_lease_ts;
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+
+    // the stand-down class: a lease op WITHOUT merge_capable must leave the
+    // capable clock alone (it proves liveness, not capability)
+    const b = await acquire(repo, "gw-personal", {});
+    expect(b.body.error ?? "").toBe("");
+    const lane1 = await laneSnap(repo);
+    expect(lane1.last_capable_lease_ts).toBe(stamped);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-personal" });
+  });
+
+  it("non-empty queue + no capable lease >10min ⇒ starved — `lane.starved` broadcast + red ask ONCE per episode", async () => {
+    const repo = "state-vector/starve-lane";
+    const a = await acquire(repo, "gw-cody", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    const seeded = await laneSnap(repo);
+    const laneCard: string = seeded.card;
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+
+    // queue a card the REAL way (verify close citing head + PR — the accept hook)
+    await queueViaAccept({ repo, pr: 44891, head: "b".repeat(40), title: "IMPL: starve drill" });
+    const queued = await laneSnap(repo);
+    expect(queued.queue.length).toBeGreaterThan(0);
+
+    // backdate the capable clock deep past the 10-min starve window
+    const before = (await kbJson("/events?limit=500")).body.events.filter(
+      (e: any) => e.op === "lane.starved" && e.artefact_id === laneCard,
+    );
+    const lc = await kbJson("/get", { id: laneCard });
+    const m = lc.body.meta;
+    m.lane.last_capable_lease_ts = Date.now() - 25 * 60_000;
+    await kbJson("/update", { id: laneCard, meta: m });
+
+    const starvedEvents = async () =>
+      (await kbJson("/events?limit=500")).body.events.filter(
+        (e: any) => e.op === "lane.starved" && e.artefact_id === laneCard,
+      );
+
+    // a read judges starvation (trainStatus) — as does the alarm sweep, so
+    // the FIRST episode entry may come from either caller; exactly one ask
+    // and one broadcast per episode is the contract
+    const st = await kbJson("/train.status", { repo });
+    const lane = st.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    expect(lane.starved).toBeTruthy();
+    expect(lane.starved.mins).toBeGreaterThanOrEqual(10);
+    expect(lane.last_capable_lease_ts).toBeGreaterThan(0);
+
+    // …the episode stamps ONCE, broadcasts ONCE, and fires the red ask ONCE
+    const after1 = await starvedEvents();
+    expect(after1.length).toBeGreaterThanOrEqual(before.length + 1);
+    const stamped1 = (await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since;
+    expect(stamped1).toBeGreaterThan(0);
+    const asks1 = await kbJson("/search?q=starved&type=question&limit=50");
+    // NB: /search's semantic branch ignores the type filter — re-apply it here
+    const mine1 = asks1.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`));
+    expect(mine1.length).toBe(1);
+
+    // a second read (and the alarm sweep riding the alarm tick) must NOT
+    // re-broadcast, re-stamp, or re-ask: once per episode
+    await kbJson("/train.status", { repo });
+    const after2 = await starvedEvents();
+    expect(after2.length).toBe(after1.length);
+    expect((await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since).toBe(stamped1);
+    const asks2 = await kbJson("/search?q=starved&type=question&limit=50");
+    expect(asks2.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`)).length).toBe(1);
+
+    // recovery: a capable lease clears the episode (state + payload)
+    await acquire(repo, "gw-cody", { merge_capable: true });
+    const lane3 = await laneSnap(repo);
+    expect(lane3.starved).toBeNull();
+    expect((await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since ?? null).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+  });
+});
