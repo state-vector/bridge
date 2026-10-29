@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Voice } from "./Voice";
 
 const LS = { url: "bridge.url" };
 
@@ -44,7 +45,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function App() {
-  const [tab, setTab] = useState<"fleet" | "forme">("fleet");
+  const [tab, setTab] = useState<"fleet" | "forme" | "voice">("fleet");
   const [board, setBoard] = useState<Board | null>(null);
   const [decisions, setDecisions] = useState<Decision[] | null>(null);
   const [proposed, setProposed] = useState<Array<{ id: string; title: string; created_ts: number }> | null>(null);
@@ -158,6 +159,7 @@ export function App() {
         <button className={tab === "forme" ? "active" : ""} onClick={() => setTab("forme")}>
           For You{forMeCount > 0 ? ` (${forMeCount})` : ""}
         </button>
+        <button className={tab === "voice" ? "active" : ""} onClick={() => setTab("voice")}>Voice</button>
       </nav>
 
       <main className="mb-main">
@@ -230,6 +232,8 @@ export function App() {
             )}
           </>
         )}
+
+        {tab === "voice" && <Voice />}
 
         {!url && (
           <div className="mb-card">

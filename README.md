@@ -114,6 +114,39 @@ Server prerequisites: the agent CLI itself (e.g. [opencode](https://opencode.ai)
 
 The desktop app (gateway with UI) is `packages/desktop`: `npm run dev -w @bridge/desktop`.
 
+### Mobile app (iOS) — the voice console
+
+`packages/mobile` is the no-gateway surface: `ui/` is the Fleet + For You +
+Voice tab (browser-testable Vite/React over hub REST + WebSocket), `shell/`
+is a Tauri 2 iOS target wrapping it (`com.statevector.bridge.mobile`).
+
+The **Voice tab** is the narrow desktop chat, by ear:
+
+- **Tap to talk** — `SFSpeechRecognizer` with `requiresOnDeviceRecognition`:
+  on-device speech-to-text, live partial transcript, audio never leaves the
+  phone. Answers are spoken back with `AVSpeechSynthesizer` (offline
+  voices); tap mid-answer to interrupt.
+- **The brain is the same engine as the desktop console** — Apple's
+  on-device model (Foundation Models, iOS 26+ with Apple Intelligence) —
+  but it drives **bridge MCP tools** over a prompt-protocol loop: it can
+  `orient`, `search_knowledge`, `get_artefact` and read the ask inbox
+  before it answers, citing BR# ids. Read-only by construction: it never
+  claims or dispatches work, and answering an ask is confirm-first (the
+  app reads the proposed answer back; you confirm by voice or tap).
+- **Connect**: hub URL + a bridge token pasted from the hub's Connect tab
+  (the machine plane — same token class an agent uses). The Fleet/For You
+  tabs keep working with the OAuth web sign-in as before.
+
+Build (simulator, no signing needed):
+
+```bash
+npm install
+npm run build -w @bridge/mobile-ui
+cd packages/mobile/shell
+npx tauri ios build --target aarch64-sim
+# product: gen/apple/build/arm64-sim/Bridge.app — boot it in any iOS 26+ simulator
+```
+
 **One rendering path.** The web UI and the desktop shell render the *same*
 view components (Top, Backlog, Completed, task detail with dep graph and
 live work tree) from the shared kit `@bridge/ui-kit`, over the same data
@@ -1159,7 +1192,7 @@ contract.
 | `packages/ui-kit` | `@bridge/ui-kit` — shared design tokens + Btn/Chip/Card/Field/ConnDot/RelTime; one look for webapp, gateway UI and mobile |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
-| `packages/mobile/ui` | mobile UI (fleet + For You) — iOS shell coming soon |
+| `packages/mobile/ui` | mobile UI (Fleet + For You + Voice console) — native iOS shell (`packages/mobile/shell`, Tauri 2) |
 | `packages/cli` | headless `bridge` runner binary (reuses the desktop dispatch core) |
 | `packages/site` | public landing page (static) |
 | `packages/adapters` | anything → `/ingest` shippers |
