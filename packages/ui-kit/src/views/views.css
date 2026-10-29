@@ -467,6 +467,10 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .set-footnote { margin-top: 8px; line-height: 1.5; }
 
 /* ---------- merge-train panel (Top view, top strip) ---------- */
+/* 2026-10-29 (Ray): the strip rides the ktable primitive — same aligned
+   columns as Top (lock dot · line · status · activity); layout lives ONLY
+   in the --cols templates in the ktable block below. This block is visual
+   identity + the error/empty strips. */
 .train-panel { margin-bottom: 14px; }
 .train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
 .train-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
@@ -477,18 +481,30 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 .train-lane-idle { opacity: 0.75; }
 .train-lane-err { color: var(--red); font-size: 12px; }
-.train-lane-name { font-weight: 600; font-size: 12.5px; white-space: nowrap; }
-.train-currently { display: inline-flex; align-items: center; gap: 5px; }
 .train-pr { font-size: 12px; color: var(--accent); }
 .train-dur { font-size: 11.5px; color: var(--text-dim); }
 .train-tp { display: inline-flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-dim); }
 .train-tp-rate { font-weight: 600; color: var(--text); white-space: nowrap; }
 .train-last-event { white-space: nowrap; }
-.train-queue { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.train-queue { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .train-queue-label { font-size: 11.5px; color: var(--text-dim); }
 .train-queue-card { cursor: pointer; }
 .train-queue-card:hover { filter: brightness(1.15); }
 .train-all-idle { margin: 2px 0 0 2px; }
+.train-row { border-radius: 6px; }
+.train-row.train-row-idle { opacity: 0.75; }
+.trainc-dot { display: flex; align-items: center; justify-content: center; }
+.train-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; cursor: help; }
+.train-dot.td-live { background: var(--green); }
+.train-dot.td-lapse { background: var(--amber); }
+.train-dot.td-dead { background: var(--red); }
+.train-dot.td-free { background: var(--text-faint, #8b94a7); }
+.trainc-line { font-weight: 600; font-size: 12.5px; }
+.trainc-line.trainc-open { cursor: pointer; }
+.trainc-line:hover { color: var(--accent); }
+.trainc-status { display: flex; align-items: center; gap: 6px; overflow: hidden; }
+.trainc-info { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+.trainc-info .muted-note { overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
@@ -938,9 +954,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* per-table column templates — layout lives ONLY here, as --cols */
 .top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
+.train-head-cols, .train-row { --cols: 30px minmax(220px, 0.9fr) 210px minmax(260px, 1fr); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
   .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
+  .train-head-cols, .train-row { --cols: 26px minmax(150px, 0.8fr) 170px minmax(180px, 1fr); }
+  .train-tp-rate { display: none; }
 }
 
 /* ============================================================
