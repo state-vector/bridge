@@ -1141,6 +1141,59 @@ typed timer (inert: never fires, never claimable, never queued). Task→supersed
 not a client-legal edge (core.ts LIFECYCLES), so retirement — not deletion — keeps the
 board free of fixture accumulation without loosening the state machine. At most two
 inert blocked fixtures accumulate per run.
+
+## The merge-train canary: the lane rides itself daily (BR#4694)
+
+The hub self-canary above never touches the merge train — its queue fixture
+cites a fake PR that can never merge, by design. The train gets its own
+canary: **a synthetic PR rides a real lane end to end, daily** — claim →
+queue → gate → merge → CI → landed → the hub machine-closes the fixture:
+
+```bash
+~/.local/bin/bridge train-canary    # one ride (typ. 20–60 min); cron/launchd daily
+# exit 0 = green, 1 = red (alarm filed), 2 = config fatal
+# --sink BR#3124              alarm sink card (default BR#3124; TRAIN_CANARY_SINK_ID)
+# --repo OWNER/REPO           the lane to ride (default state-vector/bridge; TRAIN_CANARY_REPO)
+```
+
+One qualified `[train-canary]` fixture card per day: the watcher spawns it (or
+adopts the still-in-flight fixture from a previous run — idempotent under
+cron), the pool dispatches a real executor, and that executor opens a trivial
+signed PR touching `docs/train-canary-log.md`, labeled `train-canary`. The
+**human review ask is withheld for the canary PR**: the executor self-stamps
+the acceptance (`head_sha_at_acceptance` + `meta.merge_train` queued +
+`meta.canary=true`) — a mechanical act, not a judgment call — so the lane's
+gates are exercised everywhere except the one human leg, on a one-file doc
+touch. The existing train machinery does everything else: the PR queues,
+merges, waits out main CI, lands, and the landedFlow closes the fixture done.
+
+Phase bounds — a phase exceeding its bound is RED:
+
+| phase | bound |
+| --- | --- |
+| claim (fixture spawned → an executor holds it) | 15 min |
+| work (claim → PR open) | 15 min |
+| queue (queued → merge) | 30 min, with a head-of-line progress reset — backlog ≠ stuck: the clock restarts while the queue ahead of the fixture shrinks or the lane's current/last event moves |
+| CI (merged → green) | 60 min |
+| park (bounce / review wait) | 15 min |
+
+A fixture that landed inside 26 h short-circuits the run green without a second
+PR (idempotent daily cron). Every run stamps a `[train-canary] GREEN/RED`
+progress report — **48 h of silence there is the canary's own liveness alarm**,
+same law as the hub canary.
+
+**Red path**: one deduped ask per failure class (claim, work, queue-stalled,
+ci, park, ledger-tag, killed, retired, spawn) bound to the alarm sink, and the
+stuck fixture retired **inert** — `blocked` on a 30-day typed timer,
+`merge_train.state=retired`, `pr=0`: never claimable, never queued — so a red
+ride never leaves a live PR haunting the lane.
+
+**The ride never pollutes the numbers**: the hub stamps `canary=true` onto
+every ledger event for a canary PR (merged / bounced / stopped / landed) and
+the train throughput metrics (BR#4363 panel) exclude canary rows — the daily
+synthetic ride is invisible in real throughput; a canary bounce proceeds
+without the human review ask (the watcher owns that alarm instead).
+
 ## The board↔GitHub reconcile loop (BR#4170)
 
 The merge train accounts for PRs it *knows about*. The reconcile loop closes the gap:
