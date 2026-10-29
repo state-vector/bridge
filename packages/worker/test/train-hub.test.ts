@@ -780,6 +780,108 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-refile" });
   });
 
+  it("BR#4693 L4.2: a deduped review ask RE-FILES fresh past the TTL window on a head move — exactly one open ask per window; dedupe suppresses spam, not the leg", async () => {
+    const repo = "state-vector/lane-ttl";
+    const H1 = "5".repeat(40), H2 = "6".repeat(40);
+    const openAsks = async (c: string) =>
+      (await reviewAsks(c)).filter((a) => ["todo", "in_progress", "blocked"].includes(a.status));
+    const card = await queueViaAccept({ repo, pr: 3401, head: H1, title: "IMPL: ttl-refile drill" });
+    await acquire(repo, "gw-ttl", { required_workflows: ["Test"] });
+
+    // bounce #1 at H1 → the ask files with durability stamps (filed_ts + head_sha)
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-ttl", pr: 3401, task_id: card, head_sha: H1, conflict_files: ["a.ts"] })).body.error ?? "").toBe("");
+    let live = await openAsks(card);
+    expect(live.length).toBe(1);
+    const first = live[0];
+    expect(first.meta.ask.filed_ts).toBeGreaterThan(0);
+    expect(first.meta.ask.head_sha).toBe(H1);
+
+    // the human does not answer; the ask ages past the TTL window (backdated
+    // stamps — BOTH, since refreshed_ts is the last ask event and the TTL
+    // clock runs from it: a refresh would restart the window)
+    await kbJson("/update", { id: first.id, meta: { ...first.meta, ask: { ...first.meta.ask, filed_ts: Date.now() - 25 * 60 * 60_000, refreshed_ts: Date.now() - 25 * 60 * 60_000 } } });
+
+    // repair leg: the card re-queues (conflict resolved) — the ask stays OPEN and unanswered
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `conflict resolved — PR https://github.com/${repo}/pull/3401` });
+    const v2 = await kbJson("/create", { type: "task", title: `VERIFY: ttl ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const v2id = String(v2.body.id);
+    await kbJson("/link", { src: v2id, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: v2id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    await kbJson("/transition", { id: v2id, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3401 head ${H1}` });
+
+    // bounce #2 at a NEW head: aged + head moved ⇒ RE-FILE FRESH (supersede → new ask)
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-ttl", pr: 3401, task_id: card, head_sha: H2, conflict_files: ["a.ts"] })).body.error ?? "").toBe("");
+    const all = await reviewAsks(card);
+    live = all.filter((a) => ["todo", "in_progress", "blocked"].includes(a.status));
+    expect(live.length).toBe(1);
+    expect(live[0].id).not.toBe(first.id);
+    expect(live[0].meta.ask.filed_ts).toBeGreaterThan(0);
+    expect(live[0].meta.ask.head_sha).toBe(H2);
+    const stale = all.find((a) => a.id === first.id);
+    expect(stale.status).toBe("superseded");
+    expect(String(stale.meta.ask.superseded_reason)).toContain("TTL re-file");
+    // the card's bounce stamps point at the LIVE ask, and the refile is loud on the audit chain
+    const c1 = (await kbJson("/get", { id: card })).body;
+    expect(c1.meta?.merge_train?.review_ask_id).toBe(live[0].id);
+    expect(c1.meta?.merge_train?.review_ask_refiled).toBe(true);
+    const h = JSON.stringify(await (await kbJson("/get_history", { id: card, limit: 10 })).body);
+    expect(h).toContain("re-filed fresh (TTL");
+    const refiledId = live[0].id;
+
+    // bounce #3 at the SAME head inside the window: dedupe refresh — NO new ask
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `conflict resolved again — PR https://github.com/${repo}/pull/3401` });
+    const v3 = await kbJson("/create", { type: "task", title: `VERIFY: ttl 2 ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const v3id = String(v3.body.id);
+    await kbJson("/link", { src: v3id, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: v3id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    await kbJson("/transition", { id: v3id, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3401 head ${H2}` });
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-ttl", pr: 3401, task_id: card, head_sha: H2, conflict_files: ["a.ts"] })).body.error ?? "").toBe("");
+    live = await openAsks(card);
+    expect(live.length).toBe(1);
+    expect(live[0].id).toBe(refiledId);
+    expect(live[0].meta.ask.refreshed_ts).toBeGreaterThan(0);
+    expect(live[0].meta.ask.head_sha).toBe(H2);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ttl" });
+  });
+
+  it("BR#4693 scope 3: trainStatus surfaces the lane's open review asks OLDEST-FIRST — age chip aging at the TTL, lapsed past TTL+grace", async () => {
+    const repo = "state-vector/lane-agechip";
+    const H = "8".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3501, head: H, title: "IMPL: age-chip drill" });
+    await acquire(repo, "gw-chip", { required_workflows: ["Test"] });
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-chip", pr: 3501, task_id: card, head_sha: H, conflict_files: ["x.ts"] })).body.error ?? "").toBe("");
+    let lane = await laneSnap(repo);
+    expect((lane.review_asks ?? []).length).toBe(1);
+    expect(lane.review_asks[0].task).toBe(card);
+    expect(lane.review_asks[0].aging).toBe(false);
+    expect(lane.review_asks[0].lapsed).toBe(false);
+
+    // age past the TTL: the chip goes amber (aging), not red yet — both
+    // stamps backdated, refreshed_ts is the clock the surface reads
+    const asks = (await reviewAsks(card)).filter((a) => ["todo", "in_progress", "blocked"].includes(a.status));
+    await kbJson("/update", { id: asks[0].id, meta: { ...asks[0].meta, ask: { ...asks[0].meta.ask, filed_ts: Date.now() - 25 * 60 * 60_000, refreshed_ts: Date.now() - 25 * 60 * 60_000 } } });
+    lane = await laneSnap(repo);
+    expect(lane.review_asks[0].aging).toBe(true);
+    expect(lane.review_asks[0].lapsed).toBe(false);
+
+    // age past TTL+grace: the chip goes red (lapsed) — no ask hides without a visible chip
+    await kbJson("/update", { id: asks[0].id, meta: { ...asks[0].meta, ask: { ...asks[0].meta.ask, filed_ts: Date.now() - 27 * 60 * 60_000, refreshed_ts: Date.now() - 27 * 60 * 60_000 } } });
+    lane = await laneSnap(repo);
+    expect(lane.review_asks[0].lapsed).toBe(true);
+
+    // oldest-first: a second card's FRESH ask orders after the aged one
+    const H9 = "9".repeat(40);
+    const card2 = await queueViaAccept({ repo, pr: 3502, head: H9, title: "IMPL: age-chip drill 2" });
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-chip", pr: 3502, task_id: card2, head_sha: H9, conflict_files: ["y.ts"] })).body.error ?? "").toBe("");
+    lane = await laneSnap(repo);
+    expect((lane.review_asks ?? []).length).toBe(2);
+    expect(lane.review_asks[0].task).toBe(card);
+    expect(lane.review_asks[0].age_ms).toBeGreaterThanOrEqual(lane.review_asks[1].age_ms);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-chip" });
+  });
+
   it("BR#4068: landing the card retires the live review ask — the unanswered ask never fences the landed close (done-open-children)", async () => {
     const repo = "state-vector/lane-retire";
     const HEAD = "3".repeat(40), M = "4".repeat(40);

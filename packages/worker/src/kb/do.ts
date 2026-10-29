@@ -93,6 +93,9 @@ import {
   decideTrainGate,
   trainBounceBrief,
   resolveTrainBounceKind,
+  clampReviewAskTtlHours,
+  shouldRefileReviewAsk,
+  TRAIN_REVIEW_ASK_GRACE_MS,
   trainStopAskTitle,
   trainReviewAskTitle,
   trainReviewAskDetails,
@@ -7828,6 +7831,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // so the band shows the live leg with no manual filing (leg 3).
       let reviewAskId: string | null = null;
       let reviewAskDeduped = false;
+      let reviewAskRefiled = false;
       const reviewAskTitle = trainReviewAskTitle({ repo }, pr, taskId);
       // BR#4982 (per accepted BR#3452): mechanical bounce re-verifies route to
       // the AGENT review pool, not the human top — the fresh-session verifier
@@ -7835,7 +7839,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // human sees ONE rolling per-lane-day digest instead of N asks;
       // exception classes (stop-the-line, signing env) keep direct asks.
       const reviewAskTarget = this.settingValue("train.review_ask_target", "tag:review");
-      try {
+      // BR#4693 durability stamps: an ask node carries WHEN it was last
+      // filed/refreshed and at WHICH PR head — the TTL re-file decision
+      // reads exactly these two signals. filed_ts is the FIRST filing (kept
+      // across refreshes); refreshed_ts + head_sha track the last ask event.
+      const stampReviewAsk = (askId: string, base: any, ts: number) => {
+        const m = { ...(base ?? {}), ask: { ...(base?.ask ?? {}), review_leg: true, filed_ts: Number(base?.ask?.filed_ts ?? ts), refreshed_ts: ts, ...(headSha ? { head_sha: headSha } : {}) } };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(m), ts, askId);
+      };
+      const fileReviewAsk = async (): Promise<string | null> => {
         const res: any = await this.askCreate(
           {
             to: reviewAskTarget,
@@ -7849,24 +7861,61 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           },
           actor,
         );
-        reviewAskId = res?.id ?? null;
+        const id = res?.id ?? null;
+        if (id) {
+          const fresh = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+          if (fresh) stampReviewAsk(id, JSON.parse(fresh.meta ?? "{}"), now);
+        }
+        return id;
+      };
+      try {
+        reviewAskId = await fileReviewAsk();
       } catch (e) {
-        // an identical ask is already open — that IS the live leg. Refresh it
-        // (bump the stamp so the band shows it as current) and carry on: the
-        // bounce must never lose to ask dedupe.
+        // an identical ask is already open — that IS the live leg. But dedupe
+        // must suppress SPAM, never the leg itself (BR#4633 L4.2): an ask
+        // that sat unanswered past the TTL window while the PR head moved
+        // re-files FRESH (supersede the stale ask → file a new one), or the
+        // dismissal that started this class strands the human leg behind the
+        // dedupe guard forever. Otherwise: refresh the stamps (the band shows
+        // the ask as current) and carry on — the bounce must never lose to
+        // ask dedupe.
         reviewAskDeduped = true;
         const dup = this.one(
-          `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+          `SELECT c.id AS id, c.status AS status, c.created_ts AS created_ts, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
              AND c.type = 'question' AND c.title = ? LIMIT 1`,
           taskId, reviewAskTitle.slice(0, 200),
         ) as any;
         if (dup) {
           const dm = JSON.parse(dup.meta ?? "{}");
-          dm.ask = { ...(dm.ask ?? {}), review_leg: true, refreshed_ts: now };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(dm), now, dup.id);
-          this.version(dup.id, actor, "update", "review ask refreshed — the head moved past the accepted verdict again (BR#4068)", {});
-          reviewAskId = dup.id;
+          const ttlMs = clampReviewAskTtlHours(this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
+          const refile = shouldRefileReviewAsk({ ask: dm.ask, createdTs: dup.created_ts, headSha, now, ttlMs });
+          if (refile.refile) {
+            // Retire the stale ask, THEN file fresh — askCreate dedupes on
+            // OPEN asks only, so the supersede must land first. The status
+            // write rides the askAnswer precedent (questions complete by
+            // SQL+version; the transition machine is for work items).
+            const now3 = Date.now();
+            const sm = { ...dm, ask: { ...dm.ask, superseded_ts: now3, superseded_reason: `TTL re-file: ${refile.why}` } };
+            this.state.storage.sql.exec(`UPDATE artefacts SET status = 'superseded', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now3, now3, JSON.stringify(sm), dup.id);
+            this.version(dup.id, actor, "transition", `${dup.status} → superseded — review ask re-filed fresh (TTL): ${refile.why}`, { from: dup.status, to: "superseded", refile: true });
+            try {
+              reviewAskId = await fileReviewAsk();
+              reviewAskRefiled = !!reviewAskId;
+              reviewAskDeduped = !reviewAskRefiled;
+              if (reviewAskRefiled) this.audit(actor, "train:bounce_ask_ttl_refiled", lane.id, { task: taskId, pr, old_ask: dup.id, ask: reviewAskId, why: refile.why });
+            } catch (e2) {
+              // the re-file lost (rare) — no live ask this bounce; the NEXT
+              // bounce's dedupe finds nothing open (the stale ask is
+              // superseded) and files fresh on its own
+              this.audit(actor, "train:bounce_ask_refile_failed", lane.id, { task: taskId, pr, old_ask: dup.id, reason: String((e2 as Error)?.message ?? e2).slice(0, 160) });
+              reviewAskId = null;
+            }
+          } else {
+            stampReviewAsk(dup.id, dm, now);
+            this.version(dup.id, actor, "update", `review ask refreshed — the head moved past the accepted verdict again (BR#4068)${refile.why.startsWith("ask has no") ? `; ${refile.why}` : ""}`, {});
+            reviewAskId = dup.id;
+          }
         }
         this.audit(actor, "train:bounce_ask_deduped", lane.id, { task: taskId, pr, ask: reviewAskId, reason: String((e as Error)?.message ?? e).slice(0, 160) });
       }
@@ -7942,6 +7991,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           conflict_files: conflictFiles,
           review_ask_id: reviewAskId ?? undefined,
           review_ask_deduped: reviewAskDeduped || undefined,
+          review_ask_refiled: reviewAskRefiled || undefined,
           bounced_at: now2,
           pr,
           repo,
@@ -8001,7 +8051,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       cm.boosted = now;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, ask: reviewAskId });
-      this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
+      this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskRefiled ? " re-filed fresh (TTL re-file — the aged leg re-files; dedupe suppresses spam, not the leg — BR#4633 L4.2)" : reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
       // BR#4934: the lane forgets the in-flight merge ONLY when the bounced
       // card IS that merge's card — a bounce of a QUEUED candidate (a
       // mid-drain gate bounce or a settle-window rebase conflict) must not
@@ -9005,6 +9055,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
     const now0 = Date.now();
+    const ttlMs = clampReviewAskTtlHours(this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
       `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
@@ -9093,6 +9144,47 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const m = JSON.parse(c.meta ?? "{}");
         return trainCardMatchesLane(m, lane.repo, lane.base);
       }).length;
+      // review-ask aging (BR#4693 scope 3): every open review ask on a card
+      // riding this lane's UNLANDED legs, OLDEST FIRST — the panel renders an
+      // age chip per ask (amber at the TTL, red past TTL+grace), so no lapsed
+      // human leg hides behind a silent dedupe.
+      const askRows = this.state.storage.sql.exec(
+        `SELECT c.id AS ask_id, c.created_ts AS created_ts, c.meta AS ask_meta, p.id AS task, p.meta AS task_meta
+         FROM relations r
+         JOIN artefacts c ON c.id = r.src_id
+         JOIN artefacts p ON p.id = r.dst_id
+         WHERE r.relation = 'child_of' AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked')
+           AND p.type = 'task' AND CAST(json_extract(p.meta, '$.merge_train.pr') AS INTEGER) > 0`,
+      ).toArray() as any[];
+      const asksByTask = new Map<string, any>();
+      for (const a of askRows) {
+        const am = JSON.parse(a.ask_meta ?? "{}");
+        if (am.ask?.review_leg !== true || asksByTask.has(String(a.task))) continue;
+        const tm = JSON.parse(a.task_meta ?? "{}");
+        // the last ask EVENT (newest stamp); created_ts backs legacy asks only —
+        // a backdated filed_ts must not lose to the row's creation time
+        const stampTs = Math.max(Number(am.ask?.filed_ts ?? 0), Number(am.ask?.refreshed_ts ?? 0));
+        const lastTs = stampTs > 0 ? stampTs : Number(a.created_ts ?? 0);
+        const ageMs = lastTs ? Math.max(0, now0 - lastTs) : 0;
+        asksByTask.set(String(a.task), {
+          task: String(a.task),
+          ask_id: String(a.ask_id),
+          pr: Number(tm.merge_train?.pr) || undefined,
+          age_ms: ageMs,
+          aging: ageMs >= ttlMs,
+          lapsed: ageMs >= ttlMs + TRAIN_REVIEW_ASK_GRACE_MS,
+          meta: tm,
+        });
+      }
+      // the join is the card's train leg (merge_train.pr), NOT laneQueue — a
+      // bounced card sits in_progress/in_review while repairing, so the QUEUE
+      // is the wrong join. One chip per card (the live leg), filtered to this
+      // lane, oldest first, capped so a pathological lane cannot flood the panel.
+      const reviewAsks = [...asksByTask.values()]
+        .filter((a) => trainCardMatchesLane(a.meta, lane.repo))
+        .sort((x, y) => y.age_ms - x.age_ms)
+        .slice(0, 20)
+        .map(({ meta: _drop, ...rest }) => rest);
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9113,6 +9205,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         capable,
         starved,
         queue,
+        review_asks: reviewAsks,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
           merged_24h: Number(tp.h24 ?? 0),

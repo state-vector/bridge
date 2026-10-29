@@ -241,6 +241,16 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
+  it("renders aging review asks as age chips, worst (lapsed) tone winning (BR#4633 L4.2 / BR#4693)", () => {
+    // the DO sorts review_asks oldest-first; the panel renders the tones only —
+    // no ask may sit on the lane without a visible age, and a lapsed ask
+    // (past TTL + grace) must read as urgent, aging as warn.
+    expect(trainPanelSrc).toMatch(/\(l\.review_asks \?\? \[\]\)\.map/);
+    expect(trainPanelSrc).toMatch(/a\.lapsed \? "urgent" : a\.aging \? "warn" : "scope"/);
+    expect(trainPanelSrc).toMatch(/age\(Date\.now\(\) - a\.age_ms, Date\.now\(\)\)/);
+    expect(trainPanelSrc).toContain("oldest first");
+  });
+
   it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {
     // in-flight phase (STATUS pill maps phases to words)
     expect(trainPanelSrc).toMatch(/l\.currently\.phase/);
