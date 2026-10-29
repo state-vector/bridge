@@ -607,7 +607,12 @@ is the worker-class credential per BR#3181, never a personal one.
 
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
-lands, stops or pends) → else the queue head's **first unlanded leg on this lane**
+lands, stops or pends) → else the derived queue is **walked in order** (BR#3935): a
+permanently unlandable entry — a CLOSED PR, a leg with no PR stamp, no unlanded leg on
+this lane — is logged and the walk advances to the next entry **in the same tick** (the
+card stays queued for the humans; the lane never starves behind it), while a transient
+no-op — mergeability still computing, unsettled checks, no verdict — still blocks; the
+first drivable entry's **first unlanded leg on this lane**
 (BR#3659: a multi-PR card rides leg by leg) → `decideTrainGate` → act: merge (`gh`) →
 `train:merged` → next tick polls CI on the merge commit. Every fact crosses the
 executor's fact boundary normalized (BR#3714): gh's GraphQL `mergeable` is the enum
@@ -655,6 +660,14 @@ every commit GitHub-verified, base green, head checks green) plus **verdict cove
 the accepted verify verdict must stamp the exact head, or arrive by a contiguous
 machine-clean carry chain:
 
+- **A git failure is never a verdict (BR#3935)**: the executor fetches the PR head
+  explicitly (`refs/pull/<n>/head`) before any local `merge-base`/`merge-tree` names
+  it — a head authored on another box is a bad object locally, and `merge-tree` exits
+  1 for a bad object, the same code as a real conflict. Both inputs are verified
+  commit objects first; any git failure fails the tick closed with the stderr, and a
+  bounce's conflict-file list is exactly the conflicted files (`--no-messages` keeps
+  git's prose out of it). The old behavior — a 128 folded into `behind=true` and a
+  bounce with an empty conflict list — is dead.
 - **Carry law (BR#3516 §5)**: the base advanced and the executor's `gh pr
   update-branch` lands machine-clean → the accepted verdict CARRIES (the hub appends
   the carry record on `train:merged`). A conflict resolved by hand means authored code
