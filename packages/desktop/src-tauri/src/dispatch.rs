@@ -2082,42 +2082,31 @@ fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Opti
     preserved
 }
 
-/// Compat entry: locate the worktree for a task under either root (nested
-/// <repo>/.worktrees/<slug> or legacy ~/.bridge/worktrees/<slug>) and tear it
-/// down. Callers that already hold the path (InFlight.worktree, sweep scans)
-/// should prefer cleanup_worktree_at.
-#[allow(dead_code)]
-fn cleanup_worktree(workdir: &str, task_id: &str, drop_branch: bool) {
-    let slug = slugify(task_id);
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // nested: any repo clone under <workdir>/repos may hold the task's tree
-    if let Ok(entries) = std::fs::read_dir(PathBuf::from(workdir).join("repos")) {
-        for e in entries.flatten() {
-            candidates.push(e.path().join(".worktrees").join(&slug));
-        }
-    }
-    // legacy: ~/.bridge/worktrees/<slug>
-    if let Some(home) = std::env::var("HOME").ok() {
-        candidates.push(PathBuf::from(&home).join(".bridge").join("worktrees").join(&slug));
-    }
-    for path in candidates {
-        if path.exists() {
-            cleanup_worktree_at(&path, task_id, drop_branch);
-            break;
-        }
-    }
-}
-
 /// Reconcile on-disk worktrees with live task status. Terminal tasks (done,
 /// superseded) and released tasks (todo) must not hold worktrees on disk — the
 /// finalize path cleans `done` handoffs, but yielded runs, pre-sweep history
-/// and handoff-rejections leave stragglers. in_progress/in_review/blocked
-/// worktrees are kept: they are the session's resume assets. Capped per tick
-/// so a large backlog drains without stalling the dispatch loop.
+/// and handoff-rejections leave stragglers. Fresh in_progress/in_review/blocked
+/// worktrees are kept: they are the session's resume assets — but nothing
+/// parks forever (BR#3633): a tree not held by an in-flight session that is
+/// older than WORKTREE_STALE_SECS is swept regardless of status or id
+/// resolvability (WIP preserved first, branch kept, so a re-claim re-attaches).
+/// Capped per tick, oldest first, so a large backlog always drains the worst
+/// offenders.
 /// Scans BOTH locations (BR#3204): the nested <repo>/.worktrees/<slug> trees
-/// and the legacy ~/.bridge/worktrees/<slug> roots. Before any teardown the
-/// sweep preserves uncommitted state onto wip/<task>-<date> (never main).
+/// and the legacy ~/.bridge/worktrees/<slug> roots — a missing root is a
+/// scoped skip, never a sweep abort (the old early-return there silently
+/// disabled the entire sweep on hosts where the legacy root never existed:
+/// post-BR#3204 hosts provision nested-only, so the reconciler was dead code
+/// while provisioning kept allocating — the BR#3618/BR#3633 leak). Before any
+/// teardown the sweep preserves uncommitted state onto wip/<task>-<date>
+/// (never main).
 const WORKTREE_SWEEP_CAP: usize = 20;
+/// Eventual-consistency horizon (BR#3633): a worktree not held by an in-flight
+/// session is swept once older than this, whatever its board status — an id
+/// that no longer resolves, a hub outage, or a parked blocked task all drain
+/// eventually instead of pinning disk forever. Branch is kept on the age path
+/// so re-claims re-attach; drop-branch stays the explicit terminal-status path.
+const WORKTREE_STALE_SECS: u64 = 7 * 24 * 3600;
 static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// BR#3787 — negotiated token catch-up. The hub stamps every authenticated
@@ -2136,76 +2125,158 @@ fn epoch_repair_needed(vend: u64, seen: u64) -> bool {
     vend > 0 && seen > 0 && vend != seen
 }
 
+/// One on-disk worktree candidate found by the sweep scan.
+struct WorktreeCandidate {
+    slug: String,
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+}
+
+/// Reverse slugify: BR-1003 → BR#1003. Anything else (TASK-010, session-named
+/// trees like hotfix-ext) passes through unchanged — unresolvable ids are not
+/// an error, the age rule sweeps them eventually (BR#3633).
+fn reverse_task_slug(slug: &str) -> String {
+    match slug.strip_prefix("BR-") {
+        Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
+        _ => slug.to_string(),
+    }
+}
+
+/// Sweep decision for one candidate — pure so it is unit-testable. `status`
+/// is the board status when it could be fetched (None = unresolvable id or
+/// MCP/network error). Returns (sweep, drop_branch, reason).
+fn sweep_disposition(age_secs: u64, status: Option<&str>) -> (bool, bool, String) {
+    match status {
+        // explicit terminal statuses sweep at any age — the board is the
+        // authority and these trees hold nothing the board doesn't have
+        Some(s @ ("done" | "superseded")) => (true, true, format!("task is {s}")),
+        Some("todo") => (
+            true,
+            false,
+            "task released to todo (branch kept for re-claim)".into(),
+        ),
+        // fresh non-terminal trees are resume assets — keep
+        _ if age_secs < WORKTREE_STALE_SECS => (false, false, String::new()),
+        // stale non-terminal (in_progress/blocked/in_review/unknown id/MCP
+        // outage): eventual sweep — WIP preserved, branch kept for re-claim
+        _ => (
+            true,
+            false,
+            format!(
+                "stale ≥{}d — swept regardless of status ({})",
+                WORKTREE_STALE_SECS / 86_400,
+                status.unwrap_or("id unresolvable or status unknown")
+            ),
+        ),
+    }
+}
+
+/// Collect worktree candidates from both roots. `home` is a parameter (not
+/// read from the env here) so tests can inject a scratch root. A missing root
+/// contributes nothing — a scoped skip, never an abort.
+fn collect_worktree_candidates(
+    workdir: &Path,
+    home: Option<&Path>,
+    active: &HashSet<String>,
+) -> Vec<WorktreeCandidate> {
+    let mut found: Vec<WorktreeCandidate> = Vec::new();
+    let mut push = |e: std::fs::DirEntry, found: &mut Vec<WorktreeCandidate>| {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.is_empty() || active.contains(&name) {
+            return;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        found.push(WorktreeCandidate {
+            slug: name,
+            path: e.path(),
+            mtime,
+        });
+    };
+    // nested: <workdir>/repos/<repo>/.worktrees/<slug>
+    if let Ok(repos) = std::fs::read_dir(workdir.join("repos")) {
+        for repo in repos.flatten() {
+            if let Ok(entries) = std::fs::read_dir(repo.path().join(".worktrees")) {
+                for e in entries.flatten() {
+                    push(e, &mut found);
+                }
+            }
+        }
+    }
+    // legacy: ~/.bridge/worktrees/<slug>
+    if let Some(home) = home {
+        if let Ok(entries) = std::fs::read_dir(home.join(".bridge").join("worktrees")) {
+            for e in entries.flatten() {
+                push(e, &mut found);
+            }
+        }
+    }
+    found
+}
+
 fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
     let active: HashSet<String> = in_flight
         .iter()
         .filter_map(|inf| inf.worktree.as_ref())
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .collect();
-    // candidate (slug, path) pairs from both roots
-    let mut found: Vec<(String, PathBuf)> = Vec::new();
-    // nested: <workdir>/repos/<repo>/.worktrees/<slug>
-    if let Ok(repos) = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos")) {
-        for repo in repos.flatten() {
-            let Ok(entries) = std::fs::read_dir(repo.path().join(".worktrees")) else { continue };
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if !name.is_empty() && !active.contains(&name) {
-                    found.push((name, e.path()));
-                }
-            }
-        }
-    }
-    // legacy: ~/.bridge/worktrees/<slug>
-    if let Some(home) = std::env::var("HOME").ok() {
-        let dir = PathBuf::from(&home).join(".bridge").join("worktrees");
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.is_empty() && !active.contains(&name) {
-                found.push((name, e.path()));
-            }
-        }
-    }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    found.dedup_by(|a, b| a.0 == b.0);
+    let mut found = collect_worktree_candidates(
+        Path::new(&cfg.workdir),
+        std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
+        &active,
+    );
+    // dedup by slug (same name in both roots → nested wins), then drain
+    // oldest-first: the cap must always bite the worst offenders
+    found.sort_by(|a, b| a.slug.cmp(&b.slug));
+    found.dedup_by(|a, b| a.slug == b.slug);
+    found.sort_by(|a, b| a.mtime.cmp(&b.mtime));
     let mut swept = 0;
-    for (slug, path) in found {
+    for cand in found {
         if swept >= WORKTREE_SWEEP_CAP {
             break;
         }
-        // reverse slugify: BR-1003 → BR#1003; TASK-010 → TASK-010
-        let task_id = match slug.strip_prefix("BR-") {
-            Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
-            _ => slug.clone(),
+        let task_id = reverse_task_slug(&cand.slug);
+        let age_secs = std::time::SystemTime::now()
+            .duration_since(cand.mtime)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        // status lookup only for trees the age rule would keep — stale trees
+        // sweep regardless, so a hub outage cannot freeze the reconciler
+        let status = if age_secs < WORKTREE_STALE_SECS {
+            mcp_call(cfg, id, "get_artefact", json!({ "id": task_id }))
+                .ok()
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+        } else {
+            None
         };
-        // only explicit statuses — an MCP/network error keeps the worktree
-        let status = mcp_call(cfg, id, "get_artefact", json!({ "id": task_id }))
-            .ok()
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from));
-        match status.as_deref() {
-            Some("done") | Some("superseded") => {
-                swept += 1;
-                let preserved = cleanup_worktree_at(&path, &task_id, true);
-                msgs.push(format!(
-                    "swept worktree {slug} — task {task_id} is {}{}",
-                    status.unwrap_or_else(|| "done".into()),
-                    preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()
-                ));
-            }
-            Some("todo") => {
-                swept += 1;
-                let preserved = cleanup_worktree_at(&path, &task_id, false);
-                msgs.push(format!(
-                    "swept worktree {slug} — task {task_id} released to todo (branch kept for re-claim){}",
-                    preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()
-                ));
-            }
-            _ => {}
+        let (do_sweep, drop_branch, reason) = sweep_disposition(age_secs, status.as_deref());
+        if !do_sweep {
+            continue;
         }
+        swept += 1;
+        let preserved = cleanup_worktree_at(&cand.path, &task_id, drop_branch);
+        msgs.push(format!(
+            "swept worktree {} — {}{}",
+            cand.slug,
+            reason,
+            preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()
+        ));
     }
     if swept > 0 {
-        let _ = Command::new("git").current_dir(&cfg.workdir).arg("worktree").arg("prune").output();
+        // prune the clones that actually own the registrations. cfg.workdir is
+        // scratch space, NOT a repo — the old prune against it was a silent
+        // no-op that left ghost registrations in the owning clones (BR#2421).
+        if let Ok(repos) = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos")) {
+            for repo in repos.flatten() {
+                let _ = Command::new("git")
+                    .current_dir(repo.path())
+                    .arg("worktree")
+                    .arg("prune")
+                    .output();
+            }
+        }
     }
 }
 
@@ -4449,6 +4520,76 @@ mod tests {
         let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
         assert_ne!(dir, other);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    // ---- BR#3633: worktree sweep eventual-consistency ----
+
+    #[test]
+    fn reverse_task_slug_maps_only_bare_br_slugs() {
+        assert_eq!(reverse_task_slug("BR-3620"), "BR#3620");
+        assert_eq!(reverse_task_slug("BR-1003"), "BR#1003");
+        // not BR-<digits> → passes through unchanged (the age rule owns these;
+        // an unresolvable id must never wedge the sweep)
+        assert_eq!(reverse_task_slug("TASK-007"), "TASK-007");
+        assert_eq!(reverse_task_slug("hotfix-ext"), "hotfix-ext");
+        assert_eq!(reverse_task_slug("br-3620-stale-ledger"), "br-3620-stale-ledger");
+        assert_eq!(reverse_task_slug("BR-x"), "BR-x");
+    }
+
+    #[test]
+    fn sweep_disposition_eventual_rules() {
+        // explicit terminal statuses sweep at any age; done/superseded drop
+        // the branch (the WIP preservation branch survives it)
+        assert_eq!(
+            sweep_disposition(0, Some("done")),
+            (true, true, "task is done".to_string())
+        );
+        assert_eq!(
+            sweep_disposition(0, Some("superseded")),
+            (true, true, "task is superseded".to_string())
+        );
+        // todo sweeps but keeps the branch (a re-claim re-attaches to it)
+        let (sweep, drop, _) = sweep_disposition(0, Some("todo"));
+        assert!(sweep && !drop);
+        // fresh non-terminal trees are resume assets — kept whatever the state
+        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
+            let (sweep, _, _) = sweep_disposition(0, s);
+            assert!(!sweep, "fresh tree with status {s:?} must be kept");
+        }
+        // stale trees sweep regardless of status — the eventual guarantee
+        // (hub outage, unresolvable id, parked blocked task all drain)
+        let stale = WORKTREE_STALE_SECS + 1;
+        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
+            let (sweep, drop, _) = sweep_disposition(stale, s);
+            assert!(sweep && !drop, "stale tree with status {s:?} must sweep with branch kept");
+        }
+    }
+
+    #[test]
+    fn sweep_candidates_scan_both_roots_skip_active_and_survive_missing_legacy() {
+        let base = std::env::temp_dir().join(format!("bridge-sweep-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let workdir = base.join("workdir");
+        let repo = workdir.join("repos").join("demo");
+        std::fs::create_dir_all(repo.join(".worktrees").join("BR-1")).unwrap();
+        std::fs::create_dir_all(repo.join(".worktrees").join("BR-2")).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".bridge").join("worktrees").join("BR-2")).unwrap();
+        std::fs::create_dir_all(home.join(".bridge").join("worktrees").join("BR-3")).unwrap();
+        std::fs::create_dir_all(home.join(".bridge").join("worktrees").join("hotfix-ext")).unwrap();
+        let mut active = HashSet::new();
+        active.insert("BR-2".to_string()); // in-flight on this host — excluded from BOTH roots
+        let found = collect_worktree_candidates(&workdir, Some(&home), &active);
+        let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["BR-1", "BR-3", "hotfix-ext"], "active excluded from both roots, the rest collected");
+        // the BR#3633 regression: a missing legacy root used to early-return
+        // and discard the nested candidates — now it is a scoped skip
+        let found = collect_worktree_candidates(&workdir, Some(&base.join("no-such-home")), &HashSet::new());
+        let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["BR-1", "BR-2"], "nested candidates survive a missing legacy root");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
