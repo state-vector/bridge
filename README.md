@@ -122,6 +122,8 @@ socket tail the events mirror adaptively (2s while busy, backing off to 30s
 idle) and coalesce event bursts into one refresh — the 2026-10-29 overload
 was every client refetching the full board per event.
 
+**The train self-organizes and cannot fail silently (BR#4489).** `bridge doctor` checks merge capability (gh login on the worker allowlist + repo write) — a host that cannot merge prints `will not claim train lock as I cannot merge PRs` and doesn't contend. Leases carry capability, so a lane whose queue sits >10 min with no merge-capable executor is STARVED: red on the panel, an alarm ask to the sink, and gateways re-contend on recovery. A dedicated merge node is just a gateway with `role: "train"` in its config (dispatch off, train on).
+
 Beyond dispatch it carries three human-facing surfaces:
 
 - **For you + Chat** — the decision inbox (proposed decisions, blocked work, open questions, read-only) and a console chat: ask about the board in natural language. Retrieval runs over the hub (`/api/kb-machine/search`, paired token); the answer is summarised by **Apple's on-device model** (macOS 26+ with Apple Intelligence) and falls back to the configured backend CLI one-shot otherwise. The console never claims or writes work.

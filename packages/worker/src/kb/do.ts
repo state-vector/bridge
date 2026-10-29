@@ -152,6 +152,8 @@ import {
  *  sink the destination-green sweep used (BR#3124, infrastructure). Override
  *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
 const TRAIN_ALARM_SINK_ID = "BR#3124";
+/** BR#4489: a queued lane with no merge-capable lease inside this window is STARVED — panel red + alarm. */
+const TRAIN_STARVE_MS = 10 * 60_000;
 
 /** The standard verify-duty body — the ONE 5c-gated template. The normal
  *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
@@ -5544,6 +5546,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     meta.lease = decided.lease;
     if (action === "acquire") meta.zombie = null; // fresh holder — the eviction stamp did its job
+    // BR#4489 capability-aware starvation: every lease op stamps liveness;
+    // worker-class (merge-capable) executors also stamp the capable clock.
+    // A non-empty queue with no capable lease inside the starve window means
+    // the lane cannot advance even though gateways may be ticking (the
+    // 2026-10-29 outage: bounces flowed, merges stood down).
+    meta.lane = {
+      ...(meta.lane ?? {}),
+      key: laneKey(repo, base),
+      last_lease_ts: now,
+      ...(body.merge_capable === true ? { last_capable_lease_ts: now } : {}),
+    };
+    if (body.merge_capable === true && meta.lane.starved_since) {
+      meta.lane.starved_since = null; // a capable executor is back — episode over
+    }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
     if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null)) {
@@ -6134,6 +6150,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  this). The queue is COMPUTED here (mergeTrainQueue), never stored. */
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
+    const now0 = Date.now();
     const lanes = this.state.storage.sql.exec(
       `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL ORDER BY title`,
@@ -6145,6 +6162,49 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (!lane) continue;
       if (repoFilter && lane.repo !== repoFilter) continue;
       const queue = this.laneQueue(lane.repo);
+      // BR#4489 starvation: a non-empty queue with no merge-capable lease
+      // inside the window cannot advance — the 2026-10-29 outage class
+      // (bounces flowed, merges stood down, the lane looked "served").
+      const capableAge = now0 - Number(meta.lane?.last_capable_lease_ts ?? 0);
+      const starved = queue.length > 0 && capableAge > TRAIN_STARVE_MS
+        ? { since: now0 - capableAge, mins: Math.round(capableAge / 60_000) }
+        : null;
+      if (starved && !meta.lane?.starved_since) {
+        // entering starvation: stamp the episode, red alarm (one ask per
+        // episode — askCreate's identical-open-ask guard dedupes), broadcast
+        // rides the audit event stream
+        meta.lane = { ...(meta.lane ?? {}), starved_since: starved.since };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+        this.audit("system:train", "lane_starved", l.id, {
+          lane: `${lane.repo}@${lane.base}`, queue_len: queue.length,
+          starved_mins: starved.mins,
+          reason: "queue non-empty with no merge-capable executor lease inside the starve window — merges cannot advance (BR#4489)",
+        });
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: `Merge train starved: ${lane.repo}@${lane.base} — queue non-empty ${starved.mins}m, no merge-capable executor (BR#4489)`,
+              reason: "the merge train cannot advance — queued heads wait on a worker-class executor; gateways present are standing down (BR#3181) or dead",
+              details: [
+                `Lane ${lane.repo}@${lane.base} starved since ${new Date(starved.since).toISOString()} (${starved.mins}m).`,
+                `Queue depth: ${queue.length} — head ${queue[0]?.id ?? "?"}.`,
+                `Fix: run a merge-capable gateway (gh authed as a worker identity — bridge doctor checks), or merge the head by hand.`,
+                `Recovers automatically: the starved state clears on the first capable lease.`,
+              ].join("\n\n"),
+              options: ["Ack — restarting a merge-capable gateway", "Merge the head by hand", "Waive — not urgent"],
+              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+              urgency: "time-sensitive",
+            },
+            "system:train",
+          );
+        } catch (e) {
+          this.audit("system:train", "train:starved_ask_deduped", l.id, { note: String((e as Error).message ?? e).slice(0, 160) });
+        }
+      } else if (!starved && meta.lane?.starved_since) {
+        meta.lane = { ...(meta.lane ?? {}), starved_since: null };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+      }
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -6153,6 +6213,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         stop: meta.stop ?? null,
         required_workflows: lane.required_workflows,
         reason: String(meta.blocked?.reason ?? ""),
+        last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
+        starved,
         queue,
       });
     }

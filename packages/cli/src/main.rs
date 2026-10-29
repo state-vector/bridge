@@ -805,6 +805,31 @@ fn doctor() -> bool {
             }
             _ => ok("gh authed", "gh auth status failed — run `gh auth login`", &mut bad, false),
         }
+        // BR#4489 merge-train capability: the merge executor must be a
+        // worker-class identity (default detached-cody, BR#3181) — a host
+        // authed as a personal account can tick but stands down from merges.
+        let worker_ids: Vec<String> = std::env::var("MERGE_TRAIN_WORKER_IDENTITIES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let worker_ids = if worker_ids.is_empty() { vec!["detached-cody".to_string()] } else { worker_ids };
+        let login = std::process::Command::new("gh")
+            .args(["api", "user", "--jq", ".login"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase());
+        match login {
+            Some(l) if worker_ids.contains(&l) => ok("merge-train identity", &format!("{l} is worker-class — this host can claim the train lock"), &mut bad, false),
+            Some(l) => ok(
+                "merge-train identity",
+                &format!("gh is authed as '{l}' (personal) — will not claim train lock as I cannot merge PRs; fix: auth gh as one of [{}] for the merge-train host", worker_ids.join(", ")),
+                &mut bad, false,
+            ),
+            None => ok("merge-train identity", "gh api user failed — cannot classify; the train will fail closed", &mut bad, false),
+        }
         let git_ver = std::process::Command::new("git").arg("--version").output();
         ok(
             "git present",

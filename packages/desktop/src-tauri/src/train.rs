@@ -148,6 +148,7 @@ struct Ctx {
     identity: Option<IdentityClass>,
     /// The identity label last announced — logs only on change.
     identity_announced: Option<String>,
+    skip_log_ms: u64,
     /// Lane allowlist (`repo@base` keys). Empty = every lane the hub reports.
     lane_allow: Vec<String>,
     /// Fixed workdir (MERGE_TRAIN_WORKDIR). None → managed clone cache.
@@ -254,6 +255,7 @@ impl Ctx {
             worker_identities: worker_identities_from_env(),
             identity: None,
             identity_announced: None,
+            skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: workdir_env,
             last_action: "executor started".into(),
@@ -363,6 +365,17 @@ impl Ctx {
     /// loud, never silent.
     fn write_allowed(&mut self) -> bool {
         matches!(self.ensure_identity(), IdentityClass::Worker(_))
+    }
+
+    /// BR#4489: the incapable-host skip, logged on a slow throttle (once per
+    /// 10 min) — visible without spamming a 45s loop.
+    fn note_skip_throttled(&mut self, key: &str, reason: &str) {
+        let now = now_ms();
+        if now - self.skip_log_ms >= 10 * 60_000 {
+            self.skip_log_ms = now;
+            log(Some(key), reason);
+            self.note(reason);
+        }
     }
 
     /// Resolve the workdir for a lane's repo: the explicit override
@@ -535,7 +548,7 @@ fn renew_lease(ctx: &mut Ctx, repo: &str, base: &str) -> bool {
         "progress_age_ms": now_ms().saturating_sub(ctx.last_action_ms),
         "holder": ctx.holder,
     });
-    ctx.train_lease(repo, base, "renew", json!({ "progress": progress })).is_ok()
+    ctx.train_lease(repo, base, "renew", json!({ "progress": progress, "merge_capable": true })).is_ok()
 }
 
 /// Release only when nothing is in flight; an awaiting-CI lane keeps the
@@ -570,9 +583,20 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
         .unwrap_or_default();
     let typical_ms = lane.get("ci_typical_minutes").and_then(|v| v.as_u64()).unwrap_or(TRAIN_CI_TYPICAL_MINUTES) * 60_000;
 
+    // ---- BR#4489 capability honesty: a host that cannot merge does not
+    // contend the lock. Claiming without capability made the lane LOOK
+    // served while nothing could advance (the 2026-10-29 outage). The check
+    // is cached (decided classes persist per process); the skip logs on a
+    // slow throttle so the reason stays visible without spamming. ----
+    let capable = ctx.write_allowed();
+    if !capable {
+        ctx.note_skip_throttled(&key, "will not claim train lock as I cannot merge PRs (identity gate BR#3181 — bridge doctor names the fix)");
+        return;
+    }
+
     // ---- CAS lease (the hub decides; a conflict means ANOTHER live executor).
     // holder is ALWAYS the authenticated actor (the hub stamps it). ----
-    let lease = match ctx.train_lease(&repo, &base, "acquire", json!({ "required_workflows": required })) {
+    let lease = match ctx.train_lease(&repo, &base, "acquire", json!({ "required_workflows": required, "merge_capable": true })) {
         Ok(l) => l,
         Err(e) => {
             if e.contains("lane lease held live") {
@@ -586,6 +610,14 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     log(Some(&key), &format!("lease: {} (holder={})", vstr(&lease, "note").unwrap_or("acquired"), ctx.holder));
 
     if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms) {
+        // BR#4489: a permission refusal mid-merge demotes the host for the
+        // process lifetime — startup truth was runtime falsehood; fail closed.
+        let low = e.to_lowercase();
+        if low.contains("403") || low.contains("permission") || low.contains("not authorized") {
+            ctx.identity = Some(IdentityClass::Unknown("demoted: gh refused a merge write".into()));
+            ctx.identity_announced = None;
+            log(Some(&key), "merge write refused (403/permission) — demoted to non-capable for this process; will not claim the train lock");
+        }
         // fail-closed: the lease lapses (5 min) and the next gateway
         // reconciles from live GitHub. Never retry-blind inside the tick.
         log(Some(&key), &format!("tick error: {}", trunc(&e, 300)));
@@ -1077,6 +1109,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         worker_identities: worker_identities_from_env(),
         identity: None,
         identity_announced: None,
+        skip_log_ms: 0,
         lane_allow: cfg.lanes.clone(),
         workdir_override: cfg.workdir_override.clone(),
         last_action: "gateway leg tick".into(),
@@ -1416,8 +1449,9 @@ mod tests {
             in_process: true,
             session: "merge-train@test".into(),
             worker_identities: vec!["detached-cody".into()],
-            identity: None,
+            identity: Some(IdentityClass::Worker("detached-cody".into())), // test ctx: pre-classified worker — no live gh probe
             identity_announced: None,
+            skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: None,
             last_action: "test".into(),
@@ -1465,6 +1499,8 @@ mod tests {
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         assert_eq!(names, vec!["train_lease", "get_artefact", "train_status", "train_lease", "train_lease"]);
+        // BR#4489: the acquire declares capability so the hub can starve-detect
+        assert_eq!(call_args(&recorded[0]).get("merge_capable"), Some(&json!(true)));
         // B's only call is the failed acquire — it never touched the lane.
         let b_acquire = recorded.last().unwrap();
         assert_eq!(call_args(b_acquire).get("action").and_then(|v| v.as_str()), Some("acquire"));
@@ -1491,6 +1527,19 @@ mod tests {
         assert_eq!(names, vec!["train_lease", "train_lease", "get_artefact", "train_status", "train_lease"]);
         let acquire2 = call_args(&recorded[1]);
         assert_eq!(acquire2.get("action").and_then(|v| v.as_str()), Some("acquire"));
+    }
+
+    #[test]
+    fn incapable_host_never_claims_the_lock_br4489() {
+        // A personally-classed gateway does not even contend: zero hub calls,
+        // the skip names itself (Ray's line), and no lease is taken.
+        let (hub, calls) = mock_hub(vec![]);
+        let mut ctx = test_ctx(&hub);
+        ctx.identity = Some(IdentityClass::Personal("rayh".into()));
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
+        assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
     }
 
     // ---------- BR#4170: the reconcile leg ----------

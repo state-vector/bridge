@@ -39,6 +39,11 @@ pub struct DispatchConfig {
     pub model: Option<String>, // agent model override; unset = the agent CLI's own config decides
     #[serde(default)]
     pub backend: Option<String>, // "opencode" (default) | "kiro" — which agent CLI drives the tasks
+    /// BR#4489: `role: "train"` = dedicated merge-train node — the daemon
+    /// runs connection + train legs and SKIPS task dispatch entirely. Default
+    /// (absent) = full gateway (dispatch + train).
+    #[serde(default)]
+    pub role: Option<String>,
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
     #[serde(default = "default_timeout_mins")]
@@ -283,6 +288,7 @@ impl DispatchConfig {
             agent: std::env::var("BRIDGE_AGENT").ok(),
             model: std::env::var("BRIDGE_MODEL").ok(),
             backend: std::env::var("BRIDGE_BACKEND").ok(),
+            role: std::env::var("BRIDGE_ROLE").ok().filter(|r| r == "train").or(None),
             poll_secs: std::env::var("BRIDGE_POLL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -518,6 +524,7 @@ pub fn default_config() -> DispatchConfig {
         agent: std::env::var("BRIDGE_AGENT").ok(),
         model: std::env::var("BRIDGE_MODEL").ok(),
         backend: std::env::var("BRIDGE_BACKEND").ok(),
+        role: None,
         poll_secs: default_poll_secs(),
         timeout_mins: default_timeout_mins(),
         opencode_bin: default_opencode_bin(),
@@ -4039,6 +4046,13 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 TOKEN_EPOCH_VEND.store(seen, Ordering::Relaxed); // first observation adopts
             }
         }
+        // BR#4489 `role: "train"`: dedicated merge-train node — connection,
+        // epoch self-heal, daemon legs (train) and liveness stay live; task
+        // dispatch is skipped entirely. Nothing to dispatch, nothing claimed.
+        if cfg.role.as_deref() == Some("train") {
+            std::thread::sleep(Duration::from_millis(cfg.poll_secs.max(1) * 1000));
+            continue;
+        }
         match tick(
             &cfg,
             &mut id,
@@ -4576,6 +4590,7 @@ mod tests {
             agent: None,
             model: None,
             backend: None,
+            role: None,
             poll_secs: default_poll_secs(),
             timeout_mins: default_timeout_mins(),
             opencode_bin: default_opencode_bin(),

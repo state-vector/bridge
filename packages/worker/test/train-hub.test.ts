@@ -674,3 +674,40 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
   });
 });
+
+describe("BR#4489 starvation — capability-aware lane health", () => {
+  it("a capable lease stamps the clock; >10min without one on a non-empty queue ⇒ starved", async () => {
+    const repo = "state-vector/bridge";
+    await acquire(repo, "gw-cody", { merge_capable: true });
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+    const st = await kbJson("/train.status", { repo });
+    const lane = st.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    expect(lane.last_capable_lease_ts).toBeGreaterThan(0);
+    expect(lane.starved).toBeNull(); // capable lease is fresh
+
+    // queue a real card on the lane (the accept-hook path)
+    const t = await queueViaAccept({ repo, pr: 4400, head: "b".repeat(40), title: "IMPL: starve drill card" });
+    const queued = await kbJson("/get", { id: t });
+    expect(queued.body.meta.merge_train?.state).toBe("queued");
+
+    // backdate the capable clock past the starve window
+    const laneCard = await kbJson("/get", { id: lane.card });
+    const lm = laneCard.body.meta;
+    lm.lane.last_capable_lease_ts = Date.now() - 11 * 60_000;
+    await kbJson("/update", { id: lane.card, meta: lm });
+
+    const st2 = await kbJson("/train.status", { repo });
+    const lane2 = st2.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    expect(lane2.starved).toBeTruthy();
+    expect(lane2.starved.mins).toBeGreaterThanOrEqual(10);
+
+    // a capable lease clears the episode
+    await acquire(repo, "gw-cody", { merge_capable: true });
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+    const st3 = await kbJson("/train.status", { repo });
+    const lane3 = st3.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    expect(lane3.starved).toBeNull();
+    const rec = await kbJson("/get", { id: lane.card });
+    expect(rec.body.meta.lane.starved_since ?? null).toBeNull();
+  });
+});
