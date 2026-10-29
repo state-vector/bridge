@@ -641,7 +641,12 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   identical-open-ask guard, so ten red runs are one ask, not ten. Options ride the ask:
   `Ack — on it` / `Revert the culprit` / `Waive — resume the lane`. Green again → the
   executor's next CI poll feeds a green classification (`train:landed`) and the hub
-  releases the stop automatically. v1 stops the line; there is no auto-revert — fix
+  releases the stop automatically. The clear is loud too (BR#4692): releasing the stop
+  on a green line writes a `train:stop_cleared` row to the lane history and a note to
+  the alarm sink, each naming the red window (stop set → stop cleared, who/when
+  auditable). There is no separately "held" stop: every stop auto-clears within one
+  executor tick of green — a human halts the line again by stopping it, not by holding
+  it. v1 stops the line; there is no auto-revert — fix
   forward or revert is the culprit card's job. Work on branches (worktrees) continues —
   only the line stops. Two BR#5061 refinements keep the stop honest instead of stormy:
   **one ledger episode per stop** (the same sha + reason re-reported by a tick loop —
