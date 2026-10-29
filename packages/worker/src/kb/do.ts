@@ -567,6 +567,19 @@ export class KnowledgeHub {
         const meta = JSON.parse(r.meta ?? "{}");
         parkCensus.total++;
         if (meta.awaiting_ask) continue; // ask-gated: the ask TTL + hourly aging annotation govern these (rule 6)
+        // BR#4067 — a park on a live machine wait is not drainable age. The
+        // release-hold backstop refuses ANY machine release of a card holding
+        // a typed await_event / train queue slot / bound ask, so attempting
+        // the drain never lands: it stamps blocked_drained and then re-breeds
+        // an audited transition_rejected on EVERY tick (specimen BR#4566 /
+        // BR#3575: this sweep re-poked a pr_merged park each ~60s cycle,
+        // 2026-10-29 02:18–02:20Z, folding unclassified breach cards across
+        // the parked fleet — the text-only blockedParkVerdict markers cannot
+        // see a typed wait, e.g. "PR repo#123 merges" matches neither the
+        // GitHub-lane URL nor the GH# form). Same hold check as the
+        // subprocess leg (B) above; such parks count as external input —
+        // the proxy watch / the answer / a human owns their exit.
+        if (releaseHold(meta)) { parkCensus.external++; continue; }
         const b = meta.blocked ?? {};
         const verdict = blockedParkVerdict({
           reason: String(b.reason ?? ""),
