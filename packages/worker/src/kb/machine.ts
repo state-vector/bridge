@@ -444,7 +444,7 @@ export const RULES: Rule[] = [
       if (!reason) return "moving to blocked requires a reason (note)";
       if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
       if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
-      const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done/br_pr_merged event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). Await the real upstream leg.`;
+      const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). A br_pr_merged naming the card is legal — the train stamps its provenance row while the card is blocked (BR#3620). Await the real upstream leg.`;
       if (i.body?.await_event !== undefined) {
         const ev = validateAwaitEvent(i.body.await_event);
         if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;

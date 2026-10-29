@@ -1026,13 +1026,34 @@ export class KnowledgeHub {
         const done = row.status === "done" || row.status === "superseded";
         return { ok: done, receipt: `${atom.brId} status=${row.status}` };
       }
+      case "br_answered": {
+        // board-state like br_done: the ask/question card left todo —
+        // answered, superseded, or any terminal state counts (BR#3620: the
+        // BR#3423 class — a human ruling that answered while the card sat).
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, atom.brId);
+        if (!row) return { ok: false, receipt: `${atom.brId} not found on this board` };
+        const answered = row.status === "done" || row.status === "superseded";
+        return { ok: answered, receipt: `${atom.brId} status=${row.status}${answered ? " (answered)" : " (still open)"}` };
+      }
       case "pr_merged": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516); verify first-hand (gh pr view) or wait for a train event` };
+        // ledger-native first (BR#3620): the provenance table is stamped by
+        // train events with zero hub GitHub calls — a train-stamped merge is
+        // a fact the hub OWNS, unlike a GitHub read it cannot make.
+        const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, atom.repo, atom.number);
+        if (pv) return { ok: true, receipt: `provenance: ${atom.repo}#${atom.number} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516) and no train provenance row exists — verify first-hand (gh pr view) or wait for a train event` };
       }
       case "br_pr_merged": {
-        if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — GitHub state for ${atom.brId} needs credentials the hub does not hold (BR#3516); verify first-hand or wait for a train event` };
+        // bare form resolves against the default repo (the board's project
+        // repo); ledger-native provenance by task_id (BR#3620).
+        const repo = atom.repo ?? io.defaultRepo;
+        const pv = this.one(
+          `SELECT pr, merge_sha, signer FROM provenance WHERE task_id = ? AND repo = ? ORDER BY merged_at DESC LIMIT 1`,
+          atom.brId, repo,
+        );
+        if (pv) return { ok: true, receipt: `provenance: ${atom.brId}'s PR ${repo}#${pv.pr} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        return { ok: false, receipt: `unresolvable from the hub — GitHub state for ${atom.brId} needs credentials the hub does not hold (BR#3516) and no train provenance row exists — verify first-hand or wait for a train event` };
       }
       case "issue_closed": {
         if (!atom.repo) return unresolvable;
@@ -1178,6 +1199,12 @@ export class KnowledgeHub {
           // asked anyway), mechanical when a typed leg was recoverable from
           // meta. The ladder resolves what the machine can prove and asks a
           // human ONLY for genuine ambiguity, ONE ask per class per day.
+          // (BR#4364 reconcile: this supersedes the BR#3578/BR#3620 per-card
+          // migration-ask factory this branch once carried — the ladder's
+          // recoverProseLegs already treats an existing migration ask
+          // (blocked.await_migration_ask) as a typed leg and flips the card
+          // when it is answered, so BR#3620's answered-ask exit is preserved
+          // through the ladder, not the per-card ask.)
           await this.proseLadder(r, meta, cond, now, prev, unparseable, prose);
           continue;
         }

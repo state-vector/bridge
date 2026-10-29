@@ -973,28 +973,13 @@ closes those leaks with four hub mechanisms:
 - **Unblock-proxy watch** (a): `unblockProxySweep` (paced by `unblock_proxy_sweep_minutes`, default
   15, `0` = off) re-evaluates every blocked card's `unblock_condition` on each pass. The parser
   (`packages/worker/src/kb/closure.ts`) extracts machine-checkable atoms — `pr_merged` (PR + url/number),
-  `br_pr_merged` (a "BR#N's fix PR on <repo> is MERGED" condition, resolved by head branch
-  `bridge/BR-<N>`), `issue_closed`, `br_done`, `run_success`, `pr_checks_green` — and cuts the
-  DUTY clauses ("then a fresh session closes…") so instruction text never parses as a precondition.
+  `br_pr_merged` (a "BR#N's fix PR is MERGED/merges" condition — with a repo URL, or bare and resolved
+  against the default repo), `issue_closed`, `br_done`, `br_answered` ("BR#N answered" — the ask/question
+  card left `todo`), `run_success`, `pr_checks_green` — and cuts the DUTY clauses ("then a fresh session
+  closes…", "Then: …") so instruction text never parses as a precondition.
   Conservatism law: machine-looking text that yields no atom stamps the verdict `unparseable`
   (never auto-flips); atoms with no resolvable repo stamp `unresolvable`. Since BR#3516 the
-  hub holds no VCS credentials: **GitHub-state atoms (`pr_merged`, `br_pr_merged`,
-  `issue_closed`, `run_success`, `pr_checks_green`) now classify `unresolvable` and spawn
-  nothing** — only board-state atoms (e.g. `br_done`) still verify TRUE live and auto-spawn
-  the unblock duty with the receipts embedded (a trigger, never an authority: the spawned
-  duty re-verifies first-hand; GitHub-state conditions flip when an acting session or the
-  executor operator checks them first-hand). The machine's caps still apply (≤1 open
-  unblock child, flood guard on the same exit condition). Stamp lives on `meta.proxy_check`.
-  Two BR#3668 guards complete the law: **human-gate markers** ("Human-only", "no machine atom
-  can flip this", "web/admin", "owner/web-only") in the condition text classify it unparseable
-  BY DESIGN — zero atoms, never flipped, never re-fired, and no migration ask (the marker names
-  the human leg already engaged; a text-derived machine `await_event` contradicting the markers
-  is ignored) — and a **stale-true dedup**: the sweep re-fires only on a CHANGED receipt. The
-  last sweep-spawned duty's body carries the receipt set its spawn was fired on; an identical
-  fresh evaluation (a born-true atom that can never flip — the BR#3358 class: one stand-down
-  duty per cycle, each re-verifying the same non-flip) stamps `true` with the dedup receipt and
-  spawns nothing. Park-time rounds and close-leg duties carry no receipts block and never dedup;
-  a genuine false→true transition still spawns exactly once.
+  a genuine false→true transition still spawns exactly once. hub holds no VCS credentials and never reads GitHub live: **unknown GitHub state (`issue_closed`, `run_success`, `pr_checks_green`, merges with no ledger row) stamps `unresolvable` and spawns nothing** — but three fact classes the hub owns outright still verify and auto-spawn the unblock duty with the receipts embedded (a trigger, never an authority: the spawned duty re-verifies first-hand): **board-state atoms** `br_done` and `br_answered` (BR#3620 — the answered-ask class, so a card parked on a human ruling flips the moment the ruling lands); and **merge atoms backed by the ledger** (BR#3620): `pr_merged`/`br_pr_merged` evaluate from the train-stamped provenance table (BR#3287 — `train.event merged`), receipts citing the stamped sha + signer, no credentials needed. Legacy prose cards the sweep cannot fully read run the **disposition ladder** (BR#4416 — the machine resolves what the card's own state can prove, a human is asked only for genuine ambiguity, ONE class ask per day): `recoverProseLegs` recovers the legs the card's meta already carries — an existing migration ask (BR#3578, `blocked.await_migration_ask`), meta/`merge_train` PR stamps, a terminal root blocker — and an ask leg that is already answered flips the card (BR#3620's answered-ask exit, ladder-native: the ask was recorded, answered, and the card never moved — dead). A leg that holds fires the exit with no ask; a recoverable typed leg re-types the park in place; a park with no leg at all releases to todo for re-scope; a no-legged runner/human-owned card collects into the ONE per-day class ask.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.
@@ -1016,14 +1001,7 @@ closes those leaks with four hub mechanisms:
   to claim them stamps the lease.
 
 Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts —
-incl. BR#3358's human-gated park parsing to zero atoms and the "(BR#N done, …)" parenthetical
-never yielding `br_done`),
-`test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty;
-rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence
-audit + lease; BR#3668 stale-true dedup — a born-true atom spawns exactly once and never
-re-fires, a genuine false→true transition still spawns exactly once, a human-gated park never
-flips and never migration-asks),
-plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
+plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law, including BR#3423's stale-ledger specimen, BR#3620), `test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty; the BR#3620 flips — answered-ask and train-stamped-merge cards flip, park-round close receipts; rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,
 queue and classification) and `test/train-hub.test.ts` (real-DO train drills: lease races,
 landed / stopped / bounced flows, the stop-the-line ask).
 `admin.unblock_proxy_sweep` drills on demand.
