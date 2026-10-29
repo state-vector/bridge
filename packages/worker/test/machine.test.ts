@@ -1185,6 +1185,20 @@ describe("breach fold (dedupe by task+class)", () => {
     expect(detectBreaches(storm, new Set())).toHaveLength(1);
   });
 
+  it("spawn_cap_skipped never folds — the cap guard's own suppression is the system working (BR#4702)", () => {
+    // BR#2893's escalation already carries the recurring block to the human
+    // ledger; every sweep tick that re-hits the cap while the block stays
+    // un-cleared re-suppresses identically. Pre-BR#4702 each tick audited
+    // foldable spawn_skipped → one spawn-while-open breach card per blocked
+    // parent (specimen BR#3633: steady-true atom, card raised on top of the
+    // standing escalation). BR#4282 made the flood half observable-only; this
+    // pins the cap half.
+    const ticks = [0, 1, 2, 3, 4, 5].map((n) =>
+      ev(n, "BR#7", "unblock spawner cap (5 rounds, cap 3) — escalation already filed", "spawn_cap_skipped"));
+    expect(detectBreaches(ticks, new Set())).toHaveLength(0);
+    expect(detectBreaches(ticks, new Set(["BR#7|spawn-while-open"]))).toHaveLength(0);
+  });
+
   it("replay mismatches breach immediately — one corrupted fold is never noise", () => {
     const breaches = detectBreaches([ev(0, "BR#6", "stored done, log folds to in_review", "replay_mismatch")], new Set());
     expect(breaches).toHaveLength(1);
