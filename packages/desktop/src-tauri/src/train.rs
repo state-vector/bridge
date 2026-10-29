@@ -45,6 +45,7 @@ use crate::train_gate::{
     TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1146,6 +1147,10 @@ pub struct DaemonTrainConfig {
     /// run_success / pr_checks_green typed-await parks). On by default;
     /// PROXY_PROBES_ENABLED=0 turns it off independently.
     pub probes_enabled: bool,
+    /// BR#4806: the event-driven wake leg (SSE subscription to the hub's
+    /// `lane.queued` broadcast). On by default; MERGE_TRAIN_EVENTS=0 turns
+    /// it off independently — the poll cadence remains the fallback.
+    pub events_enabled: bool,
 }
 
 impl DaemonTrainConfig {
@@ -1166,6 +1171,11 @@ impl DaemonTrainConfig {
             reconcile_enabled: env_enabled(std::env::var("RECONCILE_ENABLED").ok()),
             reconcile_interval_ms: clamp_reconcile_interval_secs(reconcile_secs) * 1000,
             probes_enabled: env_enabled(std::env::var("PROXY_PROBES_ENABLED").ok()),
+            // BR#4806 event-driven tick: subscribe to the hub's `lane.queued`
+            // broadcast and tick on arrival. MERGE_TRAIN_EVENTS=0 turns the
+            // subscription off independently (the kill-the-event-path drill)
+            // — the 45s poll cadence is the fallback and stays untouched.
+            events_enabled: env_enabled(std::env::var("MERGE_TRAIN_EVENTS").ok()),
         }
     }
 }
@@ -1185,6 +1195,13 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
         );
         return;
     }
+    // BR#4806: the event-driven wake leg (best-effort; spawn failure or
+    // MERGE_TRAIN_EVENTS=0 leaves the daemon poll-only — today's behaviour)
+    if cfg.events_enabled {
+        spawn_wake_leg(stop.clone());
+    } else {
+        emit("train", "", "train wake leg disabled (MERGE_TRAIN_EVENTS=0) — poll cadence only");
+    }
     let spawned = std::thread::Builder::new().name("merge-train".into()).spawn(move || daemon_loop(cfg, stop));
     if let Err(e) = spawned {
         emit(
@@ -1192,6 +1209,219 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
             "",
             &format!("failed to spawn gateway train leg: {e}"),
         );
+    }
+}
+
+// ===========================================================================
+// Event-driven tick (BR#4806) — the hub broadcasts `lane.queued {repo, base,
+// depth}` on its push channel when a lane's derived queue transitions
+// empty → non-empty; a subscribed gateway wakes and runs ONE tick on arrival.
+// The tick itself is UNCHANGED: the same CAS lease acquire (a push+poll
+// double-fire serializes — the second acquirer stands down), the same
+// identity gate (BR#3181), the same proof-of-progress renewal (BR#4129).
+// The poll cadence stays as the fallback: a missed event degrades to
+// today's 45s pick-up, and MERGE_TRAIN_EVENTS=0 kills the subscription for
+// the kill-the-event-path drill. Transport: the hub's SSE flavor of the
+// push channel (/api/kb/sse — the same audit-event frames the browser WS
+// carries), read with plain reqwest blocking so the vendored module needs
+// NO new dependency in either crate.
+// ===========================================================================
+
+/// Wake flag: the SSE leg sets it when `lane.queued` names a lane this
+/// daemon serves; the daemon loop's sleep slices check it and break out to
+/// a tick immediately. Plain AtomicBool — std only.
+static TRAIN_WAKE: AtomicBool = AtomicBool::new(false);
+
+/// Request a tick now. Returns false when a wake was ALREADY pending — the
+/// pending tick covers this event too (a burst of lane.queued collapses to
+/// one tick; the tick itself re-reads live queue state from the hub).
+fn request_wake() -> bool {
+    !TRAIN_WAKE.swap(true, Ordering::Relaxed)
+}
+
+/// Drain the flag — true means a tick was requested since the last drain.
+fn drain_wake() -> bool {
+    TRAIN_WAKE.swap(false, Ordering::Relaxed)
+}
+
+/// One SSE `data:` line → wake decision. The frame shape matches the WS
+/// push channel exactly: `{"type":"kb.event","event":{"op":..., "detail":
+/// {…}}}`. Only `lane.queued` frames for a lane this daemon serves (the
+/// MERGE_TRAIN_LANES allowlist, empty = every lane) wake the tick — every
+/// other audit event on this channel is board traffic, not a wake.
+fn sse_wake_on_frame(line: &str, lane_allow: &[String]) -> bool {
+    let data = match line.strip_prefix("data:") {
+        Some(d) => d.trim(),
+        None => return false,
+    };
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return false, // keepalives (`: ping`) never reach here; junk is ignored
+    };
+    if v.get("type").and_then(|t| t.as_str()) != Some("kb.event") {
+        return false;
+    }
+    let ev = match v.get("event") {
+        Some(e) => e,
+        None => return false,
+    };
+    if ev.get("op").and_then(|o| o.as_str()) != Some("lane.queued") {
+        return false;
+    }
+    let detail = ev.get("detail").cloned().unwrap_or(Value::Null);
+    let repo = detail.get("repo").and_then(|r| r.as_str()).unwrap_or("");
+    if repo.is_empty() {
+        return false;
+    }
+    let base = detail.get("base").and_then(|b| b.as_str()).unwrap_or("main");
+    if !lane_allow.is_empty() && !lane_allow.iter().any(|a| a == &format!("{repo}@{base}")) {
+        return false;
+    }
+    true
+}
+
+/// The wake leg: subscribe to the hub's SSE push channel and set the wake
+/// flag on `lane.queued`. Runs beside the daemon loop until `stop`; every
+/// failure backs off (5s doubling to 60s) and reconnects — the event path
+/// may be dead for hours without the poll cadence ever noticing, by design.
+fn wake_leg_loop(stop: std::sync::Arc<AtomicBool>) {
+    let mut backoff = Duration::from_secs(5);
+    // Connection generation (the keepalive watchdog, BR#4806): reqwest's
+    // blocking client exposes no read timeout, so the parent WATCHES the
+    // reader instead. The hub pings the stream on its 60s alarm; silence
+    // past 150s (two missed pings + margin) means the connection is dead
+    // (hub restart, network break). The parent bumps the generation and
+    // redials; the stalled reader — blocked in a read that ALWAYS unblocks
+    // eventually (CF idle bounds / TCP retransmit timeouts) — finds a stale
+    // generation on wake and exits WITHOUT redialing. Bounded: at most one
+    // zombie reader per dead connection, and none of them ever re-dials.
+    let gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // pairing re-resolved per attempt — token rotations self-heal here
+        // exactly as they do in ctx_for_daemon (BR#4104's law)
+        let (hub, token) = match crate::dispatch::DispatchConfig::resolve() {
+            Some(p) if !p.url.trim().is_empty() && !p.token.trim().is_empty() => (p.url, p.token),
+            _ => (String::new(), String::new()),
+        };
+        if hub.trim().is_empty() || token.trim().is_empty() {
+            std::thread::sleep(backoff);
+            continue;
+        }
+        let hub = hub.trim_end_matches('/').to_string();
+        // NO total timeout on this client — the stream must stay open
+        // indefinitely between frames; liveness is the watchdog above.
+        let client = match reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log(None, &format!("wake leg client build failed: {}", trunc(&e.to_string(), 160)));
+                std::thread::sleep(backoff);
+                continue;
+            }
+        };
+        let lane_allow = parse_identities(&std::env::var("MERGE_TRAIN_LANES").unwrap_or_default());
+        let resp = client
+            .get(format!("{hub}/api/kb/sse"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("accept", "text/event-stream")
+            .send();
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                let code = r.status();
+                let _ = r.error_for_status();
+                log(None, &format!("wake leg dial failed ({code}) — retrying in {}s", backoff.as_secs()));
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+            Err(e) => {
+                log(None, &format!("wake leg unreachable: {} — retrying in {}s", trunc(&e.to_string(), 160), backoff.as_secs()));
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+        };
+        backoff = Duration::from_secs(5);
+        log(None, &format!("wake leg subscribed — {hub}/api/kb/sse (lane.queued → tick, poll cadence stays as fallback)"));
+        let cur = gen.load(Ordering::Relaxed);
+        let (beat_tx, beat_rx) = std::sync::mpsc::channel::<()>();
+        let gen_r = gen.clone();
+        let stop_r = stop.clone();
+        // the reader owns the response — line-oriented SSE over a BufReader
+        // (blocking Response implements std::io::Read; no async runtime, no
+        // new dependency in the vendored module)
+        let reader = std::thread::Builder::new().name("train-wake-read".into()).spawn(move || {
+            let mut stream = std::io::BufReader::new(resp);
+            loop {
+                let mut line = String::new();
+                match stream.read_line(&mut line) {
+                    Ok(0) => break, // stream closed — parent redials
+                    Ok(_) => {
+                        if stop_r.load(Ordering::Relaxed) || gen_r.load(Ordering::Relaxed) != cur {
+                            break; // stopped, or the watchdog replaced this generation
+                        }
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if trimmed.starts_with(':') {
+                            let _ = beat_tx.send(()); // keepalive comment — alive
+                            continue;
+                        }
+                        if sse_wake_on_frame(trimmed, &lane_allow) {
+                            let woke = request_wake();
+                            if woke {
+                                log(None, "lane.queued wake — ticking now (event-driven, BR#4806; CAS lease serializes with any concurrent poll tick)");
+                            }
+                        }
+                        let _ = beat_tx.send(()); // any frame counts as alive
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = beat_tx.send(()); // final signal — the parent must not sit out the full silent window on a clean close
+        });
+        if let Err(e) = reader {
+            log(None, &format!("wake leg reader spawn failed: {e} — retrying"));
+            std::thread::sleep(backoff);
+            continue;
+        }
+        loop {
+            match beat_rx.recv_timeout(Duration::from_secs(150)) {
+                Ok(()) => {
+                    if stop.load(Ordering::Relaxed) || gen.load(Ordering::Relaxed) != cur {
+                        break;
+                    }
+                    // alive — keep watching (Disconnected arrives next on a
+                    // clean close, ending this watch immediately)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    gen.fetch_add(1, Ordering::Relaxed); // stale reader exits, never redials
+                    log(None, "wake leg stream silent >150s (keepalive lost) — redialing");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // the stream broke: back off briefly so a hub restart cycle doesn't
+        // spin the redial, then reconnect
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Spawn the wake leg beside the daemon (shared stop flag). The leg is
+/// best-effort by construction: spawn failure logs and the daemon stays
+/// poll-only — identical to today's behaviour.
+fn spawn_wake_leg(stop: std::sync::Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new().name("train-wake".into()).spawn(move || wake_leg_loop(stop));
+    if let Err(e) = spawned {
+        emit("train", "", &format!("failed to spawn train wake leg (poll cadence unaffected): {e}"));
     }
 }
 
@@ -1259,17 +1489,27 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     let mut last_reconcile: Option<std::time::Instant> = None;
     loop {
         // sleep in small slices so stop is responsive (same law as run_loop)
+        // — and so a `lane.queued` wake (BR#4806) breaks out to a tick
+        // immediately instead of waiting out the poll interval
         let wake = std::time::Instant::now() + Duration::from_millis(cfg.interval_ms);
+        let mut woken = false;
         while std::time::Instant::now() < wake {
             if stop.load(Ordering::Relaxed) {
                 log(None, "gateway train leg stopping");
                 return;
+            }
+            if drain_wake() {
+                woken = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
         if stop.load(Ordering::Relaxed) {
             log(None, "gateway train leg stopping");
             return;
+        }
+        if woken {
+            log(None, "event wake — running a tick ahead of the poll cadence (BR#4806)");
         }
         ticks += 1;
         // Proactively re-resolve the pairing every ~30 ticks (~22 min at the
@@ -2247,5 +2487,71 @@ mod tests {
         let err = probe_report_body("run:o:r:4", Err("gh not authed".into()));
         assert_eq!(err["ok"], json!(false));
         assert_eq!(err["error"], json!("gh not authed"));
+    }
+
+    // ---- event-driven tick (BR#4806): the SSE wake leg ----
+
+    /// The hub's push channel carries EVERY audit event; only a `lane.queued`
+    /// frame naming a lane this daemon serves may wake a tick. Everything
+    /// else — board traffic, other ops, junk, keepalives — is not a wake.
+    #[test]
+    fn sse_frames_wake_only_on_lane_queued_for_served_lanes() {
+        let frame = |op: &str, repo: &str, base: &str| {
+            format!(
+                "data: {}",
+                json!({ "type": "kb.event", "event": { "seq": 1, "op": op, "artefact_id": "BR#1", "detail": { "repo": repo, "base": base, "depth": 1 } } })
+            )
+        };
+        let empty: Vec<String> = vec![];
+        // the wake frame itself
+        assert!(sse_wake_on_frame(&frame("lane.queued", "state-vector/bridge", "main"), &empty));
+        // allowlist honoured (MERGE_TRAIN_LANES)
+        let allow = vec!["state-vector/superpositional@main".to_string()];
+        assert!(!sse_wake_on_frame(&frame("lane.queued", "state-vector/bridge", "main"), &allow));
+        assert!(sse_wake_on_frame(&frame("lane.queued", "state-vector/superpositional", "main"), &allow));
+        // every other op is board traffic, never a wake
+        assert!(!sse_wake_on_frame(&frame("lane.starved", "state-vector/bridge", "main"), &empty));
+        assert!(!sse_wake_on_frame(&frame("train_queued", "state-vector/bridge", "main"), &empty));
+        // malformed / non-event frames are ignored, never panic
+        assert!(!sse_wake_on_frame("data: not json", &empty));
+        assert!(!sse_wake_on_frame("data: {\"type\":\"kb.board\",\"board\":{}}", &empty));
+        assert!(!sse_wake_on_frame(": ping 1793273600000", &empty));
+        assert!(!sse_wake_on_frame("retry: 5000", &empty));
+        // a frame missing detail is dropped fail-closed (no repo → no wake)
+        assert!(!sse_wake_on_frame("data: {\"type\":\"kb.event\",\"event\":{\"op\":\"lane.queued\"}}", &empty));
+    }
+
+    /// A burst of lane.queued events collapses to ONE wake: the first sets
+    /// the flag, duplicates are no-ops, and the drain clears it exactly once.
+    #[test]
+    fn wake_flag_dedupes_bursts_and_drains_clean() {
+        drain_wake(); // whatever a parallel test left — this test owns the flag
+        assert!(request_wake(), "first request flips the flag");
+        assert!(!request_wake(), "a pending wake dedupes the burst");
+        assert!(drain_wake(), "the drain observes the request");
+        assert!(!drain_wake(), "drain clears the flag");
+        assert!(!drain_wake(), "a second drain is a no-op");
+    }
+
+    /// BR#4806 double-fire pin: push and poll can both wake a tick; the CAS
+    /// lease serializes them — the second acquirer stands down with ZERO
+    /// further hub calls (no renew, no release, no lane driving). Same seam
+    /// the concurrent-gateway tests pin; this names the push+poll case.
+    #[test]
+    fn push_and_poll_double_fire_second_acquirer_stands_down() {
+        let (hub, calls) = mock_hub(vec![
+            // the poll-side tick already holds the live lease when the
+            // push-woken tick races in for the acquire
+            Err("lane lease held live by merge-train@test — standing down this tick".into()),
+        ]);
+        let mut pushed = test_ctx(&hub);
+        pushed.identity = Some(IdentityClass::Worker("detached-cody".into()));
+        drive_lane(&mut pushed, &lane());
+        let recorded = calls.lock().unwrap();
+        // exactly one call total — the losing acquire; the loser touched nothing
+        assert_eq!(recorded.len(), 1, "a stood-down tick makes no further hub calls");
+        let args = call_args(&recorded[0]);
+        assert_eq!(args.get("action").and_then(|v| v.as_str()), Some("acquire"));
+        assert_eq!(args.get("merge_capable"), Some(&json!(true)));
     }
 }

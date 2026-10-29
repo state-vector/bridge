@@ -696,7 +696,8 @@ Env (standalone and daemon leg alike): `MERGE_TRAIN_HOLDER` (lease label, defaul
 cwd standalone / managed clone cache in the daemon), `MERGE_TRAIN_LANES` (comma-sep
 `repo@base` allowlist; default every lane the hub reports),
 `MERGE_TRAIN_WORKER_IDENTITIES` (worker-class gh logins, default `detached-cody`),
-`MERGE_TRAIN_ENABLED=0` (kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
+`MERGE_TRAIN_EVENTS=0` (kill switch for the event-driven wake leg), `MERGE_TRAIN_ENABLED=0`
+(kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
 (drive one lane only), `--once`, `--interval <secs>`, `--method <m>`. `bridge doctor`
 gates the prerequisites (gh present + authed + `repo` scope, git — each failure names
 the fix); the executor re-probes the cheap ones every start. It merges as whatever
@@ -765,6 +766,15 @@ included) as "unmergeable — CONFLICTING".
   reads and proactively on the hub's alarm sweep, so a dead train is loud even with
   zero panel readers. Recovery is automatic: the first capable lease (or the queue
   draining) clears the starved state.
+- **Event-driven tick (BR#4806)**: when a lane's derived queue transitions empty →
+  non-empty, the hub broadcasts `lane.queued {repo, base, depth}` on the push channel
+  (SSE, the same transport as `lane.starved` — subscribe at `/api/kb/sse` with a gateway
+  token). A ready gateway runs ONE tick on arrival — the exact same CAS lease acquire,
+  identity gate (BR#3181) and proof-of-progress renewal (BR#4129) as every tick — so
+  work that queues right after a tick starts within seconds instead of waiting out the
+  next 45s poll. The poll cadence stays as the fallback: a missed event degrades to
+  today's behaviour, and push + poll firing together is safe by construction (the CAS
+  lease serializes; the second acquirer stands down — pinned in test).
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, and the lane HOLDS until main settles before the next head enters.
