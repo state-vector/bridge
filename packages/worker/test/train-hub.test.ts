@@ -646,7 +646,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(live.length).toBe(1);
     const ask = live[0];
     expect(["todo", "in_progress", "blocked"]).toContain(ask.status);
-    expect(ask.meta.ask.to).toBe("human");
+    expect(ask.meta.ask.to).toBe("tag:review"); // BR#4982/BR#3452: mechanical re-verifies route to the agent pool — the human leg sees the lane-day digest instead
     expect(ask.meta.ask.urgency).toBe("time-sensitive");
     expect(ask.meta.ask.artefact_id).toBe(card);
     expect(String(ask.title)).toContain("Review requested");
@@ -727,6 +727,62 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(String(live[0].meta.ask.answer)).toContain("landed");
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
+  });
+
+  it("BR#4981/4982: attempting + bypass-wait + stop-culprit lane vocabulary; bounce asks route to the agent pool (tag:review); the human gets ONE appended lane-day digest", async () => {
+    const repo = "state-vector/lane-vocab";
+    const H1 = "5".repeat(40), H2 = "7".repeat(40), M1 = "6".repeat(40);
+    const card1 = await queueViaAccept({ repo, pr: 3401, head: H1, title: "IMPL: vocab drill leg 1" });
+    const card2 = await queueViaAccept({ repo, pr: 3402, head: H2, title: "IMPL: vocab drill leg 2" });
+    await acquire(repo, "gw-vocab", { required_workflows: ["Test"] });
+
+    // attempting: a queue head is in the gate — the reason names it (Ray: the
+    // panel must show the train TRYING, never a bare `ready` over a queue)
+    const snap1 = await laneSnap(repo);
+    expect(String(snap1.reason)).toContain(`attempting ${card1} (gate)`);
+
+    // gate bounce blocked on protection ⇒ the honest bypass-wait state
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-vocab", pr: 3401, task_id: card1, head_sha: H1, bounce_kind: "gate", merge_state_status: "blocked", reason: "review required by branch protection" })).body.error ?? "").toBe("");
+    const snap2 = await laneSnap(repo);
+    expect(String(snap2.reason)).toContain("awaiting bypass merge — PR #3401");
+    expect(snap2.bypass_wait?.pr).toBe(3401);
+
+    // asks: pool ask to tag:review; ONE human digest for the lane-day
+    const asksNow = (await kbJson("/artefacts?type=question&limit=200")).body.artefacts ?? [];
+    const poolAsk = asksNow.find((a: any) => a.meta?.ask?.review_leg === true && String(a.title).includes(`(${card1})`));
+    expect(poolAsk).toBeTruthy();
+    expect(poolAsk.meta.ask.to).toBe("tag:review");
+    const laneKeyStr = `${repo}@main`;
+    const digests1 = asksNow.filter((a: any) => String(a.title).startsWith(`Merge-train digest ${laneKeyStr}`));
+    expect(digests1.length).toBe(1);
+    expect(String(digests1[0].body_md)).toContain("PR #3401");
+
+    // second bounce on the lane appends to the SAME digest — no drip; the
+    // new gate+blocked bounce moves the bypass-wait to the new head
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-vocab", pr: 3402, task_id: card2, head_sha: H2, bounce_kind: "gate", merge_state_status: "blocked", reason: "review required by branch protection" })).body.error ?? "").toBe("");
+    const asksAfter = (await kbJson("/artefacts?type=question&limit=200")).body.artefacts ?? [];
+    const digests2 = asksAfter.filter((a: any) => String(a.title).startsWith(`Merge-train digest ${laneKeyStr}`));
+    expect(digests2.length).toBe(1);
+    expect(String(digests2[0].body_md)).toContain("PR #3401");
+    expect(String(digests2[0].body_md)).toContain("PR #3402");
+    expect((await laneSnap(repo)).bypass_wait?.pr).toBe(3402);
+
+    // landing leg 1: bypass-wait is typed to ITS pr — leg 2's wait survives
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-vocab", pr: 3401, merge_sha: M1, head_sha: H1, task_id: card1 })).body.error ?? "").toBe("");
+    const snap3 = await laneSnap(repo);
+    expect(snap3.bypass_wait?.pr).toBe(3402);
+    // the settle outranks the wait on the reason; the wait rides as a suffix
+    expect(String(snap3.reason)).toContain("settling on");
+    expect(String(snap3.reason)).toContain("bypass wait: PR #3402");
+
+    // STOP THE LINE names the culprit card (state 6)
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "stopped", actor: "gw-vocab", merge_sha: M1, pr: 3401, culprit_task: card1, reason: "required workflows RED: Test" })).body.error ?? "").toBe("");
+    const snap4 = await laneSnap(repo);
+    expect(String(snap4.reason)).toContain("STOPPED");
+    expect(String(snap4.reason)).toContain(`culprit ${card1}`);
+    expect(snap4.stop?.culprit_task).toBe(card1);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-vocab", line_green: true });
   });
 });
 

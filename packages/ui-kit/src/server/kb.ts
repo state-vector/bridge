@@ -163,7 +163,10 @@ export interface KbTrainLane {
   card: string;
   lease: KbTrainLease | null;
   currently: { phase?: string; merge_sha?: string; pr?: number; head_sha?: string; merged_at?: number; task_id?: string } | null;
-  stop: { sha?: string; reason?: string; at?: number; pr?: number } | null;
+  stop: { sha?: string; reason?: string; at?: number; pr?: number; culprit_task?: string } | null;
+  /** BR#4981: a gate-bounced head blocked on branch protection (review /
+   *  required checks) — cleared by the typed self-clear when the PR lands. */
+  bypass_wait?: { pr: number; task_id?: string; at: number } | null;
   required_workflows?: string[];
   reason?: string;
   last_capable_lease_ts?: number | null;

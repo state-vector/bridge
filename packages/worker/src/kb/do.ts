@@ -7249,34 +7249,66 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   }
 
   /** Recompute the lane card's blocked reason from its meta — the ONLY
-   *  reason-writer, so the lane always shows the truth (idle / leased /
-   *  awaiting CI / stopped / no gateway). Idempotent. */
+   *  reason-writer, so the lane always shows the truth. Idempotent.
+   *  BR#4981 activity vocabulary (Ray directive: "i dont see it actively
+   *  trying to merge anything"): the reason now names WHAT the train is doing,
+   *  all hub-derivable, never a bare `ready` while a queue exists —
+   *  retired (BR#4977) / bypass-wait (protection-blocked head) / STOPPED
+   *  (with the culprit card named) / settling (with the next head named) /
+   *  attempting <head> (gate in progress on the queue head) / ready (queue
+   *  empty) / no gateway, plus a `; last: <event>` bounce feed suffix when
+   *  the ledger moved inside 15 minutes. */
   private laneSyncReason(laneId: string, meta: any, now: number): string {
     const lane = laneOfMeta(meta);
     const lease: TrainLease | null = meta.lease ?? null;
     const currently = meta.currently ?? null;
     const stop = meta.stop ?? null;
+    // BR#4977: a retired lane (card done/superseded) never ticks again.
+    const laneRow = this.one(`SELECT status FROM artefacts WHERE id = ?`, laneId) as any;
+    const retired = !!laneRow && (laneRow.status === "done" || laneRow.status === "superseded");
+    // BR#4981: the derived queue head (what the train is attempting) and the
+    // lane's last ledger action (the bounce feed) are both hub-derivable.
+    const queue = lane ? this.laneQueue(lane.repo) : [];
+    const head = queue[0]?.id ? String(queue[0].id) : null;
+    const lastAct: any = lane ? (this.state.storage.sql.exec(
+      `SELECT ts, kind, pr, task_id FROM train_events WHERE repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+      lane.repo, lane.base,
+    ).toArray()[0] ?? null) : null;
+    const actSuffix = lastAct && now - Number(lastAct.ts ?? 0) < 15 * 60_000
+      ? `; last: ${lastAct.kind}${lastAct.pr ? ` PR #${lastAct.pr}` : ""}${lastAct.task_id ? ` (${lastAct.task_id})` : ""}`
+      : "";
+    const bw = meta.bypass_wait ?? null;
     let reason: string;
-    if (stop) reason = `merge-train: STOPPED — ${stop.reason} (resume when the line is green)`;
+    if (retired) reason = `merge-train: retired — the lane card is done/superseded (BR#4977); the train no longer ticks it`;
+    else if (stop) {
+      const culpritNote = stop.culprit_task ? ` — culprit ${stop.culprit_task}` : "";
+      reason = `merge-train: STOPPED — ${stop.reason}${culpritNote} (resume when the line is green)`;
+    }
     else if (currently) {
       const who = lease ? ` by ${lease.holder}` : "";
+      const nextNote = head ? `, attempting ${head} next` : "";
+      const bwNote = meta.bypass_wait ? ` — bypass wait: PR #${meta.bypass_wait.pr}${meta.bypass_wait.task_id ? ` (${meta.bypass_wait.task_id})` : ""}` : "";
       // BR#4804 back-pressure: the settling phase is the queue's pressure
       // valve — the reason names what main is doing and that heads are held
       // BR#4753: a failing landed close names itself — the wedge forming is
       // visible on the lane card, not silent behind a settling reason
       const lc = currently.landed_close as any;
       reason = lc
-        ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)`
-        : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight, next head held until main settles`;
-    } else if (meta.zombie) {
+        ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)${nextNote}`
+        : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight${nextNote}, heads held until main settles${bwNote}`;
+    } else if (bw) reason = `merge-train: awaiting bypass merge — PR #${bw.pr} by ${bw.task_id ?? "?"} blocked on branch protection (review/required checks a machine cannot satisfy); a human merge is the unblock, self-clears when it lands${queue.length ? ` — the walk continues on the other ${queue.length} queued head(s)` : ""}`;
+    else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
       // free until the next acquire clears the stamp (board visibility).
       const z = meta.zombie;
       const mins = Math.max(1, Math.round(Number(z.age_ms ?? 0) / 60_000));
       const queued = Number(z.queue_len ?? 0);
       reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
-    } else if (lease && lease.expires_ts > now) reason = `merge-train: leased by ${lease.holder} — idle`;
-    else {
+    } else if (lease && lease.expires_ts > now) {
+      reason = head
+        ? `merge-train: leased by ${lease.holder} — attempting ${head} (gate)${actSuffix}`
+        : `merge-train: leased by ${lease.holder} — idle`;
+    } else {
       // Ray 2026-10-29: idle no longer reads as a gateway shortage — a recent
       // merge-capable tick means the train is READY (name the machine + age);
       // only past TRAIN_READY_MS is the honest "awaiting" true.
@@ -7284,7 +7316,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const capHolder = String(meta.lane?.last_capable_holder ?? "");
       const mins = Math.max(0, Math.round((now - capAt) / 60_000));
       reason = capAt && capHolder && now - capAt < TRAIN_READY_MS
-        ? `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`
+        ? (head
+          ? `merge-train: ready — attempting ${head} (gate), last ticked by ${capHolder} ${mins}m ago${actSuffix}`
+          : `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`)
         : "merge-train: awaiting an available gateway";
     }
     if (meta.blocked?.reason !== reason) {
@@ -7501,6 +7535,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         }
       }
       meta.currently = { pr, merge_sha: mergeSha, head_sha: headSha, merged_at: mergedAt, phase: "awaiting-ci", task_id: chain.task_id };
+      // BR#4981: a landing clears the lane's bypass-wait for that PR — the
+      // typed self-clear, covering the human/admin bypass merge too (the
+      // executor's walk stamps the merged event from live state when it next
+      // sees the PR MERGED, train.rs:848).
+      if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")) }, chain.task_id);
       this.version(lane.id, actor, `train:${kind}`, `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`, { currently: meta.currently, reason });
@@ -7543,12 +7582,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       let reviewAskId: string | null = null;
       let reviewAskDeduped = false;
       const reviewAskTitle = trainReviewAskTitle({ repo }, pr, taskId);
+      // BR#4982 (per accepted BR#3452): mechanical bounce re-verifies route to
+      // the AGENT review pool, not the human top — the fresh-session verifier
+      // is the reviewer, and the ask self-resolves when the leg lands. The
+      // human sees ONE rolling per-lane-day digest instead of N asks;
+      // exception classes (stop-the-line, signing env) keep direct asks.
+      const reviewAskTarget = this.settingValue("train.review_ask_target", "tag:review");
       try {
         const res: any = await this.askCreate(
           {
-            to: "human",
+            to: reviewAskTarget,
             question: reviewAskTitle,
-            reason: "the head move past the accepted verdict dismissed the stale GitHub review — without a re-filed ask the human leg lapses silently and a card one mechanical leg from landed starves at default priority (BR#4068)",
+            reason: "the head move past the accepted verdict dismissed the stale GitHub review — the review pool re-verifies the live head; its accept re-queues the train and the ask self-resolves on the landing (BR#4068 + BR#4982)",
             details: trainReviewAskDetails({ repo, prNumber: pr, taskId, headSha, conflictFiles }),
             options: ["Approved — it can re-queue", "Changes requested — see my review", "Not yet — will review soon"],
             artefact_id: taskId,
@@ -7578,6 +7623,62 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         }
         this.audit(actor, "train:bounce_ask_deduped", lane.id, { task: taskId, pr, ask: reviewAskId, reason: String((e as Error)?.message ?? e).slice(0, 160) });
       }
+      // BR#4982: ONE rolling human digest per lane-day (accepted BR#3452 —
+      // mechanical bounces never drip into the human ForMe). The identical-
+      // open-ask guard dedupes (title is day-scoped); a dedupe appends the
+      // line. Yesterday's digest closes when today's is created (≤1 open).
+      try {
+        const day = new Date(now).toISOString().slice(0, 10);
+        const digestTitle = `Merge-train digest ${laneKey(repo, base)} ${day} — anything here need your call?`;
+        const digestLine = `- PR #${pr} (${taskId}): ${bounceKind} bounce${mergeStateStatus ? ` [${mergeStateStatus}]` : ""} — ${(defect ?? "").slice(0, 120) || "no defect detail"}; review ask routed to the agent pool (${reviewAskId ?? "deduped"})`;
+        const yesterday = this.state.storage.sql.exec(
+          `SELECT c.id AS id, c.title AS title FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question'
+             AND c.status IN ('todo','in_progress','blocked') AND c.title LIKE ? AND c.title != ? LIMIT 5`,
+          lane.id, `Merge-train digest ${laneKey(repo, base)} %`, digestTitle,
+        ).toArray() as any[];
+        for (const y of yesterday) {
+          try {
+            await this.transition({ id: y.id, to: "done", session: "", note: "superseded by today's lane digest (BR#4982 — one open digest per lane)" }, actor);
+          } catch { /* a digest the human answered stays answered */ }
+        }
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: digestTitle,
+              reason: "per accepted BR#3452 the human leg gets one daily digest per lane instead of N per-bounce asks — the mechanical re-verifies route to the agent review pool",
+              details: `Bounces on ${laneKey(repo, base)} today (re-verify pool: ${reviewAskTarget}; asks self-resolve when their PR lands):\n\n${digestLine}`,
+              options: ["Ack — digest only", "Escalate — need a human on this"],
+              artefact_id: lane.id,
+              urgency: "normal",
+            },
+            actor,
+          );
+        } catch (de) {
+          const dupDigest = this.one(
+            `SELECT c.id AS id, c.body_md AS body_md FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question'
+               AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
+            lane.id, digestTitle,
+          ) as any;
+          if (dupDigest) {
+            const body = `${String(dupDigest.body_md ?? "").trimEnd()}\n${digestLine}`;
+            this.state.storage.sql.exec(`UPDATE artefacts SET body_md = ?, updated_ts = ? WHERE id = ?`, body, now, dupDigest.id);
+            this.version(dupDigest.id, actor, "update", "digest appended — another bounce on this lane today (BR#4982)", {});
+          }
+          this.audit(actor, "train:bounce_digest_deduped", lane.id, { reason: String((de as Error)?.message ?? de).slice(0, 160) });
+        }
+      } catch (de2) {
+        this.audit(actor, "train:bounce_digest_failed", lane.id, { error: String((de2 as Error)?.message ?? de2).slice(0, 160) });
+      }
+      // BR#4981 state 7: a gate bounce whose mergeStateStatus is `blocked` is
+      // branch protection the machine cannot satisfy (review/required checks
+      // on the PR head) — surface it as the honest bypass-wait state instead
+      // of bare `ready`. Any other bounce for that PR, or its landing (typed
+      // self-clear in the merged flow), clears it.
+      if (bounceKind === "gate" && mergeStateStatus === "blocked") meta.bypass_wait = { pr, task_id: taskId, at: now };
+      else if (meta.bypass_wait?.pr === pr) delete meta.bypass_wait;
       // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
       // a bounced merge-ready card is the board's highest-value work — one
       // mechanical/human leg from landing — and must not re-enter at default
@@ -7673,7 +7774,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const failing: { name: string; conclusion?: string | null; url?: string | null }[] = Array.isArray(body.failing) ? body.failing : [];
       const culprit = String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null;
       const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
-      meta.stop = { sha, reason: why, at: now, pr, failing };
+      // BR#4981 state 6: the stop names the culprit card so the panel reads
+      // "STOP THE LINE — base red, fix card BR#X" without a ledger dig.
+      meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}) };
       // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
       if (culprit && meta.currently) {
@@ -8280,6 +8383,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         lease: meta.lease ?? null,
         currently: meta.currently ?? null,
         stop: meta.stop ?? null,
+        bypass_wait: meta.bypass_wait ?? null,
         required_workflows: lane.required_workflows,
         reason: String(meta.blocked?.reason ?? ""),
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,

@@ -53,20 +53,31 @@ function lockDot(l: KbTrainLane, now: number): { sd: "live" | "lapse" | "dead" |
   return { sd: "free", title: "no machine on this lane — no merge-capable gateway has ticked inside the 15-minute window; merges wait until one runs (start a gateway / bridge train)" };
 }
 
-/** The status column: what the lane is doing right now, one pill. */
+/** The status column: what the lane is doing right now, one pill.
+ *  BR#4981: the honest activity vocabulary — retired / bypass wait /
+ *  attempting (gate in progress on the queue head) join stop-the-line /
+ *  in-flight phase / lock held / ready / no gateway; the full lane reason
+ *  always rides the tooltip. */
 function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string } {
+  const reason = l.reason ?? "";
   if (l.stop)
     return {
       tone: "err",
       label: "⛔ stop-the-line",
-      title: `stop-the-line: ${l.stop.reason ?? ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`,
+      title: `stop-the-line: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`,
     };
+  if (reason.startsWith("merge-train: retired"))
+    return { tone: "muted", label: "retired", title: "lane card done/superseded — the train no longer ticks this lane (BR#4977)" };
+  if (reason.startsWith("merge-train: awaiting bypass merge") || l.bypass_wait)
+    return { tone: "warn", label: "⏸ bypass wait", title: reason || "a queue head is blocked on branch protection (review/required checks) — a human merge is the unblock; self-clears when it lands (BR#4981)" };
   if (l.currently)
     return {
       tone: l.currently.phase === "stopped" ? "err" : "live",
       label: l.currently.phase ?? "merging",
       title: `in-flight: ${JSON.stringify(l.currently)}`,
     };
+  if (reason.includes("attempting "))
+    return { tone: "live", label: "attempting", title: reason };
   if (l.lease?.holder) {
     const t = lockTone(l, now);
     return {

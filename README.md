@@ -459,10 +459,13 @@ silence issues one fresh round instead of flooding for an hour. The spawner cap 
 the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
 card, carries the recurring block to the human ledger.
-The trains panel is honest about capability: a held lock names its machine; an idle lane
-ticked by a merge-capable gateway inside the 15-minute window shows the pill
-`train ready` (the tooltip names the machine and its last tick age); only a lane with no
-capable tick inside the window says the muted pill `no gateway`.
+The trains panel is honest about capability and activity (BR#4981): a held lock names
+its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
+shows the pill `train ready` (the tooltip names the machine and its last tick age);
+only a lane with no capable tick inside the window says the muted pill `no gateway`;
+a gate in progress on the queue head reads `attempting` (with the head card and the
+last ledger action in the tooltip); a protection-blocked head reads `⏸ bypass wait`;
+a retired lane reads `retired`.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -734,7 +737,12 @@ included) as "unmergeable — CONFLICTING".
   `merge-train` + `infrastructure`, never claimable by agents, blocked at birth with the
   honest reason `merge-train: awaiting an available gateway` (merges happen when your
   machines are on). The card's blocked reason is recomputed by the hub from the card's
-  own meta — `idle` / `leased by X` / `awaiting CI on <sha> (PR #N)` / `STOPPED` /
+  own meta — `idle` / `leased by X` / `attempting <card> (gate)` (a queue head is in
+  the gate; the tooltip carries the last ledger action) / `settling on <sha> (PR #N)`
+  (naming the next head) / `awaiting bypass merge — PR #N by <card>` (a head blocked
+  on branch protection a machine cannot satisfy — review/required checks; a human
+  merge is the unblock and it self-clears when the PR lands) / `STOPPED — … — culprit
+  <card>` / `retired` (a done/superseded lane card is never ticked again, BR#4977) /
   `ready — last ticked by X Nm ago` (a merge-capable gateway ticked inside the
   15-minute window — the train will take work the moment it is queued) /
   `awaiting an available gateway` — so the board always shows the lane's truth, and an
@@ -790,8 +798,8 @@ included) as "unmergeable — CONFLICTING".
   dwell) admits the next head. The old default — vacuous green for unconfigured
   lanes — merged back-to-back and every push cancelled the previous Deploy Dev,
   starving main. While settling, the lane reason reads `settling on <sha> (PR #N):
-  build/deploy in flight, next head held until main settles`, and the panel's queue
-  depth is the count of heads waiting behind the pressure valve.
+  build/deploy in flight, attempting <card> next, heads held until main settles`, and
+  the panel's queue depth is the count of heads waiting behind the pressure valve.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the
