@@ -2,16 +2,16 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, parkClassOf, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, exitClassOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
-/** Backlog + Completed: the whole queue, categorised (2026-10-24 spec, Ray):
- *  NEXT (todo, claim-ranked — boost/park from the card), BLOCKED grouped by
- *  reason (awaiting human · awaiting verify · unblock duty live · other),
- *  TIMEOUT (churn/rework machine parks — nobody can action them), PARKED
- *  (deliberately not dispatchable). Completed = done work, newest first.
- *  Same ktable primitive as Top; only --cols differ. */
+/** Backlog + Completed: the whole queue (2026-10-29 spec, Ray): NEXT (todo,
+ *  claim-ranked) then every parked card filed under its EXIT CONDITION —
+ *  the typed await_event class (awaiting you · PR verification · PR merge ·
+ *  CI · deploy · another task · GitHub issue · a date · green main · other ·
+ *  timeout churn parks). Completed = done work, newest first. Same ktable
+ *  primitive as Top; only --cols differ. Top renders no parking lot. */
 
 function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<string>): { rank: number; why: string } {
   const roles: string[] = t.roles ?? [];
@@ -40,6 +40,7 @@ interface BlGroup {
   rows: any[];
   showRank: boolean;
   showBoost: boolean;
+  icon?: string;
 }
 
 export function BacklogView({ openTask }: { openTask?: (id: string) => void } = {}) {
@@ -72,27 +73,38 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
 
     const ready = ts.filter((t) => t.status === "todo" && t.is_claimable !== false).map(decorate)
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
-    const blockedHuman = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && t.meta?.awaiting_ask?.ask_id).sort(byUpdated);
-    const verify = ts.filter((t) => t.status === "in_review").sort(byUpdated);
-    const unblocking = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && !t.meta?.awaiting_ask?.ask_id && activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
-    const blockedOther = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && !t.meta?.awaiting_ask?.ask_id && !activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
-    const timeout = ts.filter((t) => parkClassOf(t) === "sin-bin").sort(byUpdated);
+    // every parked card files under its exit condition (typed await_event
+    // class with prose fallback) — one group per class, ordered by
+    // EXIT_CLASS_ORDER; in_review rides the same classifier ("Awaiting PR
+    // verification"). The live unblock duty is a chip on the row, not a group.
     const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false).sort(byUpdated);
+    const byExit = new Map<string, any[]>();
+    for (const t of ts) {
+      if (t.status !== "blocked" && t.status !== "in_review") continue;
+      const cls = exitClassOf(t);
+      const list = byExit.get(cls.key) ?? [];
+      list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
+      byExit.set(cls.key, list);
+    }
+    for (const list of byExit.values()) list.sort((a: any, b: any) => (b.t.updated_ts ?? 0) - (a.t.updated_ts ?? 0));
+    const exitGroups: BlGroup[] = [];
+    for (const key of EXIT_CLASS_ORDER) {
+      const rows = byExit.get(key) ?? [];
+      if (rows.length === 0) continue;
+      const cls = EXIT_CLASSES[key];
+      exitGroups.push({ key, title: cls.title, note: cls.note, icon: cls.icon, rows, showRank: false, showBoost: false });
+    }
 
     return [
       { key: "ready", title: "Next — ready to go", note: "claim-ranked: verify duties → unblock duties → questions → todo (verify first — in_review work parks its owner). ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
-      { key: "human", title: "Blocked — awaiting you", note: "pending human ask — answer it and the asker resumes.", rows: blockedHuman, showRank: false, showBoost: false },
-      { key: "verify", title: "Blocked — awaiting verify", note: "in review; the owner stays parked until a fresh verify session rules.", rows: verify, showRank: false, showBoost: false },
-      { key: "unblocking", title: "Blocked — unblock duty live", note: "an agent is actively working the unblock; nothing for you to do.", rows: unblocking, showRank: false, showBoost: false },
-      { key: "other", title: "Blocked — other", note: "everything else parked: most carry a machine exit condition the hub re-checks every 15 min — a condition the parser can't read never auto-flips; open the card to resolve or re-scope", rows: blockedOther, showRank: false, showBoost: false },
-      { key: "timeout", title: "Timeout — churn/rework parks", note: "the watchdog drains these to the pool automatically (BR#2893); release one early from Top's sin-bin.", rows: timeout, showRank: false, showBoost: false },
+      ...exitGroups,
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
     ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))
       .map((g) => ({ ...g, rows: g.rows.filter((r: any) => tagTheme.passes(r.t ?? r)) }));
   }, [tasks, tagTheme]);
 
   const parkedReason = (t: any): string => {
-    if (parkClassOf(t) === "sin-bin") return "churn/rework park — the watchdog drains it automatically; release early from Top's sin-bin";
+    if (exitClassOf(t).key === "timeout") return "churn/rework park — the watchdog drains it automatically; release early right here";
     if (t.status === "blocked") return (t.meta?.blocked?.unblock_condition ?? "blocked — open the card, resolve or re-scope").slice(0, 90);
     if (t.type === "question" || t.meta?.kind === "question") {
       // BR#3911: a live human hold says who has it and that it self-heals

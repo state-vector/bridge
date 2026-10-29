@@ -73,10 +73,11 @@ export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+)\b/g;
  *  lapses. Top excludes them; Backlog files them under TIMEOUT. */
 export const TIMEOUT_BLOCK_RX = /rework loop|churn guard/i;
 
-/* ---- BR#2893 park classes: the client mirror of the hub's blockedParkVerdict
- * ---- (worker kb/machine.ts). The hub drains dead parks automatically; the
- * ---- board renders the same three populations. Textual patterns MUST stay
- * ---- identical to the hub — change both together. */
+/* ---- BR#2893 churn-park pattern: the client mirror of the hub's
+ * ---- blockedParkVerdict (worker kb/machine.ts). The hub drains dead parks
+ * ---- automatically; the board files them under the Timeout exit class.
+ * ---- Textual patterns MUST stay identical to the hub — change both
+ * ---- together. */
 
 /** Churn-guard stamp, either field: the reason ("churn guard: released N
  *  times…") or the boilerplate exit condition ("read the task history…").
@@ -84,46 +85,73 @@ export const TIMEOUT_BLOCK_RX = /rework loop|churn guard/i;
  *  exit condition only. */
 export const CHURN_PARK_RX = /read the task history \(get_history\) and the last gate error|rework loop|churn guard/i;
 
-export type ParkClass = "sin-bin" | "external" | "plain";
+/** Churn-park test kept for Top's actionable admission filter. */
+export function isTimeoutBlock(t: { status?: string; meta?: any }): boolean {
+  return t.status === "blocked" && TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
+}
 
-/** Which top-level population a blocked card belongs to: sin-bin (churn
- *  parks — user-releasable), external (a named outside gate — ask, dated
- *  checkpoint, GitHub lane, red-main), or plain (honest park, ages out
- *  hub-side). Non-blocked cards are null. Ask-status isn't known client-side,
- *  so dead-ask detection stays hub-only; the drain fixes the card, the board
- *  need only render it. */
-export function parkClassOf(t: { status?: string; meta?: any }): ParkClass | null {
-  if (t.status !== "blocked") return null;
+/* ---- exit-condition classes (2026-10-29 spec, Ray): Top shows the
+ * ---- actionable fleet only; every parked card files in Backlog under
+ * ---- WHAT IT AWAITS. The class reads the card's TYPED await_event first
+ * ---- (BR#3578 closed set — the machine leg the hub re-checks), then the
+ * ---- prose unblock condition as fallback. */
+
+export interface ExitClass {
+  key: string;
+  title: string;
+  icon: string;
+  note: string;
+}
+
+const GH_PR_RX = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|\bPR #?\d+\b/i;
+const GH_ISSUE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+|\bGH#\d+\b/i;
+const RED_MAIN_RX = /\bred\s+main\b|\bmain\s+is\s+red\b|stop-the-line|\buntil main (is )?green\b|\bline is green\b/i;
+const DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/;
+const TRAIN_RX = /merge-train|serialized merge train|\bthe train\b/i;
+
+/** The exit-class table — single source; exitClassOf returns entries from it. */
+export const EXIT_CLASSES: Record<string, ExitClass> = {
+  ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes." },
+  verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it." },
+  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; parked on the serialized merge train (typed pr_merged)." },
+  ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success)." },
+  deploy: { key: "deploy", title: "Awaiting deploy", icon: "▲", note: "waiting on a hub deploy at the named commit." },
+  task: { key: "task", title: "Awaiting another task", icon: "◈", note: "waiting on another card's done/answer (br_done / br_answered)." },
+  issue: { key: "issue", title: "Awaiting GitHub issue", icon: "⊙", note: "waiting on an upstream issue closing." },
+  time: { key: "time", title: "Awaiting a date", icon: "◷", note: "time-gated — flips when the clock passes." },
+  main: { key: "main", title: "Awaiting green main", icon: "✖", note: "red-main / stop-the-line hold — resumes when the line is green." },
+  other: { key: "other", title: "Blocked — other", icon: "▪", note: "no typed leg matched — open the card to resolve or re-scope." },
+  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); release early if you disagree." },
+};
+
+/** Render order for the Backlog exit-class groups: human levers first, then
+ *  machine gates by blast radius, parks last. */
+export const EXIT_CLASS_ORDER = ["ask", "verify", "merge", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+
+/** Blocked (or in_review) card → the exit class Backlog groups it under.
+ *  First match wins; the typed await_event outranks prose. */
+export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   const m = t.meta ?? {};
   const b = m.blocked ?? {};
   const reason = String(b.reason ?? "");
   const unblock = String(b.unblock_condition ?? "");
-  if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return "sin-bin";
-  if (m.awaiting_ask?.ask_id) return "external";
-  if (/\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/.test(unblock)) return "external";
-  if (/github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i.test(unblock)) return "external";
-  if (/\bred\s+main\b|\bmain\s+is\s+red\b|\bstop-the-line\b|\buntil main (is )?green\b/i.test(unblock)) return "external";
-  return "plain";
-}
-
-/** The external owner a blocked card waits on, for the awaiting-external
- *  section: a human ask, a date, a GitHub lane, or main's health. */
-export function externalGateOf(t: { meta?: any }): { owner: string; next: string } {
-  const b = t.meta?.blocked ?? {};
-  const unblock = String(b.unblock_condition ?? "");
-  if (t.meta?.awaiting_ask?.ask_id) {
-    const awaiter = /awaiting (\S+) on ask/.exec(String(b.reason ?? ""));
-    return { owner: awaiter ? awaiter[1] : "you (ask)", next: `${t.meta.awaiting_ask.ask_id} — answer resumes the card` };
-  }
-  const date = /\b(20\d{2}-\d{2}-\d{2})/.exec(unblock);
-  if (date) return { owner: "clock", next: `until ${date[1]} — ${unblock.slice(0, 90)}` };
-  if (/github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i.test(unblock))
-    return { owner: "GitHub lane", next: unblock.slice(0, 110) };
-  return { owner: "main green", next: unblock.slice(0, 110) };
-}
-
-export function isTimeoutBlock(t: { status?: string; meta?: any }): boolean {
-  return t.status === "blocked" && TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
+  const ev = b.await_event?.event as string | undefined;
+  if (t.status === "in_review") return EXIT_CLASSES.verify;
+  if (t.status !== "blocked") return EXIT_CLASSES.other;
+  if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return EXIT_CLASSES.timeout;
+  if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
+  if (ev === "pr_merged" || ev === "br_pr_merged") return EXIT_CLASSES.merge;
+  if (ev === "pr_checks_green" || ev === "run_success") return EXIT_CLASSES.ci;
+  if (ev === "deployed") return EXIT_CLASSES.deploy;
+  if (ev === "br_done" || ev === "br_answered") return EXIT_CLASSES.task;
+  if (ev === "issue_closed") return EXIT_CLASSES.issue;
+  if (ev === "time") return EXIT_CLASSES.time;
+  // prose fallback — no typed leg on the card
+  if (TRAIN_RX.test(reason) || TRAIN_RX.test(unblock) || GH_PR_RX.test(unblock)) return EXIT_CLASSES.merge;
+  if (GH_ISSUE_RX.test(unblock)) return EXIT_CLASSES.issue;
+  if (RED_MAIN_RX.test(unblock) || RED_MAIN_RX.test(reason)) return EXIT_CLASSES.main;
+  if (DATE_RX.test(unblock)) return EXIT_CLASSES.time;
+  return EXIT_CLASSES.other;
 }
 
 export interface UnblockTwinIndex {
