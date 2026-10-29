@@ -1419,6 +1419,21 @@ describe("verdict-receipts gate classification + note shape (BR#4295)", () => {
     expect(breachClass("review BR#1 cannot complete without receipts")).toBe("gate:verdict-receipts");
   });
 
+  it("BR#4563: BR#4067 release-hold refusals classify as the held-flow family, not unclassified", () => {
+    // the exact audited reason shape on specimen TASK-016 (breach card BR#4563)
+    const typedAwaitHold =
+      "card parks on a typed await_event (pr_merged) — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release. [rule: release-holds-typed-await]";
+    expect(breachClass(typedAwaitHold)).toBe("release:held-typed-await");
+    // the tag sliced off by the audit trail's 300-char reason slice still
+    // classifies — the rule identifier rides inside the message body too
+    expect(breachClass(typedAwaitHold.slice(0, 300))).toBe("release:held-typed-await");
+    // the train-queue sibling (specimens BR#3727/BR#4068, cards BR#4573/BR#4578)
+    const trainQueueHold =
+      "card is merge-train bounced (typed await pr_merged state-vector/bridge#227) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool. [rule: release-holds-train-queue]";
+    expect(breachClass(trainQueueHold)).toBe("release:held-train-queue");
+    expect(breachClass(trainQueueHold.slice(0, 300))).toBe("release:held-train-queue");
+  });
+
   it("the guard's rejection teaches the shape hasReceipts actually accepts", async () => {
     const msg = await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note: "verdict NO_UNBLOCK, still 'blocked'" } }), baseCtx());
     expect(msg).toContain("cannot complete without receipts");
@@ -1846,6 +1861,24 @@ describe("blockedParkVerdict (BR#2893)", () => {
       askIsOpen: () => false,
     });
     expect(deduped.klass).toBe("dead-ask");
+  });
+
+  it("BR#4563: a task id inside the unblock condition is not a phantom ask ref", () => {
+    // "TASK-016" contains the substring "ASK-016" — the unbounded regex
+    // extracted it, the ask-liveness lookup missed, and the blocked-staleness
+    // drain re-attempted a machine release every sweep tick while the BR#4067
+    // backstop kept refusing it (specimen TASK-016, breach card BR#4563)
+    const withTaskId = park({
+      unblockCondition:
+        "Machine-checkable: mergeCommit non-null on PR https://github.com/state-vector/bridge/pull/99 AND PR https://github.com/state-vector/bridge/pull/67, OR an explicit Ray NO-GO. On merge receipts: a FRESH verify session closes TASK-016 done citing the mergeCommit receipts",
+      askIsOpen: () => false,
+      blockedTs: NOW - 100 * 3_600_000,
+    });
+    expect(withTaskId.klass).toBe("external"); // GitHub PR lane — exempt from the drain
+    expect(withTaskId.why).toBe("GitHub issue/PR lane");
+    // a real ask ref still parses and still gates the verdict
+    const realAsk = park({ unblockCondition: "Ray answers ASK-dead-01", askIsOpen: () => false });
+    expect(realAsk.klass).toBe("dead-ask");
   });
 
   it("true external gates are exempt from the age drain", () => {

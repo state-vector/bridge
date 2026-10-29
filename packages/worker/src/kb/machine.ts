@@ -236,7 +236,16 @@ export const CHURN_UNBLOCK_RX = /read the task history \(get_history\) and the l
 export const CHURN_REASON_RX = /^churn guard:/i;
 
 /** ASK- references inside unblock conditions ("Ray answers ASK-xyz-abc"). */
-export const ASK_REF_RX = /ASK-[a-zA-Z0-9._-]+/g;
+// BR#4563: left word-boundary. Without it, a prose unblock_condition naming a
+// task id ("…a FRESH verify session closes TASK-016 done…") yields the phantom
+// ref "ASK-016" — the substring inside the id — every ask-liveness lookup
+// misses, blockedParkVerdict misclassifies the park dead-ask, and the
+// blocked-staleness drain re-attempts a machine release every sweep tick; the
+// BR#4067 backstop refuses each attempt and the rejection stream piles up as
+// breach cards (specimen TASK-016 / BR#4563). \b fails inside "TASK" (T|A are
+// both word chars) and still matches real refs after whitespace, string start,
+// "(" or "#".
+export const ASK_REF_RX = /\bASK-[a-zA-Z0-9._-]+/g;
 
 const PARK_DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/g;
 const PARK_GH_LANE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i;
@@ -1043,6 +1052,16 @@ export function breachClass(reason: string): string {
   // park deadlocked on its own done).
   if (r.includes("self-referential await")) return "gate:self-referential-await";
   if (r.includes("machine atoms (")) return "gate:multi-atom-condition";
+  // BR#4563: the BR#4067 release-hold backstop (decide()) refusing a MACHINE
+  // silence/owner-death release — benign by design: the typed wait / the
+  // train queue owns the exit, the sweep holds ("wait it out or let a
+  // human/owner release"). Match the rule identifiers — code names, stable
+  // under message wording drift (BR#3611/BR#3612 lesson), and present in the
+  // audited reason whether or not the " [rule: …]" tag survived the 300-char
+  // slice. Specimens: TASK-016 (typed pr_merged park, BR#4563),
+  // BR#3727/BR#4068 (merge-train bounced, BR#4573/BR#4578).
+  if (r.includes("release-holds-typed-await")) return "release:held-typed-await";
+  if (r.includes("release-holds-train-queue")) return "release:held-train-queue";
   return "unclassified";
 }
 
