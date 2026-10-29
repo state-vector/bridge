@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
-import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -450,7 +450,17 @@ export const RULES: Rule[] = [
           // parses to N atoms — but a park awaits ONE typed event. Reject
           // loud naming the atoms instead of letting the sweep gate on the
           // first one while the rest vanish from the machine gate.
-          return `condition text parses to ${atoms.length} machine atoms (${atoms.map((a) => a.raw).join(" | ")}). A park awaits ONE typed event — ${AWAIT_GRAMMAR_DOC}. Name a single machine leg in await_event, or carry the rest as prose: multi-atom conjunctions never self-migrate (BR#3986).`;
+          // BR#4303: name each atom in SHORT form. `raw` is the whole
+          // 200-char line slice, so raw-based formatting spent the do.ts
+          // 300-char audit budget on atom 1's line alone — the audit trail
+          // (and the breach fold that samples it) could never show the leg
+          // to drop, and the rejected author blind-retries the same park
+          // (the BR#4301 verifier loop).
+          const shortAtom = (a: (typeof atoms)[number]) => {
+            const ev = awaitEventFromAtoms([a]);
+            return ev ? describeAwaitEvent(ev) : a.raw.slice(0, 80);
+          };
+          return `condition text parses to ${atoms.length} machine atoms (${atoms.map(shortAtom).join(" | ")}). A park awaits ONE typed event — ${AWAIT_GRAMMAR_DOC}. Name a single machine leg in await_event, or carry the rest as prose: multi-atom conjunctions never self-migrate (BR#3986).`;
         }
         if (!unparseable && atoms.length === 1) {
           const single = awaitEventFromAtoms(atoms);

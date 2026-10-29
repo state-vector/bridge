@@ -271,6 +271,31 @@ describe("loop regressions", () => {
     expect(breachClass(String(rej))).toBe("gate:multi-atom-condition");
   });
 
+  it("BR#4303: the multi-atom refusal names every atom in SHORT form inside the 300-char audit budget", async () => {
+    // Two atoms on DIFFERENT long lines. With raw (line-slice) formatting the
+    // message spent the do.ts .slice(0, 300) audit budget on atom 1's line —
+    // the audit trail and the breach fold never showed the second leg to
+    // drop, and the rejected author blind-retries the same park (the
+    // BR#4301 verifier loop). Short descriptors keep every atom inside the
+    // slice.
+    const line1 =
+      "Machine proxy (typed await_event br_done id=BR#4291): BR#4291 done — the unblock duty lands its receipts-shaped →done close (drop-in note already on the card,";
+    const line2 =
+      "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=282): PR state-vector/bridge#282 merges (mergeCommit non-null) AND main CI green after the train lands it.";
+    expect(line1.length).toBeGreaterThan(120);
+    expect(line2.length).toBeGreaterThan(120);
+    const rej = await check(
+      input({ status: "in_progress", to: "blocked", body: { note: "waiting", unblock_condition: `${line1}\n${line2}` } }),
+      baseCtx(),
+    );
+    expect(rej).toBeTruthy();
+    const reason = String(rej).slice(0, 300); // the do.ts audit budget
+    expect(reason).toContain("2 machine atoms");
+    expect(reason).toContain("BR#4291 done");
+    expect(reason).toContain("PR state-vector/bridge#282 merged");
+    expect(breachClass(String(rej))).toBe("gate:multi-atom-condition");
+  });
+
   it("BR#3986: a park awaiting its own done is refused — explicit AND text-derived (the BR#136 deadlock)", async () => {
     const explicit = await check(
       input({ id: "BR#136", status: "in_progress", to: "blocked", body: { note: "x", await_event: { event: "br_done", id: "BR#136" } } }),
