@@ -1342,6 +1342,13 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
  *  hold preserves state, it is neither an abandonment nor a lost run. */
 export const PROXY_WAIT_HOLD_RESULT_CLASS = "proxy_wait_hold";
 
+/** result_class stamped on the watchdog's bounce re-entry demote (BR#4494): a
+ *  train bounce re-opened a card in_progress with no live executor, and the
+ *  demanded re-verify/repair leg had no machine starter — the sweep releases
+ *  it claimable instead of re-parking. The score side exempts it: a machine
+ *  bounce + machine demote is nobody's abandonment. */
+export const BOUNCE_REENTRY_DEMOTE_RESULT_CLASS = "bounce_reentry_demote";
+
 /** The PR leg a card's merge-train state points at, from any of the shapes
  *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).
  *  0 when none resolves. */

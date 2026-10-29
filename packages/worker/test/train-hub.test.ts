@@ -287,7 +287,17 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.error ?? "", `coverage bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.bounce_kind).toBe("coverage");
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    // BR#4494: the self-heal re-entry LANDS now — its note carries the PR link
+    // (review-needs-pr admits it), the card is in_review, and the standard
+    // in_review handoff spawned the re-verify duty. The old pin here
+    // (in_progress) was the defect itself: the link-less note was gate-rejected
+    // and the card stranded in the unclaimable in_progress stop-gap (the
+    // BR#4467 breaches — one per coverage bounce).
+    expect(card1.status).toBe("in_review");
+    const verifyDuty = ((await kbJson("/list", { type: "task", limit: 200 })).body?.artefacts ?? [])
+      .find((a: any) => a.title === "Verify: IMPL: coverage bounce drill" && ["todo", "in_progress", "blocked"].includes(a.status));
+    expect(verifyDuty, "the coverage self-heal must leave an OWNED re-verify duty").toBeTruthy();
+    expect(String(verifyDuty.body_md)).toContain("https://github.com/state-vector/lane-coverage/pull/2611");
     const brief = String(card1.body_md);
     expect(brief).toContain("Merge-train bounce (coverage): PR #2611");
     expect(brief).toContain("head moved past the accepted verify verdict");

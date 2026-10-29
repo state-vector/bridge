@@ -567,3 +567,89 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
     expect((await taskById(id)).status).toBe("done");
   });
 });
+
+describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () => {
+  it("a bounce re-entry stranded in_progress (dead executor) is DEMOTED to a claimable todo by the sweep — never re-parked blocked; train meta + boost survive", async () => {
+    // The specimen shape (BR#4198): a train bounce re-opened its card
+    // in_progress with the PRIOR session as executor; the session is gone and
+    // nothing pings. The self-heal normally lands coverage bounces in_review
+    // (train-hub.test.ts pins that) — this drill pins the FALLBACK for every
+    // path that still strands the unclaimable in_progress: the sweep must
+    // release it claimable, never re-park it blocked (the 4×-bounce loop).
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4494 demote drill", qualified: true, session: "drill-exec-br4494" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    const claim = await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4494", session: "drill-exec-br4494" });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBe(200);
+    // the bounce's stamps, exactly what train:bounced writes (do.ts): state
+    // bounced on a live PR leg + the starvation-law boost. The executor then
+    // dies — no progress, no ping, past the stale window.
+    const stamp = await kbJson("/update", {
+      id, actor: "drill-exec-br4494",
+      meta: {
+        merge_train: { state: "bounced", bounce_kind: "coverage", pr: 2401, repo: "state-vector/superpositional", bounced_at: t0 + 30_000 },
+        boosted: t0 + 30_000,
+      },
+    });
+    expect(stamp.status, `stamp failed: ${JSON.stringify(stamp.body)}`).toBe(200);
+
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 11 * 60_000 });
+    expect(sweep.status, `stall sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+
+    const after = await taskById(id);
+    expect(after.status, "the stranded re-entry must be DEMOTED to claimable todo, not re-parked blocked").toBe("todo");
+    expect(after.meta?.blocked).toBeUndefined();
+    // the re-queue seam + the starvation law survive the release
+    expect(after.meta?.merge_train?.state).toBe("bounced");
+    expect(after.meta?.boosted).toBeTruthy();
+    // the release names the law (BR#4494) — auditable, and the churn stamp
+    // carries the reason
+    expect(String(after.meta?.attempt?.last_reason ?? "")).toContain("BR#4494");
+  });
+
+  it("the hold is NOT loosened: a queued card (flag or not) and a parked blocked bounced card stay held — only the live in_progress re-entry demotes", async () => {
+    // queued + live in_progress: the train owns the leg — the sweep must
+    // re-park blocked even though a forged flag rides the transition shape
+    // (the sweep itself would never pass one for queued; this pins the gate).
+    const q = await kbJson("/create", { type: "task", title: "IMPL: br4494 queued hold drill", qualified: true, session: "drill-exec-br4494q" });
+    expect(q.status).toBe(200);
+    const qid = String(q.body.id);
+    await kbJson("/transition", { id: qid, to: "in_progress", actor: "drill-exec-br4494q", session: "drill-exec-br4494q" });
+    await kbJson("/update", {
+      id: qid, actor: "drill-exec-br4494q",
+      meta: { merge_train: { state: "queued", pr: 2402, repo: "state-vector/superpositional" } },
+    });
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 12 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const qAfter = await taskById(qid);
+    expect(qAfter.status, "queued keeps parks-not-releases (BR#4067 — live queue slot)").toBe("blocked");
+    expect(String(qAfter.meta?.blocked?.reason ?? "")).toContain("queued");
+
+    // a parked BLOCKED bounced card: the demote carve-out is scoped to the
+    // in_progress re-entry — a park stays parked (the flag alone must not
+    // release it; the sweep's hold-park passes no flag, and the gate would
+    // refuse one from blocked).
+    const b = await kbJson("/create", { type: "task", title: "IMPL: br4494 parked bounce drill", qualified: true, session: "drill-exec-br4494b" });
+    expect(b.status).toBe(200);
+    const bid = String(b.body.id);
+    await kbJson("/transition", { id: bid, to: "in_progress", actor: "drill-exec-br4494b", session: "drill-exec-br4494b" });
+    await kbJson("/transition", {
+      id: bid, to: "blocked", actor: "drill-exec-br4494b", session: "drill-exec-br4494b",
+      note: "parked on the merge gate",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2403 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2403 },
+    });
+    await kbJson("/update", {
+      id: bid, actor: "drill-exec-br4494b",
+      meta: {
+        ...(  (await taskById(bid)).meta ?? {}),
+        merge_train: { state: "bounced", bounce_kind: "gate", pr: 2403, repo: "state-vector/superpositional", bounced_at: t0 + 40_000 },
+      },
+    });
+    const sweep2 = await kbJson("/admin.stall_sweep", { now: t0 + 13 * 60_000 });
+    expect(sweep2.body.error).toBeUndefined();
+    const bAfter = await taskById(bid);
+    expect(bAfter.status, "a parked blocked bounced card stays parked — the carve-out is in_progress-only").toBe("blocked");
+  });
+});

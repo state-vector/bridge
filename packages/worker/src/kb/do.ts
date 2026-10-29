@@ -98,6 +98,7 @@ import {
   trainProxyEvent,
   trainMergeReceipt,
   PROXY_WAIT_HOLD_RESULT_CLASS,
+  BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
   type TrainLease,
   type LeaseAction,
   type MainCheckRun,
@@ -650,6 +651,33 @@ export class KnowledgeHub {
         // (silence → re-park on the satisfied atom → identical unblock round
         // → flood-skip → threshold-1 breach card).
         if (await this.routeSatisfiedProxy(r, meta, now, `no update for >${staleMin}m`)) continue;
+        // BR#4494 — bounce re-entry demote: a train bounce re-opens its card
+        // in_progress (session:"" on the transition, the PRIOR — usually dead
+        // — session left as executor) and in_progress is not claimable (claim
+        // = todo → in_progress). For a BOUNCED card the machine wait no longer
+        // owns the next leg: the train has handed the leg BACK to the board
+        // (re-entry only after a fresh verify accept), so parks-not-releases
+        // here mints the silent-unclaimable loop — the BR#4198 specimen (4
+        // coverage bounces, one breach card per ~11-min cycle, the demanded
+        // re-verify leg never starting by any machine path). Demote to todo:
+        // claimable, with the bounce brief + boost riding the card. The
+        // queued/awaiting-ci flavors KEEP the hold — those are live queue
+        // slots (the PR #257 class this park exists to protect). The machine
+        // backstop admits exactly this shape (demote_bounced_reentry).
+        const mtState = String(((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "");
+        if (mtState === "bounced") {
+          await this.transition(
+            {
+              id: r.id,
+              to: "todo",
+              note: `bounce re-entry demoted (watchdog, BR#4494): the train bounce re-opened this card in_progress with no live executor and its demanded leg had no machine starter — released claimable with the bounce brief intact; a fresh verify accept re-queues the train`,
+              demote_bounced_reentry: true,
+              result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
+            },
+            "system:watchdog",
+          );
+          continue;
+        }
         await this.transition(this.holdParkBody(r.id, meta, hold, `no update for >${staleMin}m`), "system:watchdog");
         continue;
       }
@@ -1300,6 +1328,11 @@ Why this needs a human: the hub re-checks blocked cards every sweep, but only ag
         // BR#4067: a hold-park preserves a machine wait (train queue slot /
         // typed await / bound ask) — it is neither an abandonment nor a lost
         // run, so no counter moves.
+      }
+      else if (d?.result_class === BOUNCE_REENTRY_DEMOTE_RESULT_CLASS) {
+        // BR#4494: the bounce re-entry demote is a machine bounce + machine
+        // release of a card whose executor was already gone — nobody
+        // abandoned anything, so no counter moves.
       }
       else s.abandoned++;
     }
@@ -5886,6 +5919,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // silence by releasing the card — the exact queue-slot destruction
       // fixed above. Instead: straight back into review; the standard
       // in_review handoff auto-spawns a fresh verify duty.
+      // BR#4494: the note MUST carry the PR link — the review-needs-pr gate
+      // (hasEvidenceLink) rejects a link-less in_review note, and the
+      // rejected re-entry left the card in the unclaimable in_progress
+      // stop-gap (the BR#4467 breaches: 3 rejections, 3 stranded cards).
       if (bounceKind === "coverage") {
         try {
           await this.transition(
@@ -5893,12 +5930,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               id: taskId,
               to: "in_review",
               session: "",
-              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train`,
+              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head; its accept re-queues the train. PR: https://github.com/${repo}/pull/${pr}`,
             },
             actor,
           );
         } catch (e) {
-          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; impl re-enters review manually` });
+          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; the watchdog bounce re-entry demote (BR#4494) releases it claimable at the next stall sweep` });
         }
       }
       cm.merge_train = nextMeta.merge_train;
