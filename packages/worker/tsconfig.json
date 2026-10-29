@@ -31,6 +31,8 @@
     "test/push-board.test.ts",
     "test/rate-limit.test.ts",
     // BR#3819: same rig as do.test.ts (miniflare + workerd fetch types)
-    "test/br3819-self-edge.test.ts"
+    "test/br3819-self-edge.test.ts",
+    // BR#3942: same rig as do.test.ts (miniflare + workerd fetch types)
+    "test/ask-escalation.test.ts"
   ]
 }

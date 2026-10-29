@@ -430,6 +430,21 @@ export class KnowledgeHub {
       await this.sweepLaneStarvation(now0);
     } catch (e) {
       this.audit("system:train", "starve_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    // (0b) BR#3942 — TTL escalation for agent-addressed asks. An ask to an
+    // agent identity that sits unanswered past the TTL while the addressee is
+    // OFFLINE black-holes: the owner-gated release law (BR#3931) deadlocks
+    // ("agents render the verdict + ask the owner") and the human — the final
+    // escalation — never hears of it (the BR#3930 incident: ask to
+    // macbook-pro-local-opencode, direct identity last_seen=null, Ray saw
+    // nothing until he released the card by hand). One re-route on the SAME
+    // node: meta.ask.escalated is stamped once, the human planes surface it
+    // with the proof, and NO duplicate ask is minted (one-ask-per-class
+    // doctrine). An ONLINE addressee + unanswered is still reachable —
+    // agents may simply be mid-task — so no escalation.
+    await this.escalateStaleAsks(now0);
+
+
+
     }
     // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
     // verdict. If no verifier ever picks the verification round up, the park is
@@ -1733,6 +1748,14 @@ export class KnowledgeHub {
       const d = JSON.parse(v.data ?? "{}");
       return { artefact_id: v.artefact_id, ts: v.ts, actor: v.actor, ...d };
     });
+    // BR#3942 — ask rows carry their addressee's presence so the human
+    // planes can show "asked to X (offline, N min ago)" without any new
+    // permission: the board payload is the ask band's only data source.
+    for (const t of tasks) {
+      if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
+        t.ask_target = this.askTargetPresence(String(t.meta.ask.to ?? ""), Date.now());
+      }
+    }
     return { tasks, sessions, progress, series, agents: this.agentScores() };
   }
 
@@ -2651,6 +2674,7 @@ export class KnowledgeHub {
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
         case "admin.stall_sweep":
+        case "admin.ask_escalation_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -2673,6 +2697,14 @@ export class KnowledgeHub {
             // window of its own).
             await this.stallSweep(Number(body.now ?? Date.now()));
             return this.json({ ok: true });
+          }
+          if (op === "admin.ask_escalation_sweep") {
+            // drill/liveness path for the ask TTL escalation (BR#3942): the
+            // alarm sweep calls escalateStaleAsks(Date.now()) every minute;
+            // pass now=<future epoch ms> to test a back-dated ask against a
+            // later clock without waiting the TTL in real time.
+            const escalated = await this.escalateStaleAsks(Number(body.now ?? Date.now()));
+            return this.json({ ok: true, escalated });
           }
           // admin.stop_line_sweep / admin.merge_queue_sweep /
           // admin.provenance_sweep / admin.closure_audit_sweep DELETED with
@@ -4549,6 +4581,70 @@ export class KnowledgeHub {
       old?.hash ?? null, Date.now(), id,
     );
     return Number(old?.epoch ?? 1) + 1;
+  }
+
+  /** Ask addressees that ARE the final escalation themselves — an ask to one
+   *  of these is already human mail; the TTL re-route never applies. Bare
+   *  coordinator labels count (dispatch sessions ask under the coordinator's
+   *  label — the same law the ask band's human filter uses). */
+  private static readonly HUMAN_ASK_TARGETS = new Set(["human", "ray", "rayh", "opencode-ray"]);
+
+  /** Can a non-human ask target still be answered? Direct token OR the
+   *  gateway-dispatch edge seen inside the presence window (10 min — the
+   *  same clock listAgents uses). A label with no record at all has NEVER
+   *  connected: offline by construction (the BR#3930 addressee). */
+  private askTargetPresence(to: string, now: number): { online: boolean; last_seen_ts: number | null; source: "token" | "gateway" | "unknown" } {
+    const cutoff = now - 10 * 60_000;
+    const t = this.one(`SELECT last_seen_ts FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, to) as any;
+    if (t) return { online: Number(t.last_seen_ts) >= cutoff, last_seen_ts: Number(t.last_seen_ts), source: "token" };
+    const g = this.one(`SELECT last_seen_ts FROM gateway_agents WHERE agent = ? ORDER BY last_seen_ts DESC LIMIT 1`, to) as any;
+    if (g) return { online: Number(g.last_seen_ts) >= cutoff, last_seen_ts: Number(g.last_seen_ts), source: "gateway" };
+    return { online: false, last_seen_ts: null, source: "unknown" };
+  }
+
+  /** BR#3942 — stamp meta.ask.escalated on unanswered, offline-addressee
+   *  asks (agent-identity targets only). Idempotent: a node already carrying
+   *  escalated is skipped, so repeated sweeps never duplicate. `now` is
+   *  injectable for the admin drill door and the alarm path passes Date.now(). */
+  private async escalateStaleAsks(now: number): Promise<string[]> {
+    const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
+    const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
+    const ttlMs = ttlMin * 60_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta, created_ts FROM artefacts
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked') AND created_ts < ?`,
+      now - ttlMs,
+    ).toArray() as any[];
+    const escalated: string[] = [];
+    for (const r of rows) {
+      let m: any;
+      try { m = JSON.parse(r.meta ?? "{}"); } catch { continue; }
+      const ask = m.ask;
+      if (!ask || ask.escalated) continue;
+      const to = String(ask.to ?? "");
+      // human-directed, open-floor, capability-tag and session-scoped asks
+      // are NOT agent-identity asks: the first are already human mail, the
+      // rest are pool/roster/agent-to-agent routing that the human band
+      // deliberately never claimed (AskBand's @-filter law).
+      if (!to || to === "any" || to.startsWith("tag:") || to.includes("@")) continue;
+      if (KnowledgeHub.HUMAN_ASK_TARGETS.has(to)) continue;
+      const presence = this.askTargetPresence(to, now);
+      if (presence.online) continue;
+      m.ask.escalated = {
+        ts: now,
+        from_target: to,
+        ttl_min: ttlMin,
+        addressee_last_seen_ts: presence.last_seen_ts,
+        presence_source: presence.source,
+        reason: `addressee ${to} offline (${presence.last_seen_ts ? `last seen ${Math.round((now - presence.last_seen_ts) / 60_000)}m ago via ${presence.source}` : "never seen"}) and the ask sat unanswered ${Math.round((now - Number(r.created_ts)) / 60_000)}m > ${ttlMin}m TTL — escalated to the human For Me band with the proof below; original options intact (BR#3942)`,
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), r.id);
+      const summary = `ask escalated to human: ${to} offline, unanswered > ${ttlMin}m (BR#3942)`;
+      this.version(r.id, "system:watchdog", "escalate", summary, { to, ttl_min: ttlMin, presence_source: presence.source });
+      this.audit("system:watchdog", "ask_escalated", r.id, { to, ttl_min: ttlMin, presence_source: presence.source, artefact_bound: ask.artefact_id ?? null });
+      escalated.push(r.id);
+    }
+    return escalated;
   }
 
   /**

@@ -27,6 +27,10 @@ export interface KbArtefact {
   part_of?: string;
   /** proposed decisions only — the open feedback round + agent consensus tally (BR#903) */
   consensus?: KbConsensus;
+  /** BR#3942 — addressee presence for ask rows (question nodes only):
+   *  projected by board() so the human planes can show
+   *  "asked to X (offline, N min ago)" with no extra permission. */
+  ask_target?: { online: boolean; last_seen_ts: number | null; source: "token" | "gateway" | "unknown" };
 }
 
 /** Consensus round of a proposed decision: contributions are log_progress notes on the round task. */

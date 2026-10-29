@@ -185,11 +185,21 @@ function QuestionNodeRow({ node, onDone }: { node: any; onDone: (id: string) => 
       <div className="ask-chips">
         <Chip tone="needs">ASK</Chip>
         {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        {ask.escalated && <Chip tone="urgent" title={ask.escalated.reason}>ESCALATED — addressee offline</Chip>}
         <span className="gw-mono ab-id">{node.id}</span>
-        <span className="why-line">{ask.from ?? "agent"} · {rel(node.created_ts)}</span>
+        <span className="why-line">
+          {ask.from ?? "agent"} → {ask.to ?? "any"} · {rel(node.created_ts)}
+          {/* BR#3942 — presence: is the addressee even alive? */}
+          {node.ask_target && !node.ask_target.online && (
+            <span className="ab-offline">
+              {" · "}offline{node.ask_target.last_seen_ts ? ` · last seen ${rel(node.ask_target.last_seen_ts)}` : " · never seen"}
+            </span>
+          )}
+        </span>
       </div>
       <h3 className="ask-question">{node.title}</h3>
       {ask.reason && <p className="ask-reason"><b>why escalated:</b> {ask.reason}</p>}
+      {ask.escalated?.reason && <p className="ask-reason"><b>escalation:</b> {ask.escalated.reason}</p>}
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
       )}

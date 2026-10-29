@@ -207,12 +207,21 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
   };
   return (
     <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
-      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
+      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
+        {ask.escalated && <Chip tone="urgent" title={ask.escalated.reason}>ESCALATED — addressee offline</Chip>}</span>
       <span className="ab-main">
         <span className="ab-title" title={nodeAsk.title}>{askKernel(nodeAsk.title)}</span>
         {m.ask?.reason && <span className="ab-reason" title={m.ask.reason}>why escalated: {m.ask.reason.length > 120 ? `${m.ask.reason.slice(0, 120)}…` : m.ask.reason}</span>}
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
+          {/* BR#3942 — addressee presence: a stalled card shows WHO the ask is
+              waiting on and whether that identity is even alive */}
+          {nodeAsk.ask_target && !nodeAsk.ask_target.online && (
+            <span className="ab-offline" title={`addressee presence (10-min window, source: ${nodeAsk.ask_target.source})`}>
+              {" · "}offline{nodeAsk.ask_target.last_seen_ts ? ` · last seen ${rel(nodeAsk.ask_target.last_seen_ts)}` : " · never seen"}
+            </span>
+          )}
+          {ask.escalated && <span className="ab-offline" title={ask.escalated.reason}> · escalated to you {rel(ask.escalated.ts)}</span>}
           {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}
         </span>
         {(ask.options ?? []).length > 0 && (
