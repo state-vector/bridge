@@ -268,6 +268,25 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toContain("/24h");
     expect(trainPanelSrc).toMatch(/l\.activity\.last_event\.kind/);
   });
+
+  it("shows the bounce budget: a ×N ledger-bounce chip per queued PR (err tone over budget) + the escalation clock chips (BR#4688)", () => {
+    const kbServerSrc = readFileSync(new URL("../../ui-kit/src/server/kb.ts", import.meta.url).pathname, "utf8");
+    // queue chips carry the ledger bounce count; over budget reads as an error, never a green chip
+    expect(trainPanelSrc).toMatch(/q\.over_budget/);
+    expect(trainPanelSrc).toContain("train-bounce-chip");
+    expect(trainPanelSrc).toMatch(/×\{q\.bounces\}/);
+    expect(trainPanelSrc).toContain("OVER bounce budget");
+    expect(trainPanelSrc).toContain("budget 5 same-kind — BR#4688");
+    // de-queued escalations ride their own clock chips: ⏳ pr ×bounce_no, err once expired
+    expect(trainPanelSrc).toMatch(/l\.escalations/);
+    expect(trainPanelSrc).toContain("⏳");
+    expect(trainPanelSrc).toMatch(/e\.expired \? "err" : "warn"/);
+    expect(trainPanelSrc).toMatch(/e\.grace_until/);
+    // the server type carries both surfaces (the panel consumes the snapshot shape)
+    expect(kbServerSrc).toMatch(/over_budget\?: boolean/);
+    expect(kbServerSrc).toMatch(/escalations\?:/);
+    expect(kbServerSrc).toMatch(/expired: boolean/);
+  });
 });
 
 describe("POST /api/kb/force_review — the human force-review plane (BR#4962)", () => {

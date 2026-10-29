@@ -96,6 +96,10 @@ import {
   clampAwaitingTtlHours,
   TRAIN_AWAITING_GRACE_MS,
   trainAwaitingReason,
+  TRAIN_BOUNCE_BUDGET,
+  TRAIN_BOUNCE_GRACE_HOURS,
+  trainEscalationAskTitle,
+  trainEscalationClosedReason,
   trainStopAskTitle,
   trainLandedCloseNote,
   trainLandedCloseEdge,
@@ -7801,7 +7805,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const kind = String(body.kind ?? "").trim();
-    if (!["merged", "bounced", "stopped", "landed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed");
+    if (!["merged", "bounced", "stopped", "landed", "escalation_closed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed | escalation_closed");
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
@@ -7810,7 +7814,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const pr = Number(body.pr ?? 0) || null;
     const headSha = body.head_sha ? String(body.head_sha) : null;
     const mergeSha = body.merge_sha ? String(body.merge_sha) : null;
-    const row = (id: string) => this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, id);
+    const row = (id: string) => this.one(`SELECT id, status, meta, body_md, owner FROM artefacts WHERE id = ?`, id);
     const ev = (detail: Record<string, unknown>, taskId: string | null) => {
       this.state.storage.sql.exec(
         `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -7919,6 +7923,35 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
+      // ---- bounce budget (BR#4688): per-(PR, bounce-kind) ceiling over the
+      // train_events ledger — the 6th same-kind bounce breaches (budget 5).
+      // The count's floor is the card's last budget CLEAR (owner action resets
+      // the episode); core.replayBounceBudget walks the same rows with the
+      // same rule, so a ledger replay and this runtime count agree by
+      // construction. detail is JSON.stringify'd compact — the exact
+      // `"bounce_kind":"<kind>"` substring is the match (no json1 dep). ----
+      const prevEsc = ((cm.merge_train ?? {}) as Record<string, unknown>).escalated as Record<string, unknown> | undefined;
+      const clearFloor = Number(prevEsc?.cleared_at ?? 0);
+      const priorSameKind = Number(
+        (this.one(
+          `SELECT COUNT(*) AS n FROM train_events WHERE repo = ? AND base = ? AND pr = ? AND kind = 'bounced'
+           AND ts > ? AND detail LIKE ?`,
+          repo, base, pr, clearFloor, `%"bounce_kind":"${bounceKind}"%`,
+        ) as any)?.n ?? 0,
+      );
+      const bounceNo = priorSameKind + 1;
+      const bounceBudgetBreached = bounceNo > TRAIN_BOUNCE_BUDGET;
+      const bounceGraceHours = Math.max(1, parseInt(this.settingValue("pr_grace_hours", String(TRAIN_BOUNCE_GRACE_HOURS)), 10) || TRAIN_BOUNCE_GRACE_HOURS);
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
+      const bounceNote = bounceBudgetBreached
+        ? `merge-train bounce (#${bounceNo} ${bounceKind}) — BOUNCE BUDGET EXCEEDED (BR#4688): de-queued, one escalation ask to the owner; the train stops re-serving until an owner acts (disposition per BR#3312)`
+        : bounceKind === "coverage"
+          ? `merge-train bounce (coverage) — PR #${pr} head moved past the accepted verdict; re-verify at the new head`
+          : bounceKind === "gate"
+            ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
+            : `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`;
+      // (non-breached bounces only — a budget BREACH (BR#4688) skips this park:
+      // the card is folded blocked-on-ask below the bounce transition instead.)
       // BR#4962 (per accepted BR#4960): a COVERAGE bounce is a lapsed
       // verdict, not a defect — the card parks `blocked` under a typed
       // Awaiting reason and the human force-reviews it from the backlog.
@@ -7927,7 +7960,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // IS the visibility. The park refreshes IN PLACE (blocked→blocked is
       // an illegal edge) and PRESERVES the typed pr_merged await_event leg,
       // so the proxy still owns a legal exit if the PR merges while parked.
-      if (bounceKind === "coverage") {
+      if (!bounceBudgetBreached && bounceKind === "coverage") {
         const verdictId = this.trainChain(taskId).verdict_id;
         const awaitingReason = trainAwaitingReason(verdictId, headSha);
         // BR#4068 starvation law still stamps the boost: a coverage-bounced
@@ -7967,17 +8000,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // re-enters the queue only after a fresh verify. NO ask legs here
       // either (BR#4960): the repair leg re-enters review through the normal
       // in_review handoff, which auto-spawns the fresh verify duty.
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
-      const bounceNote =
-        bounceKind === "gate"
-          ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
-          : `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`;
       // BR#4981 state 7: a gate bounce whose mergeStateStatus is `blocked` is
       // branch protection the machine cannot satisfy (review/required checks
       // on the PR head) — surface it as the honest bypass-wait state instead
       // of bare `ready`. Any other bounce for that PR, or its landing (typed
       // self-clear in the merged flow), clears it.
-      if (bounceKind === "gate" && mergeStateStatus === "blocked") meta.bypass_wait = { pr, task_id: taskId, at: now };
+      if (!bounceBudgetBreached && bounceKind === "gate" && mergeStateStatus === "blocked") meta.bypass_wait = { pr, task_id: taskId, at: now };
       else if (meta.bypass_wait?.pr === pr) delete meta.bypass_wait;
       // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
       // a bounced merge-ready card is the board's highest-value work — one
@@ -8015,6 +8043,105 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         },
         actor,
       );
+      // ---- BR#4688 bounce-budget breach: the train STOPS re-serving this
+      // PR. ONE bound ask (askCreate's identical-open-ask guard dedupes
+      // re-fires; an escalation ask id already stamped and still open is
+      // reused verbatim). The fold to blocked-on-ask IS the de-queue: the
+      // derived queue counts only blocked cards with a `merge-train:` reason,
+      // and the ask park replaces it — so there is never a 7th bounce. The
+      // answer auto-resumes the card to the owner's repair leg; a fresh
+      // verify accept at a NEW head clears the escalation (trainQueueOnAccept)
+      // and re-queues. At grace expiry the executor's gh leg closes the PR
+      // citing this ask (escalation_closed), the disposition per BR#3312. ----
+      if (bounceBudgetBreached) {
+        const escTitle = trainEscalationAskTitle(repo, pr, taskId, bounceKind, bounceNo, bounceGraceHours);
+        const prevOpenAskId = prevEsc && !prevEsc.cleared_at && String(prevEsc.bounce_kind ?? "") === bounceKind ? String(prevEsc.ask_id ?? "") : "";
+        let escAskId: string | null = null;
+        if (prevOpenAskId) {
+          const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, prevOpenAskId) as any;
+          if (a && ["todo", "in_progress", "blocked"].includes(String(a.status))) escAskId = prevOpenAskId;
+        }
+        if (!escAskId) {
+          const owner = String((card as any).owner ?? "").trim();
+          try {
+            const res: any = await this.askCreate(
+              {
+                to: owner && isValidAskTarget(owner) && owner.toLowerCase() !== "human" ? owner : "any",
+                question: escTitle,
+                reason: `the same-kind bounce budget (${TRAIN_BOUNCE_BUDGET}) is spent — bounce #${bounceNo} (${bounceKind}); automatic re-serving is churn without escalation (the PR #279×31 class) — the train stopped serving this PR until an owner acts (BR#4688, disposition per BR#3312)`,
+                details: [
+                  `PR https://github.com/${repo}/pull/${pr} (card ${taskId}) has bounced **${bounceNo}× ${bounceKind}** within one budget episode (budget ${TRAIN_BOUNCE_BUDGET} same-kind bounces, BR#4688).`,
+                  `Latest defect: ${(defect ?? "(none reported)").slice(0, 300)}`,
+                  `The train has DE-QUEUED the PR — there is no 7th automatic bounce. Disposition (BR#3312): **merge, rebase, or close it with reason within ${bounceGraceHours}h** — at expiry the train's gh leg closes the PR citing this ask; the board card survives as the record.`,
+                  `Resume: push a new head (rebase/fix) and re-enter review — a fresh verify accept at the new head clears the escalation and re-queues the card; or answer this ask.`,
+                ].join("\n\n"),
+                options: ["Rebased/fixed — new head pushed, resume the train", "Merging by hand — close the loop", "Close the PR with reason — work abandoned", "Extend the clock — I am on it"],
+                artefact_id: taskId,
+                urgency: "time-sensitive",
+                bounce_budget: true,
+              },
+              actor,
+            );
+            escAskId = res?.id ?? null;
+          } catch (e) {
+            // an identical escalation ask is already open — that IS the one ask
+            this.audit(actor, "train:bounce_budget_ask_deduped", lane.id, { task: taskId, pr, reason: String((e as Error)?.message ?? e).slice(0, 160) });
+            const dup = this.one(
+              `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+               WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+                 AND c.type = 'question' AND c.title = ? LIMIT 1`,
+              taskId, escTitle.slice(0, 200),
+            ) as any;
+            escAskId = dup?.id ?? null;
+          }
+        }
+        // re-read the card's meta (the transition + fold just mutated it) and
+        // stamp the escalation on top of the bounce facts
+        const escMeta = JSON.parse(String((this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId) as any)?.meta ?? "{}"));
+        escMeta.merge_train = {
+          ...(escMeta.merge_train ?? {}),
+          escalated: {
+            bounce_kind: bounceKind,
+            bounce_no: bounceNo,
+            budget: TRAIN_BOUNCE_BUDGET,
+            pr,
+            repo,
+            at: now2,
+            grace_hours: bounceGraceHours,
+            grace_until: now2 + bounceGraceHours * 3_600_000,
+            ...(headSha ? { head_sha: headSha } : {}),
+            ...(escAskId ? { ask_id: escAskId } : {}),
+          },
+        };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(escMeta), now2, taskId);
+        cm.merge_train = escMeta.merge_train;
+        // a REUSED escalation ask (re-fired breach — the raw-7th-event class)
+        // skips askCreate, so the fold to blocked-on-ask never ran and the
+        // card would sit in_progress OUTSIDE the ask park — unparked, the
+        // watchdog releases it and the queue re-admits it (a 7th SERVE). The
+        // de-queue invariant is re-asserted here, not assumed. ----
+        const parked = String((this.one(`SELECT status FROM artefacts WHERE id = ?`, taskId) as any)?.status ?? "");
+        if (parked === "in_progress" && escAskId) {
+          const pm = JSON.parse(String((this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId) as any)?.meta ?? "{}"));
+          pm.awaiting_ask = { ...(pm.awaiting_ask ?? {}), ask_id: escAskId, ts: now2 };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(pm), taskId);
+          await this.transition(
+            {
+              id: taskId,
+              to: "blocked",
+              session: "",
+              note: `bounce-budget escalation stands (bounce #${bounceNo} ${bounceKind}) — still parked on ask ${escAskId}; the train does not re-serve (BR#4688)`,
+              unblock_condition: `answer ask ${escAskId}`,
+              await_event: { event: "ask", ask_id: escAskId },
+            },
+            actor,
+          );
+        }
+        ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, escalated: true, ...(escAskId ? { ask_id: escAskId } : {}) }, taskId);
+        const escReason = this.laneSyncReason(lane.id, meta, now);
+        this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (${bounceKind}) #${bounceNo} — BOUNCE BUDGET EXCEEDED: de-queued, escalation ask ${escAskId ?? "(deduped)"}; the train stops re-serving until an owner acts (BR#4688, disposition per BR#3312)`, { reason: escReason });
+        return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason: defect, escalated: true, bounce_no: bounceNo, ask: escAskId };
+      }
       cm.merge_train = nextMeta.merge_train;
       // BR#4068 starvation law (leg 1): a bounced card is the most valuable
       // work on the board — verified once, one mechanical leg from landed.
@@ -8033,13 +8160,60 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
       meta.currently = inFlightBounced ? null : meta.currently;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
+      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo }, taskId);
       const laneNote =
         bounceKind === "gate"
           ? `PR #${pr} bounced (gate) — named defect; impl fixes it, then re-verify and re-queue at the back`
           : `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`;
       this.version(lane.id, actor, `train:${kind}`, laneNote, { reason });
-      return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason };
+      return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason, bounce_no: bounceNo };
+    }
+
+    if (kind === "escalation_closed") {
+      // BR#4688: the executor's gh leg reports it closed an EXPIRED
+      // bounce-budget escalation's PR. The hub never self-certifies a close:
+      // the card must carry an ACTIVE escalation for THIS pr, else the event
+      // is rejected. The card survives as the record (BR#3312): receipt
+      // stamped, the bound ask answered with the receipt, the card released
+      // to todo (unclaimed — the PR was the vehicle, the work is the record).
+      if (!pr) throw new Error("train:escalation_closed needs pr");
+      const closeTaskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
+      const closeCard = closeTaskId ? row(closeTaskId) : null;
+      if (!closeCard) throw new Error(`train:escalation_closed could not resolve the impl card (task_id ${closeTaskId ?? "none"})`);
+      const clm = JSON.parse(closeCard.meta ?? "{}");
+      const esc = ((clm.merge_train ?? {}) as Record<string, unknown>).escalated as Record<string, unknown> | undefined;
+      if (!esc || esc.cleared_at || esc.closed_at) throw new Error("train:escalation_closed rejected — no ACTIVE bounce-budget escalation on the card (never self-certify a close)");
+      if (Number(esc.pr ?? clm.merge_train?.pr ?? 0) !== Number(pr)) throw new Error(`train:escalation_closed rejected — the escalation is for PR #${String(esc.pr ?? clm.merge_train?.pr)}, not #${pr}`);
+      const graceHours = Number(esc.grace_hours ?? TRAIN_BOUNCE_GRACE_HOURS);
+      const closeReason = String(body.reason ?? "").trim() || trainEscalationClosedReason({ repo, prNumber: Number(pr), kind: String(esc.bounce_kind ?? "gate"), bounceNo: Number(esc.bounce_no ?? 0), askId: (esc.ask_id as string) ?? null, escalatedAt: Number(esc.at ?? now), graceHours });
+      clm.merge_train = {
+        ...(clm.merge_train ?? {}),
+        escalated: { ...esc, closed_at: now },
+        escalation_closed: { at: now, by: actor, pr, reason: closeReason.slice(0, 500), ask_id: (esc.ask_id as string) ?? undefined },
+      };
+      delete clm.awaiting_ask;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(clm), now, closeTaskId);
+      if (esc.ask_id) {
+        try {
+          await this.askAnswer({ id: String(esc.ask_id), answer: `PR #${pr} closed by the train's expiry leg (${actor}) — ${closeReason.slice(0, 300)}` }, actor);
+        } catch (e) {
+          this.audit(actor, "train:escalation_closed", lane.id, { ask_settle_error: String((e as Error)?.message ?? e).slice(0, 160), ask: esc.ask_id });
+        }
+      }
+      await this.transition(
+        {
+          id: closeTaskId,
+          to: "todo",
+          session: "",
+          note: `bounce-budget escalation expired — PR #${pr} closed with reason (disposition per BR#3312); card survives as the record`,
+        },
+        actor,
+      );
+      meta.currently = null;
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      ev({ task: closeTaskId, bounce_kind: esc.bounce_kind, bounce_no: esc.bounce_no, ask_id: esc.ask_id, reason: closeReason }, closeTaskId);
+      this.version(lane.id, actor, `train:${kind}`, `escalation expired — PR #${pr} closed with reason; card ${closeTaskId} survives as the record (BR#4688/BR#3312)`, { reason });
+      return { ok: true, kind, lane: laneKey(repo, base), pr, task: closeTaskId, reason: closeReason };
     }
 
     if (kind === "stopped") {
@@ -8804,6 +8978,34 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.audit("system:merge-train", "queue_unbound", parentId, { reason: `close cited PR(s) ${unbound.map((l) => `#${l.number}`).join(", ")} without a paired \`head <sha>\` — every cited PR needs its head before the train can gate it (BR#3659)` });
       return;
     }
+    // ---- bounce budget (BR#4688): an ACTIVE escalation stops re-serving —
+    // the bound ask is the live leg and the PR rides out its clock DE-QUEUED.
+    // Owner action lifts it: a NEW head at the escalated leg (a rebase/fix
+    // was pushed) or an answered escalation ask. A lift stamps cleared_at —
+    // the budget episode resets (the bounce-time COUNT floors at the clear,
+    // matching core.replayBounceBudget). ----
+    const esc = ((meta.merge_train ?? {}) as Record<string, unknown>).escalated as Record<string, unknown> | undefined;
+    if (esc && !esc.cleared_at && !esc.closed_at) {
+      const escPr = Number(esc.pr ?? 0) || Number(withStampHeads[0]?.number ?? 0);
+      const escHead = String(esc.head_sha ?? "").toLowerCase();
+      const leg = withStampHeads.find((l) => l.number === escPr) ?? withStampHeads[0];
+      const legHead = String(leg?.head_sha_at_acceptance ?? "").toLowerCase();
+      const headMoved = !!escHead && !!legHead && legHead !== escHead;
+      let askAnswered = false;
+      if (esc.ask_id) {
+        const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(esc.ask_id)) as any;
+        askAnswered = !!a && !["todo", "in_progress", "blocked"].includes(String(a.status));
+      }
+      if (!headMoved && !askAnswered) {
+        this.audit("system:merge-train", "queue_refused_bounce_budget", parentId, { reason: `bounce-budget escalation active (${String(esc.bounce_kind)} ×${String(esc.bounce_no)}) — the train stops re-serving until an owner acts: rebase to a new head or answer ask ${String(esc.ask_id ?? "?")} (BR#4688)` });
+        this.version(parentId, "system:merge-train", "queue_refused_bounce_budget", "verify accept did NOT re-queue the card — the bounce-budget escalation stands (BR#4688)", {});
+        return;
+      }
+      const cleared = { ...esc, cleared_at: Date.now(), cleared_via: headMoved ? "head-moved" : "ask-answered" };
+      meta.merge_train = { ...(meta.merge_train ?? {}), escalated: cleared };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+      this.audit("system:merge-train", "bounce_budget_cleared", parentId, { via: cleared.cleared_via, pr: escPr, bounce_no: esc.bounce_no, reason: "owner action on a bounce-budget escalation — episode reset, re-queue proceeds (BR#4688)" });
+    }
     // BR#4648 honesty: did this accept actually move a stamp? The re-queue
     // note must never claim "stamp refreshed" on a no-op re-accept, and a
     // re-accept whose note carried a `head <sha>` token yet moved nothing
@@ -8913,7 +9115,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
-    return mergeTrainQueue(
+    const metaById = new Map<string, any>(cards.map((c) => [c.id, JSON.parse(c.meta ?? "{}")]));
+    const entries = mergeTrainQueue(
       cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
     ).filter((c) => {
       const cm = cards.find((x) => x.id === c.id);
@@ -8931,6 +9134,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
       return { ...c, ...(pr ? { pr } : {}) };
+    });
+    // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
+    // Top-panel budget chip reads this; the executor ignores the extra
+    // fields. over_budget mirrors the bounce-time rule (6th same-kind
+    // bounce breaches), computed from the same train_events rows.
+    const prs = [...new Set(entries.map((e) => Number(metaById.get(e.id)?.merge_train?.pr ?? 0)).filter(Boolean))];
+    const counts = new Map<number, number>(
+      (prs.length
+        ? (this.state.storage.sql.exec(
+            `SELECT pr, COUNT(*) AS n FROM train_events WHERE repo = ? AND kind = 'bounced' AND pr IN (${prs.map(() => "?").join(",")}) GROUP BY pr`,
+            repo, ...prs,
+          ).toArray() as any[])
+        : []
+      ).map((r) => [Number(r.pr), Number(r.n)]),
+    );
+    return entries.map((e) => {
+      const pr = Number(metaById.get(e.id)?.merge_train?.pr ?? 0);
+      if (!pr) return e;
+      const bounces = counts.get(pr) ?? 0;
+      return { ...e, pr, bounces, over_budget: bounces > TRAIN_BOUNCE_BUDGET };
     });
   }
 
@@ -9151,6 +9374,36 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         })
         .sort((x, y) => y.age_ms - x.age_ms)
         .slice(0, 20);
+      // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued
+      // PRs riding out their owner clock. `expired` + close_reason feed the
+      // executor's gh close leg (the hub holds no VCS credentials — the
+      // executor is the hand, the hub is the law).
+      const escalations = (this.state.storage.sql.exec(
+        `SELECT id, meta FROM artefacts WHERE type = 'task'
+         AND json_extract(meta, '$.merge_train.escalated.at') IS NOT NULL
+         AND json_extract(meta, '$.merge_train.escalated.cleared_at') IS NULL
+         AND json_extract(meta, '$.merge_train.escalated.closed_at') IS NULL`,
+      ).toArray() as any[])
+        .map((r) => ({ id: r.id, m: JSON.parse(r.meta ?? "{}") }))
+        .filter(({ m }) => trainCardMatchesLane(m, lane.repo) && Number(m.merge_train?.escalated?.pr ?? m.merge_train?.pr ?? 0) > 0)
+        .map(({ id, m }) => {
+          const e = m.merge_train.escalated;
+          const at = Number(e.at ?? 0);
+          const graceHours = Math.max(1, Number(e.grace_hours ?? TRAIN_BOUNCE_GRACE_HOURS));
+          const graceUntil = Number(e.grace_until ?? at + graceHours * 3_600_000);
+          const pr = Number(e.pr ?? m.merge_train?.pr ?? 0);
+          return {
+            task_id: id,
+            pr,
+            bounce_kind: e.bounce_kind ?? null,
+            bounce_no: Number(e.bounce_no ?? 0),
+            at,
+            grace_until: graceUntil,
+            ask_id: e.ask_id ?? null,
+            expired: now0 > graceUntil,
+            close_reason: trainEscalationClosedReason({ repo: lane.repo, prNumber: pr, kind: String(e.bounce_kind ?? "gate"), bounceNo: Number(e.bounce_no ?? 0), askId: (e.ask_id as string) ?? null, escalatedAt: at, graceHours }),
+          };
+        });
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9172,6 +9425,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         starved,
         queue,
         awaiting: awaitingRows,
+        escalations,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
           merged_24h: Number(tp.h24 ?? 0),

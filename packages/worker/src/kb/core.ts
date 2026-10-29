@@ -2096,6 +2096,92 @@ export function resolveTrainBounceKind(input: {
   return "gate";
 }
 
+// ---- bounce budget (TRAIN-DEFENCE L1.3, BR#4688; disposition per BR#3312) ----
+//
+// Defect: no ceiling on repeated bounces — bridge PRs #279/#281 each bounced
+// 31×/33× in ~10h (43% of all train cycles), pure churn with no escalation.
+// The budget: per-(PR, bounce-kind) ceiling on the train_events ledger. The
+// 6th same-kind bounce breaches it: the train stops re-serving the PR (the
+// re-queue paths refuse) and escalates per the BR#3312 disposition — ONE
+// bound ask to the owning agent ("merge, rebase, or close-with-reason within
+// 48h"), expiry closes the PR with reason (the card survives as the record).
+
+/** Same-kind bounces a PR may absorb before the train escalates. The breach
+ *  fires ON the bounce that exceeds this — budget 5 ⇒ escalation at #6. */
+export const TRAIN_BOUNCE_BUDGET = 5;
+
+/** Default owner-response clock for a bounce-budget escalation (hours) —
+ *  BR#3312's pr_grace_hours knob (settings override, same key). */
+export const TRAIN_BOUNCE_GRACE_HOURS = 48;
+
+/** One ledger row the replay consumes — the shape train_history serves
+ *  (train_events), narrowed to what the budget reads. */
+export interface TrainLedgerBounce {
+  ts: number;
+  kind: string;
+  repo: string;
+  base?: string | null;
+  pr: number | null;
+  task_id?: string | null;
+  detail?: { bounce_kind?: string | null; conflict_files?: string[] } | null;
+}
+
+/** Pure replay of the bounce budget over a ledger slice (train_history
+ *  events, any order). Walks events per (repo, base, pr, bounce_kind),
+ *  oldest first; the first same-kind bounce past TRAIN_BOUNCE_BUDGET emits
+ *  one escalation — never a second for the same (pr, kind) episode. This is
+ *  the SAME rule the DO applies live at train:bounced, so replay and runtime
+ *  can never disagree. */
+export function replayBounceBudget(
+  events: TrainLedgerBounce[],
+  opts?: { budget?: number; now?: number; graceHours?: number },
+): { pr: number; repo: string; base: string; bounce_kind: string; bounce_no: number; at: number; task_id: string | null; grace_until: number }[] {
+  const budget = Math.max(1, opts?.budget ?? TRAIN_BOUNCE_BUDGET);
+  const graceMs = Math.max(1, opts?.graceHours ?? TRAIN_BOUNCE_GRACE_HOURS) * 3_600_000;
+  const counts = new Map<string, number>();
+  const escalated = new Set<string>();
+  const out: ReturnType<typeof replayBounceBudget> = [];
+  for (const e of [...events].sort((a, b) => a.ts - b.ts)) {
+    if (e.kind !== "bounced" || !e.pr || !e.repo) continue;
+    const kind = String(e.detail?.bounce_kind ?? "gate");
+    const base = String(e.base ?? "main");
+    const key = `${e.repo}@${base}#${e.pr}/${kind}`;
+    if (escalated.has(key)) continue; // one escalation per (pr, kind) episode
+    const n = (counts.get(key) ?? 0) + 1;
+    counts.set(key, n);
+    if (n > budget) {
+      escalated.add(key);
+      out.push({ pr: Number(e.pr), repo: e.repo, base, bounce_kind: kind, bounce_no: n, at: e.ts, task_id: e.task_id ?? null, grace_until: e.ts + graceMs });
+    }
+  }
+  return out;
+}
+
+/** The escalation ask's title — deterministic per (repo, pr, kind, episode
+ *  bounce_no): the identical-open-ask guard dedupes re-fires of the SAME
+ *  episode; a post-clear storm (new bounce_no) files fresh. ≤240 chars,
+ *  ends in '?' — the ask contract (rule 6c). */
+export function trainEscalationAskTitle(repo: string, prNumber: number, cardId: string, kind: string, bounceNo: number, graceHours: number): string {
+  const prefix = `PR #${prNumber} (${repo}) on ${cardId} bounced ${bounceNo}× ${kind} on the merge train — `;
+  const text = `merge, rebase, or close it with reason within ${graceHours}h? The train stopped serving it`;
+  const suffix = `?`;
+  if (prefix.length + text.length + suffix.length <= 240) return prefix + text + suffix;
+  // over the cap: the free-form PREFIX (long card id / repo) shrinks — the
+  // ask itself never does (ask contract, rule 6c: one plain-reading question
+  // ≤240 chars)
+  const budget = Math.max(40, 240 - text.length - suffix.length);
+  return (prefix.slice(0, budget - 1).trimEnd() + "…" + text + suffix).slice(0, 240);
+}
+
+/** The expiry close reason — BR#3312's law text: cites the escalation ask id,
+ *  the breach facts, and the revive path (closures are reversible). */
+export function trainEscalationClosedReason(input: { repo: string; prNumber: number; kind: string; bounceNo: number; askId: string | null; escalatedAt: number; graceHours: number }): string {
+  const at = new Date(input.escalatedAt).toISOString();
+  return [
+    `Bounce-budget expiry (BR#4688, disposition per BR#3312): PR #${input.prNumber} (${input.repo}) breached the same-kind bounce budget — ${input.bounceNo}× ${input.kind} — escalated ${at} (ask ${input.askId ?? "no longer on record"}) and unanswered for ${input.graceHours}h. Closing with reason; the board card survives as the record. Revive: re-open this PR once the underlying work resumes (PRs are reopenable).`,
+  ].join("\n");
+}
+
 /** train:bounced fix-up brief — per bounce KIND (BR#4066). A coverage bounce
  *  names the authored head-move and hands the card to the verify pool (no
  *  conflict language, no file list — none exist). A conflict bounce lists the
