@@ -1790,3 +1790,79 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-leg" });
   });
 });
+
+// ---------- BR#4801: lease/stop write-back ----------
+// laneSyncReason persisted lane meta ONLY when the derived reason string
+// changed — so on a STOPPED lane (whose reason string ignores the lease), a
+// lease clear (plain release, lapse sweep) stayed in memory: stored meta kept
+// the stale holder (auditors read a lease that is logically gone, and the
+// next gateway's acquire was CAS-rejected until TTL lapse), and a renew's
+// fresh expiry never landed either. These drills pin the storage, not the
+// in-memory response the op returns.
+
+describe("BR#4801 lease/stop write-back (real bundled worker)", () => {
+  it("a plain release on a STOPPED lane persists the lease clear — stored meta stops showing the holder and the lane re-grants immediately", async () => {
+    const repo = "state-vector/lane-stop-release";
+    const H = "e".repeat(40);
+    await acquire(repo, "gw-stop", { required_workflows: ["Test"] });
+    const stopped = await kbJson("/train.event", {
+      repo, base: "main", kind: "stopped", actor: "gw-stop", pr: 4801, head_sha: H,
+      failing: [{ name: "Test", conclusion: "failure", url: "https://example/red/Test" }],
+    });
+    expect(stopped.body.error ?? "", `train:stopped failed: ${JSON.stringify(stopped.body)}`).toBe("");
+    const laneId = (await laneSnap(repo)).card;
+    // plain release — NO line_green: the stop stays, the lease must clear ON STORAGE
+    const rel = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-stop" });
+    expect(rel.body.error ?? "").toBe("");
+    const meta = (await kbJson("/get", { id: laneId })).body.meta ?? {};
+    expect(meta.lease ?? null, "stored meta still shows the released lease (BR#4801)").toBeNull();
+    expect(meta.stop).toBeTruthy();
+    expect(String(meta.blocked?.reason)).toContain("STOPPED");
+    // the CAS view follows storage — no TTL wait for the next gateway
+    const again = await acquire(repo, "gw-next");
+    expect(again.body.error ?? "", `re-acquire failed: ${JSON.stringify(again.body)}`).toBe("");
+    expect(again.body.lease.holder).toBe("gw-next");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-next" });
+  });
+
+  it("the lapse sweep on a STOPPED lane persists the lease clear — storage stops showing the lapsed holder while the reason stays STOPPED", async () => {
+    const repo = "state-vector/lane-stop-lapse";
+    const H = "f".repeat(40);
+    await acquire(repo, "gw-lapse", {});
+    const stopped = await kbJson("/train.event", { repo, base: "main", kind: "stopped", actor: "gw-lapse", pr: 4802, head_sha: H, reason: "required workflows RED: Test" });
+    expect(stopped.body.error ?? "", `train:stopped failed: ${JSON.stringify(stopped.body)}`).toBe("");
+    const laneId = (await laneSnap(repo)).card;
+    // backdate the stored lease past its expiry — the sweep's lapse arm fires.
+    // A fresh proxy_check stamp engages the sweep's per-card pacing so the
+    // BR#4416 prose ladder skips this lane (an unprotected lane card would
+    // otherwise be prose-released to todo mid-drill — its own latent hazard,
+    // filed separately — clearing meta.blocked and letting the reason gate
+    // persist the clear even without the BR#4801 fix, i.e. a vacuous pass).
+    const before = (await kbJson("/get", { id: laneId })).body.meta;
+    expect(before.lease?.holder).toBe("gw-lapse");
+    before.lease.expires_ts = Date.now() - 60_000;
+    before.proxy_check = { ...(before.proxy_check ?? {}), at: Date.now() };
+    await kbJson("/update", { id: laneId, meta: before });
+    const swept = await kbJson("/admin.alarm_sweep", {});
+    expect(swept.body.error ?? "").toBe("");
+    const after = (await kbJson("/get", { id: laneId })).body.meta ?? {};
+    expect(after.lease ?? null, "sweep cleared the lease in memory but never wrote it back (BR#4801)").toBeNull();
+    expect(after.stop).toBeTruthy();
+    expect(String(after.blocked?.reason)).toContain("STOPPED");
+  });
+
+  it("a renew persists the fresh expiry ON STORAGE — the sweep can never lapse a lease the holder just renewed", async () => {
+    const repo = "state-vector/lane-renew-persist";
+    await acquire(repo, "gw-renew", {});
+    const laneId = (await laneSnap(repo)).card;
+    const e1 = (await kbJson("/get", { id: laneId })).body.meta?.lease?.expires_ts ?? 0;
+    expect(e1).toBeGreaterThan(Date.now());
+    await new Promise((r) => setTimeout(r, 5)); // clock must move between the two ops
+    const r = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-renew" });
+    expect(r.body.error ?? "").toBe("");
+    expect(r.body.lease.expires_ts).toBeGreaterThan(e1); // the in-memory expiry moved…
+    const e2 = (await kbJson("/get", { id: laneId })).body.meta?.lease?.expires_ts ?? 0;
+    expect(e2).toBeGreaterThan(e1); // …and storage moved with it (BR#4801)
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-renew" });
+  });
+});

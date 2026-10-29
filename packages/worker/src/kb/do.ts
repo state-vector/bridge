@@ -7546,8 +7546,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  (with the culprit card named) / settling (with the next head named) /
    *  attempting <head> (gate in progress on the queue head) / ready (queue
    *  empty) / no gateway, plus a `; last: <event>` bounce feed suffix when
-   *  the ledger moved inside 15 minutes. */
-  private laneSyncReason(laneId: string, meta: any, now: number): string {
+   *  the ledger moved inside 15 minutes.
+   *  BR#4801: `dirty` marks a caller that MUTATED meta (lease / stop /
+   *  currently) — the mutated fields are persisted even when the derived
+   *  reason string is unchanged. Without this, a lease clear under an
+   *  unchanged STOPPED reason was computed in memory but never written back
+   *  (stored meta kept the stale holder until some later event happened to
+   *  move the string; a renewed lease kept its stale expiry). Read-only
+   *  callers (drift resync, the pending-CI heartbeat) stay
+   *  write-on-reason-change. */
+  private laneSyncReason(laneId: string, meta: any, now: number, dirty = false): string {
     const lane = laneOfMeta(meta);
     const lease: TrainLease | null = meta.lease ?? null;
     const currently = meta.currently ?? null;
@@ -7635,7 +7643,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           : `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`)
         : "merge-train: awaiting an available gateway";
     }
-    if (meta.blocked?.reason !== reason) {
+    if (dirty || meta.blocked?.reason !== reason) {
       meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run bridge train on a gateway (doctor-gated)" };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), laneId);
     }
@@ -7662,7 +7670,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         if (lapsed) {
           const holder = lease!.holder;
           meta.lease = null;
-          const reason = this.laneSyncReason(r.id, meta, now);
+          const reason = this.laneSyncReason(r.id, meta, now, true);
           this.audit("system:merge-train", "lease_lapsed", r.id, { holder, expired_at: new Date(lease!.expires_ts).toISOString(), reason });
           this.version(r.id, "system:merge-train", "lease_lapsed", `lease of ${holder} lapsed — ${reason}`, {});
         } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:")) {
@@ -7703,7 +7711,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         meta.lease = null; // expire — takeover within one tick
         meta.zombie = { holder, at: now, age_ms: progress.stale_ms, queue_len: queue.length, last_progress: proofNote };
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
-        const reason = this.laneSyncReason(lane.id, meta, now);
+        const reason = this.laneSyncReason(lane.id, meta, now, true);
         this.audit(actor, "train:lease_evicted", lane.id, { lane: laneKey(repo, base), holder, stale_ms: progress.stale_ms, queue_len: queue.length, reason });
         this.version(lane.id, actor, "train:lease_evicted", `renewal denied — ${progress.reason}`, { lease: null, zombie: meta.zombie, reason });
         throw Object.assign(new Error(progress.reason), { lease_conflict: true });
@@ -7750,7 +7758,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // time, so the lane simply goes idle.
       if (meta.currently?.phase === "stopped") meta.currently = null;
     }
-    const reason = this.laneSyncReason(lane.id, meta, now);
+    const reason = this.laneSyncReason(lane.id, meta, now, true);
     // BR#5114: laneSyncReason persists only on a reason CHANGE — the
     // now_action stamp refreshes every renewal without one, so persist it
     // explicitly (idempotent; ~1 write per lane per tick).
@@ -7891,7 +7899,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // executor's walk stamps the merged event from live state when it next
       // sees the PR MERGED, train.rs:848).
       if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
-      const reason = this.laneSyncReason(lane.id, meta, now);
+      const reason = this.laneSyncReason(lane.id, meta, now, true);
       ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined }, chain.task_id);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
@@ -7957,7 +7965,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // destroy the burst pass / settle record it parked behind.
         const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
         meta.currently = inFlightBounced ? null : meta.currently;
-        const reason = this.laneSyncReason(lane.id, meta, now);
+        const reason = this.laneSyncReason(lane.id, meta, now, true);
         ev({ task: taskId, bounce_kind: "coverage", merge_state_status: mergeStateStatus, reason: defect, awaiting_park: true }, taskId);
         this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (coverage) — the card parks Awaiting review (zero asks, BR#4960); force-review from the backlog re-queues or bounces it`, { reason });
         return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: "coverage", awaiting_park: true, reason };
@@ -8032,7 +8040,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // destroy the burst pass / settle record it parked behind.
       const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
       meta.currently = inFlightBounced ? null : meta.currently;
-      const reason = this.laneSyncReason(lane.id, meta, now);
+      const reason = this.laneSyncReason(lane.id, meta, now, true);
       ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
       const laneNote =
         bounceKind === "gate"
@@ -8094,7 +8102,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         }
       }
       meta.currently = meta.currently ? { ...meta.currently, phase: "stopped" } : null;
-      const reason = this.laneSyncReason(lane.id, meta, now);
+      const reason = this.laneSyncReason(lane.id, meta, now, true);
       // ONE ask per class: the sha+workflows make the title unique per red
       // episode; askCreate's identical-open-ask guard dedupes the rest.
       const askTitle = trainStopAskTitle({ repo, base }, sha, failing.map((f) => f.name).length ? failing.map((f) => f.name) : [why]);
@@ -8238,7 +8246,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, taskId);
           await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
           meta.currently = null;
-          const reason = this.laneSyncReason(lane.id, meta, now);
+          const reason = this.laneSyncReason(lane.id, meta, now, true);
           this.state.storage.sql.exec(
             `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
             now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ leg: true, run: p.greenRunUrl ?? null, remaining: remaining.map((l) => l.number) }),
@@ -8267,7 +8275,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // the burst_ancestors it carries, is cleared).
     await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
     meta.currently = null;
-    const reason = this.laneSyncReason(lane.id, meta, now);
+    const reason = this.laneSyncReason(lane.id, meta, now, true);
     this.state.storage.sql.exec(
       `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
       now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ run: p.greenRunUrl ?? null }),
@@ -8313,15 +8321,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // the previous tick closed the final card then faulted.
           await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
           meta.currently = null;
-          const reason = this.laneSyncReason(lane.id, meta, now);
+          const reason = this.laneSyncReason(lane.id, meta, now, true);
           this.audit(actor, "train:landed_close_repaired", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, error: error.slice(0, 160) });
           this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed — card ${taskId} already closed (a post-close fault retried clean); lane idled`, { reason });
           return { ok: true, decided: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, repaired: true, reason };
         }
       }
       // count the failure on the in-flight record — explicit persist, the
-      // failure must survive across ticks (laneSyncReason only writes on a
-      // reason change, BR#4801) — then let the ladder decide.
+      // failure must survive across ticks (this site passes no dirty flag:
+      // laneSyncReason persists here only when the reason string moves,
+      // BR#4801) — then let the ladder decide.
       const prev = (meta.currently?.landed_close ?? {}) as any;
       const failures = Number(prev.failures ?? 0) + 1;
       const boundExceeded = now - Number(meta.currently?.merged_at ?? now) > TRAIN_CI_BOUND_MULTIPLIER * ((laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000);
@@ -8397,7 +8406,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.version(taskId!, actor, "update", `close-bounced (priority 0 — merged green, board close gate-rejected: ${klass}; repair leg = resolve the named precondition, close citing the merge commit — BR#4753)`, {});
       }
       meta.currently = null;
-      const reason2 = this.laneSyncReason(lane.id, meta, Date.now());
+      const reason2 = this.laneSyncReason(lane.id, meta, Date.now(), true);
       this.state.storage.sql.exec(
         `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
         Date.now(), laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ close_bounced: true, breach_class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) }),
