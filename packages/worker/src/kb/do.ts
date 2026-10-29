@@ -136,6 +136,9 @@ import {
   isClonableRepoRef,
   prFromNote,
   RECEIPTS_DOC,
+  churnRelease,
+  blockedParkVerdict,
+  UNBLOCK_SPAWN_CAP,
   RuleCtx,
 } from "./machine.ts";
 import {
@@ -505,6 +508,109 @@ export class KnowledgeHub {
         this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
       }
     }
+    // (D) blocked-staleness sweep — BR#2893. Blocked had no clock: churn-guard
+    // parks (a retry instruction stamped as a block) and dead ask-refs sat
+    // forever, owned by dead runner labels that only they could release — the
+    // broken runner owned the parking lot. On tick, drain parks whose unblock
+    // condition is DEAD (churn boilerplate, every referenced ask closed) or
+    // that aged past the bar with NO external gate: demote to todo via the
+    // normal release path (claim drops, attempt counter, unblock-twin cleanup
+    // all apply), reason attached to the card. True external gates (dated
+    // checkpoint, GitHub lane, red-main) are exempt — the board renders them
+    // under "awaiting external input".
+    const bsRow = this.one(`SELECT value FROM settings WHERE key = 'blocked_stale_hours'`);
+    const blockedStaleHours = bsRow ? Math.max(1, Math.min(720, parseInt(bsRow.value, 10) || 48)) : 48;
+    const blockedStaleMs = blockedStaleHours * 3_600_000;
+    const parkCensus = { total: 0, external: 0 };
+    let drained = 0;
+    const parkRows = this.state.storage.sql.exec(
+      `SELECT id, owner, meta, status_ts, updated_ts FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    ).toArray();
+    for (const r of parkRows as any[]) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        parkCensus.total++;
+        if (meta.awaiting_ask) continue; // ask-gated: the ask TTL + hourly aging annotation govern these (rule 6)
+        const b = meta.blocked ?? {};
+        const verdict = blockedParkVerdict({
+          reason: String(b.reason ?? ""),
+          unblockCondition: String(b.unblock_condition ?? ""),
+          now,
+          staleMs: blockedStaleMs,
+          blockedTs: Number(b.ts ?? 0) || undefined,
+          askIsOpen: (id) => !!this.one(`SELECT id FROM asks WHERE id = ? AND status = 'open'`, id),
+        });
+        if (verdict.klass === "external") { parkCensus.external++; continue; }
+        const dead = verdict.klass === "churn-park" || verdict.klass === "dead-ask";
+        const age = now - Math.max(Number(b.ts ?? 0) || 0, r.status_ts ?? 0, r.updated_ts ?? 0);
+        if (!dead && age <= blockedStaleMs) continue; // honest fresh park — not the sweep's business yet
+        // annotate BEFORE the transition: it clears meta.blocked (the
+        // invariant demands it) and this record survives to tell the story
+        meta.blocked_drained = { ts: now, klass: verdict.klass, why: verdict.why };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+        await this.transition({
+          id: r.id, to: "todo",
+          note: `watchdog: blocked park drained — ${verdict.why}; owner released to the pool`,
+        }, "system:watchdog");
+        drained++;
+      } catch (e) {
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
+    }
+    // (E) owner-death release — BR#2893. A card's only legal releasers are its
+    // owner or a human; when the owner is a dead runner label the claim is a
+    // dead hand on live work. Past the owner-staleness bar with NO live
+    // session for the owner AND no touch on the card itself, ownership
+    // lapses: in_progress releases to the pool; blocked/in_review lose the
+    // dead claim but keep their status (the blocked sweep and the review
+    // sweep own those statuses). Declared silence (grace/subprocess) and
+    // ask-gated cards are exempt — their clocks are honored, not ours.
+    const osRow = this.one(`SELECT value FROM settings WHERE key = 'owner_stale_hours'`);
+    const ownerStaleHours = osRow ? Math.max(1, Math.min(168, parseInt(osRow.value, 10) || 4)) : 4;
+    const ownerStaleMs = ownerStaleHours * 3_600_000;
+    const ownerSeen = new Map<string, number>();
+    for (const s of this.state.storage.sql.exec(
+      `SELECT t.label AS label, t.principal AS principal, MAX(s.last_seen_ts) AS seen
+       FROM sessions s JOIN auth_tokens t ON t.id = s.token_id GROUP BY t.label, t.principal`,
+    ).toArray() as any[]) {
+      if (s.label) ownerSeen.set(String(s.label), Math.max(ownerSeen.get(String(s.label)) ?? 0, Number(s.seen ?? 0)));
+      if (s.principal) ownerSeen.set(String(s.principal), Math.max(ownerSeen.get(String(s.principal)) ?? 0, Number(s.seen ?? 0)));
+    }
+    let ownerReleased = 0;
+    const ownedRows = this.state.storage.sql.exec(
+      `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND owner != '' AND status IN ('in_progress','blocked','in_review')`,
+    ).toArray();
+    for (const r of ownedRows as any[]) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        if (meta.awaiting_ask) continue; // an open ask runs its own TTL; the asker auto-resumes
+        if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
+        if (meta.subprocess && typeof meta.subprocess.deadline_ts === "number" && meta.subprocess.deadline_ts > now) continue;
+        const ownerTs = ownerSeen.get(String(r.owner)) ?? 0;
+        if (now - ownerTs <= ownerStaleMs) continue; // the owner has a live session somewhere
+        const cardTs = Math.max(
+          meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
+        );
+        if (now - cardTs <= ownerStaleMs) continue; // the card itself moved — attribution lag, not death
+        const silentH = Math.max(1, Math.round((now - ownerTs) / 3_600_000));
+        if (r.status === "in_progress") {
+          await this.transition({
+            id: r.id, to: "todo",
+            note: `watchdog: owner-death release — ${r.owner} has had no live session for ~${silentH}h; claim released to the pool`,
+          }, "system:watchdog");
+        } else {
+          // blocked/in_review: lapse the ownership, keep the status — an
+          // unowned park is pool-adjacent state a human or fresh agent can move
+          this.state.storage.sql.exec(`UPDATE artefacts SET owner = '', updated_ts = ? WHERE id = ? AND owner = ?`, now, r.id, r.owner);
+          this.audit("system:watchdog", "owner_lapsed", r.id, { owner: r.owner, status: r.status, silent_h: silentH });
+          this.version(r.id, "system:watchdog", "note", `ownership lapsed — ${r.owner} has had no live session for ~${silentH}h (owner-death release, BR#2893)`);
+        }
+        ownerReleased++;
+      } catch (e) {
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
+    }
     // (C) verification nudge: an unclaimed verify task parks its parent's owner —
     // never reaped (you can't be "abandoned" from work you never picked up). Past
     // the threshold, nudge once per hour: audit line (Log + ws broadcast) for the
@@ -600,7 +706,16 @@ export class KnowledgeHub {
     const openAsks = this.one(`SELECT COUNT(*) AS n FROM asks WHERE status = 'open'`)?.n ?? 0;
     this.state.storage.sql.exec(
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.sweep', ?)`,
-      JSON.stringify({ ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow, review_stale_minutes: reviewStaleMin, open_asks: openAsks, root_blocker_rollup: rollup ?? null }),
+      JSON.stringify({
+        ts: now, stale_in_progress: staleNow, stale_in_review: staleReviewNow,
+        review_stale_minutes: reviewStaleMin, open_asks: openAsks,
+        root_blocker_rollup: rollup ?? null,
+        blocked_parks: {
+          total: parkCensus.total, external: parkCensus.external,
+          drained_this_tick: drained, owner_released_this_tick: ownerReleased,
+          blocked_stale_hours: blockedStaleHours, owner_stale_hours: ownerStaleHours,
+        },
+      }),
     );
     // BR#4212: persist the channel counters once per tick so an isolate
     // restart loses at most one minute of channel stats (/stats.channel reads
@@ -1345,6 +1460,34 @@ export class KnowledgeHub {
    *  unblock duty with the receipts embedded. Shared by atom flips and
    *  ask/time timer fires. Machine caps still apply: ≤1 open unblock child,
    *  flood guard on identical exit conditions. */
+  /** Spawner cap (BR#2893): a blocked parent has spawned at most
+   *  UNBLOCK_SPAWN_CAP unblock duties EVER — past that the spawner stops and
+   *  escalates ONCE (flag-guarded), so the human ledger carries the recurring
+   *  block instead of the pool. Counts both child generations (roles-based
+   *  machine spawns and the pre-refactor tags-based ones). Returns true when
+   *  the spawn must be skipped (cap reached; escalation stamped first hit). */
+  private unblockSpawnCapped(r: { id: string }, meta: any, actor: string, ts: number): boolean {
+    const roundsEver = this.one(
+      `SELECT COUNT(*) AS n FROM relations rel JOIN artefacts c ON c.id = rel.src_id
+       WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND (c.roles LIKE '%"unblock"%' OR c.tags LIKE '%"role:unblock"%')`, r.id,
+    )?.n ?? 0;
+    if (roundsEver < UNBLOCK_SPAWN_CAP) return false;
+    if (!meta.unblock_escalated) {
+      meta.unblock_escalated = { at: ts, rounds: roundsEver };
+      meta.escalate = {
+        at: ts,
+        attempts: roundsEver,
+        reason: `${roundsEver} unblock rounds spawned for this block and none cleared it — the spawner stopped (cap ${UNBLOCK_SPAWN_CAP}, BR#2893). Human: resolve the recurring block directly (re-scope, supersede, or land the fix), or clear this escalation to re-arm the spawner.`,
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+      this.audit("system:unblock-spawner", "escalated", r.id, { rounds: roundsEver, cap: UNBLOCK_SPAWN_CAP });
+      this.version(r.id, "system:unblock-spawner", "transition", `unblock spawner stopped — ${roundsEver} rounds failed to clear the block; escalated to human once`, { rounds: roundsEver });
+    } else {
+      this.audit(actor, "spawn_skipped", r.id, { auto: "unblock", reason: `unblock spawner cap (${roundsEver} rounds, cap ${UNBLOCK_SPAWN_CAP}) — escalation already filed` });
+    }
+    return true;
+  }
+
   private async spawnProxyDuty(
     r: any, meta: any, now: number, prev: any, cond: string, receiptLines: string[],
   ): Promise<void> {
@@ -1371,6 +1514,11 @@ export class KnowledgeHub {
       return;
     }
     const ts = Date.now();
+    // BR#2893 spawner cap: UNBLOCK_SPAWN_CAP rounds ever → stop + escalate once.
+    if (this.unblockSpawnCapped(r, meta, "hub:proxy-watch", ts)) {
+      this.stampProxyCheck(r.id, meta, now, "true", null, prev, { spawn_skipped: `unblock spawner cap (${UNBLOCK_SPAWN_CAP} rounds)` });
+      return;
+    }
     const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
     const atomLines = receiptLines.map((l) => `- ${l}`).join("\n");
     const created = await this.create(
@@ -3589,6 +3737,10 @@ export class KnowledgeHub {
           // every blocked task gets an unblock child — the executor already
           // ran the cap (≤1 open per parent) and the flood guard; this is the
           // only spawn site and it only executes.
+          // BR#2893 spawner cap: at UNBLOCK_SPAWN_CAP failed rounds ever the
+          // spawner stops and escalates once — a dead end must not manufacture
+          // work about work forever.
+          if (this.unblockSpawnCapped(row, meta, actor, ts)) break;
           const rootTitle = row.title.replace(/^(?:Unblock:\s*)+/, "");
           const created = await this.create(
             {

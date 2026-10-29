@@ -14,6 +14,8 @@ import {
   CHURN_REDIRECT_ATTEMPTS,
   SILENT_ESCALATE_CYCLES,
   SILENT_REDIRECT_CYCLES,
+  blockedParkVerdict,
+  UNBLOCK_SPAWN_CAP,
   type RuleCtx,
   type RuleInput,
   type Applied,
@@ -1671,5 +1673,95 @@ describe("decideProseDisposition (BR#4416) — rung 4: genuine ambiguity → ONE
     expect(t.endsWith("?")).toBe(true);
     expect(t).toMatch(/BR#4248/);
     expect(t).toMatch(/BR#9/);
+  });
+});
+
+// ---------- blocked-park law (BR#2893): the parking lot gets a clock ----------
+
+const NOW = Date.parse("2026-10-25T12:00:00Z");
+const STALE_48H = 48 * 3_600_000;
+const park = (over: Partial<Parameters<typeof blockedParkVerdict>[0]>) =>
+  blockedParkVerdict({
+    reason: "",
+    unblockCondition: "",
+    now: NOW,
+    staleMs: STALE_48H,
+    ...over,
+  });
+
+describe("blockedParkVerdict (BR#2893)", () => {
+  it("churn-guard parks are dead at any age, whichever field carries the stamp", () => {
+    const reasonShaped = park({
+      reason: "churn guard: released to the pool 12 times without completing",
+      unblockCondition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
+    });
+    expect(reasonShaped.klass).toBe("churn-park");
+    // legacy variant: only the boilerplate exit condition, generic reason
+    const unblockShaped = park({ reason: "some old gate", unblockCondition: "READ THE TASK HISTORY (get_history) and the last gate error" });
+    expect(unblockShaped.klass).toBe("churn-park");
+    // even a future date in the text does not resurrect a churn park
+    const withDate = park({ reason: "churn guard: released 8 times", unblockCondition: "retry after 2027-01-01" });
+    expect(withDate.klass).toBe("churn-park");
+  });
+
+  it("unresolvable ASK- refs are dead only when EVERY referenced ask is closed", () => {
+    const oneClosed = park({
+      unblockCondition: "Ray answers ASK-dead-01",
+      askIsOpen: () => false,
+    });
+    expect(oneClosed.klass).toBe("dead-ask");
+    const mixed = park({
+      unblockCondition: "ASK-dead-01 answered, or ASK-live-02",
+      askIsOpen: (id) => id === "ASK-live-02",
+    });
+    expect(mixed.klass).toBe("plain"); // a live ask keeps the park honest
+    const deduped = park({
+      unblockCondition: "ASK-x or ASK-x",
+      askIsOpen: () => false,
+    });
+    expect(deduped.klass).toBe("dead-ask");
+  });
+
+  it("true external gates are exempt from the age drain", () => {
+    const checkpoint = park({
+      unblockCondition: "now >= 2026-11-05T08:11:00Z -> run the AC3 measurement",
+      blockedTs: NOW - 100 * 3_600_000,
+    });
+    expect(checkpoint.klass).toBe("external");
+    expect(checkpoint.why).toContain("2026-11-05");
+    const ghLane = park({ unblockCondition: "GH#1980 closes — operator orphan purge (https://github.com/state-vector/superpositional/issues/1980)", blockedTs: NOW - 100 * 3_600_000 });
+    expect(ghLane.klass).toBe("external");
+    const redMain = park({ unblockCondition: "resume merging once main is green again (stop-the-line)", blockedTs: NOW - 100 * 3_600_000 });
+    expect(redMain.klass).toBe("external");
+  });
+
+  it("a past checkpoint date is not a live gate — it ages out", () => {
+    const past = park({
+      unblockCondition: "checkpoint was 2026-10-01 — re-measure",
+      blockedTs: NOW - 100 * 3_600_000,
+    });
+    expect(past.klass).toBe("plain");
+    expect(past.why).toContain("100h");
+  });
+
+  it("honest parks age out past the bar; fresh ones stay", () => {
+    const aged = park({ reason: "waiting on capacity", unblockCondition: "capacity frees up", blockedTs: NOW - 72 * 3_600_000 });
+    expect(aged.klass).toBe("plain");
+    expect(aged.why).toContain("72h");
+    const fresh = park({ reason: "waiting on capacity", unblockCondition: "capacity frees up", blockedTs: NOW - 2 * 3_600_000 });
+    expect(fresh.klass).toBe("plain");
+    expect(fresh.why).toBe("parked");
+    const noTs = park({ reason: "x", unblockCondition: "y" }); // no blockedTs — never aged, never drained on age
+    expect(noTs.klass).toBe("plain");
+  });
+
+  it("missing ask lookup defaults to OPEN (never drains on a guess)", () => {
+    const v = park({ unblockCondition: "Ray answers ASK-xyz" });
+    expect(v.klass).toBe("plain");
+  });
+
+  it("the spawner cap is a real, exported constant", () => {
+    expect(UNBLOCK_SPAWN_CAP).toBeGreaterThanOrEqual(2);
+    expect(Number.isInteger(UNBLOCK_SPAWN_CAP)).toBe(true);
   });
 });

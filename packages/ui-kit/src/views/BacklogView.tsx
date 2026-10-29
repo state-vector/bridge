@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, parkClassOf, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
@@ -72,11 +72,11 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
 
     const ready = ts.filter((t) => t.status === "todo" && t.is_claimable !== false).map(decorate)
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
-    const blockedHuman = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && t.meta?.awaiting_ask?.ask_id).sort(byUpdated);
+    const blockedHuman = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && t.meta?.awaiting_ask?.ask_id).sort(byUpdated);
     const verify = ts.filter((t) => t.status === "in_review").sort(byUpdated);
-    const unblocking = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && !t.meta?.awaiting_ask?.ask_id && activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
-    const blockedOther = ts.filter((t) => t.status === "blocked" && !isTimeoutBlock(t) && !t.meta?.awaiting_ask?.ask_id && !activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
-    const timeout = ts.filter((t) => isTimeoutBlock(t)).sort(byUpdated);
+    const unblocking = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && !t.meta?.awaiting_ask?.ask_id && activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
+    const blockedOther = ts.filter((t) => t.status === "blocked" && parkClassOf(t) !== "sin-bin" && !t.meta?.awaiting_ask?.ask_id && !activeUnblockTwinOf(t, twinIdx)).sort(byUpdated);
+    const timeout = ts.filter((t) => parkClassOf(t) === "sin-bin").sort(byUpdated);
     const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false).sort(byUpdated);
 
     return [
@@ -85,14 +85,14 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       { key: "verify", title: "Blocked — awaiting verify", note: "in review; the owner stays parked until a fresh verify session rules.", rows: verify, showRank: false, showBoost: false },
       { key: "unblocking", title: "Blocked — unblock duty live", note: "an agent is actively working the unblock; nothing for you to do.", rows: unblocking, showRank: false, showBoost: false },
       { key: "other", title: "Blocked — other", note: "everything else parked: most carry a machine exit condition the hub re-checks every 15 min — a condition the parser can't read never auto-flips; open the card to resolve or re-scope", rows: blockedOther, showRank: false, showBoost: false },
-      { key: "timeout", title: "Timeout — churn/rework parks", note: "cannot be actioned by anyone; the owning agent resumes or the park lapses.", rows: timeout, showRank: false, showBoost: false },
+      { key: "timeout", title: "Timeout — churn/rework parks", note: "the watchdog drains these to the pool automatically (BR#2893); release one early from Top's sin-bin.", rows: timeout, showRank: false, showBoost: false },
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
     ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))
       .map((g) => ({ ...g, rows: g.rows.filter((r: any) => tagTheme.passes(r.t ?? r)) }));
   }, [tasks, tagTheme]);
 
   const parkedReason = (t: any): string => {
-    if (isTimeoutBlock(t)) return "churn/rework park — agent resumes or it lapses";
+    if (parkClassOf(t) === "sin-bin") return "churn/rework park — the watchdog drains it automatically; release early from Top's sin-bin";
     if (t.status === "blocked") return (t.meta?.blocked?.unblock_condition ?? "blocked — open the card, resolve or re-scope").slice(0, 90);
     if (t.type === "question" || t.meta?.kind === "question") return "question — collect answers, the author closes it with a decision";
     if (t.meta?.operator_gated) return `operator gate: ${t.meta.operator_gated} — a human clears it`;
