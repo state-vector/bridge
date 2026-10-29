@@ -778,6 +778,20 @@ served HTML 500s where JSON acks belong, writes were silently lost, and
 as each other.** Only the three genuine identify rejections (`missing bearer`,
 `unknown auth token`, `auth token revoked`) produce a 401.
 
+The third class — **the hub refusing** — is not infra at all (BR#4390). A
+machine gate rejection (an illegal lifecycle edge, `done-open-children`,
+`blocked-needs-typed-await`, a claim race, …) is a *deterministic* answer:
+the DO stamps it `result_class: "gate_rejected"` and answers **HTTP 400**
+carrying the rule name (`[rule: …]`), and the MCP layer surfaces it as a
+tool error with that message intact. Before BR#4390 an untyped 400
+rejection fell into the infra fallback and came back as
+`503 "kb temporarily unavailable — retry"` — so refusals that could never
+succeed on retry (the BR#4068/BR#3822 close attempts) read as an outage and
+burned dozens of futile retries. The classification law, complete:
+**5xx / typed `infra_storage_fault` / unclassified throws → 503 infra
+(retry the channel); 401 → the three genuine auth rejections; 400 → the
+hub refusing — read the rule, act on it, never retry blind.**
+
 The watchdog's view is machine-checkable via `GET /stats` (or
 `POST stats`): the response carries a `channel` block — per-route `ok`/`err`
 counters with `write_ok_rate` over the write ops, `entry_faults` (which
