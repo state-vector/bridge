@@ -41,6 +41,7 @@ const baseCtx = (): RuleCtx => ({
   evidence: () => null,
   parent: () => null,
   openChildren: () => 0,
+  openChildIds: () => [],
   spawnGuard: () => null,
   openVerifyChild: () => null,
   openUnblockChild: () => null,
@@ -180,6 +181,31 @@ describe("transition matrix (task: role × from × to)", () => {
     c.openChildren = () => 2;
     const msg = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), c);
     expect(msg).toContain("still has 2 open child task(s)");
+  });
+
+  it("BR#3819: force-close passes only when EVERY open child is named, with a reason", async () => {
+    const c = baseCtx();
+    c.openChildren = () => 2;
+    c.openChildIds = () => ["BR#12", "BR#13"];
+    // complete + reasoned → the gate passes (do.ts logs the repair)
+    expect(
+      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13 — self-edge made these unclosable; repaired per BR#3819" } }), c),
+    ).toBeNull();
+    // partial list → refused, naming the missing child
+    const partial = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12 — some reason" } }), c);
+    expect(partial).toContain("missing: BR#13");
+    // no reason → refused with the grammar
+    const noReason = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13" } }), c);
+    expect(noReason).toContain("force-close-children");
+    // no marker at all → the ordinary open-children refusal, teaching the grammar
+    const plain = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done" } }), c);
+    expect(plain).toContain("force-close-children");
+    // zero open children → passes without any marker (self-edge-only state reads as clean)
+    const clean = baseCtx();
+    clean.openChildren = () => 0;
+    expect(
+      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done" } }), clean),
+    ).toBeNull();
   });
 
   it("questions are never claimable; operator gates hold; decisions need a human", async () => {

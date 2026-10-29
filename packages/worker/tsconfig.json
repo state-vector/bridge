@@ -29,6 +29,8 @@
     "test/identity-render.test.ts",
     "test/spa-routing.test.ts",
     "test/push-board.test.ts",
-    "test/rate-limit.test.ts"
+    "test/rate-limit.test.ts",
+    // BR#3819: same rig as do.test.ts (miniflare + workerd fetch types)
+    "test/br3819-self-edge.test.ts"
   ]
 }

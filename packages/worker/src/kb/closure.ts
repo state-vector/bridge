@@ -12,6 +12,11 @@
 //    close leg it claims, so "GH #N closed" claims are mechanically
 //    checkable (the BR#3220 class: done card claimed a close that never
 //    happened).
+// 4. parseForceClose: extract the deliberate force-close intent from a done
+//    note ("force-close-children: BR#x, BR#y — <reason>"), the agent-
+//    executable exit for relation-gated cards (BR#3819) — the gate accepts
+//    it only when EVERY open child is named, and do.ts logs the defect each
+//    forced close repaired. Loud by construction; never a silent path.
 //
 // Conservatism law: the parsers prefer false negatives over false
 // positives. Text that looks machine-checkable but yields no atom marks the
@@ -306,6 +311,51 @@ export function doneWhenSection(bodyMd: string): string {
   const next = /\n##\s/.exec(rest);
   return next ? rest.slice(0, next.index) : rest;
 }
+
+// ---------- 4. force-close intent (BR#3819: the agent-executable exit) ----------
+
+export interface ForceClose {
+  /** every open child id the note explicitly names — the gate refuses a
+   *  partial list (a close that silently skips a child is the defect class
+   *  this grammar exists to end) */
+  ids: string[];
+  /** why the children cannot be closed first — required, non-empty */
+  reason: string;
+  /** the exact matched line, for the audit trail */
+  raw: string;
+}
+
+const FORCE_CLOSE_LINE_RE = /^\s*(?:[-*]\s*)?force-close(?:-children)?\s*:\s*(.+)$/im;
+const ID_TOKEN_RE = /^(?:BR|Q|TASK)-?\d+$|^[A-Za-z][A-Za-z0-9]*#\d+$/;
+
+/**
+ * Extract the deliberate force-close intent from a done note (BR#3819).
+ *
+ * Grammar (one line, deliberate and loud):
+ *   `force-close-children: BR#12, BR#13 — self-edge made these unclosable; repaired per BR#3819`
+ *
+ * The id list comes first; the reason follows an em-dash or `--` on the same
+ * line. Returns null when the note carries no well-formed force-close intent
+ * — a done note without the marker never force-closes anything (conservatism
+ * law: false negatives over false positives).
+ */
+export function parseForceClose(note: string): ForceClose | null {
+  const m = FORCE_CLOSE_LINE_RE.exec(String(note ?? ""));
+  if (!m) return null;
+  const line = String(m[1] ?? "").trim();
+  const split = line.split(/\s+[—–]\s+|\s+--\s+/);
+  const head = (split.shift() ?? "").trim();
+  const reason = split.join(" — ").trim();
+  const ids = [...new Set(
+    head.split(/[,\s]+/).map((s) => s.trim().toUpperCase()).filter((s) => s && ID_TOKEN_RE.test(s)),
+  )];
+  if (!ids.length || !reason) return null;
+  return { ids, reason, raw: m[0].trim() };
+}
+
+/** The force-close grammar, for gate-rejection messages and docs. */
+export const FORCE_CLOSE_DOC =
+  'put "force-close-children: <every open child id, comma-separated> — <reason>" in the done note; every named child is audited as closed-by-force (BR#3819)';
 
 // ---------- 3. closure receipts ----------
 

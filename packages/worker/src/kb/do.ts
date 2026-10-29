@@ -146,6 +146,7 @@ import {
   parseProxyCondition,
   parseCloseLegs,
   parseClosureReceipt,
+  parseForceClose,
   doneWhenSection,
   legLabel,
   RECEIPT_CONTRACT,
@@ -2341,6 +2342,37 @@ export class KnowledgeHub {
       console.log("roles_v1 migration:", String(e).slice(0, 200));
     }
 
+    // ---------- self_edges_v1: a card is never its own relation (BR#3819) ----------
+    // The BR#3423 class: a rollup stamped a card child_of ITSELF; the
+    // done-open-children gate then counted the card as its own open child
+    // forever — unpassable by construction, with no agent-repairable exit.
+    // The write path now rejects self-edges and every gate reader excludes
+    // them; this one-time migration deletes the ones that already exist.
+    // Loud: every deleted edge is audited and version-logged on its card.
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'self_edges_v1'`)) {
+        const selfEdges = this.state.storage.sql.exec(
+          `SELECT src_id, relation, dst_id FROM relations WHERE src_id = dst_id`,
+        ).toArray() as any[];
+        if (selfEdges.length) {
+          this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id = dst_id`);
+          for (const e of selfEdges) {
+            this.audit("system:migration", "self_edge_deleted", String(e.src_id), {
+              relation: String(e.relation), dst: String(e.dst_id), why: "BR#3819: a card is never its own relation",
+            });
+            this.version(String(e.src_id), "system:migration", "note", `self-edge '${e.relation}' to itself deleted (BR#3819 migration) — the card counted as its own open child/parent and could never close`, { relation: e.relation });
+          }
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('self_edges_v1', ?)`,
+          JSON.stringify({ deleted: selfEdges.length, ts: Date.now() }),
+        );
+        this.audit("system:migration", "self_edges_v1", null, { deleted: selfEdges.length });
+      }
+    } catch (e) {
+      console.log("self_edges_v1 migration:", String(e).slice(0, 200));
+    }
+
     // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
     const projectName = this.settingsMap().project_name || "superpositional";
     this.state.storage.sql.exec(
@@ -3302,7 +3334,7 @@ export class KnowledgeHub {
       parent: () =>
         this.one(
           `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
-           WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
+           WHERE r.relation = 'child_of' AND r.src_id = ? AND r.src_id != r.dst_id LIMIT 1`,
           id,
         ),
       // BR#4068: the bounce's live review-leg ask is a VISIBILITY DEVICE
@@ -3312,20 +3344,30 @@ export class KnowledgeHub {
       // it as an open child would deadlock every one-click-from-landed card
       // behind its own review ask. The ask is retired by the close itself
       // (doTransition's retirement leg), so the band never shows a dead leg.
+      // BR#3819 (B): every child_of reader excludes self-edges — a gate must
+      // never read state that cannot exist (the BR#3423 class: the parent
+      // counted as its own open child, done forever unpassable).
       openChildren: () =>
         this.one(
           `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')`,
+             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')`,
           id,
         )?.n ?? 0,
+      openChildIds: () =>
+        (this.state.storage.sql.exec(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
+             AND r.src_id != r.dst_id`,
+          id,
+        ).toArray() as any[]).map((r) => String(r.id)),
       // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
       spawnGuard: () => {
         let cursor = id, depth = 0;
         while (depth < 10) {
           const p = this.one(
             `SELECT p.id AS id, p.roles AS roles FROM relations r JOIN artefacts p ON p.id = r.dst_id
-             WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`, cursor,
+             WHERE r.relation = 'child_of' AND r.src_id = ? AND r.src_id != r.dst_id LIMIT 1`, cursor,
           );
           if (!p) return null;
           depth++;
@@ -3341,14 +3383,14 @@ export class KnowledgeHub {
         this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"review"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
+             AND c.roles LIKE '%"review"%' AND r.src_id != r.dst_id ORDER BY c.updated_ts DESC LIMIT 1`, id,
         ),
       // at most ONE live unblock child per parent, ever (cap ≤1 open)
       openUnblockChild: () =>
         this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`, id,
+             AND c.roles LIKE '%"unblock"%' AND r.src_id != r.dst_id ORDER BY c.updated_ts DESC LIMIT 1`, id,
         ),
       // BR#3361: the task's own body (Done-when section source for the
       // terminal close-leg gate)
@@ -3361,7 +3403,7 @@ export class KnowledgeHub {
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done'
              AND (c.title || ' ' || c.body_md) LIKE '%close%'
              AND (c.title || ' ' || c.body_md) LIKE ${"?"}
-             AND c.roles LIKE '%"unblock"%' LIMIT 1`,
+             AND c.roles LIKE '%"unblock"%' AND r.src_id != r.dst_id LIMIT 1`,
           id, `%#${leg.number}%`,
         );
         return !!hit;
@@ -3560,6 +3602,17 @@ export class KnowledgeHub {
           checked_ts: null,
         };
       }
+      // BR#3819 (C): every forced close is LOUD — the gate passed because the
+      // done note named every open child with a reason; stamp the defect the
+      // close repaired on the card (meta + version log + audit) so the trail
+      // shows exactly which children were closed-by-force and why. No silent
+      // paths: a force-close without this receipt-of-record is a gate bypass.
+      const fc = parseForceClose(doneNote);
+      if (fc) {
+        meta.force_close = { ts, children: fc.ids, reason: fc.reason, actor, note: fc.raw };
+        this.audit("system:gate", "force_close_with_reason", id, { children: fc.ids, reason: fc.reason, actor });
+        this.version(id, actor, "note", `force-closed with open child(ren) ${fc.ids.join(", ")} named in the done note — defect repaired loudly (BR#3819): ${fc.reason.slice(0, 160)}`, { force_close: { children: fc.ids, reason: fc.reason } });
+      }
     }
     // BR#3361 (d): duplicate-executor fence, visible half. A transition by a
     // session that is NOT the stamped executor while the executor's liveness
@@ -3606,7 +3659,9 @@ export class KnowledgeHub {
     }
     if (verdict.status === "superseded" && body.replacement_id) {
       const rep = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, String(body.replacement_id));
-      if (rep && rep.type === row.type)
+      // BR#3819 (A): no self-edges from ANY write path — a card superseding
+      // itself is the same unrepresentable state the link API refuses.
+      if (rep && rep.type === row.type && String(body.replacement_id) !== id)
         this.state.storage.sql.exec(
           `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
           String(body.replacement_id), id, ts,
@@ -3914,6 +3969,16 @@ export class KnowledgeHub {
     const src = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, srcId);
     const dst = this.one(`SELECT id, type, tags, roles FROM artefacts WHERE id = ?`, dstId);
     if (!src || !dst) throw new Error("both src and dst must exist");
+    // BR#3819 (A): self-edges are unrepresentable — a card is never its own
+    // child, parent, supporter, or supersedee, for EVERY relation kind. The
+    // BR#3423 class: a rollup stamped a card child_of ITSELF; the
+    // done-open-children gate then counted the card as its own open child
+    // forever — every →done rejected "still has 1 open child task(s)" with
+    // no agent-repairable exit (MCP has no unlink). The wrong state cannot
+    // be expressed; the rejection is loud, never silently dropped. Checked
+    // BEFORE relation-type semantics so every kind reports the honest reason.
+    if (srcId === dstId)
+      throw new Error(`link rejected: ${srcId} → '${rel}' → ${dstId} is a self-edge — a card cannot be related to itself (BR#3819)`);
     const verdict = validateRelation(rel, src.type as ArtefactType, dst.type as ArtefactType);
     if (verdict.ok === false) throw new Error(verdict.reason);
     // verify-of-verify is structurally impossible: a verify task can never be
@@ -4764,7 +4829,7 @@ export class KnowledgeHub {
 
     // question-node asks (BR#): answer on the node, resume the subject
     if (/^BR#\d+$/.test(id)) {
-      const node = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, id);
+      const node = this.one(`SELECT id, status, meta, created_ts FROM artefacts WHERE id = ?`, id);
       if (!node) throw new Error(`no such ask: ${id}`);
       const m = JSON.parse(node.meta ?? "{}");
       if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
@@ -4781,7 +4846,7 @@ export class KnowledgeHub {
       this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200) });
       let taskStatus: string | undefined;
       const subject = this.one(
-        `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+        `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? ORDER BY r.created_ts DESC LIMIT 1`, id,
       );
       if (subject) {
@@ -4832,12 +4897,24 @@ export class KnowledgeHub {
             } else {
               taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
             }
-          } else {
+          } else if (this.askAgeGuardHold(Number(node.created_ts ?? 0)) || this.holderIsAlive(sm, subject.owner)) {
             await this.transition({
               id: subject.id, to: "in_progress",
               note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
             }, asActor);
             taskStatus = "in_progress";
+          } else {
+            // BR#3819 (D): the answer resumes work only onto a LIVE executor.
+            // The holder's session produced no live signal within the stale
+            // window — its runner already finished (the BR#3423/BR#3649
+            // misfire: resume flipped the card in_progress and nothing ever
+            // executed). Release to the pool instead; the dispatch loop
+            // picks it up fresh.
+            await this.transition({
+              id: subject.id, to: "todo",
+              note: `ask ${id} answered (${answer.slice(0, 80)}) — holder session ${String(sm.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819: never resume onto a finished runner)`,
+            }, asActor);
+            taskStatus = "todo";
           }
         }
       }
@@ -4846,7 +4923,7 @@ export class KnowledgeHub {
     }
 
     // legacy asks-row asks (ASK-…) — kept until in-flight rows drain
-    const row = this.one(`SELECT status, artefact_id FROM asks WHERE id = ?`, id);
+    const row = this.one(`SELECT status, artefact_id, created_ts FROM asks WHERE id = ?`, id);
     if (!row) throw new Error(`no such ask: ${id}`);
     if (row.status !== ASK_OPEN) throw new Error(`ask ${id} already ${row.status}`);
     this.state.storage.sql.exec(
@@ -4855,7 +4932,7 @@ export class KnowledgeHub {
     );
     let taskStatus: string | undefined;
     if (row.artefact_id) {
-      const t = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, String(row.artefact_id));
+      const t = this.one(`SELECT status, owner, meta FROM artefacts WHERE id = ?`, String(row.artefact_id));
       if (t) {
         const meta = JSON.parse(t.meta ?? "{}");
         if (meta.awaiting_ask?.ask_id === id) {
@@ -4863,16 +4940,78 @@ export class KnowledgeHub {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), String(row.artefact_id));
         }
         if (t.status === "blocked") {
-          await this.transition({
-            id: String(row.artefact_id), to: "in_progress",
-            note: `decision ${id} answered — resumed: ${answer.slice(0, 100)}`,
-          }, `system:decision(${actor})`);
-          taskStatus = "in_progress";
+          if (this.askAgeGuardHold(Number(row.created_ts ?? 0)) || this.holderIsAlive(meta, t.owner)) {
+            await this.transition({
+              id: String(row.artefact_id), to: "in_progress",
+              note: `decision ${id} answered — resumed: ${answer.slice(0, 100)}`,
+            }, `system:decision(${actor})`);
+            taskStatus = "in_progress";
+          } else {
+            // BR#3819 (D): dead holder — release to the pool, never resume
+            // onto a runner that already finished.
+            await this.transition({
+              id: String(row.artefact_id), to: "todo",
+              note: `decision ${id} answered (${answer.slice(0, 80)}) — holder session ${String(meta.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819)`,
+            }, `system:decision(${actor})`);
+            taskStatus = "todo";
+          }
         }
       }
     }
     this.audit(actor, "answer", row.artefact_id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
     return { id, status: ASK_ANSWERED, artefact_id: row.artefact_id ?? undefined, task_status: taskStatus };
+  }
+
+  /** BR#3819 (D): holder liveness for the ask-resume path — the same real-
+   *  signal law the duplicate-executor fence and the ghost-bounce conversion
+   *  already use. The holder's freshest live signal is the max of:
+   *    - the runner's liveness vouch on the card (meta.session_alive_ts),
+   *    - the card's own heartbeat (meta.last_progress.ts — log_progress),
+   *    - the stamped session's hub ping (sessions.last_seen_ts by name),
+   *    - the owner identity's hub ping (auth_tokens.last_seen_ts — a live
+   *      runner waiting on the answer keeps polling the hub, so its token
+   *      stays fresh; a finished runner stops polling and goes stale).
+   *  updated_ts is deliberately NOT a signal here: the watchdog's hourly
+   *  blocked-age annotation touches it on parked cards, and annotated noise
+   *  must never read as a live holder. meta.session is read but never
+   *  trusted as identity — the stamp is first-wins, so a re-claimed card
+   *  still carries its original session name; the heartbeats above are what
+   *  track the CURRENT executor.
+   *  No signal within the stale window = dead → the answer releases to the
+   *  pool instead of resuming onto a runner that already finished. A card
+   *  with no stamped session AND no owner has no holder to be dead — the
+   *  generic resume stands. */
+  private holderIsAlive(holderMeta: any, owner?: string): boolean {
+    const sess = String(holderMeta?.session ?? "").trim();
+    const ownerLabel = String(owner ?? "").trim();
+    if (!sess && !ownerLabel) return true;
+    const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+    const sessRow = sess
+      ? this.one(`SELECT last_seen_ts FROM sessions WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1`, sess)
+      : null;
+    const ownerToken = ownerLabel
+      ? this.one(`SELECT id, last_seen_ts FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, ownerLabel, ownerLabel)
+      : null;
+    const lastSignal = Math.max(
+      Number(holderMeta?.session_alive_ts ?? 0),
+      Number(holderMeta?.last_progress?.ts ?? 0),
+      Number(sessRow?.last_seen_ts ?? 0),
+      Number(ownerToken?.last_seen_ts ?? 0),
+    );
+    if (!lastSignal) return false;
+    return Date.now() - lastSignal <= staleMin * 60_000;
+  }
+
+  /** The ask-age presumption (BR#3819 D): a holder that was alive moments
+   *  before the ask was filed is presumed alive while the ask is still
+   *  younger than the stale window — quick answers always resume as today,
+   *  whatever signal hygiene the parked card has. Only an ask old enough for
+   *  a live holder to have heartbeated again submits to the signal check. */
+  private askAgeGuardHold(askCreatedTs: number): boolean {
+    const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+    const staleMin = s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+    return Date.now() - Number(askCreatedTs ?? 0) < staleMin * 60_000;
   }
   private async orient(body: any) {
     // open question children: DERIVED awaiting_ask (phase 4 — no marker cache)

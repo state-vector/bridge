@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
-import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -59,6 +59,9 @@ export interface RuleCtx {
   evidence(id: string): { type: string; roles?: string[]; tags?: string[]; meta: any } | null | Promise<{ type: string; roles?: string[]; tags?: string[]; meta: any } | null>;
   parent(): { id: string; status?: string; meta: any } | null | Promise<{ id: string; status?: string; meta: any } | null>;
   openChildren(): number | Promise<number>;
+  /** every OPEN child id (self-edges excluded — BR#3819: state that cannot
+   *  exist is never read); the force-close grammar validates against it */
+  openChildIds(): string[] | Promise<string[]>;
   /** verify-of-verify / nesting-cap guard: the spawn-blocker reason or null */
   spawnGuard(): string | null | Promise<string | null>;
   /** newest OPEN role:review child (reuse candidate), or null */
@@ -492,13 +495,31 @@ export const RULES: Rule[] = [
     },
   },
   {
+    // BR#3819 (B+C): a gate must never read state that cannot exist. A
+    // self-edge (child_of src == dst) counted the parent as its own open
+    // child forever — every →done rejected "still has 1 open child" with no
+    // agent-repairable exit (BR#3423 specimen). Two layers here:
+    //   (B) openChildren() excludes self-edges — the impossible state is
+    //       invisible to the gate (defense-in-depth; the write path now
+    //       rejects self-edges and the migration deleted the existing ones).
+    //   (C) the explicit force-close-with-reason: the agent-executable exit
+    //       for relation-gated cards. It must name EVERY open child and say
+    //       why — do.ts stamps + audits each forced close (loud, never
+    //       silent). A partial list is refused.
     name: "done-open-children",
     when: (i) => isTask(i) && i.to === "done",
     guard: async (i, c) => {
       const open = await c.openChildren();
-      return open > 0
-        ? `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children)`
-        : null;
+      if (open <= 0) return null;
+      const fc = parseForceClose(noteOf(i));
+      if (fc) {
+        const openIds = (await c.openChildIds()).map((x) => String(x).toUpperCase());
+        const missing = openIds.filter((x) => !fc.ids.map((y) => y.toUpperCase()).includes(x));
+        if (missing.length)
+          return `force-close must name EVERY open child task — missing: ${missing.join(", ")}. ${FORCE_CLOSE_DOC}`;
+        return null; // deliberate, complete, reasoned — do.ts logs the repair
+      }
+      return `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children). If a child is genuinely unclosable, ${FORCE_CLOSE_DOC}`;
     },
   },
   {
