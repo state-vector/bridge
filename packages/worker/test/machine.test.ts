@@ -1479,6 +1479,49 @@ describe("release-holds-train-queue (BR#4067)", () => {
     expect(msg).toMatch(/merge-train bounced \(typed await pr_merged state-vector\/bridge#259\)/);
   });
 
+  // BR#4494 — the bounce re-entry demote: bounced is the ONE train state the
+  // train does NOT own anymore (it handed the leg back; re-entry is a fresh
+  // verify/impl round), so the stall sweep may demote the STRANDED re-entry
+  // (in_progress, dead executor) to a claimable todo.
+  it("BR#4494 carve-out: the sweep's demote of a stranded in_progress bounced re-entry passes — flag + in_progress + bounced", async () => {
+    const bounced = {
+      merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "coverage", bounced_at: 1 },
+      pr: { repo: "state-vector/bridge", number: 259 },
+    };
+    const msg = await check(input({
+      status: "in_progress", to: "todo", actor: "system:watchdog", meta: bounced as any,
+      body: { note: "bounce re-entry demoted (watchdog, BR#4494)", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("BR#4494 carve-out stays narrow: the flag cannot free a PARKED blocked bounced card or a queued/awaiting-ci card", async () => {
+    const bounced = {
+      merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "conflict" },
+      pr: { repo: "state-vector/bridge", number: 259 },
+    };
+    // blocked park + flag → still held (only the live re-entry demotes)
+    const parked = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog", meta: bounced as any,
+      body: { note: "forged flag", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(parked).toMatch(/merge-train bounced/);
+    // queued + flag → still held (live queue slot, the PR #257 class)
+    const queued = await check(input({
+      status: "in_progress", to: "todo", actor: "system:watchdog",
+      meta: { ...bounced, merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" } } as any,
+      body: { note: "forged flag", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(queued).toMatch(/merge-train queued/);
+    // awaiting-ci + flag → still held
+    const awaiting = await check(input({
+      status: "in_progress", to: "todo", actor: "system:watchdog",
+      meta: { ...bounced, merge_train: { state: "awaiting-ci", pr: 259, repo: "state-vector/bridge" } } as any,
+      body: { note: "forged flag", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(awaiting).toMatch(/merge-train awaiting-ci/);
+  });
+
   it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
     const msg = await check(input({
       status: "blocked", to: "todo", actor: "system:watchdog",
