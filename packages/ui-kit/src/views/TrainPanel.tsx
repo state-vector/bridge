@@ -68,16 +68,31 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
     };
   if (reason.startsWith("merge-train: retired"))
     return { tone: "muted", label: "retired", title: "lane card done/superseded — the train no longer ticks this lane (BR#4977)" };
-  if (reason.startsWith("merge-train: awaiting bypass merge") || l.bypass_wait)
-    return { tone: "warn", label: "⏸ bypass wait", title: reason || "a queue head is blocked on branch protection (review/required checks) — a human merge is the unblock; self-clears when it lands (BR#4981)" };
+  if (reason.startsWith("merge-train: awaiting bypass merge") || l.bypass_wait) {
+    const bpm = reason.match(/PR #(\d+)/);
+    return {
+      tone: "warn",
+      label: `⏸ bypass wait${bpm ? ` · #${bpm[1]}` : ""}`,
+      title: reason || "a queue head is blocked on branch protection (review/required checks) — a human merge is the unblock; self-clears when it lands (BR#4981)",
+    };
+  }
   if (l.currently)
     return {
       tone: l.currently.phase === "stopped" ? "err" : "live",
       label: l.currently.phase ?? "merging",
       title: `in-flight: ${JSON.stringify(l.currently)}`,
     };
-  if (reason.includes("attempting "))
-    return { tone: "live", label: "attempting", title: reason };
+  if (reason.includes("attempting ")) {
+    // The subject rides the LABEL, not just the tooltip (Ray, 2026-10-30:
+    // "it says attempting but I can't see what") — reason reads
+    // "…attempting BR#4678 (gate), last ticked …" → "▶ BR#4678 · gate".
+    const am = reason.match(/attempting (BR#\d+)(?: \(([^)]+)\))?/);
+    return {
+      tone: "live",
+      label: am ? `▶ ${am[1]}${am[2] ? ` · ${am[2]}` : ""}` : "attempting",
+      title: reason,
+    };
+  }
   if (l.lease?.holder) {
     const t = lockTone(l, now);
     return {
