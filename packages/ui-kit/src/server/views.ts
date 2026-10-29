@@ -73,6 +73,55 @@ export const TASK_REF_RE = /\b(BR#\d+|TASK-\d+)\b/g;
  *  lapses. Top excludes them; Backlog files them under TIMEOUT. */
 export const TIMEOUT_BLOCK_RX = /rework loop|churn guard/i;
 
+/* ---- BR#2893 park classes: the client mirror of the hub's blockedParkVerdict
+ * ---- (worker kb/machine.ts). The hub drains dead parks automatically; the
+ * ---- board renders the same three populations. Textual patterns MUST stay
+ * ---- identical to the hub — change both together. */
+
+/** Churn-guard stamp, either field: the reason ("churn guard: released N
+ *  times…") or the boilerplate exit condition ("read the task history…").
+ *  Superset of TIMEOUT_BLOCK_RX — legacy parks carried the boilerplate on the
+ *  exit condition only. */
+export const CHURN_PARK_RX = /read the task history \(get_history\) and the last gate error|rework loop|churn guard/i;
+
+export type ParkClass = "sin-bin" | "external" | "plain";
+
+/** Which top-level population a blocked card belongs to: sin-bin (churn
+ *  parks — user-releasable), external (a named outside gate — ask, dated
+ *  checkpoint, GitHub lane, red-main), or plain (honest park, ages out
+ *  hub-side). Non-blocked cards are null. Ask-status isn't known client-side,
+ *  so dead-ask detection stays hub-only; the drain fixes the card, the board
+ *  need only render it. */
+export function parkClassOf(t: { status?: string; meta?: any }): ParkClass | null {
+  if (t.status !== "blocked") return null;
+  const m = t.meta ?? {};
+  const b = m.blocked ?? {};
+  const reason = String(b.reason ?? "");
+  const unblock = String(b.unblock_condition ?? "");
+  if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return "sin-bin";
+  if (m.awaiting_ask?.ask_id) return "external";
+  if (/\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/.test(unblock)) return "external";
+  if (/github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i.test(unblock)) return "external";
+  if (/\bred\s+main\b|\bmain\s+is\s+red\b|\bstop-the-line\b|\buntil main (is )?green\b/i.test(unblock)) return "external";
+  return "plain";
+}
+
+/** The external owner a blocked card waits on, for the awaiting-external
+ *  section: a human ask, a date, a GitHub lane, or main's health. */
+export function externalGateOf(t: { meta?: any }): { owner: string; next: string } {
+  const b = t.meta?.blocked ?? {};
+  const unblock = String(b.unblock_condition ?? "");
+  if (t.meta?.awaiting_ask?.ask_id) {
+    const awaiter = /awaiting (\S+) on ask/.exec(String(b.reason ?? ""));
+    return { owner: awaiter ? awaiter[1] : "you (ask)", next: `${t.meta.awaiting_ask.ask_id} — answer resumes the card` };
+  }
+  const date = /\b(20\d{2}-\d{2}-\d{2})/.exec(unblock);
+  if (date) return { owner: "clock", next: `until ${date[1]} — ${unblock.slice(0, 90)}` };
+  if (/github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i.test(unblock))
+    return { owner: "GitHub lane", next: unblock.slice(0, 110) };
+  return { owner: "main green", next: unblock.slice(0, 110) };
+}
+
 export function isTimeoutBlock(t: { status?: string; meta?: any }): boolean {
   return t.status === "blocked" && TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
 }

@@ -952,6 +952,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .backlog-group { margin-bottom: 14px; }
 .backlog-group-head { margin-bottom: 4px; }
 .backlog-group-head h2 { color: var(--text-dim); }
+
+/* BR#2893: sin-bin + awaiting-external sections on Top — the parking lot
+   collapses to a count with ages; rows reuse the backlog ktable grid */
+.top-parked { margin-top: 16px; }
+.top-parked > summary {
+  cursor: pointer; padding: 6px 10px; border-radius: 8px;
+  color: var(--text-dim); font-size: 12px; font-weight: 600;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  margin-bottom: 4px; list-style: none; user-select: none;
+}
+.top-parked > summary::-webkit-details-marker { display: none; }
+.top-parked > summary::before { content: "▸ "; }
+.top-parked[open] > summary::before { content: "▾ "; }
+.top-parked > summary .muted-note { font-weight: 400; margin-left: 6px; }
+.top-parked.awaiting-external > .view-head { padding: 0 10px; }
+.sinbin-release { font-size: 11px; }
 .topc-agent { font-weight: 600; }
 .topc-session { font-size: 11px; }
 .top-will { color: var(--accent); opacity: .8; }

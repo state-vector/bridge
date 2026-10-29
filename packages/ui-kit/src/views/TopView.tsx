@@ -4,8 +4,8 @@ import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
-import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
-import { Chip, type ChipTone } from "./index-kit";
+import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf, parkClassOf, externalGateOf } from "../server/views";
+import { Chip, Btn, type ChipTone } from "./index-kit";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -236,13 +236,36 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     if (useKb.getState().awaitingHuman !== humanAsks.total) useKb.setState({ awaitingHuman: humanAsks.total });
   }, [humanAsks.total]);
 
+  // BR#2893 board split: top = actionable (the table above) / sin-bin (churn
+  // parks — the watchdog drains them automatically, a human can release one
+  // early) / awaiting-external (a NAMED outside gate: ask, date, GitHub lane,
+  // red-main — each rendered with its owner + next action).
+  const sinBin = useMemo(
+    () => (tasks as any[]).filter((t) => parkClassOf(t) === "sin-bin")
+      .sort((a, b) => (a.status_ts ?? a.updated_ts ?? 0) - (b.status_ts ?? b.updated_ts ?? 0)),
+    [tasks],
+  );
+  const externalGates = useMemo(
+    () => (tasks as any[]).filter((t) => parkClassOf(t) === "external" && !visibleTaskIds.has(t.id))
+      .sort((a, b) => (b.updated_ts ?? 0) - (a.updated_ts ?? 0)),
+    [tasks, visibleTaskIds],
+  );
+  const releaseSinbin = async (id: string) => {
+    try {
+      await useKb.getState().transition(id, "todo", { note: "released from sin-bin — human override" });
+      void refreshKb();
+    } catch { /* park stands (e.g. an ask landed meanwhile) — the card stays blocked */ }
+  };
+  const sinOpenDefault = sinBin.length > 0 && sinBin.length <= 5;
+  const [sinOpen, setSinOpen] = useState<boolean | null>(null);
+
   return (
     <div className="top-wrap">
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <div className="view-head">
         <h2>Top</h2>
-        <span className="muted-note">fleet processes — status dot · agent · gauges · ages. blocked rows appear only with a pending human ask or a live unblock child; churn parks + lever-less blocks live in Backlog.</span>
+        <span className="muted-note">fleet processes — status dot · agent · gauges · ages. actionable work on top; churn parks collapse into the sin-bin (the watchdog drains them; release one early when you disagree); named external gates list their owner + next action.</span>
       </div>
       <TagThemeBar theme={tagTheme} />
 
@@ -383,8 +406,79 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         ];
       })}
 
-      {treeRows.length === 0 && (
-        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Blocked work without a pending ask or live unblock duty lives in Backlog."}</p>
+      {sinBin.length > 0 && (
+        <details
+          className="top-parked sinbin"
+          open={sinOpen ?? sinOpenDefault}
+          onToggle={(e) => setSinOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary>
+            Sin-bin — churn parks
+            <span className="muted-note">
+              {" "}· {sinBin.length} · oldest {age(sinBin[0]?.status_ts ?? sinBin[0]?.updated_ts, now)} in park — the watchdog demotes these automatically (retry instructions, dead asks); release early if you disagree
+            </span>
+          </summary>
+          <div className="backlog-list">
+            {sinBin.map((t: any) => {
+              const attempts = t.meta?.attempt?.attempts ?? 0;
+              return (
+                <div key={t.id} className="ktable-row backlog-row backlog-parked" onClick={() => openDetails(t.id)}>
+                  <span className="backlog-rank" title="churn/rework park — drains automatically on the next watchdog tick">⏱</span>
+                  <span className="backlog-id">{t.id}</span>
+                  <span className="backlog-main">
+                    <span className={`kind-pill kp-${kindOf(t)}`}>{kindOf(t)}</span>
+                    <span className="backlog-title">{t.title}</span>
+                    <span className="backlog-why"><Chip tone="urgent">why</Chip> {(t.meta?.blocked?.reason ?? "").slice(0, 110)}</span>
+                  </span>
+                  <span className="backlog-meta">
+                    {attempts > 0 && <Chip tone="urgent" title={`attempted ${attempts}x`}>×{attempts}</Chip>}
+                    {t.owner ? <span title={`parked under ${t.owner}`}>{t.owner}</span> : <span className="backlog-pool">pool</span>}
+                    <Btn
+                      size="sm"
+                      className="sinbin-release"
+                      title="release now — pushes the card back to the todo pool ahead of the watchdog's automatic drain"
+                      onClick={(e) => { e.stopPropagation(); void releaseSinbin(t.id); }}
+                    >
+                      release
+                    </Btn>
+                  </span>
+                  <span className="backlog-age top-num" title="time in park">{age(t.status_ts ?? t.updated_ts, now)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      )}
+
+      {externalGates.length > 0 && (
+        <div className="top-parked awaiting-external">
+          <div className="view-head backlog-group-head">
+            <h2>Awaiting external input</h2>
+            <span className="muted-note">{externalGates.length} · named outside gates — the watchdog exempts these from the age drain</span>
+          </div>
+          <div className="backlog-list">
+            {externalGates.map((t: any) => {
+              const gate = externalGateOf(t);
+              return (
+                <div key={t.id} className="ktable-row backlog-row" onClick={() => openDetails(t.id)}>
+                  <span className="backlog-rank" title={`external gate — owner: ${gate.owner}`}>⚑</span>
+                  <span className="backlog-id">{t.id}</span>
+                  <span className="backlog-main">
+                    <span className={`kind-pill kp-${kindOf(t)}`}>{kindOf(t)}</span>
+                    <span className="backlog-title">{t.title}</span>
+                    <span className="backlog-why"><Chip tone="scope">{gate.owner}</Chip> {gate.next}</span>
+                  </span>
+                  <span className="backlog-meta">{t.owner || "—"}</span>
+                  <span className="backlog-age top-num" title="time in park">{age(t.status_ts ?? t.updated_ts, now)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {treeRows.length === 0 && sinBin.length === 0 && externalGates.length === 0 && (
+        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Churn parks drain to the sin-bin; true external gates list their owner below."}</p>
       )}
 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}

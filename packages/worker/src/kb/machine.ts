@@ -205,6 +205,78 @@ export interface Rejection {
 
 export type Verdict = Applied | Rejection;
 
+// ---------- blocked-park law (BR#2893): the parking lot gets a clock ----------
+//
+// Blocked cards had no clock: the watchdog swept in_progress (silence) and
+// in_review (stalled rounds) but blocked rows were swept by NOTHING, and the
+// only legal releasers are the card's owner or a human — so a park whose
+// owner is a dead runner label stayed parked forever. This classifier names
+// each park: the two DEAD shapes (churn-guard boilerplate — a retry
+// instruction stamped as a block; unresolvable ASK- refs — a wait that can
+// never fire) drain automatically; true external gates (dated checkpoint,
+// GitHub lane, red-main) are exempt and render under "awaiting external
+// input"; everything else ages out past the blocked-staleness bar.
+
+/** The churn guard's own unblock boilerplate (do.ts release_redirect path) —
+ *  a retry instruction, not a blocker. Textually identical to the client
+ *  mirror in ui-kit server/views.ts; change both together. */
+export const CHURN_UNBLOCK_RX = /read the task history \(get_history\) and the last gate error/i;
+export const CHURN_REASON_RX = /^churn guard:/i;
+
+/** ASK- references inside unblock conditions ("Ray answers ASK-xyz-abc"). */
+export const ASK_REF_RX = /ASK-[a-zA-Z0-9._-]+/g;
+
+const PARK_DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/g;
+const PARK_GH_LANE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/\d+|\bGH#\d+\b/i;
+const PARK_RED_MAIN_RX = /\bred\s+main\b|\bmain\s+is\s+red\b|\bstop-the-line\b|\buntil main (is )?green\b/i;
+
+export type BlockedParkClass = "churn-park" | "dead-ask" | "external" | "plain";
+
+/** Classify one parked blocked card. Pure — do.ts supplies the ask-liveness
+ *  lookup, tests supply fixtures. Order matters: dead shapes win over
+ *  external markers (a churn park that name-drops a date is still a churn
+ *  park), and ask refs are judged only when EVERY referenced ask is closed. */
+export function blockedParkVerdict(input: {
+  reason: string;
+  unblockCondition: string;
+  now: number;
+  staleMs: number;
+  blockedTs?: number;
+  askIsOpen?: (id: string) => boolean;
+}): { klass: BlockedParkClass; why: string } {
+  const reason = String(input.reason ?? "");
+  const unblock = String(input.unblockCondition ?? "");
+  // 1. churn parks: the guard's own boilerplate — dead at any age
+  if (CHURN_REASON_RX.test(reason) || CHURN_UNBLOCK_RX.test(unblock))
+    return { klass: "churn-park", why: "churn-guard park — a retry instruction stamped as a block" };
+  // 2. ask-ref parks: every referenced ask is gone/expired/answered — the
+  //    wait can never fire (an OPEN ask keeps the card ask-gated upstream)
+  const refs = [...new Set(unblock.match(ASK_REF_RX) ?? [])];
+  if (refs.length) {
+    const dead = refs.filter((r) => !(input.askIsOpen ? input.askIsOpen(r) : true));
+    if (dead.length === refs.length)
+      return { klass: "dead-ask", why: `unresolvable ask ref(s) ${dead.join(", ")} — none is open` };
+  }
+  // 3. true external gates: future-dated checkpoint, a GitHub lane, red-main
+  for (const m of unblock.matchAll(PARK_DATE_RX)) {
+    const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
+    if (!Number.isNaN(t) && t >= input.now - 24 * 3_600_000)
+      return { klass: "external", why: `dated checkpoint ${m[0]}` };
+  }
+  if (PARK_GH_LANE_RX.test(unblock)) return { klass: "external", why: "GitHub issue/PR lane" };
+  if (PARK_RED_MAIN_RX.test(unblock)) return { klass: "external", why: "destination-main health gate" };
+  // 4. an honest park that still ages out
+  const age = input.now - (input.blockedTs ?? 0);
+  if (input.blockedTs && age > input.staleMs)
+    return { klass: "plain", why: `parked ${Math.round(age / 3_600_000)}h with no external gate (bar: ${Math.round(input.staleMs / 3_600_000)}h)` };
+  return { klass: "plain", why: "parked" };
+}
+
+/** Unblock-spawner cap (BR#2893): a blocked parent spawns at most this many
+ *  unblock duties EVER. Each failed round is one more card manufacturing
+ *  work about work; at the cap the spawner stops and escalates once. */
+export const UNBLOCK_SPAWN_CAP = 3;
+
 export const RULES: Rule[] = [
   {
     name: "verdict-no-in_review",
