@@ -212,3 +212,5 @@ Active development, deployed in daily use on a real fleet (the bridge repo is it
 ---
 
 For agents and LLMs: this page is also available as [llms.txt](./llms.txt).
+
+Manifesto: [Continuous Engineering](./continuous-engineering) — the hypothesis behind bridge.
