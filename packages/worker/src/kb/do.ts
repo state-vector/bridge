@@ -305,6 +305,57 @@ export class KnowledgeHub {
 
   webSocketClose() {}
 
+  // ---------- SSE wake channel (BR#4806) ----------
+  // The WS push channel (/ws) is browser-first (hibernating sockets, Durable
+  // Objects hibernation API). The GATEWAY daemons (train.rs, vendored verbatim
+  // into the CLI) subscribe over SSE — the same audit-event stream in the same
+  // frame shape, but a plain streaming HTTP response the Rust standard stack
+  // can read with NO new dependency (reqwest blocking is already in both
+  // crates). Broadcast-only, no state: a missed event degrades to the 45s
+  // poll cadence, which stays as the fallback (BR#4806).
+  private sseClients = new Set<WritableStreamDefaultWriter>();
+
+  /** workerd demands BYTE streams for network responses — string chunks
+   *  throw "This ReadableStream did not return bytes" the moment the body
+   *  crosses an I/O boundary (the stub bridge hid this; the real HTTP
+   *  server exposes it). Encode once per frame here. */
+  private sseEnc = new TextEncoder();
+
+  /** Fan a frame out to every SSE subscriber. A failed write drops that
+   *  client (the reader reconnects; poll cadence covers the gap). */
+  private sseWrite(frame: string): void {
+    const bytes = this.sseEnc.encode(frame);
+    for (const w of [...this.sseClients]) {
+      w.write(bytes).catch(() => {
+        this.sseClients.delete(w);
+        try { w.close(); } catch { /* already gone */ }
+      });
+    }
+  }
+
+  /** GET /sse — the gateway wake channel. Same events as /ws, text/event-
+   *  stream encoded. Capped (gateway fleets are small); the cap response is
+   *  loud so an operator sees it instead of a silently dead stream. */
+  private handleSse(request: Request): Response {
+    if (this.sseClients.size >= 64) {
+      return new Response("sse subscriber cap reached (64) — a fleet this large should share a wake relay", { status: 503 });
+    }
+    const ts = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = ts.writable.getWriter();
+    this.sseClients.add(writer);
+    const drop = () => {
+      this.sseClients.delete(writer);
+      try { writer.close(); } catch { /* already closed */ }
+    };
+    request.signal.addEventListener("abort", drop);
+    writer.write(this.sseEnc.encode("retry: 5000\n\n")).catch(drop);
+    writer.write(this.sseEnc.encode(`data: ${JSON.stringify({ type: "kb.hello", ts: Date.now() })}\n\n`)).catch(drop);
+    return new Response(ts.readable, {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
+    });
+  }
+
   // BR#4362 push-driven board: the socket is the source of truth, never a
   // doorbell. One coalesced snapshot per second max, no matter the mutation
   // rate or the client count — the 2026-10-29 overload was every client
@@ -376,6 +427,8 @@ export class KnowledgeHub {
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(frame); } catch { this.wsSendFail++; /* hibernated client gone — counted (BR#4212) */ }
     }
+    // BR#4806: the same frame to the SSE wake channel (gateway daemons)
+    this.sseWrite(`data: ${frame}\n\n`);
     // BR#4362 follow-up: every mutation drops the HTTP board cache — read-
     // after-write must reflect the write (a 2s-stale board after a claim is
     // a correctness bug, not a performance trade; the storm protection is
@@ -420,6 +473,11 @@ export class KnowledgeHub {
     } catch (e) {
       this.noteStorageFault("alarm_rearm", e);
     }
+    // BR#4806: SSE keepalive — gateway readers carry an idle read-timeout;
+    // a silent gap longer than that tears the stream down and reconnects.
+    // Pinging on the 60s alarm bounds the silent gap to ≤60s, well inside
+    // the reader's timeout, and fires even when the sweep below faults.
+    this.sseWrite(`: ping ${Date.now()}\n\n`);
     // BR#4362: flush a burst's tail board push (the ≥1s coalescer in
     // broadcastEvent may have swallowed the last mutation of a burst)
     if (this.boardDirty && Date.now() - this.boardLastPush >= 1000) {
@@ -2858,6 +2916,10 @@ export class KnowledgeHub {
 
     // realtime: hibernating WS fanout of audit events
     if (url.pathname === "/ws") return this.handleWs(request);
+
+    // realtime: the same fanout over text/event-stream — the gateway wake
+    // channel (train.rs subscribes; no WS dep on the Rust side) (BR#4806)
+    if (url.pathname === "/sse") return this.handleSse(request);
 
     // machine-plane self-rename: the bearer token renames its own label.
     // The runner sends its hostname at pair/start and the pair page pre-fills
@@ -8013,6 +8075,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     // stamp: meta.prs = every leg; meta.pr = the first leg (compat: the gate,
     // the derived-queue filter, and older readers read meta.pr)
+    // BR#4806 wake bookkeeping — read the per-lane queue depth BEFORE the
+    // stamp: a fresh entry's card is not yet in the derived queue (before=0
+    // on an idle lane); an already-queued card's re-stamp (alreadyQueued)
+    // never transitions a queue. The empty→non-empty lanes get one
+    // `lane.queued` broadcast after the stamp lands.
+    const touchedRepos = [...new Set(withStampHeads.map((l) => l.repo))];
+    const queueBefore = new Map(touchedRepos.map((r) => [r, this.laneQueue(r).length]));
     meta.prs = withStampHeads;
     meta.pr = { ...(meta.pr ?? {}), repo: withStampHeads[0].repo, number: withStampHeads[0].number, head_sha_at_acceptance: withStampHeads[0].head_sha_at_acceptance, ...(withStampHeads[0].base ? { base: withStampHeads[0].base } : {}) };
     meta.merge_train = { ...(meta.merge_train ?? {}), state: "queued", at: Date.now(), pr: withStampHeads[0].number, repo: withStampHeads[0].repo, legs_total: withStampHeads.length };
@@ -8046,7 +8115,33 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     // the lane card exists before anything can lease it — one per repo the
     // legs ride (a multi-PR parent may span repos; each lane takes its own)
-    for (const repo of [...new Set(withStampHeads.map((l) => l.repo))]) await this.laneEnsure(repo, String(meta.pr.base ?? "main"), actor);
+    const laneCards = new Map<string, string>();
+    for (const repo of [...new Set(withStampHeads.map((l) => l.repo))]) {
+      const laneCard = await this.laneEnsure(repo, String(meta.pr.base ?? "main"), actor);
+      laneCards.set(repo, String(laneCard?.id ?? ""));
+    }
+    // BR#4806 event-driven tick — wake the gateways: on a lane's derived
+    // queue transitioning empty → non-empty, broadcast `lane.queued {repo,
+    // base, depth}` on the push channel (same transport as `lane.starved` —
+    // the audit call fans out to WS + SSE AND writes the ledger receipt).
+    // Ready gateways run ONE tick on arrival under the exact same CAS lease;
+    // the poll cadence stays as the fallback, and a push+poll double-fire
+    // is serialized by the lease (the second acquirer stands down).
+    for (const repo of touchedRepos) {
+      const base = String(withStampHeads.find((l) => l.repo === repo)?.base ?? meta.pr.base ?? "main");
+      const after = this.laneQueue(repo);
+      if ((queueBefore.get(repo) ?? 0) === 0 && after.length > 0) {
+        this.audit("system:train", "lane.queued", laneCards.get(repo) ?? parentId, {
+          lane: `${repo}@${base}`,
+          repo,
+          base,
+          depth: after.length,
+          head: after[0]?.id ?? null,
+          trigger: parentId,
+          reason: "queue transitioned empty → non-empty — merge-capable gateways may tick now (BR#4806)",
+        });
+      }
+    }
     this.audit(actor, "train_queued", parentId, { prs: withStampHeads.map((l) => l.number), repos: [...new Set(withStampHeads.map((l) => l.repo))], head: (withStampHeads[0].head_sha_at_acceptance ?? "").slice(0, 9), requeued: alreadyQueued });
     this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? " (re-queued, stamp refreshed)" : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }

@@ -41,6 +41,10 @@ beforeAll(async () => {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (before vitest)");
   }
   mf = new Miniflare({
+    // HTTP server ON: the SSE test dials the real /api/kb/sse route through
+    // it — the DO stub bridge cannot carry an open streaming Response — and
+    // a single runtime keeps stub calls + SSE in the SAME durable object.
+    port: 0,
     workers: [{
       name: "main",
       scriptPath: bundle,
@@ -899,5 +903,100 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     expect((await kbJson("/get", { id: card })).body.status).toBe("done");
     expect((await laneSnap(repo)).currently).toBeNull();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-z" });
+  });
+
+  // ---- BR#4806 event-driven tick: the lane.queued wake + the SSE channel ----
+
+  /** Events strictly AFTER a seq — the exact delta, immune to the 500-row
+   *  window sliding between reads. */
+  const eventsAfter = async (seq: number) =>
+    (await kbJson(`/events?since=${seq}&limit=500`)).body.events as any[];
+
+  it("BR#4806 — a lane's queue empty→non-empty broadcasts `lane.queued` ONCE; non-transitions never re-broadcast", async () => {
+    const repo = "state-vector/wake-lane";
+    const cur = (await kbJson("/events?limit=1")).body.last_seq;
+
+    // fresh entry on an idle lane → exactly one wake, shaped per the card
+    await queueViaAccept({ repo, pr: 48100, head: "c".repeat(40), title: "IMPL: wake drill" });
+    const wakes1 = (await eventsAfter(cur)).filter((e: any) => e.op === "lane.queued" && e.detail?.repo === repo);
+    expect(wakes1.length).toBe(1);
+    expect(wakes1[0].detail.base).toBe("main");
+    expect(wakes1[0].detail.depth).toBeGreaterThanOrEqual(1);
+    expect(wakes1[0].detail.head).toBeTruthy();
+    expect(wakes1[0].actor).toBe("system:train");
+
+    // a second card in the SAME lane (queue already non-empty) → NO wake:
+    // the broadcast rides the empty→non-empty TRANSITION, not every entry
+    const cur2 = (await kbJson("/events?limit=1")).body.last_seq;
+    await queueViaAccept({ repo, pr: 48101, head: "d".repeat(40), title: "IMPL: wake drill 2" });
+    const wakes2 = (await eventsAfter(cur2)).filter((e: any) => e.op === "lane.queued" && e.detail?.repo === repo);
+    expect(wakes2.length).toBe(0);
+  });
+
+  it("BR#4806 — /sse streams the same kb.event frames the WS channel carries (the gateway wake channel)", { timeout: 40_000 }, async () => {
+    // The miniflare DO stub bridge cannot carry an open streaming Response
+    // (its value-stream closes immediately) — drive the REAL path instead:
+    // this rig's OWN HTTP server → /api/kb/sse → authKb(?token=) → DO /sse,
+    // exactly what the Rust wake leg dials. A second Miniflare would hold a
+    // second DO with separate storage — the lane.queued broadcast would
+    // never reach its sink, so the HTTP server rides the shared runtime.
+    let res: Response | null = null;
+    try {
+      // a gateway-plane token for the kb plane (the same auth /kb-ws takes)
+      const mint = await kbJson("/admin.mint", { label: "sse-wake-drill", tags: ["gateway"] });
+      expect(mint.status, JSON.stringify(mint.body)).toBe(200);
+      const token = String(mint.body.secret ?? "");
+      expect(token).toBeTruthy();
+      const served = await mf.ready; // resolves to the server URL (no getServerPort in miniflare 3.20250718.x)
+      const port = Number(served.port);
+      expect(port).toBeGreaterThan(0);
+
+      const repo = "state-vector/sse-wake-lane";
+      res = await fetch(`http://127.0.0.1:${port}/api/kb/sse?token=${encodeURIComponent(token)}`, {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+      let buf = "";
+      let got: any = null;
+      const scan = () => {
+        for (const frame of buf.split("\n\n")) {
+          if (!frame.startsWith("data: ")) continue;
+          try {
+            const j = JSON.parse(frame.slice(6));
+            if (j?.type === "kb.event" && j?.event?.op === "lane.queued" && j?.event?.detail?.repo === repo) got = j;
+          } catch { /* partial frame — more chunks coming */ }
+        }
+      };
+      // consume the stream BEFORE triggering the queue entry — the
+      // subscriber must already be registered when the broadcast fires
+      const deadline = Date.now() + 25_000;
+      const pump = (async () => {
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        try {
+          while (Date.now() < deadline && !got) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            scan();
+          }
+        } catch { /* stream torn down at test end */ }
+      })();
+
+      await queueViaAccept({ repo, pr: 48200, head: "e".repeat(40), title: "IMPL: sse wake drill" });
+      const early = Date.now() + 25_000;
+      while (!got && Date.now() < early) {
+        await new Promise((r) => setTimeout(r, 100));
+        scan();
+      }
+      await pump.catch(() => {});
+      expect(got, "the lane.queued frame must arrive on the SSE stream within 25s").toBeTruthy();
+      expect(got.event.detail.base).toBe("main");
+      expect(got.event.detail.depth).toBeGreaterThanOrEqual(1);
+    } finally {
+      res?.body?.cancel?.().catch?.(() => {});
+    }
   });
 });

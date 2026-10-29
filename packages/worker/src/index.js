@@ -148,6 +148,17 @@ export default {
       return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/ws", request);
     }
 
+    // Knowledge realtime (human + gateway plane, cookie | bearer): the SSE
+    // flavor of the same event fanout — the gateway daemons subscribe here
+    // (train.rs reads a plain streaming response; no WS dep on the Rust
+    // side). Broadcast-only; a missed event degrades to the poll cadence.
+    if (url.pathname === "/api/kb/sse") {
+      if (request.method === "OPTIONS") return kbPreflight();
+      const auth = await authKb(request, env);
+      if (auth instanceof Response) return kbCors(auth);
+      return env.KB.get(env.KB.idFromName(doWs(auth.ws))).fetch("https://kb/sse", request);
+    }
+
     // Gateway self-provision (human plane, session cookie ONLY): the desktop's
     // post-login leg of the credential-class ADR — the login IS the human
     // approval, so the web session mints its own desktop's gateway-class
