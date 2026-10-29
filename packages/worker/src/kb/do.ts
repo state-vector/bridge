@@ -1131,7 +1131,7 @@ export class KnowledgeHub {
         // fact the hub OWNS (stamped through proxy.verify with the gh
         // receipt), same trust shape as the train-stamped provenance above.
         const v = this.one(
-          `SELECT ok, receipt, head_sha, conclusion, state, attempts FROM proxy_probes WHERE key = ?`,
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
           proxyProbeKey(atom),
         ) as any;
         if (v?.state === "verified" && v.ok === 1) {
@@ -1140,7 +1140,7 @@ export class KnowledgeHub {
         if (v?.state === "verified" && v.ok === 0) {
           // conclusive negative (head mismatch / run failed) — the gate has
           // NOT fired; the park stays (BR#3409 fail-closed), loudly.
-          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.receipt}`, probeState: "negative" };
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
         }
         if (v?.state === "failed") {
           const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
@@ -1160,14 +1160,14 @@ export class KnowledgeHub {
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
         const v = this.one(
-          `SELECT ok, receipt, head_sha, conclusion, state, attempts FROM proxy_probes WHERE key = ?`,
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
           proxyProbeKey(atom),
         ) as any;
         if (v?.state === "verified" && v.ok === 1) {
           return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
         }
         if (v?.state === "verified" && v.ok === 0) {
-          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.receipt}`, probeState: "negative" };
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
         }
         if (v?.state === "failed") {
           const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
@@ -5124,7 +5124,7 @@ export class KnowledgeHub {
     const group = (filter: (a: any) => boolean) => {
       const byCanon = new Map<string, { row: any; aliases: string[] }>();
       for (const a of rows.filter(filter)) {
-        const c = this.canonLabel(a.label);
+        const c = this.canonLabel(String(a.label ?? ""));
         const cur = byCanon.get(c);
         if (!cur) { byCanon.set(c, { row: a, aliases: [] }); continue; }
         const keep = (a.last_seen_ts ?? 0) > (cur.row.last_seen_ts ?? 0) ? a : cur.row;

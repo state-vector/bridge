@@ -28,6 +28,8 @@ export const TOOL_NAMES = [
   "list_agents",
   "log_progress",
   "orient",
+  "proxy_probes",
+  "proxy_verify",
   "reconcile_ignore",
   "reconcile_report",
   "reconcile_schedule",
@@ -207,6 +209,24 @@ export const TOOL_ARG_SCHEMAS = {
     run_url: z.string().optional(),
   }),
   train_status: z.looseObject({ repo: z.string().optional() }),
+  // ---- proxy verification probes (BR#4658): the sweep enqueues probes for
+  // run_success / pr_checks_green parks it cannot verify itself (the hub
+  // holds no VCS credentials — BR#3516); a worker-executor daemon leg polls
+  // the queue, runs gh first-hand (read-only), and feeds the verdict back.
+  // Executor-fed facts, hub-decided — the head law and the flip stay with
+  // the hub (BR#3409 fail-closed).
+  proxy_probes: z.looseObject({ limit: z.number().int().optional() }),
+  proxy_verify: z.looseObject({
+    key: z.string(),
+    ok: z.boolean(),
+    receipt: z.string().optional(),
+    head_sha: z.string().optional(),
+    conclusion: z.string().optional(),
+    error: z.string().optional(),
+    /** true = the executor saw the gate conclusively FAIL (run failed /
+     *  cancelled, checks red) — as opposed to a transient gh error. */
+    conclusive: z.boolean().optional(),
+  }),
   train_history: z.looseObject({
     repo: z.string().optional(),
     base: z.string().optional(),

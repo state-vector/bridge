@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.5.0";
+export const BUILD = "0.6.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -315,6 +315,21 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Rule one PR off the board WITH A REASON — the invariant's second disposition. {repo, pr, reason}; the report then accounts it as ignored-with-reason instead of alarming.",
     schema: TOOL_ARG_SCHEMAS.reconcile_ignore,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.ignore", args), null, 1)),
+  },
+  // ---- proxy verification probes (BR#4658) — executor-facing: the daemon
+  // leg beside the merge train. The hub holds no VCS credentials (BR#3516);
+  // run_success / pr_checks_green parks get their closer through these two
+  // tools: the executor polls the probe queue, runs gh READ-ONLY first-hand,
+  // feeds the verdict back, and the hub decides (head law, flip, events).
+  proxy_probes: {
+    description: "Poll the proxy verification queue (BR#4658): typed-await parks on run_success / pr_checks_green that need a first-hand gh check the hub cannot make (BR#3516). Executor daemon leg: for each probe run the gh command its kind names, then report through proxy_verify. Read-only on GitHub; the hub owns every decision.",
+    schema: TOOL_ARG_SCHEMAS.proxy_probes,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("proxy.probes", args), null, 1)),
+  },
+  proxy_verify: {
+    description: "Feed one proxy probe's gh verdict back (BR#4658). {key, ok, receipt (GitHub URL(s) of the evidence), head_sha, conclusion, error, conclusive}. The hub applies the head law (mismatch = conclusive NO, BR#3409 fail-closed), stamps the proxy_verified event with the receipt on the parked card, and lets the standard satisfied-proxy path close or spawn. Transient gh failures just back off (attempt-capped).",
+    schema: TOOL_ARG_SCHEMAS.proxy_verify,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("proxy.verify", args), null, 1)),
   },
 });
 

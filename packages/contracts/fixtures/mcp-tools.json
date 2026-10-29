@@ -64,6 +64,17 @@
       "required": []
     },
     {
+      "name": "proxy_probes",
+      "required": []
+    },
+    {
+      "name": "proxy_verify",
+      "required": [
+        "key",
+        "ok"
+      ]
+    },
+    {
       "name": "reconcile_ignore",
       "required": [
         "pr",
