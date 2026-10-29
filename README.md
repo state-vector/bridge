@@ -854,6 +854,16 @@ machine-clean carry chain:
   the required checks on the new head — pending, not a defect: the gate WAITS on it
   (red head checks note; blocked with green checks — protection wants reviews — still
   bounces honestly).
+- **UNKNOWN mergeability polls, never bounces (BR#4685)**: GitHub computes mergeability
+  asynchronously — a read right after a base merge yields `mergeStateStatus=null/UNKNOWN`,
+  and `mergeable` rides the same recomputation, so an answer is definitive only when the
+  state names itself. The executor backoff-polls inside the tick (15s/30s/60s,
+  `MERGE_TRAIN_POLL_SECS` overrides) — bounded by the lane lease, renewed around every
+  wait — until GitHub answers, and the shared gate WAITS on an unanswered state: never a
+  bounce, and never a merge on an unconfirmed state (the old null-state fall-through is
+  closed). Bounce only on definitive DIRTY/CONFLICTING. Receipt: the 2026-10-28 ledger,
+  where PRs #279/#281 bounced 28× with `merge_state_status:null` — every "CONFLICTING"
+  row of that loop trial-merged CLEAN (a stale read, not a conflict).
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
