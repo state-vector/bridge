@@ -968,12 +968,15 @@ export const BREACH_THRESHOLD = 3;
  *  attempt, an invariant violation, or a replay mismatch is never noise.
  *  BR#3337: claim races (lifecycle-edge rejections) are retryable by
  *  definition — they must never raise a breach card, no matter how many
- *  pile up in a dispatch storm. */
+ *  pile up in a dispatch storm. BR#4562: release_held joins that family —
+ *  the BR#4067 hold guard REFUSING a machine release is the system working
+ *  (zero state destroyed, the wait owns the exit), never a breach. */
 export const BREACH_THRESHOLDS: Record<string, number> = {
   invariant: 1,
   replay: 1,
   "spawn-while-open": 1,
   claim_race: Number.POSITIVE_INFINITY,
+  release_held: Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -998,6 +1001,16 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // accepted classification ruling BR#3430: ownership-gate rejections are
   // the claim_race family — observable, never a breach.
   "release-needs-ownership": "claim_race",
+  // BR#4562 (specimen TASK-001): the BR#4067 release-hold backstop — a
+  // machine silence/owner-death release attempt on a card parked on a typed
+  // wait or a merge-train queue slot is REFUSED by design ("wait it out or
+  // let a human/owner release"). The guard succeeding is not a breach —
+  // same never-a-breach family as claim_race — but it gets its own honest
+  // name (release_held, the audit op the sibling sweeps already emit for
+  // holds) instead of borrowing the race label: the Log should say WHAT
+  // held, and unbounded refusal storms are fixed at the emitter.
+  "release-holds-typed-await": "release:held-typed-await",
+  "release-holds-train-queue": "release:held-train-queue",
 };
 
 export function breachClass(reason: string): string {
@@ -1062,6 +1075,14 @@ export function breachClass(reason: string): string {
   // BR#3727/BR#4068 (merge-train bounced, BR#4573/BR#4578).
   if (r.includes("release-holds-typed-await")) return "release:held-typed-await";
   if (r.includes("release-holds-train-queue")) return "release:held-train-queue";
+  // BR#4562: the release-hold guards' invariant language, for when the
+  // "[rule: …]" tag is cut by the 300-char audit slice — the train-queue
+  // message runs 302 chars with a long repo name
+  // (state-vector/superpositional), slicing the tag mid-way exactly like the
+  // AWAIT_GRAMMAR_DOC case above. The invariant stems live well inside the
+  // slice; both guards' messages carry exactly one of them.
+  if (r.includes("must not destroy the wait") || r.includes("must not destroy the queue slot"))
+    return "release_held";
   return "unclassified";
 }
 

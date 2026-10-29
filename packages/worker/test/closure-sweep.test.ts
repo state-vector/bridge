@@ -894,3 +894,81 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     expect(bodies).toContain("provenance: BR#");
   });
 });
+// ---------- (h) BR#4562 — the park drain must not attempt a held release ----------
+
+describe("BR#4562 — the blocked-park drain checks the release-hold before attempting (real DO)", () => {
+  it("a dead-ask park on a typed await_event is NEVER drained: no attempt, no blocked_drained stamp, no refusal storm", async () => {
+    // TASK-001's exact shape: parked blocked on a typed pr_merged proxy whose
+    // park prose references a long-gone ask (dead-ask verdict at any age).
+    // The drain used to stamp blocked_drained + attempt the todo release EVERY
+    // tick; the BR#4067 guard refused every attempt, and the refusals folded
+    // into the 2026-10-29 "unclassified" breach pile (16 cards in one sweep
+    // window). The hold is now checked BEFORE the annotation: the sweep waits
+    // it out — the proxy watch / the answer owns the exit.
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4562 held-park drill", qualified: true, session: "drill-exec-br4562" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    const claim = await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4562", session: "drill-exec-br4562" });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBe(200);
+    const blk = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br4562", session: "drill-exec-br4562",
+      note: "parked on the merge gate",
+      unblock_condition: "owner GO recorded on ask ASK-lapsed-4562 (historical ref) — the typed proxy owns the exit",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2404 },
+    });
+    expect(blk.status, `park failed: ${JSON.stringify(blk.body)}`).toBe(200);
+
+    const before = ((await kbJson("/events", { since: 0, limit: 1 })).body ?? {}) as any;
+    const cursor = Number(before[0]?.seq ?? 0);
+    // the park drain lives in the FULL alarm sweep (admin.stall_sweep runs
+    // only the stall/hold/route phase and never reaches it)
+    const sweep = await kbJson("/admin.alarm_sweep");
+    expect(sweep.status, `alarm sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+
+    const after = await taskById(id);
+    expect(after.status, "a held park stays parked — the proxy watch owns the exit (BR#4067)").toBe("blocked");
+    expect(after.meta?.blocked_drained, "the drain annotation must not fire for a held park (it only survives on a REAL drain)").toBeUndefined();
+    expect(after.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2404 });
+
+    // zero refusal events: the drain never attempts the release the guard
+    // would refuse — that is the loop fix, not just the label fix.
+    const evs = (((await kbJson("/events", { since: cursor, limit: 500 })).body ?? {}) as any).events ?? [];
+    const refusals = evs.filter((e: any) => e.op === "transition_rejected" && e.artefact_id === id);
+    expect(refusals, `expected no transition_rejected for the held park, got ${JSON.stringify(refusals.map((e: any) => String(e.detail?.reason ?? "").slice(0, 90)))}`).toEqual([]);
+  });
+
+  it("the drain still drains what it should: a dead park with NO typed wait releases to todo with the stamp", async () => {
+    // The churn-stamp population: a blocked park carrying guard boilerplate
+    // and NO typed event (the shape blockedParkVerdict was written for). The
+    // hold check must gate ONLY the held shape — everything else drains.
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4562 drainable-park drill", qualified: true, session: "drill-exec-br4562d" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4562d", session: "drill-exec-br4562d" });
+    const blk = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br4562d", session: "drill-exec-br4562d",
+      note: "parked on the merge gate",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2405 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2405 },
+    });
+    expect(blk.status, `park failed: ${JSON.stringify(blk.body)}`).toBe(200);
+    // strip the typed wait: the churn-stamp shape (guard boilerplate, no
+    // machine leg) + a dead-park reason the drain exists for
+    const parkedMeta = (await taskById(id)).meta ?? {};
+    const stripped = await kbJson("/update", {
+      id, actor: "drill-exec-br4562d",
+      meta: {
+        ...parkedMeta,
+        blocked: { ...parkedMeta.blocked, await_event: undefined, reason: "churn guard: released to the pool 3 times without completing — retry" },
+      },
+    });
+    expect(stripped.status, `strip failed: ${JSON.stringify(stripped.body)}`).toBe(200);
+
+    const sweep = await kbJson("/admin.alarm_sweep");
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "a dead park with no machine wait is the drain's legitimate work").toBe("todo");
+    expect(after.meta?.blocked_drained?.klass).toBe("churn-park");
+  });
+});
