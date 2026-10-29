@@ -749,6 +749,24 @@ included) as "unmergeable — CONFLICTING".
   starving main. While settling, the lane reason reads `settling on <sha> (PR #N):
   build/deploy in flight, next head held until main settles`, and the panel's queue
   depth is the count of heads waiting behind the pressure valve.
+- **The landed close is guarded — a green verdict can never wedge the lane
+  (BR#4753)**: when the all-green verdict fires the landed close and the close itself
+  is refused (a gate rejection — e.g. done-open-children — or a storage fault), the
+  old code raw-threw, silently, every tick: the lane sat `awaiting-ci` fail-open past
+  the fail-closed bound (which was only ever consulted on the pending branch) and the
+  queue starved behind it. Now every failure is counted on the lane's in-flight
+  record (the lane reason names it: `landed close FAILED N× (<class>)`) and resolved
+  by the retry ladder: a semantic gate rejection **close-bounces the culprit card
+  immediately** (retrying cannot succeed — the bounce brief carries the named gate
+  error and the repair contract: the PR is already merged and main green, so resolve
+  exactly the named precondition, then close citing the merge commit — no re-merge,
+  no re-verify); anything else retries ≤3 ticks, then — or past the bound, whichever
+  first — bounces fail-closed with `bounce_bound`. The bounced card is boosted to
+  priority 0 (one mechanical leg from landed) and leaves the derived queue, so the
+  lane idles and the next head enters; a fault after the `done` actually landed
+  repairs to a clean landed on the next tick instead of bouncing a closed card. One
+  deduped ask per episode rides the alarm sink (`train_alarm_sink_id`, default
+  BR#3124) — the failure used to be invisible.
 
 ### The gate, the carry law, the bounce
 

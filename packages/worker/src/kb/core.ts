@@ -2142,6 +2142,84 @@ export function trainLandedCloseNote(input: { repo: string; prNumber: number; me
   ].join("\n");
 }
 
+// ---- landed-close recovery (BR#4753) ----
+
+/** The landed close (landedFlow) runs inside train.ci's GREEN verdict — a
+ *  gate-rejected close (done-open-children, receipts, any lifecycle gate)
+ *  used to throw raw EVERY tick: the lane sat in awaiting-ci fail-open past
+ *  the fail-closed bound and the stop arm was structurally unreachable,
+ *  because bound_exceeded is only consulted on the pending branch
+ *  (BR#4753 — observed on state-vector/bridge@main: 60+ min past bound,
+ *  ~65 silent tick failures, queue starved). The green branch must
+ *  therefore ALWAYS resolve: landed | red-stop | bound-stop | bounce. */
+
+/** Transient (potentially self-healing) close failures are retried this many
+ *  consecutive ticks before the fail-closed bounce fires — a lane far past
+ *  the fail-closed bound fires sooner (trainLandedCloseEdge). */
+export const TRAIN_LANDED_CLOSE_MAX_RETRIES = 3;
+
+export type LandedCloseEdge = { edge: "retry" | "bounce"; bound_fired: boolean };
+
+/** The recovery ladder for ONE failed landed close (pure; the DO applies it).
+ *  RETRY-LAW shape (BR#4403): a SEMANTIC gate rejection — breachClass names
+ *  a rule ("gate:open-children", "gate:separation", …) — can NEVER succeed
+ *  on retry, so it bounces the culprit card immediately (the BR#3516 §6
+ *  lifecycle-legal edge) citing the gate error. Anything else could be a
+ *  storage fault or a race: retry ≤ TRAIN_LANDED_CLOSE_MAX_RETRIES
+ *  consecutive ticks; past that — or past the fail-closed bound
+ *  (~TRAIN_CI_BOUND_MULTIPLIER × typical, BR#3516 §2), whichever comes
+ *  first — bounce fail-closed. A green-verdict tick never raw-throws. */
+export function trainLandedCloseEdge(input: { breach_class: string; failures: number; bound_exceeded: boolean }): LandedCloseEdge {
+  if (input.breach_class.startsWith("gate:")) return { edge: "bounce", bound_fired: false };
+  if (input.failures >= TRAIN_LANDED_CLOSE_MAX_RETRIES || input.bound_exceeded)
+    return { edge: "bounce", bound_fired: input.bound_exceeded };
+  return { edge: "retry", bound_fired: false };
+}
+
+/** The fix-up brief for a close-bounced card. NOT the conflict/gate merge
+ *  brief: the PR is ALREADY MERGED and main is GREEN (the machine proxy
+ *  held) — only the BOARD close was refused. Re-merging or re-verifying is
+ *  wrong; the repair leg is exactly the gate's named precondition. */
+export function trainCloseBounceBrief(input: { repo: string; prNumber: number; mergeSha: string; gateway: string; error: string; breachClass: string; boundFired: boolean; failures: number }): string {
+  const err = (input.error ?? "").trim().slice(0, 400) || "(no error text)";
+  return [
+    `Merge-train close bounce (BR#4753): PR #${input.prNumber} (${input.repo}) IS MERGED as ${input.mergeSha.slice(0, 9)} and main is GREEN — but the board close (blocked→in_progress→done on the machine proxy, BR#3516) failed ${input.failures} time(s).`,
+    ``,
+    `**Gate rejection (${input.breachClass}):** ${err}`,
+    input.boundFired
+      ? `**Fail-closed bound fired:** the lane blew past ~${TRAIN_CI_BOUND_MULTIPLIER}× typical CI wall-clock retrying this close — bounced so the queue cannot starve (BR#3516 §2).`
+      : `**Why bounced:** a gate rejection cannot succeed on retry (BR#4403 retry law) — retrying every tick wedged the whole lane.`,
+    ``,
+    `**Next owner: impl** — resolve EXACTLY the named precondition (e.g. finish/close the open child task(s), attach the receipts the gate names), then close this card done citing the merge commit. Do NOT re-merge (the PR is landed), do NOT re-verify (main green is already proven):`,
+    `merge commit: https://github.com/${input.repo}/commit/${input.mergeSha}`,
+  ].join("\n");
+}
+
+/** Deterministic close-failure alarm title — ONE per episode (the sha makes
+ *  it unique; askCreate's identical-open-ask guard dedupes). ≤240 chars,
+ *  ends "?" — the ask contract. */
+export function trainCloseFailAskTitle(lane: { repo: string; base: string }, sha: string, prNumber: number, breachClass: string, boundFired: boolean): string {
+  const suffix = " — intervene?";
+  const prefix = `MERGE TRAIN landed close failed (${breachClass}${boundFired ? ", bound fired" : ""}): ${lane.repo}@${lane.base} PR #${prNumber} merged as ${sha.slice(0, 9)} — card close keeps failing`;
+  const budget = 240 - suffix.length;
+  return prefix.slice(0, budget) + suffix;
+}
+
+/** The close-failure ask's details: the episode's facts and why it reached
+ *  the alarm sink (the failure used to be silent per tick). */
+export function trainCloseFailAskDetails(input: { repo: string; base: string; prNumber: number; mergeSha: string; taskId: string | null; error: string; breachClass: string; boundFired: boolean; failures: number; gateway: string }): string {
+  return [
+    `The merge train's landed close failed on ${input.repo}@${input.base}.`,
+    ``,
+    `- PR: https://github.com/${input.repo}/pull/${input.prNumber} (merged as ${input.mergeSha.slice(0, 9)} — main GREEN, the merge itself is fine)`,
+    `- Card: ${input.taskId ?? "(none)"}`,
+    `- Gate rejection (${input.breachClass}): ${(input.error ?? "").slice(0, 400) || "(no error text)"}`,
+    `- Attempts: ${input.failures}${input.boundFired ? `, fail-closed bound fired (~${TRAIN_CI_BOUND_MULTIPLIER}× typical CI wall-clock past the merge)` : ""} — gateway ${input.gateway}`,
+    ``,
+    `The culprit card has been close-bounced to impl with the repair brief (resolve the named precondition, then close citing the merge commit — no re-merge, no re-verify); the lane idled and the queue advances. This ask exists because the failure used to be SILENT per tick (BR#4753: ~65 unseen failures over an hour starved the queue past the fail-closed bound). One ask per episode.`,
+  ].join("\n");
+}
+
 /** The verify template's accept instruction — the head sha the verifier must
  *  record in the close note so the hub can stamp head_sha_at_acceptance
  *  without any hub-side GitHub call. The lookahead is punctuation-tolerant:

@@ -14,6 +14,10 @@ import {
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
+  trainCloseBounceBrief,
+  trainCloseFailAskDetails,
+  trainCloseFailAskTitle,
+  trainLandedCloseEdge,
   trainLandedCloseNote,
   trainLegLanded,
   trainLegs,
@@ -908,5 +912,78 @@ describe("trainBounceBrief kinds (BR#4066)", () => {
     expect(resolveTrainBounceKind({ defect: "x", conflictFiles: ["a.ts"] })).toBe("conflict");
     expect(resolveTrainBounceKind({ defect: "head is not covered by the accepted verdict (leg 1)", conflictFiles: [] })).toBe("coverage");
     expect(resolveTrainBounceKind({ defect: "mergeStateStatus=dirty", conflictFiles: [] })).toBe("gate");
+  });
+});
+
+// ---------- the landed-close recovery ladder (BR#4753) ----------
+
+describe("trainLandedCloseEdge (green-branch wedge fix: never raw-throw, never wedge)", () => {
+  it("a SEMANTIC gate rejection bounces on the FIRST failure — retrying cannot succeed (BR#4403 retry law)", () => {
+    // the observed incident class: done-open-children
+    expect(trainLandedCloseEdge({ breach_class: "gate:open-children", failures: 1, bound_exceeded: false })).toEqual({ edge: "bounce", bound_fired: false });
+    expect(trainLandedCloseEdge({ breach_class: "gate:separation", failures: 1, bound_exceeded: false })).toEqual({ edge: "bounce", bound_fired: false });
+  });
+
+  it("a transient/unknown failure retries the next tick — a storage fault may self-heal", () => {
+    expect(trainLandedCloseEdge({ breach_class: "claim_race", failures: 1, bound_exceeded: false })).toEqual({ edge: "retry", bound_fired: false });
+    expect(trainLandedCloseEdge({ breach_class: "unclassified", failures: 1, bound_exceeded: false })).toEqual({ edge: "retry", bound_fired: false });
+    expect(trainLandedCloseEdge({ breach_class: "unclassified", failures: 2, bound_exceeded: false })).toEqual({ edge: "retry", bound_fired: false });
+  });
+
+  it("the retry budget is bounded: 3 consecutive failures bounce even with bound far away", () => {
+    expect(trainLandedCloseEdge({ breach_class: "unclassified", failures: 3, bound_exceeded: false })).toEqual({ edge: "bounce", bound_fired: false });
+    expect(trainLandedCloseEdge({ breach_class: "claim_race", failures: 5, bound_exceeded: false })).toEqual({ edge: "bounce", bound_fired: false });
+  });
+
+  it("the FAIL-CLOSED bound fires on the green branch too — the incident: 60+ min past bound with zero stop arms reachable", () => {
+    // first observed failure already past the bound → bounce immediately, honestly named
+    expect(trainLandedCloseEdge({ breach_class: "unclassified", failures: 1, bound_exceeded: true })).toEqual({ edge: "bounce", bound_fired: true });
+    // a benign race that outlives the bound still terminates (never wedge)
+    expect(trainLandedCloseEdge({ breach_class: "claim_race", failures: 1, bound_exceeded: true })).toEqual({ edge: "bounce", bound_fired: true });
+  });
+});
+
+describe("trainCloseBounceBrief + alarm ask copy (BR#4753)", () => {
+  const lane = { repo: "state-vector/bridge", base: "main" };
+  const sha = "c".repeat(40);
+  const err = "parent BR#3633 still has 1 open child task(s) — finish or close them first (decomposition owns its children)";
+
+  it("the brief says the PR IS MERGED and main GREEN — impl must not re-merge or re-verify", () => {
+    const b = trainCloseBounceBrief({ repo: lane.repo, prNumber: 222, mergeSha: sha, gateway: "gw-1", error: err, breachClass: "gate:open-children", boundFired: false, failures: 1 });
+    expect(b).toContain("IS MERGED");
+    expect(b).toContain("main is GREEN");
+    expect(b).toContain("gate:open-children");
+    expect(b).toContain(err);
+    expect(b).toContain("Do NOT re-merge");
+    expect(b).toContain(`https://github.com/${lane.repo}/commit/${sha}`);
+  });
+
+  it("the bound-fired variant names the fail-closed bound (BR#3516 §2), not the retry law", () => {
+    const b = trainCloseBounceBrief({ repo: lane.repo, prNumber: 222, mergeSha: sha, gateway: "gw-1", error: "storage write failed", breachClass: "unclassified", boundFired: true, failures: 3 });
+    expect(b).toContain("Fail-closed bound fired");
+    expect(b).not.toContain("cannot succeed on retry");
+  });
+
+  it("the alarm title is a per-episode ask: ≤240 chars, ends '?', sha-keyed for dedupe", () => {
+    const t = trainCloseFailAskTitle(lane, sha, 222, "gate:open-children", false);
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+    expect(t).toContain(lane.repo);
+    expect(t).toContain(sha.slice(0, 9));
+    expect(t).toContain("gate:open-children");
+    // same episode (same sha) → identical title (askCreate dedupe); a new
+    // merge sha is a new episode (fresh ask)
+    expect(trainCloseFailAskTitle(lane, sha, 222, "gate:open-children", false)).toBe(t);
+    expect(trainCloseFailAskTitle(lane, "d".repeat(40), 222, "gate:open-children", false)).not.toBe(t);
+    const bound = trainCloseFailAskTitle(lane, sha, 222, "unclassified", true);
+    expect(bound).toContain("bound fired");
+  });
+
+  it("the alarm details carry the whole story: PR, card, gate error, attempts, episode history", () => {
+    const d = trainCloseFailAskDetails({ repo: lane.repo, base: "main", prNumber: 222, mergeSha: sha, taskId: "BR#3633", error: err, breachClass: "gate:open-children", boundFired: false, failures: 1, gateway: "gw-1" });
+    expect(d).toContain(`https://github.com/${lane.repo}/pull/222`);
+    expect(d).toContain("BR#3633");
+    expect(d).toContain(err);
+    expect(d).toContain("BR#4753");
   });
 });
