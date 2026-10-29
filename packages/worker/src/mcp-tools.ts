@@ -267,7 +267,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
   // VCS credentials. Every mutating op requires the lane lease (train_lease
   // acquire first; CAS ~5 min TTL — renew on every tick).
   train_lease: {
-    description: "Merge-train lane lease (CAS). action: acquire | renew | release — acquire fails while another holder's lease is live (~5 min TTL; lapse then reconcile from live GitHub state); renew/release only by the holder. Acquire carries the lane config (required_workflows, ci_typical_minutes — config, never hardcoded). release with line_green:true clears a stop-the-line.",
+    description: "Merge-train lane lease (CAS). action: acquire | renew | release — acquire fails while another holder's lease is live (~5 min TTL; lapse then reconcile from live GitHub state); renew/release only by the holder. Acquire carries the lane config (required_workflows, ci_typical_minutes — config, never hardcoded); an EMPTY required set refuses unless the flag allow_empty_workflows=true is passed (BR#4691 — the refusal names the fix; the override is logged and stamped on the lane card). release with line_green:true clears a stop-the-line.",
     schema: TOOL_ARG_SCHEMAS.train_lease,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lease", args), null, 1)),
   },
@@ -302,7 +302,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.history", args), null, 1)),
   },
   train_lane: {
-    description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing.",
+    description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing. Creation and config-refresh REFUSE an empty required_workflows unless allow_empty_workflows=true (BR#4691 — an unconfigured lane lets the awaiting-CI phase pass through unverified; the override is logged and stamped on the lane card).",
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
   },

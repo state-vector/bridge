@@ -261,7 +261,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
 
   it("only a line_green release re-opens a stopped lane (a plain release never clears the stop)", async () => {
     const repo = "state-vector/lane-green";
-    await acquire(repo, "gw-green");
+    await acquire(repo, "gw-green", { required_workflows: ["Test"] });
     // stopped at admission — red facts with no merge in flight, nothing bounces
     const stopped = await kbJson("/train.event", {
       repo, base: "main", kind: "stopped", actor: "gw-green",
@@ -412,6 +412,9 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
 
   it("every train op demands the lane lease (the lease holder IS the authenticated actor)", async () => {
     const repo = "state-vector/lane-lease";
+    // the lane exists and is configured (BR#4691) — so a leaseless op fails
+    // on the LEASE law, not on lane config
+    await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     // no lease at all → both facts ops reject
     const noLease = await kbJson("/train.event", { repo, base: "main", kind: "merged", pr: 1, merge_sha: "a".repeat(40) });
     expect(noLease.status).toBe(400);

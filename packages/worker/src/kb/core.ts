@@ -1519,6 +1519,10 @@ export type LaneSpec = {
   ci_typical_minutes?: number;
   /** burst-drain cap per settle pass (BR#4934); 0 = unlimited */
   burst_max: number;
+  /** BR#4691: set ONLY when an explicit allow_empty_workflows override
+   *  created/leased this lane with an EMPTY required set — the typed,
+   *  logged, card-visible risk acknowledgement. */
+  empty_workflows_override?: { at: number; by: string };
 };
 
 export const LANE_TITLE_PREFIX = "Merge lane: ";
@@ -1574,21 +1578,47 @@ export function laneOfMeta(meta: any): LaneSpec | null {
     required_workflows: required,
     ci_typical_minutes: typeof lane.ci_typical_minutes === "number" && lane.ci_typical_minutes > 0 ? lane.ci_typical_minutes : undefined,
     burst_max: parseBurstMax(lane.burst_max),
+    empty_workflows_override:
+      lane.empty_workflows_override && typeof lane.empty_workflows_override === "object"
+        ? { at: Number(lane.empty_workflows_override.at ?? 0), by: String(lane.empty_workflows_override.by ?? "") }
+        : undefined,
   };
 }
 
 /** The lane card's standing body (created once, updated only by events). */
 export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): string {
+  const required =
+    lane.required_workflows.length
+      ? lane.required_workflows.map((w) => `\`${w}\``).join(", ")
+      : lane.empty_workflows_override
+        ? `_(none — EMPTY-CONFIG OVERRIDE acknowledged by ${lane.empty_workflows_override.by} at ${new Date(lane.empty_workflows_override.at).toISOString()}; the awaiting-CI phase passes through immediately)_`
+        : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_";
   return [
     `Standing merge lane for **${lane.repo}** base **${lane.base}** — serialized: one merge at a time, gated, lease-held by an opportunistic gateway executor (decision BR#3516).`,
     ``,
-    `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_"}`,
+    `**Required workflows on the merge commit (lane config):** ${required}`,
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
     `**Burst drain (BR#4934):** up to ${lane.burst_max === 0 ? "unlimited" : lane.burst_max} gate-clean heads merge back-to-back per pass, then ONE settle wait on the final merge commit; red anywhere stops the line instantly; a red settle bisects the pass to ONE culprit. Rebase work rides the settle wait.`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
     `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`bridge train\` on a gateway to work it.`,
   ].join("\n");
+}
+
+/** BR#4691 — an EMPTY required_workflows is a hole, not a choice: the
+ *  awaiting-CI phase would pass through immediately and a `landed` stamp would
+ *  prove nothing (under-verified merges flow into main — the BR#4630 feedback
+ *  loop). Lane creation, config refresh, and lease acquisition REFUSE an empty
+ *  set unless the caller passes the explicit, risk-acknowledged override flag
+ *  (typed, logged, stamped on the lane card). Returns the refusal reason, or
+ *  null when the config is legal. */
+export function requiredWorkflowsGuard(required: string[], allowEmpty: boolean): string | null {
+  if (required.length > 0 || allowEmpty) return null;
+  return (
+    "lane config refused: required_workflows is empty — the awaiting-CI phase would pass through unverified and a `landed` stamp would prove nothing (BR#4691). " +
+    "Configure the lane's real gate set (train_lane spec or the train_lane setting — enumerate from a recent green PR's checks), " +
+    "or pass allow_empty_workflows=true to acknowledge the risk explicitly."
+  );
 }
 
 // ---- the derived queue ----
