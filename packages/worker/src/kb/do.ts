@@ -560,6 +560,15 @@ export class KnowledgeHub {
           askIsOpen: (id) => !!this.one(`SELECT id FROM asks WHERE id = ? AND status = 'open'`, id),
         });
         if (verdict.klass === "external") { parkCensus.external++; continue; }
+        // BR#4562 — the typed-proxy law for the park drain, the same check the
+        // review-stall and subprocess sweeps make before releasing: a card
+        // parked on a typed wait, a bound ask or a train queue slot is HELD —
+        // the proxy watch / the answer owns the exit, not the staleness sweep.
+        // Attempting the release the BR#4067 backstop will refuse re-manufactured
+        // the refusal every tick (an unbounded transition_rejected storm that
+        // folded into the 2026-10-29 "unclassified" breach pile) — check the
+        // hold BEFORE the blocked_drained annotation and wait it out.
+        if (releaseHold(meta)) continue;
         const dead = verdict.klass === "churn-park" || verdict.klass === "dead-ask";
         const age = now - Math.max(Number(b.ts ?? 0) || 0, r.status_ts ?? 0, r.updated_ts ?? 0);
         if (!dead && age <= blockedStaleMs) continue; // honest fresh park — not the sweep's business yet
@@ -2607,6 +2616,7 @@ export class KnowledgeHub {
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
         case "admin.stall_sweep":
+        case "admin.alarm_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
@@ -2628,6 +2638,18 @@ export class KnowledgeHub {
             // make freshly-touched cards stale (the sweep has no cadence
             // window of its own).
             await this.stallSweep(Number(body.now ?? Date.now()));
+            return this.json({ ok: true });
+          }
+          if (op === "admin.alarm_sweep") {
+            // drill/liveness path for the FULL alarm sweep (BR#4562): the
+            // blocked-park drain (D) and owner-death lapse (E) phases live
+            // only here — admin.stall_sweep never exercises them, which is
+            // how the drain's missing release-hold check stayed invisible
+            // until it manufactured the unclassified breach pile. Real clock
+            // (the alarm cadence's own now0): dead-park verdicts
+            // (churn/dead-ask) drain at any age; fresh parks and live owners
+            // are untouched.
+            await this.alarmSweep();
             return this.json({ ok: true });
           }
           // admin.stop_line_sweep / admin.merge_queue_sweep /

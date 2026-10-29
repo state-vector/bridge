@@ -1595,6 +1595,77 @@ describe("release-holds-train-queue (BR#4067)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#4562 — the BR#4067 release-hold refusals classify `release_held` and
+// never raise a breach. Specimen: TASK-001 parked blocked on a typed
+// await_event pr_merged(state-vector/superpositional#2117); the owner-death /
+// park-drain sweeps attempted the release once per tick, the guard refused,
+// and the refusals folded into "unclassified" breach cards (16 cards,
+// 2026-10-29). The guard succeeding is not a breach — same never-a-breach
+// family as claim_race (BR#3430) — and the refusal storm itself is fixed at
+// the emitter (the park-drain sweep now checks releaseHold before attempting).
+// ---------------------------------------------------------------------------
+describe("breachClass: release_held (BR#4562)", () => {
+  const awaitHoldMeta = {
+    blocked: { reason: "parked", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 257 } },
+  };
+
+  it("the typed-await hold refusal classifies from its rule tag", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: awaitHoldMeta as any }), baseCtx());
+    // do.ts audits `${verdict.message} [rule: ${verdict.rule}]` — build the
+    // audited reason exactly that way (the tag survives: ~222 < 300)
+    const audited = `${String(msg)} [rule: release-holds-typed-await]`;
+    expect(audited.length).toBeLessThanOrEqual(300);
+    expect(breachClass(audited)).toBe("release_held");
+  });
+
+  it("the train-queue hold refusal classifies from its rule tag", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: {
+        merge_train: { state: "queued", pr: 257, repo: "state-vector/bridge" },
+        pr: { repo: "state-vector/bridge", number: 257 },
+      } as any,
+    }), baseCtx());
+    const audited = `${String(msg)} [rule: release-holds-train-queue]`;
+    expect(audited.length).toBeLessThanOrEqual(300); // short repo name — tag survives
+    expect(breachClass(audited)).toBe("release_held");
+    // the raw verdict message (no tag) still classifies — the ladder stem
+    expect(breachClass(String(msg))).toBe("release_held");
+  });
+
+  it("classifies even when the 300-char audit slice cuts the tag (long repo name — the live specimen shape)", () => {
+    // state-vector/superpositional pushes the train-queue message to 302
+    // chars: the audited reason IS the slice, tag severed mid-way (BR#3738's
+    // AWAIT_GRAMMAR_DOC case, one guard over).
+    const full = "card is merge-train queued (typed await pr_merged state-vector/superpositional#2117) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool. [rule: release-holds-train-queue]";
+    expect(full.length).toBeGreaterThan(300);
+    const sliced = full.slice(0, 300);
+    expect(sliced).not.toMatch(/\[rule: [a-z0-9-]+\]$/);
+    expect(breachClass(sliced)).toBe("release_held");
+  });
+
+  it("the typed-await hold classifies from the message stem with no tag at all", () => {
+    expect(breachClass("card parks on a typed await_event (run_success) — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release.")).toBe("release_held");
+  });
+
+  it("release_held never raises a breach, however many refusals pile up", () => {
+    const reason = "card parks on a typed await_event (pr_merged) — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release. [rule: release-holds-typed-await]";
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "TASK-001", ts: 1000 + i * 60_000, reason,
+    }));
+    const out = detectBreaches(events as any, new Set());
+    expect(out.map((b) => b.klass)).not.toContain("release_held");
+  });
+
+  it("the contrast holds: an equally persistent unknown refusal still folds unclassified and raises at the threshold", () => {
+    const events = Array.from({ length: 3 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#1", ts: 1000 + i * 60_000, reason: "something novel",
+    }));
+    expect(detectBreaches(events as any, new Set()).map((b) => b.klass)).toEqual(["unclassified"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
