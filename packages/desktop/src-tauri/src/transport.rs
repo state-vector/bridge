@@ -163,14 +163,22 @@ impl AgentTransport for OpencodeRun {
                         Ok(n) => {
                             if first {
                                 first = false;
-                                eprintln!("[dispatch] {label} picked up — agent responding");
+                                crate::logging::emit(
+                                    "dispatch",
+                                    &label,
+                                    "picked up — agent responding",
+                                );
                             }
                             bytes.extend_from_slice(&chunk[..n]);
                             while let Some(nl) = bytes[shown..].iter().position(|&b| b == b'\n') {
                                 let end = shown + nl;
                                 let line = String::from_utf8_lossy(&bytes[shown..end]).trim().to_string();
                                 if !line.is_empty() {
-                                    eprintln!("[dispatch] {label} | {}", head_line(&line, 240));
+                                    crate::logging::emit(
+                                        "dispatch",
+                                        &label,
+                                        &head_line(&line, 240),
+                                    );
                                     if let Some(cell) = &live {
                                         if let Ok(mut slot) = cell.lock() {
                                             *slot = head_line(&line, 200);

@@ -191,7 +191,11 @@ fn handle_callback(mut stream: std::net::TcpStream, hub: &str) -> Option<Session
         expires_ts: parts[0].parse().ok()?,
     };
     if let Err(e) = store(&session) {
-        eprintln!("[session] failed to persist session: {e}");
+        crate::logging::emit(
+            "session",
+            "",
+            &format!("error: failed to persist session: {e}"),
+        );
     }
     let body = format!(
         "<html><body style=\"font-family:-apple-system,sans-serif;background:#0b0e14;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0\"><div style=\"text-align:center\"><h1>Signed in as {}</h1><p>Return to Bridge — this tab can be closed.</p></div></body></html>",

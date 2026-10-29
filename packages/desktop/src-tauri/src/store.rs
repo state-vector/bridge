@@ -68,7 +68,11 @@ impl TokenStore {
         out.schema_version = CONFIG_SCHEMA_VERSION;
         let body = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
         self.atomic_write(&self.config_path(), body.as_bytes())?;
-        eprintln!("[store] config saved to {}", self.config_path().display());
+        crate::logging::emit(
+            "store",
+            "",
+            &format!("config saved to {}", self.config_path().display()),
+        );
         Ok(())
     }
 
@@ -83,9 +87,13 @@ impl TokenStore {
         match serde_json::from_str::<DispatchConfig>(&raw) {
             Ok(mut c) => {
                 if c.schema_version > CONFIG_SCHEMA_VERSION {
-                    eprintln!(
-                        "[store] WARNING: config schema {} is newer than this build knows ({}); update the runner",
-                        c.schema_version, CONFIG_SCHEMA_VERSION
+                    crate::logging::emit(
+                        "store",
+                        "",
+                        &format!(
+                            "warning: config schema {} is newer than this build knows ({}); update the runner",
+                            c.schema_version, CONFIG_SCHEMA_VERSION
+                        ),
                     );
                 }
                 let _ = self.principal(); // eager one-way legacy migration
@@ -93,7 +101,7 @@ impl TokenStore {
                 Some(c)
             }
             Err(e) => {
-                eprintln!("[store] ERROR: config.json is corrupt: {e} — fix or delete {} (settings reset to defaults)", self.config_path().display());
+                crate::logging::emit("store", "", &format!("error: config.json is corrupt: {e} — fix or delete {} (settings reset to defaults)", self.config_path().display()));
                 None
             }
         }
@@ -167,8 +175,8 @@ impl TokenStore {
     pub fn attach_token(&self, cfg: &mut DispatchConfig) {
         if !cfg.token.is_empty() {
             match crate::keychain::save_token(cfg.token.trim()) {
-                Ok(()) => eprintln!("[store] migrated gateway token from config.json to the OS keychain"),
-                Err(e) => eprintln!("[store] WARNING: keychain migration failed ({e}) — token cleared from config anyway; sign in to re-provision"),
+                Ok(()) => crate::logging::emit("store", "", "migrated gateway token from config.json to the OS keychain"),
+                Err(e) => crate::logging::emit("store", "", &format!("warning: keychain migration failed ({e}) — token cleared from config anyway; sign in to re-provision")),
             }
             cfg.token.clear();
         }
@@ -195,9 +203,13 @@ impl TokenStore {
                 if let Some(p) = v.get("principal").and_then(|p| p.as_str()).filter(|p| !p.trim().is_empty()) {
                     let p = p.trim().to_string();
                     if self.write_principal(&p).is_ok() {
-                        eprintln!(
-                            "[store] migrated principal out of config.json into {}",
-                            self.principal_path().display()
+                        crate::logging::emit(
+                            "store",
+                            "",
+                            &format!(
+                                "migrated principal out of config.json into {}",
+                                self.principal_path().display()
+                            ),
                         );
                     }
                     return p;
@@ -221,10 +233,14 @@ impl TokenStore {
             return;
         }
         if !current.is_empty() {
-            eprintln!("[store] principal rotated by the hub: {current} -> {p}");
+            crate::logging::emit(
+                "store",
+                &current,
+                &format!("principal rotated by the hub → {p}"),
+            );
         }
         if let Err(e) = self.write_principal(p) {
-            eprintln!("[store] ERROR: principal write failed: {e}");
+            crate::logging::emit("store", "", &format!("error: principal write failed: {e}"));
         }
     }
 
