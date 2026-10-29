@@ -196,7 +196,7 @@
 			path = Sources;
 			sourceTree = "<group>";
 		};
-		"TEMP_2E228A67-0C54-4F78-B2CA-BFED23BD206C" /* arm64 */ = {
+		"TEMP_243122BF-6382-4C00-87CA-90E0520D0190" /* arm64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -310,7 +310,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\ncase \"${PLATFORM_NAME:-}\" in\n  iphonesimulator) RUST_TARGET=aarch64-apple-ios-sim ;;\n  *)               RUST_TARGET=aarch64-apple-ios ;;\nesac\nPROFILE_DIR=$(echo \"${CONFIGURATION:-Debug}\" | tr '[:upper:]' '[:lower:]')\ncd \"$SRCROOT/../..\"\n# release builds must match `tauri ios build`: the custom-protocol\n# feature is what embeds the frontend dist into the binary\nif [ \"$PROFILE_DIR\" = \"release\" ]; then\n  cargo build --lib --target \"$RUST_TARGET\" --release --features tauri/custom-protocol\nelse\n  cargo build --lib --target \"$RUST_TARGET\"\nfi\nOUT=\"$SRCROOT/Externals/arm64/${CONFIGURATION}\"\nmkdir -p \"$OUT\"\ncp \"target/$RUST_TARGET/$PROFILE_DIR/libbridge_mobile_lib.a\" \"$OUT/libapp.a\"\n";
+			shellScript = "set -e\n# Xcode runs script phases with a minimal PATH (/usr/bin:/bin:…) —\n# cargo/rustup live in ~/.cargo/bin, so export it explicitly (the\n# CLI lane via `tauri ios build` has the user shell PATH and never\n# needed this).\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:$PATH\"\n[ -f \"$HOME/.cargo/env\" ] && . \"$HOME/.cargo/env\"\ncommand -v cargo >/dev/null || { echo \"cargo not found — install rustup or fix PATH\"; exit 1; }\ncase \"${PLATFORM_NAME:-}\" in\n  iphonesimulator) RUST_TARGET=aarch64-apple-ios-sim ;;\n  *)               RUST_TARGET=aarch64-apple-ios ;;\nesac\nPROFILE_DIR=$(echo \"${CONFIGURATION:-Debug}\" | tr '[:upper:]' '[:lower:]')\ncd \"$SRCROOT/../..\"\n# release builds must match `tauri ios build`: the custom-protocol\n# feature is what embeds the frontend dist into the binary\nif [ \"$PROFILE_DIR\" = \"release\" ]; then\n  cargo build --lib --target \"$RUST_TARGET\" --release --features tauri/custom-protocol\nelse\n  cargo build --lib --target \"$RUST_TARGET\"\nfi\nOUT=\"$SRCROOT/Externals/arm64/${CONFIGURATION}\"\nmkdir -p \"$OUT\"\ncp \"target/$RUST_TARGET/$PROFILE_DIR/libbridge_mobile_lib.a\" \"$OUT/libapp.a\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -367,7 +367,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.statevector.bridge.mobile;
-				PRODUCT_NAME = "Bridge";
+				PRODUCT_NAME = Bridge;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -553,7 +553,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.statevector.bridge.mobile;
-				PRODUCT_NAME = "Bridge";
+				PRODUCT_NAME = Bridge;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
