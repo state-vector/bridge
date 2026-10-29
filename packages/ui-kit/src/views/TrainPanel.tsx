@@ -96,6 +96,14 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
       ? { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` }
       : { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
   }
+  // BR#4849: a red-main episode the train never saw fed (stop is null) still
+  // reads red in the status column — the episode task is board fact.
+  if (l.red_main)
+    return {
+      tone: "err",
+      label: "main RED",
+      title: `open root-blocker/main-red episode task ${l.red_main.task_id} (${l.red_main.status}) — main is red on this lane; merges gated until it lands green`,
+    };
   if (l.lease?.holder) {
     const t = lockTone(l, now);
     return {
@@ -136,6 +144,74 @@ function nowAction(l: KbTrainLane, now: number): { text: string; title: string }
 }
 
 const REFRESH_MS = 30_000;
+
+/** BR#4849: the stop-the-line banner — a red main must be the FIRST thing the
+ *  Top view says (Ray 2026-10-29: "its critical we reflect this and show a)
+ *  who broke it and b) who is fixing it"). Two accountability lines:
+ *  - broke it: the machine-recorded culprit card stamped on the stop, else the
+ *    lane's last landed merge before the red (labeled unconfirmed);
+ *  - fixing it: the open root-blocker/main-red episode task (hub-derived
+ *    `red_main`) with its owner/executor — or a loud UNOWNED chip, because
+ *    "nobody is fixing it" is exactly what a reader must not miss. */
+function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: string) => void }) {
+  const repo = l.lane.split("@")[0];
+  const red = l.red_main ?? null;
+  const culprit = l.stop?.culprit_task ?? null;
+  const lastMerge = l.last_merge ?? null;
+  const fixer = red ? red.owner || red.executor_session : "";
+  return (
+    <div className="train-stopline" role="alert">
+      <div className="train-stopline-head">
+        <span className="train-stopline-flag">⛔ STOP-THE-LINE</span>
+        <span className="train-stopline-line">main RED — {l.lane}</span>
+      </div>
+      <div
+        className="train-stopline-why"
+        title={[l.stop?.reason ?? red?.title ?? "", ...(l.stop?.failing ?? []).map((f) => `${f.name}: ${f.conclusion ?? "failed"}`)].filter(Boolean).join(" · ")}
+      >
+        {l.stop?.reason ?? red?.title ?? "required checks red on main"}
+        {l.stop?.sha ? <span className="top-num"> @ {l.stop.sha.slice(0, 9)}</span> : null}
+      </div>
+      <div className="train-stopline-who">
+        <span
+          className="train-stopline-cell"
+          title="who broke it — the machine-recorded culprit card on the stop, else the lane's last landed merge before the red (probable, unconfirmed)"
+        >
+          broke it:{" "}
+          {culprit ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(culprit)}>{culprit}</a>
+          ) : lastMerge?.pr ? (
+            <>
+              <a className="train-stopline-who-link" href={`https://github.com/${repo}/pull/${lastMerge.pr}`} target="_blank" rel="noreferrer">#{lastMerge.pr}</a>
+              {" "}by {lastMerge.gateway ?? "?"}
+              {lastMerge.task_id ? <> — <a className="train-stopline-who-link" onClick={() => openTask?.(lastMerge.task_id!)}>{lastMerge.task_id}</a></> : null}
+              {" "}<span className="muted-note">(last landed before red — unconfirmed)</span>
+            </>
+          ) : (
+            <span className="muted-note">unconfirmed — no landing recorded</span>
+          )}
+        </span>
+        <span className="train-stopline-cell" title="who is fixing it — the open root-blocker/main-red episode task and its owner/executor session">
+          fixing it:{" "}
+          {red ? (
+            <>
+              <a className="train-stopline-who-link" onClick={() => openTask?.(red.task_id)}>{red.task_id}</a>
+              {fixer ? (
+                <span> · {red.owner || red.executor_session}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
+              ) : (
+                <Chip tone="urgent" className="train-stopline-unowned" title={`${red.task_id} is open and unclaimed — claim it before anything else merges`}>
+                  ⚠ UNOWNED — nobody is fixing it
+                </Chip>
+              )}
+            </>
+          ) : (
+            <span className="muted-note">no open root-blocker task on the board</span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
 
 /** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
  *  labeled time-frames — NOW (what is being done right now + progress),
@@ -181,6 +257,9 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         <span className="muted-note">per-lane CAS lock + derived queue · 45s tick, 30s poll</span>
       </div>
       {error && <div className="train-lane train-lane-err" title={error}>⚠ train status unavailable — {error.slice(0, 120)}</div>}
+      {!error && (lanes ?? []).filter((l) => l.stop || l.red_main).map((l) => (
+        <StopLineBanner key={`stopline-${l.lane}`} l={l} openTask={openTask} />
+      ))}
       {!error && lanes?.length === 0 && (
         <div className="train-lane train-lane-idle">no merge-train lanes configured — a lane appears when a card enters the train</div>
       )}

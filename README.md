@@ -658,6 +658,19 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
   evidence.
 
+- **The banner (BR#4849)**: a red main is the loudest thing on the Top view — the merge
+  trains panel opens with a red STOP-THE-LINE banner per red lane answering the two
+  accountability questions: **who broke it** (the machine-recorded `culprit_task` stamped
+  on the stop, else the lane's last landed merge from the train ledger — labeled
+  unconfirmed) and **who is fixing it** (the open root-blocker/main-red episode task in
+  the lane's project, with its owner/executor session — or a loud `⚠ UNOWNED — nobody is
+  fixing it` chip, because an unclaimed blocker must be impossible to miss). The
+  derivation is hub-native (`red_main` in `GET /api/kb/train`: newest OPEN task tagged
+  `main-red`/`root-blocker` in the lane's project): it catches reds the train never saw
+  fed — a post-merge deploy failing on main files no train stop, but the episode task
+  still turns the panel red. The banner clears when the episode task leaves the open set
+  (fixed, done, superseded) — main green again is board fact, not a manual UI toggle.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in

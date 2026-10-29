@@ -491,6 +491,27 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-queue-card { cursor: pointer; }
 .train-queue-card:hover { filter: brightness(1.15); }
 .train-all-idle { margin: 2px 0 0 2px; }
+/* BR#4849 stop-the-line banner — a red main is the loudest thing on the panel:
+   red-ruled strip above the lane table, two accountability lines (broke it /
+   fixing it), UNOWNED chip when nobody has claimed the episode task. */
+.train-stopline {
+  border: 1px solid var(--red); border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 12%, var(--bg-raised));
+  padding: 7px 10px; margin-bottom: 6px;
+  display: flex; flex-direction: column; gap: 3px; min-width: 0;
+}
+.train-stopline-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.train-stopline-flag { color: var(--red); font-weight: 700; font-size: 12.5px; letter-spacing: 0.02em; white-space: nowrap; }
+.train-stopline-line { font-weight: 600; font-size: 12.5px; }
+.train-stopline-why {
+  font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.train-stopline-who { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; }
+.train-stopline-cell { display: inline-flex; align-items: center; gap: 4px; min-width: 0; flex-wrap: wrap; }
+.train-stopline-who-link { color: var(--accent); cursor: pointer; font-weight: 600; }
+.train-stopline-who-link:hover { text-decoration: underline; }
+.train-stopline-unowned { cursor: help; }
 .train-row { border-radius: 6px; }
 .train-row.train-row-idle { opacity: 0.75; }
 .trainc-dot { display: flex; align-items: center; justify-content: center; }

@@ -184,7 +184,15 @@ export interface KbTrainLane {
   card: string;
   lease: KbTrainLease | null;
   currently: { phase?: string; merge_sha?: string; pr?: number; head_sha?: string; merged_at?: number; task_id?: string; burst_merged?: number; burst_cap?: number } | null;
-  stop: { sha?: string; reason?: string; at?: number; pr?: number; culprit_task?: string } | null;
+  stop: {
+    sha?: string;
+    reason?: string;
+    at?: number;
+    pr?: number;
+    /** the card whose landing turned the line red (stamped by train.event stopped, BR#4849) */
+    culprit_task?: string | null;
+    failing?: { name: string; conclusion?: string | null; url?: string | null }[];
+  } | null;
   /** BR#4981: a gate-bounced head blocked on branch protection (review /
    *  required checks) — cleared by the typed self-clear when the PR lands. */
   bypass_wait?: { pr: number; task_id?: string; at: number } | null;
@@ -217,6 +225,21 @@ export interface KbTrainLane {
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
   awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
+  /** BR#4849 red-main episode (hub-derived): the newest OPEN root-blocker /
+   *  main-red task in the lane's project — null when main is green (the task
+   *  closes when the line recovers). `owner`/`executor_session` answer "who
+   *  is fixing it"; both empty = UNOWNED, and the banner says so loudly. */
+  red_main?: {
+    task_id: string;
+    title: string;
+    status: string;
+    owner: string;
+    executor_session: string;
+    created_ts: number;
+  } | null;
+  /** the lane's newest landed merge (train_events ledger) — the probable
+   *  "who broke it" anchor when no machine culprit was recorded on the stop */
+  last_merge?: { ts: number; pr?: number; task_id?: string; gateway?: string; merge_sha?: string } | null;
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;
