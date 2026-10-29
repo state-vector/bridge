@@ -199,10 +199,6 @@ export interface KbTrainLane {
    *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
-  /** BR#5114: the lease holder's live last action, verbatim from the
-   *  executor's tick log (BR#4104 proof-of-progress seam, hub-consumed) —
-   *  WHAT is being done right now and why a held head is held. Ages out at
-   *  the 5-min lease TTL; null when no holder has reported. */
   now_action?: { note: string; holder: string; at: number } | null;
   /** BR#5114 round 2 (Ray: "remove jargon — make it clear"): the current
    *  attempt in plain words — which card the train is on and WHY it is or
@@ -214,6 +210,11 @@ export interface KbTrainLane {
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
   queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
+  /** open review-leg asks on this lane's bounced cards, OLDEST FIRST
+   *  (BR#4693): one age chip per ask — amber (aging) at the re-ask TTL, red
+   *  (lapsed) past TTL + grace. The TTL itself stays hub-side; the surface
+   *  only reports the ask's age and which side of the window it sits on. */
+  review_asks?: { task: string; ask_id: string; pr?: number; age_ms: number; aging: boolean; lapsed: boolean }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

@@ -33,6 +33,10 @@ import {
   trainStopAskTitle,
   trainReviewAskTitle,
   trainReviewAskDetails,
+  clampReviewAskTtlHours,
+  shouldRefileReviewAsk,
+  TRAIN_REVIEW_ASK_TTL_H_DEFAULT,
+  TRAIN_REVIEW_ASK_GRACE_MS,
   verdictCoversHead,
   verdictCoversHeadLeg,
   TRAIN_CI_BOUND_MULTIPLIER,
@@ -598,6 +602,141 @@ describe("train event copy", () => {
     expect(TRAIN_HEAD_STAMP_RE.exec("forehead abc123def")).toBeNull();
     expect(TRAIN_HEAD_STAMP_RE.exec("heads abc123def")).toBeNull();
     expect(TRAIN_HEAD_STAMP_RE.exec("verified, no stamp here")).toBeNull();
+  });
+});
+
+// ---------- BR#4633 L4.2 / BR#4693: review-ask durability ----------
+
+describe("shouldRefileReviewAsk (dedupe suppresses spam, not the leg — BR#4693)", () => {
+  const H = (c: string) => c.repeat(40);
+  const NOW = 1_800_000_000_000;
+  const TTL = 24 * 60 * 60_000;
+  const ask = (over: Record<string, unknown> = {}) => ({ filed_ts: NOW - 25 * 60 * 60_000, head_sha: H("1"), ...over });
+
+  it("refiles ONLY when the ask aged past the TTL AND the head moved since the last ask event", () => {
+    // both facts: exactly one re-filed ask per TTL window
+    const go = shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL });
+    expect(go.refile).toBe(true);
+    expect(go.why).toContain("BR#4633 L4.2");
+    // inside the TTL window (even with a head move) → refresh only
+    expect(shouldRefileReviewAsk({ ask: ask({ filed_ts: NOW - 2 * 60 * 60_000 }), createdTs: NOW - 3 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // past the TTL but the head is UNCHANGED since the last ask → refresh only
+    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: H("1"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // refreshed_ts counts as the last ask event (a recent refresh keeps the leg deduped)
+    expect(shouldRefileReviewAsk({ ask: ask({ refreshed_ts: NOW - 2 * 60 * 60_000 }), createdTs: NOW - 26 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // a BACKDATED stamp out-votes the row's created_ts (the DO-drill regression):
+    // the ask event is the stamp, not the row's birth — an aged stamp never reads fresh
+    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(true);
+  });
+
+  it("fail-safes never refile: legacy asks without stamps, headless bounces, empty asks", () => {
+    // no age stamp at all (a legacy ask predating the durability stamps)
+    expect(shouldRefileReviewAsk({ ask: { head_sha: H("1") }, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // age stamp but no head stamp (legacy) — refresh adopts the stamp, never refiles
+    expect(shouldRefileReviewAsk({ ask: { filed_ts: NOW - 48 * 60 * 60_000 }, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // the bounce carried no head sha — nothing to compare
+    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: null, now: NOW, ttlMs: TTL }).refile).toBe(false);
+    // empty ask meta entirely
+    expect(shouldRefileReviewAsk({ ask: null, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
+  });
+
+  it("the refile window is exactly the TTL: one re-filed ask per window falls out of the stamps", () => {
+    // the fresh ask re-stamps filed_ts + head_sha, so the NEXT re-bounce
+    // inside the window dedupes again — no refile storms
+    let stamps = { filed_ts: NOW - 25 * 60 * 60_000, head_sha: H("1") };
+    let head = H("2");
+    const refile = shouldRefileReviewAsk({ ask: stamps, createdTs: stamps.filed_ts, headSha: head, now: NOW, ttlMs: TTL });
+    expect(refile.refile).toBe(true);
+    // the re-filed ask's stamps: same TTL clock from NOW, new head baseline
+    stamps = { filed_ts: NOW, head_sha: head };
+    expect(shouldRefileReviewAsk({ ask: stamps, createdTs: NOW, headSha: head, now: NOW + 60_000, ttlMs: TTL }).refile).toBe(false);
+    // ...and one MORE head move past the window refiles exactly once more
+    head = H("3");
+    expect(shouldRefileReviewAsk({ ask: stamps, createdTs: NOW, headSha: head, now: NOW + TTL + 60_000, ttlMs: TTL }).refile).toBe(true);
+  });
+
+  it("clampReviewAskTtlHours: settings garbage clamps to the honest default window", () => {
+    expect(TRAIN_REVIEW_ASK_TTL_H_DEFAULT).toBe(24);
+    expect(TRAIN_REVIEW_ASK_GRACE_MS).toBe(2 * 60 * 60_000);
+    expect(clampReviewAskTtlHours("36")).toBe(36);
+    expect(clampReviewAskTtlHours(48)).toBe(48);
+    expect(clampReviewAskTtlHours("0")).toBe(24); // falsy garbage → the default
+    expect(clampReviewAskTtlHours(-5)).toBe(24);
+    expect(clampReviewAskTtlHours("abc")).toBe(24);
+    expect(clampReviewAskTtlHours("9999")).toBe(720); // the 1..720 clamp
+    expect(clampReviewAskTtlHours(undefined)).toBe(24);
+  });
+});
+
+// ---------- BR#3727 clock + BR#4633 L4.2 approval anchor ----------
+
+describe("decideTrainGate blocked/behind (BR#3727 clock + BR#4633 L4.2 approval anchor)", () => {
+  const HEAD = "c".repeat(40);
+  const run = (id: number, conclusion: string | null): MainCheckRun =>
+    ({ id, name: "Test", status: conclusion == null ? "in_progress" : "completed", conclusion, html_url: `https://example/${id}` });
+  const gate = (over: Partial<Parameters<typeof decideTrainGate>[0]> = {}) =>
+    decideTrainGate({
+      prNumber: 4700,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 4700, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "blocked",
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [run(1, "success")],
+      ...over,
+    });
+
+  it("BR#3727 clock: blocked with PENDING required checks is a wait, not a bounce — skip this tick", () => {
+    // strict protection re-runs the required checks on the head after every
+    // machine-clean update-branch — the tick after the carry reads blocked
+    const d = gate({ headChecks: [run(1, "success"), run(2, null)] });
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") {
+      expect(d.reason).toContain("mergeStateStatus=blocked");
+      expect(d.reason).toContain("pending, not a defect");
+    }
+  });
+
+  it("blocked with RED head checks notes (no bounce) — the queued card's session owns it", () => {
+    const d = gate({ headChecks: [run(1, "failure")] });
+    expect(d.kind).toBe("note");
+    if (d.kind === "note") expect(d.reason).toContain("head check RED");
+  });
+
+  it("BR#4633 L4.2: blocked + GREEN head checks + covered verdict MERGES — the BR verdict is the approval of record (supersedes BR#3727's bounce)", () => {
+    const d = gate();
+    expect(d.kind).toBe("merge");
+    if (d.kind === "merge") {
+      // the receipt names WHY the blocked state was pre-cleared
+      expect(d.receipt).toContain("blocked pre-cleared");
+      expect(d.receipt).toContain("approval of record");
+      expect(d.receipt).toContain("BR#4633 L4.2");
+    }
+  });
+
+  it("the shared law keeps the anchor: decideMergeAction's blocked bounce names the BR verdict, not a re-approve leg", () => {
+    const d = decideMergeAction({
+      prNumber: 4701,
+      prTitle: "",
+      headSha: HEAD,
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "blocked",
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [run(1, "success")],
+      cardStatus: "blocked",
+      verifyAcceptedOnHead: true,
+      verifyAcceptedAny: true,
+    });
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") {
+      expect(d.bounceKind).toBe("gate");
+      expect(d.defect).toContain("approval of record");
+      expect(d.defect).toContain("BR#4633 L4.2");
+      expect(d.defect).not.toContain("re-approve)"); // the old posture is gone
+    }
   });
 });
 
