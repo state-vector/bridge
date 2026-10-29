@@ -196,6 +196,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     const merged = await kbJson("/train.event", {
       repo, base: "main", kind: "merged", actor: "gw-1",
       pr: 2600, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 10 * 60_000, // past the settle dwell (BR#4804)
     });
     expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
     expect(merged.body.task).toBe(card);
@@ -210,7 +211,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     const mid = await laneSnap(repo);
     expect(mid.currently.phase).toBe("awaiting-ci");
     expect(mid.currently.pr).toBe(2600);
-    expect(String(mid.reason)).toContain("awaiting CI");
+    expect(String(mid.reason)).toContain("settling on");
 
     // pending required CI: the lane holds
     const pending = await kbJson("/train.ci", { repo, base: "main", actor: "gw-1", sha: M, checks: [check(3, "Test", null)] });

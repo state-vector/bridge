@@ -314,7 +314,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
       repo, base: "main", actor: "gw-mint", sha: M, checks: [check(3, "Test", null)],
     });
     expect(pending.body.decided).toBe("pending");
-    expect(String((await laneSnap(repo)).reason)).toContain("awaiting CI");
+    expect(String((await laneSnap(repo)).reason)).toContain("settling on");
 
     const landed = await kbJson("/train.ci", {
       repo, base: "main", actor: "gw-mint", sha: M,

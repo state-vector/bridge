@@ -318,8 +318,40 @@ describe("classifyRequiredRuns (executor-fed runs vs lane config)", () => {
     expect(v.missing).toEqual(["Ghost"]);
   });
 
-  it("an unconfigured lane (no required set) is vacuously green — the phase passes through", () => {
-    expect(classifyRequiredRuns([], [], base).verdict).toBe("green");
+  it("BACK-PRESSURE (Ray 2026-10-29): an unconfigured lane settles on EVERY check on the merge commit — no more vacuous pass-through", () => {
+    // all observed checks settled green past the settle dwell → landed
+    const settled = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "Deploy Dev", "success")], [],
+      { merged_at: 0, now: 10 * MIN },
+    );
+    expect(settled.verdict).toBe("green");
+    // the deploy still running → the lane HOLDS (the old code merged here)
+    const deployRunning = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "Deploy Dev", null)], [],
+      { merged_at: 0, now: 10 * MIN },
+    );
+    expect(deployRunning.verdict).toBe("pending");
+    expect(deployRunning.pending).toEqual(["Deploy Dev"]);
+    // deploy red → stop-the-line like any required failure
+    const deployRed = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "Deploy Dev", "failure")], [],
+      { merged_at: 0, now: 10 * MIN },
+    );
+    expect(deployRed.verdict).toBe("red");
+    expect(deployRed.failing).toEqual([{ name: "Deploy Dev", conclusion: "failure", url: "https://example/2" }]);
+    // a cancelled-only deploy (the cascade this fix kills) is UNSETTLED, not success
+    const cancelledOnly = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "Deploy Dev", "cancelled")], [],
+      { merged_at: 0, now: 10 * MIN },
+    );
+    expect(cancelledOnly.verdict).toBe("pending");
+    // settle dwell: green may not land before slower-triggered workflows
+    // (deploys) have even registered a check run on the commit
+    const tooSoon = classifyRequiredRuns([run(1, "Test", "success")], [], { merged_at: 0, now: 1 * MIN });
+    expect(tooSoon.verdict).toBe("pending");
+    expect(tooSoon.pending).toContain("settle-dwell");
+    const dwellPassed = classifyRequiredRuns([run(1, "Test", "success")], [], { merged_at: 0, now: 3 * MIN });
+    expect(dwellPassed.verdict).toBe("green");
   });
 
   it("the fail-closed bound: unknown past ~3× typical ⇒ bound_exceeded (the caller stops the line)", () => {

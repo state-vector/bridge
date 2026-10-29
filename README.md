@@ -721,9 +721,21 @@ included) as "unmergeable — CONFLICTING".
   draining) clears the starved state.
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
-  in flight per lane, CI settling on the merge commit before the next head enters.
+  in flight per lane, and the lane HOLDS until main settles before the next head enters.
   Serialized is the point: no interleaved merges, no surprise rebases, every merge
   attributable to exactly one lane event.
+- **Back-pressure: main settles before the next head enters (BR#4804)** — after a
+  merge, the lane's awaiting-CI phase judges the check runs ON the merge commit: a
+  lane with a configured `required_workflows` set settles exactly those; an
+  unconfigured lane (the default) settles on **every** check run on the commit —
+  build AND deploy — with a 2-minute settle dwell after the merge so
+  slower-triggered deploys can register a check run. Anything unsettled (including a
+  cancelled-only run) holds; anything red stops the line; only all-green (past the
+  dwell) admits the next head. The old default — vacuous green for unconfigured
+  lanes — merged back-to-back and every push cancelled the previous Deploy Dev,
+  starving main. While settling, the lane reason reads `settling on <sha> (PR #N):
+  build/deploy in flight, next head held until main settles`, and the panel's queue
+  depth is the count of heads waiting behind the pressure valve.
 
 ### The gate, the carry law, the bounce
 

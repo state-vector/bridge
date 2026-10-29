@@ -1527,7 +1527,7 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
   return [
     `Standing merge lane for **${lane.repo}** base **${lane.base}** — serialized: one merge at a time, gated, lease-held by an opportunistic gateway executor (decision BR#3516).`,
     ``,
-    `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — the awaiting-CI phase passes through immediately)_"}`,
+    `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_"}`,
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
@@ -1820,8 +1820,15 @@ export type RequiredRunsVerdict = {
 /** Classify the executor-fed check runs on the merge commit against the
  *  lane's REQUIRED workflows. Same judge rule as classifyMainCheckRuns
  *  (newest non-cancelled run per name; cancelled says nothing). Required is
- *  lane config — an unconfigured lane has no required set, so green is
- *  vacuous and the phase passes through. */
+ *  lane config.
+ *  BACK-PRESSURE (Ray, 2026-10-29): an unconfigured lane no longer passes
+ *  through vacuously — that pass-through merged back-to-back and every push
+ *  cancelled the previous Deploy Dev, starving main (the base-red pile).
+ *  Default now: settle on EVERY check run on the merge commit (build +
+ *  deploy) before the next head enters, with a short dwell after the merge
+ *  so slower-triggered workflows (deploys) have registered a check run. */
+export const TRAIN_SETTLE_DWELL_MS = 2 * 60_000;
+
 export function classifyRequiredRuns(
   runs: MainCheckRun[],
   required: string[],
@@ -1833,14 +1840,18 @@ export function classifyRequiredRuns(
     list.push(r);
     byName.set(r.name ?? "", list);
   }
+  // back-pressure default: judge every observed check on the merge commit
+  const judgeNames = required.length ? required : [...byName.keys()];
   const failing: MainRedCheck[] = [];
   const missing: string[] = [];
   const pending: string[] = [];
-  for (const name of required) {
+  for (const name of judgeNames) {
     const list = byName.get(name) ?? [];
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge || judge.conclusion == null) {
-      (list.length ? pending : missing).push(name);
+      // unconfigured mode: a cancelled-only run (or in-flight with no
+      // conclusion) is UNSETTLED — the commit has not finished proving itself
+      (list.length || !required.length ? pending : missing).push(name);
       continue;
     }
     if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
@@ -1848,6 +1859,11 @@ export function classifyRequiredRuns(
     } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
       pending.push(name);
     }
+  }
+  if (!required.length) {
+    // the settle dwell: a green verdict may not land before slower-triggered
+    // workflows (deploys) have even registered a check run on the commit
+    if (opts.now - opts.merged_at < TRAIN_SETTLE_DWELL_MS) pending.push("settle-dwell");
   }
   const typical = opts.typical_ms ?? TRAIN_CI_TYPICAL_MINUTES * 60_000;
   const bound_exceeded = opts.now - opts.merged_at > TRAIN_CI_BOUND_MULTIPLIER * typical;

@@ -7184,7 +7184,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (stop) reason = `merge-train: STOPPED — ${stop.reason} (resume when the line is green)`;
     else if (currently) {
       const who = lease ? ` by ${lease.holder}` : "";
-      reason = `merge-train: leased${who} — awaiting CI on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr})`;
+      // BR#4804 back-pressure: the settling phase is the queue's pressure
+      // valve — the reason names what main is doing and that heads are held
+      reason = `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight, next head held until main settles`;
     } else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
       // free until the next acquire clears the stamp (board visibility).
@@ -7373,8 +7375,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (kind === "merged") {
       if (!mergeSha) throw new Error("train:merged needs merge_sha");
       if (!pr) throw new Error("train:merged needs pr");
+      // the executor may report its own merge wall-clock (BR#4804 settle
+      // clock): clamp to now — a future stamp would fake a settled lane
+      const mergedAt = Math.min(Number(body.merged_at) || now, now);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
-      this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: now });
+      this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
       // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
       // meta write: carry + awaiting-ci stamp + provenance + (blocked)
@@ -7397,24 +7402,24 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // + lane reads are card-level).
           next.merge_train = {
             ...(next.merge_train ?? {}),
-            legs: { ...(next.merge_train?.legs ?? {}), [String(pr)]: { state: "awaiting-ci", merge_sha: mergeSha, merged_at: now } },
+            legs: { ...(next.merge_train?.legs ?? {}), [String(pr)]: { state: "awaiting-ci", merge_sha: mergeSha, merged_at: mergedAt } },
             state: "awaiting-ci",
             pr,
             merge_sha: mergeSha,
-            merged_at: now,
+            merged_at: mergedAt,
           };
-          next.provenance = { repo, pr, head_sha: headSha ?? "", merge_sha: mergeSha, task_id: chain.task_id, verdict_id: chain.verdict_id, session: chain.session, signer: String(body.signer ?? "worker-executor"), merged_at: now };
+          next.provenance = { repo, pr, head_sha: headSha ?? "", merge_sha: mergeSha, task_id: chain.task_id, verdict_id: chain.verdict_id, session: chain.session, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt };
           // blocked stays blocked (lifecycle forbids blocked→blocked) — the
           // state rides meta.merge_train; the reason says awaiting-CI.
           if (card.status === "blocked") {
-            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main CI pending` };
+            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main settling (build/deploy)` };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, chain.task_id);
           } else {
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
           }
         }
       }
-      meta.currently = { pr, merge_sha: mergeSha, head_sha: headSha, merged_at: now, phase: "awaiting-ci", task_id: chain.task_id };
+      meta.currently = { pr, merge_sha: mergeSha, head_sha: headSha, merged_at: mergedAt, phase: "awaiting-ci", task_id: chain.task_id };
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")) }, chain.task_id);
       this.version(lane.id, actor, `train:${kind}`, `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`, { currently: meta.currently, reason });
