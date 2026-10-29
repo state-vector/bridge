@@ -195,6 +195,11 @@ struct Ctx {
     lane_allow: Vec<String>,
     /// Fixed workdir (MERGE_TRAIN_WORKDIR). None → managed clone cache.
     workdir_override: Option<String>,
+    /// BR#4977: shell out to gh before acquiring a lane to prove its base
+    /// branch still exists on the remote (404 ⇒ the lane is retired — skip
+    /// with no lease, no hub meta writes). On in production; off in the
+    /// test ctxs so the drills stay hermetic.
+    base_probe: bool,
     // ---- lease liveness: proof of progress ----
     /// Last meaningful ledger action this executor took (renewals carry it).
     last_action: String,
@@ -275,6 +280,7 @@ impl Ctx {
             skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: workdir_env,
+            base_probe: true,
             last_action: "executor started".into(),
             last_action_ms: now_ms(),
         })
@@ -669,6 +675,29 @@ fn release_if_idle(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Result<(
     Ok(())
 }
 
+/// BR#4977: is the lane's base branch gone from the remote? A 404 /
+/// not-found from `gh api repos/<repo>/branches/<base>` is definitive (the
+/// branch was deleted — the lane can never advance again); every other
+/// failure is transient (gh absent, network, auth, no workdir) and fails
+/// OPEN — the tick proceeds and the normal paths surface the error.
+/// Gated by `ctx.base_probe` so tests stay hermetic.
+fn base_missing_on_remote(ctx: &Ctx, repo: &str, base: &str) -> bool {
+    if !ctx.base_probe {
+        return false;
+    }
+    match ctx.sh("gh", &["api", &format!("repos/{repo}/branches/{base}"), "--jq", ".name"]) {
+        Ok(_) => false,
+        Err(e) => not_found_err(&e),
+    }
+}
+
+/// The missing-branch classifier: 404 / "not found" in gh's error text is a
+/// definitive no-such-branch; anything else is not a retirement signal.
+fn not_found_err(e: &str) -> bool {
+    let low = e.to_lowercase();
+    low.contains("404") || low.contains("not found")
+}
+
 /// One lane, one tick. Port of the former Node executor's driveLane.
 fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     let key = vstr(lane, "lane").unwrap_or("").to_string();
@@ -692,6 +721,18 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     let capable = ctx.write_allowed();
     if !capable {
         ctx.note_skip_throttled(&key, "will not claim train lock as I cannot merge PRs (identity gate BR#3181 — bridge doctor names the fix)");
+        return;
+    }
+
+    // ---- BR#4977 lane lifecycle: a lane whose base branch no longer exists
+    // on the remote can never advance — a merge there is meaningless and the
+    // lease stamps would keep a dead lane looking served. Skip WITHOUT
+    // leasing (no hub meta writes). A 404 / not-found is definitive; any
+    // other gh failure is transient — fail open and let the normal paths
+    // surface it (a deleted base on a stopped lane already errors honestly
+    // in the stop arm). ----
+    if base_missing_on_remote(ctx, &repo, &base) {
+        log(Some(&key), &format!("base branch `{base}` missing on the remote — lane retired, skipping (BR#4977)"));
         return;
     }
 
@@ -1108,6 +1149,14 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
         if !ctx.lane_allow.is_empty() && !ctx.lane_allow.iter().any(|a| a == &key) {
             continue;
         }
+        // BR#4977 lane lifecycle: the hub marks a RETIRED lane (its lane card
+        // is done/superseded — the base was deleted or the lane deliberately
+        // closed, "never tick again"). The tick never touches it: no lease
+        // traffic, no hub meta writes, no workdir spin-up.
+        if lane.get("retired").and_then(|v| v.as_bool()).unwrap_or(false) {
+            log(Some(&key), "lane retired (lane card closed) — skipping (BR#4977)");
+            continue;
+        }
         // Daemon mode resolves the workdir per lane from the managed clone
         // cache (or the MERGE_TRAIN_WORKDIR override) before driving it.
         if ctx.in_process {
@@ -1508,6 +1557,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         skip_log_ms: 0,
         lane_allow: cfg.lanes.clone(),
         workdir_override: cfg.workdir_override.clone(),
+        base_probe: true,
         last_action: "gateway leg tick".into(),
         last_action_ms: now_ms(),
     })
@@ -2110,6 +2160,7 @@ mod tests {
             skip_log_ms: 0,
             lane_allow: vec![],
             workdir_override: None,
+            base_probe: false, // hermetic drills — the base probe shells out to gh
             last_action: "test".into(),
             last_action_ms: now_ms(),
         }
@@ -2196,6 +2247,33 @@ mod tests {
         let recorded = calls.lock().unwrap();
         assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
         assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
+    }
+
+    #[test]
+    fn tick_skips_a_retired_lane_before_any_traffic_br4977() {
+        // The hub marks a retired lane (its lane card is done/superseded —
+        // the base was deleted or the lane was deliberately closed, the
+        // BR#4772 drill-residue class). The tick consumes the status snapshot
+        // and NOTHING else: no lease, no release, no workdir spin-up — a
+        // further mock request would exhaust the script loud.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "retired": true, "queue": [], "currently": null, "stop": null } ] })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        tick(&mut ctx).unwrap();
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_status"], "a retired lane must not be leased or driven, got {:?}", names);
+    }
+
+    #[test]
+    fn not_found_is_the_only_missing_branch_signal_br4977() {
+        // The base-existence probe retires a lane ONLY on gh's definitive
+        // 404 — transient failures (auth, network, gh absent) fail open so a
+        // flaky environment can never silently retire live lanes.
+        assert!(not_found_err("gh api repos/o/r/branches/dead failed (exit status 1): gh: Not found (HTTP 404)"));
+        assert!(!not_found_err("gh: To request access run `gh auth login`"));
+        assert!(!not_found_err("dial tcp 1.2.3.4:443: connection refused"));
     }
 
     #[test]
@@ -2387,6 +2465,7 @@ mod tests {
                 skip_log_ms: 0,
                 lane_allow: vec![],
                 workdir_override: None,
+                base_probe: false, // local git-plumbing verdicts only — no gh
                 last_action: String::new(),
                 last_action_ms: now_ms(),
             }

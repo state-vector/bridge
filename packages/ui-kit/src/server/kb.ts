@@ -169,6 +169,10 @@ export interface KbTrainLane {
   bypass_wait?: { pr: number; task_id?: string; at: number } | null;
   required_workflows?: string[];
   reason?: string;
+  /** BR#4977 lane lifecycle: true when the lane's card is done/superseded
+   *  (base deleted or lane retired) — the tick never touches it; queue is
+   *  always empty and the reason names the retirement. */
+  retired?: boolean;
   last_capable_lease_ts?: number | null;
   /** last merge-capable gateway tick — the machine the train will hand to
    *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
