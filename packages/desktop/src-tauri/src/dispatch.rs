@@ -39,6 +39,11 @@ pub struct DispatchConfig {
     pub model: Option<String>, // agent model override; unset = the agent CLI's own config decides
     #[serde(default)]
     pub backend: Option<String>, // "opencode" (default) | "kiro" — which agent CLI drives the tasks
+    /// BR#4489: `role: "train"` = dedicated merge-train node — the daemon
+    /// runs connection + train legs and SKIPS task dispatch entirely. Default
+    /// (absent) = full gateway (dispatch + train).
+    #[serde(default)]
+    pub role: Option<String>,
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
     #[serde(default = "default_timeout_mins")]
@@ -283,6 +288,10 @@ impl DispatchConfig {
             agent: std::env::var("BRIDGE_AGENT").ok(),
             model: std::env::var("BRIDGE_MODEL").ok(),
             backend: std::env::var("BRIDGE_BACKEND").ok(),
+            // BR#4489: the only recognized role is "train" (dedicated merge
+            // node). Anything else — absent, garbage — is the default full
+            // gateway; an unknown role must never silently disable dispatch.
+            role: std::env::var("BRIDGE_ROLE").ok().map(|r| r.trim().to_string()).filter(|r| r == "train"),
             poll_secs: std::env::var("BRIDGE_POLL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -518,6 +527,7 @@ pub fn default_config() -> DispatchConfig {
         agent: std::env::var("BRIDGE_AGENT").ok(),
         model: std::env::var("BRIDGE_MODEL").ok(),
         backend: std::env::var("BRIDGE_BACKEND").ok(),
+        role: None,
         poll_secs: default_poll_secs(),
         timeout_mins: default_timeout_mins(),
         opencode_bin: default_opencode_bin(),
@@ -3963,6 +3973,15 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // renewals carry proof-of-progress; MERGE_TRAIN_ENABLED=0 disables
     // (deploy.md §7).
     crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), stop.clone());
+    // BR#4489 `role: "train"`: a dedicated merge-train node is a normal
+    // gateway in a named mode — the daemon legs (train thread above, WS
+    // connection/transport, epoch self-heal, liveness) keep running; the
+    // DISPATCH loop below skips task claiming entirely. Nothing to dispatch,
+    // nothing claimed. Default (role absent) is unchanged.
+    let dispatch_enabled = cfg.role.as_deref() != Some("train");
+    if !dispatch_enabled {
+        eprintln!("[dispatch] role: train — dedicated merge-train node: task dispatch OFF, train + connection legs ON");
+    }
     let mut id: i64 = 0;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut attempts: HashMap<String, Instant> = HashMap::new();
@@ -4039,21 +4058,24 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 TOKEN_EPOCH_VEND.store(seen, Ordering::Relaxed); // first observation adopts
             }
         }
-        match tick(
-            &cfg,
-            &mut id,
-            &mut in_flight,
-            &mut attempts,
-            &mut fail_counts,
-            &mut finished_no_pr,
-            &mut gave_up,
-            &snap,
-            &mut avail,
-            &mut last_avail_ok,
-            &mut breaker,
-            &mut live_notes,
-            &mut gated_announced,
-        ) {
+        // BR#4489 role:"train" — skip ONLY the dispatch tick; the tail of the
+        // loop (runner-state sync + responsive stop) still runs every pass.
+        if dispatch_enabled {
+            match tick(
+                &cfg,
+                &mut id,
+                &mut in_flight,
+                &mut attempts,
+                &mut fail_counts,
+                &mut finished_no_pr,
+                &mut gave_up,
+                &snap,
+                &mut avail,
+                &mut last_avail_ok,
+                &mut breaker,
+                &mut live_notes,
+                &mut gated_announced,
+            ) {
             Ok(msgs) => {
                 for msg in msgs {
                     eprintln!("[dispatch] {msg}");
@@ -4134,6 +4156,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                         },
                     },
                 }
+            }
             }
         }
         // ephemeral flat-file state: keep ~/.bridge/dispatch/runner.json in sync
@@ -4576,6 +4599,7 @@ mod tests {
             agent: None,
             model: None,
             backend: None,
+            role: None,
             poll_secs: default_poll_secs(),
             timeout_mins: default_timeout_mins(),
             opencode_bin: default_opencode_bin(),

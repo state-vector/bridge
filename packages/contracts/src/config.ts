@@ -38,6 +38,9 @@ export const BridgeConfigSchema = z.looseObject({
   agent: z.string().nullable(),
   model: z.string().nullable(),
   backend: z.string().nullable(),
+  /** BR#4489: "train" = dedicated merge-train node (dispatch off, train +
+   *  connection legs on). Absent/null = the default full gateway. */
+  role: z.enum(["train"]).nullable(),
   poll_secs: z.number().int(),
   timeout_mins: z.number().int(),
   opencode_bin: z.string(),
