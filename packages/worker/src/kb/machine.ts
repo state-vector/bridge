@@ -179,7 +179,7 @@ export type Effect =
   | { kind: "reuse_verify"; parent: string; verify: string }
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
-  | { kind: "skip_unblock_spawn"; parent: string; reason: string }
+  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean }
   | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "release_redirect"; attempts: number; silent_cycles: number };
@@ -254,6 +254,21 @@ export const RULES: Rule[] = [
     when: (i) => i.type === "decision" && i.to === "accepted" && !HUMAN_ACTOR.test(i.actor),
     guard: (i) =>
       `decision ${i.id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`,
+  },
+  {
+    // BR#3913 / BR#2508(a): blocked → superseded is a parked card's one drop
+    // edge, and it is not agent-executable — dropping work is a
+    // human-authority act (BR#2480). It arrives as an ANSWERED ask whose
+    // options offer SUPERSEDE (the answer is the authorisation; the askAnswer
+    // dispatch leg acts as system:question(<answerer>)) or as a web/admin
+    // action. A bare agent session is refused; the machinery (system:) and
+    // humans (web:/human:) pass — the same exemption the release-ownership
+    // rule uses ("releases are the machinery working, not agents dumping
+    // each other's work").
+    name: "supersede-authority",
+    when: (i) => isTask(i) && i.to === "superseded" && !OWNER_RELEASE_EXEMPT.test(i.actor),
+    guard: (i) =>
+      `task ${i.id} cannot be superseded by an agent session — dropping a card is a human-authority act (BR#2480). Route it through an answered ask whose options offer SUPERSEDE (the answer is the authorisation) or the web.`,
   },
   {
     name: "human-signoff-done",
@@ -586,8 +601,10 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
 
   // supersede cascades: children are ephemeral — when the parent moves on,
   // their round closes (review rounds keep their newest child alive across a
-  // bounce so the same round re-enters).
-  if (["in_progress", "todo", "done"].includes(i.to)) {
+  // bounce so the same round re-enters). superseded counts: a dropped parent's
+  // rounds are dead by definition (BR#3913 — the SUPERSEDE answer dispatch
+  // lands here; done/verify rounds of a dropped card must not linger open).
+  if (["in_progress", "todo", "done", "superseded"].includes(i.to)) {
     const cause =
       i.to === "in_progress" && i.status === "blocked"
         ? `${i.id} resumed from blocked — unblock confirmed, child superseded`
@@ -595,15 +612,25 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
           ? `${i.id} bounced — unblock round closed`
           : `${i.id} → ${i.to} — unblock round closed`;
     effects.push({ kind: "supersede_children", parent: i.id, tag: "unblock", keep_newest: false, cause });
+    // BR#4282: a resume CONSUMES the round — the exit condition was verified
+    // and the card moved. Clear the stamp so a post-resume silence issues a
+    // FRESH round (the owned done-close) instead of flooding against a stamp
+    // whose round no longer exists. Dedup keeps suppressing duplicates of an
+    // UNCONSUMED round; a consumed one is not a duplicate.
+    if (i.to === "in_progress" && i.status === "blocked") patch.last_unblock_spawn = undefined;
   }
-  if (i.to === "done" || (i.status === "in_review" && i.to === "in_progress")) {
+  if (i.to === "done" || i.to === "superseded" || (i.status === "in_review" && i.to === "in_progress")) {
     const isBounce = i.status === "in_review" && i.to === "in_progress";
     effects.push({
       kind: "supersede_children",
       parent: i.id,
       tag: "review",
       keep_newest: isBounce,
-      cause: isBounce ? `${i.id} bounced — older verification rounds superseded (newest kept for re-entry)` : `${i.id} done — verification round closed`,
+      cause: isBounce
+        ? `${i.id} bounced — older verification rounds superseded (newest kept for re-entry)`
+        : i.to === "superseded"
+          ? `${i.id} superseded — verification round closed`
+          : `${i.id} done — verification round closed`,
     });
   }
 
@@ -645,6 +672,10 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
           kind: "skip_unblock_spawn",
           parent: i.id,
           reason: `unblock round issued ${Math.round((now - last.at) / 60_000)}m ago with the same exit condition — flood guard`,
+          // BR#4282: a flood skip is the dedup WORKING (the round for this
+          // exact exit is already on the case), not a double-spawn attempt —
+          // the executor audits it observably and never folds a breach card.
+          flood: true,
         });
       } else {
         effects.push({
