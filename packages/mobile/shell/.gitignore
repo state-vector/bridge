@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Tauri generated schemas (regenerated on every build)
+gen/schemas
+
+# npm/vite must not leak in — the ui dist is built by beforeBuildCommand
+node_modules
+dist
+
+# local build outputs (derived data, stock-build stashes)
+/build
+gen/apple/build
