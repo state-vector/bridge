@@ -120,6 +120,13 @@ describe("bootstrap composition", () => {
     expect(b).not.toContain("external board");
   });
 
+  it("rule 4b + PROTOCOL CARD carry the verdict-duty carve-out — the protocol never steers a verify/unblock duty into blocked (BR#4392)", () => {
+    const b = composeBootstrap("My Project", DEFAULT_BOARD);
+    expect(b).toContain("can NEVER take the blocked leg");
+    expect(b).toContain("they cannot block");
+    expect(b).toContain('"cannot proceed" is itself the verdict');
+  });
+
   it("appends the user board prompt when board is external", () => {
     const b = composeBootstrap("P", { mode: "external", kind: "github-projects", url: "https://x/p/1", prompt: "Move tasks to In Progress." });
     expect(b).toContain("github-projects");

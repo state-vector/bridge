@@ -101,7 +101,13 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   steering: { draft: ["active"], active: ["superseded"] },
   goal: { draft: ["active"], active: ["achieved", "dropped"] },
   decision: { proposed: ["accepted", "superseded"], accepted: ["superseded"] },
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo"] },
+  // blocked → superseded (BR#3913, per accepted BR#2508(a)): a parked card's
+  // one drop edge. Guarded at the law table (machine.ts supersede-authority):
+  // an answered ask offering SUPERSEDE (the answer is the authorisation,
+  // BR#3578 dispatch) or a web/human action may take it — a bare agent
+  // session never can. todo/done stay closed (BR#2508: done is a reviewed
+  // terminal; a drop never rides the churn-counted release path).
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo", "superseded"] },
   // questions are answered, never claimed: todo → done (answer) or superseded (closed by ADR)
   question: { todo: ["done", "superseded"] },
   progress: {},
@@ -356,7 +362,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `2. orient first, every session (session: "<unique-name>"). Work from its response, not memory. Pass session on every tool call — claims, transitions, progress. Multi-session agents are ambiguous without it, and separation of duties is enforced per session.`,
     `3. Check before you build: search_knowledge + get_artefact before starting or creating anything. If someone owns overlapping open work, ask_agent — don't fork.`,
     `4. HEARTBEAT: while in_progress, log_progress at least every 10 minutes — did (what just happened) + will (what you do next) + sentiment + gauges (completion_pct, confidence_pct, risk_pct, context_pct — 0-100; context_pct = how full your context window is, report it so the board can spot sessions that should hand off before quality degrades). Silence >10m = abandoned: the task is reassigned and your score drops. Re-claim by logging progress.`,
-    `4b. DECLARE SILENCE before any quiet stretch >10m: short op still yours (build, CI wait) → log_progress {will, grace_minutes ≤ 60}. Long or handed-off op (re-index, deploy, background batch) → transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes ≤ 1440}. Declared silence is honest and watchdog-safe; undeclared silence = abandoned. Overrun your declared window and it trips as abandoned anyway.`,
+    `4b. DECLARE SILENCE before any quiet stretch >10m: short op still yours (build, CI wait) → log_progress {will, grace_minutes ≤ 60}. Long or handed-off op (re-index, deploy, background batch) → transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes ≤ 1440}. Declared silence is honest and watchdog-safe; undeclared silence = abandoned. Overrun your declared window and it trips as abandoned anyway. Verdict-duty cards (role:review / role:unblock) can NEVER take the blocked leg — declare their silence with log_progress {will, grace_minutes} only; if the duty cannot proceed, "cannot proceed" is itself the verdict: render it and close done (BR#4392).`,
     `5. Status is your responsibility: claim → in_progress immediately; finish → in_review with the PR link in the note; stuck → blocked with BOTH a reason and an unblock condition. in_review is NOT done: you stay owner, poll get_history {id} for the verdict — bounce = action the findings; done = released. Gates are enforced — unqualified todo is picked up only by role:analysis/role:review agents; done requires review acceptance. Don't route around them; qualify, review, resolve.`,
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `5c. VERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident). Verification agents: BEFORE any substance check, confirm the PR is mechanically mergeable — gh pr view --json mergeable,mergeStateStatus,reviewDecision AND every commit signature isValid=true. mergeable=false / CONFLICTING / any unsigned or NO_USER commit → STOP: zero substance checks, and bounce the parent to in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push"). Never file a human ask for a mechanical defect, never report "verified, awaiting merge" for an unmergeable PR (false report — it has zero verified legs), and never treat "accept the unsigned commit" as an option (the ruleset forbids it by construction). The ONLY escalation to a human: a broken signing environment (key unavailable / NO_USER) — one ask describing the environment covers the whole class, never one per PR.`,
@@ -369,7 +375,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes or subprocess-block with a budget. 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them.`,
+    `PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes, or subprocess-block with a budget (never on verify/unblock duties: they cannot block — grace_minutes only, and "cannot proceed" is itself the verdict: render it and close done). 5. UNCERTAIN: ask_agent first. 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
@@ -1142,6 +1148,167 @@ export function prEscalationAskTitle(repo: string, prNumber: number, cardId: str
   const suffix = `?`;
   const budget = 240 - prefix.length - suffix.length;
   let text = `merge, rebase, or close it with reason within ${graceHours}h, or the merge sweep closes it with reason`;
+  if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + text + suffix;
+}
+
+// ---------------------------------------------------------------------------
+// Prose-card disposition ladder (BR#4416): when the proxy sweep finds a
+// blocked card whose resume condition parses to no atoms (proxy_check
+// no_atoms), the machine resolves what it can prove from the card's OWN
+// machine state and asks a human ONLY for genuine ambiguity — never one ask
+// per card. Mirrors the PR disposition law (decidePrDisposition, BR#3315)
+// for the prose-park class. BR#4248 killed the generator (the churn-guard
+// redirect now stamps typed time atoms); this ladder drains the legacy
+// backlog and arms the population canary: after that deploy, prose parks
+// are incidents, not inbox items.
+//
+// The legs come from CARD META (stamped by the machine at block/queue time:
+// meta.pr / meta.prs / merge_train stamps / a bound ask / an open
+// root_blocker), never from parsing the prose again — the prose already
+// failed to parse (that is why we are here). Evaluations are board-local
+// with ZERO GitHub calls (BR#3287: the provenance/train ledger is the merge
+// proof; asks and card statuses are SQL reads).
+// ---------------------------------------------------------------------------
+
+/** A typed leg recovered from the card's machine state. */
+export type ProseLeg =
+  | { kind: "pr_merged"; repo: string; n: number }
+  | { kind: "ask"; ask_id: string }
+  | { kind: "br_done"; id: string }
+  | { kind: "time"; until_ts: number };
+
+/** Board-local verdict for one recovered leg — the receipt cites WHERE the
+ *  fact came from (provenance row / artefact status / clock), never GitHub. */
+export interface ProseLegVerdict {
+  leg: ProseLeg;
+  ok: boolean;
+  receipt: string;
+}
+
+export type ProseDisposition =
+  /** rung 1: the recovered leg already holds → auto-flip per the card's own
+   *  promised exit (spawn the unblock duty with the receipt); NO ask. */
+  | { kind: "flip"; leg: ProseLeg; receipt: string }
+  /** rung 2: a typed leg is recoverable but not yet true → restore the typed
+   *  await_event into meta.blocked; the normal typed-leg path owns the exit;
+   *  NO ask. */
+  | { kind: "restore"; leg: ProseLeg; await_event: AwaitEvent; receipt: string }
+  /** rung 3: no machine state at all → release to todo with the churn
+   *  context (the pool re-scopes, BR#3578 §3's own no-leg law); NO ask. */
+  | { kind: "release"; reason: string }
+  /** rung 4: genuine human ambiguity only → ONE ask per class per day. */
+  | { kind: "escalate_class"; askClass: string; question: string; reason: string }
+  /** already parked on a live bound ask (or today's class ask) — the answer
+   *  owns the exit; not prose, not an ask. */
+  | { kind: "waiting"; receipt: string };
+
+export interface ProseDispositionInput {
+  cardId: string;
+  title: string;
+  /** sweep epoch (ms) */
+  now: number;
+  /** recovered legs with their board-local verdicts, in the sweep's
+   *  precedence order (ask > pr_merged > br_done > time). A bound ask IS a
+   *  leg: open → not yet true (rung 2 restores it as typed {event:"ask"});
+   *  answered → true (rung 1 flips). */
+  legs: ProseLegVerdict[];
+  /** the sweep may not release this card (runner/human-owned, or
+   *  human-qualified scope): supersede-vs-continue is genuinely theirs */
+  releaseRestricted: boolean;
+  /** ts of the last class ask (settings prose_migration_<class>), or null */
+  lastClassAskTs: number | null;
+  /** the class-ask quiet window (ms; 24h = one ask per class per day) */
+  classAskQuietMs: number;
+}
+
+/** The one rung-4 class today: a protected card with no machine state, where
+ *  re-scoping overrides a human's earlier ruling. Key for the settings
+ *  dedupe stamp: `prose_migration_<class>`. */
+export const PROSE_CLASS_AMBIGUOUS = "ambiguous_re_scope";
+
+/** The class-ask quiet window: ONE ask per class per day (the 5c one-per-
+ *  class law at daily granularity). Also the population-alarm's dedupe
+ *  window (one canary alarm per episode per day, never per card). */
+export const PROSE_CLASS_QUIET_MS = 24 * 3_600_000;
+
+/** ProseLeg → its grammar-valid AwaitEvent (total over the leg set — every
+ *  variant maps into the closed AWAIT_GRAMMAR_DOC set by construction). */
+export function proseLegAwaitEvent(leg: ProseLeg): AwaitEvent {
+  switch (leg.kind) {
+    case "pr_merged": return { event: "pr_merged", repo: leg.repo, n: leg.n };
+    case "ask": return { event: "ask", ask_id: leg.ask_id };
+    case "br_done": return { event: "br_done", id: leg.id };
+    case "time": return { event: "time", until_ts: leg.until_ts };
+  }
+}
+
+/** The prose-park decision table. Order is the law's: the conjunction of
+ *  recovered legs (ALL must hold before any flip — the same conjunction law
+ *  the atom path obeys) → restore the first not-true leg → release → the
+ *  once-per-day class ask. Exactly one disposition per card per pass; every
+ *  ask-shaped row is deduped. */
+export function decideProseDisposition(i: ProseDispositionInput): ProseDisposition {
+  // (1) condition provably true: every machine-stamped leg holds (zero legs
+  //     never flips — vacuity guard). The exit fires per the card's own
+  //     promise; the ask in the old factory never exists (the BR#4170 case:
+  //     the PR sat MERGED while a human was asked to re-scope). An answered
+  //     bound ask lands here too — the answer is the proof.
+  if (i.legs.length > 0 && i.legs.every((l) => l.ok)) {
+    const won = i.legs[0];
+    return { kind: "flip", leg: won.leg, receipt: won.receipt };
+  }
+
+  // (2) a typed leg is recoverable but not (all) true: restore the first
+  //     not-true leg in precedence order — the sweep re-types the park and
+  //     the normal typed-leg path owns the exit from here. NO ask.
+  const pending = i.legs.find((l) => !l.ok);
+  if (pending)
+    return { kind: "restore", leg: pending.leg, await_event: proseLegAwaitEvent(pending.leg), receipt: pending.receipt };
+
+  // (3) no machine state at all: the churn guard's park is not a human
+  //     decision — release to todo for re-scope (BR#3578 §3's no-leg law).
+  //     NO ask. Restricted cards fall through to (4).
+  if (!i.releaseRestricted)
+    return {
+      kind: "release",
+      reason: "no machine leg anywhere in card state (no PR, no bound ask, no timer, no open root blocker) — released to the pool for re-scope per the BR#3578 no-leg law",
+    };
+
+  // (4) genuine human ambiguity (protected owner / human-qualified scope,
+  //     no machine state): ONE ask per class per day — never one per card
+  //     (the 5c one-per-class law). Within the quiet window: waiting.
+  if (i.lastClassAskTs != null && i.now - i.lastClassAskTs < i.classAskQuietMs)
+    return { kind: "waiting", receipt: "class ask already filed inside the quiet window — the answer owns the class" };
+  return {
+    kind: "escalate_class",
+    askClass: PROSE_CLASS_AMBIGUOUS,
+    question: proseClassAskTitle([i.cardId]),
+    reason: `protected card (${i.cardId}) parked on pure prose with no machine leg — supersede-vs-continue is a human ruling; one class ask per day carries it`,
+  };
+}
+
+/** Deterministic rung-4 class ask title: ≤240 chars, ends in "?" (the ask
+ *  contract). The sweep files it for the WHOLE class found this pass and
+ *  dedupes via askCreate's identical-open-ask guard + the
+ *  prose_migration_<class> settings stamp. */
+export function proseClassAskTitle(cardIds: string[]): string {
+  const prefix = `Prose-parked cards need a human ruling (one ask for the whole class, at most daily): `;
+  const suffix = ` — re-scope, release, or drop?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let ids = cardIds.join(", ");
+  if (ids.length > budget) ids = ids.slice(0, Math.max(0, budget - 1)).replace(/,?\s*\S*$/, "") + "…";
+  return prefix + ids + suffix;
+}
+
+/** Deterministic population-alarm title (the canary, not an inbox): fires
+ *  ONCE per episode at the alarm sink when prose parks exist after the
+ *  BR#4248 deploy. ≤240 chars, ends in "?". */
+export function proseAlarmAskTitle(cardSummaries: string[]): string {
+  const prefix = `Prose-parked cards exist after the BR#4248 deploy (population canary): `;
+  const suffix = ` — which writer minted them?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let text = cardSummaries.join("; ");
   if (text.length > budget) text = text.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
   return prefix + text + suffix;
 }
