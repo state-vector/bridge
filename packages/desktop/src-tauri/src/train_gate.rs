@@ -341,6 +341,7 @@ pub enum MergeAction {
     HumanLeg { reason: String },
 }
 
+#[derive(Clone)]
 pub struct TrainGateInput<'a> {
     pub pr_number: i64,
     pub head_sha: &'a str,
@@ -388,7 +389,7 @@ pub fn decide_merge_action(
     if let Some(state) = merge_state_status.filter(|s| !s.is_empty()) {
         if state != "clean" && state != "unstable" {
             return MergeAction::Bounce {
-                defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter"),
+                defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg"),
                 bounce_kind: BounceKind::Gate,
             };
         }
@@ -473,13 +474,71 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             bounce_kind: BounceKind::Coverage,
         };
     }
+    // BR#3727: mergeStateStatus=behind IS the state the carry law (BR#3516 §5)
+    // was written for — base advanced, branch still mergeable. The shared law
+    // stays clean/unstable and bounces behind: the SWEEP has no update-branch
+    // authority. The TRAIN does — its merge leg owns trial-merge →
+    // update-branch → verdict carries — so the train gate pre-clears behind
+    // here. Without it, the exact PRs the carry law was written for
+    // bounce-loop (bounce → re-verify → re-queue → behind again — nothing in
+    // the bounce flow updates the branch). Coverage is already settled above:
+    // an uncovered head bounced before this line, so behind reaching the
+    // compose is always a §5-carryable head.
+    let behind = i
+        .merge_state_status
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("behind"))
+        .unwrap_or(false);
+    // BR#3727: blocked with head checks merely PENDING is a clock, not a
+    // defect — strict branch protection re-runs the required checks on the
+    // head right after every machine-clean update-branch, so the tick after
+    // the carry reads blocked. Pending checks wait a tick; red checks note
+    // (the shared law's own non-in_review row). BR#4633 L4.2 (the approval
+    // anchor): blocked with GREEN checks no longer bounces — the BR verify
+    // verdict IS the approval of record, and the head move that dismissed the
+    // stale GitHub review is exactly the event L4.2 refuses to count as a
+    // lost approval. Coverage is settled above (an uncovered head bounced
+    // before this line), so blocked+green reaching the compose is a verified,
+    // covered head — the merge leg pre-clears the state (supersedes the
+    // BR#3727 "blocked+green bounce stands" posture).
+    let blocked = i
+        .merge_state_status
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("blocked"))
+        .unwrap_or(false);
+    if blocked {
+        let head = classify_head_checks(i.head_checks);
+        if head.verdict == MainVerdict::Unsettled {
+            return MergeAction::Skip {
+                reason: format!(
+                    "PR #{n} mergeStateStatus=blocked — required checks re-running on head {h} ({u}) — pending, not a defect; next tick",
+                    n = i.pr_number,
+                    h = &i.head_sha[..i.head_sha.len().min(9)],
+                    u = head.unsettled.join(", ")
+                ),
+            };
+        }
+        if head.verdict == MainVerdict::Red {
+            return MergeAction::Note {
+                reason: format!(
+                    "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
+                    n = i.pr_number,
+                    names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            };
+        }
+    }
+    let composed_state: Option<&str> = match i.merge_state_status.as_deref() {
+        Some(s) if behind || blocked => Some("clean"),
+        other => other,
+    };
     let gate = decide_merge_action(
         i.pr_number,
         i.head_sha,
         i.card_status,
         &i.base_verdict,
         i.mergeable,
-        i.merge_state_status.as_deref(),
+        composed_state,
         i.commits,
         i.head_checks,
         true,
@@ -488,11 +547,18 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
     match gate {
         MergeAction::Merge { .. } => MergeAction::Merge {
             receipt: format!(
-                "PR #{n} merged by the serialized merge train (BR#3516) leg {L}/{M}: head {h} — verdict covers head (stamp/carry), 5c gate pass (mergeable, clean, {k} verified commits), base green, head checks green",
+                "PR #{n} merged by the serialized merge train (BR#3516) leg {L}/{M}: head {h} — verdict covers head (stamp/carry), 5c gate pass (mergeable, {state}, {k} verified commits), base green, head checks green",
                 n = i.pr_number,
                 L = leg_number,
                 M = if legs.is_empty() { 1 } else { legs.len() },
                 h = &i.head_sha[..i.head_sha.len().min(9)],
+                state = if behind {
+                    "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
+                } else if blocked {
+                    "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
+                } else {
+                    "clean"
+                },
                 k = i.commits.len()
             ),
         },
@@ -631,6 +697,133 @@ mod tests {
                 // the bounce NAMES its kind (BR#4066): a coverage bounce — the
                 // hub's brief must not render conflict language for it
                 assert_eq!(bounce_kind, BounceKind::Coverage);
+            }
+            other => panic!("expected bounce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn behind_pre_clears_at_the_train_gate_br3727() {
+        // mirrored from merge-train.test.ts: uppercase behind PRE-CLEARS at
+        // the train gate — the §5 carry is reachable (the shared
+        // decide_merge_action still bounces behind; the sweep owns that)
+        let meta = serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 4700, "head_sha_at_acceptance": "ccccccccc" } });
+        let head = "c".repeat(40);
+        let checks = [run(1, "ci", Some("success"))];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 4700,
+            head_sha: &head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("BEHIND".into()),
+            commits: &[(head.clone(), true)],
+            head_checks: &checks,
+            leg_number: Some(1),
+        });
+        match gate {
+            MergeAction::Merge { receipt } => {
+                assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}");
+                assert!(receipt.contains("BR#3516 §5"), "receipt: {receipt}");
+            }
+            other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_pending_is_a_clock_blocked_red_notes_br3727() {
+        // mirrored from merge-train.test.ts: strict protection re-runs the
+        // required checks on the head after every machine-clean update-branch
+        let meta = serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 4700, "head_sha_at_acceptance": "ccccccccc" } });
+        let head = "c".repeat(40);
+        let commits = [(head.clone(), true)];
+        // pending (in-flight required check) → skip this tick, never a bounce
+        let pending = [run(1, "ci", Some("success")), run(2, "lint", None)];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 4700,
+            head_sha: &head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".into()),
+            commits: &commits,
+            head_checks: &pending,
+            leg_number: Some(1),
+        });
+        match gate {
+            MergeAction::Skip { reason } => {
+                assert!(reason.contains("mergeStateStatus=blocked"), "reason: {reason}");
+                assert!(reason.contains("pending, not a defect"), "reason: {reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+        // red → note (the shared law's own non-in_review row)
+        let red = [run(1, "ci", Some("failure"))];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 4700,
+            head_sha: &head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".into()),
+            commits: &commits,
+            head_checks: &red,
+            leg_number: Some(1),
+        });
+        match gate {
+            MergeAction::Note { reason } => assert!(reason.contains("head check RED"), "reason: {reason}"),
+            other => panic!("expected note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_green_verdict_anchor_merges_br4633_l4_2() {
+        // mirrored from merge-train.test.ts: blocked + GREEN head checks +
+        // covered verdict MERGES — the BR verify verdict is the approval of
+        // record (supersedes BR#3727's "blocked+green bounce stands" posture)
+        let meta = serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 4700, "head_sha_at_acceptance": "ccccccccc" } });
+        let head = "c".repeat(40);
+        let checks = [run(1, "ci", Some("success"))];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 4700,
+            head_sha: &head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".into()),
+            commits: &[(head.clone(), true)],
+            head_checks: &checks,
+            leg_number: Some(1),
+        });
+        match gate {
+            MergeAction::Merge { receipt } => {
+                assert!(receipt.contains("blocked pre-cleared"), "receipt: {receipt}");
+                assert!(receipt.contains("approval of record"), "receipt: {receipt}");
+                assert!(receipt.contains("BR#4633 L4.2"), "receipt: {receipt}");
+            }
+            other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_law_names_the_br_verdict_not_reapprove_br4633_l4_2() {
+        // mirrored from merge-train.test.ts: decide_merge_action's blocked
+        // bounce names the BR verdict as the approval of record — the old
+        // "re-approve" posture is gone (byte-identical TS↔Rust wording)
+        let head = "c".repeat(40);
+        let g = MainVerdict::Green;
+        let checks = [run(1, "ci", Some("success"))];
+        let gate = decide_merge_action(4701, &head, Some("blocked"), &g, Some(true), Some("blocked"), &[(head.clone(), true)], &checks, true, true);
+        match gate {
+            MergeAction::Bounce { defect, bounce_kind } => {
+                assert_eq!(bounce_kind, BounceKind::Gate);
+                assert!(defect.contains("approval of record"), "defect: {defect}");
+                assert!(defect.contains("BR#4633 L4.2"), "defect: {defect}");
+                assert!(!defect.contains("re-approve)"), "defect: {defect}");
             }
             other => panic!("expected bounce, got {other:?}"),
         }

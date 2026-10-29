@@ -172,6 +172,11 @@ export interface KbTrainLane {
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
   queue: { id: string; priority: "critical" | "normal" }[];
+  /** open review-leg asks on this lane's bounced cards, OLDEST FIRST
+   *  (BR#4693): one age chip per ask — amber (aging) at the re-ask TTL, red
+   *  (lapsed) past TTL + grace. The TTL itself stays hub-side; the surface
+   *  only reports the ask's age and which side of the window it sits on. */
+  review_asks?: { task: string; ask_id: string; pr?: number; age_ms: number; aging: boolean; lapsed: boolean }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

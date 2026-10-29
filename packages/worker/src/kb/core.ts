@@ -1030,7 +1030,7 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
     return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`, bounceKind: "conflict" };
   }
   if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
-    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg`, bounceKind: "gate" };
   // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
   const unverified = i.commits.filter((c) => !c.verified);
   if (unverified.length)
@@ -1965,10 +1965,16 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   // defect — strict branch protection re-runs the required checks on the
   // head right after every machine-clean update-branch, so the tick after
   // the carry reads blocked. Pending checks wait a tick; red checks note
-  // (the shared law's own non-in_review row); blocked with GREEN checks
-  // means protection wants something checks can't give (reviews/settings) —
-  // the shared law's bounce stands.
-  if (typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked") {
+  // (the shared law's own non-in_review row). BR#4633 L4.2 (the approval
+  // anchor): blocked with GREEN checks no longer bounces — the BR verify
+  // verdict IS the approval of record, and the head move that dismissed the
+  // stale GitHub review is exactly the event L4.2 refuses to count as a
+  // lost approval. Coverage is settled above (an uncovered head bounced
+  // before this line), so blocked+green reaching the compose is a verified,
+  // covered head — the merge leg pre-clears the state (supersedes the
+  // BR#3727 "blocked+green bounce stands" posture).
+  const blocked = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked";
+  if (blocked) {
     const head = classifyHeadChecks(i.headChecks);
     if (head.verdict === "unsettled")
       return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
@@ -1981,7 +1987,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     headSha: i.headSha,
     baseVerdict: i.baseVerdict,
     mergeable: i.mergeable,
-    mergeStateStatus: behind ? "clean" : i.mergeStateStatus,
+    mergeStateStatus: behind || blocked ? "clean" : i.mergeStateStatus,
     commits: i.commits,
     headChecks: i.headChecks,
     cardStatus: i.cardStatus,
@@ -1991,7 +1997,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (gate.kind === "merge")
     return {
       kind: "merge",
-      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
+      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
     };
   return gate;
 }
@@ -2111,6 +2117,61 @@ export function trainReviewAskDetails(input: { repo: string; prNumber: number; t
     `This ask is the live leg. It re-files (deduped) on every further head move until the card re-enters the train; answering it retires it.`,
     `PR: https://github.com/${input.repo}/pull/${input.prNumber}`,
   ].join("\n");
+}
+
+/** The dedupe-vs-leg window: an identical open ask dedupes re-bounces of the
+ *  same leg — but the human leg must LAPSE-PROOF, not just spam-proof. An
+ *  ask unanswered past this window re-files fresh when the PR head moved
+ *  since it was last filed/refreshed (dedupe suppresses spam, not the leg).
+ *  Settings knob `train.review_ask_ttl_h`, clamped 1..720. */
+export const TRAIN_REVIEW_ASK_TTL_H_DEFAULT = 24;
+
+/** The visible-age grace past the TTL before a review ask reads LAPSED (red)
+ *  on the train panel — `aging` (amber) starts AT the TTL. */
+export const TRAIN_REVIEW_ASK_GRACE_MS = 2 * 60 * 60_000;
+
+export function clampReviewAskTtlHours(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.min(720, Math.max(1, n)) : TRAIN_REVIEW_ASK_TTL_H_DEFAULT;
+}
+
+/** Should a deduped (identical-open) review ask re-file FRESH? Two facts
+ *  must BOTH hold — the leg is still unmet AND time has actually passed:
+ *  1. the ask has sat unanswered past the TTL window (age from the LAST ask
+ *     event — filed_ts/refreshed_ts; created_ts is the legacy fallback ONLY
+ *     when neither stamp exists — a backdated stamp must not lose to the
+ *     row's creation time), and
+ *  2. the PR head moved since the ask was last filed/refreshed (the head_sha
+ *     stamp the bounce handler writes on every ask event).
+ *  Fail-safes (never refile): no stamps at all (a legacy ask with neither an
+ *  age nor a head stamp just refreshes), or the event carried no head sha to
+ *  compare — without both signals a re-file could loop forever. Exactly one
+ *  re-filed ask per TTL window falls out: the fresh ask re-stamps both
+ *  signals, so the next re-bounce inside the window dedupes again. */
+export function shouldRefileReviewAsk(input: {
+  ask?: { filed_ts?: number; refreshed_ts?: number; head_sha?: string } | null;
+  createdTs?: number | null;
+  headSha: string | null;
+  now: number;
+  ttlMs: number;
+}): { refile: boolean; why: string } {
+  const a = input.ask ?? {};
+  // The last ask EVENT is the newest durability stamp; created_ts only backs
+  // a legacy ask with neither stamp — it must never out-vote a stamp, or a
+  // backdated (aged) ask reads fresh and the leg never lapses.
+  const stampTs = Math.max(Number(a.filed_ts ?? 0), Number(a.refreshed_ts ?? 0));
+  const lastTs = stampTs > 0 ? stampTs : Number(input.createdTs ?? 0);
+  const lastHead = String(a.head_sha ?? "").toLowerCase();
+  const head = String(input.headSha ?? "").toLowerCase();
+  if (!lastTs) return { refile: false, why: "ask has no age stamp (legacy) — refresh only" };
+  if (input.now - lastTs < input.ttlMs) return { refile: false, why: "ask is inside the TTL window — refresh only" };
+  if (!lastHead) return { refile: false, why: "ask has no head stamp (legacy) — refresh only" };
+  if (!head) return { refile: false, why: "bounce carried no head sha — nothing to compare" };
+  if (lastHead === head) return { refile: false, why: "head unchanged since the ask was last filed/refreshed — refresh only" };
+  return {
+    refile: true,
+    why: `ask unanswered ${Math.round((input.now - lastTs) / 60_000)}m (past the ${Math.round(input.ttlMs / 3_600_000)}h window) and the head moved since (${lastHead.slice(0, 9)}→${head.slice(0, 9)}) — dedupe suppresses spam, not the leg (BR#4633 L4.2)`,
+  };
 }
 
 /** Deterministic stop-the-line ask title (ONE per red episode — the sha makes

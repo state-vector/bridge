@@ -809,7 +809,17 @@ machine-clean carry chain:
   a new head move after an answer posts a fresh leg) so **For Me always shows the live
   leg** as "Review requested … one click from landed?". The ask is a visibility device,
   not work: it never fences the card's done, and the landed (or superseded) close
-  retires it automatically.
+  retires it automatically. **The leg is lapse-proof, not just spam-proof (BR#4693,
+  child of BR#4633 L4.2)**: every ask carries durability stamps (when it was last
+  filed/refreshed, at which PR head). A deduped ask that has sat unanswered past the
+  re-ask window (`train.review_ask_ttl_h`, default 24h, clamp 1..720) while the PR head
+  moved **re-files fresh** — the stale ask is superseded (`TTL re-file` reason, audited
+  `train:bounce_ask_ttl_refiled`) and one new ask posts, so dedupe suppresses spam,
+  never the leg; exactly one re-filed ask per window falls out of the stamps. And no
+  ask ages silently: `train.status` surfaces every open review ask on a lane's cards
+  OLDEST-FIRST with its age (`review_asks`), and the train panel renders an age chip
+  per ask — amber (aging) at the TTL, red (lapsed) past TTL + a 2h grace — so a lapsed
+  human leg is visible before the next head move ever re-files it.
 - **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727)**: behind is
   exactly "base advanced, branch still mergeable" — the state the carry law was written
   for, which the shared `decideMergeAction` (clean/unstable, untouched) bounces because
@@ -819,8 +829,16 @@ machine-clean carry chain:
   the new head's checks settle. Conflicts still bounce with the file list. The tick
   right after an update-branch reads `blocked` while strict branch protection re-runs
   the required checks on the new head — pending, not a defect: the gate WAITS on it
-  (red head checks note; blocked with green checks — protection wants reviews — still
-  bounces honestly).
+  (red head checks note).
+- **The approval of record is the BR verify verdict, not the GitHub review (BR#4633
+  L4.2, impl BR#4693)**: the head move past an accepted verdict dismisses the stale
+  GitHub review (GitHub law) — that dismissal must not fence a verified leg. At the
+  train gate, `mergeStateStatus=blocked` with GREEN head checks and a verdict-covered
+  head **pre-clears to clean and merges** (supersedes BR#3727's "blocked+green bounce
+  stands" posture): protection is asking for what the accepted BR verdict already
+  gives. The gate-bounce defect names the verdict as the approval of record — there is
+  no GitHub re-approve leg (byte-identical wording in the Rust twin). Pending checks
+  still wait the clock; red still notes.
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
@@ -865,7 +883,11 @@ runs on the merge commit) · `train.lane` (ensure / configure) · `train.history
     "ci_typical_minutes": 20
   }
 },
-"train_alarm_sink_id": "BR#3124"   // stop-the-line asks land here (default BR#3124)
+"train_alarm_sink_id": "BR#3124",  // stop-the-line asks land here (default BR#3124)
+"train.review_ask_ttl_h": "24"     // the review-ask re-file window (hours, clamp 1..720):
+                                   // an ask unanswered past it re-files fresh when the
+                                   // PR head moved (BR#4633 L4.2); age chips read amber
+                                   // at the TTL, red past TTL + 2h grace
 ```
 
 `required_workflows` names the checks that must be green to land (the same checks the

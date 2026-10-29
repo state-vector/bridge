@@ -95,7 +95,10 @@ const REFRESH_MS = 30_000;
  *  Dot = CAS lock state (hover names the holding machine + liveness); line =
  *  repo@base, click opens the lane card; status = one pill (stop-the-line /
  *  in-flight phase / lock held / ready / no gateway); activity = throughput,
- *  last ledger event, derived queue (clickable card ids). Data: GET
+ *  last ledger event, derived queue (clickable card ids) + review-ask age
+ *  chips (BR#4693: amber at the re-ask TTL, red past TTL+grace — the hub
+ *  re-files a lapsed ask on the next head move; the panel renders tones
+ *  only, the TTL knowledge stays hub-side). Data: GET
  *  /api/kb/train (the DO's train.status snapshot — lease is executor-fed,
  *  queue is hub-computed). Polls every 30s (the tick is 45s); errors surface
  *  in-panel, never silent. */
@@ -192,6 +195,19 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                         title={`${q.id} — ${q.priority === "critical" ? "boosted (priority 0)" : "normal priority"}`}
                       >
                         {q.id}
+                      </Chip>
+                    ))}
+                  </span>
+                  <span className="train-review-asks">
+                    {(l.review_asks ?? []).map((a) => (
+                      <Chip
+                        key={a.ask_id}
+                        tone={a.lapsed ? "urgent" : a.aging ? "warn" : "scope"}
+                        className="train-review-ask"
+                        onClick={() => openTask?.(a.task)}
+                        title={`review ask ${a.ask_id} on ${a.task}${a.pr ? ` (PR #${a.pr})` : ""} — waiting on the human review leg ${age(Date.now() - a.age_ms, Date.now())}${a.lapsed ? ", PAST the re-ask window + grace (red): the ask re-files fresh on the next head move" : a.aging ? ", past the re-ask window (amber): re-files fresh after TTL on a head move (BR#4633 L4.2)" : ""} — oldest first`}
+                      >
+                        review ask {age(Date.now() - a.age_ms, Date.now())}
                       </Chip>
                     ))}
                   </span>
