@@ -284,6 +284,43 @@ pub fn verdict_covers_head_leg(leg: Option<&TrainLeg>, head_sha: &str) -> bool {
     }
 }
 
+/// core.ts carryChainTip (BR#4689 L1.4): the head the chain currently ends
+/// at — the ONE point a new carry leg may extend. Walks stamp → … → tip
+/// enforcing contiguity; a break anywhere (or a non-sha stamp) yields None —
+/// a broken chain can never be covered by extension, only re-rendered.
+pub fn carry_chain_tip(stamped: &str, carry: Option<&Value>) -> Option<String> {
+    let s = stamped.trim().to_lowercase();
+    if !is_sha_like(&s) {
+        return None;
+    }
+    let mut cur = s;
+    if let Some(Value::Array(records)) = carry {
+        for c in records {
+            let from = c.get("from_head").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let to = c.get("to_head").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            if from != cur || !is_sha_like(&to) {
+                return None;
+            }
+            cur = to;
+        }
+    }
+    Some(cur)
+}
+
+/// The executor-proved mechanical head move (BR#4689 L1.4): the live head is
+/// the stamped head REBASED — `git range-diff old...new` came back all-'='
+/// pairs (same patch-ids, same order, no content delta). Executor-fed fact
+/// like mergeable/commits: the gate reasons over it, it never self-certifies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MechanicalMove {
+    /// the chain tip the move extends (must equal carry_chain_tip of the leg)
+    pub from_head: String,
+    /// the live head the move lands on (must equal head_sha)
+    pub to_head: String,
+    /// the proof receipt — the range-diff summary riding the carry record
+    pub evidence: String,
+}
+
 // ---------- fact-boundary normalizers (core.ts 1462-1476, BR#3714) ----------
 
 /// gh's `mergeable` is the GraphQL enum STRING; the gate wants bool-or-null.
@@ -356,6 +393,11 @@ pub enum MergeAction {
     Note { reason: String },
     Skip { reason: String },
     HumanLeg { reason: String },
+    /// BR#4689 L1.4: the head moved MECHANICALLY (same patch-ids) — stamp
+    /// the carry leg (hub event `carried`) and let the next tick merge the
+    /// covered head. Never a bounce, never a re-verify duty, never a
+    /// review re-ask.
+    Carry { from_head: String, to_head: String, evidence: String, receipt: String },
 }
 
 #[derive(Clone)]
@@ -370,6 +412,11 @@ pub struct TrainGateInput<'a> {
     pub commits: &'a [(String, bool)],
     pub head_checks: &'a [MainCheckRun],
     pub leg_number: Option<usize>,
+    /// BR#4689 L1.4: the executor's mechanical head-move proof (git
+    /// range-diff all-'='), present only when the live head is an uncovered
+    /// move AND the executor could prove the move content-preserving.
+    /// Absent → the coverage bounce stands (fail-closed unchanged).
+    pub mechanical_move: Option<MechanicalMove>,
 }
 
 /// core.ts decideMergeAction (907): the 5c gate + verify lineage as one
@@ -484,7 +531,10 @@ pub fn decide_merge_action(
 
 /// core.ts decideTrainGate (1486): the executor's per-candidate gate, each
 /// leg fail-closed — verdict coverage (stamp or contiguous carry) first,
-/// then the standing gate.
+/// then the standing gate. BR#4689 L1.4: an uncovered head is first offered
+/// the mechanical-carry row (the executor's range-diff proof of a
+/// content-preserving rebase extends the chain); only substantive content,
+/// an unprovable move, or a broken chain bounces.
 pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
     if i.card_status == Some("superseded") {
         return MergeAction::CloseSuperseded { reason: "linked card is superseded — closing PR without review".into() };
@@ -496,6 +546,45 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
     let leg_number = i.leg_number.unwrap_or(1).max(1);
     let leg = if !legs.is_empty() { legs.get(leg_number - 1) } else { None };
     if !verdict_covers_head_leg(leg, i.head_sha) {
+        // BR#4689 L1.4: carry is the DEFAULT path for a mechanical head move.
+        // The executor proved the live head is the stamped head rebased —
+        // same patch-ids, no content delta (git range-diff all-'=' pairs).
+        // The carry must extend the leg's chain tip exactly (contiguity
+        // re-checked here; the hub re-checks it again server-side when
+        // stamping `carried`). A substantive change (different patch-ids),
+        // an unprovable move, or a broken chain still bounces —
+        // fail-closed, unchanged.
+        let tip = carry_chain_tip(
+            leg.and_then(|l| l.head_sha_at_acceptance.as_deref()).unwrap_or(""),
+            leg.and_then(|l| l.carry.as_ref()),
+        );
+        if let Some(mv) = &i.mechanical_move {
+            let to_norm = mv.to_head.trim().to_lowercase();
+            let contiguous = tip
+                .as_deref()
+                .map(|t| t == mv.from_head.trim().to_lowercase())
+                .unwrap_or(false)
+                && is_sha_like(&to_norm)
+                && to_norm == i.head_sha.trim().to_lowercase();
+            if contiguous {
+                let tip = tip.unwrap();
+                let short_tip = tip[..tip.len().min(9)].to_string();
+                let short_to = i.head_sha[..i.head_sha.len().min(9)].to_string();
+                let evidence = mv.evidence.trim();
+                let evidence = if evidence.len() > 300 { &evidence[..300] } else { evidence };
+                return MergeAction::Carry {
+                    from_head: tip,
+                    to_head: i.head_sha.to_string(),
+                    evidence: evidence.to_string(),
+                    receipt: format!(
+                        "PR #{n} head moved mechanically {f}→{t} (same patch-ids, no content delta) — verdict carries as a new chain leg (BR#4689 L1.4); no bounce, no re-verify duty; merge re-gated next tick",
+                        n = i.pr_number,
+                        f = short_tip,
+                        t = short_to,
+                    ),
+                };
+            }
+        }
         let stamped = leg
             .and_then(|l| l.head_sha_at_acceptance.clone())
             .map(|s| s[..s.len().min(9)].to_string())
@@ -828,6 +917,7 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[],
             leg_number: Some(1),
+            mechanical_move: None,
         });
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -844,6 +934,145 @@ mod tests {
             }
             other => panic!("expected bounce, got {other:?}"),
         }
+    }
+
+    // ---- BR#4689 L1.4: mechanical head moves carry by default ----
+
+    #[test]
+    fn mechanical_carry_is_the_default_path_for_a_rebase_only_head_move() {
+        let meta = serde_json::json!({ "pr": { "repo": "r", "number": 7, "head_sha_at_acceptance": "aaaaaaaaa" } });
+        let new_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 7,
+            head_sha: new_head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(new_head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            mechanical_move: Some(MechanicalMove {
+                from_head: "aaaaaaaaa".into(),
+                to_head: new_head.into(),
+                evidence: "git range-diff aaaaaaaaa...bbbbbbbbb — 2 patch-id pairs, all '='".into(),
+            }),
+        });
+        match gate {
+            MergeAction::Carry { from_head, to_head, evidence, receipt } => {
+                assert_eq!(from_head, "aaaaaaaaa");
+                assert_eq!(to_head, new_head);
+                assert!(evidence.contains("all '='"));
+                assert!(receipt.contains("BR#4689") && receipt.contains("same patch-ids"));
+            }
+            other => panic!("expected carry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_content_change_still_bounces_even_with_proof_claims() {
+        let meta = serde_json::json!({ "pr": { "repo": "r", "number": 7, "head_sha_at_acceptance": "aaaaaaaaa" } });
+        let new_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // the proof's to_head doesn't match the live head — no carry
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 7,
+            head_sha: new_head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(new_head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            mechanical_move: Some(MechanicalMove {
+                from_head: "aaaaaaaaa".into(),
+                to_head: "cccccccccccccccccccccccccccccccccccccccc".into(),
+                evidence: "stale proof".into(),
+            }),
+        });
+        assert!(matches!(gate, MergeAction::Bounce { bounce_kind: BounceKind::Coverage, .. }));
+        // no proof at all — the unchanged fail-closed bounce
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 7,
+            head_sha: new_head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(new_head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            mechanical_move: None,
+        });
+        assert!(matches!(gate, MergeAction::Bounce { bounce_kind: BounceKind::Coverage, .. }));
+    }
+
+    #[test]
+    fn a_carry_must_extend_the_chain_tip_and_a_broken_chain_cannot_be_extended() {
+        // an existing chain a→c: the tip is c — a proof claiming from=a skips
+        // a link and is refused (bounce), a proof from=c carries
+        let meta = serde_json::json!({ "pr": { "repo": "r", "number": 7, "head_sha_at_acceptance": "aaaaaaaaa", "carry": [
+            { "from_head": "aaaaaaaaa", "to_head": "ccccccccc", "prior_verdict_id": null, "carried_ts": 1, "via": "update-branch" }
+        ] } });
+        let new_head = "dddddddddddddddddddddddddddddddddddddddd";
+        let gate_for = |from_head: &str| {
+            decide_train_gate(TrainGateInput {
+                pr_number: 7,
+                head_sha: new_head,
+                card_meta: &meta,
+                card_status: Some("blocked"),
+                base_verdict: MainVerdict::Green,
+                mergeable: Some(true),
+                merge_state_status: Some("clean".into()),
+                commits: &[(new_head.into(), true)],
+                head_checks: &[run(1, "ci", Some("success"))],
+                leg_number: Some(1),
+                mechanical_move: Some(MechanicalMove {
+                    from_head: from_head.into(),
+                    to_head: new_head.into(),
+                    evidence: "range-diff all '='".into(),
+                }),
+            })
+        };
+        assert!(matches!(gate_for("ccccccccc"), MergeAction::Carry { .. }));
+        assert!(matches!(gate_for("aaaaaaaaa"), MergeAction::Bounce { .. }));
+        // a BROKEN chain (second record starts off-chain) yields no tip —
+        // it can never be covered by extension, so even a fresh proof bounces
+        let broken = serde_json::json!({ "pr": { "repo": "r", "number": 7, "head_sha_at_acceptance": "aaaaaaaaa", "carry": [
+            { "from_head": "aaaaaaaaa", "to_head": "ccccccccc", "prior_verdict_id": null, "carried_ts": 1, "via": "update-branch" },
+            { "from_head": "eeeeeeeee", "to_head": "fffffffff", "prior_verdict_id": null, "carried_ts": 2, "via": "update-branch" }
+        ] } });
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 7,
+            head_sha: new_head,
+            card_meta: &broken,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(new_head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            mechanical_move: Some(MechanicalMove {
+                from_head: "ccccccccc".into(),
+                to_head: new_head.into(),
+                evidence: "range-diff all '='".into(),
+            }),
+        });
+        assert!(matches!(gate, MergeAction::Bounce { bounce_kind: BounceKind::Coverage, .. }));
+    }
+
+    #[test]
+    fn carry_chain_tip_walks_contiguous_and_refuses_breaks() {
+        assert_eq!(carry_chain_tip("aaaaaaaaa", None).as_deref(), Some("aaaaaaaaa"));
+        let one = serde_json::json!([{ "from_head": "aaaaaaaaa", "to_head": "ccccccccc" }]);
+        assert_eq!(carry_chain_tip("aaaaaaaaa", Some(&one)).as_deref(), Some("ccccccccc"));
+        let broken = serde_json::json!([{ "from_head": "aaaaaaaaa", "to_head": "ccccccccc" }, { "from_head": "ddddddddd", "to_head": "eeeeeeeee" }]);
+        assert_eq!(carry_chain_tip("aaaaaaaaa", Some(&broken)), None); // break → not extensible
+        assert_eq!(carry_chain_tip("zzz", None), None); // non-sha stamp → None
     }
 
     #[test]
@@ -1030,6 +1259,7 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[run(1, "ci", Some("success"))],
             leg_number: Some(1),
+            mechanical_move: None,
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("leg 1/1") && receipt.contains("BR#3516")),

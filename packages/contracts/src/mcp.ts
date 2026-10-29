@@ -171,7 +171,7 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   train_event: z.looseObject({
     repo: z.string(),
-    kind: z.enum(["merged", "bounced", "stopped", "landed"]),
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "carried"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
@@ -180,6 +180,10 @@ export const TOOL_ARG_SCHEMAS = {
     signer: z.string().optional(),
     run_url: z.string().optional(),
     carry_from: z.string().optional(),
+    /** BR#4689 L1.4 (kind=carried): the chain tip the mechanical move extends */
+    from_head: z.string().optional(),
+    /** BR#4689 L1.4 (kind=carried): the git range-diff proof receipt */
+    evidence: z.string().optional(),
     reason: z.string().optional(),
     conflict_files: z.array(z.string()).optional(),
     failing: z
