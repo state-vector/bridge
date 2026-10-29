@@ -96,6 +96,11 @@ import {
   trainReviewAskTitle,
   trainReviewAskDetails,
   trainLandedCloseNote,
+  trainLandedCloseEdge,
+  trainCloseBounceBrief,
+  trainCloseFailAskTitle,
+  trainCloseFailAskDetails,
+  TRAIN_LANDED_CLOSE_MAX_RETRIES,
   releaseHold,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
@@ -133,6 +138,7 @@ import {
   decide,
   invariants as checkInvariants,
   detectBreaches,
+  breachClass,
   classOf,
   replayStatus,
   BREACH_WINDOW_MS,
@@ -7194,7 +7200,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const who = lease ? ` by ${lease.holder}` : "";
       // BR#4804 back-pressure: the settling phase is the queue's pressure
       // valve — the reason names what main is doing and that heads are held
-      reason = `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight, next head held until main settles`;
+      // BR#4753: a failing landed close names itself — the wedge forming is
+      // visible on the lane card, not silent behind a settling reason
+      const lc = currently.landed_close as any;
+      reason = lc
+        ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)`
+        : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight, next head held until main settles`;
     } else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
       // free until the next acquire clears the stamp (board visibility).
@@ -7669,7 +7680,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const laneSpec = laneOfMeta(meta)!;
     const classified = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
     if (classified.verdict !== "green") throw new Error(`train:landed rejected — required runs classify ${classified.verdict} (failing: ${classified.failing.map((f) => f.name).join(", ") || "none"}; pending: ${classified.pending.join(", ") || "none"}); post train.ci instead and let the hub decide`);
-    return this.landedFlow(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
+    return this.landedFlowGuarded(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
   }
 
   /** The landed close: impl card blocked→in_progress→done (lifecycle law:
@@ -7741,9 +7752,166 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, reason };
   }
 
+  /** BR#4753: the landed close GUARDED. A green-verdict tick whose
+   *  landedFlow throws (gate-rejected done, storage fault mid-close) used to
+   *  fail raw — and silently, rejections aren't versioned — EVERY tick: the
+   *  lane sat in awaiting-ci fail-open, the fail-closed bound was
+   *  structurally unreachable (bound_exceeded is only consulted on the
+   *  pending branch), and the queue starved (observed on the
+   *  state-vector/bridge@main lane: 60+ min past bound, ~65 silent ticks —
+   *  BR#4753). Every failure here is counted on the in-flight record,
+   *  surfaced (audit + lane reason), and resolved by the pure ladder
+   *  trainLandedCloseEdge: a SEMANTIC gate rejection (breachClass names a
+   *  rule) bounces the culprit card immediately — the BR#3516 §6
+   *  lifecycle-legal edge, citing the gate error; anything else retries ≤
+   *  TRAIN_LANDED_CLOSE_MAX_RETRIES ticks, then — or past the fail-closed
+   *  bound, whichever first — bounces fail-closed with ONE alarm-sink ask
+   *  per episode. awaiting-ci always resolves to
+   *  { landed, red-stop, bound-stop, bounce }; never a raw throw. */
+  private async landedFlowGuarded(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null }): Promise<any> {
+    const laneSpec = laneOfMeta(meta)!;
+    try {
+      const out = await this.landedFlow(lane, meta, actor, p);
+      return { ...out, decided: "landed" };
+    } catch (e) {
+      const error = String((e as Error)?.message ?? e);
+      const klass = breachClass(error);
+      const now = Date.now();
+      const taskId: string | null = meta.currently?.task_id ?? null;
+      // A fault AFTER the done transition landed (storage/audit/version) is a
+      // COMPLETED close — retrying it succeeds by construction (landedFlow
+      // skips a done card and idles the lane). Never bounce a landed card.
+      if (taskId) {
+        const card = this.one(`SELECT status FROM artefacts WHERE id = ?`, taskId);
+        if (card && (card.status === "done" || card.status === "superseded")) {
+          meta.currently = null;
+          const reason = this.laneSyncReason(lane.id, meta, now);
+          this.audit(actor, "train:landed_close_repaired", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, error: error.slice(0, 160) });
+          this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed — card ${taskId} already closed (a post-close fault retried clean); lane idled`, { reason });
+          return { ok: true, decided: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, repaired: true, reason };
+        }
+      }
+      // count the failure on the in-flight record — explicit persist, the
+      // failure must survive across ticks (laneSyncReason only writes on a
+      // reason change, BR#4801) — then let the ladder decide.
+      const prev = (meta.currently?.landed_close ?? {}) as any;
+      const failures = Number(prev.failures ?? 0) + 1;
+      const boundExceeded = now - Number(meta.currently?.merged_at ?? now) > TRAIN_CI_BOUND_MULTIPLIER * ((laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000);
+      const edge = trainLandedCloseEdge({ breach_class: klass, failures, bound_exceeded: boundExceeded });
+      meta.currently = { ...meta.currently, landed_close: { failures, breach_class: klass, last_error: error.slice(0, 300), first_failed_at: Number(prev.first_failed_at ?? now), last_failed_at: now } };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      if (edge.edge === "retry") {
+        // loud per tick — the audit IS the log; the version fires once so
+        // the episode is on the card's timeline without per-tick noise.
+        this.audit(actor, "train:landed_close_error", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, failures, class: klass, error: error.slice(0, 300) });
+        if (failures === 1)
+          this.version(lane.id, actor, "train:landed", `landed close failed (attempt 1) — ${klass}: ${error.slice(0, 120)}; retrying next tick (≤${TRAIN_LANDED_CLOSE_MAX_RETRIES}, then close-bounce — BR#4753)`, { reason });
+        return { ok: true, decided: "landed_retry", pr: p.pr, merge_sha: p.mergeSha, task: taskId, failures, breach_class: klass, reason };
+      }
+      // The lifecycle-legal edge (BR#3516 §6): close-bounce the culprit card
+      // CITING the gate error, idle the lane, ONE alarm ask per episode. The
+      // merge itself is fine — the PR is landed and main green — so this is
+      // NOT stop-the-line (meta.stop auto-clears on green main) and NOT a
+      // re-verify bounce: the brief points impl at exactly the named
+      // precondition.
+      const boundFired = edge.bound_fired;
+      const card = taskId ? this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, taskId) : null;
+      if (card) {
+        const now2 = Date.now();
+        const cm = JSON.parse(card.meta ?? "{}");
+        const nextMeta = {
+          ...cm,
+          // starvation law shape (BR#4068): a merged-green card one gate
+          // precondition away from done is the board's highest-value work
+          boosted: now2,
+          merge_train: {
+            ...(cm.merge_train ?? {}),
+            state: "bounced",
+            bounce_kind: "gate",
+            close_bounce: true,
+            defect: error.slice(0, 300),
+            breach_class: klass,
+            landed_merge_sha: p.mergeSha,
+            bounced_at: now2,
+            pr: p.pr,
+            repo: laneSpec.repo,
+          },
+        };
+        const brief = trainCloseBounceBrief({ repo: laneSpec.repo, prNumber: p.pr, mergeSha: p.mergeSha, gateway: actor, error, breachClass: klass, boundFired, failures });
+        const body = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train close bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), body, now2, taskId);
+        // blocked → in_progress with the brief; a HALF-CLOSED card (a prior
+        // tick already cleared blocked→in_progress, then done was refused)
+        // is already in impl's hands — the brief + boost stand, no illegal
+        // in_progress→in_progress exists.
+        if (card.status === "blocked") {
+          try {
+            await this.transition(
+              {
+                id: taskId!,
+                to: "in_progress",
+                // anonymous — the hub acts as the machine, never as the last
+                // session on the token (same rule as the conflict bounce)
+                session: "",
+                note: `merge-train close bounce (BR#4753) — ${klass}: ${error.slice(0, 120)}`,
+              },
+              actor,
+            );
+          } catch (te) {
+            // the bounce transition itself refused (a race) — the brief, the
+            // bounce stamp and the boost already stand; never raw-throw from
+            // the green branch (BR#4753)
+            this.audit(actor, "train:close_bounce_refused", taskId!, { error: String((te as Error)?.message ?? te).slice(0, 200) });
+          }
+        }
+        this.audit(actor, "boost", taskId!, { root: taskId!, via: "train:close_bounce", pr: p.pr });
+        this.version(taskId!, actor, "update", `close-bounced (priority 0 — merged green, board close gate-rejected: ${klass}; repair leg = resolve the named precondition, close citing the merge commit — BR#4753)`, {});
+      }
+      meta.currently = null;
+      const reason2 = this.laneSyncReason(lane.id, meta, Date.now());
+      this.state.storage.sql.exec(
+        `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+        Date.now(), laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ close_bounced: true, breach_class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) }),
+      );
+      this.audit(actor, "train:landed_close_bounced", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) });
+      this.version(lane.id, actor, "train:landed", `PR #${p.pr} merged green but the card close failed ${failures}× (${klass}${boundFired ? ", bound fired" : ""}) — card close-bounced with the repair brief; lane idled, queue advances (BR#4753)`, { reason: reason2 });
+      // ONE ask per episode to the alarm sink (BR#3124) — askCreate's
+      // identical-open-ask guard dedupes the rest. NEVER artefact_id = the
+      // culprit card: an open ask child would fence its next landed close —
+      // the exact done-open-children class this fix exists for (BR#4068).
+      const askTitle = trainCloseFailAskTitle({ repo: laneSpec.repo, base: laneSpec.base }, p.mergeSha, p.pr, klass, boundFired);
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: "the merge train's landed close was gate-rejected repeatedly — previously SILENT per tick, it starved the whole lane past the fail-closed bound (BR#4753); the card is close-bounced, but a session should confirm the named precondition is agent-repairable",
+            details: trainCloseFailAskDetails({ repo: laneSpec.repo, base: laneSpec.base, prNumber: p.pr, mergeSha: p.mergeSha, taskId, error, breachClass: klass, boundFired, failures, gateway: actor }),
+            options: ["Ack — checking the card", "Fix the gate precondition", "Stop the line — human needed"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (ae) {
+        const am = String((ae as Error)?.message ?? ae);
+        // an identical ask is already open for this episode — that IS one
+        // per episode. Any other failure (missing sink card) is loud in the
+        // audit, never a raw throw (BR#4753: silence is the defect).
+        this.audit(actor, am.startsWith("an identical ask is already open") ? "train:close_ask_deduped" : "train:close_ask_failed", lane.id, { reason: am.slice(0, 160) });
+      }
+      return { ok: true, decided: boundFired ? "bounce_bound" : "bounce_gate", pr: p.pr, merge_sha: p.mergeSha, task: taskId, breach_class: klass, bound_fired: boundFired, failures, reason: reason2 };
+    }
+  }
+
   /** train.ci — executor-fed CI facts on the lane's merge commit; the HUB
    *  decides (BR#3516: executor-fed facts, hub-decided). Green ⇒ landed;
-   *  red ⇒ stop-the-line; pending past the bound ⇒ fail-closed stop. */
+   *  red ⇒ stop-the-line; pending past the bound ⇒ fail-closed stop.
+   *  BR#4753: the green arm is GUARDED — a landed close that throws
+   *  (gate-rejected done, storage fault) resolves via landedFlowGuarded to
+   *  { landed, landed_retry, bounce_gate, bounce_bound }; it used to
+   *  raw-throw every tick and wedge the lane fail-open past the bound. */
   private async trainCi(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
@@ -7766,8 +7934,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const pr = Number(meta.currently.pr);
     const mergeSha = String(meta.currently.merge_sha);
     if (v.verdict === "green") {
-      const out = await this.landedFlow(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
-      return { ...out, decided: "landed" };
+      // BR#4753: never raw-throw from the green branch — the guard resolves
+      // { landed, landed_retry, bounce_gate, bounce_bound } and the bound
+      // fires here too after repeated close failures (it used to be
+      // reachable only from the pending branch).
+      return this.landedFlowGuarded(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
     }
     if (v.verdict === "red") {
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, failing: v.failing }, actor);
