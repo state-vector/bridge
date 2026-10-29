@@ -925,6 +925,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    visual identity ONLY — no grid, no tracks, no templates.
    ============================================================ */
 .topc-task { display: flex; align-items: center; gap: 5px; font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; }
+
+/* restored 2026-10-25 (BR#3022): two c303d25e9 casualties the 129b56168
+   sweep missed — still referenced by TopView markup (task-id column,
+   status cell). Visual only, same constraint as the block above. */
+.top-task-id { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px; margin-right: 5px; opacity: .9; }
+.topc-status { display: flex; align-items: center; gap: 5px; overflow: hidden; }
 .top-row.top-click { cursor: pointer; }
 .top-row.top-click:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 
