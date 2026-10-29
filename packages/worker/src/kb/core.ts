@@ -1886,7 +1886,12 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  Composes the standing decideMergeAction; the train layer adds the
  *  carry law the sweep never had. BR#3659: coverage is judged per LEG —
  *  a multi-PR card's legs verify independently, and an uncovered leg
- *  bounces naming ITS stamp. */
+ *  bounces naming ITS stamp. BR#3727: the train layer also pre-clears
+ *  mergeStateStatus=behind (the §5 carry's own state — base advanced,
+ *  branch still mergeable; the merge leg owns the machine-clean
+ *  update-branch) and WAITS on blocked-with-pending-head-checks (strict
+ *  branch protection re-runs the required checks on the head after every
+ *  carry). decideMergeAction, the shared law, stays clean/unstable. */
 export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (i.cardStatus === "superseded")
     return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
@@ -1903,13 +1908,38 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
       bounceKind: "coverage",
     };
   }
+  // BR#3727: mergeStateStatus=behind IS the state the carry law (BR#3516 §5)
+  // was written for — base advanced, branch still mergeable. The shared law
+  // stays clean/unstable and bounces behind: the SWEEP has no update-branch
+  // authority. The TRAIN does — its merge leg owns trial-merge →
+  // update-branch → verdict carries — so the train gate pre-clears behind
+  // here. Without it, the exact PRs the carry law was written for
+  // bounce-loop (bounce → re-verify → re-queue → behind again — nothing in
+  // the bounce flow updates the branch). Coverage is already settled above:
+  // an uncovered head bounced before this line, so behind reaching the
+  // compose is always a §5-carryable head.
+  const behind = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "behind";
+  // BR#3727: blocked with head checks merely PENDING is a clock, not a
+  // defect — strict branch protection re-runs the required checks on the
+  // head right after every machine-clean update-branch, so the tick after
+  // the carry reads blocked. Pending checks wait a tick; red checks note
+  // (the shared law's own non-in_review row); blocked with GREEN checks
+  // means protection wants something checks can't give (reviews/settings) —
+  // the shared law's bounce stands.
+  if (typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked") {
+    const head = classifyHeadChecks(i.headChecks);
+    if (head.verdict === "unsettled")
+      return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
+    if (head.verdict === "red")
+      return { kind: "note", reason: `PR #${i.prNumber} head check RED: ${head.red.map((r) => r.name).join(", ")} — card queued (not in_review), no bounce; the linked session owns it` };
+  }
   const gate = decideMergeAction({
     prNumber: i.prNumber,
     prTitle: "",
     headSha: i.headSha,
     baseVerdict: i.baseVerdict,
     mergeable: i.mergeable,
-    mergeStateStatus: i.mergeStateStatus,
+    mergeStateStatus: behind ? "clean" : i.mergeStateStatus,
     commits: i.commits,
     headChecks: i.headChecks,
     cardStatus: i.cardStatus,
@@ -1919,7 +1949,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (gate.kind === "merge")
     return {
       kind: "merge",
-      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green`,
+      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
     };
   return gate;
 }

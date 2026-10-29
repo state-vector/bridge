@@ -3,6 +3,7 @@ import {
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
+  decideMergeAction,
   decideTrainGate,
   leaseDecide,
   mergeTrainQueue,
@@ -836,14 +837,11 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     }
     // UNKNOWN → null → skip this tick (never a bounce)
     expect(decideTrainGate(gh("UNKNOWN", "UNKNOWN")).kind).toBe("skip");
-    // uppercase states read back lowercase-named: BEHIND bounces NAMING behind
-    const behind = decideTrainGate(gh("MERGEABLE", "BEHIND"));
-    expect(behind.kind).toBe("bounce");
-    if (behind.kind === "bounce") {
-      expect(behind.defect).toContain("mergeStateStatus=behind");
-      // a non-clean state is a GATE bounce (BR#4066) — not a conflict lie
-      expect(behind.bounceKind).toBe("gate");
-    }
+    // uppercase behind PRE-CLEARS at the train gate (BR#3727 — the §5 carry
+    // is reachable; supersedes this block's original "BEHIND bounces naming
+    // behind" pin: the shared decideMergeAction still bounces behind, and
+    // the BR#3727 describe below pins that).
+    expect(decideTrainGate(gh("MERGEABLE", "BEHIND")).kind).toBe("merge");
     // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
     expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
   });
