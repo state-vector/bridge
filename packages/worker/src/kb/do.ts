@@ -181,6 +181,41 @@ const TRAIN_STARVE_MS = 10 * 60_000;
  *  there is no work so the lane is trusted the moment work arrives. */
 const TRAIN_READY_MS = 15 * 60_000;
 
+// ---- BR#4658 worker-executor verification probes ----
+/** A failed probe re-arms after this backoff (the executor re-polls pending
+ *  probes each tick; the sweep re-enqueues failed rows past the backoff). */
+const PROBE_RETRY_MS = 10 * 60_000;
+/** Transient gh failures before the probe gives up and the park goes back to
+ *  a loud unresolvable (never a silent infinite retry loop). */
+const PROBE_ATTEMPT_CAP = 12;
+
+/** The dedupe key for a probe — one row per atom across all waiting cards. */
+export function proxyProbeKey(atom: Pick<ProxyAtom, "kind" | "repo" | "runId" | "newerThan" | "number">): string | null {
+  const repo = String(atom.repo ?? "").trim();
+  if (!repo) return null;
+  if (atom.kind === "run_success") {
+    if (atom.runId) return `run:${repo}:${atom.runId}`;
+    if (atom.newerThan) return `newer:${repo}:${atom.newerThan}`;
+    return null;
+  }
+  if (atom.kind === "pr_checks_green") {
+    return Number(atom.number ?? 0) > 0 ? `checks:${repo}#${Number(atom.number)}` : null;
+  }
+  return null;
+}
+
+/** The hub-side head law (BR#3409 / BR#4658): the observed head matches the
+ *  awaited head — exact, or the awaited value is a prefix of the full 40-hex
+ *  observed head (parks may record a short hex prefix). The reverse never
+ *  matches: a short observed value cannot confirm a longer expectation. */
+export function headMatches(observed: string, expected: string): boolean {
+  const o = String(observed ?? "").toLowerCase();
+  const e = String(expected ?? "").toLowerCase();
+  if (!o || !e) return false;
+  return o === e || o.startsWith(e);
+}
+
+
 /** The standard verify-duty body — the ONE 5c-gated template. The normal
  *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
  *  render through here, so the two spawn sites can never drift apart.
@@ -1040,11 +1075,15 @@ export class KnowledgeHub {
   // unresolvable (never auto-flip — conservatism law) and the spawned unblock
   // duty verifies them first-hand, where the creds live.
   /** Live verdict for one proxy atom. `receipt` is the evidence line that
-   *  rides the spawned duty's body (and the per-card stamp). */
+   *  rides the spawned duty's body (and the per-card stamp). `probeState`
+   *  (BR#4658) carries the worker-executor verification-probe lifecycle for
+   *  run_success/pr_checks_green atoms: unprobed (needs enqueue) | pending |
+   *  exhausted (cap reached — loud unresolvable again) | negative (conclusive
+   *  no — the gate has not fired). */
   private async evalProxyAtom(
     atom: ProxyAtom,
     io: { defaultRepo: string },
-  ): Promise<{ ok: boolean; receipt: string }> {
+  ): Promise<{ ok: boolean; receipt: string; probeState?: "unprobed" | "pending" | "exhausted" | "negative" }> {
     const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
     switch (atom.kind) {
       case "br_done": {
@@ -1088,11 +1127,62 @@ export class KnowledgeHub {
       }
       case "run_success": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — run ${atom.runId} outcome needs credentials the hub does not hold (BR#3516); verify first-hand` };
+        // BR#4658: ledger-native first — a worker-executor probe verdict is a
+        // fact the hub OWNS (stamped through proxy.verify with the gh
+        // receipt), same trust shape as the train-stamped provenance above.
+        const v = this.one(
+          `SELECT ok, receipt, head_sha, conclusion, state, attempts FROM proxy_probes WHERE key = ?`,
+          proxyProbeKey(atom),
+        ) as any;
+        if (v?.state === "verified" && v.ok === 1) {
+          return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
+        }
+        if (v?.state === "verified" && v.ok === 0) {
+          // conclusive negative (head mismatch / run failed) — the gate has
+          // NOT fired; the park stays (BR#3409 fail-closed), loudly.
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.receipt}`, probeState: "negative" };
+        }
+        if (v?.state === "failed") {
+          const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
+          return {
+            ok: false,
+            receipt: exhausted
+              ? `worker-executor probe exhausted after ${v.attempts} attempts — ${v.error ?? "gh kept failing"}; verify first-hand (BR#3516)`
+              : `worker-executor probe pending (attempt ${v.attempts}/${PROBE_ATTEMPT_CAP} failed: ${v.error ?? "gh failed"} — retrying)`,
+            probeState: exhausted ? "exhausted" : "pending",
+          };
+        }
+        if (v) {
+          return { ok: false, receipt: `worker-executor probe pending (BR#4658) — a daemon executor will run gh and stamp the verdict`, probeState: "pending" };
+        }
+        return { ok: false, receipt: `unverified from the hub — run ${atom.runId ?? atom.newerThan} outcome needs credentials the hub does not hold (BR#3516); enqueueing a worker-executor verification probe (BR#4658)`, probeState: "unprobed" };
       }
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
+        const v = this.one(
+          `SELECT ok, receipt, head_sha, conclusion, state, attempts FROM proxy_probes WHERE key = ?`,
+          proxyProbeKey(atom),
+        ) as any;
+        if (v?.state === "verified" && v.ok === 1) {
+          return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
+        }
+        if (v?.state === "verified" && v.ok === 0) {
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.receipt}`, probeState: "negative" };
+        }
+        if (v?.state === "failed") {
+          const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
+          return {
+            ok: false,
+            receipt: exhausted
+              ? `worker-executor probe exhausted after ${v.attempts} attempts — ${v.error ?? "gh kept failing"}; verify first-hand (BR#3516)`
+              : `worker-executor probe pending (attempt ${v.attempts}/${PROBE_ATTEMPT_CAP} failed: ${v.error ?? "gh failed"} — retrying)`,
+            probeState: exhausted ? "exhausted" : "pending",
+          };
+        }
+        if (v) {
+          return { ok: false, receipt: `worker-executor probe pending (BR#4658) — a daemon executor will run gh and stamp the verdict`, probeState: "pending" };
+        }
+        return { ok: false, receipt: `unverified from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); enqueueing a worker-executor verification probe (BR#4658)`, probeState: "unprobed" };
       }
       case "deployed": {
         // the one credential-free external atom: the hub IS the deploy. Its
@@ -1132,6 +1222,129 @@ export class KnowledgeHub {
       this.audit("hub:proxy-watch", "proxy_check", id, { verdict, detail: detail?.slice(0, 300) });
     }
   }
+
+  // ---- worker-executor verification probes (BR#4658) ----
+  // The hub holds no GitHub credentials (BR#3516); run_success /
+  // pr_checks_green parks had NO machine closer (specimen BR#3621: the run
+  // concluded SUCCESS and the card sat blocked ~60h past its exit). The
+  // sweep enqueues a probe; the daemon executor leg (train.rs, beside the
+  // merge train) runs gh first-hand and feeds the verdict through
+  // proxy.verify — executor-fed facts, hub-decided (BR#4489). Fail-closed
+  // per BR#3409: a head mismatch or an inconclusive gh state never flips.
+
+  /** Enqueue (or retry) the verification probe for one atom. Dedupe by the
+   *  atom key — two cards awaiting the same run share ONE probe. Attempt-
+   *  capped with backoff pacing so a broken gh never tight-loops. */
+  private enqueueProxyProbe(atom: ProxyAtom, cardId: string, now: number): void {
+    const key = proxyProbeKey(atom);
+    if (!key) return;
+    const existing = this.one(`SELECT state, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key) as any;
+    if (existing) {
+      if (existing.state === "pending" || existing.state === "verified") return; // in flight / done
+      // failed: retry on backoff until the cap
+      if (Number(existing.attempts ?? 0) >= PROBE_ATTEMPT_CAP) return; // exhausted — loud unresolvable
+      if (now - Number(existing.updated_ts ?? 0) < PROBE_RETRY_MS) return; // backoff
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'pending', card_id = ?, updated_ts = ? WHERE key = ?`,
+        cardId, now, key,
+      );
+      this.audit("hub:proxy-watch", "proxy_probe_retry", key, { attempts: Number(existing.attempts ?? 0) + 1, card: cardId });
+      return;
+    }
+    this.state.storage.sql.exec(
+      `INSERT INTO proxy_probes (key, repo, kind, run_id, newer_than, pr, expected_head, card_id, state, attempts, created_ts, updated_ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
+      key, String(atom.repo ?? ""), atom.kind,
+      atom.kind === "run_success" ? (atom.runId ?? null) : null,
+      atom.kind === "run_success" ? (atom.newerThan ?? null) : null,
+      atom.kind === "pr_checks_green" ? Number(atom.number ?? 0) || null : null,
+      atom.kind === "run_success" ? (atom.head ?? null) : null,
+      cardId, now, now,
+    );
+    this.audit("hub:proxy-watch", "proxy_probe_enqueued", key, { card: cardId, kind: atom.kind });
+  }
+
+  /** proxy.probes — the executor poll: pending probes, oldest first, capped.
+   *  Read-only; the hub decides nothing here (the facts come back through
+   *  proxy.verify). */
+  private proxyProbes(body: any): any {
+    const limit = Math.max(1, Math.min(Number(body?.limit ?? 10) || 10, 25));
+    const rows = this.state.storage.sql.exec(
+      `SELECT key, repo, kind, run_id, newer_than, pr, expected_head, card_id, attempts FROM proxy_probes
+       WHERE state = 'pending' ORDER BY updated_ts ASC LIMIT ?`,
+      limit,
+    ).toArray();
+    return { ok: true, probes: rows };
+  }
+
+  /** proxy.verify — the executor feeds one probe's gh verdict; the HUB
+   *  decides (executor-fed facts, hub-decided — BR#3516/BR#4489). A
+   *  satisfied verdict stamps a `proxy_verified` event on the parked card
+   *  with the GitHub-URL receipt and re-enters the standard satisfied-proxy
+   *  path on the next sweep pass; head mismatches and conclusive failures
+   *  are stamped negative and NEVER flip (BR#3409 fail-closed); transient
+   *  gh errors bump attempts (backoff, cap → loud unresolvable again). */
+  private proxyVerify(body: any, actor: string): any {
+    const key = String(body?.key ?? "").trim();
+    const probe = this.one(`SELECT * FROM proxy_probes WHERE key = ?`, key) as any;
+    if (!probe) return { ok: false, error: `no such probe: ${key}` };
+    if (probe.state === "verified") return { ok: false, error: `probe ${key} already verified — verdict of record stands` };
+    const now = Date.now();
+    const headSha = typeof body?.head_sha === "string" ? body.head_sha.toLowerCase() : "";
+    const receipt = String(body?.receipt ?? "").trim();
+    const conclusion = typeof body?.conclusion === "string" ? body.conclusion.toUpperCase() : "";
+    const expected = String(probe.expected_head ?? "").toLowerCase();
+
+    // HUB-side head law (BR#3409): the executor reports what it saw; the hub
+    // compares against the awaited head — a mismatch is a conclusive NO
+    // whatever the executor's ok said.
+    const headMismatch = !!(expected && headSha && !headMatches(headSha, expected));
+
+    if (body?.ok === true && !headMismatch) {
+      if (!/https:\/\/github\.com\//.test(receipt)) {
+        return { ok: false, error: "receipt must carry the GitHub URL(s) of the evidence (BR#4658 contract)" };
+      }
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'verified', ok = 1, receipt = ?, head_sha = ?, conclusion = ?, error = NULL, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+        receipt.slice(0, 500), headSha || null, conclusion || null, now, key,
+      );
+      const note = `proxy_verified: ${probe.kind} SATISFIED — ${receipt}${headSha ? ` (head ${headSha.slice(0, 9)})` : ""} (worker-executor ${actor}, BR#4658)`;
+      this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 1, receipt: receipt.slice(0, 300), head_sha: headSha || null });
+      this.audit("hub:proxy-watch", "proxy_probe_verified", key, { card: probe.card_id, receipt: receipt.slice(0, 300), head_sha: headSha || null });
+      return { ok: true, verdict: "satisfied", note };
+    }
+
+    // conclusive negative: the executor saw the gate fail for real (run
+    // failed/cancelled, checks red) or the hub's head law failed the verdict.
+    const conclusive = headMismatch || body?.conclusive === true;
+    if (conclusive) {
+      const why = headMismatch
+        ? `head mismatch — run concluded at ${headSha.slice(0, 9) || "?"}, the park awaits ${expected.slice(0, 9)} (BR#3409 fail-closed)`
+        : String(body?.error ?? body?.reason ?? "conclusive negative from the executor").slice(0, 300);
+      const ev = receipt && /https:\/\/github\.com\//.test(receipt) ? receipt : `https://github.com/${probe.repo}/actions`;
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+        ev.slice(0, 500), headSha || null, conclusion || null, why, now, key,
+      );
+      const note = `proxy_verified: ${probe.kind} NOT satisfied — ${why} (worker-executor ${actor}, BR#4658); the park stands (fail-closed)`;
+      this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 0, receipt: ev.slice(0, 300), head_sha: headSha || null });
+      this.audit("hub:proxy-watch", "proxy_probe_negative", key, { card: probe.card_id, why });
+      return { ok: true, verdict: "negative", note };
+    }
+
+    // transient: gh broken / run still in flight — backoff, cap, no event
+    // stamp (a pending run re-probing every few minutes must not churn the
+    // card's version log).
+    const attempts = Number(probe.attempts ?? 0) + 1;
+    const err = String(body?.error ?? "gh failed (no detail)").slice(0, 300);
+    this.state.storage.sql.exec(
+      `UPDATE proxy_probes SET state = 'failed', error = ?, attempts = ?, updated_ts = ? WHERE key = ?`,
+      err, attempts, now, key,
+    );
+    this.audit("hub:proxy-watch", "proxy_probe_transient", key, { attempts, error: err.slice(0, 200) });
+    return { ok: true, verdict: attempts >= PROBE_ATTEMPT_CAP ? "exhausted" : "retry", attempts };
+  }
+
 
   private async unblockProxySweep(now: number): Promise<void> {
     const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("unblock_proxy_sweep_minutes", "15"), 10) || 15));
@@ -1235,13 +1448,37 @@ export class KnowledgeHub {
           await this.proseLadder(r, meta, cond, now, prev, unparseable, prose);
           continue;
         }
-        const results: { atom: ProxyAtom; ok: boolean; receipt: string }[] = [];
+        const results: { atom: ProxyAtom; ok: boolean; receipt: string; probeState?: string }[] = [];
         for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { defaultRepo })) });
         const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
         if (unparseable || unresolvable) {
           // cannot FULLY read the condition — never auto-flip (conservatism law)
           this.stampProxyCheck(r.id, meta, now, unparseable ? "unparseable" : "unresolvable",
             "condition partially machine-checkable — the sweep never flips a card it cannot fully read", prev,
+            { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
+          continue;
+        }
+        // BR#4658 — the worker-executor verification leg. run_success /
+        // pr_checks_green atoms are now probe-backed: enqueue what has no
+        // probe yet (dedup, attempt-capped, paced), retry failed ones on
+        // backoff, and keep the card parked (drain-silent — the typed hold
+        // already classifies it external) until a verdict lands. A verified
+        // verdict re-enters the standard path: every-atom-true flips below
+        // (BR#4282 owned done-close / unblock spawn); a conclusive negative
+        // or an exhausted probe stamps honestly and never flips.
+        const probeStates = results.filter((x) => x.probeState && x.probeState !== "negative");
+        if (probeStates.length) {
+          for (const x of probeStates) this.enqueueProxyProbe(x.atom, r.id, now);
+          const exhausted = probeStates.some((x) => x.probeState === "exhausted");
+          if (exhausted) {
+            // the probe burned its attempts — back to the loud pre-BR#4658
+            // state (unresolvable), receipts intact on the stamp
+            this.stampProxyCheck(r.id, meta, now, "unresolvable",
+              "worker-executor verification probe exhausted — the sweep cannot read this gate (BR#3516); verify first-hand", prev,
+              { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
+            continue;
+          }
+          this.stampProxyCheck(r.id, meta, now, "probe_pending", null, prev,
             { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
           continue;
         }
@@ -2094,6 +2331,16 @@ export class KnowledgeHub {
         last_seen_ts INTEGER NOT NULL,
         PRIMARY KEY (gateway, agent)
       );
+      -- identity aliases (2026-10-29, Ray): a retired display name → the label
+      -- it became. Machine/agent names churn with hostnames (macOS rotation,
+      -- -2 suffixes, DHCP-IP hosts) — the PRINCIPAL is the identity anchor
+      -- (BR#3787), so every rename records the old name here and display
+      -- surfaces resolve through it instead of showing a pile of dead labels.
+      CREATE TABLE IF NOT EXISTS identity_aliases (
+        label TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         token_id TEXT NOT NULL,
@@ -2221,6 +2468,35 @@ export class KnowledgeHub {
         updated_ts INTEGER NOT NULL,
         PRIMARY KEY (repo, pr)
       );
+      -- BR#4658 — the worker-executor verification leg for non-train
+      -- typed-await parks. The hub holds no VCS credentials (BR#3516): the
+      -- proxy sweep cannot VERIFY run_success / pr_checks_green atoms
+      -- machine-side, so those parks had NO closer once their gate fired
+      -- (specimen BR#3621: exit met 60h, still parked). The sweep enqueues a
+      -- probe here; a worker-executor (the daemon leg beside the merge
+      -- train) runs gh first-hand and feeds the verdict back through
+      -- proxy.verify — executor-fed facts, hub-decided (the BR#4489
+      -- division of labour). One row per atom (dedupe across cards).
+      CREATE TABLE IF NOT EXISTS proxy_probes (
+        key TEXT PRIMARY KEY,     -- run:<repo>:<run_id> | newer:<repo>:<run_id> | checks:<repo>#<n>
+        repo TEXT NOT NULL,
+        kind TEXT NOT NULL,       -- run_success | pr_checks_green
+        run_id TEXT,              -- run_success: the awaited run id
+        newer_than TEXT,          -- run_success newer_than form
+        pr INTEGER,               -- pr_checks_green: the PR number
+        expected_head TEXT,       -- the awaited commit (7-40 hex, optional) — mismatch fails closed (BR#3409)
+        card_id TEXT NOT NULL,    -- the parked card the probe serves (first requester)
+        state TEXT NOT NULL DEFAULT 'pending', -- pending | verified | failed
+        ok INTEGER,               -- last conclusive verdict (1 satisfied / 0 negative)
+        receipt TEXT,             -- GitHub URL(s) — the evidence that rode the verdict
+        head_sha TEXT,            -- the observed head at verification time
+        conclusion TEXT,          -- the observed run conclusion / checks verdict
+        error TEXT,               -- last transient gh failure (state=failed)
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_proxy_probes_state ON proxy_probes (state, updated_ts);
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -2684,6 +2960,11 @@ export class KnowledgeHub {
         case "reconcile.report": return this.json(await this.reconcileReport(body, actor));
         case "reconcile.status": return this.json(await this.reconcileStatus(body));
         case "reconcile.ignore": return this.json(await this.reconcileIgnore(body, actor));
+        // ---- proxy verification probes (BR#4658): the executor polls the
+        // sweep-enqueued probes, runs gh first-hand, feeds verdicts back —
+        // executor-fed facts, hub-decided ----
+        case "proxy.probes": return this.json(this.proxyProbes(body));
+        case "proxy.verify": return this.json(this.proxyVerify(body, actor));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
@@ -2736,6 +3017,8 @@ export class KnowledgeHub {
         case "admin.list_tokens":
         case "admin.revoke":
         case "admin.token_tags":
+        case "admin.alias":
+        case "admin.aliases":
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
@@ -2745,6 +3028,8 @@ export class KnowledgeHub {
         case "admin.alarm_sweep":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
+          if (op === "admin.alias") return this.json(await this.adminAliasSet(body, actor));
+          if (op === "admin.aliases") return this.json({ aliases: this.state.storage.sql.exec(`SELECT label, canonical, ts FROM identity_aliases ORDER BY ts DESC`).toArray() });
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
@@ -4824,21 +5109,62 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql.exec(
       `SELECT label, tags, transport, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY last_seen_ts DESC`,
     ).toArray().filter((a) => !a.revoked_ts);
-    const shape = (a: any) => ({
-      label: a.label,
+    // Identity collapse (2026-10-29): retired display names resolve through
+    // identity_aliases onto their live label — the board shows ONE identity
+    // per machine/agent with the dead names carried as `aliases`, instead of
+    // a pile of stale gateway/agent labels per hostname churn.
+    const shape = (a: any, label: string, aliases: string[]) => ({
+      label,
+      ...(aliases.length ? { aliases } : {}),
       tags: parseTags(a.tags),
       transport: a.transport ?? "mcp",
       online: a.last_seen_ts >= cutoff,
       last_seen_ts: a.last_seen_ts,
     });
-    const agents = rows.filter((a) => !tagsSayGateway(a.tags)).map((a: any) => ({ ...shape(a), tags: [] }));
-    const gateways = rows.filter((a) => tagsSayGateway(a.tags)).map((g: any) => ({
-      ...shape(g),
-      agents: this.state.storage.sql.exec(
-        `SELECT agent AS label, last_seen_ts FROM gateway_agents WHERE gateway = ? ORDER BY last_seen_ts DESC LIMIT 20`,
-        g.label,
-      ).toArray(),
-    }));
+    const group = (filter: (a: any) => boolean) => {
+      const byCanon = new Map<string, { row: any; aliases: string[] }>();
+      for (const a of rows.filter(filter)) {
+        const c = this.canonLabel(a.label);
+        const cur = byCanon.get(c);
+        if (!cur) { byCanon.set(c, { row: a, aliases: [] }); continue; }
+        const keep = (a.last_seen_ts ?? 0) > (cur.row.last_seen_ts ?? 0) ? a : cur.row;
+        const aliases = (cur.row === keep ? cur.aliases : [...cur.aliases, cur.row.label]);
+        if (a !== keep) aliases.push(a.label);
+        byCanon.set(c, { row: keep, aliases });
+      }
+      // every retired name recorded in identity_aliases for this identity
+      // shows as `aliases`, even when only one token row ever existed
+      for (const [c, v] of byCanon)
+        v.aliases = [...new Set([...v.aliases, ...[...this.aliasSetOf(c)].filter((l) => l !== c)])];
+      return byCanon;
+    };
+    const agents = [...group((a) => !tagsSayGateway(a.tags)).entries()]
+      .map(([c, v]) => ({ ...shape(v.row, c, v.aliases), tags: [] }))
+      .sort((a, b) => b.last_seen_ts - a.last_seen_ts);
+    const gateways = [...group((a) => tagsSayGateway(a.tags)).entries()]
+      .map(([c, v]) => {
+        // gateway→agent edges are keyed by raw historical labels — resolve
+        // every alias variant of this gateway, then collapse agent labels too
+        const variants = [...this.aliasSetOf(c)];
+        const edges = this.state.storage.sql.exec(
+          `SELECT agent, MAX(last_seen_ts) AS last_seen_ts FROM gateway_agents
+           WHERE ${variants.map(() => "gateway = ?").join(" OR ")} GROUP BY agent`,
+          ...variants,
+        ).toArray() as any[];
+        const byAgent = new Map<string, number>();
+        for (const e of edges) {
+          const ca = this.canonLabel(String(e.agent));
+          byAgent.set(ca, Math.max(byAgent.get(ca) ?? 0, Number(e.last_seen_ts ?? 0)));
+        }
+        return {
+          ...shape(v.row, c, v.aliases),
+          agents: [...byAgent.entries()]
+            .map(([label, last_seen_ts]) => ({ label, last_seen_ts }))
+            .sort((a, b) => b.last_seen_ts - a.last_seen_ts)
+            .slice(0, 20),
+        };
+      })
+      .sort((a, b) => b.last_seen_ts - a.last_seen_ts);
     return { agents, gateways, note: "bridge routes between agents — gateways are listed separately with the agents they dispatched; transport shows how each is reachable today (mcp) or next (a2a, acp-proxy, board)" };
   }
 
@@ -4855,6 +5181,75 @@ export class KnowledgeHub {
        ON CONFLICT(gateway, agent) DO UPDATE SET last_seen_ts = excluded.last_seen_ts`,
       gateway.slice(0, 80), agent.slice(0, 80), Date.now(),
     );
+  }
+
+  /** Record a retired display name → its current label (2026-10-29). */
+  private recordAlias(label: string, canonical: string) {
+    if (!label || label === canonical) return;
+    this.state.storage.sql.exec(
+      `INSERT INTO identity_aliases (label, canonical, ts) VALUES (?, ?, ?)
+       ON CONFLICT(label) DO UPDATE SET canonical = excluded.canonical, ts = excluded.ts`,
+      label.slice(0, 80), canonical.slice(0, 80), Date.now(),
+    );
+  }
+
+  /** Transitive closure of a canonical label: itself + every retired name
+   *  that resolves to it (alias chains — old→new recorded at each rename). */
+  private aliasSetOf(canonical: string): Set<string> {
+    const rows = this.state.storage.sql.exec(`SELECT label, canonical FROM identity_aliases`).toArray() as any[];
+    const byCanonical = new Map<string, string[]>();
+    for (const r of rows) {
+      const list = byCanonical.get(r.canonical) ?? [];
+      list.push(r.label);
+      byCanonical.set(r.canonical, list);
+    }
+    const out = new Set<string>([canonical]);
+    let frontier = [canonical];
+    while (frontier.length) {
+      const next: string[] = [];
+      for (const c of frontier)
+        for (const l of byCanonical.get(c) ?? [])
+          if (!out.has(l)) { out.add(l); next.push(l); }
+      frontier = next;
+    }
+    return out;
+  }
+
+  /** Display resolution: a retired name renders as its current label
+   *  (chain-followed with a depth guard against cycles). */
+  private canonLabel(label: string): string {
+    let cur = label;
+    for (let i = 0; i < 10; i++) {
+      const row = this.one(`SELECT canonical FROM identity_aliases WHERE label = ?`, cur) as any;
+      if (!row?.canonical) break;
+      cur = String(row.canonical);
+    }
+    return cur;
+  }
+
+  /** Agent labels are namespaced under the GATEWAY's display label — a
+   *  gateway rename (re-pair with the same principal, BR#3787) must not
+   *  strand its provisioned agents under the dead prefix (the mac-modem →
+   *  macbook-pro-local-2 pile). When `<caller>/<suffix>` is provisioned and
+   *  `<oldGW>/<suffix>` exists for a name that aliases to caller, the agent
+   *  token RENAMES IN PLACE: same id, same hash (the runner's stored secret
+   *  keeps authenticating), same tags — only the display label moves. */
+  private agentReassociateOnGatewayRename(caller: string, label: string): { id: string } | null {
+    const suffix = label.slice(caller.length + 1);
+    if (!suffix || suffix.includes("/")) return null;
+    const prevs = this.aliasSetOf(caller);
+    const olds = [...prevs].filter((p) => p !== caller).map((p) => `${p}/${suffix}`);
+    if (!olds.length) return null;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, label FROM auth_tokens WHERE label IN (${olds.map(() => "?").join(", ")}) AND revoked_ts IS NULL`,
+      ...olds,
+    ).toArray() as any[];
+    const old = rows[0];
+    if (!old) return null;
+    this.state.storage.sql.exec(`UPDATE auth_tokens SET label = ? WHERE id = ?`, label, old.id);
+    this.recordAlias(old.label, label);
+    this.audit(caller, "agent_reassociate", old.id, { from: old.label, to: label });
+    return { id: old.id };
   }
 
   /** The session a write belongs to: explicit, else the token's most recent session. */
@@ -6333,6 +6728,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     const rotate = body.rotate === true;
     const ts = Date.now();
+    // gateway renamed (re-paired on the same principal, BR#3787)? its
+    // namespaced agents re-associate onto the new prefix instead of piling
+    // up a fresh `<newGW>/<agent>` identity per rename (2026-10-29)
+    if (label.includes("/") && !rotate) {
+      const renamed = this.agentReassociateOnGatewayRename(caller, label);
+      if (renamed) return { exists: true, id: renamed.id, label, reassociated: true };
+    }
     const existing = this.one(`SELECT id, revoked_ts FROM auth_tokens WHERE label = ?`, label);
     if (existing && !rotate) {
       if (existing.revoked_ts) throw new Error(`token '${label}' was revoked — provision with rotate to re-mint`);
@@ -6493,6 +6895,24 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return { secret, label, ws, id, principal: vended ?? principal, epoch: Number(epochRow?.epoch ?? 1) };
   }
 
+  /** Human alias merge (2026-10-29): dead labels that predate the principal
+   *  anchor cannot be auto-clustered — the operator asserts the mapping once
+   *  (admin.alias) and every display surface collapses them via canonLabel. */
+  private async adminAliasSet(body: any, actor: string) {
+    const alias = String(body.alias ?? "").trim();
+    const canonical = String(body.canonical ?? "").trim();
+    if (!alias || !canonical) throw new Error("alias + canonical required");
+    if (alias === canonical) throw new Error("alias and canonical are the same label");
+    if (alias.startsWith("_") || canonical.startsWith("_")) throw new Error("system namespaces (_direct/...) are not aliasable");
+    if (this.one(`SELECT 1 FROM identity_aliases WHERE label = ?`, canonical))
+      throw new Error(`'${canonical}' is itself a retired alias — merge into '${this.canonLabel(canonical)}' instead`);
+    const live = this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, canonical);
+    if (!live) throw new Error(`canonical label '${canonical}' has no live token`);
+    this.recordAlias(alias, canonical);
+    this.audit(actor, "identity_alias", null, { alias, canonical });
+    return { ok: true, alias, canonical, alias_set_size: this.aliasSetOf(canonical).size };
+  }
+
   private async tokenMint(body: any) {
     const label = String(body.label ?? "").trim();
     if (!/^[a-zA-Z0-9._\/-]{2,64}$/.test(label)) throw new Error("label must be 2-64 chars [a-zA-Z0-9._/-]");
@@ -6518,7 +6938,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const secret = generateAuthToken();
     const hash = await hashAuthToken(secret);
     const own = principal ? this.one(`SELECT id, label, revoked_ts, principal FROM auth_tokens WHERE principal = ? AND revoked_ts IS NULL`, principal) as any : null;
-    const byLabel = this.one(`SELECT id, principal FROM auth_tokens WHERE label = ?`, label) as any;
+    const byLabel = this.one(`SELECT id, label, principal FROM auth_tokens WHERE label = ?`, label) as any;
     if (byLabel && own?.id !== byLabel.id && byLabel.principal && byLabel.principal !== principal) {
       throw new Error(`label '${label}' already belongs to another device's credential — pick a different label (rotation never steals, BR#3787)`);
     }
@@ -6531,6 +6951,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const target = (own && !byLabel) ? own : (byLabel ?? own);
     if (target) {
       const epoch = this.rotateTokenRow(target.id as string);
+      const prevLabel = String((target as any).label ?? "");
       // the vended class rides with the replacement: a gateway pairing must
       // not leave the row carrying the replaced token's stale tags
       const mintTags = Array.isArray(body.tags) ? body.tags.map((t: any) => String(t).slice(0, 40)).slice(0, 10) : [];
@@ -6538,6 +6959,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         `UPDATE auth_tokens SET hash = ?, label = ?, tags = ?, principal = COALESCE(?, principal), revoked_ts = NULL WHERE id = ?`,
         hash, label, JSON.stringify(mintTags), principal, target.id,
       );
+      // the machine is the same (principal-anchored) — the old display name
+      // becomes an alias so history and the board resolve to the live label
+      this.recordAlias(prevLabel, label);
       const ws = this.wsSlug();
       if (ws) {
         const reg = (this.env as any).KB.get((this.env as any).KB.idFromName(doWs(DEFAULT_WS_SLUG)));

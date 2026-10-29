@@ -191,6 +191,25 @@ not migrated), and every label door (`token.rename`, pair approve,
 2026-10-28/29 incident was a token-shaped string pasted as a label that then
 rendered into owner columns.
 
+**Machine/agent names are display, not identity — renames alias, never mint
+(2026-10-29)**: a hostname change (macOS local-name rotation, the network's
+`-2` dedup suffix, a VPS's DHCP IP, a lost principal file) used to mint a
+fresh gateway identity and — because agent labels are namespaced
+`<gateway>/<agent>` — a fresh identity per provisioned agent, piling dead
+labels on the board. Now every rename through the principal anchor records
+the old name in `identity_aliases` (`old → current`), and:
+
+- `agent.provision` under a renamed gateway **renames the agent token in
+  place** (same id, same hash — the runner's stored secret keeps working)
+  instead of minting `<newGW>/<agent>`;
+- the identity list (`/agents`) collapses each identity to its live label
+  and carries the retired names as `aliases` (gateway→agent edges resolve
+  across the alias set too), so history reads through one name;
+- `admin.alias {alias, canonical}` merges the legacy dead labels that predate
+  the principal anchor (human asserts the mapping once; `admin.aliases`
+  lists the table; a retired name can never be a canonical, so chains stay
+  forward-only).
+
 ```jsonc
 {
   "schema_version": 2,                 // written by the runner; future versions warn

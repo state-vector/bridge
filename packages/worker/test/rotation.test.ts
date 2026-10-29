@@ -240,3 +240,59 @@ describe("BR#3787 — pairing stores the device's host + principal (the forwardi
     expect(get.body.device).toBe("ip-172-31-1-230", "the device's hostname survives to the approve screen");
   });
 });
+
+describe("identity aliases (2026-10-29) — renames record aliases; agents re-associate; display collapses", () => {
+  it("a gateway re-pair on the same principal RENAMES in place and records the old name as an alias — /agents shows one identity", async () => {
+    const first = await kbJson("/admin.mint", { label: "alias-gw-old", tags: ["gateway"], principal: "p_alias_gw_kkkkkkkkkkkkkkkkkkk" });
+    expect(first.body.secret).toBeTruthy();
+    const second = await kbJson("/admin.mint", { label: "alias-gw-new", tags: ["gateway"], principal: "p_alias_gw_kkkkkkkkkkkkkkkkkkk" });
+    expect(second.body.reassociated).toBe(true);
+    expect(second.body.id).toBe(first.body.id, "same device re-pairs into the SAME token row");
+    const agents = await kbJson("/agents.list", {});
+    const gws = agents.body.gateways.filter((g: any) => g.label === "alias-gw-new");
+    expect(gws.length).toBe(1, "the old gateway name is gone from the list");
+    expect(gws[0].aliases).toContain("alias-gw-old");
+    const aliasRows = (await kbJson("/admin.aliases", {})).body.aliases;
+    expect(aliasRows).toContainEqual(expect.objectContaining({ label: "alias-gw-old", canonical: "alias-gw-new" }));
+  });
+
+  it("provisioning <renamedGW>/agent RENAMES the old <oldGW>/agent token in place — same id, stored secret keeps working", async () => {
+    // gateway minted as alias-gw2-old, provisions an agent, THEN renames
+    await kbJson("/admin.mint", { label: "alias-gw2-old", tags: ["gateway"], principal: "p_alias_gw2_llllllllllllllllllll" });
+    const prov = await kbJson("/agent.provision", { provisioned_by: "alias-gw2-old", label: "alias-gw2-old/worker" });
+    expect(prov.body.error ?? "").toBe("");
+    const oldSecret = prov.body.secret as string;
+    const agentId = prov.body.id as string;
+    // the gateway rename (same principal, new label)
+    const ren = await kbJson("/admin.mint", { label: "alias-gw2-new", tags: ["gateway"], principal: "p_alias_gw2_llllllllllllllllllll" });
+    expect(ren.body.reassociated).toBe(true);
+    // the runner provisions under the NEW prefix — must find + rename, not mint
+    const re = await kbJson("/agent.provision", { provisioned_by: "alias-gw2-new", label: "alias-gw2-new/worker" });
+    expect(re.body.error ?? "").toBe("");
+    expect(re.body.reassociated).toBe(true);
+    expect(re.body.id).toBe(agentId, "same agent token row");
+    // the OLD secret still authenticates — rename is display-only
+    const ident = await kbJson("/auth.identify", { bearer: oldSecret });
+    expect(ident.body.error).toBeUndefined();
+    // and the identity list shows the agent only under the new prefix
+    const agents = await kbJson("/agents.list", {});
+    expect(agents.body.agents.some((a: any) => a.label === "alias-gw2-new/worker")).toBe(true);
+    expect(agents.body.agents.some((a: any) => a.label === "alias-gw2-old/worker")).toBe(false);
+    expect(agents.body.agents.find((a: any) => a.label === "alias-gw2-new/worker").aliases)
+      .toContain("alias-gw2-old/worker");
+  });
+
+  it("admin.alias merges a legacy dead label into a live one; bad shapes are refused", async () => {
+    await kbJson("/admin.mint", { label: "legacy-live", tags: ["gateway"], principal: "p_alias_live_mmmmmmmmmmmmmmmmmm" });
+    const set = await kbJson("/admin.alias", { alias: "mac-modem", canonical: "legacy-live" });
+    expect(set.body.error ?? "").toBe("");
+    expect(set.body.ok).toBe(true);
+    const dup = await kbJson("/admin.alias", { alias: "legacy-live", canonical: "legacy-live" });
+    expect(dup.body.error).toMatch(/same label/);
+    const orphan = await kbJson("/admin.alias", { alias: "ghost", canonical: "no-such-label" });
+    expect(orphan.body.error).toMatch(/no live token/);
+    // the canonical may not itself be a retired alias — merge into its live label
+    const chained = await kbJson("/admin.alias", { alias: "other-dead", canonical: "mac-modem" });
+    expect(chained.body.error).toMatch(/retired alias/);
+  });
+});
