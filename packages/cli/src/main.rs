@@ -292,6 +292,7 @@ fn run(cfg: Option<DispatchConfig>) {
                         std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
                     }),
                     agent: std::env::var("BRIDGE_AGENT").ok(),
+                    role: None,
                     poll_secs: std::env::var("BRIDGE_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
                     timeout_mins: std::env::var("OPENCODE_TIMEOUT_MINS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
                     opencode_bin: std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
@@ -804,6 +805,104 @@ fn doctor() -> bool {
                 }
             }
             _ => ok("gh authed", "gh auth status failed — run `gh auth login`", &mut bad, false),
+        }
+        // BR#4489 merge-train capability: the merge executor must be a
+        // worker-class identity (default detached-cody, BR#3181) AND be able
+        // to push the lane repos. A host that cannot merge must learn it
+        // HERE, loudly: it will not claim the train lock (the executor
+        // enforces the same gate at claim time) and doctor exits with the
+        // merge-train leg flagged. Non-fatal for non-train functions — the
+        // rest of the checks below still run and a non-train gateway is
+        // unaffected.
+        let worker_ids: Vec<String> = std::env::var("MERGE_TRAIN_WORKER_IDENTITIES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let worker_ids = if worker_ids.is_empty() { vec!["detached-cody".to_string()] } else { worker_ids };
+        let login = std::process::Command::new("gh")
+            .args(["api", "user", "--jq", ".login"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase());
+        let mut lane_repos: Vec<String> = std::env::var("MERGE_TRAIN_LANES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|l| l.trim().split_once('@').map(|(r, _)| r.trim().to_string()))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if lane_repos.is_empty() {
+            // lanes are hub-defined — ask the hub (the doctor already has an
+            // authenticated client); a hub miss degrades to a note, not a FAIL
+            if let Ok(resp) = client
+                .post(format!("{}/train.status", cfg.url.trim_end_matches('/')))
+                .header("content-type", "application/json")
+                .header("Authorization", format!("Bearer {}", cfg.token))
+                .json(&serde_json::json!({}))
+                .send()
+            {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<serde_json::Value>() {
+                        if let Some(lanes) = v.get("lanes").and_then(|l| l.as_array()) {
+                            for l in lanes {
+                                if let Some(key) = l.get("lane").and_then(|x| x.as_str()) {
+                                    if let Some((r, _)) = key.split_once('@') {
+                                        let r = r.trim().to_string();
+                                        if !r.is_empty() && !lane_repos.contains(&r) {
+                                            lane_repos.push(r);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut train_capable = true;
+        match login {
+            Some(l) if worker_ids.contains(&l) => ok("merge-train identity", &format!("{l} is worker-class — this host can claim the train lock"), &mut bad, false),
+            Some(l) => {
+                train_capable = false;
+                ok(
+                    "merge-train identity",
+                    &format!("gh is authed as '{l}' (personal) — will not claim train lock as I cannot merge PRs; fix: auth gh as one of [{}] for the merge-train host", worker_ids.join(", ")),
+                    &mut bad, true,
+                );
+            }
+            None => ok("merge-train identity", "gh api user failed — cannot classify; the train will fail closed (transient? re-run doctor)", &mut bad, false),
+        }
+        // identity is necessary, not sufficient: the credential must also
+        // push each lane repo (per-lane permissions.push). Capped at 5 repos
+        // to respect gh rate limits; the count of unchecked lanes rides the note.
+        for repo in lane_repos.iter().take(5) {
+            let push = std::process::Command::new("gh")
+                .args(["api", &format!("repos/{repo}"), "--jq", ".permissions.push == true"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+            match push {
+                Some(true) => ok("merge-train push", &format!("{repo}: push allowed"), &mut bad, false),
+                Some(false) => {
+                    train_capable = false;
+                    ok(
+                        "merge-train push",
+                        &format!("{repo}: this credential CANNOT push — will not claim train lock as I cannot merge PRs; fix: grant push on {repo} (or authenticate a credential that has it)"),
+                        &mut bad, true,
+                    );
+                }
+                None => ok("merge-train push", &format!("{repo}: repo lookup failed (no access or transient) — the train fails closed; check `gh api repos/{repo}`"), &mut bad, false),
+            }
+        }
+        if lane_repos.len() > 5 {
+            ok("merge-train push", &format!("{} more lane repo(s) unchecked (rate-limit cap) — the claim-time gate re-checks every ≤5 min regardless", lane_repos.len() - 5), &mut bad, false);
+        }
+        if !train_capable {
+            println!("  \x1b[31mFAIL\x1b[0m  merge-train capability — will not claim train lock as I cannot merge PRs (train functions off; all other gateway functions unaffected)");
+            bad = true;
         }
         let git_ver = std::process::Command::new("git").arg("--version").output();
         ok(

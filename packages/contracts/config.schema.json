@@ -31,6 +31,19 @@
         "null"
       ]
     },
+    "role": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "train"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "poll_secs": {
       "type": "integer",
       "minimum": -9007199254740991,
@@ -144,6 +157,7 @@
     "agent",
     "model",
     "backend",
+    "role",
     "poll_secs",
     "timeout_mins",
     "opencode_bin",
