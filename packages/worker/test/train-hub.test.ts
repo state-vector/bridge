@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 let mf: Miniflare;
 let kbNs: any;
+let sinkId = "";
 
 const kbJson = async (path: string, body?: unknown): Promise<{ status: number; body: any }> => {
   const stub: any = await kbNs.get(kbNs.idFromName("global"));
@@ -52,6 +53,13 @@ beforeAll(async () => {
   });
   kbNs = await mf.getDurableObjectNamespace("KB");
   await kbJson("/orient", {});
+  // the drill DB is fresh: create the local alarm-sink card and point the
+  // train's asks (stop-the-line, landed-close rejections) at it
+  const sink = await kbJson("/create", { type: "task", title: "ALARM SINK — train hub drill", body_md: "test-local ask sink", tags: ["alarm"] });
+  expect(sink.status).toBe(200);
+  sinkId = String(sink.body.id);
+  const setSink = await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: sinkId } });
+  expect(setSink.body.error ?? "").toBe("");
 });
 
 afterAll(async () => {
@@ -806,5 +814,105 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
     expect(lane3.starved).toBeNull();
     expect((await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since ?? null).toBeNull();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cody" });
+  });
+
+  it("BR#4753: a gate-rejected landed close BOUNCES the card citing the gate — awaiting-ci resolves, never a raw throw (the BR#3633 wedge)", async () => {
+    const repo = "state-vector/bridge-wedge";
+    const HEAD = "b".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4700, head: HEAD, title: "IMPL: landed-close wedge drill" });
+
+    // fence the done: one open child makes the done-open-children gate
+    // reject the landed close's final leg — the exact BR#3633 shape
+    // (BR#4585 sat open while BR#3633 tried to close for an hour)
+    const child = await kbJson("/create", { type: "task", title: "open child fencing the wedge drill", session: "" });
+    expect(child.status).toBe(200);
+    const childId = String(child.body.id);
+    const linked = await kbJson("/link", { src: childId, relation: "child_of", dst: card });
+    expect(linked.body.error ?? "").toBe("");
+
+    await acquire(repo, "gw-wedge", { required_workflows: ["Test"] });
+    const M = "d".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-wedge",
+      pr: 4700, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 10 * 60_000, // past the settle dwell
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // green CI on the merge commit — but the close's done leg is fenced
+    const green = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-wedge", sha: M,
+      checks: [check(9, "Test", "success")],
+    });
+    // THE regression: the raw throw used to surface as a 5xx and re-poll forever
+    expect(green.status, `train.ci threw: ${JSON.stringify(green.body)}`).toBeLessThan(400);
+    expect(green.body.decided).toBe("bounced");
+    expect(String(green.body.error)).toContain("open child");
+
+    // the card: bounced out of the queue with the gate error in the brief.
+    // The done leg was rejected AFTER the claim leg; the bounce's review ask
+    // (BR#4068) then auto-blocks the in_progress subject — the card parks
+    // blocked-on-human with "Approved — it can re-queue" as the resume leg.
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.awaiting_ask?.ask_id).toBeTruthy(); // parked ON the review ask; the answer auto-resumes
+    expect(c.meta?.merge_train?.state).toBe("bounced");
+    expect(c.meta?.merge_train?.bounce_kind).toBe("gate");
+    expect(String(c.body_md)).toContain("Merge-train bounce");
+    expect(String(c.body_md)).toContain("open child");
+
+    // the lane idled; the queue no longer holds the card
+    const snap = await laneSnap(repo);
+    expect(snap.currently).toBeNull();
+    expect(snap.queue.map((x: any) => x.id)).not.toContain(card);
+
+    // ONE time-sensitive ask per episode, bound to the alarm sink
+    const asks = await kbJson("/search", { q: "landed close rejected", limit: 50 });
+    const mine = (asks.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo));
+    expect(mine.length).toBe(1);
+    const ask = (await kbJson("/get", { id: mine[0].id })).body;
+    expect(ask.meta?.ask?.artefact_id).toBe(sinkId);
+    expect(ask.meta?.ask?.urgency).toBe("time-sensitive");
+    expect(String(ask.meta?.ask?.details ?? ask.body_md)).toContain("open child");
+
+    // the ledger names the bounce and the audited failure
+    const hist = (await kbJson("/train.history", { repo })).body.events;
+    expect(hist.map((e: any) => e.kind)).toContain("bounced");
+  });
+
+  it("BR#4753: zero-check unconfigured lane past the fail-closed bound STOPS (bound-stop reachable) — never lands vacuously, never wedges", async () => {
+    const repo = "state-vector/bridge-vacuous";
+    const HEAD = "e".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4701, head: HEAD, title: "IMPL: vacuous bound drill" });
+
+    // NO required_workflows on acquire — the unconfigured lane that used to
+    // go vacuously green and could never reach bound-stop
+    await acquire(repo, "gw-vac");
+    const M = "f".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-vac",
+      pr: 4701, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 4 * 60 * 60_000, // 4h — past any bound (3× default 20min), past the dwell
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // ZERO check runs: green-by-vacuity + bound_exceeded ⇒ fail-closed stop
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-vac", sha: M, checks: [] });
+    expect(ci.status, `train.ci threw: ${JSON.stringify(ci.body)}`).toBeLessThan(400);
+    expect(ci.body.decided).toBe("stopped_bound");
+
+    const snap = await laneSnap(repo);
+    expect(snap.stop?.sha).toBe(M);
+    expect(String(snap.reason)).toContain("STOPPED");
+    expect(snap.currently.phase).toBe("stopped");
+
+    // the culprit bounced at stop time; the sink ask fired (the stopped flow)
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("in_progress");
+    expect(c.meta?.merge_train?.state).toBe("stopped");
+
+    // a line_green release re-opens the lane (the stop is resumable, §6)
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-vac", line_green: true });
+    expect((await kbJson("/get", { id: card })).body.status).toBe("in_progress"); // the bounce stands
   });
 });

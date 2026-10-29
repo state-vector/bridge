@@ -1872,6 +1872,39 @@ export function classifyRequiredRuns(
   return { verdict: "pending", failing, missing, pending, bound_exceeded };
 }
 
+// ---- landed-close failure policy (BR#4753 — the green branch resolves) ----
+
+/** BR#4753: a green-verdict landed close whose card transitions are
+ *  gate-REJECTED (done-open-children, review-needs-pr, separation of
+ *  duties, done-close-legs, …) is SEMANTIC per the BR#4403 retry law —
+ *  retrying cannot succeed. Storage / infra faults are retryable, bounded
+ *  by TRAIN_LANDED_CLOSE_MAX_FAILURES, then fail-closed. Every guard
+ *  rejection carries the " [rule: <name>]" tag; the other markers are the
+ *  protocol card's BR#4403 text classes plus the lifecycle illegal-edge
+ *  wording. A MISSED class only costs a bounded retry-then-stop — never a
+ *  silent forever-wedge; an over-matched class costs a bounce instead of a
+ *  retry — also a resolution. Fail-safe in both directions. */
+export const TRAIN_GATE_REJECTION_RE = /\[rule: |gate:|not allowed|separation of duties|open child|malformed|requires /i;
+
+export function isTrainGateRejection(e: unknown): boolean {
+  return TRAIN_GATE_REJECTION_RE.test(String((e as Error)?.message ?? e ?? ""));
+}
+
+/** Consecutive failed landed closes on ONE awaiting-CI merge before a
+ *  retryable failure stops failing open and takes the fail-closed stop. */
+export const TRAIN_LANDED_CLOSE_MAX_FAILURES = 3;
+
+/** The green-branch failure decision (BR#4753): awaiting-ci must always
+ *  resolve to {landed, red-stop, bound-stop, bounce} — never raw-throw.
+ *  bounce = gate rejection, the lifecycle-legal edge NOW (BR#3516 §5/§6);
+ *  stop = retryable failure at the failure budget or past the fail-closed
+ *  bound (§2); retry = storage fault, try again next tick. */
+export function landedClosePolicy(p: { gateRejection: boolean; failures: number; boundExceeded: boolean; maxFailures?: number }): "bounce" | "stop" | "retry" {
+  if (p.gateRejection) return "bounce";
+  if (p.failures >= (p.maxFailures ?? TRAIN_LANDED_CLOSE_MAX_FAILURES) || p.boundExceeded) return "stop";
+  return "retry";
+}
+
 // ---- the train's admission gate (executor-side, fail-closed) ----
 
 export type TrainGateInput = {

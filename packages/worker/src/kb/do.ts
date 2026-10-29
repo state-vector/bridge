@@ -89,6 +89,9 @@ import {
   trainQueueRemainingReason,
   trainParseNoteLegs,
   classifyRequiredRuns,
+  isTrainGateRejection,
+  landedClosePolicy,
+  TRAIN_LANDED_CLOSE_MAX_FAILURES,
   decideTrainGate,
   trainBounceBrief,
   resolveTrainBounceKind,
@@ -7450,6 +7453,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         throw new Error("train:bounced (conflict) without conflict_files — the executor must enumerate the trial-merge conflicts; refusing to render a file-less conflict brief (BR#4066)");
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
+      // BR#4753: the landed close runs blocked→in_progress→done — a
+      // gate-rejected DONE leg leaves the card in_progress, and
+      // in_progress→in_progress is an illegal edge, so the bounce leg is
+      // STATUS-AWARE: a blocked card rides the transition as always; an
+      // in_progress card is already out of the queue (the queue is
+      // blocked + merge-train reason) and takes the brief on its body
+      // instead — the BR#4494 demote drains an executor-less in_progress
+      // residue; a card that closed between the merge and the bounce has
+      // nothing to bounce (the lane just idles below).
+      const cardOpen = card.status === "blocked" || card.status === "in_progress";
       const cm = JSON.parse(card.meta ?? "{}");
       const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
       const bounceNote =
@@ -7467,120 +7480,144 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // guard dedupes re-bounces of the same leg; an answered ask re-posts
       // fresh (a new head move is a new live leg). For Me reads open asks,
       // so the band shows the live leg with no manual filing (leg 3).
+      // BR#4753: none of the card-touching legs fire on a card that already
+      // closed (done/superseded between the merge and the bounce).
       let reviewAskId: string | null = null;
       let reviewAskDeduped = false;
-      const reviewAskTitle = trainReviewAskTitle({ repo }, pr, taskId);
-      try {
-        const res: any = await this.askCreate(
-          {
-            to: "human",
-            question: reviewAskTitle,
-            reason: "the head move past the accepted verdict dismissed the stale GitHub review — without a re-filed ask the human leg lapses silently and a card one mechanical leg from landed starves at default priority (BR#4068)",
-            details: trainReviewAskDetails({ repo, prNumber: pr, taskId, headSha, conflictFiles }),
-            options: ["Approved — it can re-queue", "Changes requested — see my review", "Not yet — will review soon"],
-            artefact_id: taskId,
-            urgency: "time-sensitive",
-            review_leg: true,
-          },
-          actor,
-        );
-        reviewAskId = res?.id ?? null;
-      } catch (e) {
-        // an identical ask is already open — that IS the live leg. Refresh it
-        // (bump the stamp so the band shows it as current) and carry on: the
-        // bounce must never lose to ask dedupe.
-        reviewAskDeduped = true;
-        const dup = this.one(
-          `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.type = 'question' AND c.title = ? LIMIT 1`,
-          taskId, reviewAskTitle.slice(0, 200),
-        ) as any;
-        if (dup) {
-          const dm = JSON.parse(dup.meta ?? "{}");
-          dm.ask = { ...(dm.ask ?? {}), review_leg: true, refreshed_ts: now };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(dm), now, dup.id);
-          this.version(dup.id, actor, "update", "review ask refreshed — the head moved past the accepted verdict again (BR#4068)", {});
-          reviewAskId = dup.id;
-        }
-        this.audit(actor, "train:bounce_ask_deduped", lane.id, { task: taskId, pr, ask: reviewAskId, reason: String((e as Error)?.message ?? e).slice(0, 160) });
-      }
-      // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
-      // a bounced merge-ready card is the board's highest-value work — one
-      // mechanical/human leg from landing — and must not re-enter at default
-      // priority and starve). One meta write, before the transition.
-      const now2 = Date.now();
-      const nextMeta = {
-        ...cm,
-        boosted: now2,
-        merge_train: {
-          ...(cm.merge_train ?? {}),
-          state: "bounced",
-          bounce_kind: bounceKind,
-          defect: (defect ?? "").slice(0, 300) || undefined,
-          conflict_files: conflictFiles,
-          review_ask_id: reviewAskId ?? undefined,
-          review_ask_deduped: reviewAskDeduped || undefined,
-          bounced_at: now2,
-          pr,
-          repo,
-        },
-      };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
-      // blocked→in_progress with the fix-up brief; resolution invalidates the
-      // verdict — the card re-enters the queue only after a fresh verify.
-      await this.transition(
-        {
-          id: taskId,
-          to: "in_progress",
-          // anonymous: the hub acts as the machine, never as the last session
-          // on the token — a session-less card must not inherit the closer's
-          // session as its implementer (misattribution + a spurious
-          // review-separation refusal on a same-session re-verify)
-          session: "",
-          note: bounceNote,
-          body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
-        },
-        actor,
-      );
-      // BR#4066/67 self-heal: a coverage bounce fabricated impl work (there is
-      // nothing to repair) and the watchdog then punished the resulting
-      // silence by releasing the card — the exact queue-slot destruction
-      // fixed above. Instead: straight back into review; the standard
-      // in_review handoff auto-spawns a fresh verify duty. The re-entry note
-      // MUST carry the PR link: the review-needs-pr gate rejects a link-less
-      // in_review transition, so every coverage bounce emitted one audited
-      // rejection (folded as a gate:review-needs-pr breach event — the
-      // BR#4428 storm on BR#4363: 3 bounces, 3 events) and the card
-      // stranded in_progress instead of re-entering review.
-      // BR#4494: the rejected re-entry also sat in the unclaimable in_progress
-      // stop-gap (the BR#4467 breaches: 3 rejections, 3 stranded cards).
-      if (bounceKind === "coverage") {
+      if (cardOpen) {
+        const reviewAskTitle = trainReviewAskTitle({ repo }, pr, taskId);
         try {
-          await this.transition(
+          const res: any = await this.askCreate(
             {
-              id: taskId,
-              to: "in_review",
-              session: "",
-              note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head of PR https://github.com/${repo}/pull/${pr}; its accept re-queues the train`,
+              to: "human",
+              question: reviewAskTitle,
+              reason: "the head move past the accepted verdict dismissed the stale GitHub review — without a re-filed ask the human leg lapses silently and a card one mechanical leg from landed starves at default priority (BR#4068)",
+              details: trainReviewAskDetails({ repo, prNumber: pr, taskId, headSha, conflictFiles }),
+              options: ["Approved — it can re-queue", "Changes requested — see my review", "Not yet — will review soon"],
+              artefact_id: taskId,
+              urgency: "time-sensitive",
+              review_leg: true,
             },
             actor,
           );
+          reviewAskId = res?.id ?? null;
         } catch (e) {
-          this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; the watchdog bounce re-entry demote (BR#4494) releases it claimable at the next stall sweep` });
+          // an identical ask is already open — that IS the live leg. Refresh it
+          // (bump the stamp so the band shows it as current) and carry on: the
+          // bounce must never lose to ask dedupe.
+          reviewAskDeduped = true;
+          const dup = this.one(
+            `SELECT c.id AS id, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+               AND c.type = 'question' AND c.title = ? LIMIT 1`,
+            taskId, reviewAskTitle.slice(0, 200),
+          ) as any;
+          if (dup) {
+            const dm = JSON.parse(dup.meta ?? "{}");
+            dm.ask = { ...(dm.ask ?? {}), review_leg: true, refreshed_ts: now };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(dm), now, dup.id);
+            this.version(dup.id, actor, "update", "review ask refreshed — the head moved past the accepted verdict again (BR#4068)", {});
+            reviewAskId = dup.id;
+          }
+          this.audit(actor, "train:bounce_ask_deduped", lane.id, { task: taskId, pr, ask: reviewAskId, reason: String((e as Error)?.message ?? e).slice(0, 160) });
         }
+        // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
+        // a bounced merge-ready card is the board's highest-value work — one
+        // mechanical/human leg from landing — and must not re-enter at default
+        // priority and starve). One meta write, before the transition.
+        const now2 = Date.now();
+        const nextMeta = {
+          ...cm,
+          boosted: now2,
+          merge_train: {
+            ...(cm.merge_train ?? {}),
+            state: "bounced",
+            bounce_kind: bounceKind,
+            defect: (defect ?? "").slice(0, 300) || undefined,
+            conflict_files: conflictFiles,
+            review_ask_id: reviewAskId ?? undefined,
+            review_ask_deduped: reviewAskDeduped || undefined,
+            bounced_at: now2,
+            pr,
+            repo,
+          },
+        };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
+        // blocked→in_progress with the fix-up brief; resolution invalidates the
+        // verdict — the card re-enters the queue only after a fresh verify.
+        // BR#4753: an in_progress card (a gate-rejected done already moved it
+        // out of blocked) takes the brief on its BODY — the transition edge
+        // in_progress→in_progress does not exist, and it is already out of the
+        // derived queue.
+        if (card.status === "blocked") {
+          await this.transition(
+            {
+              id: taskId,
+              to: "in_progress",
+              // anonymous: the hub acts as the machine, never as the last session
+              // on the token — a session-less card must not inherit the closer's
+              // session as its implementer (misattribution + a spurious
+              // review-separation refusal on a same-session re-verify)
+              session: "",
+              note: bounceNote,
+              body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
+            },
+            actor,
+          );
+        } else {
+          const bodyWithBrief = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`;
+          this.state.storage.sql.exec(`UPDATE artefacts SET body_md = ?, updated_ts = ? WHERE id = ?`, bodyWithBrief, now2, taskId);
+          this.version(taskId, actor, "update", `merge-train bounce (gate) — the landed close was gate-rejected after the claim leg; the brief rides the body (BR#4753)`, {});
+        }
+        // BR#4066/67 self-heal: a coverage bounce fabricated impl work (there is
+        // nothing to repair) and the watchdog then punished the resulting
+        // silence by releasing the card — the exact queue-slot destruction
+        // fixed above. Instead: straight back into review; the standard
+        // in_review handoff auto-spawns a fresh verify duty. The re-entry note
+        // MUST carry the PR link: the review-needs-pr gate rejects a link-less
+        // in_review transition, so every coverage bounce emitted one audited
+        // rejection (folded as a gate:review-needs-pr breach event — the
+        // BR#4428 storm on BR#4363: 3 bounces, 3 events) and the card
+        // stranded in_progress instead of re-entering review.
+        // BR#4494: the rejected re-entry also sat in the unclaimable in_progress
+        // stop-gap (the BR#4467 breaches: 3 rejections, 3 stranded cards).
+        if (bounceKind === "coverage") {
+          try {
+            await this.transition(
+              {
+                id: taskId,
+                to: "in_review",
+                session: "",
+                note: `coverage-bounce self-heal (BR#4066/67): no conflict exists — fresh verify duty re-checks the live head of PR https://github.com/${repo}/pull/${pr}; its accept re-queues the train`,
+              },
+              actor,
+            );
+          } catch (e) {
+            this.audit(actor, "train:bounced", taskId, { self_heal: `in_review re-entry failed: ${String((e as Error).message ?? e).slice(0, 200)} — the card stays in_progress; the watchdog bounce re-entry demote (BR#4494) releases it claimable at the next stall sweep` });
+          }
+        }
+        cm.merge_train = nextMeta.merge_train;
+        // BR#4068 starvation law (leg 1): a bounced card is the most valuable
+        // work on the board — verified once, one mechanical leg from landed.
+        // Stamp the SAME boost the human boost writes; the rank seams already
+        // read it (claim ranking do.ts rank(), train rank core.ts, Backlog ▲).
+        // Decay is the accept hook's job: re-queue deletes it — never
+        // auto-expire mid-repair.
+        // BR#4753: write over a FRESH read — the ask leg may have auto-blocked
+        // the subject (in_progress at ask time) and stamped awaiting_ask; the
+        // stale pre-ask snapshot would clobber the park's marker + typed await.
+        const fresh = row(taskId!);
+        const fm = JSON.parse(fresh?.meta ?? "{}");
+        fm.merge_train = nextMeta.merge_train;
+        fm.boosted = now;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(fm), taskId);
+        this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, ask: reviewAskId });
+        this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
+      } else {
+        // the card closed between the merge and the bounce — nothing to
+        // bounce; the lane idles below and the ledger names the skip.
+        this.audit(actor, "train:bounce_skipped", lane.id, { task: taskId, status: card.status, note: "card closed before the bounce landed — no bounce leg" });
       }
-      cm.merge_train = nextMeta.merge_train;
-      // BR#4068 starvation law (leg 1): a bounced card is the most valuable
-      // work on the board — verified once, one mechanical leg from landed.
-      // Stamp the SAME boost the human boost writes; the rank seams already
-      // read it (claim ranking do.ts rank(), train rank core.ts, Backlog ▲).
-      // Decay is the accept hook's job: re-queue deletes it — never
-      // auto-expire mid-repair.
-      cm.boosted = now;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
-      this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, ask: reviewAskId });
-      this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
       meta.currently = null;
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
@@ -7741,6 +7778,82 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, reason };
   }
 
+  /** BR#4753 — the landed close FAILED; awaiting-ci still resolves. Policy
+   *  (landedClosePolicy, BR#4403 retry law + BR#3516 §2/§6):
+   *  - bounce: a gate rejection (semantic — retrying cannot succeed) takes
+   *    the lifecycle-legal edge NOW: the culprit card bounces via
+   *    train:bounced (kind gate) CITING the gate error, one dedupe-guarded
+   *    ask per episode hits the alarm sink, the lane idles, the queue
+   *    advances. A gate rejection with no card to bounce stops the line
+   *    citing the gate error instead (there is nothing to bounce).
+   *  - stop: a retryable failure at the consecutive-failure budget or past
+   *    the fail-closed bound stops the line citing the failures (the
+   *    stopped flow bounces a blocked culprit and files the sink ask).
+   *  - retry: a storage fault inside the budget and before the bound
+   *    persists the consecutive-failure count on the lane and waits for the
+   *    next green tick — counted, bounded, and AUDITED (never silent). */
+  private async landedCloseFailed(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; error: unknown; boundExceeded: boolean }): Promise<any> {
+    const now = Date.now();
+    const laneSpec = laneOfMeta(meta)!;
+    const errText = String((p.error as Error)?.message ?? p.error ?? "unknown error").slice(0, 500);
+    const taskId: string | null = meta.currently?.task_id ?? null;
+    const gate = isTrainGateRejection(p.error);
+    const failures = Number(meta.currently?.landed_close_failures ?? 0) + 1;
+    this.audit(actor, "train:landed_close_failed", lane.id, {
+      lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, merge_sha: p.mergeSha, task: taskId,
+      failure: failures, gate_rejection: gate, bound_exceeded: p.boundExceeded, error: errText.slice(0, 300),
+    });
+    const verdict = landedClosePolicy({ gateRejection: gate && !!taskId, failures, boundExceeded: p.boundExceeded });
+    if (verdict === "bounce") {
+      const out = await this.trainEvent({
+        repo: laneSpec.repo, base: laneSpec.base, kind: "bounced", pr: p.pr, merge_sha: p.mergeSha, task_id: taskId,
+        bounce_kind: "gate", reason: `landed close gate-rejected (BR#4753): ${errText}`,
+      }, actor);
+      // ONE ask per episode to the alarm sink — the exception surfaces even
+      // though the lane resolved (askCreate's identical-open guard dedupes
+      // re-episodes of the same lane+PR).
+      const askTitle = `MERGE TRAIN landed close rejected: ${laneSpec.repo}@${laneSpec.base} PR #${p.pr} (${p.mergeSha.slice(0, 9)}) — card bounced. Acknowledge?`;
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle.slice(0, 240),
+            reason: `a green-verdict landed close was gate-rejected (BR#4753) — the wedge class that starved a lane 60+ min must surface, not repeat silently`,
+            details: [
+              `Lane ${laneKey(laneSpec.repo, laneSpec.base)}: CI green on merge commit ${p.mergeSha.slice(0, 9)} (PR #${p.pr}), but closing the landed card threw.`,
+              `Gate error: ${errText}`,
+              `Resolution: the culprit card ${taskId} bounced (gate bounce) with the error in the brief; the lane is idle and the queue advances.`,
+              `Fix the named precondition on the card (e.g. close its open child), then re-verify to re-queue.`,
+            ].join("\n\n"),
+            options: ["Ack — on it", "Investigate the gate", "Waive — no action"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (askErr) {
+        // an identical ask is already open for this episode — that IS one per episode
+        this.audit(actor, "train:landed_close_ask_deduped", lane.id, { deduped: String((askErr as Error).message ?? askErr).slice(0, 160) });
+      }
+      return { ...out, decided: "bounced", gate_rejection: true, error: errText };
+    }
+    if (verdict === "stop") {
+      const why = p.boundExceeded
+        ? `landed close failed ${failures}× consecutively and the fail-closed bound expired — CI green but the close never landed: ${errText}`
+        : `landed close failed ${failures}× consecutively — failing closed (BR#3516 §2): ${errText}`;
+      const out = await this.trainEvent({ repo: laneSpec.repo, base: laneSpec.base, kind: "stopped", pr: p.pr, merge_sha: p.mergeSha, reason: why }, actor);
+      return { ...out, decided: p.boundExceeded ? "stopped_bound" : "stopped", error: errText };
+    }
+    // retry: persist the consecutive-failure count on the lane so it survives
+    // ticks; success clears it naturally (the landed close nulls `currently`).
+    meta.currently = { ...meta.currently, landed_close_failures: failures, landed_close_last_error: errText, landed_close_last_at: now };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    return {
+      ok: true, decided: "landed_retrying", lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, merge_sha: p.mergeSha,
+      retrying: { failures, max: TRAIN_LANDED_CLOSE_MAX_FAILURES, bound_exceeded: p.boundExceeded, last_error: errText },
+    };
+  }
+
   /** train.ci — executor-fed CI facts on the lane's merge commit; the HUB
    *  decides (BR#3516: executor-fed facts, hub-decided). Green ⇒ landed;
    *  red ⇒ stop-the-line; pending past the bound ⇒ fail-closed stop. */
@@ -7766,8 +7879,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const pr = Number(meta.currently.pr);
     const mergeSha = String(meta.currently.merge_sha);
     if (v.verdict === "green") {
-      const out = await this.landedFlow(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
-      return { ...out, decided: "landed" };
+      // BR#4753: green with ZERO facts — an unconfigured lane
+      // (required_workflows=[]) on which no check run ever registered — is
+      // §2 UNKNOWN, not green, once the fail-closed bound expires. The
+      // empty-required lane was exactly the one that could never reach
+      // bound-stop (verdict green on vacuity, bound read only on pending);
+      // it stops here like any other unknown past the bound.
+      if (v.bound_exceeded && !checks.length && !laneSpec.required_workflows.length) {
+        const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical) — zero check runs registered on the merge commit (unconfigured lane)` }, actor);
+        return { ...out, decided: "stopped_bound" };
+      }
+      try {
+        const out = await this.landedFlow(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
+        return { ...out, decided: "landed" };
+      } catch (e) {
+        // BR#4753: the green branch must RESOLVE, never raw-throw — a thrown
+        // landed close used to escape train.ci, the executor logged the 5xx
+        // and re-polled, and every later tick failed silently (the BR#3633
+        // lane: ~65 throws over 60+ min past the bound, queue starved).
+        return await this.landedCloseFailed(lane, meta, actor, { pr, mergeSha, error: e, boundExceeded: v.bound_exceeded });
+      }
     }
     if (v.verdict === "red") {
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, failing: v.failing }, actor);

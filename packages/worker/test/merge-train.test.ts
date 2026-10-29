@@ -5,6 +5,8 @@ import {
   classifyRequiredRuns,
   decideMergeAction,
   decideTrainGate,
+  isTrainGateRejection,
+  landedClosePolicy,
   leaseDecide,
   mergeTrainQueue,
   normalizeGhMergeable,
@@ -725,6 +727,42 @@ describe("the remaining-legs queue reason + the multi-leg landed close note (BR#
     expect(note).toContain("machine proxy held: mergeCommit non-null AND required main workflows green");
     const single = trainLandedCloseNote({ repo: "o/r", prNumber: 5, mergeSha: "5".repeat(40), gateway: "gw" });
     expect(single).toContain("PR [#5](https://github.com/o/r/pull/5) merged as 555555555");
+  });
+});
+
+// ---------- BR#4753: the landed-close failure policy ----------
+
+describe("landed-close failure policy (BR#4753 — the green branch resolves)", () => {
+  it("a gate rejection is SEMANTIC and bounces NOW — every BR#4403 marker class matches", () => {
+    // the observed BR#3633 rejection (the gate error text + the [rule:] tag)
+    expect(isTrainGateRejection(new Error("parent BR#3633 still has 1 open child task(s) — finish or close them first (decomposition owns its children). If a child is genuinely unclosable, force-close grammar. [rule: done-open-children]"))).toBe(true);
+    // receipt-gate rejections ride the [rule: …] tag
+    expect(isTrainGateRejection(new Error("done close cites legs not receipted: state-vector/bridge#222 — [rule: done-close-legs]"))).toBe(true);
+    expect(isTrainGateRejection(new Error("the in_review transition needs a PR link [rule: review-needs-pr]"))).toBe(true);
+    // the other BR#4403 protocol-card classes
+    expect(isTrainGateRejection(new Error("gate:review-needs-pr — re-entry note carries no PR link"))).toBe(true);
+    expect(isTrainGateRejection(new Error("separation of duties: the session that implemented cannot produce the review"))).toBe(true);
+    expect(isTrainGateRejection(new Error("malformed await_event condition — two machine atoms"))).toBe(true);
+    expect(isTrainGateRejection(new Error("task: 'blocked' → 'done' not allowed (allowed: in_progress, todo, superseded)"))).toBe(true);
+    expect(isTrainGateRejection(new Error("this close requires the review receipts"))).toBe(true);
+  });
+
+  it("a storage / infra fault is RETRYABLE — none of the gate markers match", () => {
+    expect(isTrainGateRejection(new Error("Storage unit of work failed: Durable Object reset"))).toBe(false);
+    expect(isTrainGateRejection(new Error("internal error"))).toBe(false);
+    expect(isTrainGateRejection(null)).toBe(false);
+    expect(isTrainGateRejection(undefined)).toBe(false);
+  });
+
+  it("the policy matrix: bounce on gate; retry inside the budget; stop at the budget or past the bound", () => {
+    expect(landedClosePolicy({ gateRejection: true, failures: 1, boundExceeded: false })).toBe("bounce");
+    expect(landedClosePolicy({ gateRejection: true, failures: 5, boundExceeded: true })).toBe("bounce");
+    expect(landedClosePolicy({ gateRejection: false, failures: 1, boundExceeded: false })).toBe("retry");
+    expect(landedClosePolicy({ gateRejection: false, failures: 2, boundExceeded: false })).toBe("retry");
+    expect(landedClosePolicy({ gateRejection: false, failures: 3, boundExceeded: false })).toBe("stop");
+    expect(landedClosePolicy({ gateRejection: false, failures: 4, boundExceeded: false })).toBe("stop");
+    // bound_exceeded shortens the retry window — the BR#3633 bound-never-armed defect
+    expect(landedClosePolicy({ gateRejection: false, failures: 1, boundExceeded: true })).toBe("stop");
   });
 });
 
