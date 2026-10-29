@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Bridge",
+  "mainBinaryName": "Bridge",
+  "version": "0.1.0",
+  "identifier": "com.statevector.bridge.mobile",
+  "build": {
+    "beforeBuildCommand": "cd ../.. && npm run build -w @bridge/mobile-ui",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

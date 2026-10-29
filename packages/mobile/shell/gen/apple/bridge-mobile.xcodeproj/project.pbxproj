@@ -1,0 +1,596 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		039D8C6FBAC989B48234A1BA /* BridgeShellUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A595DFC3C3B78047996A89A0 /* BridgeShellUITests.swift */; };
+		163CEC4C83B2F8AF604D9143 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = C43948B4C14DFF44E6FEED01 /* libapp.a */; };
+		2372F2E91BD609B566CB42B9 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 63F443C0CF98FF8BB5C43DD2 /* QuartzCore.framework */; };
+		3ED58F9192D13D513B81170B /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 5617AECEB7A7475D4CCF5AFD /* main.mm */; };
+		3FCDE49ECFC0FE03EA132AC8 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 68F47303195AD23B6AF5F0E8 /* Security.framework */; };
+		610D23AA3766B3BE0B10B95A /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C138A2A6E71D6AED7A27EC11 /* Metal.framework */; };
+		775CBFC3B9E45BEBEFA9BE73 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A65A5BCA148AA7230B55CFF9 /* MetalKit.framework */; };
+		7EDD309A1F5502757A6EED09 /* FMVoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2361CE670D3532A86EFD7AA2 /* FMVoice.swift */; };
+		99C5515D6C0B241215B8B19F /* Speech.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9F88AD17DA05887FF404F328 /* Speech.framework */; };
+		A23E4987660060C40F664083 /* AVFAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11ABEBC831FBCCD2C04F5F73 /* AVFAudio.framework */; };
+		CAEB844194E10DF1C745946A /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 8EFBA4718E9A208BB1DFCD4F /* LaunchScreen.storyboard */; };
+		CEC7F8F95B27E37A28520A41 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 95161750D5FECD9CE51E58BA /* UIKit.framework */; };
+		DDA98A197FB587C4D3289B14 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8482677C4522BFF8A2E399FE /* WebKit.framework */; };
+		E4EF75F8D43BE0FCE3184468 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 73DF5B45CD052D9E564C464A /* CoreGraphics.framework */; };
+		E595DC418B80B064B9618C48 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 9089190CB588340036E7B4B0 /* Assets.xcassets */; };
+		F75509F4A96BB359105D36B0 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 431E7A8F64F39243918641B1 /* assets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C4A5B51B68D217ED10EC8D72 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2042145E79DCD19729E90414 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 19D7220356E0056833BCF567;
+			remoteInfo = "bridge-mobile_iOS";
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		02D366CADFD16DB35832EC8A /* ios_notify.rs */ = {isa = PBXFileReference; path = ios_notify.rs; sourceTree = "<group>"; };
+		11ABEBC831FBCCD2C04F5F73 /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = System/Library/Frameworks/AVFAudio.framework; sourceTree = SDKROOT; };
+		123047406EF321E03073F7C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		14AE49CFF73C1C631D797E38 /* console.rs */ = {isa = PBXFileReference; path = console.rs; sourceTree = "<group>"; };
+		2361CE670D3532A86EFD7AA2 /* FMVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FMVoice.swift; sourceTree = "<group>"; };
+		431E7A8F64F39243918641B1 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		4EC076B81BB39B8A44706772 /* bridge-mobile_UITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = "bridge-mobile_UITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		550B2492906021C25E292DB0 /* bridge-mobile_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "bridge-mobile_iOS.entitlements"; sourceTree = "<group>"; };
+		5617AECEB7A7475D4CCF5AFD /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		63F443C0CF98FF8BB5C43DD2 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		68C8D12A9A908FC1FAD7C205 /* voice.rs */ = {isa = PBXFileReference; path = voice.rs; sourceTree = "<group>"; };
+		68F47303195AD23B6AF5F0E8 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		6C24E594C3D1674DAF33620E /* mcp.rs */ = {isa = PBXFileReference; path = mcp.rs; sourceTree = "<group>"; };
+		73298A23FB2FD826994C3BF4 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		73DF5B45CD052D9E564C464A /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		79A7E15D0074C016A353F835 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		8482677C4522BFF8A2E399FE /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		8EFBA4718E9A208BB1DFCD4F /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		9089190CB588340036E7B4B0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		95161750D5FECD9CE51E58BA /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		9D98D13E9B01DE757A4C0A12 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		9F88AD17DA05887FF404F328 /* Speech.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Speech.framework; path = System/Library/Frameworks/Speech.framework; sourceTree = SDKROOT; };
+		A18D08B76D7972EC567F8AB4 /* fm.rs */ = {isa = PBXFileReference; path = fm.rs; sourceTree = "<group>"; };
+		A595DFC3C3B78047996A89A0 /* BridgeShellUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeShellUITests.swift; sourceTree = "<group>"; };
+		A65A5BCA148AA7230B55CFF9 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		C138A2A6E71D6AED7A27EC11 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		C43948B4C14DFF44E6FEED01 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		CAB6BD68259760489948BF9E /* shellui.rs */ = {isa = PBXFileReference; path = shellui.rs; sourceTree = "<group>"; };
+		F9B490D6E0C5BDCDF55EBD74 /* bridge-mobile_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "bridge-mobile_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		7822A8CD31A375D1BB4141AE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				163CEC4C83B2F8AF604D9143 /* libapp.a in Frameworks */,
+				E4EF75F8D43BE0FCE3184468 /* CoreGraphics.framework in Frameworks */,
+				610D23AA3766B3BE0B10B95A /* Metal.framework in Frameworks */,
+				775CBFC3B9E45BEBEFA9BE73 /* MetalKit.framework in Frameworks */,
+				2372F2E91BD609B566CB42B9 /* QuartzCore.framework in Frameworks */,
+				3FCDE49ECFC0FE03EA132AC8 /* Security.framework in Frameworks */,
+				CEC7F8F95B27E37A28520A41 /* UIKit.framework in Frameworks */,
+				DDA98A197FB587C4D3289B14 /* WebKit.framework in Frameworks */,
+				99C5515D6C0B241215B8B19F /* Speech.framework in Frameworks */,
+				A23E4987660060C40F664083 /* AVFAudio.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0E47CDD977E2CEA0318FEDF4 /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				A595DFC3C3B78047996A89A0 /* BridgeShellUITests.swift */,
+			);
+			path = UITests;
+			sourceTree = "<group>";
+		};
+		0ED8A488B1352E975ED11829 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				14AE49CFF73C1C631D797E38 /* console.rs */,
+				A18D08B76D7972EC567F8AB4 /* fm.rs */,
+				02D366CADFD16DB35832EC8A /* ios_notify.rs */,
+				73298A23FB2FD826994C3BF4 /* lib.rs */,
+				79A7E15D0074C016A353F835 /* main.rs */,
+				6C24E594C3D1674DAF33620E /* mcp.rs */,
+				CAB6BD68259760489948BF9E /* shellui.rs */,
+				68C8D12A9A908FC1FAD7C205 /* voice.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		28A97C66212AE837F58AC6FF /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				9D98D13E9B01DE757A4C0A12 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		33A030A1DA581E7C7A1F5F77 = {
+			isa = PBXGroup;
+			children = (
+				431E7A8F64F39243918641B1 /* assets */,
+				9089190CB588340036E7B4B0 /* Assets.xcassets */,
+				8EFBA4718E9A208BB1DFCD4F /* LaunchScreen.storyboard */,
+				AB804C369A0F64EE53BF271C /* bridge-mobile_iOS */,
+				548EA8DCA87AAE1556FD8C88 /* Externals */,
+				F494E95070A763BB54A4DF9F /* Sources */,
+				0ED8A488B1352E975ED11829 /* src */,
+				0E47CDD977E2CEA0318FEDF4 /* UITests */,
+				754368F5B2990AD2D746E6EC /* Frameworks */,
+				4003F42B6B156DAF5C808BFB /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		4003F42B6B156DAF5C808BFB /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F9B490D6E0C5BDCDF55EBD74 /* bridge-mobile_iOS.app */,
+				4EC076B81BB39B8A44706772 /* bridge-mobile_UITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		548EA8DCA87AAE1556FD8C88 /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		566D2173F9B7CC73D5AF8C1F /* bridge-mobile */ = {
+			isa = PBXGroup;
+			children = (
+				2361CE670D3532A86EFD7AA2 /* FMVoice.swift */,
+				5617AECEB7A7475D4CCF5AFD /* main.mm */,
+				28A97C66212AE837F58AC6FF /* bindings */,
+			);
+			path = "bridge-mobile";
+			sourceTree = "<group>";
+		};
+		754368F5B2990AD2D746E6EC /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				11ABEBC831FBCCD2C04F5F73 /* AVFAudio.framework */,
+				73DF5B45CD052D9E564C464A /* CoreGraphics.framework */,
+				C43948B4C14DFF44E6FEED01 /* libapp.a */,
+				C138A2A6E71D6AED7A27EC11 /* Metal.framework */,
+				A65A5BCA148AA7230B55CFF9 /* MetalKit.framework */,
+				63F443C0CF98FF8BB5C43DD2 /* QuartzCore.framework */,
+				68F47303195AD23B6AF5F0E8 /* Security.framework */,
+				9F88AD17DA05887FF404F328 /* Speech.framework */,
+				95161750D5FECD9CE51E58BA /* UIKit.framework */,
+				8482677C4522BFF8A2E399FE /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		AB804C369A0F64EE53BF271C /* bridge-mobile_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				550B2492906021C25E292DB0 /* bridge-mobile_iOS.entitlements */,
+				123047406EF321E03073F7C0 /* Info.plist */,
+			);
+			path = "bridge-mobile_iOS";
+			sourceTree = "<group>";
+		};
+		F494E95070A763BB54A4DF9F /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				566D2173F9B7CC73D5AF8C1F /* bridge-mobile */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		"TEMP_2E228A67-0C54-4F78-B2CA-BFED23BD206C" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		19D7220356E0056833BCF567 /* bridge-mobile_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4FE8DBDDD4B4354B7C28A236 /* Build configuration list for PBXNativeTarget "bridge-mobile_iOS" */;
+			buildPhases = (
+				0D5322896A3F82521C047AF0 /* Build Rust Code */,
+				4286BDF92D510121AC73FF84 /* Sources */,
+				C801A79B3410F39ABA797FCA /* Resources */,
+				7822A8CD31A375D1BB4141AE /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "bridge-mobile_iOS";
+			packageProductDependencies = (
+			);
+			productName = "bridge-mobile_iOS";
+			productReference = F9B490D6E0C5BDCDF55EBD74 /* bridge-mobile_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		8B7C251DE1569869ABD9B104 /* bridge-mobile_UITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BB847ABA41A3FAFC8638F5AF /* Build configuration list for PBXNativeTarget "bridge-mobile_UITests" */;
+			buildPhases = (
+				9840E9431254F2A469388C2C /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				32FA251369EEFB744FFF3F38 /* PBXTargetDependency */,
+			);
+			name = "bridge-mobile_UITests";
+			packageProductDependencies = (
+			);
+			productName = "bridge-mobile_UITests";
+			productReference = 4EC076B81BB39B8A44706772 /* bridge-mobile_UITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		2042145E79DCD19729E90414 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					8B7C251DE1569869ABD9B104 = {
+						TestTargetID = 19D7220356E0056833BCF567;
+					};
+				};
+			};
+			buildConfigurationList = AD2BC0D0F806873EE25C15DE /* Build configuration list for PBXProject "bridge-mobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 33A030A1DA581E7C7A1F5F77;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 4003F42B6B156DAF5C808BFB /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				19D7220356E0056833BCF567 /* bridge-mobile_iOS */,
+				8B7C251DE1569869ABD9B104 /* bridge-mobile_UITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C801A79B3410F39ABA797FCA /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E595DC418B80B064B9618C48 /* Assets.xcassets in Resources */,
+				CAEB844194E10DF1C745946A /* LaunchScreen.storyboard in Resources */,
+				F75509F4A96BB359105D36B0 /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0D5322896A3F82521C047AF0 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\ncase \"${PLATFORM_NAME:-}\" in\n  iphonesimulator) RUST_TARGET=aarch64-apple-ios-sim ;;\n  *)               RUST_TARGET=aarch64-apple-ios ;;\nesac\nPROFILE_DIR=$(echo \"${CONFIGURATION:-Debug}\" | tr '[:upper:]' '[:lower:]')\ncd \"$SRCROOT/../..\"\n# release builds must match `tauri ios build`: the custom-protocol\n# feature is what embeds the frontend dist into the binary\nif [ \"$PROFILE_DIR\" = \"release\" ]; then\n  cargo build --lib --target \"$RUST_TARGET\" --release --features tauri/custom-protocol\nelse\n  cargo build --lib --target \"$RUST_TARGET\"\nfi\nOUT=\"$SRCROOT/Externals/arm64/${CONFIGURATION}\"\nmkdir -p \"$OUT\"\ncp \"target/$RUST_TARGET/$PROFILE_DIR/libbridge_mobile_lib.a\" \"$OUT/libapp.a\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		4286BDF92D510121AC73FF84 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7EDD309A1F5502757A6EED09 /* FMVoice.swift in Sources */,
+				3ED58F9192D13D513B81170B /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9840E9431254F2A469388C2C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				039D8C6FBAC989B48234A1BA /* BridgeShellUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		32FA251369EEFB744FFF3F38 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 19D7220356E0056833BCF567 /* bridge-mobile_iOS */;
+			targetProxy = C4A5B51B68D217ED10EC8D72 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1B16B2705E3426A89955EB47 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "bridge-mobile_iOS/bridge-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "bridge-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.statevector.bridge.mobile;
+				PRODUCT_NAME = "Bridge";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		576BB58042A86D0FFEB04994 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		5EECF8537B4C012E66951979 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.statevector.bridge.mobile.bridge-mobile-UITests";
+				PRODUCT_NAME = "bridge-mobile_UITests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = "bridge-mobile_iOS";
+			};
+			name = release;
+		};
+		C0A50527492D0E082635BB9D /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.statevector.bridge.mobile.bridge-mobile-UITests";
+				PRODUCT_NAME = "bridge-mobile_UITests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = "bridge-mobile_iOS";
+			};
+			name = debug;
+		};
+		CE62565F7DD9A0683C8275AB /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		E4D4E3B60064E56981F564CF /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "bridge-mobile_iOS/bridge-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "bridge-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.statevector.bridge.mobile;
+				PRODUCT_NAME = "Bridge";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4FE8DBDDD4B4354B7C28A236 /* Build configuration list for PBXNativeTarget "bridge-mobile_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E4D4E3B60064E56981F564CF /* debug */,
+				1B16B2705E3426A89955EB47 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		AD2BC0D0F806873EE25C15DE /* Build configuration list for PBXProject "bridge-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CE62565F7DD9A0683C8275AB /* debug */,
+				576BB58042A86D0FFEB04994 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		BB847ABA41A3FAFC8638F5AF /* Build configuration list for PBXNativeTarget "bridge-mobile_UITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C0A50527492D0E082635BB9D /* debug */,
+				5EECF8537B4C012E66951979 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 2042145E79DCD19729E90414 /* Project object */;
+}
