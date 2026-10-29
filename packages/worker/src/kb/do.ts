@@ -7794,14 +7794,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     );
   }
 
-  /** train.event — kind merged | bounced | stopped | landed. The acting
-   *  gateway (actor) must hold the lease; every event is audited with the
-   *  gateway for attribution and written to the train_events ledger. */
+  /** train.event — kind merged | bounced | stopped | landed | updated. The
+   *  acting gateway (actor) must hold the lease; every event is audited with
+   *  the gateway for attribution and written to the train_events ledger.
+   *  `updated` (BR#4687, L1.2): the executor machine-updated a behind
+   *  worker-authored branch (gh pr update-branch) — the verdict CARRIES to
+   *  the new head via the carry chain and the card silently re-enters the
+   *  queue: no bounce, no re-verify, no review ask. */
   private async trainEvent(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const kind = String(body.kind ?? "").trim();
-    if (!["merged", "bounced", "stopped", "landed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed");
+    if (!["merged", "bounced", "stopped", "landed", "updated"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed | updated");
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
@@ -7818,6 +7822,49 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       );
       this.audit(actor, `train:${kind}`, lane.id, { lane: laneKey(repo, base), pr, task: taskId, sha: mergeSha ?? headSha, ...detail });
     };
+
+    if (kind === "updated") {
+      // BR#4687 (L1.2): the machine update-branch landed — stamp the carry
+      // chain NOW (before the merge, before the required checks re-run) so
+      // the next tick's coverage check sees stamp→new head as covered and
+      // the card re-enters the queue silently. No bounce cascade: no
+      // re-verify duty, no review ask, no priority boost, no card status
+      // change — the card is still queued exactly where it was.
+      if (!pr) throw new Error("train:updated needs pr");
+      const from = String(body.from_head ?? "").toLowerCase();
+      const to = headSha ? headSha.toLowerCase() : "";
+      if (!/^[0-9a-f]{40}$/.test(from) || !/^[0-9a-f]{40}$/.test(to))
+        throw new Error("train:updated needs 40-hex from_head and head_sha — a sha-shape carry can never be contiguity-checked");
+      const chain = this.trainChain(String(body.task_id ?? "") || null);
+      if (chain.task_id) {
+        const card = row(chain.task_id);
+        if (card) {
+          const cm = JSON.parse(card.meta ?? "{}");
+          const leg = trainLegs(cm).find((l) => l.number === Number(pr));
+          const stamped = String(leg?.head_sha_at_acceptance ?? cm.pr?.head_sha_at_acceptance ?? "").toLowerCase();
+          if (!stamped)
+            throw new Error(`train:updated PR #${pr} has no stamped verdict head on ${chain.task_id} — nothing to carry from`);
+          if (from !== stamped)
+            throw new Error(`train:updated from_head ${from.slice(0, 9)} != the leg's stamp ${stamped.slice(0, 9)} — a carry from any other head would break the chain (BR#3516 §5)`);
+          const priorCarry = [...(Array.isArray(leg?.carry) ? leg.carry : []), ...(Array.isArray(cm.pr?.carry) ? cm.pr.carry : [])];
+          const alreadyCarried = priorCarry.some((c) => String(c?.to_head ?? "").toLowerCase() === to);
+          if (alreadyCarried) {
+            // idempotent re-delivery: the chain already ends here — ledger the
+            // observation, never double-append (the merged-time dedupe below
+            // shares this rule).
+          } else if (from === to) {
+            throw new Error("train:updated head_sha equals the stamp — nothing moved; do not fabricate a carry");
+          } else {
+            const next = carryAppendLeg(cm, Number(pr), { from_head: stamped, to_head: to, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
+            this.version(chain.task_id, actor, "train_carry", `verdict carried across machine update-branch ${stamped.slice(0, 9)}→${to.slice(0, 9)} (worker-authored branch, prior verdict ${chain.verdict_id ?? "unrecorded"} cited; BR#4687)`, {});
+          }
+        }
+      }
+      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: true, from_head: from }, chain.task_id);
+      this.version(lane.id, actor, `train:updated`, `machine update-branch PR #${pr} ${from.slice(0, 9)}→${to.slice(0, 9)} — verdict carries, card re-enters the queue (BR#4687)`, {});
+      return { ok: true, kind, lane: laneKey(repo, base), pr, from_head: from, head_sha: to, task: chain.task_id };
+    }
 
     if (kind === "merged") {
       if (!mergeSha) throw new Error("train:merged needs merge_sha");
@@ -7847,7 +7894,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           const leg = trainLegs(cm).find((l) => l.number === Number(pr));
           const stamped = String(leg?.head_sha_at_acceptance ?? cm.pr?.head_sha_at_acceptance ?? "");
           let next = cm;
-          if (stamped && headSha && stamped.toLowerCase() !== headSha.toLowerCase()) {
+          // BR#4687: an `updated` event may already carry stamp→headSha (the
+          // executor stamps the machine update-branch the moment it lands) —
+          // appending again would double the chain leg. Dedupe on to_head.
+          const priorCarry = [...(Array.isArray(leg?.carry) ? leg.carry : []), ...(Array.isArray(cm.pr?.carry) ? cm.pr.carry : [])];
+          const alreadyCarried = priorCarry.some((c) => String(c?.to_head ?? "").toLowerCase() === (headSha ?? "").toLowerCase());
+          if (stamped && headSha && stamped.toLowerCase() !== headSha.toLowerCase() && !alreadyCarried) {
             next = carryAppendLeg(cm, Number(pr), { from_head: stamped, to_head: headSha, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
             this.version(chain.task_id, actor, "train_carry", `verdict carried across clean update ${stamped.slice(0, 9)}→${headSha.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
           }

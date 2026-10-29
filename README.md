@@ -943,8 +943,11 @@ machine-clean carry chain:
   git's prose out of it). The old behavior — a 128 folded into `behind=true` and a
   bounce with an empty conflict list — is dead.
 - **Carry law (BR#3516 §5)**: the base advanced and the executor's `gh pr
-  update-branch` lands machine-clean → the accepted verdict CARRIES (the hub appends
-  the carry record on `train:merged`). A conflict resolved by hand means authored code
+  update-branch` lands machine-clean → the accepted verdict CARRIES — the hub stamps
+  the carry record the MOMENT the update lands (`train:updated`, BR#4687: `from_head`
+  must equal the leg's stamp, both heads 40-hex, re-delivery is idempotent), and the
+  merged event dedupes instead of double-appending the chain. A conflict resolved by
+  hand means authored code
   changed under the verdict → the verdict is INVALID at the new head: the executor
   enumerates the conflicting files (`git merge-tree`), `train:bounced` lists them on
   the PR's card, the card re-enters review, and the train re-queues it at the BACK once
@@ -980,16 +983,30 @@ machine-clean carry chain:
   stop-the-line and signing-environment asks remain the only genuine-decision asks on
   a lane.
 - **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727)**: behind is
+- **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727,
+  provenance-gated BR#4687)**: behind is
   exactly "base advanced, branch still mergeable" — the state the carry law was written
   for, which the shared `decideMergeAction` (clean/unstable, untouched) bounces because
-  the sweep has no update-branch authority. The train gate pre-clears it so the
-  executor reaches its own `gh pr update-branch`: behind + a verdict-covered head + a
-  clean trial merge → machine-clean update, verdict CARRIES, and the train merges when
-  the new head's checks settle. Conflicts still bounce with the file list. The tick
+  the sweep has no update-branch authority. The train gate pre-clears it ONLY for
+  worker-authored branches: every commit's GitHub author login must be on
+  `MERGE_TRAIN_WORKER_IDENTITIES` (fetched once, only when the state reads behind, so
+  the common tick's gh budget is unchanged; an empty/unknown authorship list fails
+  CLOSED to human-owned — a bounce is the safe direction, a machine rewrite of an
+  unknown branch is not). The train machine-updates branches its own fleet authored
+  and never moves a protected human branch: behind on one of those still bounces to
+  its owner. With provenance + a verdict-covered head + a clean trial merge → `gh pr
+  update-branch` lands machine-clean, the executor stamps `train:updated` THAT MOMENT
+  (leg stamp → new head), and the card re-enters the queue SILENTLY — no bounce
+  cascade, no card status change, no re-verify duty, no review ask, no boost: the
+  machine rebase is the train's own plumbing, and humans only ever see TRUE content
+  conflicts. A dirty trial merge still bounces with the file list (the verdict does
+  not carry across hand-resolved code), and an update that reports ok but leaves the
+  head unreadable/unchanged fails the tick closed with the carry withheld. The tick
   right after an update-branch reads `blocked` while strict branch protection re-runs
   the required checks on the new head — pending, not a defect: the gate WAITS on it
   (red head checks note; blocked with green checks — protection wants reviews — still
   bounces honestly).
+  bounces honestly). A SECOND behind on the same leg (base raced again after a prior carry) machine-updates again — coverage is stamp OR carry, so the chain extends instead of attempting a doomed merge.
 - **UNKNOWN mergeability polls, never bounces (BR#4685)**: GitHub computes mergeability
   asynchronously — a read right after a base merge yields `mergeStateStatus=null/UNKNOWN`,
   and `mergeable` rides the same recomputation, so an answer is definitive only when the

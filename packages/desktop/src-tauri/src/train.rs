@@ -82,6 +82,18 @@ fn classify_login(login: &str, worker_identities: &[String]) -> IdentityClass {
     }
 }
 
+/// BR#4687 (L1.2) branch provenance — pure, unit-pinned. The branch is the
+/// train's own (machine-updatable) iff it is non-empty and EVERY commit was
+/// authored by a worker-class identity. An empty commit list (API hiccup)
+/// fails closed to human-owned: a bounce is the safe direction, a machine
+/// rewrite of an unknown branch is not.
+fn branch_is_worker_authored(commit_logins: &[String], worker_identities: &[String]) -> bool {
+    !commit_logins.is_empty()
+        && commit_logins
+            .iter()
+            .all(|l| matches!(classify_login(l, worker_identities), IdentityClass::Worker(_)))
+}
+
 /// "detached-cody, rayh" → ["detached-cody", "rayh"] — trimmed, lowercased.
 fn parse_identities(raw: &str) -> Vec<String> {
     raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
@@ -548,6 +560,24 @@ impl Ctx {
                         c.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
                     )
                 })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
+    /// commit on the PR head. The pulls API resolves the commit email to the
+    /// owning account (`author.login`; null when the email maps to no
+    /// account). Worker-authored = every commit's login on the worker
+    /// allowlist; anything else (a human's login, an unlinked email) fails
+    /// closed to human-owned — the train never machine-updates a branch it
+    /// cannot prove is its own fleet's.
+    fn pr_commit_logins(&self, repo: &str, n: i64) -> Vec<String> {
+        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {login: (.author.login // \"\")}]"]);
+        match out {
+            Ok(Value::Array(a)) => a
+                .iter()
+                .map(|c| c.get("login").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
                 .collect(),
             _ => vec![],
         }
@@ -1035,7 +1065,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
-        let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
+        let mut head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
         // BR#4934 mid-drain: destination-green is owned by the pass settle
         // (decision BR#4932) — the gate composes with base FORCED green; the
@@ -1044,6 +1074,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let gate_base = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
+        // BR#4687 (L1.2): branch provenance for the behind pre-clear — the
+        // PR's commit author logins against the worker allowlist. One extra
+        // read-only gh call, fetched only when the state could be behind
+        // (the only provenance-sensitive state) to keep the common tick's
+        // gh budget unchanged.
+        let merge_state = vstr(&facts, "mergeStateStatus").unwrap_or("").to_lowercase();
+        let train_owned_branch = if merge_state == "behind" {
+            let logins = ctx.pr_commit_logins(repo, pr);
+            let owned = branch_is_worker_authored(&logins, &ctx.worker_identities);
+            if !owned {
+                log(
+                    Some(key),
+                    &format!(
+                        "PR #{pr} is behind but NOT worker-authored ({} commit author(s)) — the bounce goes to its owner; the train does not move human branches",
+                        logins.len()
+                    ),
+                );
+            }
+            owned
+        } else {
+            false
+        };
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -1055,6 +1107,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             commits: &commits,
             head_checks: &head_checks,
             leg_number: Some(leg_number),
+            train_owned_branch,
         });
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
@@ -1181,6 +1234,60 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // update-branch (verdict carries, BR#3516 §5) and merge on
                 // the next tick.
                 renew_lease(ctx, repo, base);
+                ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
+                ctx.fetch_pr_head(pr)?;
+                // BR#3935: fail-closed — a locally-unreadable head is a tick
+                // error, never a fabricated "behind" (and via trial_merge, never
+                // a fabricated "conflict" with an empty file list).
+                let behind = !ctx.is_ancestor(&format!("origin/{base}"), &head_sha)?;
+                // BR#3659: the behind-check reads THIS leg's accepted-at head, not
+                // the card-level first-leg stamp — each leg carries its own verdict.
+                // BR#4687 (L1.2): coverage is stamp OR contiguous carry — a second
+                // behind on the same leg (base raced again after a prior carry)
+                // machine-updates again instead of attempting a doomed merge.
+                let covered = crate::train_gate::verdict_covers_head_leg(Some(&leg), &head_sha);
+                if behind && covered {
+                    // base advanced past a verdict-covered head: update-branch is
+                    // the MACHINE-clean rebase — if it lands, the verdict carries
+                    // (BR#3516 §5); if it conflicts, that's human-resolved.
+                    let (clean, tm_files) = ctx.trial_merge(base, &head_sha)?;
+                    if !clean {
+                        let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                        ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
+                        log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
+                        release_if_idle(ctx, key, repo, base)?;
+                        return Ok(());
+                    }
+                    ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
+                    ctx.note(&format!("machine update-branch PR #{pr} (verdict carries)"));
+                    let updated = ctx.pr_facts(repo, pr)?;
+                    let new_head = vstr(&updated, "headRefOid").unwrap_or("").to_string();
+                    if new_head.is_empty() || new_head.to_lowercase() == head_sha {
+                        // fail closed: an unchanged/unreadable head means the
+                        // update did NOT land — carry nothing, retry next tick.
+                        return Err(format!(
+                            "gh pr update-branch reported ok but PR #{pr} head is {} — the machine update did NOT land; carry stamp withheld",
+                            if new_head.is_empty() { "unreadable" } else { "unchanged" }
+                        ));
+                    }
+                    // BR#4687 (L1.2): stamp the carry THE MOMENT the machine
+                    // update lands — `updated` appends the carry chain (stamp →
+                    // new head) hub-side with NO bounce, NO re-verify duty, NO
+                    // review ask. This is the zero-bounce re-enter: the next
+                    // tick's coverage check sees the carried verdict and the
+                    // card proceeds (merge now, or wait out the re-running
+                    // required checks) without ever leaving the queue.
+                    ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "updated", "pr": pr, "task_id": head_id, "from_head": head_sha, "head_sha": new_head, "signer": ctx.holder, "reason": "machine update-branch on a behind worker-authored branch — verdict carries (BR#4687)" }))?;
+                    log(Some(key), &format!("machine update-branch clean: {} → {} (verdict carries)", &head_sha[..head_sha.len().min(9)], &new_head[..new_head.len().min(9)]));
+                    // the merged event below must report the POST-update head —
+                    // provenance and the carry chain both key on it.
+                    head_sha = new_head;
+                    if updated.get("mergeable").and_then(|v| v.as_bool()) != Some(true) {
+                        log(Some(key), "mergeability recomputing after update-branch — next tick (card re-enters the queue, verdict carried)");
+                        release_if_idle(ctx, key, repo, base)?;
+                        return Ok(());
+                    }
+                }
                 let method_flag = match ctx.method.as_str() { "squash" => "--squash", "rebase" => "--rebase", _ => "--merge" };
                 if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
                     let low = err.to_lowercase();
@@ -2380,6 +2487,25 @@ mod tests {
     }
 
     #[test]
+    fn branch_provenance_worker_authored_fail_closed() {
+        // BR#4687 (L1.2): the branch is machine-updatable iff EVERY commit was
+        // authored by a worker-class identity — and every missing/blank/unknown
+        // case fails closed to human-owned.
+        let workers = vec!["detached-cody".to_string()];
+        // all-worker authorship → the train owns the branch (case-insensitive)
+        assert!(branch_is_worker_authored(&["detached-cody".into(), "Detached-Cody".into()], &workers));
+        // ONE personal author → a protected human branch, never machine-moved
+        assert!(!branch_is_worker_authored(&["detached-cody".into(), "rayh".into()], &workers));
+        // empty logins (API hiccup) → fail-closed human-owned
+        assert!(!branch_is_worker_authored(&[], &workers));
+        // empty allowlist → every login personal → never owned
+        assert!(!branch_is_worker_authored(&["detached-cody".into()], &vec![]));
+        // blank/unknown login → not worker class → not owned
+        assert!(!branch_is_worker_authored(&["".into()], &workers));
+        assert!(!branch_is_worker_authored(&["ghost-login".into()], &workers));
+    }
+
+    #[test]
     fn write_gate_allows_only_worker_class() {
         let hub = mock_hub(vec![]).0;
         let mut ctx = test_ctx(&hub);
@@ -2810,6 +2936,9 @@ mod tests {
             run(&base_dir, &["init", "-q", "-b", "main", "work"]);
             run(&work, &["config", "user.email", "train@test"]);
             run(&work, &["config", "user.name", "train"]);
+            // hermetic fixture: a machine's global signing config (gpgsign +
+            // 1Password SSH agent) must never fail a throwaway test clone
+            run(&work, &["config", "commit.gpgsign", "false"]);
             run(&work, &["remote", "add", "origin", base_dir.join("origin.git").to_str().unwrap()]);
             std::fs::write(work.join("f.txt"), "base line\n").unwrap();
             run(&work, &["add", "."]);

@@ -272,7 +272,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lease", args), null, 1)),
   },
   train_event: {
-    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue). Requires the lane lease.",
+    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue), updated (BR#4687: machine update-branch on a behind worker-authored branch — stamps the carry chain, the verdict carries, the card silently re-enters the queue). Requires the lane lease.",
     schema: TOOL_ARG_SCHEMAS.train_event,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.event", args), null, 1)),
   },
@@ -297,7 +297,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.carry", args), null, 1)),
   },
   train_history: {
-    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed with provenance (sha → PR → task → verdict → session).",
+    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed/updated with provenance (sha → PR → task → verdict → session).",
     schema: TOOL_ARG_SCHEMAS.train_history,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.history", args), null, 1)),
   },
