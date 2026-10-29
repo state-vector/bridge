@@ -220,9 +220,20 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "integration: merge the roles column PR?",
       options: ["GO — merge", "NO-GO — hold"],
       reason: "integration test coverage",
+      details: "Adds a roles column to tasks so review-gated cards dispatch only to review-role agents. PR is green; this ask covers the go/no-go on merging it.",
       to: "human",
     });
     expect(ask.status).toBe(200);
+    // human-directed asks require the plain-reading brief (details) — bare
+    // reference soup is rejected at the door
+    const bare = await kbJson("/ask.create", {
+      question: "integration: merge the roles column PR without a brief?",
+      options: ["GO — merge", "NO-GO — hold"],
+      reason: "integration test coverage",
+      to: "human",
+    });
+    expect(bare.status).toBe(400);
+    expect(String(bare.body.error)).toContain("details");
     const node = await kbJson("/get", { id: ask.body.id });
     expect(node.body.type).toBe("question");
     expect(node.body.tags).toEqual([]);
@@ -245,6 +256,8 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       reason: "BR#3822 regression fixture",
       to: "human",
       artefact_id: t.id,
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
+
     });
     expect(ask.status).toBe(200);
 
@@ -310,6 +323,8 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       reason: "BR#3822 failure-path fixture",
       to: "human",
       artefact_id: t.id,
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
+
     });
     expect(ask.status).toBe(400);
     expect(String(ask.body.error)).toContain("verdict-no-blocked");
@@ -336,6 +351,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
       reason: "churn guard rework loop",
       to: "human",
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
     // ask.create parked the subject blocked-on-ask (typed await on the ask node)
@@ -712,6 +728,7 @@ describe("typed answers dispatch like the option click (BR#3912 type-your-own)",
       to: "ray",
       question: `Rework loop on ${subject.id} "${title}" — the release→claim→stall cycle is now invalid (it failed 20 times). What do you want to do with it?`,
       reason: "20 dispatch attempts without completion — re-running repeats the claim→stall cycle",
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
       options: OPTIONS,
       artefact_id: subject.id,
     });
@@ -793,7 +810,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
     const wrong = await kbJson("/question.claim", { id: t.id, actor: "web:rayh" });
     expect(wrong.status).toBe(400);
     expect(String(wrong.body.error)).toContain("only on question");
-    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "human", reason: "drill", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for the human-claim hold lifecycle.", options: ["GO", "NO-GO"] });
     expect(ask.status).toBe(200);
     await kbJson("/ask.answer", { id: ask.body.id, answer: "GO" });
     const ans = await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
@@ -823,7 +840,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
   });
 
   it("an answer resolves the hold — the timer is cancelled and the stamp clears", async () => {
-    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "human", reason: "drill", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for answer-resolves-hold behavior.", options: ["GO", "NO-GO"] });
     await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
     const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO", actor: "web:rayh" });
     expect(ans.status).toBe(200);

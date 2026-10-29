@@ -138,6 +138,7 @@ describe("ask TTL escalation (real DO)", () => {
     const human = await kbJson("/ask.create", {
       to: "ray", question: "Human ruling drill — never re-route this?",
       reason: "drill", options: ["GO", "NO-GO"], artefact_id: null,
+      details: "drill brief: fixture ask exercising that ray-directed asks never re-route to agent identities.",
     });
     const any = await kbJson("/ask.create", {
       to: "any", question: "Open-floor drill — never re-route this?", reason: "drill",

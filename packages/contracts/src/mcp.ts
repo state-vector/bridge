@@ -132,8 +132,12 @@ export const TOOL_ARG_SCHEMAS = {
   ask_agent: z.looseObject({
     to: z.string().optional(),
     question: z.string().max(240),
+    // one-line WHY escalated (≤1200); the narrative goes in details
     reason: z.string(),
+    // self-contained plain-reading brief — REQUIRED by the hub for
+    // human-directed asks (what/why/current state; gloss BR#/PR# refs)
     details: z.string().optional(),
+    // 2–8 one-click answers; recommended option FIRST, prefixed "(Recommended)"
     options: z.array(z.string()).min(2).max(8),
     artefact_id: z.string().optional(),
   }),

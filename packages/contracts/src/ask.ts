@@ -15,8 +15,18 @@ export const AskCreatePayloadSchema = z.looseObject({
   question: z.string().min(1).max(240),
   /** WHY this is escalated instead of automatic (required for humans). */
   reason: z.string().optional(),
+  /**
+   * Self-contained plain-reading brief — REQUIRED for human-directed asks
+   * (the hub rejects human asks without it): what this is about, current
+   * state, why it needs a human. Gloss every BR#/PR# reference in one
+   * clause; never rely on the reader knowing other cards.
+   */
   details: z.string().optional(),
-  /** 2–8 one-click answers — humans answer by clicking. */
+  /**
+   * 2–8 one-click answers — humans answer by clicking. If you recommend
+   * one, make it options[0] and prefix it "(Recommended)" — the first
+   * button IS the recommendation.
+   */
   options: z.array(z.string()).min(2).max(8).optional(),
   /** Your blocked task — links the decision, pauses the watchdog. */
   artefact_id: z.string().optional(),
