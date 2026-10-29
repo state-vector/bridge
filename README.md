@@ -412,7 +412,10 @@ the sweep spawns the owned done-close duty — which, when the parent sits `in_p
 worked; it owes a close, not a resume). The silence-re-park can also no longer loop: a
 flood-guard skip (`skip_unblock_spawn` with `flood: true`) is the dedup working and is
 audited without folding a breach card, and a resume consumes the unblock round so post-resume
-silence issues one fresh round instead of flooding for an hour.
+silence issues one fresh round instead of flooding for an hour. The spawner cap re-suppresses
+the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
+`spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
+card, carries the recurring block to the human ledger.
 The trains panel is honest about capability: a held lock names its machine; an idle lane
 ticked by a merge-capable gateway inside the 15-minute window shows
 `train ready · <machine> · tick Xm ago`; only a lane with no recent capable tick says

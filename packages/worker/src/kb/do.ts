@@ -1863,7 +1863,15 @@ export class KnowledgeHub {
       this.audit("system:unblock-spawner", "escalated", r.id, { rounds: roundsEver, cap: UNBLOCK_SPAWN_CAP });
       this.version(r.id, "system:unblock-spawner", "transition", `unblock spawner stopped — ${roundsEver} rounds failed to clear the block; escalated to human once`, { rounds: roundsEver });
     } else {
-      this.audit(actor, "spawn_skipped", r.id, { auto: "unblock", reason: `unblock spawner cap (${roundsEver} rounds, cap ${UNBLOCK_SPAWN_CAP}) — escalation already filed` });
+      // BR#4702: a cap RE-suppression is the guard working — the escalation
+      // already carries the recurring block to the human ledger, and the
+      // parent is re-evaluated on every sweep/park tick while it stays
+      // un-cleared. Audit observably, never fold a breach card: the fold
+      // raising spawn-while-open on the guard's own suppression is the same
+      // detection-noise class BR#4282 fixed for the flood guard (specimen
+      // BR#3633: steady-true atom, breach card per sweep tick on top of a
+      // standing escalation).
+      this.audit(actor, "spawn_cap_skipped", r.id, { auto: "unblock", reason: `unblock spawner cap (${roundsEver} rounds, cap ${UNBLOCK_SPAWN_CAP}) — escalation already filed` });
     }
     return true;
   }

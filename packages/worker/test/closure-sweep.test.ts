@@ -972,3 +972,66 @@ describe("BR#4562 — the blocked-park drain checks the release-hold before atte
     expect(after.meta?.blocked_drained?.klass).toBe("churn-park");
   });
 });
+
+// ---------- (g) BR#4702 — the spawner-cap re-suppression never folds a breach card ----------
+
+describe("BR#4702 — capped re-attempts under a standing escalation are observable-only", () => {
+  it("the 4th park escalates ONCE and spawns nothing; a 5th capped park audits spawn_cap_skipped and raises NO spawn-while-open card (specimen BR#3633)", async () => {
+    // 1. the parent: a qualified impl card that will cycle parks (each park
+    // spawns a real round via the park-time machine law).
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br4702 drill", qualified: true, session: "drill-exec-br4702" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4702", session: "drill-exec-br4702" });
+
+    // 2. three rounds EVER (the BR#2893 cap): park on a distinct exit, the
+    // duty runs and closes with its findings, the resume consumes the stamp.
+    for (let n = 1; n <= 3; n++) {
+      const parked = await block(id, "drill-exec-br4702", `Exit ${n}: PR https://github.com/a/b/pull/${n} merged`, `parked on exit ${n}`);
+      expect(parked.status, `park ${n} failed: ${JSON.stringify(parked.body)}`).toBe(200);
+      const round = (await unblockDuties()).find((x: any) =>
+        x.title.startsWith("Unblock: IMPL: br4702 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+      expect(round, `round ${n} must exist`).toBeTruthy();
+      await kbJson("/transition", { id: round.id, to: "in_progress", actor: `duty-br4702-${n}`, session: `duty-br4702-${n}` });
+      const done = await kbJson("/transition", {
+        id: round.id, to: "done", actor: `duty-br4702-${n}`,
+        note: `receipts: exit ${n} re-verified on the board — PR https://github.com/a/b/pull/${n} still OPEN, exit not held; findings recorded per the unblock contract`,
+      });
+      expect(done.status, `round ${n} done failed: ${JSON.stringify(done.body)}`).toBe(200);
+      const resumed = await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4702", session: "drill-exec-br4702", note: `exit ${n} not held — re-scoping` });
+      expect(resumed.status, `resume ${n} failed: ${JSON.stringify(resumed.body)}`).toBe(200);
+    }
+    expect((await unblockDuties()).filter((x: any) => x.title.startsWith("Unblock: IMPL: br4702 drill")).length).toBe(3);
+
+    // 3. the 4th park hits the cap: the spawner escalates ONCE, spawns nothing.
+    const park4 = await block(id, "drill-exec-br4702", "Exit 4: PR https://github.com/a/b/pull/4 merged", "parked on exit 4");
+    expect(park4.status, `park 4 failed: ${JSON.stringify(park4.body)}`).toBe(200);
+    const escalated = await taskById(id);
+    expect(escalated.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(escalated.meta?.escalate?.reason)).toContain("spawner stopped");
+    expect((await unblockDuties()).filter((x: any) => x.title.startsWith("Unblock: IMPL: br4702 drill")).length).toBe(3);
+
+    // 4. the 5th park re-hits the cap with the escalation standing — the
+    // guard re-suppresses. This is the tick class that folded the breach card
+    // on BR#3633: the parent re-evaluates every park/sweep tick while the
+    // block stays un-cleared, and pre-BR#4702 each tick audited foldable
+    // spawn_skipped ("unblock spawner cap (N rounds, cap 3) — escalation
+    // already filed").
+    const resume4 = await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br4702", session: "drill-exec-br4702", note: "re-scoping under the standing escalation" });
+    expect(resume4.status, `resume 4 failed: ${JSON.stringify(resume4.body)}`).toBe(200);
+    const park5 = await block(id, "drill-exec-br4702", "Exit 5: PR https://github.com/a/b/pull/5 merged", "parked on exit 5");
+    expect(park5.status, `park 5 failed: ${JSON.stringify(park5.body)}`).toBe(200);
+    expect((await taskById(id)).status).toBe("blocked");
+    expect((await unblockDuties()).filter((x: any) => x.title.startsWith("Unblock: IMPL: br4702 drill")).length).toBe(3);
+
+    // 5. run the fold over the audit stream (a rejected transition folds its
+    // subject; blocked → done is an illegal edge, so this rejection is safe):
+    // NO spawn-while-open card may rise — the guard's own suppression is the
+    // system working, never a breach (the BR#4282 law, cap half).
+    const rejected = await kbJson("/transition", { id, to: "done", actor: "drill-exec-br4702", note: "no receipts — must be rejected to trigger the fold" });
+    expect(rejected.status, "blocked → done must be rejected").toBeGreaterThanOrEqual(400);
+    const breaches = ((await kbJson("/list", { type: "task", tag: "breach", limit: 200 })).body?.artefacts ?? [])
+      .filter((a: any) => String(a.meta?.breach_task ?? "") === id);
+    expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((b: any) => [b.id, b.meta?.breach_key]))}`).toHaveLength(0);
+  });
+});
