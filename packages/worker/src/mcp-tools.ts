@@ -286,6 +286,16 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_status,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.status", args), null, 1)),
   },
+  train_bisect: {
+    description: "Red-settle bisect (BR#4934) — one step per tick while the line is stopped on a burst-red settle. step {sha, verdict} stamps the probe of one intermediate merge sha (oldest→newest walk order); a RED step names culprit_task (the ONE culprit card — the hub bounces it and re-parks the wrongly-bounced final card); inconclusive:true stamps the walk failed and the pass bounces oldest-first instead. Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_bisect,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.bisect", args), null, 1)),
+  },
+  train_carry: {
+    description: "Feed one machine-clean carry (BR#4934 settle-window rebase): after gh pr update-branch moved a verdict-covered head from_head→to_head content-preserving, the hub appends the carry record so the accepted verdict covers the new head (BR#3516 §5 shape). The hub appends via the carry law; the executor never writes card meta. Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_carry,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.carry", args), null, 1)),
+  },
   train_history: {
     description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed with provenance (sha → PR → task → verdict → session).",
     schema: TOOL_ARG_SCHEMAS.train_history,

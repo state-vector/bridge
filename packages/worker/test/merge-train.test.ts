@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_BURST_MAX,
+  drainBurstDecision,
+  firstRedIndex,
+  laneCardBody,
+  laneOfMeta,
+  parseBurstMax,
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
@@ -1021,5 +1027,71 @@ describe("trainCloseBounceBrief + alarm ask copy (BR#4753)", () => {
     expect(d).toContain("BR#3633");
     expect(d).toContain(err);
     expect(d).toContain("BR#4753");
+  });
+});
+
+// ---------- burst-drain settle law (BR#4934, decision BR#4932 amends BR#4804) ----------
+
+describe("burst-drain law (BR#4934)", () => {
+  it("drainBurstDecision: clean heads drain back-to-back; cap or queue-end settles; red stops instantly", () => {
+    // clean heads remain, cap not reached → drain back-to-back
+    expect(drainBurstDecision(0, 10, true, false)).toBe("drain");
+    expect(drainBurstDecision(9, 10, true, false)).toBe("drain");
+    // cap reached → settle on the final merge
+    expect(drainBurstDecision(10, 10, true, false)).toBe("settle");
+    // queue empty of clean heads → settle even below cap
+    expect(drainBurstDecision(3, 10, false, false)).toBe("settle");
+    expect(drainBurstDecision(0, 10, false, false)).toBe("settle");
+    // cap 0 = unlimited → keep draining
+    expect(drainBurstDecision(500, 0, true, false)).toBe("drain");
+    // red seen stops the line immediately — never waits for the settle (GH#2261)
+    expect(drainBurstDecision(0, 10, true, true)).toBe("stop");
+    expect(drainBurstDecision(0, 10, false, true)).toBe("stop");
+    expect(drainBurstDecision(500, 0, false, true)).toBe("stop");
+  });
+
+  it("parseBurstMax: default on absent/junk; 0 = unlimited; integers pass", () => {
+    expect(DEFAULT_BURST_MAX).toBe(10);
+    expect(parseBurstMax(undefined)).toBe(10);
+    expect(parseBurstMax(null)).toBe(10);
+    expect(parseBurstMax("7")).toBe(10); // junk shape → default
+    expect(parseBurstMax(7.5)).toBe(10); // non-integer → default
+    expect(parseBurstMax(-1)).toBe(10); // negative → default
+    expect(parseBurstMax(7)).toBe(7);
+    expect(parseBurstMax(0)).toBe(0); // unlimited
+  });
+
+  it("laneOfMeta parses burst_max off meta.lane; wrong shape still fails loud (null)", () => {
+    expect(laneOfMeta({ lane: { repo: "state-vector/bridge", base: "main", burst_max: 3 } })).toMatchObject({
+      repo: "state-vector/bridge",
+      base: "main",
+      burst_max: 3,
+    });
+    // absent burst_max → DEFAULT (never a guessed 0)
+    expect(laneOfMeta({ lane: { repo: "r", base: "main" } })?.burst_max).toBe(DEFAULT_BURST_MAX);
+    // junk burst_max → DEFAULT
+    expect(laneOfMeta({ lane: { repo: "r", base: "main", burst_max: "lots" } })?.burst_max).toBe(DEFAULT_BURST_MAX);
+    expect(laneOfMeta({ lane: { repo: "r", base: "main", burst_max: 0 } })?.burst_max).toBe(0);
+    expect(laneOfMeta({})).toBeNull();
+    expect(laneOfMeta({ lane: { repo: "", base: "main" } })).toBeNull();
+  });
+
+  it("laneCardBody carries the burst line: cap named (or unlimited), one settle, red stops, bisect names one culprit", () => {
+    const cfg = { alarm_sink: "sink" };
+    const capped = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: 4 }, cfg);
+    expect(capped).toContain("up to 4 gate-clean heads");
+    expect(capped).toContain("ONE settle wait");
+    expect(capped).toContain("ONE culprit");
+    const unlimited = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: 0 }, cfg);
+    expect(unlimited).toContain("up to unlimited gate-clean heads");
+    const def = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: DEFAULT_BURST_MAX }, cfg);
+    expect(def).toContain(`up to ${DEFAULT_BURST_MAX} gate-clean heads`);
+  });
+
+  it("firstRedIndex: the OLDEST red names the culprit; null when the whole pass is green", () => {
+    expect(firstRedIndex([false, false, false])).toBeNull();
+    expect(firstRedIndex([false, true, false, true])).toBe(1);
+    expect(firstRedIndex([true])).toBe(0);
+    expect(firstRedIndex([])).toBeNull();
   });
 });

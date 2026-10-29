@@ -1055,4 +1055,180 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
       res?.body?.cancel?.().catch?.(() => {});
     }
   });
+
+  // ---------- burst-drain settle (BR#4934, decision BR#4932 amends BR#4804) ----------
+
+  it("BR#4934 burst config rides acquire; mid-drain + settle phase strings; a legacy merge keeps the BR#4804 strings byte-identical", async () => {
+    const repo = "state-vector/lane-burst-cfg";
+    await acquire(repo, "gw-bcfg", { required_workflows: ["Test"], burst_max: 3 });
+    const snap = await laneSnap(repo);
+    expect(snap.burst_max).toBe(3);
+    const laneMeta = (await kbJson("/get", { id: snap.card })).body.meta ?? {};
+    expect(laneMeta.lane.burst_max).toBe(3);
+
+    // a legacy merged event (no burst payload) — the BR#4804 settle string, byte-identical
+    const card = await queueViaAccept({ repo, pr: 5001, head: "1".repeat(40) });
+    const M = "2".repeat(40);
+    const merged = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5001, merge_sha: M, head_sha: "1".repeat(40), task_id: card });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    // the merged card itself is the queue head (awaiting-ci cards are blocked
+    // with a merge-train reason) → BR#4981's nextNote rides the settle string
+    expect(merged.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M.slice(0, 9)} (PR #5001): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
+
+    // a burst merged event (mid-drain) flips the phase string to the drain view
+    const card2 = await queueViaAccept({ repo, pr: 5002, head: "3".repeat(40) });
+    const M2 = "4".repeat(40);
+    const burst = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5002, merge_sha: M2, head_sha: "3".repeat(40), task_id: card2, burst_merged: 1, burst_cap: 3 });
+    expect(burst.body.error ?? "").toBe("");
+    expect(burst.body.reason).toBe("merge-train: leased by gw-bcfg — merging burst (1 merged, cap 3) — settle pending");
+    expect((await laneSnap(repo)).currently.phase).toBe("bursting");
+
+    // the settle feed (train.ci, pending) flips bursting → awaiting-ci with the burst settle string
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-bcfg", sha: M2, checks: [check(61, "Test", null)] });
+    expect(ci.body.decided).toBe("pending");
+    // queue head = the older parked card (the legacy-merged card 5001) — nextNote names it (BR#4981)
+    expect(ci.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M2.slice(0, 9)} after 1 merges (PR #5002): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
+
+    // cap 0 renders "unlimited" in the drain string
+    const card3 = await queueViaAccept({ repo, pr: 5003, head: "5".repeat(40) });
+    const M3 = "6".repeat(40);
+    const unlimited = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5003, merge_sha: M3, head_sha: "5".repeat(40), task_id: card3, burst_merged: 2, burst_cap: 0 });
+    expect(unlimited.body.reason).toContain("cap unlimited");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-bcfg" });
+  });
+
+  it("BR#4934 burst pass: back-to-back merges park the intermediates; the GREEN settle closes them via fed ancestry (cancelled-by-next-push law) while the final card lands normally", async () => {
+    const repo = "state-vector/lane-burst-pass";
+    await acquire(repo, "gw-pass", { required_workflows: ["Test", "Deploy"], burst_max: 10 });
+    const H1 = "a".repeat(40), H2 = "b".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5101, head: H1, title: "IMPL: burst intermediate drill" });
+    const c2 = await queueViaAccept({ repo, pr: 5102, head: H2, title: "IMPL: burst final drill" });
+    const M1 = "c".repeat(40), M2 = "d".repeat(40);
+    // merge 1 — mid-drain: the card parks awaiting-ci, the lane stays bursting
+    const m1 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pass", pr: 5101, merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10 });
+    expect(m1.body.error ?? "", `train:merged failed: ${JSON.stringify(m1.body)}`).toBe("");
+    // the per-leg stamp rides meta.merge_train.legs keyed by PR NUMBER
+    expect((await kbJson("/get", { id: c1 })).body.meta?.merge_train?.legs?.["5101"]?.state).toBe("awaiting-ci");
+    expect((await laneSnap(repo)).currently.phase).toBe("bursting");
+    // merge 2 — the pass's FINAL merge: the lane settles on it
+    const m2 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pass", pr: 5102, merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    expect(m2.body.error ?? "", `train:merged failed: ${JSON.stringify(m2.body)}`).toBe("");
+    // settle feed: the executor-fed ancestry (M1 IS a git ancestor of M2 — the
+    // hub holds no VCS creds, BR#3516) + green runs on the final sha only
+    const ci = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-pass", sha: M2,
+      ancestors_of_settled: [M1],
+      checks: [check(71, "Test", "success"), check(72, "Deploy", "success")],
+    });
+    expect(ci.body.decided, JSON.stringify(ci.body)).toBe("landed");
+    // the FINAL card closed through the normal machine-proxy landed close
+    const done2 = (await kbJson("/get", { id: c2 })).body;
+    expect(done2.status).toBe("done");
+    expect(done2.meta?.merge_train?.state).toBe("landed");
+    // the INTERMEDIATE park closed on the burst settle — zero hub GitHub calls,
+    // the fed ancestry is the evidence, its cancelled runs say nothing (GH#2261)
+    const done1 = (await kbJson("/get", { id: c1 })).body;
+    expect(done1.status, JSON.stringify(done1.meta)).toBe("done");
+    expect(done1.meta?.merge_train?.state).toBe("landed");
+    expect(done1.meta?.merge_train?.burst_evidence).toBe(M2);
+    expect(done1.meta?.merge_train?.legs?.["5101"]?.via).toBe("burst-settle");
+    const h1 = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 10 })).body);
+    expect(h1).toContain("Burst-settle close (BR#4934)");
+    expect(h1).toContain("cancelled-by-next-push");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-pass" });
+  });
+
+  it("BR#4934 red settle: the stop pre-stamps the bisect, the walk names ONE culprit (bounce + BR#4068 boost) and re-parks the wrongly stop-bounced final", async () => {
+    const repo = "state-vector/lane-burst-red";
+    await acquire(repo, "gw-red", { required_workflows: ["Test"], burst_max: 10 });
+    const H1 = "e".repeat(40), H2 = "f".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5201, head: H1, title: "IMPL: bisect culprit drill" });
+    const c2 = await queueViaAccept({ repo, pr: 5202, head: H2, title: "IMPL: bisect final drill" });
+    const M1 = "7".repeat(40), M2 = "8".repeat(40);
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-red", pr: 5201, merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10 });
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-red", pr: 5202, merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    // the settle comes back RED on the final sha → the line stops, the FINAL
+    // card bounces (the stop flow's default culprit), stop.bisect pre-stamps
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-red", sha: M2, checks: [check(73, "Test", "failure")] });
+    expect(ci.body.decided).toBe("stopped");
+    const laneId = (await laneSnap(repo)).card;
+    const stopMeta = (await kbJson("/get", { id: laneId })).body.meta;
+    expect(stopMeta.stop?.bisect).toBeTruthy();
+    expect(stopMeta.stop.bisect.pass).toEqual({ merged: 2, cap: 10 });
+    expect(stopMeta.currently.phase).toBe("stopped");
+    expect((await kbJson("/get", { id: c2 })).body.status).toBe("in_progress");
+    // the executor's oldest→newest probe: M1 runs RED → c1 is THE culprit
+    const bisect = await kbJson("/train.bisect", { repo, base: "main", actor: "gw-red", step: { sha: M1, verdict: "red" }, culprit_task: c1, culprit_sha: M1 });
+    expect(bisect.body.error ?? "", JSON.stringify(bisect.body)).toBe("");
+    expect(bisect.body.bounced).toBe(c1);
+    expect(bisect.body.reparked).toBe(c2);
+    // the TRUE culprit: bounced with the fix-forward brief + the starvation boost
+    const culpritCard = (await kbJson("/get", { id: c1 })).body;
+    expect(culpritCard.status).toBe("in_progress");
+    expect(culpritCard.meta?.merge_train?.bisect_culprit).toBe(true);
+    expect(culpritCard.meta?.merge_train?.culprit_sha).toBe(M1);
+    expect(culpritCard.meta?.boosted).toBeTruthy();
+    expect(String(culpritCard.body_md)).toContain("oldest RED");
+    // the final card re-parked blocked, awaiting-ci restored — it closes on the
+    // NEXT green settle via ancestor evidence
+    const fin = (await kbJson("/get", { id: c2 })).body;
+    expect(fin.status).toBe("blocked");
+    expect(fin.meta?.merge_train?.state).toBe("awaiting-ci");
+    expect(fin.meta?.merge_train?.reparked_by).toBe("bisect");
+    // walk state lives hub-side (crash-safe): steps + culprit stamped
+    const stop2 = (await kbJson("/get", { id: laneId })).body.meta.stop;
+    expect(stop2.bisect.steps[M1]?.verdict).toBe("red");
+    expect(stop2.bisect.culprit_task).toBe(c1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-red" });
+  });
+
+  it("BR#4934 inconclusive bisect: the stamp rides stop.bisect, nothing bounces — the executor sweeps the pass oldest-first next", async () => {
+    const repo = "state-vector/lane-burst-inc";
+    await acquire(repo, "gw-inc", { required_workflows: ["Test"], burst_max: 10 });
+    const c1 = await queueViaAccept({ repo, pr: 5301, head: "1".repeat(40) });
+    const c2 = await queueViaAccept({ repo, pr: 5302, head: "2".repeat(40) });
+    const M1 = "3".repeat(40), M2 = "4".repeat(40);
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-inc", pr: 5301, merge_sha: M1, head_sha: "1".repeat(40), task_id: c1, burst_merged: 1, burst_cap: 10 });
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-inc", pr: 5302, merge_sha: M2, head_sha: "2".repeat(40), task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-inc", sha: M2, checks: [check(74, "Test", "failure")] });
+    expect(ci.body.decided).toBe("stopped");
+    // probes dispatched, stalled past the CI bound, re-runs inconclusive →
+    // the executor stamps it; no culprit is named, nothing bounces
+    const b = await kbJson("/train.bisect", { repo, base: "main", actor: "gw-inc", step: { sha: M1, verdict: "inconclusive" }, inconclusive: true });
+    expect(b.body.error ?? "", JSON.stringify(b.body)).toBe("");
+    expect(b.body.stop.bisect.inconclusive).toBe(true);
+    expect(b.body.bounced).toBeNull();
+    expect(b.body.reparked).toBeNull();
+    expect((await kbJson("/get", { id: c1 })).body.status).toBe("blocked");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-inc" });
+  });
+
+  it("BR#4934 settle-window rebase: train.carry appends the verdict-carry chain (contiguity enforced, gaps fail loud)", async () => {
+    const repo = "state-vector/lane-carry";
+    await acquire(repo, "gw-carry", {});
+    const H = "5".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 5401, head: H, title: "IMPL: settle-window carry drill" });
+    const H2 = "6".repeat(40);
+    // the executor ran gh pr update-branch during the settle wait — the carry
+    // rides the leg so the accepted verdict covers the moved head (BR#3516 §5)
+    const carry = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: H, to_head: H2 });
+    expect(carry.body.error ?? "", JSON.stringify(carry.body)).toBe("");
+    expect(carry.body.task).toBe(card);
+    const cm = (await kbJson("/get", { id: card })).body.meta;
+    const leg = cm.pr;
+    expect(leg.carry?.[0]?.from_head).toBe(H);
+    expect(leg.carry?.[0]?.to_head).toBe(H2);
+    expect(leg.carry?.[0]?.via).toBe("update-branch");
+    // a gap fails LOUD — carries append contiguously or not at all
+    const gap = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: "7".repeat(40), to_head: "8".repeat(40) });
+    expect(gap.status).toBeGreaterThanOrEqual(400);
+    expect(String(gap.body.error)).toContain("contiguously");
+    // a no-op carry (nothing moved) fails too
+    const noop = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: H2, to_head: H2 });
+    expect(noop.status).toBeGreaterThanOrEqual(400);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-carry" });
+  });
 });

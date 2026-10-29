@@ -788,18 +788,47 @@ included) as "unmergeable — CONFLICTING".
   in flight per lane, and the lane HOLDS until main settles before the next head enters.
   Serialized is the point: no interleaved merges, no surprise rebases, every merge
   attributable to exactly one lane event.
-- **Back-pressure: main settles before the next head enters (BR#4804)** — after a
-  merge, the lane's awaiting-CI phase judges the check runs ON the merge commit: a
-  lane with a configured `required_workflows` set settles exactly those; an
-  unconfigured lane (the default) settles on **every** check run on the commit —
-  build AND deploy — with a 2-minute settle dwell after the merge so
-  slower-triggered deploys can register a check run. Anything unsettled (including a
-  cancelled-only run) holds; anything red stops the line; only all-green (past the
-  dwell) admits the next head. The old default — vacuous green for unconfigured
-  lanes — merged back-to-back and every push cancelled the previous Deploy Dev,
-  starving main. While settling, the lane reason reads `settling on <sha> (PR #N):
-  build/deploy in flight, attempting <card> next, heads held until main settles`, and
-  the panel's queue depth is the count of heads waiting behind the pressure valve.
+- **Back-pressure: main settles before the next head enters (BR#4804, cadence
+  amended by BR#4934)** — after a merge, the lane's awaiting-CI phase judges the
+  check runs ON the merge commit: a lane with a configured `required_workflows`
+  set settles exactly those; an unconfigured lane (the default) settles on
+  **every** check run on the commit — build AND deploy — with a 2-minute settle
+  dwell after the merge so slower-triggered deploys can register a check run.
+  Anything unsettled (including a cancelled-only run) holds; anything red stops
+  the line; only all-green (past the dwell) admits the next head. The old
+  default — vacuous green for unconfigured lanes — merged back-to-back and
+  every push cancelled the previous Deploy Dev, starving main. While settling,
+  the lane reason reads `settling on <sha> (PR #N): build/deploy in flight,
+  attempting <card> next, heads held until main settles`, and the panel's queue
+  depth is the count of heads waiting behind the pressure valve.
+- **Burst-drain settle: one settle per drain pass, not per merge (BR#4934,
+  decision BR#4932)** — the per-merge settle stays the law for a not-clean
+  head, but a GATE-CLEAN head merges back-to-back behind the previous merge:
+  the executor drains every gate-clean head in one pass (up to
+  `lane.burst_max`, default 10, `0` = unlimited — it rides `train_lane` lane
+  config alongside `required_workflows`) and runs the full settle ONCE, on the
+  pass's FINAL merge commit. The lane reason names the phase mid-drain
+  (`merging burst (N merged, cap M) — settle pending`) and on settle
+  (`settling on <sha> after N merges (PR #N): build/deploy in flight, heads
+  held until main settles`); without burst context the BR#4804 strings
+  (BR#4981 vocabulary included) are byte-identical. Red anywhere stops the
+  line instantly (GH#2261) — a red fed mid-drain never waits for the settle.
+  While the settle wait runs, the executor uses it as a rebase window: one
+  machine-clean `update-branch` per tick on a behind, verdict-covered queued
+  head (a clean trial merge rides with it; a dirty one conflict-bounces;
+  carries append contiguously via `train.carry` — the minimal primitive,
+  superseded by L1.4's carry law when it lands). On a GREEN settle the pass's
+  intermediate parked cards close on executor-fed git ancestry
+  (`ancestors_of_settled` via `train.ci` — their runs were
+  cancelled-by-next-push, and the hub holds no VCS credentials, so the
+  ancestry is the evidence; zero hub GitHub calls); the final head closes
+  per BR#4804 unchanged. On a RED settle the hub pre-stamps `stop.bisect` and
+  the executor probes the pass's intermediate merge shas oldest→newest (one
+  step per tick via `train.bisect`, re-running the stamped checks): the oldest
+  RED probe names the ONE culprit — it bounces with a fix-forward brief + the
+  BR#4068 boost while the wrongly stop-bounced final card re-parks to close on
+  the next green settle; probes that stall past the CI bound (or leave nothing
+  re-runnable) stamp the walk INCONCLUSIVE and the pass bounces oldest-first.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the
