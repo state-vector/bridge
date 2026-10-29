@@ -48,6 +48,12 @@ export interface ProxyAtom {
   number?: number;
   brId?: string;
   runId?: string;
+  /** run_success newer_than form (BR#4658): "a run NEWER than this run id
+   *  concluded success" — the probe resolves it with `gh run list`. */
+  newerThan?: string;
+  /** run_success optional awaited head (7-40 hex, BR#4658): the executor
+   *  probe compares the run's headSha against it; mismatch fails closed. */
+  head?: string;
   /** ask: the ask id the card awaits (an OPEN ask answers/closes = fired) */
   askId?: string;
   /** time: the epoch-ms deadline (now >= until_ts = fired) */
@@ -161,7 +167,7 @@ function atomKey(a: Omit<ProxyAtom, "raw">): string {
     a.brId ??
     (a.number !== undefined
       ? String(a.number)
-      : a.runId ?? a.commit ?? a.askId ?? (a.untilTs !== undefined ? String(a.untilTs) : ""));
+      : a.runId ?? (a.newerThan !== undefined ? `newer:${a.newerThan}` : undefined) ?? a.commit ?? a.askId ?? (a.untilTs !== undefined ? String(a.untilTs) : ""));
   return `${a.kind}|${a.repo ?? ""}|${target}`;
 }
 
@@ -177,7 +183,7 @@ function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n };
     case "br_done": return { kind: "br_done", repo: null, brId: e.id };
     case "br_answered": return { kind: "br_answered", repo: null, brId: e.id };
-    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than };
+    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id, newerThan: e.newer_than, head: e.head };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
     case "ask": return { kind: "ask", repo: null, askId: e.ask_id };
@@ -559,7 +565,7 @@ export type AwaitEvent =
   | { event: "issue_closed"; repo: string; n: number }
   | { event: "br_done"; id: string }
   | { event: "br_answered"; id: string }
-  | { event: "run_success"; repo: string; run_id?: string; newer_than?: string }
+  | { event: "run_success"; repo: string; run_id?: string; newer_than?: string; head?: string }
   | { event: "pr_checks_green"; repo: string; n: number }
   | { event: "deployed"; commit: string }
   | { event: "ask"; ask_id: string }
@@ -571,7 +577,7 @@ export const AWAIT_EVENT_KINDS = [
 ] as const;
 
 export const AWAIT_GRAMMAR_DOC =
-  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"br_answered",id} (a resolved ask/question card) | {event:"run_success",repo,run_id?,newer_than?} | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
+  'typed await_event (closed set): {event:"pr_merged",repo,n} | {event:"br_pr_merged",id} | {event:"issue_closed",repo,n} | {event:"br_done",id} | {event:"br_answered",id} (a resolved ask/question card) | {event:"run_success",repo,run_id?,newer_than?,head?} (head = the awaited commit, 7-40 hex — the executor probe fails closed on a head mismatch, BR#4658) | {event:"pr_checks_green",repo,n} | {event:"deployed",commit} (the HUB worker deployed at that commit, 7-40 hex prefix) | {event:"ask",ask_id} (an OPEN ask) | {event:"time",until_ts}';
 
 /** Closed-set validation. Returns the normalised event or null (fail-closed). */
 export function validateAwaitEvent(v: unknown): AwaitEvent | null {
@@ -596,7 +602,13 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
       if (!repo) return null;
       const rid = typeof e.run_id === "string" && /^\d{6,}$/.test(e.run_id) ? e.run_id : undefined;
       const nt = typeof e.newer_than === "string" && /^\d{6,}$/.test(e.newer_than) ? e.newer_than : undefined;
-      return rid || nt ? { event: "run_success", repo, run_id: rid, newer_than: nt } : null;
+      // BR#4658: optional `head` — the commit the park awaits (7-40 hex).
+      // The executor probe compares the run's headSha against it and fails
+      // closed on a mismatch (BR#3409). A PRESENT-but-malformed head
+      // invalidates the whole event (conservatism law — never guess).
+      if (e.head !== undefined && (typeof e.head !== "string" || !/^[0-9a-f]{7,40}$/i.test(e.head))) return null;
+      const head = typeof e.head === "string" ? e.head.toLowerCase() : undefined;
+      return rid || nt ? { event: "run_success", repo, run_id: rid, newer_than: nt, head } : null;
     }
     case "ask":
       return typeof e.ask_id === "string" && e.ask_id.trim() ? { event: "ask", ask_id: e.ask_id.trim() } : null;
@@ -621,7 +633,7 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "br_done": return { kind: "br_done", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
     case "br_answered": return { kind: "br_answered", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
-    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than, raw: describeAwaitEvent(e) };
+    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id, newerThan: e.newer_than, head: e.head, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
     case "ask": case "time": return null;
@@ -638,7 +650,7 @@ export function describeAwaitEvent(e: AwaitEvent): string {
     case "br_answered": return `${e.id} answered (no longer open)`;
     case "run_success":
       return e.run_id
-        ? `GitHub run ${e.repo}/${e.run_id} conclusion=success`
+        ? `GitHub run ${e.repo}/${e.run_id} conclusion=success${e.head ? ` at head ${e.head}` : ""}`
         : `a GitHub Actions run on ${e.repo} newer than ${e.newer_than} with conclusion=success`;
     case "pr_checks_green": return `all checks green on PR ${e.repo}#${e.n}`;
     case "deployed": return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
@@ -659,7 +671,16 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
     case "issue_closed": return a.repo && a.number ? { event: "issue_closed", repo: a.repo, n: a.number } : null;
     case "br_done": return a.brId ? { event: "br_done", id: a.brId } : null;
     case "br_answered": return a.brId ? { event: "br_answered", id: a.brId } : null;
-    case "run_success": return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
+    case "run_success":
+      return a.repo && (a.runId || a.newerThan)
+        ? {
+            event: "run_success",
+            repo: a.repo,
+            ...(a.runId ? { run_id: a.runId } : {}),
+            ...(a.newerThan ? { newer_than: a.newerThan } : {}),
+            ...(a.head ? { head: a.head } : {}),
+          }
+        : null;
     case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
     case "deployed": return a.commit ? { event: "deployed", commit: a.commit } : null;
     // BR#4062: typed ask/time legs parse from prose and map like any atom —

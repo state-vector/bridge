@@ -1169,6 +1169,10 @@ pub struct DaemonTrainConfig {
     /// RECONCILE_ENABLED=0 turns it off independently of the train leg.
     pub reconcile_enabled: bool,
     pub reconcile_interval_ms: u64,
+    /// BR#4658: the proxy verification probe leg (read-only gh for
+    /// run_success / pr_checks_green typed-await parks). On by default;
+    /// PROXY_PROBES_ENABLED=0 turns it off independently.
+    pub probes_enabled: bool,
 }
 
 impl DaemonTrainConfig {
@@ -1188,6 +1192,7 @@ impl DaemonTrainConfig {
             enabled: env_enabled(std::env::var("MERGE_TRAIN_ENABLED").ok()),
             reconcile_enabled: env_enabled(std::env::var("RECONCILE_ENABLED").ok()),
             reconcile_interval_ms: clamp_reconcile_interval_secs(reconcile_secs) * 1000,
+            probes_enabled: env_enabled(std::env::var("PROXY_PROBES_ENABLED").ok()),
         }
     }
 }
@@ -1252,11 +1257,12 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     log(
         None,
         &format!(
-            "gateway train leg up — holder={} interval={}s lanes={} reconcile={} (in-process, identity-gated per BR#3181)",
+            "gateway train leg up — holder={} interval={}s lanes={} reconcile={} probes={} (in-process, identity-gated per BR#3181)",
             cfg.holder,
             cfg.interval_ms / 1000,
             if cfg.lanes.is_empty() { "all".to_string() } else { cfg.lanes.join(",") },
-            if cfg.reconcile_enabled { format!("on/{}s", cfg.reconcile_interval_ms / 1000) } else { "off".to_string() }
+            if cfg.reconcile_enabled { format!("on/{}s", cfg.reconcile_interval_ms / 1000) } else { "off".to_string() },
+            if cfg.probes_enabled { "on".to_string() } else { "off".to_string() },
         ),
     );
     let mut ctx = match ctx_for_daemon(&cfg) {
@@ -1354,6 +1360,26 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
                 }
             }
         }
+        // BR#4658: the proxy verification probe leg — read-only gh checks the
+        // hub cannot make (it holds no VCS credentials), giving non-train
+        // typed-await parks (run_success / pr_checks_green) their machine
+        // closer. Runs every tick (one cheap poll; gh only when probes are
+        // pending); same survivability rules as the reconcile leg.
+        if cfg.probes_enabled {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| proxy_probe_pass(&mut ctx)));
+            match r {
+                Ok(Ok(lines)) => {
+                    for l in lines {
+                        log(None, &l);
+                    }
+                }
+                Ok(Err(e)) => log(None, &format!("[probe] pass failed (retries next tick): {}", trunc(&e, 300))),
+                Err(p) => {
+                    let msg = p.downcast_ref::<String>().cloned().unwrap_or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_else(|| "panic".into()));
+                    log(None, &format!("[probe] pass PANIC (leg survives): {}", trunc(&msg, 300)));
+                }
+            }
+        }
         if failures > 0 {
             failures = failures.saturating_sub(1); // a completed tick heals the breaker
         }
@@ -1401,6 +1427,207 @@ fn pr_payload(rows: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().filter(|r| r.is_object()).cloned().collect()),
         _ => Value::Array(Vec::new()),
     }
+}
+
+// ===========================================================================
+// BR#4658 — the proxy verification probe leg. Non-train typed-await parks
+// (run_success / pr_checks_green) had NO machine closer: the hub holds no
+// VCS credentials (BR#3516), so its proxy sweep could never verify the gate
+// (specimen BR#3621 — the run concluded SUCCESS and the card sat blocked
+// ~60h past its exit). The sweep enqueues probes; THIS leg (beside the
+// reconcile leg) runs the read-only gh command each probe names and feeds
+// the verdict back through proxy_verify. The DAEMON only observes; the HUB
+// decides (head law BR#3409, the proxy_verified event, the flip). Every gh
+// call here is read-only — the same class as the reconcile leg, never
+// identity-gated (BR#3181 gates WRITE legs only).
+// ===========================================================================
+
+/// What one probe observation means (pure — unit-testable). The mapping to
+/// proxy_verify payloads lives in proxy_probe_pass; this enum is the whole
+/// decision surface the executor owns.
+#[derive(Debug, PartialEq)]
+enum ProbeVerdict {
+    /// The gate fired — feed ok=true with the evidence URL.
+    Satisfied { receipt: String, head_sha: String, conclusion: String },
+    /// The gate conclusively did NOT fire (run failed/cancelled, checks red)
+    /// — feed ok=false conclusive=true; the hub stamps a negative
+    /// proxy_verified and the park stands (BR#3409 fail-closed).
+    Conclusive { error: String, receipt: String, conclusion: String },
+    /// Nothing decidable yet (gh error, run in flight, checks pending) —
+    /// feed ok=false transient; the hub backs off, attempt-capped.
+    Transient { error: String },
+}
+
+/// gh emits run conclusions uppercase; SUCCESS is the only green. The
+/// terminal-failure classes are conclusive (a re-poll will not change them);
+/// everything else (empty, in-progress classes) stays transient.
+fn classify_run_conclusion(conclusion: &str, url: &str, head_sha: &str) -> ProbeVerdict {
+    match conclusion.to_ascii_uppercase().as_str() {
+        "SUCCESS" => ProbeVerdict::Satisfied {
+            receipt: url.to_string(),
+            head_sha: head_sha.to_string(),
+            conclusion: "success".into(),
+        },
+        "FAILURE" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => ProbeVerdict::Conclusive {
+            error: format!("run concluded {conclusion}"),
+            receipt: url.to_string(),
+            conclusion: conclusion.to_ascii_lowercase(),
+        },
+        _ => ProbeVerdict::Transient { error: format!("run not concluded yet (conclusion {conclusion:?})") },
+    }
+}
+
+/// The newer_than form: "a run NEWER than <id> concluded success" — scan the
+/// run list (newest first) for any qualifying row; none yet = transient (a
+/// future run may still satisfy; one failed newer run does not falsify).
+fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
+    let floor: u64 = newer_than.parse().unwrap_or(0);
+    for r in rows {
+        let id = r.get("databaseId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let conclusion = r.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        if id > floor && conclusion.eq_ignore_ascii_case("success") {
+            return ProbeVerdict::Satisfied {
+                receipt: r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                head_sha: r.get("headSha").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                conclusion: "success".into(),
+            };
+        }
+    }
+    ProbeVerdict::Transient { error: format!("no successful run newer than {newer_than} yet") }
+}
+
+/// pr_checks_green: gh's statusCheckRollup reflects the PR's CURRENT head
+/// (head-consistency by construction). SUCCESS/NEUTRAL/SKIPPED don't block;
+/// the terminal-failure classes are conclusive; everything else is pending.
+fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict {
+    if rollup.is_empty() {
+        return ProbeVerdict::Transient { error: "no checks reported on the PR yet".into() };
+    }
+    let mut failed: Vec<String> = Vec::new();
+    let mut pending = 0usize;
+    for e in rollup {
+        let state = e
+            .get("conclusion")
+            .and_then(|v| v.as_str())
+            .or_else(|| e.get("state").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let name = e.get("name").and_then(|v| v.as_str()).or_else(|| e.get("context").and_then(|v| v.as_str())).unwrap_or("?");
+        match state.to_ascii_uppercase().as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => failed.push(format!("{name}={state}")),
+            _ => pending += 1,
+        }
+    }
+    if let Some(first) = failed.first() {
+        let more = if failed.len() > 1 { format!(" (+{} more)", failed.len() - 1) } else { String::new() };
+        return ProbeVerdict::Conclusive {
+            error: format!("checks failing: {first}{more}"),
+            receipt: url.to_string(),
+            conclusion: "failing".into(),
+        };
+    }
+    if pending > 0 {
+        return ProbeVerdict::Transient { error: format!("checks pending ({pending} of {} not concluded)", rollup.len()) };
+    }
+    ProbeVerdict::Satisfied { receipt: url.to_string(), head_sha: head_sha.to_string(), conclusion: "checks green".into() }
+}
+
+/// Run the read-only gh observation for one probe — the only GitHub I/O on
+/// this leg. gh errors surface as Err → reported transient (the hub backs
+/// off; nothing here ever fabricates a verdict).
+fn observe_probe(ctx: &Ctx, repo: &str, kind: &str, p: &Value) -> Result<ProbeVerdict, String> {
+    match kind {
+        "run_success" => {
+            if let Some(run_id) = vstr(p, "run_id").filter(|s| !s.is_empty()) {
+                let v = ctx.gh_json(&["run", "view", run_id, "--repo", repo, "--json", "conclusion,headSha,url"])?;
+                Ok(classify_run_conclusion(
+                    vstr(&v, "conclusion").unwrap_or(""),
+                    vstr(&v, "url").unwrap_or(""),
+                    vstr(&v, "headSha").unwrap_or(""),
+                ))
+            } else if let Some(newer) = vstr(p, "newer_than").filter(|s| !s.is_empty()) {
+                let v = ctx.gh_json(&["run", "list", "--repo", repo, "--limit", "30", "--json", "databaseId,conclusion,headSha,url"])?;
+                let rows = v.as_array().cloned().unwrap_or_default();
+                Ok(classify_run_list(&rows, newer))
+            } else {
+                Ok(ProbeVerdict::Transient { error: "probe names neither run_id nor newer_than".into() })
+            }
+        }
+        "pr_checks_green" => {
+            let pr = p.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pr <= 0 {
+                return Ok(ProbeVerdict::Transient { error: "probe carries no PR number".into() });
+            }
+            let v = ctx.gh_json(&["pr", "view", &pr.to_string(), "--repo", repo, "--json", "headRefOid,statusCheckRollup,url"])?;
+            let rollup = v.get("statusCheckRollup").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            Ok(classify_rollup(
+                &rollup,
+                vstr(&v, "url").unwrap_or(""),
+                vstr(&v, "headRefOid").unwrap_or(""),
+            ))
+        }
+        other => Ok(ProbeVerdict::Transient { error: format!("unknown probe kind {other}") }),
+    }
+}
+
+/// Map one probe observation to its proxy_verify payload (pure — the report
+/// contract in one place). An Err observation maps to a transient report.
+fn probe_report_body(key: &str, observed: Result<ProbeVerdict, String>) -> Value {
+    let mut body = json!({ "key": key });
+    match observed {
+        Ok(ProbeVerdict::Satisfied { receipt, head_sha, conclusion }) => {
+            body["ok"] = json!(true);
+            body["receipt"] = json!(receipt);
+            body["head_sha"] = json!(head_sha);
+            body["conclusion"] = json!(conclusion);
+        }
+        Ok(ProbeVerdict::Conclusive { error, receipt, conclusion }) => {
+            body["ok"] = json!(false);
+            body["conclusive"] = json!(true);
+            body["error"] = json!(error);
+            body["receipt"] = json!(receipt);
+            body["conclusion"] = json!(conclusion);
+        }
+        Ok(ProbeVerdict::Transient { error }) => {
+            body["ok"] = json!(false);
+            body["error"] = json!(error);
+        }
+        Err(e) => {
+            body["ok"] = json!(false);
+            body["error"] = json!(trunc(&e, 300));
+        }
+    }
+    body
+}
+
+/// One probe pass: poll the hub's queue, observe each probe first-hand, feed
+/// the verdict back. Errors NEVER fabricate satisfaction — a gh failure is
+/// reported transient and the hub retries on its own backoff.
+fn proxy_probe_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
+    let res = ctx.mcp("proxy_probes", json!({}))?;
+    let probes = res.get("probes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut lines = Vec::new();
+    for p in &probes {
+        let key = vstr(p, "key").unwrap_or("").to_string();
+        let repo = vstr(p, "repo").unwrap_or("").to_string();
+        let kind = vstr(p, "kind").unwrap_or("").to_string();
+        if key.is_empty() || repo.is_empty() {
+            continue;
+        }
+        let body = probe_report_body(&key, observe_probe(ctx, &repo, &kind, p));
+        match ctx.mcp("proxy_verify", body) {
+            Ok(rep) => {
+                let verdict = rep.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
+                lines.push(format!("[probe] {key}: {verdict}"));
+            }
+            Err(e) => {
+                // the hub kept the probe (it is still ours to report next
+                // tick) — log, never fabricate, never retry in-pass
+                log(Some(&key), &format!("proxy_verify refused (hub retains the probe): {}", trunc(&e, 200)));
+            }
+        }
+    }
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -1941,5 +2168,103 @@ mod tests {
         assert!(ctx.is_ancestor("main", &pr_head).is_err(), "an unfetched head must fail closed, not read as behind");
         ctx.fetch_pr_head(7).unwrap();
         assert_eq!(ctx.is_ancestor("main", &pr_head).unwrap(), true, "the fetched head must be a readable object");
+    }
+
+    // ---- BR#4658: the probe verdict law (pure classifiers + report map) ----
+
+    #[test]
+    fn run_conclusion_success_is_the_only_green() {
+        let v = classify_run_conclusion("success", "https://github.com/o/r/actions/runs/1", "ca18675f0f");
+        assert!(matches!(v, ProbeVerdict::Satisfied { .. }));
+        let v = classify_run_conclusion("SUCCESS", "https://github.com/o/r/actions/runs/1", "ca18675f0f");
+        assert!(matches!(v, ProbeVerdict::Satisfied { .. }));
+    }
+
+    #[test]
+    fn run_conclusion_terminal_failures_are_conclusive_never_transient() {
+        for c in ["failure", "CANCELLED", "timed_out", "startup_failure", "action_required"] {
+            let v = classify_run_conclusion(c, "https://github.com/o/r/actions/runs/2", "");
+            assert!(matches!(v, ProbeVerdict::Conclusive { .. }), "{c} must be conclusive");
+        }
+    }
+
+    #[test]
+    fn run_in_flight_is_transient_never_a_verdict() {
+        for c in ["", "in_progress", "queued", "unknown-future-class"] {
+            let v = classify_run_conclusion(c, "https://github.com/o/r/actions/runs/3", "");
+            assert!(matches!(v, ProbeVerdict::Transient { .. }), "{c:?} must stay transient (BR#3409: no fabricated verdict)");
+        }
+    }
+
+    #[test]
+    fn run_list_newer_than_finds_only_newer_success() {
+        let rows = json!([
+            { "databaseId": 500u64, "conclusion": "success", "headSha": "aaa", "url": "https://github.com/o/r/actions/runs/500" },
+            { "databaseId": 400u64, "conclusion": "failure", "headSha": "bbb", "url": "https://github.com/o/r/actions/runs/400" },
+            { "databaseId": 300u64, "conclusion": "success", "headSha": "ccc", "url": "https://github.com/o/r/actions/runs/300" }
+        ]);
+        let as_arr = rows.as_array().unwrap();
+        // newer than 300: run 500 is a newer success → satisfied on IT
+        let v = classify_run_list(as_arr, "300");
+        match v {
+            ProbeVerdict::Satisfied { receipt, head_sha, .. } => {
+                assert!(receipt.ends_with("/500"));
+                assert_eq!(head_sha, "aaa");
+            }
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+        // newer than 500: nothing newer → transient (one failed newer run
+        // does not falsify the gate — a future run may still satisfy)
+        let v = classify_run_list(as_arr, "500");
+        assert!(matches!(v, ProbeVerdict::Transient { .. }));
+    }
+
+    #[test]
+    fn rollup_green_counts_neutral_and_skipped_as_green() {
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "Lint", "state": "NEUTRAL" },
+            { "name": "Gen", "state": "SKIPPED" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        assert!(matches!(v, ProbeVerdict::Satisfied { .. }));
+    }
+
+    #[test]
+    fn rollup_red_is_conclusive_and_names_the_failing_check() {
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "Rust Tests", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Conclusive { error, .. } => assert!(error.contains("Rust Tests=FAILURE")),
+            other => panic!("expected conclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollup_pending_is_transient_and_empty_rollup_is_transient() {
+        let rollup = json!([{ "name": "Test", "conclusion": null, "status": "IN_PROGRESS" }]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "u", "");
+        assert!(matches!(v, ProbeVerdict::Transient { .. }));
+        let v = classify_rollup(&[], "u", "");
+        assert!(matches!(v, ProbeVerdict::Transient { .. }));
+    }
+
+    #[test]
+    fn report_body_maps_the_three_verdicts_and_errors() {
+        let sat = probe_report_body("run:o:r:1", Ok(ProbeVerdict::Satisfied { receipt: "https://github.com/o/r/actions/runs/1".into(), head_sha: "ca18675f0f".into(), conclusion: "success".into() }));
+        assert_eq!(sat["ok"], json!(true));
+        assert!(sat["receipt"].as_str().unwrap().starts_with("https://github.com/"));
+        let con = probe_report_body("checks:o/r#9", Ok(ProbeVerdict::Conclusive { error: "checks failing: Test=FAILURE".into(), receipt: "u".into(), conclusion: "failing".into() }));
+        assert_eq!(con["ok"], json!(false));
+        assert_eq!(con["conclusive"], json!(true));
+        let tr = probe_report_body("run:o:r:3", Ok(ProbeVerdict::Transient { error: "run not concluded yet".into() }));
+        assert_eq!(tr["ok"], json!(false));
+        assert!(tr.get("conclusive").is_none(), "transient must NOT claim conclusiveness");
+        let err = probe_report_body("run:o:r:4", Err("gh not authed".into()));
+        assert_eq!(err["ok"], json!(false));
+        assert_eq!(err["error"], json!("gh not authed"));
     }
 }

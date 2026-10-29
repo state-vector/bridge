@@ -181,6 +181,41 @@ const TRAIN_STARVE_MS = 10 * 60_000;
  *  there is no work so the lane is trusted the moment work arrives. */
 const TRAIN_READY_MS = 15 * 60_000;
 
+// ---- BR#4658 worker-executor verification probes ----
+/** A failed probe re-arms after this backoff (the executor re-polls pending
+ *  probes each tick; the sweep re-enqueues failed rows past the backoff). */
+const PROBE_RETRY_MS = 10 * 60_000;
+/** Transient gh failures before the probe gives up and the park goes back to
+ *  a loud unresolvable (never a silent infinite retry loop). */
+const PROBE_ATTEMPT_CAP = 12;
+
+/** The dedupe key for a probe — one row per atom across all waiting cards. */
+export function proxyProbeKey(atom: Pick<ProxyAtom, "kind" | "repo" | "runId" | "newerThan" | "number">): string | null {
+  const repo = String(atom.repo ?? "").trim();
+  if (!repo) return null;
+  if (atom.kind === "run_success") {
+    if (atom.runId) return `run:${repo}:${atom.runId}`;
+    if (atom.newerThan) return `newer:${repo}:${atom.newerThan}`;
+    return null;
+  }
+  if (atom.kind === "pr_checks_green") {
+    return Number(atom.number ?? 0) > 0 ? `checks:${repo}#${Number(atom.number)}` : null;
+  }
+  return null;
+}
+
+/** The hub-side head law (BR#3409 / BR#4658): the observed head matches the
+ *  awaited head — exact, or the awaited value is a prefix of the full 40-hex
+ *  observed head (parks may record a short hex prefix). The reverse never
+ *  matches: a short observed value cannot confirm a longer expectation. */
+export function headMatches(observed: string, expected: string): boolean {
+  const o = String(observed ?? "").toLowerCase();
+  const e = String(expected ?? "").toLowerCase();
+  if (!o || !e) return false;
+  return o === e || o.startsWith(e);
+}
+
+
 /** The standard verify-duty body — the ONE 5c-gated template. The normal
  *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
  *  render through here, so the two spawn sites can never drift apart.
@@ -1040,11 +1075,15 @@ export class KnowledgeHub {
   // unresolvable (never auto-flip — conservatism law) and the spawned unblock
   // duty verifies them first-hand, where the creds live.
   /** Live verdict for one proxy atom. `receipt` is the evidence line that
-   *  rides the spawned duty's body (and the per-card stamp). */
+   *  rides the spawned duty's body (and the per-card stamp). `probeState`
+   *  (BR#4658) carries the worker-executor verification-probe lifecycle for
+   *  run_success/pr_checks_green atoms: unprobed (needs enqueue) | pending |
+   *  exhausted (cap reached — loud unresolvable again) | negative (conclusive
+   *  no — the gate has not fired). */
   private async evalProxyAtom(
     atom: ProxyAtom,
     io: { defaultRepo: string },
-  ): Promise<{ ok: boolean; receipt: string }> {
+  ): Promise<{ ok: boolean; receipt: string; probeState?: "unprobed" | "pending" | "exhausted" | "negative" }> {
     const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
     switch (atom.kind) {
       case "br_done": {
@@ -1088,11 +1127,62 @@ export class KnowledgeHub {
       }
       case "run_success": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — run ${atom.runId} outcome needs credentials the hub does not hold (BR#3516); verify first-hand` };
+        // BR#4658: ledger-native first — a worker-executor probe verdict is a
+        // fact the hub OWNS (stamped through proxy.verify with the gh
+        // receipt), same trust shape as the train-stamped provenance above.
+        const v = this.one(
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
+          proxyProbeKey(atom),
+        ) as any;
+        if (v?.state === "verified" && v.ok === 1) {
+          return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
+        }
+        if (v?.state === "verified" && v.ok === 0) {
+          // conclusive negative (head mismatch / run failed) — the gate has
+          // NOT fired; the park stays (BR#3409 fail-closed), loudly.
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
+        }
+        if (v?.state === "failed") {
+          const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
+          return {
+            ok: false,
+            receipt: exhausted
+              ? `worker-executor probe exhausted after ${v.attempts} attempts — ${v.error ?? "gh kept failing"}; verify first-hand (BR#3516)`
+              : `worker-executor probe pending (attempt ${v.attempts}/${PROBE_ATTEMPT_CAP} failed: ${v.error ?? "gh failed"} — retrying)`,
+            probeState: exhausted ? "exhausted" : "pending",
+          };
+        }
+        if (v) {
+          return { ok: false, receipt: `worker-executor probe pending (BR#4658) — a daemon executor will run gh and stamp the verdict`, probeState: "pending" };
+        }
+        return { ok: false, receipt: `unverified from the hub — run ${atom.runId ?? atom.newerThan} outcome needs credentials the hub does not hold (BR#3516); enqueueing a worker-executor verification probe (BR#4658)`, probeState: "unprobed" };
       }
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
-        return { ok: false, receipt: `unresolvable from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); verify first-hand or wait for the train's CI verdict` };
+        const v = this.one(
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
+          proxyProbeKey(atom),
+        ) as any;
+        if (v?.state === "verified" && v.ok === 1) {
+          return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
+        }
+        if (v?.state === "verified" && v.ok === 0) {
+          return { ok: false, receipt: `executor-verified negative (BR#4658): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
+        }
+        if (v?.state === "failed") {
+          const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
+          return {
+            ok: false,
+            receipt: exhausted
+              ? `worker-executor probe exhausted after ${v.attempts} attempts — ${v.error ?? "gh kept failing"}; verify first-hand (BR#3516)`
+              : `worker-executor probe pending (attempt ${v.attempts}/${PROBE_ATTEMPT_CAP} failed: ${v.error ?? "gh failed"} — retrying)`,
+            probeState: exhausted ? "exhausted" : "pending",
+          };
+        }
+        if (v) {
+          return { ok: false, receipt: `worker-executor probe pending (BR#4658) — a daemon executor will run gh and stamp the verdict`, probeState: "pending" };
+        }
+        return { ok: false, receipt: `unverified from the hub — PR ${atom.repo}#${atom.number} checks need credentials the hub does not hold (BR#3516); enqueueing a worker-executor verification probe (BR#4658)`, probeState: "unprobed" };
       }
       case "deployed": {
         // the one credential-free external atom: the hub IS the deploy. Its
@@ -1132,6 +1222,129 @@ export class KnowledgeHub {
       this.audit("hub:proxy-watch", "proxy_check", id, { verdict, detail: detail?.slice(0, 300) });
     }
   }
+
+  // ---- worker-executor verification probes (BR#4658) ----
+  // The hub holds no GitHub credentials (BR#3516); run_success /
+  // pr_checks_green parks had NO machine closer (specimen BR#3621: the run
+  // concluded SUCCESS and the card sat blocked ~60h past its exit). The
+  // sweep enqueues a probe; the daemon executor leg (train.rs, beside the
+  // merge train) runs gh first-hand and feeds the verdict through
+  // proxy.verify — executor-fed facts, hub-decided (BR#4489). Fail-closed
+  // per BR#3409: a head mismatch or an inconclusive gh state never flips.
+
+  /** Enqueue (or retry) the verification probe for one atom. Dedupe by the
+   *  atom key — two cards awaiting the same run share ONE probe. Attempt-
+   *  capped with backoff pacing so a broken gh never tight-loops. */
+  private enqueueProxyProbe(atom: ProxyAtom, cardId: string, now: number): void {
+    const key = proxyProbeKey(atom);
+    if (!key) return;
+    const existing = this.one(`SELECT state, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key) as any;
+    if (existing) {
+      if (existing.state === "pending" || existing.state === "verified") return; // in flight / done
+      // failed: retry on backoff until the cap
+      if (Number(existing.attempts ?? 0) >= PROBE_ATTEMPT_CAP) return; // exhausted — loud unresolvable
+      if (now - Number(existing.updated_ts ?? 0) < PROBE_RETRY_MS) return; // backoff
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'pending', card_id = ?, updated_ts = ? WHERE key = ?`,
+        cardId, now, key,
+      );
+      this.audit("hub:proxy-watch", "proxy_probe_retry", key, { attempts: Number(existing.attempts ?? 0) + 1, card: cardId });
+      return;
+    }
+    this.state.storage.sql.exec(
+      `INSERT INTO proxy_probes (key, repo, kind, run_id, newer_than, pr, expected_head, card_id, state, attempts, created_ts, updated_ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
+      key, String(atom.repo ?? ""), atom.kind,
+      atom.kind === "run_success" ? (atom.runId ?? null) : null,
+      atom.kind === "run_success" ? (atom.newerThan ?? null) : null,
+      atom.kind === "pr_checks_green" ? Number(atom.number ?? 0) || null : null,
+      atom.kind === "run_success" ? (atom.head ?? null) : null,
+      cardId, now, now,
+    );
+    this.audit("hub:proxy-watch", "proxy_probe_enqueued", key, { card: cardId, kind: atom.kind });
+  }
+
+  /** proxy.probes — the executor poll: pending probes, oldest first, capped.
+   *  Read-only; the hub decides nothing here (the facts come back through
+   *  proxy.verify). */
+  private proxyProbes(body: any): any {
+    const limit = Math.max(1, Math.min(Number(body?.limit ?? 10) || 10, 25));
+    const rows = this.state.storage.sql.exec(
+      `SELECT key, repo, kind, run_id, newer_than, pr, expected_head, card_id, attempts FROM proxy_probes
+       WHERE state = 'pending' ORDER BY updated_ts ASC LIMIT ?`,
+      limit,
+    ).toArray();
+    return { ok: true, probes: rows };
+  }
+
+  /** proxy.verify — the executor feeds one probe's gh verdict; the HUB
+   *  decides (executor-fed facts, hub-decided — BR#3516/BR#4489). A
+   *  satisfied verdict stamps a `proxy_verified` event on the parked card
+   *  with the GitHub-URL receipt and re-enters the standard satisfied-proxy
+   *  path on the next sweep pass; head mismatches and conclusive failures
+   *  are stamped negative and NEVER flip (BR#3409 fail-closed); transient
+   *  gh errors bump attempts (backoff, cap → loud unresolvable again). */
+  private proxyVerify(body: any, actor: string): any {
+    const key = String(body?.key ?? "").trim();
+    const probe = this.one(`SELECT * FROM proxy_probes WHERE key = ?`, key) as any;
+    if (!probe) return { ok: false, error: `no such probe: ${key}` };
+    if (probe.state === "verified") return { ok: false, error: `probe ${key} already verified — verdict of record stands` };
+    const now = Date.now();
+    const headSha = typeof body?.head_sha === "string" ? body.head_sha.toLowerCase() : "";
+    const receipt = String(body?.receipt ?? "").trim();
+    const conclusion = typeof body?.conclusion === "string" ? body.conclusion.toUpperCase() : "";
+    const expected = String(probe.expected_head ?? "").toLowerCase();
+
+    // HUB-side head law (BR#3409): the executor reports what it saw; the hub
+    // compares against the awaited head — a mismatch is a conclusive NO
+    // whatever the executor's ok said.
+    const headMismatch = !!(expected && headSha && !headMatches(headSha, expected));
+
+    if (body?.ok === true && !headMismatch) {
+      if (!/https:\/\/github\.com\//.test(receipt)) {
+        return { ok: false, error: "receipt must carry the GitHub URL(s) of the evidence (BR#4658 contract)" };
+      }
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'verified', ok = 1, receipt = ?, head_sha = ?, conclusion = ?, error = NULL, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+        receipt.slice(0, 500), headSha || null, conclusion || null, now, key,
+      );
+      const note = `proxy_verified: ${probe.kind} SATISFIED — ${receipt}${headSha ? ` (head ${headSha.slice(0, 9)})` : ""} (worker-executor ${actor}, BR#4658)`;
+      this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 1, receipt: receipt.slice(0, 300), head_sha: headSha || null });
+      this.audit("hub:proxy-watch", "proxy_probe_verified", key, { card: probe.card_id, receipt: receipt.slice(0, 300), head_sha: headSha || null });
+      return { ok: true, verdict: "satisfied", note };
+    }
+
+    // conclusive negative: the executor saw the gate fail for real (run
+    // failed/cancelled, checks red) or the hub's head law failed the verdict.
+    const conclusive = headMismatch || body?.conclusive === true;
+    if (conclusive) {
+      const why = headMismatch
+        ? `head mismatch — run concluded at ${headSha.slice(0, 9) || "?"}, the park awaits ${expected.slice(0, 9)} (BR#3409 fail-closed)`
+        : String(body?.error ?? body?.reason ?? "conclusive negative from the executor").slice(0, 300);
+      const ev = receipt && /https:\/\/github\.com\//.test(receipt) ? receipt : `https://github.com/${probe.repo}/actions`;
+      this.state.storage.sql.exec(
+        `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+        ev.slice(0, 500), headSha || null, conclusion || null, why, now, key,
+      );
+      const note = `proxy_verified: ${probe.kind} NOT satisfied — ${why} (worker-executor ${actor}, BR#4658); the park stands (fail-closed)`;
+      this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 0, receipt: ev.slice(0, 300), head_sha: headSha || null });
+      this.audit("hub:proxy-watch", "proxy_probe_negative", key, { card: probe.card_id, why });
+      return { ok: true, verdict: "negative", note };
+    }
+
+    // transient: gh broken / run still in flight — backoff, cap, no event
+    // stamp (a pending run re-probing every few minutes must not churn the
+    // card's version log).
+    const attempts = Number(probe.attempts ?? 0) + 1;
+    const err = String(body?.error ?? "gh failed (no detail)").slice(0, 300);
+    this.state.storage.sql.exec(
+      `UPDATE proxy_probes SET state = 'failed', error = ?, attempts = ?, updated_ts = ? WHERE key = ?`,
+      err, attempts, now, key,
+    );
+    this.audit("hub:proxy-watch", "proxy_probe_transient", key, { attempts, error: err.slice(0, 200) });
+    return { ok: true, verdict: attempts >= PROBE_ATTEMPT_CAP ? "exhausted" : "retry", attempts };
+  }
+
 
   private async unblockProxySweep(now: number): Promise<void> {
     const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("unblock_proxy_sweep_minutes", "15"), 10) || 15));
@@ -1235,13 +1448,37 @@ export class KnowledgeHub {
           await this.proseLadder(r, meta, cond, now, prev, unparseable, prose);
           continue;
         }
-        const results: { atom: ProxyAtom; ok: boolean; receipt: string }[] = [];
+        const results: { atom: ProxyAtom; ok: boolean; receipt: string; probeState?: string }[] = [];
         for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { defaultRepo })) });
         const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
         if (unparseable || unresolvable) {
           // cannot FULLY read the condition — never auto-flip (conservatism law)
           this.stampProxyCheck(r.id, meta, now, unparseable ? "unparseable" : "unresolvable",
             "condition partially machine-checkable — the sweep never flips a card it cannot fully read", prev,
+            { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
+          continue;
+        }
+        // BR#4658 — the worker-executor verification leg. run_success /
+        // pr_checks_green atoms are now probe-backed: enqueue what has no
+        // probe yet (dedup, attempt-capped, paced), retry failed ones on
+        // backoff, and keep the card parked (drain-silent — the typed hold
+        // already classifies it external) until a verdict lands. A verified
+        // verdict re-enters the standard path: every-atom-true flips below
+        // (BR#4282 owned done-close / unblock spawn); a conclusive negative
+        // or an exhausted probe stamps honestly and never flips.
+        const probeStates = results.filter((x) => x.probeState && x.probeState !== "negative");
+        if (probeStates.length) {
+          for (const x of probeStates) this.enqueueProxyProbe(x.atom, r.id, now);
+          const exhausted = probeStates.some((x) => x.probeState === "exhausted");
+          if (exhausted) {
+            // the probe burned its attempts — back to the loud pre-BR#4658
+            // state (unresolvable), receipts intact on the stamp
+            this.stampProxyCheck(r.id, meta, now, "unresolvable",
+              "worker-executor verification probe exhausted — the sweep cannot read this gate (BR#3516); verify first-hand", prev,
+              { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
+            continue;
+          }
+          this.stampProxyCheck(r.id, meta, now, "probe_pending", null, prev,
             { atoms: results.map((x) => ({ raw: x.atom.raw, ok: x.ok, receipt: x.receipt })) });
           continue;
         }
@@ -2231,6 +2468,35 @@ export class KnowledgeHub {
         updated_ts INTEGER NOT NULL,
         PRIMARY KEY (repo, pr)
       );
+      -- BR#4658 — the worker-executor verification leg for non-train
+      -- typed-await parks. The hub holds no VCS credentials (BR#3516): the
+      -- proxy sweep cannot VERIFY run_success / pr_checks_green atoms
+      -- machine-side, so those parks had NO closer once their gate fired
+      -- (specimen BR#3621: exit met 60h, still parked). The sweep enqueues a
+      -- probe here; a worker-executor (the daemon leg beside the merge
+      -- train) runs gh first-hand and feeds the verdict back through
+      -- proxy.verify — executor-fed facts, hub-decided (the BR#4489
+      -- division of labour). One row per atom (dedupe across cards).
+      CREATE TABLE IF NOT EXISTS proxy_probes (
+        key TEXT PRIMARY KEY,     -- run:<repo>:<run_id> | newer:<repo>:<run_id> | checks:<repo>#<n>
+        repo TEXT NOT NULL,
+        kind TEXT NOT NULL,       -- run_success | pr_checks_green
+        run_id TEXT,              -- run_success: the awaited run id
+        newer_than TEXT,          -- run_success newer_than form
+        pr INTEGER,               -- pr_checks_green: the PR number
+        expected_head TEXT,       -- the awaited commit (7-40 hex, optional) — mismatch fails closed (BR#3409)
+        card_id TEXT NOT NULL,    -- the parked card the probe serves (first requester)
+        state TEXT NOT NULL DEFAULT 'pending', -- pending | verified | failed
+        ok INTEGER,               -- last conclusive verdict (1 satisfied / 0 negative)
+        receipt TEXT,             -- GitHub URL(s) — the evidence that rode the verdict
+        head_sha TEXT,            -- the observed head at verification time
+        conclusion TEXT,          -- the observed run conclusion / checks verdict
+        error TEXT,               -- last transient gh failure (state=failed)
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_proxy_probes_state ON proxy_probes (state, updated_ts);
       -- artefact_versions: now a VIEW over ledger (migration below)
       CREATE TABLE IF NOT EXISTS asks (
         id TEXT PRIMARY KEY,
@@ -2694,6 +2960,11 @@ export class KnowledgeHub {
         case "reconcile.report": return this.json(await this.reconcileReport(body, actor));
         case "reconcile.status": return this.json(await this.reconcileStatus(body));
         case "reconcile.ignore": return this.json(await this.reconcileIgnore(body, actor));
+        // ---- proxy verification probes (BR#4658): the executor polls the
+        // sweep-enqueued probes, runs gh first-hand, feeds verdicts back —
+        // executor-fed facts, hub-decided ----
+        case "proxy.probes": return this.json(this.proxyProbes(body));
+        case "proxy.verify": return this.json(this.proxyVerify(body, actor));
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
