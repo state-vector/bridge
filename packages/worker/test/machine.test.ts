@@ -18,8 +18,17 @@ import {
   type RuleInput,
   type Applied,
 } from "../src/kb/machine.ts";
+import {
+  decideProseDisposition,
+  proseAlarmAskTitle,
+  proseClassAskTitle,
+  proseLegAwaitEvent,
+  PROSE_CLASS_QUIET_MS,
+  type ProseDispositionInput,
+  type ProseLegVerdict,
+} from "../src/kb/core.ts";
+import { AWAIT_GRAMMAR_DOC, validateAwaitEvent } from "../src/kb/closure.ts";
 import { LIFECYCLES } from "../src/kb/core.ts";
-import { AWAIT_GRAMMAR_DOC } from "../src/kb/closure.ts";
 
 // ---- null-law context: every lazy lookup permissive/empty. Individual tests
 // override only the accessor they exercise. ----
@@ -1435,5 +1444,181 @@ describe("release-holds-train-queue (BR#4067)", () => {
   it("a silent in_progress card with no machine wait releases as before (the sweeps own the todo path)", async () => {
     const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: { last_progress: { ts: 1 } } as any }), baseCtx());
     expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BR#4416 — the prose-card disposition ladder (closure tier): the decision
+// table that replaced the per-card "awaits nothing" ask factory. Same shape
+// as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
+// pinned row by row. The sweep (kb/do.ts proseLadder) supplies board-local
+// inputs and acts on the verdict; these pins are the law.
+// ---------------------------------------------------------------------------
+
+const DAY = 86_400_000;
+
+const proseInput = (over: Partial<ProseDispositionInput>): ProseDispositionInput => ({
+  cardId: "BR#4170",
+  title: "a specimen prose card",
+  now: 10 * DAY,
+  legs: [],
+  releaseRestricted: false,
+  lastClassAskTs: null,
+  classAskQuietMs: PROSE_CLASS_QUIET_MS,
+  ...over,
+});
+
+const legOk = (leg: ProseLegVerdict["leg"], receipt = "board-local proof"): ProseLegVerdict => ({ leg, ok: true, receipt });
+const legPending = (leg: ProseLegVerdict["leg"], receipt = "not yet"): ProseLegVerdict => ({ leg, ok: false, receipt });
+
+describe("decideProseDisposition (BR#4416) — rung 1: provably true → flip, zero asks", () => {
+  it("the BR#4170 regression: a merged-PR prose card flips per its own promise — no ask exists", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [legOk({ kind: "pr_merged", repo: "state-vector/bridge", n: 272 }, "provenance ledger: merged as d22cf6fc0")],
+    }));
+    expect(d.kind).toBe("flip");
+    if (d.kind === "flip") {
+      expect(d.leg).toEqual({ kind: "pr_merged", repo: "state-vector/bridge", n: 272 });
+      expect(d.receipt).toMatch(/provenance ledger/);
+    }
+  });
+
+  it("an answered bound ask is proof — the answer is the flip", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [legOk({ kind: "ask", ask_id: "ASK-1" }, "ask ASK-1 done — the answer is in")],
+    }));
+    expect(d.kind).toBe("flip");
+  });
+
+  it("a terminal root blocker is proof", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [legOk({ kind: "br_done", id: "BR#42" }, "BR#42 status=done")],
+    }));
+    expect(d.kind).toBe("flip");
+  });
+
+  it("the conjunction law: one true leg among many does NOT flip — the park stands until ALL hold", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [
+        legOk({ kind: "pr_merged", repo: "r/a", n: 1 }),
+        legPending({ kind: "br_done", id: "BR#7" }, "BR#7 status=in_progress"),
+      ],
+    }));
+    expect(d.kind).toBe("restore"); // rung 2 re-types the pending leg, never a partial flip
+  });
+
+  it("vacuity guard: zero legs never flips", () => {
+    expect(decideProseDisposition(proseInput({ legs: [] })).kind).not.toBe("flip");
+  });
+});
+
+describe("decideProseDisposition (BR#4416) — rung 2: recoverable leg → typed await restored, zero asks", () => {
+  it("the-five regression: a PR leg in card meta restores as a grammar-valid typed await", () => {
+    const d = decideProseDisposition(proseInput({
+      cardId: "BR#3990",
+      legs: [legPending({ kind: "pr_merged", repo: "state-vector/bridge", n: 254 }, "no provenance merge row yet")],
+    }));
+    expect(d.kind).toBe("restore");
+    if (d.kind === "restore") {
+      // the restored await must pass the ONE grammar authority, not just typecheck
+      expect(validateAwaitEvent(d.await_event)).toEqual({ event: "pr_merged", repo: "state-vector/bridge", n: 254 });
+    }
+  });
+
+  it("an OPEN bound ask restores as a typed ask leg (the park becomes watchdog-safe)", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [legPending({ kind: "ask", ask_id: "ASK-9" }, "ask ASK-9 still done? no — open")],
+    }));
+    expect(d.kind).toBe("restore");
+    if (d.kind === "restore") expect(validateAwaitEvent(d.await_event)).toEqual({ event: "ask", ask_id: "ASK-9" });
+  });
+
+  it("an open root blocker restores as br_done — the root owns the exit, no ask", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [legPending({ kind: "br_done", id: "BR#3816" }, "BR#3816 status=blocked")],
+    }));
+    expect(d.kind).toBe("restore");
+    if (d.kind === "restore") expect(validateAwaitEvent(d.await_event)).toEqual({ event: "br_done", id: "BR#3816" });
+  });
+
+  it("precedence: the first pending leg in the sweep's order is the one restored", () => {
+    const d = decideProseDisposition(proseInput({
+      legs: [
+        legPending({ kind: "ask", ask_id: "ASK-1" }),
+        legPending({ kind: "pr_merged", repo: "r/b", n: 2 }),
+      ],
+    }));
+    expect(d.kind).toBe("restore");
+    if (d.kind === "restore") expect(d.leg.kind).toBe("ask");
+  });
+
+  it("proseLegAwaitEvent is total and grammar-valid over the leg set", () => {
+    expect(validateAwaitEvent(proseLegAwaitEvent({ kind: "pr_merged", repo: "o/r", n: 3 }))).toEqual({ event: "pr_merged", repo: "o/r", n: 3 });
+    expect(validateAwaitEvent(proseLegAwaitEvent({ kind: "ask", ask_id: "ASK-2" }))).toEqual({ event: "ask", ask_id: "ASK-2" });
+    expect(validateAwaitEvent(proseLegAwaitEvent({ kind: "br_done", id: "BR#5" }))).toEqual({ event: "br_done", id: "BR#5" });
+    expect(validateAwaitEvent(proseLegAwaitEvent({ kind: "time", until_ts: 123 })).event).toBe("time");
+  });
+});
+
+describe("decideProseDisposition (BR#4416) — rung 3: no machine state → todo with context, zero asks", () => {
+  it("a churn-guard park with no leg anywhere releases to the pool — the guard's park is not a human decision", () => {
+    const d = decideProseDisposition(proseInput({ legs: [], releaseRestricted: false }));
+    expect(d.kind).toBe("release");
+    if (d.kind === "release") expect(d.reason).toMatch(/BR#3578 no-leg law/);
+  });
+});
+
+describe("decideProseDisposition (BR#4416) — rung 4: genuine ambiguity → ONE class ask per day, deduped", () => {
+  it("a protected card with no machine state escalates — once", () => {
+    const d = decideProseDisposition(proseInput({ legs: [], releaseRestricted: true }));
+    expect(d.kind).toBe("escalate_class");
+    if (d.kind === "escalate_class") expect(d.askClass).toBe("ambiguous_re_scope");
+  });
+
+  it("the second ambiguous card the SAME DAY files NO second ask (quiet window)", () => {
+    const now = 50 * DAY;
+    const d = decideProseDisposition(proseInput({
+      now,
+      cardId: "BR#second",
+      legs: [],
+      releaseRestricted: true,
+      lastClassAskTs: now - 1_000, // filed a minute ago
+    }));
+    expect(d.kind).toBe("waiting");
+    if (d.kind === "waiting") expect(d.receipt).toMatch(/quiet window/);
+  });
+
+  it("the quiet window EXPIRES: the class ask re-files the next day", () => {
+    const now = 50 * DAY;
+    const d = decideProseDisposition(proseInput({
+      now,
+      legs: [],
+      releaseRestricted: true,
+      lastClassAskTs: now - PROSE_CLASS_QUIET_MS - 1,
+    }));
+    expect(d.kind).toBe("escalate_class");
+  });
+
+  it("the class ask title: deterministic, ≤240 chars, ends in ?", () => {
+    const t = proseClassAskTitle(["BR#1", "BR#2", "BR#3"]);
+    expect(t).toBe(proseClassAskTitle(["BR#1", "BR#2", "BR#3"]));
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+    expect(t).toMatch(/BR#1/);
+  });
+
+  it("the class ask title truncates a huge class without losing the question mark", () => {
+    const ids = Array.from({ length: 60 }, (_, i) => `BR#${1000 + i}`);
+    const t = proseClassAskTitle(ids);
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+  });
+
+  it("the population-alarm title carries the canary framing and obeys the ask contract", () => {
+    const t = proseAlarmAskTitle(['BR#9 "mystery card" (writer: some-session)']);
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+    expect(t).toMatch(/BR#4248/);
+    expect(t).toMatch(/BR#9/);
   });
 });
