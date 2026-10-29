@@ -2289,6 +2289,14 @@ const TRAIN_HEAD_STAMP_RE_G = /(?:^|\s)head[=:\s]+([0-9a-f]{7,40})(?=[\s;.,)]|$)
  *  URL per leg — the hub stamps ALL of them, not just the first). */
 export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 
+/** The board's own cross-reference shorthand — `owner/name#N` (BR#4648): a
+ *  verifier citing the PR the way every bounce note and brief already does
+ *  (`repo#N`) still counts as a PR reference. A full /pull/ URL wins when
+ *  both cite the same PR (dedupe keeps the earliest mention); plain `#N`
+ *  without an owner/name prefix never matches, so card ids and "unrelated
+ *  #2534 merge" prose stay inert. */
+export const TRAIN_PR_SHORT_RE = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
+
 export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
 
 /** Parse a verify close note into PR legs. Single-PR notes keep the
@@ -2304,12 +2312,24 @@ export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptanc
  *  a stray head is never stolen across an intervening PR. A PR with no head
  *  on its line takes the first head BELOW it before the next PR (the
  *  "- PR n\n  head <sha>" list layout). Anything unpaired stays unbound —
- *  the queue arm fail-closes on it. Never a silent cross-pairing. */
+ *  the queue arm fail-closes on it. Never a silent cross-pairing. A PR may
+ *  be cited as the full /pull/ URL or the board's `owner/name#N` shorthand
+ *  (BR#4648) — the URL form wins when both cite the same PR. */
 export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const t = String(text ?? "");
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
-  for (const m of t.matchAll(TRAIN_PR_URL_RE))
+  const seen = new Set<string>();
+  for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
     prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    seen.add(`${m[1]}/${m[2]}#${m[3]}`);
+  }
+  for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
+    const key = `${m[1]}/${m[2]}#${m[3]}`;
+    if (seen.has(key)) continue; // the same PR already cited by its URL
+    seen.add(key);
+    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  }
+  prs.sort((a, b) => a.index - b.index);
   if (!prs.length) return [];
   const heads: { sha: string; index: number; end: number; used: boolean }[] = [];
   for (const m of t.matchAll(TRAIN_HEAD_STAMP_RE_G))

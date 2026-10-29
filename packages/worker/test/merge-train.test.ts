@@ -654,6 +654,40 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
   it("no PR reference parses empty", () => {
     expect(trainParseNoteLegs("verified head abc123def, no PR cited")).toEqual([]);
   });
+  it("BR#4648: the board's owner/name#N shorthand is a PR reference — it pairs heads exactly like a URL", () => {
+    const R = "state-vector/superpositional";
+    const h = "6".repeat(40);
+    // the exact production shape that spun the coverage loop (BR#3764 cycles 2-6):
+    // shorthand citation + the head token present — this must parse to a bound leg
+    expect(trainParseNoteLegs(`Verify ACCEPT — PR ${R}#2466 OPEN, all commits verified; head ${h}`)).toEqual([
+      { repo: R, number: 2466, head_sha_at_acceptance: h },
+    ]);
+    // multi-PR adjacency through shorthand, both orders
+    const b = "b".repeat(40), c = "c".repeat(40);
+    expect(trainParseNoteLegs(`PR o/r#11 head ${b}; PR o/r#12 head ${c}`)).toEqual([
+      { repo: "o/r", number: 11, head_sha_at_acceptance: b },
+      { repo: "o/r", number: 12, head_sha_at_acceptance: c },
+    ]);
+    expect(trainParseNoteLegs(`head ${b} — PR o/r#11; head ${c} — PR o/r#12`)).toEqual([
+      { repo: "o/r", number: 11, head_sha_at_acceptance: b },
+      { repo: "o/r", number: 12, head_sha_at_acceptance: c },
+    ]);
+    // a shorthand-cited PR with no head stays unbound — fail-closed, no guessing
+    expect(trainParseNoteLegs(`PR o/r#11 head ${b}; PR o/r#12`)).toEqual([
+      { repo: "o/r", number: 11, head_sha_at_acceptance: b },
+      { repo: "o/r", number: 12 },
+    ]);
+  });
+  it("BR#4648: URL + shorthand citing the same PR collapse to one leg; bare #N (card ids, prose) never matches", () => {
+    const R = "state-vector/bridge";
+    const h = "a".repeat(40);
+    expect(trainParseNoteLegs(`PR https://github.com/${R}/pull/7 merged; re-verified ${R}#7 head ${h}`)).toEqual([
+      { repo: R, number: 7, head_sha_at_acceptance: h },
+    ]);
+    // `#N` without an owner/name prefix is inert — BR#NNNN card refs and
+    // "the unrelated #2534 merge" prose never become legs
+    expect(trainParseNoteLegs(`rebased over the unrelated #2534 merge; BR#4648 spins no more; head ${h}`)).toEqual([]);
+  });
 });
 
 // ---------- BR#3659: the leg model ----------

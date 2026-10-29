@@ -476,7 +476,18 @@ head <sha>` — and the hub queues one **leg** per PR (`meta.prs`; pairing is
 line-adjacency based: a head after `;` belongs to the next clause's PR, never the
 previous one, and a cited PR without its head fails the queue closed with the card
 stamped `unbound`). A single-PR close keeps the pre-3659 shape (the note's one URL
-binds its first `head <sha>` wherever it sits). The card closes only when its **last**
+binds its first `head <sha>` wherever it sits). The citation itself is
+convention-tolerant (BR#4648): a PR cited as the board's own `owner/name#N`
+shorthand — the way every bounce note and brief writes it — parses like the URL
+(the URL form wins when both cite the same PR), and a head-bearing close with no
+PR citation at all refreshes a card that has exactly one open leg (multi-leg
+stamps stay fail-closed — a lone head is never guessed onto one of several
+legs). The re-queue note is honest about it: it says *stamp refreshed* only when
+a stamp actually moved, and an accept whose `head <sha>` cannot bind any leg is
+audited loud (`queue_stamp_not_refreshed`) instead of silently re-queuing a
+stale stamp — the silent-stale class that once spun coverage bounces on an
+unchanged head (five accepts on BR#3764 while the stamp never left the old
+head). The card closes only when its **last**
 leg lands — after a partial landing it stays queued with an honest reason naming the
 legs still out, and the train drives the next leg on a later tick. A bounced card is
 NOT re-queued by a stale verify close (the bounce stands until the card re-enters
