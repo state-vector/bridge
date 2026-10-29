@@ -28,6 +28,10 @@ export const TOOL_NAMES = [
   "list_agents",
   "log_progress",
   "orient",
+  "reconcile_ignore",
+  "reconcile_report",
+  "reconcile_schedule",
+  "reconcile_status",
   "related_artefacts",
   "search_knowledge",
   "session_alive",
@@ -145,6 +149,17 @@ export const TOOL_ARG_SCHEMAS = {
     required_workflows: z.array(z.string()).optional(),
     ci_typical_minutes: z.number().optional(),
     line_green: z.boolean().optional(),
+    // proof-of-progress (BR#4104 wire, BR#4129 hub consumption): the renewing
+    // holder's last ledger action + its age. Absent on legacy renewals — the
+    // hub treats that as UNKNOWN (allow + audit) while the deprecation
+    // window runs; on a non-empty queue a STALE note denies the renewal.
+    progress: z
+      .looseObject({
+        progress: z.string().optional(),
+        progress_age_ms: z.number().optional(),
+        holder: z.string().optional(),
+      })
+      .optional(),
   }),
   train_event: z.looseObject({
     repo: z.string(),
@@ -204,5 +219,39 @@ export const TOOL_ARG_SCHEMAS = {
         ci_typical_minutes: z.number().optional(),
       })
       .optional(),
+  }),
+  // ---- board↔GitHub reconciliation (BR#4170). The gateway daemon feeds
+  // OBSERVED open-PR facts (read-only `gh pr list`; the hub holds NO VCS
+  // credentials — accepted BR#3507); the hub joins them against card
+  // bindings, accounts every reviewed PR as bound / ignored-with-reason /
+  // in-flight, and alarms on drift. The report never merges, never queues
+  // by itself — verify acceptance stamps the queue (BR#4079 contract).
+  reconcile_schedule: z.looseObject({}),
+  reconcile_report: z.looseObject({
+    repo: z.string(),
+    gateway: z.string().optional(),
+    observed_at: z.number().int().optional(),
+    prs: z.array(
+      z.looseObject({
+        number: z.number().int(),
+        title: z.string().nullish(),
+        reviewDecision: z.string().nullish(),
+        mergeable: z.string().nullish(),
+        mergeStateStatus: z.string().nullish(),
+        headRefOid: z.string().nullish(),
+        headRefName: z.string().nullish(),
+        updatedAt: z.string().nullish(),
+        isDraft: z.boolean().nullish(),
+      }),
+    ),
+  }),
+  reconcile_status: z.looseObject({
+    repo: z.string().optional(),
+    limit: z.number().int().max(50).optional(),
+  }),
+  reconcile_ignore: z.looseObject({
+    repo: z.string(),
+    pr: z.number().int(),
+    reason: z.string().min(1),
   }),
 } as const satisfies Record<ToolName, z.ZodType>;

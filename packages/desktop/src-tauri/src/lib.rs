@@ -8,6 +8,17 @@ mod scm;
 mod session;
 mod store;
 mod transport;
+// The native merge-train executor (BR#3879) and its admission gate live here —
+// the shared home beside the dispatch core they plug into. The CLI vendors both
+// via #[path] (same single-source-of-truth law as dispatch.rs): the gateway
+// daemon runs the train tick in-process (BR#4104), and `bridge train` stays the
+// standalone form of the very same module. `allow(dead_code)`: the standalone
+// `bridge train` entry is alive only in the CLI compilation (mirroring the
+// CLI's own #[allow] on its vendored desktop modules).
+#[allow(dead_code)]
+mod train;
+#[allow(dead_code)]
+mod train_gate;
 
 use serde::Deserialize;
 use tauri::Manager;
@@ -84,6 +95,9 @@ fn dispatch_snapshot(state: tauri::State<'_, dispatch::DispatchState>) -> serde_
     // Overlay the in-memory logout notice so the pair screen can guide the
     // re-pair instead of the logout living only in the dispatch log.
     dispatch::overlay_logout_notice(&state.snapshot, &mut v);
+    // BR#4113: overlay the needs-attention park the same way — a RUNNING
+    // external loop's park must still say why nothing is dispatching.
+    dispatch::overlay_needs_attention(&state.snapshot, &mut v);
     v
 }
 

@@ -13,8 +13,8 @@
 // Applied(effects) | Rejection{code, rule, message}. Effects (spawn, escalate,
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
-import { parseTags, validateTransition } from "./core";
-import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
+import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
+import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
 
@@ -87,6 +87,13 @@ const isTask = (i: RuleInput) => i.type === "task";
 const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
 const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
 const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
+/** BR#4295: the receipts shape hasReceipts accepts — one source of truth for
+ *  the guard's rejection text (so an agent obeying it verbatim passes on the
+ *  retry, never flails: each rejection is a breach event) and for every
+ *  unblock-duty spawn template (do.ts), so future duties close first-try.
+ *  Specimen BR#3735/BR#4291: the old message invited "the check you ran" and
+ *  "the unblock verdict" — prose the matcher can never accept. */
+export const RECEIPTS_DOC = "any URL, or one of the verdict tokens (PR / merged / passed / unblocked / still blocked)";
 
 /** SQL rows carry meta as a JSON string; tests and callers may pass objects.
  *  Parse tolerantly either way — garbage parses as empty, never throws. */
@@ -173,7 +180,7 @@ export type Effect =
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
   | { kind: "skip_unblock_spawn"; parent: string; reason: string }
-  | { kind: "supersede_children"; parent: string; tag: "review" | "unblock"; keep_newest: boolean; cause: string }
+  | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "release_redirect"; attempts: number; silent_cycles: number };
 
@@ -338,10 +345,12 @@ export const RULES: Rule[] = [
       if (!reason) return "moving to blocked requires a reason (note)";
       if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
       if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
+      const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done/br_pr_merged event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). Await the real upstream leg.`;
       if (i.body?.await_event !== undefined) {
-        return validateAwaitEvent(i.body.await_event)
-          ? null
-          : `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        const ev = validateAwaitEvent(i.body.await_event);
+        if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        if (isSelfAwait(String(i.id), ev)) return selfMsg;
+        return null;
       }
       // compat shim: legacy text conditions that parse cleanly to ONE atom
       // are derived typed events at write time; unparseable/no-atom text is
@@ -349,9 +358,20 @@ export const RULES: Rule[] = [
       const text = String(i.body?.unblock_condition ?? "").trim();
       if (text) {
         const { atoms, unparseable } = parseProxyCondition(text);
-        if (!unparseable && awaitEventFromAtoms(atoms)) return null;
+        if (!unparseable && atoms.length > 1) {
+          // BR#3986: the extractors now collect EVERY match, so a conjunction
+          // parses to N atoms — but a park awaits ONE typed event. Reject
+          // loud naming the atoms instead of letting the sweep gate on the
+          // first one while the rest vanish from the machine gate.
+          return `condition text parses to ${atoms.length} machine atoms (${atoms.map((a) => a.raw).join(" | ")}). A park awaits ONE typed event — ${AWAIT_GRAMMAR_DOC}. Name a single machine leg in await_event, or carry the rest as prose: multi-atom conjunctions never self-migrate (BR#3986).`;
+        }
+        if (!unparseable && atoms.length === 1) {
+          const single = awaitEventFromAtoms(atoms);
+          if (single && isSelfAwait(String(i.id), single)) return selfMsg;
+          if (single) return null;
+        }
       }
-      return `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578)`;
+      return `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}. Pass it as the transition's await_event param (bridge_transition takes it directly; until_ts is epoch ms), or cite it in prose as "typed await_event <event> key=value" (BR#4062), or bind an ask via ask_agent — the human leg. Free text alone is annotation, never an exit condition (BR#3578)`;
     },
   },
   {
@@ -360,7 +380,7 @@ export const RULES: Rule[] = [
     guard: (i) =>
       hasReceipts(noteOf(i))
         ? null
-        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict).`,
+        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — the note must cite receipts: ${RECEIPTS_DOC}.`,
   },
   {
     name: "review-separation-of-duties",
@@ -416,12 +436,61 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // ---- the law: edge shape first, then the table, first fail wins ----
   const base = validateTransition(i.type as any, i.status, i.to);
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
+  // system sweeps) must never destroy merge-train state or a typed wait. A
+  // card the train owns (meta.merge_train queued/awaiting-ci/bounced with a
+  // live PR leg) is parked on the typed pr_merged proxy; a card with a typed
+  // await_event or a bound ask parks on that wait — the proxy watch / the
+  // answer owns the exit, not the staleness sweep. Humans and owners still
+  // release freely (rule-9 / web). The sweeps hold BEFORE attempting a todo
+  // release (they park blocked); this backstop catches any machine-actor
+  // path that slips past them. A human_verdict body flag (the answered-ask
+  // dispatch — the human's typed/clicked RELEASE riding a system actor as
+  // its pen) is exempt: the human decided, the machine only typed.
+  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? "")) && !i.body?.human_verdict) {
+    const m = metaOf(i.meta);
+    const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
+    const st = String(mtq.state ?? "");
+    const pr = trainPrLeg(m);
+    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr) {
+      const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-train-queue",
+        message: `card is merge-train ${st} (typed await pr_merged ${repo}#${pr}) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool.`,
+      };
+    }
+    const hold = releaseHold(m);
+    if (hold) {
+      const aw = m.blocked?.await_event
+        ? `typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")})`
+        : `bound ask (${String(m.awaiting_ask?.ask_id ?? "")})`;
+      return {
+        ok: false,
+        code: "guard-failed",
+        rule: "release-holds-typed-await",
+        message: `card parks on a ${aw} — the proxy watch / the answer owns the exit; a machine release must not destroy the wait (BR#4067). Wait it out or let a human/owner release.`,
+      };
+    }
+  }
   for (const r of RULES) {
     if (!r.when(i)) continue;
     const err = await r.guard(i, c);
     if (err) return { ok: false, code: "guard-failed", rule: r.name, message: err };
   }
-  if (i.type !== "task") return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: [] };
+  if (i.type !== "task") {
+    // decisions: the auto-spawned consensus round (BR#903) is ephemeral the
+    // same way verify/unblock rounds are — when the decision resolves
+    // (accepted, or superseded: the human decided), the round closes. The
+    // tally + reasons stay in the round's history; the decision's acceptance
+    // is never gated by the round.
+    const fx: Effect[] =
+      i.type === "decision" && (i.to === "accepted" || i.to === "superseded")
+        ? [{ kind: "supersede_children", parent: i.id, tag: "question", keep_newest: false, cause: `${i.id} ${i.to} — consensus round closed (the human decided; the round informed, it never gated)` }]
+        : [];
+    return { ok: true, status: i.to, owner_clear: false, tags_add: [], meta_patch: {}, effects: fx };
+  }
 
   // ---- effects: every spawn/escalate/stamp/supersede decision lives here ----
   const now = i.now ?? Date.now();
@@ -543,14 +612,27 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // declarations are silence-on-a-working-task, not a block; unblock duties
   // don't spawn their own kind. Merge-train parks (BR#3516 §2) are
   // machine-managed: the train itself is the unblock path, and a spawned
-  // child would race the executor's CAS lease — suppressed via merge_train.
+  // child would race the executor's CAS lease. The train's OWN transitions
+  // mark the park with body.merge_train; agent re-parks follow the
+  // verify-duty contract instead, which marks it in the NOTE ("merge-train:
+  // queued — …" — the canonical prefix the verify template in do.ts
+  // instructs). Missing the agent flavor made every re-queue spawn an
+  // unblock child that the next bounce superseded (keep_newest: false) and
+  // the re-park after it flood-guarded on the stale stamp — spawn →
+  // supersede → flood-skip → threshold-1 breach card, one loop per train
+  // bounce (specimen BR#3990 rounds 4→6, breach BR#4135). Scope: the SPAWN
+  // gate only — the typed-await exemption (blocked-needs-typed-await) stays
+  // keyed on body.merge_train so prose cannot dodge the grammar by
+  // prefixing a note (BR#3578 fail-closed).
+  const mergeTrainPark =
+    Boolean(i.body?.merge_train) || /^merge-train:/i.test(String(i.body?.note ?? "").trimStart());
   if (
     i.to === "blocked" &&
     r !== "unblock" &&
     !meta.awaiting_ask &&
     !i.body?.awaiting_ask_id &&
     i.body?.class !== "subprocess" &&
-    !i.body?.merge_train
+    !mergeTrainPark
   ) {
     const open = await c.openUnblockChild();
     if (open) {
@@ -716,8 +798,30 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
  *  categories"): it reads as what it is, a classifier GAP, not a mystery
  *  defect. The fold's card states the action for it (add a pattern or fix
  *  the flow), so an unclassified pile points at breachClass itself. */
+/** BR#4295: rule name → breach class for rejections that carry the audited
+ *  " [rule: <name>]" tag (do.ts appends it to every guard rejection; it
+ *  survives the 300-char audit slice for short messages). Only the gates
+ *  whose message-ladder classification was wrong or unreachable need an
+ *  entry — everything else keeps classifying through the stems below. */
+const RULE_BREACH_CLASSES: Record<string, string> = {
+  // the receipts gate's own message embeds "PR link", so the ladder's
+  // earlier "pr link" test folded EVERY verdict-done-needs-receipts
+  // rejection as gate:review-needs-pr — the dedicated class was unreachable
+  // for its own gate (specimens BR#3735, BR#4291/BR#4294).
+  "verdict-done-needs-receipts": "gate:verdict-receipts",
+  "review-needs-pr": "gate:review-needs-pr",
+  // accepted classification ruling BR#3430: ownership-gate rejections are
+  // the claim_race family — observable, never a breach.
+  "release-needs-ownership": "claim_race",
+};
+
 export function breachClass(reason: string): string {
   const r = reason.toLowerCase();
+  // BR#4295: the audited rule tag classifies FIRST. Anchored at the end —
+  // a tag cut mid-way by the 300-char slice fails this match and falls
+  // through to the message ladder, exactly like a suffix-less legacy reason.
+  const ruleTag = r.match(/\[rule: ([a-z0-9-]+)\]$/);
+  if (ruleTag && RULE_BREACH_CLASSES[ruleTag[1]]) return RULE_BREACH_CLASSES[ruleTag[1]];
   // BR#3337: lifecycle-edge rejections are claim races — two dispatchers
   // raced for one card and the lifecycle table refused the double-claim
   // (`task: 'in_progress' → 'in_progress' not allowed (allowed: …)` /
@@ -758,6 +862,11 @@ export function breachClass(reason: string): string {
   // sentence literals (BR#3612's wording-drift lesson).
   if (r.includes("malformed await_event")) return "gate:malformed-await-event";
   if (r.includes("requires a typed await_event")) return "gate:blocked-needs-typed-await";
+  // BR#3986: the multi-atom + self-referential park rejections (same rule,
+  // distinct causes — a conjunction the sweep could only partially gate vs a
+  // park deadlocked on its own done).
+  if (r.includes("self-referential await")) return "gate:self-referential-await";
+  if (r.includes("machine atoms (")) return "gate:multi-atom-condition";
   return "unclassified";
 }
 

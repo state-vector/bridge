@@ -248,6 +248,121 @@ describe("loop regressions", () => {
     expect(malformed).toBeTruthy();
   });
 
+  it("BR#3986: a multi-atom conjunction text park is refused loud, naming every atom", async () => {
+    const rej = await check(
+      input({ status: "in_progress", to: "blocked", body: { note: "waiting", unblock_condition: "BR#3945 done AND BR#3946 done" } }),
+      baseCtx(),
+    );
+    expect(rej).toBeTruthy();
+    expect(String(rej)).toContain("2 machine atoms");
+    expect(String(rej)).toContain("BR#3945");
+    expect(String(rej)).toContain("BR#3946");
+    expect(breachClass(String(rej))).toBe("gate:multi-atom-condition");
+  });
+
+  it("BR#3986: a park awaiting its own done is refused — explicit AND text-derived (the BR#136 deadlock)", async () => {
+    const explicit = await check(
+      input({ id: "BR#136", status: "in_progress", to: "blocked", body: { note: "x", await_event: { event: "br_done", id: "BR#136" } } }),
+      baseCtx(),
+    );
+    expect(explicit).toBeTruthy();
+    expect(String(explicit)).toContain("self-referential");
+    expect(breachClass(String(explicit))).toBe("gate:self-referential-await");
+    // the text shim derives {br_done, BR#136} from prose — same refusal
+    const derived = await check(
+      input({ id: "BR#136", status: "in_progress", to: "blocked", body: { note: "x", unblock_condition: "then the sweep transitions BR#136 done" } }),
+      baseCtx(),
+    );
+    expect(derived).toBeTruthy();
+    expect(String(derived)).toContain("self-referential");
+    // another card's br_done still passes the single-atom text shim
+    expect(
+      await check(input({ id: "BR#3557", status: "in_progress", to: "blocked", body: { note: "x", unblock_condition: "BR#3945 done" } }), baseCtx()),
+    ).toBeNull();
+  });
+
+  it("BR#4062: EVERY closed-set atom parks through the gate — typed param AND machine-proxy prose", async () => {
+    const cases: { label: string; ev: Record<string, unknown>; prose: string }[] = [
+      {
+        label: "pr_merged", ev: { event: "pr_merged", repo: "state-vector/bridge", n: 253 },
+        prose: "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=253): PR https://github.com/state-vector/bridge/pull/253 merges (mergeCommit non-null) AND main CI green after.",
+      },
+      {
+        label: "br_pr_merged", ev: { event: "br_pr_merged", id: "BR#4015" },
+        prose: "Machine proxy (typed await_event br_pr_merged id=BR#4015): the card's fix PR lands on the train.",
+      },
+      {
+        label: "issue_closed", ev: { event: "issue_closed", repo: "state-vector/superpositional", n: 1258 },
+        prose: "Machine proxy (typed await_event issue_closed repo=state-vector/superpositional n=1258): the upstream report closes after the operator purge.",
+      },
+      {
+        label: "br_done", ev: { event: "br_done", id: "BR#3819" },
+        prose: "Machine proxy (typed await_event br_done id=BR#3819): BR#3819 done.",
+      },
+      {
+        label: "run_success", ev: { event: "run_success", repo: "state-vector/bridge", run_id: "403581" },
+        prose: "Machine proxy (typed await_event run_success repo=state-vector/bridge run_id=40358175346): the nightly completes green after the deploy.",
+      },
+      {
+        label: "pr_checks_green", ev: { event: "pr_checks_green", repo: "state-vector/bridge", n: 257 },
+        prose: "Machine proxy (typed await_event pr_checks_green repo=state-vector/bridge n=257): every check settles on the head.",
+      },
+      {
+        label: "deployed", ev: { event: "deployed", commit: "5d53c1e" },
+        prose: "Machine proxy (typed await_event deployed commit=5d53c1e): the hub serves this commit.",
+      },
+      {
+        label: "ask", ev: { event: "ask", ask_id: "BR#4061" },
+        prose: "Machine proxy (typed await_event ask ask_id=BR#4061): re-entry waits on the ruling.",
+      },
+      {
+        label: "time", ev: { event: "time", until_ts: 1793673600000 },
+        prose: "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer.",
+      },
+    ];
+    for (const c of cases) {
+      expect(
+        await check(input({ status: "in_progress", to: "blocked", body: { note: "parked", await_event: c.ev } }), baseCtx()),
+        `typed param: ${c.label}`,
+      ).toBeNull();
+      expect(
+        await check(input({ status: "in_progress", to: "blocked", body: { note: "parked", unblock_condition: c.prose } }), baseCtx()),
+        `prose shim: ${c.label}`,
+      ).toBeNull();
+    }
+  });
+
+  it("BR#4062 repro: the takeover session's verbatim rejected parks now pass", async () => {
+    // {event:"time"} epoch-ms — REJECTED from MCP on 2026-10-28, must pass
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on a typed timer for the fresh-verify render",
+        unblock_condition: "Machine proxy (typed await_event time until_ts=1793673600000): Machine proxy (typed await_event time until_ts=1793673600000): the fresh-verify render gate re-parks the card → then a FRESH session closes BR#2637 done citing the render.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // ISO variant — the prose shim normalizes ISO until_ts to epoch ms
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on a typed timer",
+        unblock_condition: "Machine proxy (typed await_event time until_ts=2026-11-04T00:00:00Z): re-entry at the render slot.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // {event:"ask"} bound to an OPEN ask — REJECTED from MCP on 2026-10-28, must pass
+    expect(
+      await check(input({ id: "BR#2637", status: "in_progress", to: "blocked", body: {
+        note: "parked on the ruling",
+        unblock_condition: "Machine proxy (typed await_event ask ask_id=BR#4061): Machine proxy (typed await_event ask ask_id=BR#4061): Ask BR#4061 answered → the board task re-enters the pool when unblocked.",
+      } }), baseCtx()),
+    ).toBeNull();
+    // the pr_merged control that already passed stays passing (no multi-atom regression)
+    expect(
+      await check(input({ id: "BR#3935", status: "in_progress", to: "blocked", body: {
+        note: "parked on the merge",
+        unblock_condition: "Machine proxy (typed await_event pr_merged repo=state-vector/bridge n=253): PR https://github.com/state-vector/bridge/pull/253 merges (mergeCommit non-null) AND main CI green after. Serialized merge train merges #253 at head.",
+      } }), baseCtx()),
+    ).toBeNull();
+  });
+
   it("every rule has a name and the set is stable (table drift alarm)", () => {
     expect(RULES.map((r) => r.name).sort()).toEqual(
       [
@@ -493,9 +608,17 @@ describe("executor contract: Applied(effects) | Rejection{code,rule,message}", (
     ]);
   });
 
-  it("non-task artefacts carry no effects", async () => {
+  it("non-task artefacts carry no effects — except a decision's consensus-round close (BR#903)", async () => {
+    // a decision resolving (superseded here) closes its auto-spawned feedback
+    // round: exactly one supersede_children effect, tag "question" — the round
+    // informed the human, it never gated them
     const v = ok(await decide(input({ type: "decision", status: "proposed", to: "superseded", actor: "web:ray" }), baseCtx()));
-    expect(v.effects).toEqual([]);
+    expect(v.effects).toEqual([
+      { kind: "supersede_children", parent: "BR#1", tag: "question", keep_newest: false, cause: "BR#1 superseded — consensus round closed (the human decided; the round informed, it never gated)" },
+    ]);
+    // every other non-task type stays effect-free
+    const steering = ok(await decide(input({ type: "steering", status: "draft", to: "active", actor: "web:ray" }), baseCtx()));
+    expect(steering.effects).toEqual([]);
   });
 });
 
@@ -583,6 +706,64 @@ describe("effects decided executor-side (F4)", () => {
     const unblockDuty = await decide(input({ status: "in_progress", to: "blocked", roles: ["unblock"], body: { note: "n", unblock_condition: "u" } }), baseCtx());
     expect(unblockDuty.ok).toBe(false);
     if (unblockDuty.ok === false) expect(unblockDuty.rule).toBe("verdict-no-blocked");
+  });
+
+  it("merge-train parks never spawn unblock children — the train's flag OR the agent re-queue's canonical note (BR#4135)", async () => {
+    // BR#3516 §2: the train itself is the unblock path; a spawned child
+    // would race the executor's CAS lease. The train's own park carries the
+    // typed flag —
+    const trainPark = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "queued on the merge train", merge_train: true, unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(trainPark.effects).toEqual([]);
+    // — while agent re-parks follow the verify-duty contract, which marks the
+    // park in the note. Specimen BR#3990 rounds 4→6: the note flavor was
+    // missed, so every re-queue spawned an unblock child the next bounce
+    // superseded and the re-park after it flood-guarded — one breach card
+    // (BR#4135) per bounce cycle.
+    const agentRequeue = ok(
+      await decide(
+        input({
+          status: "in_review",
+          to: "blocked",
+          body: { note: "merge-train: queued — verify RE-ACCEPT at the unchanged live head", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(agentRequeue.effects).toEqual([]);
+    // any merge-train note flavor counts on a blocked park (bounce KINDs, BR#4066)
+    const stopped = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "merge-train: stopped — lane halted", unblock_condition: "PR https://github.com/a/b/pull/11 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(stopped.effects).toEqual([]);
+    // the suppression is SCOPED to the spawn gate: a plain park with the same
+    // exit condition still spawns its unblock round
+    const plain = ok(
+      await decide(
+        input({
+          status: "in_progress",
+          to: "blocked",
+          body: { note: "why", unblock_condition: "PR https://github.com/a/b/pull/9 merged" },
+        }),
+        baseCtx(),
+      ),
+    );
+    expect(plain.effects[0].kind).toBe("spawn_unblock");
   });
 
   it("parent movement supersedes ephemeral children; a bounce keeps the newest verify round", async () => {
@@ -1034,7 +1215,7 @@ describe("typed-await gate classification (BR#3738)", () => {
   // as a NUMBER} → gate refused; the corrected string retry succeeded 32s
   // later — the gate, not the park, was rejected. Both fold as 'other' here
   // until this fix.
-  const BLOCKED_NEEDS_TYPED_AWAIT = `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}; a bound ask (ask_agent) is the human leg. Free text alone is annotation, never an exit condition (BR#3578) [rule: blocked-needs-typed-await]`;
+  const BLOCKED_NEEDS_TYPED_AWAIT = `moving to blocked requires a typed await_event — ${AWAIT_GRAMMAR_DOC}. Pass it as the transition's await_event param (bridge_transition takes it directly; until_ts is epoch ms), or cite it in prose as "typed await_event <event> key=value" (BR#4062), or bind an ask via ask_agent — the human leg. Free text alone is annotation, never an exit condition (BR#3578) [rule: blocked-needs-typed-await]`;
   const MALFORMED_AWAIT_EVENT = `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC} [rule: blocked-needs-typed-await]`;
 
   it("classifies the two fail-closed typed-await park gates", () => {
@@ -1060,6 +1241,63 @@ describe("typed-await gate classification (BR#3738)", () => {
     const blockedNeeds = detectBreaches(storm(BLOCKED_NEEDS_TYPED_AWAIT, "BR#3738B"), new Set());
     expect(blockedNeeds).toHaveLength(1);
     expect(blockedNeeds[0].klass).toBe("gate:blocked-needs-typed-await");
+  });
+});
+
+// ---------- BR#4295: the verdict-done receipts gate — its own class, an honest message ----------
+
+describe("verdict-receipts gate classification + note shape (BR#4295)", () => {
+  // Specimen BR#4291 (breach card BR#4294, sample verbatim): the rejection as
+  // the audit stores it — the guard's message plus the " [rule: …]" suffix
+  // do.ts appends to every gate rejection, well under the 300-char slice.
+  // The holder's closing note was honest findings prose (quoted
+  // still 'blocked', "NO_UNBLOCK", no URL) → zero hasReceipts matches →
+  // 3 rejections in 18s, every one folded as gate:review-needs-pr because
+  // the gate's OWN message embeds "PR link" and breachClass tested that
+  // stem first — the dedicated class was unreachable for its own gate.
+  const VERDICT_RECEIPTS_REJECTION =
+    "unblock BR#4291 cannot complete without receipts — cite what you verified in the note (PR link, merge state, the check you ran, or the unblock verdict). [rule: verdict-done-needs-receipts]";
+
+  it("classifies receipts rejections under their OWN class — the audited rule tag wins over the message's 'pr link' stem", () => {
+    expect(breachClass(VERDICT_RECEIPTS_REJECTION)).toBe("gate:verdict-receipts");
+    expect(breachClass(VERDICT_RECEIPTS_REJECTION.slice(0, 300))).toBe("gate:verdict-receipts"); // survives the audit slice
+  });
+
+  it("maps the tagged gates suffix-first; the message ladder stays the fallback for suffix-less legacy reasons", () => {
+    expect(
+      breachClass("moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call) [rule: review-needs-pr]"),
+    ).toBe("gate:review-needs-pr");
+    expect(
+      breachClass("task BR#3372 is claimed by mac-modem-opencode — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. [rule: release-needs-ownership]"),
+    ).toBe("claim_race");
+    // suffix-less legacy reason → message stem, unchanged
+    expect(breachClass("review BR#1 cannot complete without receipts")).toBe("gate:verdict-receipts");
+  });
+
+  it("the guard's rejection teaches the shape hasReceipts actually accepts", async () => {
+    const msg = await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note: "verdict NO_UNBLOCK, still 'blocked'" } }), baseCtx());
+    expect(msg).toContain("cannot complete without receipts");
+    expect(msg).toContain("URL"); // a bare URL suffices
+    expect(msg).toContain("still blocked"); // the exact token — quoted 'blocked' or "unblock verdict" never match
+  });
+
+  it("hasReceipts accepts a URL and the bare verdict tokens; near-miss prose still rejects", async () => {
+    for (const note of [
+      "verified: https://github.com/x/y/pull/1 merged", // any URL
+      "BR#3311 still blocked — the hub proxy TRUE was the timer atom only", // bare token, exactly what BR#4291 needed
+      "PR merged",
+      "passed",
+      "unblocked",
+    ]) {
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must pass: ${note}`).toBeNull();
+    }
+    for (const note of [
+      "still 'blocked'", // quoted — not the token (the BR#4291 specimen)
+      "unblock verdict: NO_UNBLOCK", // no -ed, preceded by non-space
+      "the check I ran looks clean", // honest prose, zero tokens
+    ]) {
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must reject: ${note}`).toContain("cannot complete without receipts");
+    }
   });
 });
 
@@ -1123,5 +1361,79 @@ describe("tag inertness (BR#2983)", () => {
   it("question invariants: in_progress on a question is a breach", () => {
     expect(invariants({ type: "question", status: "in_progress", meta: {} }).length).toBeGreaterThan(0);
     expect(invariants({ type: "question", status: "todo", meta: {} })).toEqual([]);
+  });
+});
+
+// BR#4067 — queue-slot durability: a machine silence-release must never
+// destroy merge-train state (the PR #257 class: verify accepted, watchdog
+// released the queued card to todo, nothing re-queued it).
+describe("release-holds-train-queue (BR#4067)", () => {
+  const queuedMeta = {
+    merge_train: { state: "queued", pr: 257, repo: "state-vector/bridge" },
+    pr: { repo: "state-vector/bridge", number: 257, head_sha_at_acceptance: "a".repeat(40) },
+  };
+
+  it("system actor releasing a queued card is refused with the proxy named", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: queuedMeta as any }), baseCtx());
+    expect(msg).toMatch(/merge-train queued.*pr_merged/s);
+  });
+
+  it("awaiting-ci holds too", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "hub:proxy-watch", meta: { ...queuedMeta, merge_train: { state: "awaiting-ci" } } as any }), baseCtx());
+    expect(msg).toMatch(/merge-train awaiting-ci/);
+  });
+
+  it("bounced holds too — the release that destroyed BR#4067 itself (in_progress, train-bounced, silent)", async () => {
+    const bounced = {
+      merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "conflict" },
+      pr: { repo: "state-vector/bridge", number: 259 },
+    };
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: bounced as any }), baseCtx());
+    expect(msg).toMatch(/merge-train bounced \(typed await pr_merged state-vector\/bridge#259\)/);
+  });
+
+  it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: { blocked: { reason: "parked", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 257 } } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/typed await_event \(pr_merged\).*machine release must not destroy the wait/s);
+  });
+
+  it("a bound ask holds — the answer owns the exit", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:reaper",
+      meta: { blocked: { reason: "parked" }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(String(msg)).toMatch(/bound ask \(ASK-1\).*machine release must not destroy the wait/s);
+  });
+
+  it("humans and owners release freely — the guard is machine-actor only", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "web:rayh", owner: "web:rayh", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds-train-queue|merge-train queued/);
+  });
+
+  it("humans also release silent in_progress train cards freely (rule-9)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "some-agent", meta: queuedMeta as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a human's answered-ask verdict rides the system pen freely (BR#3912 typed RELEASE)", async () => {
+    const msg = await check(input({
+      status: "blocked", to: "todo", actor: "system:question(ray)",
+      body: { human_verdict: true },
+      meta: { blocked: { reason: "parked", await_event: { event: "ask", ask_id: "ASK-1" } }, awaiting_ask: { ask_id: "ASK-1" } },
+    } as any), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+  });
+
+  it("a blocked card with NO train state releases as before", async () => {
+    const msg = await check(input({ status: "blocked", to: "todo", actor: "system:watchdog", meta: { blocked: { reason: "parked" } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/merge-train/);
+  });
+
+  it("a silent in_progress card with no machine wait releases as before (the sweeps own the todo path)", async () => {
+    const msg = await check(input({ status: "in_progress", to: "todo", actor: "system:watchdog", meta: { last_progress: { ts: 1 } } as any }), baseCtx());
+    expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
   });
 });

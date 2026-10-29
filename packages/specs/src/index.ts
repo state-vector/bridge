@@ -1,6 +1,7 @@
 // @bridge/specs — the contract every package codes against. Source of truth for
 // the wire protocol; TS types mirror schemas/*.json (generated, see types.ts).
 export * from "./types.js";
+export * from "./permalink.js";
 
 /** Kinds with hub semantics — everything else renders as generic activity. */
 export const SPECIAL_KINDS = [

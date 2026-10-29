@@ -1,1 +1,0 @@
-This folder contains the built output assets for the worker "bridge" generated at 2026-10-27T23:53:01.351Z.

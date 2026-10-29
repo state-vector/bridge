@@ -25,6 +25,21 @@ export interface KbArtefact {
   status_ts?: number;
   /** parent task id, projected by board() from child_of relations */
   part_of?: string;
+  /** proposed decisions only — the open feedback round + agent consensus tally (BR#903) */
+  consensus?: KbConsensus;
+}
+
+/** Consensus round of a proposed decision: contributions are log_progress notes on the round task. */
+export interface KbConsensus {
+  round_id: string;
+  round_title: string;
+  round_status: string;
+  round_ts: number;
+  contributions: number;
+  agree: number;
+  disagree: number;
+  other: number;
+  contributors: string[];
 }
 
 export interface KbEvent {
@@ -207,10 +222,21 @@ export const kbApi = {
 /** Realtime KB events. Browser (webapp): WS authenticated by the human
  *  session cookie — ZERO tokens on this plane (credential-class ADR BR#2673;
  *  the ?token= leg is gateway-class only, agents poll REST instead). Native
- *  shells (desktop; transport set): cross-origin WS can neither carry the
- *  HttpOnly cookie nor pass CORS, so poll the events mirror through the
- *  shell transport instead. Reconnects/polls with backoff; feeds onEvent. */
-export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" | "closed") => void) {
+  *  shells (desktop; transport set): cross-origin WS can neither carry the
+  *  HttpOnly cookie nor pass CORS, so tail the events mirror through the
+  *  shell transport instead — ADAPTIVELY (BR#4362: no fixed short poll):
+  *  2s while events flow, backing off to 30s when idle, reset on activity.
+  *  Browser shells get the real socket, which now carries state: kb.event
+  *  frames per mutation plus coalesced kb.board snapshots. */
+export function wsPushAvailable(): boolean {
+  return !transport;
+}
+export function connectKbWs(
+  onEvent: (e: KbEvent) => void,
+  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[] }) => void,
+  onStatus: (s: "open" | "closed") => void,
+  sinceRef: () => number,
+) {
   if (transport) {
     const viaTransport = transport;
     let since = 0;
@@ -221,18 +247,21 @@ export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" 
       if (stopped) return;
       try {
         const r = (await viaTransport(`/api/kb/events?since=${since}&limit=200`)) as { events?: KbEvent[]; last_seq?: number };
+        const got = (r.events ?? []).length > 0;
         for (const e of r.events ?? []) onEvent(e);
         if (typeof r.last_seq === "number") since = r.last_seq;
         if (!open) {
           open = true;
           onStatus("open");
         }
-        backoff = 2000;
+        // adaptive: busy → 2s; idle doubles up to 30s (activity resets)
+        backoff = got ? 2000 : Math.min(backoff * 2, 30000);
       } catch {
         if (open) {
           open = false;
           onStatus("closed");
         }
+        backoff = Math.min(backoff * 2, 30000);
       }
       if (!stopped) setTimeout(poll, backoff);
     };
@@ -241,12 +270,13 @@ export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" 
       stopped = true;
     };
   }
-  const url = base().replace(/^http/, "ws") + "/kb-ws?since=0";
-  let ws: WebSocket | null = null;
   let stopped = false;
   let backoff = 2000;
+  let ws: WebSocket | null = null;
   const dial = () => {
     if (stopped) return;
+    // since=lastSeq: reconnect catch-up replays exactly once (BR#4362)
+    const url = base().replace(/^http/, "ws") + "/kb-ws?since=" + (sinceRef() || 0);
     ws = new WebSocket(url);
     ws.onopen = () => {
       backoff = 2000;
@@ -256,6 +286,7 @@ export function connectKbWs(onEvent: (e: KbEvent) => void, onStatus: (s: "open" 
       try {
         const f = JSON.parse(e.data);
         if (f.type === "kb.event") onEvent(f.event);
+        else if (f.type === "kb.board") onBoard(f.board); // the socket carries state
       } catch { /* ignore */ }
     };
     ws.onclose = () => {

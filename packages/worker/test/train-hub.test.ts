@@ -243,28 +243,108 @@ describe("merge train DO drill (real bundled worker)", () => {
     });
     expect(merged.body.error ?? "").toBe("");
 
-    // the executor's trial rebase hit conflicts → bounce with the file list
+    // the executor's trial rebase hit conflicts → bounce with the file list,
+    // NAMING THE KIND (BR#4066: every bounce carries coverage|conflict|gate)
     const bounced = await kbJson("/train.event", {
       repo, base: "main", kind: "bounced", actor: "gw-b", pr: 2601, head_sha: "b".repeat(40),
+      bounce_kind: "conflict", merge_state_status: "dirty",
       conflict_files: ["packages/worker/src/kb/do.ts", "packages/contracts/src/mcp.ts"],
     });
     expect(bounced.body.error ?? "", `train:bounced failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.task).toBe(c1);
+    expect(bounced.body.bounce_kind).toBe("conflict");
 
     const card1 = (await kbJson("/get", { id: c1 })).body;
     expect(card1.status).toBe("in_progress");
     expect(card1.meta?.merge_train?.state).toBe("bounced");
-    expect(String(card1.body_md)).toContain("Merge-train bounce: PR #2601");
+    expect(String(card1.body_md)).toContain("Merge-train bounce (conflict): PR #2601");
     expect(String(card1.body_md)).toContain("- `packages/worker/src/kb/do.ts`");
     expect(String(card1.body_md)).toContain("- `packages/contracts/src/mcp.ts`");
     expect(String(card1.body_md)).toContain("INVALID at the new head");
+    expect(String(card1.body_md)).toContain("the impl repair leg");
     expect(String(card1.body_md)).toContain("machine-clean carries, human-resolved invalidates");
     expect(String(card1.body_md)).toContain("re-queues at the BACK");
+    // the transition note names the kind too — not a generic "conflicts with base"
+    const bounceHist = (await kbJson("/get_history", { id: c1, limit: 5 })).body;
+    expect(JSON.stringify(bounceHist)).toContain("merge-train bounce (conflict) — PR #2601 conflicts with base (2 file(s))");
 
     // the lane freed; the follower is now the whole queue
     const after = await laneSnap(repo);
     expect(after.currently).toBeNull();
     expect(after.queue.map((x: any) => x.id)).toEqual([c2]);
+  });
+
+  it("a COVERAGE bounce (head moved past the accepted verdict, BR#4066) renders the verify-pool brief — NO conflict language, no file list", async () => {
+    const repo = "state-vector/lane-coverage";
+    const c1 = await queueViaAccept({ repo, pr: 2611, head: "e".repeat(40), title: "IMPL: coverage bounce drill" });
+    await acquire(repo, "gw-c", { required_workflows: ["Test"] });
+    // an authored push moved the head past the stamp: no conflicts exist
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-c", pr: 2611, head_sha: "e".repeat(40), task_id: c1,
+      bounce_kind: "coverage", merge_state_status: "clean",
+      reason: `PR #2611 live head ${"e".repeat(40)} is not covered by the accepted verdict (leg 1 stamped ${"e".repeat(9)}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+    });
+    expect(bounced.body.error ?? "", `coverage bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
+    expect(bounced.body.bounce_kind).toBe("coverage");
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("in_progress");
+    const brief = String(card1.body_md);
+    expect(brief).toContain("Merge-train bounce (coverage): PR #2611");
+    expect(brief).toContain("head moved past the accepted verify verdict");
+    expect(brief).toContain("the push was authored");
+    expect(brief).toContain("NOT a merge conflict");
+    expect(brief).toContain("the verify pool");
+    // the lie that sent impl hunting for nonexistent conflicts is GONE:
+    expect(brief).not.toContain("conflicts with its base");
+    expect(brief).not.toContain("Conflicting files");
+    expect(brief).not.toContain("no file list supplied");
+    const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 5 })).body);
+    expect(hist).toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict; re-verify at the new head");
+  });
+
+  it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
+    const repo = "state-vector/lane-gate";
+    const c1 = await queueViaAccept({ repo, pr: 2621, head: "f".repeat(40), title: "IMPL: gate bounce drill" });
+    await acquire(repo, "gw-g", { required_workflows: ["Test"] });
+    const defect = "PR #2621 head check RED: Test. Fix or bounce to impl";
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-g", pr: 2621, head_sha: "f".repeat(40), task_id: c1,
+      bounce_kind: "gate", merge_state_status: "blocked", reason: defect,
+    });
+    expect(bounced.body.error ?? "", `gate bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
+    expect(bounced.body.bounce_kind).toBe("gate");
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("in_progress");
+    const brief = String(card1.body_md);
+    expect(brief).toContain("Merge-train bounce (gate): PR #2621");
+    expect(brief).toContain("mergeStateStatus=BLOCKED");
+    expect(brief).toContain(`**Defect:** ${defect}`);
+    expect(brief).toContain("**Next owner: impl**");
+    expect(brief).not.toContain("conflicts with its base");
+    expect(brief).not.toContain("Conflicting files");
+  });
+
+  it("a conflict bounce WITHOUT the file list FAILS LOUD (BR#4066) — no brief, no transition, the lie cannot render", async () => {
+    const repo = "state-vector/lane-nofiles";
+    const c1 = await queueViaAccept({ repo, pr: 2631, head: "a".repeat(40), title: "IMPL: fileless conflict drill" });
+    await acquire(repo, "gw-n", { required_workflows: ["Test"] });
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-n", pr: 2631, head_sha: "a".repeat(40), task_id: c1,
+      bounce_kind: "conflict", merge_state_status: "dirty",
+      // NO conflict_files — the executor omitted the trial-merge enumeration
+    });
+    expect(bounced.body.error ?? "", "a file-less conflict bounce must fail loud").toContain("without conflict_files");
+    // the card was NOT bounced: still queued/blocked, no brief appended
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("blocked");
+    expect(String(card1.body_md)).not.toContain("Merge-train bounce");
+    // and a garbage kind is rejected too
+    const garbage = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-n", pr: 2631, head_sha: "a".repeat(40),
+      bounce_kind: "rebase-needed",
+    });
+    expect(garbage.body.error ?? "").toContain("bounce_kind must be coverage | conflict | gate");
+    expect((await kbJson("/get", { id: c1 })).body.status).toBe("blocked");
   });
 
   it("a verify close with no `head <sha>` stamp does NOT queue — the card is stamped unbound, fail-closed", async () => {
@@ -417,5 +497,180 @@ describe("merge train DO drill (real bundled worker)", () => {
       { repo, number: 3002, head_sha_at_acceptance: H2 },
     ]);
     expect(c.meta?.merge_train?.legs_total).toBe(2);
+  });
+
+  it("BR#4129 zombie eviction: a renewal with a frozen progress note on a non-empty queue is denied and EXPIRES — the next gateway's acquire takes over within a tick; legacy `{}` renewals still pass", async () => {
+    const repo = "state-vector/lane-zombie";
+    // a verify-accepted card queues — the lane's derived queue is non-empty
+    const cardId = await queueViaAccept({ repo, pr: 3101, head: "a".repeat(40), title: "IMPL: zombie eviction drill" });
+    expect((await laneSnap(repo)).queue.map((x: any) => x.id)).toContain(cardId);
+
+    // the zombie acquires, then renews carrying its FROZEN action note (hours old)
+    const a = await acquire(repo, "gw-zombie");
+    expect(a.body.error ?? "").toBe("");
+    const denied = await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-zombie",
+      progress: { progress: "merged PR #3100", progress_age_ms: 3 * 60 * 60_000, holder: "gw-zombie" },
+    });
+    expect(denied.status).toBe(400);
+    expect(String(denied.body.error)).toContain("zombie holder");
+    expect(String(denied.body.error)).toContain("no progress for 180m");
+    expect(String(denied.body.error)).toContain("non-empty queue (1 queued)");
+
+    // the lease EXPIRED on denial and the lane card says why (board visibility)
+    const snap = await laneSnap(repo);
+    expect(snap.lease).toBeNull();
+    expect(String(snap.reason)).toContain("zombie holder evicted");
+    expect(String(snap.reason)).toContain("gw-zombie");
+    // the eviction is on the lane's audit trail (the handover receipt)
+    const hist = await kbJson(`/history?id=${encodeURIComponent(snap.card)}`);
+    const notes = JSON.stringify(hist.body ?? {});
+    expect(notes).toContain("train:lease_evicted");
+
+    // takeover: the next gateway's acquire WINS the now-free lane
+    const takeover = await acquire(repo, "gw-2");
+    expect(takeover.body.error ?? "").toBe("");
+    expect(takeover.body.lease.holder).toBe("gw-2");
+
+    // a FRESH proof renews fine on the non-empty queue (awaiting-CI law —
+    // the CI-poll note refreshes every tick, it never trips)
+    const fresh = await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-2",
+      progress: { progress: "CI poll on abc123def: pending", progress_age_ms: 45_000, holder: "gw-2" },
+    });
+    expect(fresh.body.error ?? "").toBe("");
+    // a legacy `{}` renewal (no proof) is UNKNOWN — allowed on the non-empty
+    // queue while the deprecation window runs (BR#4104 retires the senders)
+    const legacy = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-2", progress: {} });
+    expect(legacy.body.error ?? "").toBe("");
+
+    // empty queue ⇒ even a frozen note renews — idle holding is harmless
+    const idleRepo = "state-vector/lane-zombie-idle";
+    expect((await acquire(idleRepo, "gw-idle")).body.error ?? "").toBe("");
+    const idleRenew = await kbJson("/train.lease", {
+      repo: idleRepo, base: "main", action: "renew", actor: "gw-idle",
+      progress: { progress: "merged PR #1", progress_age_ms: 3 * 60 * 60_000, holder: "gw-idle" },
+    });
+    expect(idleRenew.body.error ?? "").toBe("");
+  });
+
+  /** The open review-leg asks bound to a card (BR#4068 stamps them
+   *  review_leg on meta.ask). One live leg per (card, PR) — the dedupe
+   *  contract. */
+  async function reviewAsks(card: string): Promise<any[]> {
+    const { body } = await kbJson("/artefacts?type=question&limit=200");
+    return ((body.artefacts ?? []) as any[]).filter(
+      (a) => a.meta?.ask?.review_leg === true && String(a.title).includes(`(${card})`),
+    );
+  }
+
+  it("BR#4068 starvation law: a train:bounced card auto-boosts (priority 0) and the human review ask goes live in the SAME tick — no manual filing (BR#257 replay)", async () => {
+    const repo = "state-vector/lane-starve";
+    const HEAD = "b".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3101, head: HEAD, title: "IMPL: starvation-law drill" });
+    await acquire(repo, "gw-starve", { required_workflows: ["Test"] });
+
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-starve", pr: 3101, task_id: card,
+      head_sha: HEAD, conflict_files: ["packages/worker/src/kb/do.ts"],
+    });
+    expect(bounced.body.error ?? "", `train:bounced failed: ${JSON.stringify(bounced.body)}`).toBe("");
+
+    // leg 1: boosted to priority 0 by the bounce itself — the claim ranking
+    // (do.ts rank) and the Backlog ▲ read exactly this stamp
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.meta?.boosted).toBeGreaterThan(0);
+    expect(c.status).toBe("in_progress");
+    expect(c.meta?.merge_train?.state).toBe("bounced");
+    // the boost is on the audit chain, not a silent meta write
+    const h = JSON.stringify(await (await kbJson("/get_history", { id: card, limit: 10 })).body);
+    expect(h).toContain("boosted (priority 0 — train bounce");
+
+    // legs 2+3: the live human review ask — hub-filed, For Me-shaped
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    const ask = live[0];
+    expect(["todo", "in_progress", "blocked"]).toContain(ask.status);
+    expect(ask.meta.ask.to).toBe("human");
+    expect(ask.meta.ask.urgency).toBe("time-sensitive");
+    expect(ask.meta.ask.artefact_id).toBe(card);
+    expect(String(ask.title)).toContain("Review requested");
+    expect(String(ask.title)).toContain("one click from landed");
+    expect(String(ask.title).endsWith("?")).toBe(true);
+    expect(ask.meta.ask.options.length).toBeGreaterThanOrEqual(2);
+    expect(String(ask.body_md)).toContain("dismissed the stale GitHub review");
+    expect(String(ask.body_md)).toContain(`pull/3101`);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-starve" });
+  });
+
+  it("BR#4068: the review ask re-files DEDUPE-SAFE (one live leg, refreshed not duplicated) and the boost decays on re-queue — never auto-expired mid-repair", async () => {
+    const repo = "state-vector/lane-refile";
+    const H1 = "1".repeat(40), H1b = "2".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3201, head: H1, title: "IMPL: dedupe re-file drill" });
+    await acquire(repo, "gw-refile", { required_workflows: ["Test"] });
+
+    // bounce #1 — boosted + ask filed
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-refile", pr: 3201, task_id: card, head_sha: H1, conflict_files: ["a.ts"] })).body.error ?? "").toBe("");
+    expect((await reviewAsks(card)).length).toBe(1);
+
+    // repair: in_progress → in_review, fresh verify at the new head → re-queued
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `conflict resolved — PR https://github.com/${repo}/pull/3201` });
+    const v2 = await kbJson("/create", { type: "task", title: `VERIFY: re-file ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const v2id = String(v2.body.id);
+    await kbJson("/link", { src: v2id, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: v2id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    await kbJson("/transition", { id: v2id, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3201 head ${H1b}` });
+
+    // decay: re-entry cleared the bounce boost — the card is back in line
+    let c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.merge_train?.state).toBe("queued");
+    expect(c.meta?.boosted).toBeUndefined();
+
+    // bounce #2: the head moved past the verdict AGAIN. The open ask from #1
+    // is REFRESHED (the live leg), never duplicated.
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-refile", pr: 3201, task_id: card, head_sha: H1b, conflict_files: ["a.ts", "b.ts"] })).body.error ?? "").toBe("");
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    expect(live[0].meta.ask.refreshed_ts).toBeGreaterThan(0);
+    // …and the card re-boosted: still one mechanical leg from landed
+    c = (await kbJson("/get", { id: card })).body;
+    expect(c.meta?.boosted).toBeGreaterThan(0);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-refile" });
+  });
+
+  it("BR#4068: landing the card retires the live review ask — the unanswered ask never fences the landed close (done-open-children)", async () => {
+    const repo = "state-vector/lane-retire";
+    const HEAD = "3".repeat(40), M = "4".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3301, head: HEAD, title: "IMPL: leg-retire drill" });
+    await acquire(repo, "gw-retire", { required_workflows: ["Test"] });
+
+    // bounce → the ask lives → repair → re-queue → merge → green ⇒ landed close
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-retire", pr: 3301, task_id: card, head_sha: HEAD, conflict_files: ["x.ts"] })).body.error ?? "").toBe("");
+    expect((await reviewAsks(card)).length).toBe(1);
+    await kbJson("/transition", { id: card, to: "in_review", actor: "drill", session: "", note: `resolved — PR https://github.com/${repo}/pull/3301` });
+    const v = await kbJson("/create", { type: "task", title: `VERIFY: retire ${card}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const vid = String(v.body.id);
+    await kbJson("/link", { src: vid, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: vid, to: "in_progress", actor: "drill-verifier", note: "re-verifying" });
+    await kbJson("/transition", { id: vid, to: "done", actor: "drill-verifier", note: `re-verified PR https://github.com/${repo}/pull/3301 head ${HEAD}` });
+    const merged = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-retire", pr: 3301, merge_sha: M, head_sha: HEAD, task_id: card });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const landed = await kbJson("/train.ci", { repo, base: "main", actor: "gw-retire", sha: M, checks: [check(41, "Test", "success")] });
+    expect(landed.body.decided).toBe("landed");
+
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("done");
+    expect(c.meta?.merge_train?.state).toBe("landed");
+    // the close retired the dead leg — the band never shows a landed card's ask
+    const live = await reviewAsks(card);
+    expect(live.length).toBe(1);
+    expect(live[0].status).toBe("done");
+    expect(live[0].meta.ask.answered_by).toBe("system:starvation-law");
+    expect(String(live[0].meta.ask.answer)).toContain("landed");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
   });
 });

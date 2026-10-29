@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.4.0";
+export const BUILD = "0.5.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -82,7 +82,7 @@ async function seeAlso(a: any, rel: any, identity: ToolCtx["identity"], call: To
  */
 export const TOOL_TABLE: ToolTable = defineToolTable({
   orient: {
-    description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags.",
+    description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags. Every artefact row carries url — its stable deep link (/card/BR-NNNN), pasteable in a browser.",
     schema: TOOL_ARG_SCHEMAS.orient,
     handler: async (args, ctx) => {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
@@ -111,7 +111,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("search", { q: args.q, type: args.type, limit: args.limit }))),
   },
   get_artefact: {
-    description: "Read one artefact by id, with its relations. Returns see_also: related work, docs, and goals — including open tasks owned by OTHER agents (coordination flag) — so you discover overlap before building.",
+    description: "Read one artefact by id, with its relations. Returns see_also: related work, docs, and goals — including open tasks owned by OTHER agents (coordination flag) — so you discover overlap before building. The artefact and every see_also row carry url — the card's stable deep link.",
     schema: TOOL_ARG_SCHEMAS.get_artefact,
     handler: async (args, ctx) => {
       const a = await ctx.call("get", { id: args.id });
@@ -165,7 +165,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}. Moving to blocked REQUIRES note (reason) + unblock_condition — no dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned.`,
     schema: TOOL_ARG_SCHEMAS.transition,
     handler: async (args, ctx) => text(JSON.stringify({
       ...await ctx.call("transition", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
@@ -288,6 +288,26 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing.",
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
+  },
+  reconcile_schedule: {
+    description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_schedule,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.schedule", args), null, 1)),
+  },
+  reconcile_report: {
+    description: "Feed one daemon observation cycle: the repo's open PRs (raw `gh pr list --json` rows). The hub runs the join, applies every judgement (bind / ignore / spawn duties / reverse-close via provenance), records the accounting, and alarms when the invariant fails. Read-only on GitHub, write-only on the board.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_report,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.report", args), null, 1)),
+  },
+  reconcile_status: {
+    description: "The operator view of reconciliation: settings, recent accounting lines (the canary), the duty ledger, ignores, and PRs on the reverse-reconcile missing clock.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_status,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.status", args), null, 1)),
+  },
+  reconcile_ignore: {
+    description: "Rule one PR off the board WITH A REASON — the invariant's second disposition. {repo, pr, reason}; the report then accounts it as ignored-with-reason instead of alarming.",
+    schema: TOOL_ARG_SCHEMAS.reconcile_ignore,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("reconcile.ignore", args), null, 1)),
   },
 });
 

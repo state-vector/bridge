@@ -29,13 +29,21 @@ export interface ProxyAtom {
     | "br_done"
     | "run_success"
     | "pr_checks_green"
-    | "deployed";
+    | "deployed"
+    /** BR#4062: typed ask/time legs parse from prose too — they evaluate
+     *  board-locally (first-class in the sweep), never via GitHub state. */
+    | "ask"
+    | "time";
   /** repo slug "owner/name"; null = no repo resolvable from the text (the
    *  atom is then unresolvable — the condition can never auto-flip) */
   repo: string | null;
   number?: number;
   brId?: string;
   runId?: string;
+  /** ask: the ask id the card awaits (an OPEN ask answers/closes = fired) */
+  askId?: string;
+  /** time: the epoch-ms deadline (now >= until_ts = fired) */
+  untilTs?: number;
   /** deployed: the hub-worker commit prefix the card waits for (7-40 hex).
    *  The ONLY credential-free external-state atom: the hub evaluates it
    *  against its OWN baked version stamp — no GitHub creds, no guesswork. */
@@ -53,7 +61,7 @@ export interface ParsedCondition {
 /** Machine-predicate-looking text: if this matches and no atom parsed, the
  *  condition is marked unparseable instead of silently ignored. */
 const LOOKS_MACHINE =
-  /\b(?:PR\s?#|pull\/\d+|mergeCommit|MERGED|GH\s?#|GH#\d|issue\s?#?\d|BR#\d|run\s+\d{6,}|check\s+run|actions\/runs\/\d)/i;
+  /\b(?:PR\s?#|pull\/\d+|mergeCommit|MERGED|GH\s?#|GH#\d|issue\s?#?\d|BR#\d|run\s+\d{6,}|check\s+run|actions\/runs\/\d|typed\s+await_event|until_ts)/i;
 
 /** Duty clauses are the instruction half of an unblock condition ("then a
  *  FRESH session closes BR#N done citing…") — not preconditions. Cut them
@@ -82,9 +90,43 @@ function repoFromLine(line: string): string | null {
   return m ? `${m[1]}/${m[2].replace(/\.git$/, "")}` : null;
 }
 
-function numberFromPullUrl(line: string): number | null {
-  const m = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/.exec(line);
-  return m ? Number(m[1]) : null;
+/** ALL pull-URL numbers on the line — a conjunction may merge several PRs
+ *  (BR#3986: first-match exec silently swallowed every condition after the
+ *  first, so the sweep gated on the wrong atom). */
+function numbersFromPullUrls(line: string): number[] {
+  return [...String(line ?? "").matchAll(/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/g)].map((m) => Number(m[1]));
+}
+
+/** Dedupe key for atoms of the same kind pointing at the same target — the
+ *  same PR/BR#/ask/timer named twice on one line (once in the typed-await
+ *  prose, once in the English phrase) is ONE condition, not two (BR#4062;
+ *  same key shape the BR#3986 conjunction dedupe uses). */
+function atomKey(a: Omit<ProxyAtom, "raw">): string {
+  const target =
+    a.brId ??
+    (a.number !== undefined
+      ? String(a.number)
+      : a.runId ?? a.commit ?? a.askId ?? (a.untilTs !== undefined ? String(a.untilTs) : ""));
+  return `${a.kind}|${a.repo ?? ""}|${target}`;
+}
+
+/** AwaitEvent → the sweep's ProxyAtom shape — TOTAL, including ask/time.
+ *  awaitEventToAtom deliberately returns null for ask/time (the sweep
+ *  evaluates those first-class, board-locally); the prose parser still needs
+ *  their atom shape so `typed await_event ask/time` conditions parse
+ *  (BR#4062). */
+function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
+  switch (e.event) {
+    case "pr_merged": return { kind: "pr_merged", repo: e.repo, number: e.n };
+    case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id };
+    case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n };
+    case "br_done": return { kind: "br_done", repo: null, brId: e.id };
+    case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id ?? e.newer_than };
+    case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n };
+    case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
+    case "ask": return { kind: "ask", repo: null, askId: e.ask_id };
+    case "time": return { kind: "time", repo: null, untilTs: e.until_ts };
+  }
 }
 
 /**
@@ -94,6 +136,7 @@ function numberFromPullUrl(line: string): number | null {
  */
 export function parseProxyCondition(text: string): ParsedCondition {
   const atoms: ProxyAtom[] = [];
+  const seen = new Set<string>();
   let unparseable = false;
   // Cut the DUTY clauses over the WHOLE text before splitting: real conditions
   // enumerate the duty steps with semicolons ("then a fresh session: (1) …;
@@ -105,57 +148,104 @@ export function parseProxyCondition(text: string): ParsedCondition {
     const line = rawLine.trim();
     if (!line) continue;
     const repo = repoFromLine(line);
+    const raw = line.slice(0, 200);
     let lineYielded = false;
+    const push = (a: Omit<ProxyAtom, "raw">) => {
+      const atom = { ...a, raw } as ProxyAtom;
+      const key = atomKey(atom);
+      if (seen.has(key)) {
+        lineYielded = true; // a dup of an earlier line's atom still parsed
+        return;
+      }
+      seen.add(key);
+      atoms.push(atom);
+      lineYielded = true;
+    };
 
     // pr_merged: "PR <url|#N> … mergeCommit non-null / state MERGED / merged"
+    // ALL PR numbers on the line (BR#3986: first-match exec truncated
+    // conjunctions — "PR #1 merged AND PR #2 merged" gated on #1 only).
+    let prMerged = false;
     if (/\b(?:is\s+)?(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
-      const urlN = numberFromPullUrl(line);
-      const bare = /PR\s+#?(\d+)\b/.exec(line);
-      const prNumber = urlN ?? (bare ? Number(bare[1]) : null);
-      if (prNumber) {
-        atoms.push({ kind: "pr_merged", repo, number: prNumber, raw: line.trim().slice(0, 200) });
-        lineYielded = true;
-      }
+      const nums = new Set<number>(numbersFromPullUrls(line));
+      for (const m of line.matchAll(/PR\s+#?(\d+)\b/g)) nums.add(Number(m[1]));
+      for (const n of nums) push({ kind: "pr_merged", repo, number: n });
+      prMerged = nums.size > 0;
     }
 
     // br_pr_merged: "BR#N's fix PR on <repo> is MERGED" — the PR itself is
-    // unnamed; the sweep resolves it by head branch bridge/BR-<N>.
-    if (!lineYielded) {
-      const br = /\bBR#(\d+)\b/.exec(line);
-      if (br && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
-        atoms.push({ kind: "br_pr_merged", repo, brId: `BR#${br[1]}`, raw: line.trim().slice(0, 200) });
-        lineYielded = true;
+    // unnamed; the sweep resolves it by head branch bridge/BR-<N>. Only when
+    // the line didn't already name a concrete PR; every BR# on the line.
+    if (!prMerged && repo && /(?:fix\s+)?PR\b/.test(line) && /\b(?:mergeCommit\s+non-null|state[:\s]+MERGED\b|MERGED\b|merged\b)/i.test(line)) {
+      for (const m of line.matchAll(/\bBR#(\d+)\b/g)) push({ kind: "br_pr_merged", repo, brId: `BR#${m[1]}` });
+    }
+
+    // issue_closed: "GH#N closed" / "issue #N is CLOSED" / URL + closed —
+    // every GH# on the line.
+    for (const m of line.matchAll(/(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/gi)) {
+      push({ kind: "issue_closed", repo, number: Number(m[1]) });
+    }
+
+    // br_done: "BR#N done" / "BR#N is done" — EVERY "BR#N done" on the line.
+    // The headline BR#3986 defect: non-global exec yielded the FIRST match
+    // only, so "BR#3945 done AND BR#3946 done" gated on BR#3945 alone while
+    // BR#3946 vanished from the machine gate entirely.
+    for (const m of line.matchAll(/\bBR#(\d+)\s+(?:is\s+)?done\b/gi)) {
+      push({ kind: "br_done", repo: null, brId: `BR#${m[1]}` });
+    }
+
+    // run_success: "run <id> … SUCCESS / green" — every run on the line.
+    if (/\b(?:SUCCESS|success|green)\b/.test(line)) {
+      for (const m of line.matchAll(/\brun\s+(\d{6,})\b/g)) push({ kind: "run_success", repo, runId: m[1] });
+    }
+
+    // pr_checks_green: "a fresh green check run … on PR #N (head)" — every
+    // PR the green-check sentence names.
+    for (const m of line.matchAll(/green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/gi)) {
+      push({ kind: "pr_checks_green", repo, number: Number(m[1]) });
+    }
+
+    // BR#4062: the typed-await prose convention — "Machine proxy (typed
+    // await_event ask ask_id=BR#4061): …" / "(typed await_event time
+    // until_ts=1793673600000)". EVERY closed-set kind parses here, and each
+    // candidate is validated by validateAwaitEvent (one grammar authority),
+    // so prose can never mint an event the typed door would reject. ISO
+    // until_ts normalizes to epoch ms (the BR#3796 tripping hazard).
+    const pushAtom = (a: Omit<ProxyAtom, "raw">) => {
+      const key = atomKey(a);
+      if (!atoms.some((x) => atomKey(x) === key)) atoms.push({ ...a, raw: line.slice(0, 200) });
+      lineYielded = true;
+    };
+    for (const m of line.matchAll(/\btyped\s+await_event\s+(\w+)([^)\n]*)/gi)) {
+      const param = (k: string) => new RegExp(`\\b${k}\\s*[=:]\\s*([^\\s;)}\\]]+)`, "i").exec(m[2])?.[1];
+      const cand: Record<string, unknown> = { event: m[1].toLowerCase() };
+      for (const k of ["repo", "n", "id", "ask_id", "run_id", "newer_than", "commit", "until_ts"]) {
+        const v = param(k);
+        if (v === undefined) continue;
+        if (k === "n") cand.n = Number(v);
+        else if (k === "until_ts") {
+          if (/^\d+$/.test(v)) cand.until_ts = Number(v);
+          else {
+            const ms = Date.parse(v); // ISO 8601 → epoch ms
+            if (Number.isFinite(ms)) cand.until_ts = ms;
+          }
+        } else cand[k] = v;
       }
+      const ev = validateAwaitEvent(cand);
+      if (ev) pushAtom(atomOfAwait(ev));
+      // else: the line names the grammar but nothing valid parsed —
+      // LOOKS_MACHINE (which knows the marker) stamps it unparseable.
     }
 
-    // issue_closed: "GH#N closed" / "issue #N is CLOSED" / URL + closed
-    const issueClosed = /(?:GH\s?#|GH#|issue\s+#|issues\/)(\d+)\s*(?:is\s+)?(?:CLOSED|closed)\b/i.exec(line);
-    if (issueClosed) {
-      const n = Number(issueClosed[1]);
-      atoms.push({ kind: "issue_closed", repo, number: n, raw: line.trim().slice(0, 200) });
-      lineYielded = true;
+    // BR#4062: derived-annotation shapes — the exact texts describeAwaitEvent
+    // writes when a typed park carries no prose ("timer elapsed
+    // (until_ts N)" / "ask BR#N answered"), so a re-park citing them
+    // re-derives the event instead of degrading to unparseable.
+    for (const m of line.matchAll(/\buntil_ts\s*[(:]?\s*(\d{10,16})\b/gi)) {
+      pushAtom({ kind: "time", repo: null, untilTs: Number(m[1]) });
     }
-
-    // br_done: "BR#N done" / "BR#N is done"
-    const brDone = /\bBR#(\d+)\s+(?:is\s+)?done\b/i.exec(line);
-    if (brDone) {
-      atoms.push({ kind: "br_done", repo: null, brId: `BR#${brDone[1]}`, raw: line.trim().slice(0, 200) });
-      lineYielded = true;
-    }
-
-    // run_success: "run <id> … SUCCESS / green"
-    const runOk = /\brun\s+(\d{6,})\b/.exec(line);
-    if (runOk && /\b(?:SUCCESS|success|green)\b/.test(line)) {
-      atoms.push({ kind: "run_success", repo, runId: runOk[1], raw: line.trim().slice(0, 200) });
-      lineYielded = true;
-    }
-
-    // pr_checks_green: "a fresh green check run … on PR #N (head)"
-    const checks = /green\s+check\s+run\b[^.]{0,100}?\bPR\s+#?(\d+)\b/i.exec(line);
-    if (checks) {
-      atoms.push({ kind: "pr_checks_green", repo, number: Number(checks[1]), raw: line.trim().slice(0, 200) });
-      lineYielded = true;
-    }
+    const askAns = /\bask\s+(BR#\d+|ASK-[\w-]{2,})\s+(?:is\s+)?answered\b/i.exec(line);
+    if (askAns) pushAtom({ kind: "ask", repo: null, askId: askAns[1] });
 
     if (!lineYielded && LOOKS_MACHINE.test(line)) unparseable = true;
   }
@@ -407,7 +497,22 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
     case "run_success": return a.repo && a.runId ? { event: "run_success", repo: a.repo, run_id: a.runId } : null;
     case "pr_checks_green": return a.repo && a.number ? { event: "pr_checks_green", repo: a.repo, n: a.number } : null;
     case "deployed": return a.commit ? { event: "deployed", commit: a.commit } : null;
+    // BR#4062: typed ask/time legs parse from prose and map like any atom —
+    // a single-atom ask/time condition derives its typed event at the door.
+    case "ask": return a.askId ? { event: "ask", ask_id: a.askId } : null;
+    case "time":
+      return a.untilTs !== undefined && Number.isFinite(a.untilTs) && a.untilTs > 0
+        ? { event: "time", until_ts: a.untilTs }
+        : null;
   }
+}
+
+/** Self-referential await (BR#3986 / the BR#136 deadlock): a card awaiting
+ *  its own done can never fire — the typed event's subject only reaches that
+ *  state AFTER the card unblocks, so the park deadlocks silently. Pure +
+ *  exported for the park gate and the regression tests. */
+export function isSelfAwait(cardId: string, e: AwaitEvent): boolean {
+  return (e.event === "br_done" || e.event === "br_pr_merged") && e.id === cardId;
 }
 
 /** Whether the hub's OWN deployed commit satisfies a `deployed` atom: prefix
