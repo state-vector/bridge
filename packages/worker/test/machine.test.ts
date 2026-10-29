@@ -389,6 +389,7 @@ describe("loop regressions", () => {
         "release-needs-ownership",
         "review-needs-pr",
         "review-separation-of-duties",
+        "supersede-authority",
         "unblock-needs-resolution",
         "verdict-done-needs-receipts",
         "verdict-no-blocked",
@@ -462,6 +463,31 @@ describe("loop regressions", () => {
     if (forged.ok === false) {
       expect(forged.rule).toBe("release-needs-ownership");
     }
+  });
+
+  it("BR#3913 shape: blocked → superseded exists, but only an answered ask (the dispatch actor) or a human may drop a card", async () => {
+    // the edge is real: the askAnswer SUPERSEDE dispatch acts as system:question(<answerer>)
+    const v = ok(
+      await decide(input({ status: "blocked", to: "superseded", actor: "system:question(web:rayh)", body: { note: "ask BR#3909 answered — dropped" } }), baseCtx()),
+    );
+    expect(v.status).toBe("superseded");
+    // a dropped parent's ephemeral rounds close with it
+    expect(v.effects).toContainEqual({ kind: "supersede_children", parent: "BR#1", tag: "unblock", keep_newest: false, cause: "BR#1 → superseded — unblock round closed" });
+    expect(v.effects).toContainEqual({ kind: "supersede_children", parent: "BR#1", tag: "review", keep_newest: false, cause: "BR#1 superseded — verification round closed" });
+    // web and human actors pass (the same exemption release-ownership uses)
+    expect((await decide(input({ status: "blocked", to: "superseded", actor: "web:rayh" }), baseCtx())).ok).toBe(true);
+    expect((await decide(input({ status: "blocked", to: "superseded", actor: "human:rayh" }), baseCtx())).ok).toBe(true);
+    // a bare agent session is refused — dropping work is a human-authority act (BR#2480)
+    const v2 = await decide(input({ status: "blocked", to: "superseded", actor: "agent-x" }), baseCtx());
+    expect(v2.ok).toBe(false);
+    if (v2.ok === false) {
+      expect(v2.code).toBe("guard-failed");
+      expect(v2.rule).toBe("supersede-authority");
+      expect(v2.message).toContain("human-authority act");
+    }
+    // BR#2508 held the line elsewhere: todo/in_review/done stay closed to superseded
+    expect(await check(input({ status: "todo", to: "superseded", actor: "web:rayh" }), baseCtx())).toContain("not allowed");
+    expect(await check(input({ status: "in_review", to: "superseded", actor: "web:rayh" }), baseCtx())).toContain("not allowed");
   });
 });
 
