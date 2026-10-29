@@ -170,14 +170,17 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>
-        <span className="trainc-msg">{line.remediation?.text ?? line.reason}</span>
+        <span className="trainc-msg">{line.remediation?.text ?? line.reason}
+          {(l.escalations ?? []).map((e) => <Chip key={`${e.task_id}-${e.pr}`} pill tone={e.expired ? "err" : "warn"}
+            title={`bounce budget (BR#4688): ${e.task_id} PR #${e.pr} breached at ${e.bounce_no}× ${e.bounce_kind ?? "?"} bounces — de-queued, escalation ask ${e.ask_id ?? "?"}; owner clock ${e.expired ? `expired ${age(e.grace_until, now)} ago (executor closes the PR)` : `${age(e.grace_until, now)} left`}`}>⏳ {e.pr ? `#${e.pr}` : e.task_id} ×{e.bounce_no}</Chip>)}
+        </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog"><span className="train-stats">
           <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} ready</span>
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
-          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}`}
-            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}`} onClick={() => openTask?.(q.id)} />)}
+          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
+            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · ${q.bounces} train bounce(s) on this PR (budget 5 same-kind — BR#4688)${q.over_budget ? " — OVER BUDGET (escalated, de-queued)" : ""}` : ""}`} onClick={() => openTask?.(q.id)}>{q.bounces ? <span className={`train-bounce-chip${q.over_budget ? " over-budget" : ""}`}>×{q.bounces}</span> : null}</span>)}
         </span>)}</span></span>
       </div>
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
