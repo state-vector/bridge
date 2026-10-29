@@ -236,6 +236,14 @@ export const kbApi = {
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
   transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
+  // BR#3910: one-click human supersede — the server composes the two-step
+  // (blocked → release → todo → superseded) and enforces the web-session-only
+  // gate; replacement is optional but validated server-side when given.
+  supersede: (id: string, replacement_id?: string, note?: string) =>
+    j<{ id: string; status: string; replacement_id?: string }>(`/api/kb/supersede`, {
+      method: "POST",
+      body: JSON.stringify({ id, ...(replacement_id ? { replacement_id } : {}), ...(note ? { note } : {}) }),
+    }),
   update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[]; roles?: string[] }) =>
     j<{ id: string }>("/api/kb/update", { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 
