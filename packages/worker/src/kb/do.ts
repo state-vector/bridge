@@ -2669,6 +2669,7 @@ export class KnowledgeHub {
         case "ws.create": return this.json(await this.wsCreate(body, String(body.login)));
         case "ws.join": return this.json(await this.wsJoin(body, String(body.login)));
         case "ws.members": return this.json(await this.wsMembers(body, String(body.login)));
+        case "ws.remove": return this.json(await this.wsRemove(body, String(body.login)));
         case "ws.token_register": return this.json(await this.wsTokenRegister(body));
         case "ws.token_lookup_principal": return this.json(await this.wsTokenLookupPrincipal(body));
         case "ws.token_lookup": return this.json(await this.wsTokenLookup(body));
@@ -6013,18 +6014,39 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return { ok: true, slug };
   }
 
-  /** join: only the owner of an existing workspace can add members */
+  /** invite: any member of an existing workspace can add members — everyone
+   *  holds the same rights (no role tiers). The invitee arrives as
+   *  body.member; body.login is always the CALLER (dispatch supplies it). */
   private async wsJoin(body: any, login: string) {
     const slug = String(body.ws ?? "").trim();
     const w = this.one(`SELECT slug, owner FROM workspaces WHERE slug = ?`, slug);
     if (!w) throw new Error(`no such workspace: ${slug}`);
-    if (w.owner !== login) throw new Error("only the workspace owner can add members");
-    const who = String(body.login ?? "").trim().toLowerCase();
+    if (!this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, slug, login))
+      throw new Error("only workspace members can add members");
+    const who = String(body.member ?? "").trim().toLowerCase();
     if (!/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}$/.test(who)) throw new Error("bad github login");
     this.state.storage.sql.exec(
       `INSERT OR IGNORE INTO workspace_members (ws, login) VALUES (?, ?)`, slug, who,
     );
     return { ok: true, ws: slug, login: who };
+  }
+
+  /** remove: any member can remove any member — except the workspace creator
+   *  (owner), who cannot be removed by anyone, not even themselves. */
+  private async wsRemove(body: any, login: string) {
+    const slug = String(body.ws ?? "").trim();
+    const w = this.one(`SELECT slug, owner FROM workspaces WHERE slug = ?`, slug);
+    if (!w) throw new Error(`no such workspace: ${slug}`);
+    if (!this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, slug, login))
+      throw new Error("only workspace members can remove members");
+    const who = String(body.member ?? "").trim().toLowerCase();
+    if (!who) throw new Error("member required");
+    if (who === String(w.owner).toLowerCase()) throw new Error("the workspace creator cannot be removed");
+    this.state.storage.sql.exec(
+      `DELETE FROM workspace_members WHERE ws = ? AND login = ?`, slug, who,
+    );
+    const still = this.one(`SELECT 1 FROM workspace_members WHERE ws = ? AND login = ?`, slug, who);
+    return { ok: true, ws: slug, login: who, removed: !still };
   }
 
   private async wsMembers(body: any, login: string) {

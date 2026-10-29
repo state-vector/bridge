@@ -57,7 +57,7 @@ not_found_handling = "single-page-application"
 # A route missing from this list is silently eaten by the SPA assets layer
 # (372bbe973). Any new worker-handled path MUST be added here. BR#4252
 # removed /v1/models (fabricated hub-side model authority) — do not re-add.
-run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/switch", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
+run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/*", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/token.rename", "/kb-ws"]
 
 [vars]
 # BR#4252: MODEL_IDS (the fabricated model registry served at /v1/models) is
@@ -69,3 +69,4 @@ run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api
 #   BRIDGE_INGEST_TOKEN    shared bearer for POST /ingest (legacy FLOWS_INGEST_TOKEN still accepted during rotation)
 #   CF_ACCESS_TEAM        optional: https://<team>.cloudflareaccess.com (edge JWT mode)
 #   CF_ACCESS_AUD         optional: Access application AUD tag
+#   GITHUB_TOKEN          optional: raises the invite-time GitHub username lookup rate limit (60/hr shared egress IP → 5000/hr)

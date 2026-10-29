@@ -45,13 +45,13 @@ npx wrangler secret put GITHUB_CLIENT_ID
 npx wrangler secret put GITHUB_CLIENT_SECRET
 ```
 
-3. Set the login allowlist (default deny — without this secret **no** GitHub login can sign in):
+3. Set the login allowlist (default deny — without this secret only **invited** GitHub logins can sign in):
 
 ```bash
 npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (e.g. "rayh"), or "*" for any account
 ```
 
-Optional workspace scoping via `WORKSPACE_MEMBERS` (JSON map slug → GitHub logins); logins not in any list get an isolated auto-workspace. See `deploy.md` for the full runbook.
+**Inviting teammates:** workspace members self-serve — the 👥 button next to the workspace picker invites/removes members by GitHub username (validated against the GitHub API at invite time; optional `GITHUB_TOKEN` secret raises the lookup rate limit). An invited login can sign in via the GitHub button even when not on `GITHUB_ALLOWED_USERS`. Everyone holds the same rights — any member can invite or remove — and the workspace creator cannot be removed.
 
 ## 3 · Run a runner (the gateway)
 

@@ -43,7 +43,7 @@
 }
 @keyframes wt-pulse { }
 /* workspace picker (topbar) */
-.ws-picker { display: flex; align-items: center; gap: 6px; margin-right: 10px; }
+.ws-picker { position: relative; display: flex; align-items: center; gap: 6px; margin-right: 10px; }
 .ws-picker select { font-size: 11px; padding: 3px 6px; max-width: 180px; }
 .ws-create { display: flex; align-items: center; gap: 4px; }
 .ws-create input {
@@ -53,3 +53,24 @@
 }
 .ws-create input:focus { border-color: var(--accent); }
 .ws-new { padding: 2px 7px !important; }
+.ws-people { padding: 2px 7px !important; }
+.ws-members {
+  position: absolute; top: 42px; right: 8px; z-index: 40;
+  display: flex; flex-direction: column; gap: 6px;
+  min-width: 220px; max-width: 280px; padding: 10px;
+  background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+.ws-members-row { display: flex; align-items: center; gap: 4px; }
+.ws-members-row input {
+  font-size: 11px; padding: 3px 6px; width: 130px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; outline: none;
+}
+.ws-members-row input:focus { border-color: var(--accent); }
+.ws-members ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto; }
+.ws-members li {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  font-size: 11px; padding: 2px 0;
+}
+.ws-members li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

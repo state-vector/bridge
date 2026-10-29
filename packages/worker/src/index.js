@@ -446,6 +446,46 @@ export default {
       });
     }
 
+    // Workspace members (human plane): list / invite / remove by GitHub
+    // username. An invited login can then sign in via OAuth (the login
+    // callback admits workspace members). All members hold the same rights —
+    // anyone can invite or remove; the workspace creator cannot be removed
+    // (DO-side guard). Membership is checked DO-side on every call.
+    const mm = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/members(?:\/([^/]+))?$/);
+    if (mm) {
+      const ws = decodeURIComponent(mm[1]).toLowerCase();
+      const caller = auth.login.toLowerCase();
+      try {
+        if (request.method === "GET") {
+          return json(await wsCall(env, "ws.members", { ws, login: caller }));
+        }
+        if (request.method !== "POST" && request.method !== "DELETE")
+          return json({ error: "GET, POST or DELETE only" }, 405);
+        const raw = request.method === "DELETE"
+          ? decodeURIComponent(mm[2] ?? "")
+          : String((await request.json().catch(() => ({}))).login ?? "");
+        const member = raw.trim();
+        if (!member) return json({ error: "member required" }, 400);
+        if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/.test(member))
+          return json({ error: "bad github login" }, 400);
+        if (request.method === "DELETE") {
+          return json(await wsCall(env, "ws.remove", { ws, login: caller, member: member.toLowerCase() }));
+        }
+        // best-effort GitHub resolution at invite time: a definitive 404
+        // rejects the typo; rate-limit or network trouble fails OPEN
+        // (verified:false) — Cloudflare egress IPs share GitHub's
+        // unauthenticated quota, so hard-failing there would make invites
+        // unusable. The OAuth login itself is the real proof that the
+        // username exists and the invitee owns it.
+        const gh = await githubUserLookup(env, member);
+        if (!gh) return json({ error: `no such GitHub user: ${member}` }, 404);
+        const out = await wsCall(env, "ws.join", { ws, login: caller, member: member.toLowerCase() });
+        return json({ ...out, verified: gh.verified });
+      } catch (e) {
+        return json({ error: String(e?.message ?? e) }, 400);
+      }
+    }
+
     const hub = env.HUB.get(env.HUB.idFromName(doWs(auth.ws)));
     if (url.pathname === "/ws") return hub.fetch("https://hub/ws", request);
     if (url.pathname === "/api/state") return hub.fetch("https://hub/state", request);
@@ -521,6 +561,28 @@ async function wsHome(env, login) {
 }
 
 const SESSION_COOKIE = "bridge_session";
+
+/** Resolve a GitHub username at invite time (best-effort). Returns
+ *  { login, verified: true } on a definitive hit, { login, verified: false }
+ *  when GitHub cannot be asked (rate limit / network), null on a definitive
+ *  404 (no such user). Optional GITHUB_TOKEN secret raises the rate limit
+ *  from 60/hr (per shared egress IP) to 5000/hr. */
+async function githubUserLookup(env, login) {
+  const r = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": "bridge",
+      ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+    },
+  });
+  if (r.status === 404) return null;
+  if (r.status === 200) {
+    const u = await r.json().catch(() => ({}));
+    return u.login ? { login: String(u.login), verified: true } : { login, verified: false };
+  }
+  return { login, verified: false };
+}
+
 const OAUTH_COOKIE = "bridge_oauth";
 const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
 
@@ -756,21 +818,30 @@ async function handleGithubCallback(request, env) {
   if (!u.login) return oauthFailure(url.origin, "github_user");
 
   // GitHub user allowlist — GITHUB_ALLOWED_USERS secret. Default is DENY:
-  // unless the secret exists, no GitHub login may sign in at all. Values:
+  // unless the secret exists, no GitHub login may sign in at all — EXCEPT
+  // logins invited into a workspace (workspace_members): invitations are the
+  // self-serve second door (checked BEFORE wsHome, which would create a
+  // personal workspace and make every login a member of something).
+  // Values:
   //   "*"              any GitHub account may sign in (fully open mode)
   //   "rayh,alice"     comma-separated allowlist (case-insensitive)
-  // An empty/unset secret = nobody gets in. This is the access gate for the
-  // whole hub; workspace scoping (WORKSPACE_MEMBERS) is a second, finer gate.
+  // An empty/unset secret = allowlisted + invited logins only. Workspace
+  // scoping beyond this is a second, finer gate (see /api/workspaces).
   const allowed = (env.GITHUB_ALLOWED_USERS ?? "").trim();
-  if (!allowed) {
-    console.error("login: refused — GITHUB_ALLOWED_USERS is not set (default deny)");
-    return oauthFailure(url.origin, "not_allowed");
-  }
   if (allowed !== "*") {
     const list = allowed.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
     if (!list.includes(u.login.toLowerCase())) {
-      console.error(`login: refused — ${u.login} not in GITHUB_ALLOWED_USERS`);
-      return oauthFailure(url.origin, "not_allowed");
+      let invited = false;
+      try {
+        const { workspaces } = await wsCall(env, "ws.list", { login: u.login.toLowerCase() });
+        invited = workspaces.some((w) => w.member);
+      } catch (e) {
+        console.error("login: membership check failed (failing closed):", String(e));
+      }
+      if (!invited) {
+        console.error(`login: refused — ${u.login} not in GITHUB_ALLOWED_USERS and no workspace membership`);
+        return oauthFailure(url.origin, "not_allowed");
+      }
     }
   }
 
