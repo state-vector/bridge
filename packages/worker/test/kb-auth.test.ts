@@ -120,10 +120,32 @@ describe("bootstrap composition", () => {
     expect(b).not.toContain("external board");
   });
 
+  it("rule 4b + PROTOCOL CARD carry the verdict-duty carve-out — the protocol never steers a verify/unblock duty into blocked (BR#4392)", () => {
+    const b = composeBootstrap("My Project", DEFAULT_BOARD);
+    expect(b).toContain("can NEVER take the blocked leg");
+    expect(b).toContain("they cannot block");
+    expect(b).toContain('"cannot proceed" is itself the verdict');
+  });
+
   it("appends the user board prompt when board is external", () => {
     const b = composeBootstrap("P", { mode: "external", kind: "github-projects", url: "https://x/p/1", prompt: "Move tasks to In Progress." });
     expect(b).toContain("github-projects");
     expect(b).toContain("https://x/p/1");
     expect(b).toContain("Move tasks to In Progress.");
+  });
+
+  it("carries the retry law — 5xx retryable, semantic gate rejections terminal (BR#4474)", () => {
+    // BR#4403/BR#4473: during a storage-fault era, duty sessions retried
+    // gate-rejected transitions on 5xx backoff — every retry an audited breach
+    // event (four gate:open-children cards in 18min, park-retry specimens).
+    // The law must ride in the bootstrap rules AND the PROTOCOL CARD (the only
+    // thing delegated subagents receive).
+    const b = composeBootstrap("My Project", DEFAULT_BOARD);
+    expect(b).toContain("4c. RETRY LAW");
+    expect(b).toContain("infra_storage_fault");
+    expect(b).toContain("TERMINAL");
+    expect(b).toContain("audited breach event");
+    // the mirrored clause in the delegated-subagent card
+    expect(b).toMatch(/PROTOCOL CARD:.*9\. RETRY LAW/s);
   });
 });
