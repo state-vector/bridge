@@ -1433,7 +1433,9 @@ describe("BR#4977 lane lifecycle + queue base scoping", () => {
     // — via the legal lifecycle edges, exactly how that card was retired)
     const t1 = await kbJson("/transition", { id: laneCard, to: "in_progress", actor: "drill", session: "drill", note: "retiring the drill lane" });
     expect(t1.status, `claim failed: ${JSON.stringify(t1.body)}`).toBeLessThan(400);
-    const t = await kbJson("/transition", { id: laneCard, to: "done", actor: "drill", session: "drill", note: "DRILL RESIDUE — lane retired, will never tick again" });
+    // BR#5151: the close is web-authoritative now — a self-close by the
+    // claiming session is exactly the BR#5050 shape and is refused
+    const t = await kbJson("/transition", { id: laneCard, to: "done", actor: "web:drill", session: "drill", note: "DRILL RESIDUE — lane retired, will never tick again" });
     expect(t.status, `retire transition failed: ${JSON.stringify(t.body)}`).toBeLessThan(400);
 
     // the tick refuses — acquire/renew/release all bounce, and the lane's
@@ -1561,7 +1563,7 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     const old = await laneSnap(repo);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-fr" });
     await kbJson("/transition", { id: old.card, to: "in_progress", actor: "gw-fr", note: "drill: claiming to retire" });
-    const closed = await kbJson("/transition", { id: old.card, to: "done", actor: "gw-fr", note: "drill: retire with no reseed registered (owner close)" });
+    const closed = await kbJson("/transition", { id: old.card, to: "done", actor: "web:drill", note: "drill: deliberate retirement via web — no reseed registered (BR#5151: owner identity no longer closes standing cards)" });
     expect(closed.status).toBeLessThan(400);
 
     // every lane op refuses — the lane is deliberately retired, no
@@ -1601,10 +1603,13 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     expect(refused2.status).toBeGreaterThanOrEqual(400);
     expect(String(refused2.body.error)).toContain("infrastructure");
 
-    // the OWNER may close their own claimed infra card (ownership is the
-    // other legal path — the guard never fences the owner out)
+    // BR#5151: ownership is NO LONGER a close path for standing cards — the
+    // BR#5050 incident was the owner-actor daemon closing its own lane via
+    // the old owner-identity exemption. Same named rejection, no close.
     const okOwner = await kbJson("/transition", { id: String(infra.body.id), to: "done", actor: "duty-BR-drill", note: "owner closes own infra card — receipts: drill" });
-    expect(okOwner.status).toBeLessThan(400);
+    expect(okOwner.status).toBeGreaterThanOrEqual(400);
+    expect(String(okOwner.body.error)).toContain("infrastructure/merge-train lane card");
+    expect(String(okOwner.body.error)).toContain("BR#5151");
 
     // humans retire lanes fine (web/human actors are exempt — the recovery
     // lever this incident needed)
@@ -1788,5 +1793,72 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane.now_action ?? null).toBeNull();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-leg" });
+  });
+});
+
+// ---------- BR#5151: train:merged is the only lane writer, and it dedupes ----------
+
+describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {
+  it("an identical re-report collapses to an ack; a different sha is a named reject; the ledger keeps ONE merged row", async () => {
+    const repo = "state-vector/dedupe-drill";
+    const HEAD = "b".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 5151, head: HEAD, title: "IMPL: train dedupe drill (BR#5151)" });
+    await acquire(repo, "gw-dedup", { required_workflows: ["Test"] });
+    const M = "d".repeat(40);
+    const first = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-dedup",
+      pr: 5151, merge_sha: M, head_sha: HEAD, task_id: card,
+    });
+    expect(first.body.error ?? "", `first merged failed: ${JSON.stringify(first.body)}`).toBe("");
+    expect(first.body.task).toBe(card);
+
+    // crash-recovery re-report: the SAME sha collapses to an ack — no error,
+    // no second settle, no provenance overwrite
+    const dup = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-dedup",
+      pr: 5151, merge_sha: M, head_sha: HEAD, task_id: card,
+    });
+    expect(dup.status).toBe(200);
+    expect(dup.body.ok).toBe(true);
+    expect(dup.body.deduped).toBe(true);
+
+    // a DIFFERENT merge_sha for a PR already recorded merged: a named
+    // protocol reject (≥400), never a silent provenance overwrite
+    const conflict = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-dedup",
+      pr: 5151, merge_sha: "e".repeat(40), head_sha: HEAD, task_id: card,
+    });
+    expect(conflict.status).toBeGreaterThanOrEqual(400);
+    expect(String(conflict.body.error)).toContain("already recorded merged");
+
+    // the ledger holds exactly one merged row for the PR
+    const hist = (await kbJson("/train.history", { repo })).body.events.filter(
+      (e: any) => e.kind === "merged" && Number(e.pr) === 5151,
+    );
+    expect(hist).toHaveLength(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-dedup" });
+  });
+
+  it("a merged event naming the standing LANE card is a named reject — nothing stamped, nothing settled", async () => {
+    const repo = "state-vector/dedupe-lane-drill";
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    expect(lane.body.error ?? "").toBe("");
+    const laneId = String(lane.body.id);
+    await acquire(repo, "gw-lane", { required_workflows: ["Test"] });
+    const M = "9e".repeat(20); // unique in this DO — nothing else stamps 9e9e…
+    const reject = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-lane",
+      pr: 5152, merge_sha: M, task_id: laneId, // the lane card itself — the BR#5050 foothold
+    });
+    expect(reject.status).toBeGreaterThanOrEqual(400);
+    expect(String(reject.body.error)).toContain("standing lane card");
+    // the rejected event left NO provenance row for that merge
+    const prov = await kbJson(`/provenance?sha=${M}`);
+    expect(prov.status).toBe(404);
+    // the lane itself is untouched: still blocked, lease still held
+    const after = (await kbJson("/get", { id: laneId })).body;
+    expect(after.status).toBe("blocked");
+    expect(after.meta?.lease?.holder).toBe("gw-lane");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-lane" });
   });
 });
