@@ -8665,7 +8665,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     } else if (noteLegs.length) {
       legs = noteLegs;
     } else if (stampLegs.length) {
-      legs = stampLegs;
+      // no parseable PR reference in the note — the existing stamp re-queues
+      // as-is, EXCEPT (BR#4648): a note that still carries a `head <sha>`
+      // token speaks for the card's ONE open leg. A single-unlanded-leg
+      // stamp has nothing to cross-pair, so the lone head refreshes it — a
+      // verifier citing bare receipts (no URL, no `repo#N`) must not strand
+      // the stamp on an old head and spin the coverage bounce. Multi-leg
+      // stamps stay fail-closed (no guessing which leg a lone head names).
+      legs = stampLegs.map((l) => ({ ...l }));
+      const loneHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
+      const open = legs.filter((l) => !trainLegLanded(meta, l));
+      if (loneHead && open.length === 1 && open[0].head_sha_at_acceptance !== loneHead) {
+        open[0].head_sha_at_acceptance = loneHead;
+        this.audit(actor, "queue_stamp_refreshed", parentId, { leg: `${open[0].repo}#${open[0].number}`, head: loneHead.slice(0, 9), via: "lone head token — the close note cited no PR reference (BR#4648)" });
+      }
     } else {
       legs = trainParseNoteLegs(String(parent.body_md ?? ""));
       const loneHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
@@ -8689,6 +8702,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.audit("system:merge-train", "queue_unbound", parentId, { reason: `close cited PR(s) ${unbound.map((l) => `#${l.number}`).join(", ")} without a paired \`head <sha>\` — every cited PR needs its head before the train can gate it (BR#3659)` });
       return;
     }
+    // BR#4648 honesty: did this accept actually move a stamp? The re-queue
+    // note must never claim "stamp refreshed" on a no-op re-accept, and a
+    // re-accept whose note carried a `head <sha>` token yet moved nothing
+    // the stamp doesn't already cover is audited loud — that gap is exactly
+    // the silent-stale coverage-bounce spin class.
+    const stampBefore = new Map(stampLegs.map((l) => [`${l.repo}#${l.number}`, l.head_sha_at_acceptance]));
+    const refreshed = withStampHeads.some((l) => stampBefore.get(`${l.repo}#${l.number}`) !== l.head_sha_at_acceptance);
     // stamp: meta.prs = every leg; meta.pr = the first leg (compat: the gate,
     // the derived-queue filter, and older readers read meta.pr)
     // BR#4806 wake bookkeeping — read the per-lane queue depth BEFORE the
@@ -8771,8 +8791,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         });
       }
     }
-    this.audit(actor, "train_queued", parentId, { prs: withStampHeads.map((l) => l.number), repos: [...new Set(withStampHeads.map((l) => l.repo))], head: (withStampHeads[0].head_sha_at_acceptance ?? "").slice(0, 9), requeued: alreadyQueued });
-    this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? " (re-queued, stamp refreshed)" : ""}`, { prs: withStampHeads.map((l) => l.number) });
+    this.audit(actor, "train_queued", parentId, { prs: withStampHeads.map((l) => l.number), repos: [...new Set(withStampHeads.map((l) => l.repo))], head: (withStampHeads[0].head_sha_at_acceptance ?? "").slice(0, 9), requeued: alreadyQueued, refreshed });
+    const noteHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
+    if (alreadyQueued && !refreshed && noteHead && !stampLegs.some((l) => l.head_sha_at_acceptance === noteHead)) {
+      this.audit("system:merge-train", "queue_stamp_not_refreshed", parentId, { head: noteHead.slice(0, 9), reason: "the accept note carried a `head <sha>` token but no stamped leg moved — its PR citation did not parse onto a leg (BR#4648 class); the stamp rides at its old head" });
+    }
+    this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? ` (re-queued${refreshed ? ", stamp refreshed" : ""})` : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }
 
   /** The lane's derived queue — COMPUTED (mergeTrainQueue over blocked,
