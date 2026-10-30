@@ -137,6 +137,18 @@ function nowAction(l: KbTrainLane, now: number): { text: string; title: string }
 
 const REFRESH_MS = 30_000;
 
+/** BR#5106 depth-counter honesty (Ray: "depth counters seem wrong — there
+ *  are way more PRs open"): the derived queue is the ACTIONABLE subset
+ *  (verdict-stamped, gate-clean heads per the BR#4079 contract) while `open`
+ *  is every open PR the repo's last reconcile pass listed. Both render —
+ *  `queue N · open M` — so a lane can never read nearly-empty while GitHub
+ *  shows a pile (the "43 open PRs, queue EMPTY" class, BR#5022). No
+ *  reconcile data yet → queue alone, never a made-up zero. */
+export function trainQueueDepthLabel(l: Pick<KbTrainLane, "queue" | "open_prs">): string {
+  const depth = `queue ${l.queue.length}`;
+  return l.open_prs ? `${depth} · open ${l.open_prs.count}` : depth;
+}
+
 /** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
  *  labeled time-frames — NOW (what is being done right now + progress),
  *  NEXT (the first queued head the train takes after the current work),
@@ -263,8 +275,8 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
               )}
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
-            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}`}>
-              {l.queue.length} queued{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed — the derived queue is only the actionable subset (${age(l.open_prs.ts, now)} ago; BR#5106/BR#5022)` : ""}`}>
+              {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
             </span>
           </div>
         );

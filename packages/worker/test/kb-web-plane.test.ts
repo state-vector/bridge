@@ -234,8 +234,8 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
-    // BACKLOG: the count + how many need reviews
-    expect(trainPanelSrc).toMatch(/queued\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
+    // BACKLOG: the BR#5106 depth counters (queue N · open M) + how many need reviews
+    expect(trainPanelSrc).toMatch(/\{trainQueueDepthLabel\(l\)\}\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
     expect(trainPanelSrc).toContain("stopped — main is red");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
@@ -263,6 +263,13 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/l\.now_action/);
     expect(trainPanelSrc).toMatch(/nowAction\(l, now\)/);
     expect(trainPanelSrc).toContain("ageSec > 300");
+    // queue depth with the head named — BR#5106: both counters render as
+    // `queue N · open M` via the pure trainQueueDepthLabel fn (exact output
+    // pinned by ui-kit/train-queue-depth.test.ts); the queue count still
+    // derives from l.queue.length, the open count from lane.open_prs.
+    expect(trainPanelSrc).toMatch(/trainQueueDepthLabel\(l\)/);
+    expect(trainPanelSrc).toMatch(/queue \$\{l\.queue\.length\}/);
+    expect(trainPanelSrc).toMatch(/open \$\{l\.open_prs\.count\}/);
     // RATE: merges per hour / 24h
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");

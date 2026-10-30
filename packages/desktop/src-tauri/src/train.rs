@@ -2110,8 +2110,12 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
 
 /// BR#4170 — one reconcile pass: for each repo the hub's schedule lists, run
 /// the read-only `gh pr list` and feed the observations to the hub. The
-/// DAEMON only observes (identity read-only; it never writes the board) —
-/// the HUB runs the join, decides, mutates, and alarms (reconcile.report).
+/// DAEMON only observes the BOARD (identity read-only; it never writes the
+/// board) — the HUB runs the join, decides, mutates, and alarms
+/// (reconcile.report). BR#5106 adds the one GitHub-write family this leg may
+/// make: the per-PR status labels (bridge:merge-ready / bridge:wip),
+/// identity-gated like every other write leg (BR#3181) and derived from the
+/// hub's queue, never from the executor's own judgement.
 fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
     let schedule = ctx.mcp("reconcile_schedule", json!({}))?;
     if schedule.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
@@ -2127,14 +2131,36 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
     }
     let mut lines = Vec::new();
     for repo in repos {
-        // Read-only by construction: `gh pr list` is the ONLY GitHub call
-        // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
-        // board authority and the hub holds no VCS credentials).
+        // `gh pr list` is the observation (accepted BR#3499/BR#3507 — the
+        // gateway holds no board authority and the hub holds no VCS
+        // credentials); the ONLY write this leg may make is the BR#5106
+        // label family, identity-gated below.
         let rows = ctx.gh_json(&[
             "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
-            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
+            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft,state,labels",
         ])?;
-        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
+        let mut report = json!({ "repo": repo, "prs": pr_payload(&rows) });
+        // BR#5106: the PR status labels (bridge:merge-ready / bridge:wip) are
+        // GitHub WRITES — identity-gated exactly like merge legs (BR#3181,
+        // the BR#3516 split): a worker-class credential stamps them from the
+        // hub's derived queue; a personally-authed gateway skips LOUDLY.
+        if ctx.write_allowed() {
+            let (changes, events, errors) = sync_pr_labels(ctx, &repo, &rows);
+            for e in &errors {
+                log(None, &format!("[labels] {repo}: {e}"));
+            }
+            if !events.is_empty() {
+                report["labels"] = Value::Array(events);
+            }
+            lines.push(format!(
+                "[labels] {repo}: {} label transition(s){}",
+                changes,
+                if errors.is_empty() { String::new() } else { format!(", {} error(s) — non-fatal", errors.len()) }
+            ));
+        } else {
+            lines.push(format!("[labels] {repo}: will not label PRs — gh is not a worker-class credential (BR#3181/BR#5106); label sync skipped loudly"));
+        }
+        let res = ctx.mcp("reconcile_report", report)?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         lines.push(format!("[reconcile] {repo}: {line}{}", if ok { String::new() } else { " — ALARM routed to the sink".to_string() }));
@@ -2149,6 +2175,190 @@ fn pr_payload(rows: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().filter(|r| r.is_object()).cloned().collect()),
         _ => Value::Array(Vec::new()),
     }
+}
+
+// ===========================================================================
+// BR#5106 — PR status labels (bridge:merge-ready / bridge:wip)
+//
+// Ray, 2026-10-30: the GitHub PR list view should carry the bridge truth per
+// PR. During each reconcile pass every OPEN PR on a lane repo gets exactly
+// one label from the bridge:* family: merge-ready when it sits in the lane's
+// DERIVED queue (verdict covers the live head, gate-clean — the BR#4068
+// "one click from landed" state), wip otherwise (unbound / bounced /
+// conflicted / stale verdict / draft). The queue is the hub's verdict — the
+// executor never self-certifies; it reads train_status and stamps GitHub
+// accordingly (the BR#3516 split: the hub holds no VCS credentials, the
+// executor holds no board authority). Transitions ride the reconcile_report
+// the pass already sends; the hub audits each as pr_label_synced.
+// ===========================================================================
+
+/// The family, fixed colors + descriptions so the list view reads at a
+/// glance. Extensible: a new state = a new spec entry + a mapping arm.
+const BRIDGE_LABEL_MERGE_READY: (&str, &str, &str) = (
+    "bridge:merge-ready",
+    "0E8A16",
+    "merge train: verdict covers head, gate-clean — one click from landed",
+);
+const BRIDGE_LABEL_WIP: (&str, &str, &str) = (
+    "bridge:wip",
+    "FBCA04",
+    "merge train: open but not queued (unbound / bounced / conflicted / stale verdict / draft)",
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeLabel {
+    MergeReady,
+    Wip,
+}
+
+impl BridgeLabel {
+    fn spec(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            BridgeLabel::MergeReady => BRIDGE_LABEL_MERGE_READY,
+            BridgeLabel::Wip => BRIDGE_LABEL_WIP,
+        }
+    }
+    fn name(self) -> &'static str {
+        self.spec().0
+    }
+    /// The whole family — the per-repo creation set and the exactly-one
+    /// strip-set.
+    fn family() -> [&'static str; 2] {
+        [BRIDGE_LABEL_MERGE_READY.0, BRIDGE_LABEL_WIP.0]
+    }
+}
+
+/// Pure state mapping (the labeler's whole decision surface, unit-tested):
+/// queued → merge-ready; every other OPEN PR (drafts ALWAYS wip) → wip;
+/// anything not open → None (closed/merged PRs are never labeled).
+fn desired_bridge_label(state: &str, is_draft: bool, queued: bool) -> Option<BridgeLabel> {
+    if !state.eq_ignore_ascii_case("open") {
+        return None;
+    }
+    if is_draft {
+        return Some(BridgeLabel::Wip);
+    }
+    Some(if queued { BridgeLabel::MergeReady } else { BridgeLabel::Wip })
+}
+
+/// Pure apply plan: Noop when the desired label is present and no sibling
+/// family label is (unchanged = ZERO gh calls — never API-spam); otherwise
+/// add the desired label and strip every other family member present
+/// (exactly one bridge:* label at a time).
+enum LabelAction {
+    Noop,
+    Apply { add: &'static str, remove: Vec<&'static str> },
+}
+
+fn label_action(current: &[String], desired: BridgeLabel) -> LabelAction {
+    let wanted = desired.name();
+    let has = |n: &str| current.iter().any(|c| c == n);
+    let remove: Vec<&'static str> = BridgeLabel::family().into_iter().filter(|n| *n != wanted && has(n)).collect();
+    if has(wanted) && remove.is_empty() {
+        LabelAction::Noop
+    } else {
+        LabelAction::Apply { add: wanted, remove }
+    }
+}
+
+/// The family labels a repo still lacks — created on first use, per repo.
+fn missing_bridge_labels(have: &[String]) -> Vec<&'static str> {
+    BridgeLabel::family().into_iter().filter(|n| !have.iter().any(|h| h == n)).collect()
+}
+
+/// One repo's label sync inside the reconcile pass. Returns (transitions,
+/// events for the hub audit, non-fatal error lines). The queue comes from
+/// train_status (the hub's derived verdict, BR#4079); if that read fails,
+/// NOTHING is labeled — a blind stamp would lie. Per-PR gh failures are
+/// logged and skipped: labeling is never fatal to the tick.
+fn sync_pr_labels(ctx: &mut Ctx, repo: &str, rows: &Value) -> (usize, Vec<Value>, Vec<String>) {
+    let mut events = Vec::new();
+    let mut errors = Vec::new();
+    let empty: Vec<Value> = Vec::new();
+    let rows: &[Value] = rows.as_array().map(|a| a.as_slice()).unwrap_or(&empty);
+    let st = match ctx.mcp("train_status", json!({ "repo": repo })) {
+        Ok(v) => v,
+        Err(e) => return (0, events, vec![format!("train_status failed — no labels applied (a blind stamp would lie): {}", trunc(&e, 200))]),
+    };
+    let queued: Vec<i64> = st
+        .get("lanes")
+        .and_then(|v| v.as_array())
+        .map(|lanes| {
+            lanes
+                .iter()
+                .filter_map(|l| l.get("queue").and_then(|q| q.as_array()))
+                .flatten()
+                .filter_map(|c| c.get("pr").and_then(|p| p.as_i64()))
+                .filter(|n| *n > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let is_queued = |n: i64| queued.contains(&n);
+
+    // Repo label inventory — the family is created on first use, per repo.
+    let mut have: Vec<String> = match ctx.gh_json(&["label", "list", "--repo", repo, "--limit", "200", "--json", "name"]) {
+        Ok(v) => v
+            .as_array()
+            .map(|a| a.iter().filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+            .unwrap_or_default(),
+        Err(e) => return (0, events, vec![format!("gh label list failed — no labels applied: {}", trunc(&e, 200))]),
+    };
+    for want in missing_bridge_labels(&have) {
+        let (name, color, desc) = if want == BRIDGE_LABEL_MERGE_READY.0 {
+            BRIDGE_LABEL_MERGE_READY
+        } else {
+            BRIDGE_LABEL_WIP
+        };
+        if let Err(e) = ctx.sh("gh", &["label", "create", name, "--repo", repo, "--color", color, "--description", desc]) {
+            let e = trunc(&e, 200);
+            // another writer may have created it mid-pass — tolerate only that
+            if !e.to_ascii_lowercase().contains("already exists") {
+                errors.push(format!("label create {name} failed: {e}"));
+                continue;
+            }
+        }
+        have.push(name.to_string());
+    }
+
+    let mut changes = 0usize;
+    for row in rows {
+        let n = match row.get("number").and_then(|v| v.as_i64()) {
+            Some(n) if n > 0 => n,
+            _ => continue,
+        };
+        let state = vstr(row, "state").unwrap_or("");
+        let is_draft = row.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+        let desired = match desired_bridge_label(state, is_draft, is_queued(n)) {
+            Some(d) => d,
+            None => continue, // not open — skip (the pass lists open only; defensive)
+        };
+        let current: Vec<String> = row
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|l| l.get("name").and_then(|x| x.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let prev: Option<&'static str> = BridgeLabel::family().into_iter().find(|f| current.iter().any(|c| c == f));
+        let (add, remove) = match label_action(&current, desired) {
+            LabelAction::Noop => continue,
+            LabelAction::Apply { add, remove } => (add, remove),
+        };
+        let pr_num = n.to_string();
+        let mut args: Vec<&str> = vec!["pr", "edit", &pr_num, "--repo", repo, "--add-label", add];
+        for r in remove {
+            args.push("--remove-label");
+            args.push(r);
+        }
+        match ctx.sh("gh", &args) {
+            Ok(_) => {
+                changes += 1;
+                ctx.note(&format!("pr_label_synced {repo}#{n}: {} → {}", prev.unwrap_or("(none)"), add));
+                events.push(json!({ "pr": n, "from": prev.map(Value::from).unwrap_or(Value::Null), "to": add }));
+                log(None, &format!("[labels] {repo}#{n}: {} → {}", prev.unwrap_or("(none)"), add));
+            }
+            Err(e) => errors.push(format!("#{n}: label apply failed: {}", trunc(&e, 200))),
+        }
+    }
+    (changes, events, errors)
 }
 
 // ===========================================================================
@@ -2410,6 +2620,65 @@ mod tests {
         assert_eq!(cache_dir(base, "owner/repo"), PathBuf::from("/tmp/bridge-train-test/owner/repo"));
         assert_eq!(cache_dir(base, "owner/../repo"), PathBuf::from("/tmp/bridge-train-test/owner/repo"));
         assert_eq!(cache_dir(base, "a/b/c"), PathBuf::from("/tmp/bridge-train-test/a/b/c"));
+    }
+
+    // ---- BR#5106: the PR status labeler (pure decision surface) ----
+
+    #[test]
+    fn label_state_mapping_br5106() {
+        // queued → merge-ready (the "one click from landed" state)
+        assert_eq!(desired_bridge_label("OPEN", false, true), Some(BridgeLabel::MergeReady));
+        // open but NOT queued (bounced / unbound / conflicted / stale verdict) → wip
+        assert_eq!(desired_bridge_label("OPEN", false, false), Some(BridgeLabel::Wip));
+        // drafts are ALWAYS wip — even while queued
+        assert_eq!(desired_bridge_label("OPEN", true, true), Some(BridgeLabel::Wip));
+        assert_eq!(desired_bridge_label("OPEN", true, false), Some(BridgeLabel::Wip));
+    }
+
+    #[test]
+    fn label_closed_and_merged_never_labeled_br5106() {
+        assert_eq!(desired_bridge_label("CLOSED", false, true), None);
+        assert_eq!(desired_bridge_label("MERGED", false, true), None);
+        assert_eq!(desired_bridge_label("", false, false), None);
+    }
+
+    #[test]
+    fn label_one_label_invariant_br5106() {
+        // a stale sibling is stripped when the desired label is applied —
+        // exactly one bridge:* label at a time; non-family labels untouched
+        match label_action(&["bridge:wip".into(), "bug".into()], BridgeLabel::MergeReady) {
+            LabelAction::Apply { add, remove } => {
+                assert_eq!(add, "bridge:merge-ready");
+                assert_eq!(remove, vec!["bridge:wip"]);
+            }
+            _ => panic!("expected an apply"),
+        }
+        // no family label yet → add only
+        match label_action(&["bug".into()], BridgeLabel::Wip) {
+            LabelAction::Apply { add, remove } => {
+                assert_eq!(add, "bridge:wip");
+                assert!(remove.is_empty());
+            }
+            _ => panic!("expected an apply"),
+        }
+    }
+
+    #[test]
+    fn label_noop_when_unchanged_br5106() {
+        // exact match → zero gh calls (never API-spam)
+        assert!(matches!(label_action(&["bridge:merge-ready".into()], BridgeLabel::MergeReady), LabelAction::Noop));
+        assert!(matches!(label_action(&["bridge:wip".into()], BridgeLabel::Wip), LabelAction::Noop));
+        // non-family noise never triggers a write
+        assert!(matches!(label_action(&["bug".into(), "bridge:merge-ready".into()], BridgeLabel::MergeReady), LabelAction::Noop));
+    }
+
+    #[test]
+    fn label_creation_on_first_use_br5106() {
+        // a fresh repo lacks the whole family — both created on first use
+        assert_eq!(missing_bridge_labels(&[]), vec!["bridge:merge-ready", "bridge:wip"]);
+        // a partially labeled repo creates only what it lacks
+        assert_eq!(missing_bridge_labels(&["bridge:wip".to_string()]), vec!["bridge:merge-ready"]);
+        assert!(missing_bridge_labels(&["bridge:merge-ready".into(), "bridge:wip".into()]).is_empty());
     }
 
     #[test]
