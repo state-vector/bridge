@@ -420,7 +420,7 @@ pub fn decide_merge_action(
     }
     if state != "clean" && state != "unstable" {
         return MergeAction::Bounce {
-            defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg"),
+            defect: format!("PR #{pr_number} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg"),
             bounce_kind: BounceKind::Gate,
         };
     }
@@ -592,7 +592,7 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 state = if behind {
                     "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
                 } else if blocked {
-                    "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)
+                    "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
                 } else {
                     "clean"
                 },
@@ -1142,9 +1142,11 @@ mod tests {
             ),
             other => panic!("expected note, got {other:?}"),
         }
-        // blocked + GREEN head checks → the shared law's bounce stands
-        let gate = decide_train_gate(gate_input(&meta, Some("blocked"), &[run(1, "ci", Some("success"))]));
-        assert!(matches!(gate, MergeAction::Bounce { bounce_kind: BounceKind::Gate, .. }));
+        // blocked + GREEN head checks: BR#3727's "the shared law's bounce stands"
+        // posture is SUPERSEDED by BR#4633 L4.2 — blocked+green now pre-clears and
+        // MERGES (the BR verify verdict is the approval of record). That posture is
+        // pinned by `blocked_green_verdict_anchor_merges_br4633_l4_2` above; the old
+        // Gate-bounce leg was removed with the superseded law.
     }
 
     // ---------- burst-drain law mirrors (BR#4934) ----------
