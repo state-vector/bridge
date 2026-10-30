@@ -7744,11 +7744,30 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       meta.lane.key = laneKey(repo, base);
     }
     if (action === "release" && body.line_green) {
+      const stop = meta.stop ?? null;
       meta.stop = null;
       // the stopped phase's in-flight record is the BROKEN merge commit —
       // never poll it toward a landing; the culprit card was bounced at stop
       // time, so the lane simply goes idle.
       if (meta.currently?.phase === "stopped") meta.currently = null;
+      // BR#4692: a stop-clear on the green line is LOUD — the lane history
+      // carries a stop_cleared row with the red window (who/when auditable)
+      // and the alarm sink gets the stop set → stop cleared note. Fires only
+      // when a stop actually existed: the executor's idle releases also send
+      // line_green (release_if_idle passes !stop) and must stay silent.
+      if (stop) {
+        const stoppedAt = Number(stop.at ?? now);
+        const redMs = Math.max(0, now - stoppedAt);
+        const redMin = Math.max(1, Math.round(redMs / 60_000));
+        const sha9 = String(stop.sha ?? "").slice(0, 9);
+        const window = `red window ${redMin}m (sha ${sha9}, stopped ${new Date(stoppedAt).toISOString()} → cleared ${new Date(now).toISOString()} by ${actor})`;
+        this.version(lane.id, actor, "train:stop_cleared", `stop auto-cleared on green line — ${window}`, { stop, red_window_ms: redMs, cleared_by: actor });
+        this.audit(actor, "train:stop_cleared", lane.id, { lane: laneKey(repo, base), sha: stop.sha, stopped_at: stoppedAt, cleared_at: now, red_window_ms: redMs });
+        try {
+          const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+          this.version(sinkId, actor, "note", `stop-the-line auto-cleared — ${laneKey(repo, base)} ${window}`, { lane: laneKey(repo, base), stop, red_window_ms: redMs, cleared_by: actor });
+        } catch { /* sink re-issued/missing — the lane rows above carry the audit */ }
+      }
     }
     const reason = this.laneSyncReason(lane.id, meta, now);
     // BR#5114: laneSyncReason persists only on a reason CHANGE — the

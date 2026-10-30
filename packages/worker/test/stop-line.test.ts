@@ -296,6 +296,24 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(green.body.currently).toBeNull();
     expect(green.body.reason).toBe("merge-train: awaiting an available gateway");
     expect((await laneSnap(repo)).stop).toBeNull();
+
+    // BR#4692: the clear is LOUD — the lane history carries ONE stop_cleared
+    // row with the red window (who/when auditable; the plain release above
+    // produced none), and the alarm sink gets the stop set → stop cleared note
+    const laneCard = (await laneSnap(repo)).card as string;
+    expect(laneCard).toBeTruthy();
+    const laneHist = ((await kbJson("/get_history", { id: laneCard, limit: 15 })).body?.versions ?? []) as any[];
+    const clearedRows = laneHist.filter((v) => v.action === "train:stop_cleared");
+    expect(clearedRows.length, `stop_cleared rows: ${JSON.stringify(laneHist.map((v) => [v.action, v.summary]))}`).toBe(1);
+    expect(String(clearedRows[0].summary)).toContain("stop auto-cleared on green line");
+    expect(String(clearedRows[0].summary)).toContain("red window");
+    expect(String(clearedRows[0].summary)).toContain("ddddddddd"); // the episode that was live at clear time
+    expect(String(clearedRows[0].summary)).toContain("gw-green"); // who
+    const sinkHist = ((await kbJson("/get_history", { id: sinkId, limit: 15 })).body?.versions ?? []) as any[];
+    const sinkNotes = sinkHist.filter((v) => v.action === "note" && String(v.summary).includes("stop-the-line auto-cleared"));
+    expect(sinkNotes.length, `sink notes: ${JSON.stringify(sinkHist.map((v) => [v.action, v.summary]))}`).toBe(1);
+    expect(String(sinkNotes[0].summary)).toContain(`${repo}@main`);
+    expect(String(sinkNotes[0].summary)).toContain("red window");
   });
 
   it("green required runs land through the machine proxy and close the card; the lane idles and the queue advances", async () => {
