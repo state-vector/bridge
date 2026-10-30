@@ -712,10 +712,11 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
   it("a bounce re-entry stranded in_progress (dead executor) is DEMOTED to a claimable todo by the sweep — never re-parked blocked; train meta + boost survive", async () => {
     // The specimen shape (BR#4198): a train bounce re-opened its card
     // in_progress with the PRIOR session as executor; the session is gone and
-    // nothing pings. The self-heal normally lands coverage bounces in_review
-    // (train-hub.test.ts pins that) — this drill pins the FALLBACK for every
-    // path that still strands the unclaimable in_progress: the sweep must
-    // release it claimable, never re-park it blocked (the 4×-bounce loop).
+    // nothing pings. Since BR#4962 a coverage bounce parks the card blocked
+    // Awaiting (zero asks) and the old self-heal re-entry is retired — this
+    // drill pins the FALLBACK for every path that still strands the
+    // unclaimable in_progress: the sweep must release it claimable, never
+    // re-park it blocked (the 4×-bounce loop).
     const c = await kbJson("/create", { type: "task", title: "IMPL: br4494 demote drill", qualified: true, session: "drill-exec-br4494" });
     expect(c.status).toBe(200);
     const id = String(c.body.id);

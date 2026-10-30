@@ -31,12 +31,11 @@ import {
   trainParseNoteLegs,
   trainQueueRemainingReason,
   trainStopAskTitle,
-  trainReviewAskTitle,
-  trainReviewAskDetails,
-  clampReviewAskTtlHours,
-  shouldRefileReviewAsk,
-  TRAIN_REVIEW_ASK_TTL_H_DEFAULT,
-  TRAIN_REVIEW_ASK_GRACE_MS,
+  trainAwaitingReason,
+  TRAIN_AWAITING_REASON_PREFIX,
+  TRAIN_AWAITING_TTL_H_DEFAULT,
+  TRAIN_AWAITING_GRACE_MS,
+  clampAwaitingTtlHours,
   verdictCoversHead,
   verdictCoversHeadLeg,
   TRAIN_CI_BOUND_MULTIPLIER,
@@ -560,29 +559,23 @@ describe("train event copy", () => {
     expect(resolveTrainBounceKind({ defect: "PR #7 head check RED: Test" })).toBe("gate");
   });
 
-  it("trainReviewAskTitle dedupes per (card, PR) — stable across re-bounces, carries the For Me phrasing, holds the ask contract (BR#4068)", () => {
-    const t = trainReviewAskTitle({ repo: "state-vector/bridge" }, 2476, "BR#257");
-    expect(t).toContain("Review requested");
-    expect(t).toContain("one click from landed");
-    expect(t).toContain("bridge#2476");
-    expect(t).toContain("(BR#257)");
-    expect(t.endsWith("?")).toBe(true);
-    expect(t.length).toBeLessThanOrEqual(240);
-    // the dedupe key: identical per (card, PR) so the identical-open-ask
-    // guard collapses re-bounces of the same leg onto the live ask
-    expect(trainReviewAskTitle({ repo: "state-vector/bridge" }, 2476, "BR#257")).toBe(t);
-    // a different leg is a different ask
-    expect(trainReviewAskTitle({ repo: "state-vector/bridge" }, 2477, "BR#257")).not.toBe(t);
+  it("trainAwaitingReason: the typed park reason is plain-readable — verdict + anchored head inline, stable per (card, leg) (BR#4962)", () => {
+    const r = trainAwaitingReason("BR#2601", "b".repeat(40));
+    // the exact format the acceptance pins (BR#4960 pull model — no ask)
+    expect(r).toBe(`Awaiting review (verdict BR#2601, anchored at head ${"b".repeat(9)})`);
+    expect(r.startsWith(TRAIN_AWAITING_REASON_PREFIX)).toBe(true);
+    // the backlog/backlog-filter readers match on the prefix, never prose
+    expect(TRAIN_AWAITING_REASON_PREFIX).toBe("Awaiting review (verdict ");
+    // head is ALWAYS truncated to 9 — the reason never carries a 40-hex wall
+    expect(trainAwaitingReason("BR#1", "c".repeat(40))).toContain(`head ${"c".repeat(9)}`);
+    // honest degenerate shapes: unrecorded verdict / headless bounce
+    expect(trainAwaitingReason(null, null)).toBe("Awaiting review (verdict unrecorded, anchored at head unknown)");
   });
 
-  it("trainReviewAskDetails names the lapse law and the live leg; no file list → say so honestly (BR#4068)", () => {
-    const d = trainReviewAskDetails({ repo: "state-vector/bridge", prNumber: 2476, taskId: "BR#257", headSha: "b".repeat(40), conflictFiles: ["src/a.ts"] });
-    expect(d).toContain("dismissed the stale GitHub review");
-    expect(d).toContain("priority 0");
-    expect(d).toContain("- `src/a.ts`");
-    expect(d).toContain("github.com/state-vector/bridge/pull/2476");
-    const bare = trainReviewAskDetails({ repo: "r", prNumber: 1, taskId: "BR#1", headSha: null, conflictFiles: [] });
-    expect(bare).toContain("the executor enumerates them on the trial rebase");
+  it("trainAwaitingReason: re-bounces of the same leg refresh IN PLACE — the reason is a pure function, never a second row (BR#4962)", () => {
+    const a = trainAwaitingReason("BR#2601", "b".repeat(40));
+    const b = trainAwaitingReason("BR#2601", "b".repeat(40));
+    expect(a).toBe(b);
   });
 
   it("trainLandedCloseNote cites the PR, the gateway, and the machine proxy", () => {
@@ -605,66 +598,25 @@ describe("train event copy", () => {
   });
 });
 
-// ---------- BR#4633 L4.2 / BR#4693: review-ask durability ----------
+// ---------- BR#4962 / BR#4960: the Awaiting park's visible-age window ----------
 
-describe("shouldRefileReviewAsk (dedupe suppresses spam, not the leg — BR#4693)", () => {
-  const H = (c: string) => c.repeat(40);
-  const NOW = 1_800_000_000_000;
-  const TTL = 24 * 60 * 60_000;
-  const ask = (over: Record<string, unknown> = {}) => ({ filed_ts: NOW - 25 * 60 * 60_000, head_sha: H("1"), ...over });
-
-  it("refiles ONLY when the ask aged past the TTL AND the head moved since the last ask event", () => {
-    // both facts: exactly one re-filed ask per TTL window
-    const go = shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL });
-    expect(go.refile).toBe(true);
-    expect(go.why).toContain("BR#4633 L4.2");
-    // inside the TTL window (even with a head move) → refresh only
-    expect(shouldRefileReviewAsk({ ask: ask({ filed_ts: NOW - 2 * 60 * 60_000 }), createdTs: NOW - 3 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // past the TTL but the head is UNCHANGED since the last ask → refresh only
-    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: H("1"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // refreshed_ts counts as the last ask event (a recent refresh keeps the leg deduped)
-    expect(shouldRefileReviewAsk({ ask: ask({ refreshed_ts: NOW - 2 * 60 * 60_000 }), createdTs: NOW - 26 * 60 * 60_000, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // a BACKDATED stamp out-votes the row's created_ts (the DO-drill regression):
-    // the ask event is the stamp, not the row's birth — an aged stamp never reads fresh
-    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(true);
-  });
-
-  it("fail-safes never refile: legacy asks without stamps, headless bounces, empty asks", () => {
-    // no age stamp at all (a legacy ask predating the durability stamps)
-    expect(shouldRefileReviewAsk({ ask: { head_sha: H("1") }, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // age stamp but no head stamp (legacy) — refresh adopts the stamp, never refiles
-    expect(shouldRefileReviewAsk({ ask: { filed_ts: NOW - 48 * 60 * 60_000 }, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // the bounce carried no head sha — nothing to compare
-    expect(shouldRefileReviewAsk({ ask: ask(), createdTs: NOW - 26 * 60 * 60_000, headSha: null, now: NOW, ttlMs: TTL }).refile).toBe(false);
-    // empty ask meta entirely
-    expect(shouldRefileReviewAsk({ ask: null, createdTs: null, headSha: H("2"), now: NOW, ttlMs: TTL }).refile).toBe(false);
-  });
-
-  it("the refile window is exactly the TTL: one re-filed ask per window falls out of the stamps", () => {
-    // the fresh ask re-stamps filed_ts + head_sha, so the NEXT re-bounce
-    // inside the window dedupes again — no refile storms
-    let stamps = { filed_ts: NOW - 25 * 60 * 60_000, head_sha: H("1") };
-    let head = H("2");
-    const refile = shouldRefileReviewAsk({ ask: stamps, createdTs: stamps.filed_ts, headSha: head, now: NOW, ttlMs: TTL });
-    expect(refile.refile).toBe(true);
-    // the re-filed ask's stamps: same TTL clock from NOW, new head baseline
-    stamps = { filed_ts: NOW, head_sha: head };
-    expect(shouldRefileReviewAsk({ ask: stamps, createdTs: NOW, headSha: head, now: NOW + 60_000, ttlMs: TTL }).refile).toBe(false);
-    // ...and one MORE head move past the window refiles exactly once more
-    head = H("3");
-    expect(shouldRefileReviewAsk({ ask: stamps, createdTs: NOW, headSha: head, now: NOW + TTL + 60_000, ttlMs: TTL }).refile).toBe(true);
-  });
-
-  it("clampReviewAskTtlHours: settings garbage clamps to the honest default window", () => {
-    expect(TRAIN_REVIEW_ASK_TTL_H_DEFAULT).toBe(24);
-    expect(TRAIN_REVIEW_ASK_GRACE_MS).toBe(2 * 60 * 60_000);
-    expect(clampReviewAskTtlHours("36")).toBe(36);
-    expect(clampReviewAskTtlHours(48)).toBe(48);
-    expect(clampReviewAskTtlHours("0")).toBe(24); // falsy garbage → the default
-    expect(clampReviewAskTtlHours(-5)).toBe(24);
-    expect(clampReviewAskTtlHours("abc")).toBe(24);
-    expect(clampReviewAskTtlHours("9999")).toBe(720); // the 1..720 clamp
-    expect(clampReviewAskTtlHours(undefined)).toBe(24);
+describe("clampAwaitingTtlHours (the park never expires itself — the knob feeds the chip only)", () => {
+  it("settings garbage clamps to the honest default window; the legacy knob falls back first", () => {
+    expect(TRAIN_AWAITING_TTL_H_DEFAULT).toBe(24);
+    expect(TRAIN_AWAITING_GRACE_MS).toBe(2 * 60 * 60_000);
+    expect(clampAwaitingTtlHours("36")).toBe(36);
+    expect(clampAwaitingTtlHours(48)).toBe(48);
+    // legacy fallback: the awaiting knob unset, the old review-ask knob set
+    expect(clampAwaitingTtlHours("", "72")).toBe(72);
+    expect(clampAwaitingTtlHours(undefined, "72")).toBe(72);
+    // the awaiting knob outranks the legacy one
+    expect(clampAwaitingTtlHours("36", "72")).toBe(36);
+    // garbage in BOTH → the default
+    expect(clampAwaitingTtlHours("0", "abc")).toBe(24); // falsy garbage → the default
+    expect(clampAwaitingTtlHours(-5)).toBe(24);
+    expect(clampAwaitingTtlHours("abc")).toBe(24);
+    expect(clampAwaitingTtlHours("9999")).toBe(720); // the 1..720 clamp
+    expect(clampAwaitingTtlHours()).toBe(24);
   });
 });
 
