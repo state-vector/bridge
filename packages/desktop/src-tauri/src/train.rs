@@ -40,8 +40,8 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, drain_burst_decision, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
+    classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
@@ -774,6 +774,19 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     }
 }
 
+/// BR#5190: the root-fix fast lane's stop carve-out condition — the DERIVED
+/// queue's head is the bound root-fix card (the hub offers only tier 0 while
+/// the base is red, so "head is the cure" == "a cure is in flight"). Only
+/// then does the stopped lane fall through to the walk, so the gate can see
+/// base red + the cure's head.
+fn root_fix_head_under_stop(lane: &Value) -> bool {
+    lane.get("queue")
+        .and_then(|q| q.as_array())
+        .and_then(|q| q.first())
+        .map(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
@@ -786,6 +799,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
             log(Some(key), "main green again — stop cleared, lane released");
+            return Ok(());
+        }
+        // BR#5190 root-fix fast lane: while the line holds, a bound root-fix
+        // card at the queue head falls through to the walk below — the gate
+        // sees base red + the cure's head and either fast-tracks the merge
+        // (head green) or opens the human fast-lane ask (the circular
+        // deploy-health class). Without this carve-out the stop arm returned
+        // before the queue walk, so the fast lane was unreachable exactly
+        // when it mattered. The bisect walk is PARKED while the cure is in
+        // flight — its state lives hub-side (stop.bisect) and resumes once
+        // the fix lands or the head stops being the cure.
+        if root_fix_head_under_stop(lane) {
+            log(Some(key), "root-fix card heads the queue — fast lane under stop: falling through to the walk (bisect parked, BR#5190)");
         } else {
             // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
             // drive the walk ONE step per tick while the line holds (state
@@ -796,14 +822,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             log(Some(key), &format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") }));
+            return Ok(());
         }
-        return Ok(());
     }
 
     // ---- post-stop residue: the stop cleared (main green again) but the
     // in-flight record is the broken merge commit — never poll it toward a
-    // landing. The culprit card was bounced at stop time; lane is idle. ----
-    if lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("stopped") {
+    // landing. The culprit card was bounced at stop time; lane is idle.
+    // BR#5190: runs ONLY when the stop is actually gone — a live stop that
+    // fell through above (root-fix head) must not read as residue. ----
+    if lane.get("stop").map(|s| s.is_null()).unwrap_or(true)
+        && lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("stopped")
+    {
         log(Some(key), "stop cleared — stale in-flight record; lane idle (culprit card re-enters via verify)");
         release_if_idle(ctx, key, repo, base)?;
         return Ok(());
@@ -1041,7 +1071,22 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // (decision BR#4932) — the gate composes with base FORCED green; the
         // tip RED check at the loop head owns the stop (GH#2261). The first
         // merge of a pass still gates under the standing law (real verdict).
-        let gate_base = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
+        // BR#5190: the base's failing check NAMES ride the gate — the
+        // root-fix fast lane matches the circular deploy-health class off
+        // them (the receipt names the red the fix cures).
+        let base_runs = ctx.check_runs(repo, &base_sha);
+        let base_class = classify_main_check_runs(&base_runs);
+        let base_red_names: Vec<String> = if pass_merged > 0 {
+            Vec::new()
+        } else {
+            base_class.red.iter().map(|r| r.name.clone()).collect()
+        };
+        let gate_base = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict.clone() };
+        // BR#5190: the candidate IS the main-breakage fix iff it is the
+        // bound root-fix card (tags + meta.root_fix binding) — the executor
+        // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
+        // on the card row, the binding under meta.root_fix).
+        let root_fix = is_root_fix_card(&card);
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
@@ -1055,6 +1100,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             commits: &commits,
             head_checks: &head_checks,
             leg_number: Some(leg_number),
+            root_fix,
+            base_red_names: &base_red_names,
         });
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
@@ -1106,6 +1153,31 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 continue;
             }
             MergeAction::HumanLeg { reason } => {
+                // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
+                // deploy-health class — the deterministic one-click merge ask
+                // (title byte-identical to the hub's, ask-dedupe keys on exact
+                // wording). First option IS the recommendation: one click
+                // merges the cure onto the red base.
+                if root_fix {
+                    renew_lease(ctx, repo, base);
+                    let fast_details = [
+                        format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
+                        "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
+                        "Merging the cure is what turns main green again; declining holds the line (bisect stays parked on the cure).".to_string(),
+                    ].join("\n\n");
+                    ctx.mcp("ask_agent", json!({
+                        "to": "human",
+                        "question": root_fix_fast_lane_title(repo, pr),
+                        "reason": reason,
+                        "details": fast_details,
+                        "options": ["Merge the cure now", "Not yet — hold the line"],
+                        "artefact_id": head_id,
+                    }))?;
+                    ctx.note(&format!("root-fix fast lane: filed the one-click merge ask for PR #{pr} (circular deploy-health class)"));
+                    log(Some(key), &format!("root-fix fast lane: human merge ask filed for PR #{pr} — the train cannot merge through the circular gate"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
                 renew_lease(ctx, repo, base);
                 ctx.mcp("ask_agent", json!({
@@ -1218,16 +1290,23 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // single settle feed (the hub flips bursting → awaiting-ci
                 // on the first settle poll, not here).
                 pass_merged = pass_merged.saturating_add(1);
-                ctx.mcp("train_event", json!({
+                // BR#5190: the event carries root_fix so the hub knows the
+                // pass head is the cure (settle copy + the fast-lane receipt).
+                let mut merged_ev = json!({
                     "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder,
                     "burst_merged": pass_merged, "burst_cap": burst_cap, "burst_settling": false,
-                }))?;
+                });
+                if root_fix {
+                    merged_ev.as_object_mut().unwrap().insert("root_fix".into(), json!(true));
+                }
+                ctx.mcp("train_event", merged_ev)?;
                 tip_sha = merge_sha.clone();
-                ctx.note(&format!("merged PR #{pr} as {}", &tip_sha[..tip_sha.len().min(9)]));
+                let fast_note = if root_fix { " — ROOT-FIX FAST-TRACK (BR#5189): the cure is in flight; the line greens when its CI settles" } else { "" };
+                ctx.note(&format!("merged PR #{pr} as {}{}", &tip_sha[..tip_sha.len().min(9)], fast_note));
                 log(
                     Some(key),
                     &format!(
-                        "PR #{pr} merged as {} — bursting ({pass_merged} merged, cap {}): drain continues back-to-back, no settle between merges",
+                        "PR #{pr} merged as {} — bursting ({pass_merged} merged, cap {}): drain continues back-to-back, no settle between merges{fast_note}",
                         &tip_sha[..tip_sha.len().min(9)],
                         if burst_cap == 0 { "unlimited".to_string() } else { burst_cap.to_string() }
                     ),
