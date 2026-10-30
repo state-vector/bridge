@@ -210,11 +210,13 @@ export interface KbTrainLane {
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
   queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
-  /** open review-leg asks on this lane's bounced cards, OLDEST FIRST
-   *  (BR#4693): one age chip per ask — amber (aging) at the re-ask TTL, red
-   *  (lapsed) past TTL + grace. The TTL itself stays hub-side; the surface
-   *  only reports the ask's age and which side of the window it sits on. */
-  review_asks?: { task: string; ask_id: string; pr?: number; age_ms: number; aging: boolean; lapsed: boolean }[];
+  /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
+   *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
+   *  gone: zero asks ride the lanes): one chip per parked card — amber
+   *  (aging) at the awaiting TTL, red (lapsed) past TTL + grace; a lapsed
+   *  park still lists (visibility without interruption). Force-review from
+   *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
+  awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;
@@ -307,6 +309,15 @@ export const kbApi = {
     j<{ id: string; status: string; replacement_id?: string }>(`/api/kb/supersede`, {
       method: "POST",
       body: JSON.stringify({ id, ...(replacement_id ? { replacement_id } : {}), ...(note ? { note } : {}) }),
+    }),
+  // BR#4962 (per accepted BR#4960): human force-review on an Awaiting park —
+  // approve re-anchors the accepted verdict at the parked head and re-queues
+  // the train; request_changes bounces impl. Web/human-only server-side
+  // (bearers 403): the parked card in the backlog IS the human leg, no ask.
+  forceReview: (id: string, decision: "approve" | "request_changes", note?: string) =>
+    j<{ ok: boolean; id: string; decision: string }>(`/api/kb/force_review`, {
+      method: "POST",
+      body: JSON.stringify({ id, decision, ...(note ? { note } : {}) }),
     }),
   update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[]; roles?: string[] }) =>
     j<{ id: string }>("/api/kb/update", { method: "POST", body: JSON.stringify({ id, ...patch }) }),

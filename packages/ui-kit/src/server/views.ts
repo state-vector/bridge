@@ -108,10 +108,14 @@ const GH_ISSUE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+|\bGH#\d+\b/i;
 const RED_MAIN_RX = /\bred\s+main\b|\bmain\s+is\s+red\b|stop-the-line|\buntil main (is )?green\b|\bline is green\b/i;
 const DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/;
 const TRAIN_RX = /merge-train|serialized merge train|\bthe train\b/i;
+/** BR#4962: the typed Awaiting review park a coverage bounce stamps
+ *  (per accepted BR#4960 — no asks; the parked card IS the visibility). */
+const AWAITING_RX = /^Awaiting review \(verdict /i;
 
 /** The exit-class table — single source; exitClassOf returns entries from it. */
 export const EXIT_CLASSES: Record<string, ExitClass> = {
   ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes." },
+  awaiting: { key: "awaiting", title: "Awaiting review — force-review", icon: "◉", note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl." },
   verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it." },
   merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; parked on the serialized merge train (typed pr_merged)." },
   ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success)." },
@@ -126,7 +130,7 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "verify", "merge", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed await_event outranks prose. */
@@ -139,6 +143,10 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   if (t.status === "in_review") return EXIT_CLASSES.verify;
   if (t.status !== "blocked") return EXIT_CLASSES.other;
   if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return EXIT_CLASSES.timeout;
+  // the Awaiting park outranks the typed leg it preserves (BR#4962): the
+  // pr_merged await_event rides along on an Awaiting park, but the HUMAN
+  // force-review owns the exit, not the proxy
+  if (AWAITING_RX.test(reason)) return EXIT_CLASSES.awaiting;
   if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
   if (ev === "pr_merged" || ev === "br_pr_merged") return EXIT_CLASSES.merge;
   if (ev === "pr_checks_green" || ev === "run_success") return EXIT_CLASSES.ci;
