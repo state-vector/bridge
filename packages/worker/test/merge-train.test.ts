@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_BURST_MAX,
+  drainBurstDecision,
+  firstRedIndex,
+  laneCardBody,
+  laneOfMeta,
+  parseBurstMax,
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
@@ -433,6 +439,42 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     const d = decideTrainGate(clean({ baseVerdict: "red" }));
     expect(d.kind).not.toBe("merge");
   });
+
+  it("BR#4685: UNKNOWN × N polls → no bounce event — the compose waits on an unanswered state", () => {
+    // the acceptance pin: poll the gate N times over UNKNOWN/null states and
+    // no bounce ever fires; the mergeable field riding the same recomputation
+    // changes nothing (a false read beside an unanswered state is a stale read)
+    for (let poll = 1; poll <= 6; poll++) {
+      const d = decideTrainGate(clean({
+        mergeable: poll % 2 ? true : false,
+        mergeStateStatus: poll % 3 ? "unknown" : null,
+      }));
+      expect(d.kind).toBe("skip");
+      if (d.kind === "skip") expect(d.reason).toContain("BR#4685");
+    }
+  });
+
+  it("BR#4685 ledger replay: the 2026-10-28 null-state rows (PRs #279/#281) yield zero bounces against this gate", () => {
+    // rows lifted from train_events (state-vector/bridge, seq 136-162,
+    // 2026-10-28): bounced 28× with merge_state_status:null — every
+    // "CONFLICTING" row trial-merged CLEAN (stale reads mid-recomputation)
+    const sha279 = "1bb7e4670e2a21420528ee9d1b154658afb69d02";
+    const sha281 = "9391ea4a9822c01dc40cd021dac25b3d8877c0e2";
+    const row = (pr: number, headSha: string, mergeable: boolean | null) =>
+      clean({ prNumber: pr, headSha, cardMeta: { pr: { head_sha_at_acceptance: headSha.slice(0, 9) } }, mergeable, mergeStateStatus: null, commits: [{ sha: headSha, verified: true }] });
+    for (const [pr, sha, mergeable] of [
+      [281, sha281, false],
+      [279, sha279, false],
+      [279, sha279, true],
+      [281, sha281, true], // the old fail-open: green-but-unanswered used to merge
+    ] as const) {
+      expect(decideTrainGate(row(pr, sha, mergeable)).kind).toBe("skip");
+    }
+    // control: a DEFINITIVE dirty state still bounces — real defects stay
+    const dirty = decideTrainGate(clean({ mergeable: false, mergeStateStatus: "dirty" }));
+    expect(dirty.kind).toBe("bounce");
+    if (dirty.kind === "bounce") expect(dirty.bounceKind).toBe("conflict");
+  });
 });
 
 // ---------- ask/brief copy (the ask contract: ≤240 chars, ends "?") ----------
@@ -659,6 +701,24 @@ describe("trainLegs / trainLegLanded / trainLegsRemaining (the leg model)", () =
     };
     expect(trainCardMatchesLane(r2Only, "o/r1")).toBe(false);
     expect(trainCardMatchesLane(r2Only, "o/r2")).toBe(true);
+  });
+  it("a lane's BASE filters the queue — baseless legs default to main (BR#4977)", () => {
+    // A card stamped with base "release/1" rides the release lane, NEVER the
+    // main lane of the same repo (the drill-lane inheritance defect), and a
+    // baseless stamp (the legacy/pre-stamp convention) defaults to "main".
+    const onRelease = {
+      pr: { repo: "o/r", number: 3, head_sha_at_acceptance: "c".repeat(40), base: "release/1" },
+    };
+    expect(trainCardMatchesLane(onRelease, "o/r", "release/1")).toBe(true);
+    expect(trainCardMatchesLane(onRelease, "o/r", "main")).toBe(false);
+    const baseless = { pr: { repo: "o/r", number: 4, head_sha_at_acceptance: "d".repeat(40) } };
+    expect(trainCardMatchesLane(baseless, "o/r", "main")).toBe(true);
+    expect(trainCardMatchesLane(baseless, "o/r", "release/1")).toBe(false);
+    // repo scoping still applies first — a leg on another repo never matches
+    expect(trainCardMatchesLane(onRelease, "o/other", "release/1")).toBe(false);
+    // landed legs on the matching base still drop off
+    const landedOnRelease = { pr: { repo: "o/r", number: 5 }, merge_train: { state: "landed" } };
+    expect(trainCardMatchesLane(landedOnRelease, "o/r", "release/1")).toBe(false);
   });
 });
 
@@ -985,5 +1045,71 @@ describe("trainCloseBounceBrief + alarm ask copy (BR#4753)", () => {
     expect(d).toContain("BR#3633");
     expect(d).toContain(err);
     expect(d).toContain("BR#4753");
+  });
+});
+
+// ---------- burst-drain settle law (BR#4934, decision BR#4932 amends BR#4804) ----------
+
+describe("burst-drain law (BR#4934)", () => {
+  it("drainBurstDecision: clean heads drain back-to-back; cap or queue-end settles; red stops instantly", () => {
+    // clean heads remain, cap not reached → drain back-to-back
+    expect(drainBurstDecision(0, 10, true, false)).toBe("drain");
+    expect(drainBurstDecision(9, 10, true, false)).toBe("drain");
+    // cap reached → settle on the final merge
+    expect(drainBurstDecision(10, 10, true, false)).toBe("settle");
+    // queue empty of clean heads → settle even below cap
+    expect(drainBurstDecision(3, 10, false, false)).toBe("settle");
+    expect(drainBurstDecision(0, 10, false, false)).toBe("settle");
+    // cap 0 = unlimited → keep draining
+    expect(drainBurstDecision(500, 0, true, false)).toBe("drain");
+    // red seen stops the line immediately — never waits for the settle (GH#2261)
+    expect(drainBurstDecision(0, 10, true, true)).toBe("stop");
+    expect(drainBurstDecision(0, 10, false, true)).toBe("stop");
+    expect(drainBurstDecision(500, 0, false, true)).toBe("stop");
+  });
+
+  it("parseBurstMax: default on absent/junk; 0 = unlimited; integers pass", () => {
+    expect(DEFAULT_BURST_MAX).toBe(10);
+    expect(parseBurstMax(undefined)).toBe(10);
+    expect(parseBurstMax(null)).toBe(10);
+    expect(parseBurstMax("7")).toBe(10); // junk shape → default
+    expect(parseBurstMax(7.5)).toBe(10); // non-integer → default
+    expect(parseBurstMax(-1)).toBe(10); // negative → default
+    expect(parseBurstMax(7)).toBe(7);
+    expect(parseBurstMax(0)).toBe(0); // unlimited
+  });
+
+  it("laneOfMeta parses burst_max off meta.lane; wrong shape still fails loud (null)", () => {
+    expect(laneOfMeta({ lane: { repo: "state-vector/bridge", base: "main", burst_max: 3 } })).toMatchObject({
+      repo: "state-vector/bridge",
+      base: "main",
+      burst_max: 3,
+    });
+    // absent burst_max → DEFAULT (never a guessed 0)
+    expect(laneOfMeta({ lane: { repo: "r", base: "main" } })?.burst_max).toBe(DEFAULT_BURST_MAX);
+    // junk burst_max → DEFAULT
+    expect(laneOfMeta({ lane: { repo: "r", base: "main", burst_max: "lots" } })?.burst_max).toBe(DEFAULT_BURST_MAX);
+    expect(laneOfMeta({ lane: { repo: "r", base: "main", burst_max: 0 } })?.burst_max).toBe(0);
+    expect(laneOfMeta({})).toBeNull();
+    expect(laneOfMeta({ lane: { repo: "", base: "main" } })).toBeNull();
+  });
+
+  it("laneCardBody carries the burst line: cap named (or unlimited), one settle, red stops, bisect names one culprit", () => {
+    const cfg = { alarm_sink: "sink" };
+    const capped = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: 4 }, cfg);
+    expect(capped).toContain("up to 4 gate-clean heads");
+    expect(capped).toContain("ONE settle wait");
+    expect(capped).toContain("ONE culprit");
+    const unlimited = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: 0 }, cfg);
+    expect(unlimited).toContain("up to unlimited gate-clean heads");
+    const def = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: DEFAULT_BURST_MAX }, cfg);
+    expect(def).toContain(`up to ${DEFAULT_BURST_MAX} gate-clean heads`);
+  });
+
+  it("firstRedIndex: the OLDEST red names the culprit; null when the whole pass is green", () => {
+    expect(firstRedIndex([false, false, false])).toBeNull();
+    expect(firstRedIndex([false, true, false, true])).toBe(1);
+    expect(firstRedIndex([true])).toBe(0);
+    expect(firstRedIndex([])).toBeNull();
   });
 });

@@ -462,10 +462,13 @@ silence issues one fresh round instead of flooding for an hour. The spawner cap 
 the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
 card, carries the recurring block to the human ledger.
-The trains panel is honest about capability: a held lock names its machine; an idle lane
-ticked by a merge-capable gateway inside the 15-minute window shows
-`train ready · <machine> · tick Xm ago`; only a lane with no recent capable tick says
-`no gateway ticking` / `awaiting an available gateway`.
+The trains panel is honest about capability and activity (BR#4981): a held lock names
+its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
+shows the pill `train ready` (the tooltip names the machine and its last tick age);
+only a lane with no capable tick inside the window says the muted pill `no gateway`;
+a gate in progress on the queue head reads `attempting` (with the head card and the
+last ledger action in the tooltip); a protection-blocked head reads `⏸ bypass wait`;
+a retired lane reads `retired`.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -699,7 +702,8 @@ Env (standalone and daemon leg alike): `MERGE_TRAIN_HOLDER` (lease label, defaul
 cwd standalone / managed clone cache in the daemon), `MERGE_TRAIN_LANES` (comma-sep
 `repo@base` allowlist; default every lane the hub reports),
 `MERGE_TRAIN_WORKER_IDENTITIES` (worker-class gh logins, default `detached-cody`),
-`MERGE_TRAIN_ENABLED=0` (kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
+`MERGE_TRAIN_EVENTS=0` (kill switch for the event-driven wake leg), `MERGE_TRAIN_ENABLED=0`
+(kill switch for the daemon leg). Flags: `--lane <repo>@<base>`
 (drive one lane only), `--once`, `--interval <secs>`, `--method <m>`. `bridge doctor`
 gates the prerequisites (gh present + authed + `repo` scope, git — each failure names
 the fix); the executor re-probes the cheap ones every start. It merges as whatever
@@ -736,7 +740,12 @@ included) as "unmergeable — CONFLICTING".
   `merge-train` + `infrastructure`, never claimable by agents, blocked at birth with the
   honest reason `merge-train: awaiting an available gateway` (merges happen when your
   machines are on). The card's blocked reason is recomputed by the hub from the card's
-  own meta — `idle` / `leased by X` / `awaiting CI on <sha> (PR #N)` / `STOPPED` /
+  own meta — `idle` / `leased by X` / `attempting <card> (gate)` (a queue head is in
+  the gate; the tooltip carries the last ledger action) / `settling on <sha> (PR #N)`
+  (naming the next head) / `awaiting bypass merge — PR #N by <card>` (a head blocked
+  on branch protection a machine cannot satisfy — review/required checks; a human
+  merge is the unblock and it self-clears when the PR lands) / `STOPPED — … — culprit
+  <card>` / `retired` (a done/superseded lane card is never ticked again, BR#4977) /
   `ready — last ticked by X Nm ago` (a merge-capable gateway ticked inside the
   15-minute window — the train will take work the moment it is queued) /
   `awaiting an available gateway` — so the board always shows the lane's truth, and an
@@ -768,23 +777,77 @@ included) as "unmergeable — CONFLICTING".
   reads and proactively on the hub's alarm sweep, so a dead train is loud even with
   zero panel readers. Recovery is automatic: the first capable lease (or the queue
   draining) clears the starved state.
+- **Lane lifecycle: a retired lane is never ticked again (BR#4977)**: a lane card
+  that is closed (`done`/`superseded`) — a base branch deleted after a drill, or a
+  lane deliberately retired — is frozen. Every lane-touching hub op refuses it
+  (`lane retired — … re-open the lane card to re-arm`): no lease acquire/renew/
+  release, no `ready — last ticked` stamp, no reason rewrite — the BR#4772 class
+  where a card marked "never tick again" still showed `ready — last ticked by …
+  0m ago` ten minutes later. `train_status` shows the lane **visibly retired**
+  (`retired: true`, empty queue, the reason names the retirement) instead of a
+  phantom-ready row. The executor honors it from both directions: it skips any lane
+  the hub marks retired, and it probes the lane's base branch before acquiring — a
+  definitive 404 (base deleted on the remote) skips the lane with no lease and no
+  hub meta writes, while any transient gh failure fails open. **The derived queue is
+  base-scoped** (same law): a queued card rides only the lane whose base matches its
+  PR stamp (`meta.pr.base`, defaulting to `main`) — a second lane on the same repo
+  can never inherit another base's queue (the retired drill lane used to show
+  `@main`'s queue as its own).
+- **Event-driven tick (BR#4806)**: when a lane's derived queue transitions empty →
+  non-empty, the hub broadcasts `lane.queued {repo, base, depth}` on the push channel
+  (SSE, the same transport as `lane.starved` — subscribe at `/api/kb/sse` with a gateway
+  token). A ready gateway runs ONE tick on arrival — the exact same CAS lease acquire,
+  identity gate (BR#3181) and proof-of-progress renewal (BR#4129) as every tick — so
+  work that queues right after a tick starts within seconds instead of waiting out the
+  next 45s poll. The poll cadence stays as the fallback: a missed event degrades to
+  today's behaviour, and push + poll firing together is safe by construction (the CAS
+  lease serializes; the second acquirer stands down — pinned in test).
 - **The queue is derived, never stored**: every open PR on the lane is re-read from
   GitHub each tick, oldest first, and only the head of the queue may merge — one merge
   in flight per lane, and the lane HOLDS until main settles before the next head enters.
   Serialized is the point: no interleaved merges, no surprise rebases, every merge
   attributable to exactly one lane event.
-- **Back-pressure: main settles before the next head enters (BR#4804)** — after a
-  merge, the lane's awaiting-CI phase judges the check runs ON the merge commit: a
-  lane with a configured `required_workflows` set settles exactly those; an
-  unconfigured lane (the default) settles on **every** check run on the commit —
-  build AND deploy — with a 2-minute settle dwell after the merge so
-  slower-triggered deploys can register a check run. Anything unsettled (including a
-  cancelled-only run) holds; anything red stops the line; only all-green (past the
-  dwell) admits the next head. The old default — vacuous green for unconfigured
-  lanes — merged back-to-back and every push cancelled the previous Deploy Dev,
-  starving main. While settling, the lane reason reads `settling on <sha> (PR #N):
-  build/deploy in flight, next head held until main settles`, and the panel's queue
+- **Back-pressure: main settles before the next head enters (BR#4804, cadence
+  amended by BR#4934)** — after a merge, the lane's awaiting-CI phase judges the
+  check runs ON the merge commit: a lane with a configured `required_workflows`
+  set settles exactly those; an unconfigured lane (the default) settles on
+  **every** check run on the commit — build AND deploy — with a 2-minute settle
+  dwell after the merge so slower-triggered deploys can register a check run.
+  Anything unsettled (including a cancelled-only run) holds; anything red stops
+  the line; only all-green (past the dwell) admits the next head. The old
+  default — vacuous green for unconfigured lanes — merged back-to-back and
+  every push cancelled the previous Deploy Dev, starving main. While settling,
+  the lane reason reads `settling on <sha> (PR #N): build/deploy in flight,
+  attempting <card> next, heads held until main settles`, and the panel's queue
   depth is the count of heads waiting behind the pressure valve.
+- **Burst-drain settle: one settle per drain pass, not per merge (BR#4934,
+  decision BR#4932)** — the per-merge settle stays the law for a not-clean
+  head, but a GATE-CLEAN head merges back-to-back behind the previous merge:
+  the executor drains every gate-clean head in one pass (up to
+  `lane.burst_max`, default 10, `0` = unlimited — it rides `train_lane` lane
+  config alongside `required_workflows`) and runs the full settle ONCE, on the
+  pass's FINAL merge commit. The lane reason names the phase mid-drain
+  (`merging burst (N merged, cap M) — settle pending`) and on settle
+  (`settling on <sha> after N merges (PR #N): build/deploy in flight, heads
+  held until main settles`); without burst context the BR#4804 strings
+  (BR#4981 vocabulary included) are byte-identical. Red anywhere stops the
+  line instantly (GH#2261) — a red fed mid-drain never waits for the settle.
+  While the settle wait runs, the executor uses it as a rebase window: one
+  machine-clean `update-branch` per tick on a behind, verdict-covered queued
+  head (a clean trial merge rides with it; a dirty one conflict-bounces;
+  carries append contiguously via `train.carry` — the minimal primitive,
+  superseded by L1.4's carry law when it lands). On a GREEN settle the pass's
+  intermediate parked cards close on executor-fed git ancestry
+  (`ancestors_of_settled` via `train.ci` — their runs were
+  cancelled-by-next-push, and the hub holds no VCS credentials, so the
+  ancestry is the evidence; zero hub GitHub calls); the final head closes
+  per BR#4804 unchanged. On a RED settle the hub pre-stamps `stop.bisect` and
+  the executor probes the pass's intermediate merge shas oldest→newest (one
+  step per tick via `train.bisect`, re-running the stamped checks): the oldest
+  RED probe names the ONE culprit — it bounces with a fix-forward brief + the
+  BR#4068 boost while the wrongly stop-bounced final card re-parks to close on
+  the next green settle; probes that stall past the CI bound (or leave nothing
+  re-runnable) stamp the walk INCONCLUSIVE and the pass bounces oldest-first.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the
@@ -857,6 +920,16 @@ machine-clean carry chain:
   the required checks on the new head — pending, not a defect: the gate WAITS on it
   (red head checks note; blocked with green checks — protection wants reviews — still
   bounces honestly).
+- **UNKNOWN mergeability polls, never bounces (BR#4685)**: GitHub computes mergeability
+  asynchronously — a read right after a base merge yields `mergeStateStatus=null/UNKNOWN`,
+  and `mergeable` rides the same recomputation, so an answer is definitive only when the
+  state names itself. The executor backoff-polls inside the tick (15s/30s/60s,
+  `MERGE_TRAIN_POLL_SECS` overrides) — bounded by the lane lease, renewed around every
+  wait — until GitHub answers, and the shared gate WAITS on an unanswered state: never a
+  bounce, and never a merge on an unconfirmed state (the old null-state fall-through is
+  closed). Bounce only on definitive DIRTY/CONFLICTING. Receipt: the 2026-10-28 ledger,
+  where PRs #279/#281 bounced 28× with `merge_state_status:null` — every "CONFLICTING"
+  row of that loop trial-merged CLEAN (a stale read, not a conflict).
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects

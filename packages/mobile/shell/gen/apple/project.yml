@@ -127,6 +127,13 @@ targets:
       # libapp.a.
       - script: |
           set -e
+          # Xcode runs script phases with a minimal PATH (/usr/bin:/bin:…) —
+          # cargo/rustup live in ~/.cargo/bin, so export it explicitly (the
+          # CLI lane via `tauri ios build` has the user shell PATH and never
+          # needed this).
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+          [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+          command -v cargo >/dev/null || { echo "cargo not found — install rustup or fix PATH"; exit 1; }
           case "${PLATFORM_NAME:-}" in
             iphonesimulator) RUST_TARGET=aarch64-apple-ios-sim ;;
             *)               RUST_TARGET=aarch64-apple-ios ;;

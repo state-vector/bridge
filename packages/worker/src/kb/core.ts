@@ -1024,13 +1024,24 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
     return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
 
   const short = i.headSha.slice(0, 9);
-  // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23)
+  // (1) mergeability is a precondition, NOT a finding (5c, 2026-10-23).
+  //     BR#4685: GitHub computes mergeability ASYNC — an unanswered
+  //     mergeStateStatus (null/UNKNOWN; typical right after a base merge)
+  //     means no answer yet, and the `mergeable` field rides the same
+  //     recomputation, so a false read beside an unanswered state is a stale
+  //     read. Wait (the executor backoff-polls before this gate) — never a
+  //     bounce, and never a merge on an unconfirmed state (the old
+  //     null-state fall-through). The 2026-10-28 ledger is the receipt:
+  //     PRs #279/#281 bounced 28× with merge_state_status:null.
+  const state = typeof i.mergeStateStatus === "string" ? i.mergeStateStatus.trim().toLowerCase() : "";
+  if (!state || state === "unknown")
+    return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)` };
   if (i.mergeable !== true) {
     if (i.mergeable === null) return { kind: "skip", reason: "GitHub still computing mergeability — not yet, skip this tick" };
     return { kind: "bounce", defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`, bounceKind: "conflict" };
   }
-  if (i.mergeStateStatus && i.mergeStateStatus !== "clean" && i.mergeStateStatus !== "unstable")
-    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${i.mergeStateStatus} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
+  if (state !== "clean" && state !== "unstable")
+    return { kind: "bounce", defect: `PR #${i.prNumber} mergeStateStatus=${state} — not clean. Fix the named state (rebase/re-sign/re-approve) and re-enter`, bounceKind: "gate" };
   // (2) every commit GitHub-verified (signed+valid; NO_USER/UNKNOWN are the human leg)
   const unverified = i.commits.filter((c) => !c.verified);
   if (unverified.length)
@@ -1490,7 +1501,9 @@ export function renewProgressDecide(
 }
 
 /** Lane identity: ONE standing lane card per (repo, base). Config, never
- *  hardcoded (BR#3516 §1): required workflows + CI bound ride meta.lane. */
+ *  hardcoded (BR#3516 §1): required workflows + CI bound ride meta.lane.
+ *  BR#4934: burst_max rides too — the back-to-back merge cap per settle
+ *  pass (0 = unlimited), default DEFAULT_BURST_MAX. */
 export type LaneSpec = {
   repo: string;
   base: string;
@@ -1498,6 +1511,8 @@ export type LaneSpec = {
   required_workflows: string[];
   /** typical CI wall-clock, minutes — the unknown bound is 3× this */
   ci_typical_minutes?: number;
+  /** burst-drain cap per settle pass (BR#4934); 0 = unlimited */
+  burst_max: number;
 };
 
 export const LANE_TITLE_PREFIX = "Merge lane: ";
@@ -1506,6 +1521,39 @@ export function laneKey(repo: string, base: string): string {
 }
 export function laneCardTitle(repo: string, base: string): string {
   return `${LANE_TITLE_PREFIX}${repo}@${base}`;
+}
+
+// ---- burst-drain settle law (BR#4934, decision BR#4932 amends BR#4804) ----
+
+/** lane.burst_max default (BR#4934): back-to-back merges per settle pass. */
+export const DEFAULT_BURST_MAX = 10;
+
+/** Parse lane.burst_max (BR#4934): 0 = unlimited; absent or junk → default. */
+export function parseBurstMax(v: unknown): number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : DEFAULT_BURST_MAX;
+}
+
+/** WHY this tick's drain pass ended (the executor acts per arm):
+ *  "drain" — more gate-clean heads to merge back-to-back; "settle" — the
+ *  pass's ONE settle wait on the final merge commit; "stop" — a pass sha's
+ *  fed checks went RED mid-drain (the line stops immediately, GH#2261). */
+export type DrainDecision = "drain" | "settle" | "stop";
+
+/** The burst-drain law (BR#4934): after a merge, keep draining gate-clean
+ *  heads back-to-back — ONE settle per drain pass, on the final merge
+ *  commit; rebase work rides the settle wait. Red at any point stops the
+ *  line immediately (GH#2261); it never waits for the settle. */
+export function drainBurstDecision(merged: number, cap: number, hasNext: boolean, redSeen: boolean): DrainDecision {
+  if (redSeen) return "stop";
+  if (hasNext && (cap === 0 || merged < cap)) return "drain";
+  return "settle";
+}
+
+/** The red-settle bisect walk order (BR#4934): the pass's stamped merge
+ *  shas, oldest first — the first RED one names the ONE culprit merge. */
+export function firstRedIndex(reds: boolean[]): number | null {
+  const i = reds.indexOf(true);
+  return i === -1 ? null : i;
 }
 
 /** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
@@ -1519,6 +1567,7 @@ export function laneOfMeta(meta: any): LaneSpec | null {
     base: lane.base,
     required_workflows: required,
     ci_typical_minutes: typeof lane.ci_typical_minutes === "number" && lane.ci_typical_minutes > 0 ? lane.ci_typical_minutes : undefined,
+    burst_max: parseBurstMax(lane.burst_max),
   };
 }
 
@@ -1529,6 +1578,7 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
     ``,
     `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_"}`,
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
+    `**Burst drain (BR#4934):** up to ${lane.burst_max === 0 ? "unlimited" : lane.burst_max} gate-clean heads merge back-to-back per pass, then ONE settle wait on the final merge commit; red anywhere stops the line instantly; a red settle bisects the pass to ONE culprit. Rebase work rides the settle wait.`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
     `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`bridge train\` on a gateway to work it.`,
@@ -1754,17 +1804,21 @@ export function trainLegLanded(meta: any, leg: TrainLeg): boolean {
 }
 
 /** The legs that still keep the card queued — optionally scoped to one
- *  repo (a card rides exactly the lanes that own one of its UNLANDED legs). */
-export function trainLegsRemaining(meta: any, repo?: string): TrainLeg[] {
-  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && !trainLegLanded(meta, l));
+ *  repo (a card rides exactly the lanes that own one of its UNLANDED legs)
+ *  and, with `base`, to that repo's ONE base (BR#4977: a leg without a base
+ *  stamp defaults to "main" — the card-stamp convention — so a lane on a
+ *  second base never inherits another base's queue). */
+export function trainLegsRemaining(meta: any, repo?: string, base?: string): TrainLeg[] {
+  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && (!base || String(l.base ?? "main") === base) && !trainLegLanded(meta, l));
 }
 
 /** Does this queued card ride the given repo's lane? True when at least one
- *  of its UNLANDED legs belongs to that repo. (BR#3659: replaces the old
- *  lane filter that read meta.merge_train.repo — a field nothing ever set,
- *  so every queued card matched every lane.) */
-export function trainCardMatchesLane(meta: any, repo: string): boolean {
-  return trainLegsRemaining(meta, repo).length > 0;
+ *  of its UNLANDED legs belongs to that repo — and, when `base` is given,
+ *  to that lane's base (BR#4977). (BR#3659: replaces the old lane filter
+ *  that read meta.merge_train.repo — a field nothing ever set, so every
+ *  queued card matched every lane.) */
+export function trainCardMatchesLane(meta: any, repo: string, base?: string): boolean {
+  return trainLegsRemaining(meta, repo, base).length > 0;
 }
 
 /** Does an accepted verdict cover this LEG's head? Same law as
@@ -1933,7 +1987,11 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  branch still mergeable; the merge leg owns the machine-clean
  *  update-branch) and WAITS on blocked-with-pending-head-checks (strict
  *  branch protection re-runs the required checks on the head after every
- *  carry). decideMergeAction, the shared law, stays clean/unstable. */
+ *  carry). decideMergeAction, the shared law, stays clean/unstable.
+ *  BR#4685: an unanswered mergeStateStatus (null/UNKNOWN) means GitHub is
+ *  still computing — the executor backoff-polls (15/30/60s, lease-bounded)
+ *  before this gate and the shared law waits on it: never a bounce, never
+ *  a merge on an unconfirmed state. */
 export function decideTrainGate(i: TrainGateInput): MergeAction {
   if (i.cardStatus === "superseded")
     return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };

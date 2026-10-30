@@ -41,6 +41,10 @@ beforeAll(async () => {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (before vitest)");
   }
   mf = new Miniflare({
+    // HTTP server ON: the SSE test dials the real /api/kb/sse route through
+    // it — the DO stub bridge cannot carry an open streaming Response — and
+    // a single runtime keeps stub calls + SSE in the SAME durable object.
+    port: 0,
     workers: [{
       name: "main",
       scriptPath: bundle,
@@ -642,7 +646,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(live.length).toBe(1);
     const ask = live[0];
     expect(["todo", "in_progress", "blocked"]).toContain(ask.status);
-    expect(ask.meta.ask.to).toBe("human");
+    expect(ask.meta.ask.to).toBe("tag:review"); // BR#4982/BR#3452: mechanical re-verifies route to the agent pool — the human leg sees the lane-day digest instead
     expect(ask.meta.ask.urgency).toBe("time-sensitive");
     expect(ask.meta.ask.artefact_id).toBe(card);
     expect(String(ask.title)).toContain("Review requested");
@@ -723,6 +727,62 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(String(live[0].meta.ask.answer)).toContain("landed");
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
+  });
+
+  it("BR#4981/4982: attempting + bypass-wait + stop-culprit lane vocabulary; bounce asks route to the agent pool (tag:review); the human gets ONE appended lane-day digest", async () => {
+    const repo = "state-vector/lane-vocab";
+    const H1 = "5".repeat(40), H2 = "7".repeat(40), M1 = "6".repeat(40);
+    const card1 = await queueViaAccept({ repo, pr: 3401, head: H1, title: "IMPL: vocab drill leg 1" });
+    const card2 = await queueViaAccept({ repo, pr: 3402, head: H2, title: "IMPL: vocab drill leg 2" });
+    await acquire(repo, "gw-vocab", { required_workflows: ["Test"] });
+
+    // attempting: a queue head is in the gate — the reason names it (Ray: the
+    // panel must show the train TRYING, never a bare `ready` over a queue)
+    const snap1 = await laneSnap(repo);
+    expect(String(snap1.reason)).toContain(`attempting ${card1} (gate)`);
+
+    // gate bounce blocked on protection ⇒ the honest bypass-wait state
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-vocab", pr: 3401, task_id: card1, head_sha: H1, bounce_kind: "gate", merge_state_status: "blocked", reason: "review required by branch protection" })).body.error ?? "").toBe("");
+    const snap2 = await laneSnap(repo);
+    expect(String(snap2.reason)).toContain("awaiting bypass merge — PR #3401");
+    expect(snap2.bypass_wait?.pr).toBe(3401);
+
+    // asks: pool ask to tag:review; ONE human digest for the lane-day
+    const asksNow = (await kbJson("/artefacts?type=question&limit=200")).body.artefacts ?? [];
+    const poolAsk = asksNow.find((a: any) => a.meta?.ask?.review_leg === true && String(a.title).includes(`(${card1})`));
+    expect(poolAsk).toBeTruthy();
+    expect(poolAsk.meta.ask.to).toBe("tag:review");
+    const laneKeyStr = `${repo}@main`;
+    const digests1 = asksNow.filter((a: any) => String(a.title).startsWith(`Merge-train digest ${laneKeyStr}`));
+    expect(digests1.length).toBe(1);
+    expect(String(digests1[0].body_md)).toContain("PR #3401");
+
+    // second bounce on the lane appends to the SAME digest — no drip; the
+    // new gate+blocked bounce moves the bypass-wait to the new head
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-vocab", pr: 3402, task_id: card2, head_sha: H2, bounce_kind: "gate", merge_state_status: "blocked", reason: "review required by branch protection" })).body.error ?? "").toBe("");
+    const asksAfter = (await kbJson("/artefacts?type=question&limit=200")).body.artefacts ?? [];
+    const digests2 = asksAfter.filter((a: any) => String(a.title).startsWith(`Merge-train digest ${laneKeyStr}`));
+    expect(digests2.length).toBe(1);
+    expect(String(digests2[0].body_md)).toContain("PR #3401");
+    expect(String(digests2[0].body_md)).toContain("PR #3402");
+    expect((await laneSnap(repo)).bypass_wait?.pr).toBe(3402);
+
+    // landing leg 1: bypass-wait is typed to ITS pr — leg 2's wait survives
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-vocab", pr: 3401, merge_sha: M1, head_sha: H1, task_id: card1 })).body.error ?? "").toBe("");
+    const snap3 = await laneSnap(repo);
+    expect(snap3.bypass_wait?.pr).toBe(3402);
+    // the settle outranks the wait on the reason; the wait rides as a suffix
+    expect(String(snap3.reason)).toContain("settling on");
+    expect(String(snap3.reason)).toContain("bypass wait: PR #3402");
+
+    // STOP THE LINE names the culprit card (state 6)
+    expect((await kbJson("/train.event", { repo, base: "main", kind: "stopped", actor: "gw-vocab", merge_sha: M1, pr: 3401, culprit_task: card1, reason: "required workflows RED: Test" })).body.error ?? "").toBe("");
+    const snap4 = await laneSnap(repo);
+    expect(String(snap4.reason)).toContain("STOPPED");
+    expect(String(snap4.reason)).toContain(`culprit ${card1}`);
+    expect(snap4.stop?.culprit_task).toBe(card1);
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-vocab", line_green: true });
   });
 });
 
@@ -899,5 +959,342 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     expect((await kbJson("/get", { id: card })).body.status).toBe("done");
     expect((await laneSnap(repo)).currently).toBeNull();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-z" });
+  });
+
+  // ---- BR#4806 event-driven tick: the lane.queued wake + the SSE channel ----
+
+  /** Events strictly AFTER a seq — the exact delta, immune to the 500-row
+   *  window sliding between reads. */
+  const eventsAfter = async (seq: number) =>
+    (await kbJson(`/events?since=${seq}&limit=500`)).body.events as any[];
+
+  it("BR#4806 — a lane's queue empty→non-empty broadcasts `lane.queued` ONCE; non-transitions never re-broadcast", async () => {
+    const repo = "state-vector/wake-lane";
+    const cur = (await kbJson("/events?limit=1")).body.last_seq;
+
+    // fresh entry on an idle lane → exactly one wake, shaped per the card
+    await queueViaAccept({ repo, pr: 48100, head: "c".repeat(40), title: "IMPL: wake drill" });
+    const wakes1 = (await eventsAfter(cur)).filter((e: any) => e.op === "lane.queued" && e.detail?.repo === repo);
+    expect(wakes1.length).toBe(1);
+    expect(wakes1[0].detail.base).toBe("main");
+    expect(wakes1[0].detail.depth).toBeGreaterThanOrEqual(1);
+    expect(wakes1[0].detail.head).toBeTruthy();
+    expect(wakes1[0].actor).toBe("system:train");
+
+    // a second card in the SAME lane (queue already non-empty) → NO wake:
+    // the broadcast rides the empty→non-empty TRANSITION, not every entry
+    const cur2 = (await kbJson("/events?limit=1")).body.last_seq;
+    await queueViaAccept({ repo, pr: 48101, head: "d".repeat(40), title: "IMPL: wake drill 2" });
+    const wakes2 = (await eventsAfter(cur2)).filter((e: any) => e.op === "lane.queued" && e.detail?.repo === repo);
+    expect(wakes2.length).toBe(0);
+  });
+
+  it("BR#4806 — /sse streams the same kb.event frames the WS channel carries (the gateway wake channel)", { timeout: 40_000 }, async () => {
+    // The miniflare DO stub bridge cannot carry an open streaming Response
+    // (its value-stream closes immediately) — drive the REAL path instead:
+    // this rig's OWN HTTP server → /api/kb/sse → authKb(?token=) → DO /sse,
+    // exactly what the Rust wake leg dials. A second Miniflare would hold a
+    // second DO with separate storage — the lane.queued broadcast would
+    // never reach its sink, so the HTTP server rides the shared runtime.
+    let res: Response | null = null;
+    try {
+      // a gateway-plane token for the kb plane (the same auth /kb-ws takes)
+      const mint = await kbJson("/admin.mint", { label: "sse-wake-drill", tags: ["gateway"] });
+      expect(mint.status, JSON.stringify(mint.body)).toBe(200);
+      const token = String(mint.body.secret ?? "");
+      expect(token).toBeTruthy();
+      const served = await mf.ready; // resolves to the server URL (no getServerPort in miniflare 3.20250718.x)
+      const port = Number(served.port);
+      expect(port).toBeGreaterThan(0);
+
+      const repo = "state-vector/sse-wake-lane";
+      res = await fetch(`http://127.0.0.1:${port}/api/kb/sse?token=${encodeURIComponent(token)}`, {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+      let buf = "";
+      let got: any = null;
+      const scan = () => {
+        for (const frame of buf.split("\n\n")) {
+          if (!frame.startsWith("data: ")) continue;
+          try {
+            const j = JSON.parse(frame.slice(6));
+            if (j?.type === "kb.event" && j?.event?.op === "lane.queued" && j?.event?.detail?.repo === repo) got = j;
+          } catch { /* partial frame — more chunks coming */ }
+        }
+      };
+      // consume the stream BEFORE triggering the queue entry — the
+      // subscriber must already be registered when the broadcast fires
+      const deadline = Date.now() + 25_000;
+      const pump = (async () => {
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        try {
+          while (Date.now() < deadline && !got) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            scan();
+          }
+        } catch { /* stream torn down at test end */ }
+      })();
+
+      await queueViaAccept({ repo, pr: 48200, head: "e".repeat(40), title: "IMPL: sse wake drill" });
+      const early = Date.now() + 25_000;
+      while (!got && Date.now() < early) {
+        await new Promise((r) => setTimeout(r, 100));
+        scan();
+      }
+      await pump.catch(() => {});
+      expect(got, "the lane.queued frame must arrive on the SSE stream within 25s").toBeTruthy();
+      expect(got.event.detail.base).toBe("main");
+      expect(got.event.detail.depth).toBeGreaterThanOrEqual(1);
+    } finally {
+      res?.body?.cancel?.().catch?.(() => {});
+    }
+  });
+
+  // ---------- burst-drain settle (BR#4934, decision BR#4932 amends BR#4804) ----------
+
+  it("BR#4934 burst config rides acquire; mid-drain + settle phase strings; a legacy merge keeps the BR#4804 strings byte-identical", async () => {
+    const repo = "state-vector/lane-burst-cfg";
+    await acquire(repo, "gw-bcfg", { required_workflows: ["Test"], burst_max: 3 });
+    const snap = await laneSnap(repo);
+    expect(snap.burst_max).toBe(3);
+    const laneMeta = (await kbJson("/get", { id: snap.card })).body.meta ?? {};
+    expect(laneMeta.lane.burst_max).toBe(3);
+
+    // a legacy merged event (no burst payload) — the BR#4804 settle string, byte-identical
+    const card = await queueViaAccept({ repo, pr: 5001, head: "1".repeat(40) });
+    const M = "2".repeat(40);
+    const merged = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5001, merge_sha: M, head_sha: "1".repeat(40), task_id: card });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    // the merged card itself is the queue head (awaiting-ci cards are blocked
+    // with a merge-train reason) → BR#4981's nextNote rides the settle string
+    expect(merged.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M.slice(0, 9)} (PR #5001): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
+
+    // a burst merged event (mid-drain) flips the phase string to the drain view
+    const card2 = await queueViaAccept({ repo, pr: 5002, head: "3".repeat(40) });
+    const M2 = "4".repeat(40);
+    const burst = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5002, merge_sha: M2, head_sha: "3".repeat(40), task_id: card2, burst_merged: 1, burst_cap: 3 });
+    expect(burst.body.error ?? "").toBe("");
+    expect(burst.body.reason).toBe("merge-train: leased by gw-bcfg — merging burst (1 merged, cap 3) — settle pending");
+    expect((await laneSnap(repo)).currently.phase).toBe("bursting");
+
+    // the settle feed (train.ci, pending) flips bursting → awaiting-ci with the burst settle string
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-bcfg", sha: M2, checks: [check(61, "Test", null)] });
+    expect(ci.body.decided).toBe("pending");
+    // queue head = the older parked card (the legacy-merged card 5001) — nextNote names it (BR#4981)
+    expect(ci.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M2.slice(0, 9)} after 1 merges (PR #5002): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
+
+    // cap 0 renders "unlimited" in the drain string
+    const card3 = await queueViaAccept({ repo, pr: 5003, head: "5".repeat(40) });
+    const M3 = "6".repeat(40);
+    const unlimited = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-bcfg", pr: 5003, merge_sha: M3, head_sha: "5".repeat(40), task_id: card3, burst_merged: 2, burst_cap: 0 });
+    expect(unlimited.body.reason).toContain("cap unlimited");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-bcfg" });
+  });
+
+  it("BR#4934 burst pass: back-to-back merges park the intermediates; the GREEN settle closes them via fed ancestry (cancelled-by-next-push law) while the final card lands normally", async () => {
+    const repo = "state-vector/lane-burst-pass";
+    await acquire(repo, "gw-pass", { required_workflows: ["Test", "Deploy"], burst_max: 10 });
+    const H1 = "a".repeat(40), H2 = "b".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5101, head: H1, title: "IMPL: burst intermediate drill" });
+    const c2 = await queueViaAccept({ repo, pr: 5102, head: H2, title: "IMPL: burst final drill" });
+    const M1 = "c".repeat(40), M2 = "d".repeat(40);
+    // merge 1 — mid-drain: the card parks awaiting-ci, the lane stays bursting
+    const m1 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pass", pr: 5101, merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10 });
+    expect(m1.body.error ?? "", `train:merged failed: ${JSON.stringify(m1.body)}`).toBe("");
+    // the per-leg stamp rides meta.merge_train.legs keyed by PR NUMBER
+    expect((await kbJson("/get", { id: c1 })).body.meta?.merge_train?.legs?.["5101"]?.state).toBe("awaiting-ci");
+    expect((await laneSnap(repo)).currently.phase).toBe("bursting");
+    // merge 2 — the pass's FINAL merge: the lane settles on it
+    const m2 = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pass", pr: 5102, merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    expect(m2.body.error ?? "", `train:merged failed: ${JSON.stringify(m2.body)}`).toBe("");
+    // settle feed: the executor-fed ancestry (M1 IS a git ancestor of M2 — the
+    // hub holds no VCS creds, BR#3516) + green runs on the final sha only
+    const ci = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-pass", sha: M2,
+      ancestors_of_settled: [M1],
+      checks: [check(71, "Test", "success"), check(72, "Deploy", "success")],
+    });
+    expect(ci.body.decided, JSON.stringify(ci.body)).toBe("landed");
+    // the FINAL card closed through the normal machine-proxy landed close
+    const done2 = (await kbJson("/get", { id: c2 })).body;
+    expect(done2.status).toBe("done");
+    expect(done2.meta?.merge_train?.state).toBe("landed");
+    // the INTERMEDIATE park closed on the burst settle — zero hub GitHub calls,
+    // the fed ancestry is the evidence, its cancelled runs say nothing (GH#2261)
+    const done1 = (await kbJson("/get", { id: c1 })).body;
+    expect(done1.status, JSON.stringify(done1.meta)).toBe("done");
+    expect(done1.meta?.merge_train?.state).toBe("landed");
+    expect(done1.meta?.merge_train?.burst_evidence).toBe(M2);
+    expect(done1.meta?.merge_train?.legs?.["5101"]?.via).toBe("burst-settle");
+    const h1 = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 10 })).body);
+    expect(h1).toContain("Burst-settle close (BR#4934)");
+    expect(h1).toContain("cancelled-by-next-push");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-pass" });
+  });
+
+  it("BR#4934 red settle: the stop pre-stamps the bisect, the walk names ONE culprit (bounce + BR#4068 boost) and re-parks the wrongly stop-bounced final", async () => {
+    const repo = "state-vector/lane-burst-red";
+    await acquire(repo, "gw-red", { required_workflows: ["Test"], burst_max: 10 });
+    const H1 = "e".repeat(40), H2 = "f".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5201, head: H1, title: "IMPL: bisect culprit drill" });
+    const c2 = await queueViaAccept({ repo, pr: 5202, head: H2, title: "IMPL: bisect final drill" });
+    const M1 = "7".repeat(40), M2 = "8".repeat(40);
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-red", pr: 5201, merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10 });
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-red", pr: 5202, merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    // the settle comes back RED on the final sha → the line stops, the FINAL
+    // card bounces (the stop flow's default culprit), stop.bisect pre-stamps
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-red", sha: M2, checks: [check(73, "Test", "failure")] });
+    expect(ci.body.decided).toBe("stopped");
+    const laneId = (await laneSnap(repo)).card;
+    const stopMeta = (await kbJson("/get", { id: laneId })).body.meta;
+    expect(stopMeta.stop?.bisect).toBeTruthy();
+    expect(stopMeta.stop.bisect.pass).toEqual({ merged: 2, cap: 10 });
+    expect(stopMeta.currently.phase).toBe("stopped");
+    expect((await kbJson("/get", { id: c2 })).body.status).toBe("in_progress");
+    // the executor's oldest→newest probe: M1 runs RED → c1 is THE culprit
+    const bisect = await kbJson("/train.bisect", { repo, base: "main", actor: "gw-red", step: { sha: M1, verdict: "red" }, culprit_task: c1, culprit_sha: M1 });
+    expect(bisect.body.error ?? "", JSON.stringify(bisect.body)).toBe("");
+    expect(bisect.body.bounced).toBe(c1);
+    expect(bisect.body.reparked).toBe(c2);
+    // the TRUE culprit: bounced with the fix-forward brief + the starvation boost
+    const culpritCard = (await kbJson("/get", { id: c1 })).body;
+    expect(culpritCard.status).toBe("in_progress");
+    expect(culpritCard.meta?.merge_train?.bisect_culprit).toBe(true);
+    expect(culpritCard.meta?.merge_train?.culprit_sha).toBe(M1);
+    expect(culpritCard.meta?.boosted).toBeTruthy();
+    expect(String(culpritCard.body_md)).toContain("oldest RED");
+    // the final card re-parked blocked, awaiting-ci restored — it closes on the
+    // NEXT green settle via ancestor evidence
+    const fin = (await kbJson("/get", { id: c2 })).body;
+    expect(fin.status).toBe("blocked");
+    expect(fin.meta?.merge_train?.state).toBe("awaiting-ci");
+    expect(fin.meta?.merge_train?.reparked_by).toBe("bisect");
+    // walk state lives hub-side (crash-safe): steps + culprit stamped
+    const stop2 = (await kbJson("/get", { id: laneId })).body.meta.stop;
+    expect(stop2.bisect.steps[M1]?.verdict).toBe("red");
+    expect(stop2.bisect.culprit_task).toBe(c1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-red" });
+  });
+
+  it("BR#4934 inconclusive bisect: the stamp rides stop.bisect, nothing bounces — the executor sweeps the pass oldest-first next", async () => {
+    const repo = "state-vector/lane-burst-inc";
+    await acquire(repo, "gw-inc", { required_workflows: ["Test"], burst_max: 10 });
+    const c1 = await queueViaAccept({ repo, pr: 5301, head: "1".repeat(40) });
+    const c2 = await queueViaAccept({ repo, pr: 5302, head: "2".repeat(40) });
+    const M1 = "3".repeat(40), M2 = "4".repeat(40);
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-inc", pr: 5301, merge_sha: M1, head_sha: "1".repeat(40), task_id: c1, burst_merged: 1, burst_cap: 10 });
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-inc", pr: 5302, merge_sha: M2, head_sha: "2".repeat(40), task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-inc", sha: M2, checks: [check(74, "Test", "failure")] });
+    expect(ci.body.decided).toBe("stopped");
+    // probes dispatched, stalled past the CI bound, re-runs inconclusive →
+    // the executor stamps it; no culprit is named, nothing bounces
+    const b = await kbJson("/train.bisect", { repo, base: "main", actor: "gw-inc", step: { sha: M1, verdict: "inconclusive" }, inconclusive: true });
+    expect(b.body.error ?? "", JSON.stringify(b.body)).toBe("");
+    expect(b.body.stop.bisect.inconclusive).toBe(true);
+    expect(b.body.bounced).toBeNull();
+    expect(b.body.reparked).toBeNull();
+    expect((await kbJson("/get", { id: c1 })).body.status).toBe("blocked");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-inc" });
+  });
+
+  it("BR#4934 settle-window rebase: train.carry appends the verdict-carry chain (contiguity enforced, gaps fail loud)", async () => {
+    const repo = "state-vector/lane-carry";
+    await acquire(repo, "gw-carry", {});
+    const H = "5".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 5401, head: H, title: "IMPL: settle-window carry drill" });
+    const H2 = "6".repeat(40);
+    // the executor ran gh pr update-branch during the settle wait — the carry
+    // rides the leg so the accepted verdict covers the moved head (BR#3516 §5)
+    const carry = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: H, to_head: H2 });
+    expect(carry.body.error ?? "", JSON.stringify(carry.body)).toBe("");
+    expect(carry.body.task).toBe(card);
+    const cm = (await kbJson("/get", { id: card })).body.meta;
+    const leg = cm.pr;
+    expect(leg.carry?.[0]?.from_head).toBe(H);
+    expect(leg.carry?.[0]?.to_head).toBe(H2);
+    expect(leg.carry?.[0]?.via).toBe("update-branch");
+    // a gap fails LOUD — carries append contiguously or not at all
+    const gap = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: "7".repeat(40), to_head: "8".repeat(40) });
+    expect(gap.status).toBeGreaterThanOrEqual(400);
+    expect(String(gap.body.error)).toContain("contiguously");
+    // a no-op carry (nothing moved) fails too
+    const noop = await kbJson("/train.carry", { repo, base: "main", actor: "gw-carry", pr: 5401, from_head: H2, to_head: H2 });
+    expect(noop.status).toBeGreaterThanOrEqual(400);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-carry" });
+  });
+});
+
+describe("BR#4977 lane lifecycle + queue base scoping", () => {
+  it("a retired (done) lane card is frozen — the tick refuses it, its meta never moves, train_status shows it retired with an empty queue", async () => {
+    const repo = "state-vector/retire-lane";
+    // create + exercise the lane normally first (the card exists, blocked)
+    const a = await acquire(repo, "gw-retire", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
+    const laneCard: string = (await laneSnap(repo)).card;
+    const before = (await kbJson("/get", { id: laneCard })).body.meta;
+    expect(before.lane.last_lease_ts).toBeGreaterThan(0);
+
+    // retire it (the BR#4772 drill-residue shape: base deleted, card closed
+    // — via the legal lifecycle edges, exactly how that card was retired)
+    const t1 = await kbJson("/transition", { id: laneCard, to: "in_progress", actor: "drill", session: "drill", note: "retiring the drill lane" });
+    expect(t1.status, `claim failed: ${JSON.stringify(t1.body)}`).toBeLessThan(400);
+    const t = await kbJson("/transition", { id: laneCard, to: "done", actor: "drill", session: "drill", note: "DRILL RESIDUE — lane retired, will never tick again" });
+    expect(t.status, `retire transition failed: ${JSON.stringify(t.body)}`).toBeLessThan(400);
+
+    // the tick refuses — acquire/renew/release all bounce, and the lane's
+    // meta is FROZEN (no lease/CPO writes on a "never tick again" card)
+    const reArm = await acquire(repo, "gw-zombie", { merge_capable: true });
+    expect(String(reArm.body.error ?? "")).toContain("lane retired");
+    const after = (await kbJson("/get", { id: laneCard })).body.meta;
+    expect(after.lane.last_lease_ts).toBe(before.lane.last_lease_ts);
+    expect(after.lane.last_capable_lease_ts).toBe(before.lane.last_capable_lease_ts);
+    const renewal = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-zombie" });
+    expect(String(renewal.body.error ?? "")).toContain("lane retired");
+
+    // the snapshot shows the lane VISIBLY retired — empty queue, retired
+    // flag, the reason names it (never a phantom "ready" again)
+    const snap = await laneSnap(repo);
+    expect(snap.retired).toBe(true);
+    expect(snap.queue).toEqual([]);
+    expect(String(snap.reason)).toContain("retired");
+  });
+
+  it("the derived queue is base-scoped — a second lane on the same repo never inherits the other base's queue", async () => {
+    const repo = "state-vector/base-split";
+    const H1 = "1".repeat(40), H2 = "2".repeat(40);
+    const mainCard = await queueViaAccept({ repo, pr: 49771, head: H1, title: "IMPL: main-base drill" });
+    const releaseCard = await queueViaAccept({ repo, pr: 49772, head: H2, title: "IMPL: release-base drill" });
+
+    // re-target the second card to a release base (the stamp carries base;
+    // verify accepts on a non-main PR would stamp it the same way)
+    const rc = (await kbJson("/get", { id: releaseCard })).body;
+    const m = rc.meta;
+    m.pr.base = "release/1";
+    if (Array.isArray(m.prs)) m.prs = m.prs.map((l: any) => (Number(l.number) === 49772 ? { ...l, base: "release/1" } : l));
+    expect((await kbJson("/update", { id: releaseCard, meta: m })).status).toBeLessThan(400);
+
+    // a lane for the release base exists (created on demand like any lane)
+    const rl = await kbJson("/train.lane", { repo, base: "release/1", actor: "drill" });
+    expect(rl.body.error ?? "").toBe("");
+
+    const st = await kbJson("/train.status", { repo });
+    const mainLane = st.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    const releaseLane = st.body.lanes.find((l: any) => l.lane === `${repo}@release/1`);
+    expect(mainLane.queue.map((c: any) => c.id)).toEqual([mainCard]);
+    expect(releaseLane.queue.map((c: any) => c.id)).toEqual([releaseCard]);
+    // the retired-drill noise class: the main lane's queue is NOT inherited
+    // by the second base (and vice versa) on the same repo
+    expect(mainLane.queue.map((c: any) => c.id)).not.toContain(releaseCard);
+    expect(releaseLane.queue.map((c: any) => c.id)).not.toContain(mainCard);
   });
 });
