@@ -815,7 +815,11 @@ included) as "unmergeable — CONFLICTING".
   `holder = the authenticated actor`; the executor never supplies a holder, so a leaked
   token cannot forge another machine's lease. A lapsed lease is cleared by the hub's
   credential-free train-watch sweep and the next gateway reconciles from live GitHub —
-  a crashed executor cannot wedge the lane.
+  a crashed executor cannot wedge the lane. Every lease-mutating op writes the lane's
+  stored meta back immediately (BR#4801): a plain release or lapse sweep on a STOPPED
+  lane no longer leaves the stale holder visible in storage (auditors and the next
+  gateway's CAS read the truth, no TTL wait), and a renewal's fresh expiry lands on
+  storage too, so the sweep can never lapse a just-renewed lease.
 - **Zombie eviction (BR#4129)**: every renewal carries proof-of-progress — the
   holder's last ledger action and its age. On a **non-empty queue**, a renewal whose
   action note is frozen past 10 minutes (`TRAIN_PROGRESS_STALE_MS`) is DENIED and the
