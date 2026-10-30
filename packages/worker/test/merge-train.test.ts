@@ -702,6 +702,24 @@ describe("trainLegs / trainLegLanded / trainLegsRemaining (the leg model)", () =
     expect(trainCardMatchesLane(r2Only, "o/r1")).toBe(false);
     expect(trainCardMatchesLane(r2Only, "o/r2")).toBe(true);
   });
+  it("a lane's BASE filters the queue — baseless legs default to main (BR#4977)", () => {
+    // A card stamped with base "release/1" rides the release lane, NEVER the
+    // main lane of the same repo (the drill-lane inheritance defect), and a
+    // baseless stamp (the legacy/pre-stamp convention) defaults to "main".
+    const onRelease = {
+      pr: { repo: "o/r", number: 3, head_sha_at_acceptance: "c".repeat(40), base: "release/1" },
+    };
+    expect(trainCardMatchesLane(onRelease, "o/r", "release/1")).toBe(true);
+    expect(trainCardMatchesLane(onRelease, "o/r", "main")).toBe(false);
+    const baseless = { pr: { repo: "o/r", number: 4, head_sha_at_acceptance: "d".repeat(40) } };
+    expect(trainCardMatchesLane(baseless, "o/r", "main")).toBe(true);
+    expect(trainCardMatchesLane(baseless, "o/r", "release/1")).toBe(false);
+    // repo scoping still applies first — a leg on another repo never matches
+    expect(trainCardMatchesLane(onRelease, "o/other", "release/1")).toBe(false);
+    // landed legs on the matching base still drop off
+    const landedOnRelease = { pr: { repo: "o/r", number: 5 }, merge_train: { state: "landed" } };
+    expect(trainCardMatchesLane(landedOnRelease, "o/r", "release/1")).toBe(false);
+  });
 });
 
 // ---------- BR#3659: per-leg carry ----------

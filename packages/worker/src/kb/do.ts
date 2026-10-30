@@ -7197,6 +7197,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const key = laneKey(repo, base);
     const existing = this.laneRow(key);
     if (existing) {
+      // BR#4977 lane lifecycle: a done/superseded lane card is RETIRED —
+      // its base branch was deleted or the lane was deliberately closed
+      // ("never tick again"). Every lane-touching op funnels through here,
+      // so this is the single refusal point: no lease/CPO meta writes, no
+      // config refresh, no re-arm (the BR#4772 drill residue class). Re-arm
+      // is a deliberate lifecycle act — re-open the lane card first.
+      if (existing.status === "done" || existing.status === "superseded") {
+        throw new Error(`lane retired — ${key}'s lane card ${existing.id} is ${existing.status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card to re-arm`);
+      }
       // config updates ride the op that knows better (operator/executor):
       // required_workflows / ci_typical_minutes / burst_max refresh in place.
       const cur = laneOfMeta(existing.meta);
@@ -7272,7 +7281,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const retired = !!laneRow && (laneRow.status === "done" || laneRow.status === "superseded");
     // BR#4981: the derived queue head (what the train is attempting) and the
     // lane's last ledger action (the bounce feed) are both hub-derivable.
-    const queue = lane ? this.laneQueue(lane.repo) : [];
+    const queue = lane ? this.laneQueue(lane.repo, lane.base) : [];
     const head = queue[0]?.id ? String(queue[0].id) : null;
     const lastAct: any = lane ? (this.state.storage.sql.exec(
       `SELECT ts, kind, pr, task_id FROM train_events WHERE repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
@@ -7349,10 +7358,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  incident — the red line is, and that lives in the stopped flow). */
   private async trainWatchSweep(now: number): Promise<void> {
     const rows = this.state.storage.sql.exec(
-      `SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
+      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const r of rows) {
       try {
+        // BR#4977: a retired lane card is frozen — no lease_lapsed clears,
+        // no reason resyncs on a card marked "never tick again".
+        if (r.status === "done" || r.status === "superseded") continue;
         const meta = JSON.parse(r.meta ?? "{}");
         const lease: TrainLease | null = meta.lease ?? null;
         const lapsed = !!lease && lease.expires_ts <= now;
@@ -7393,7 +7405,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // proof (legacy `{}` renewals) is UNKNOWN — allowed + loud audit while
     // the deprecation window runs (BR#4104 retires those senders). ----
     if (action === "renew") {
-      const queue = this.laneQueue(repo);
+      const queue = this.laneQueue(repo, base);
       const progress = renewProgressDecide(body.progress ?? null, holder, queue.length);
       if (progress.ok === false) {
         const proofNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
@@ -8508,7 +8520,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // never transitions a queue. The empty→non-empty lanes get one
     // `lane.queued` broadcast after the stamp lands.
     const touchedRepos = [...new Set(withStampHeads.map((l) => l.repo))];
-    const queueBefore = new Map(touchedRepos.map((r) => [r, this.laneQueue(r).length]));
+    // BR#4977: the before/after wake compare is base-scoped like the queue
+    // itself — a second base's lane never counts another base's entries.
+    const queueBefore = new Map(touchedRepos.map((r) => [r, this.laneQueue(r, String(withStampHeads.find((l) => l.repo === r)?.base ?? meta.pr?.base ?? "main")).length]));
     meta.prs = withStampHeads;
     meta.pr = { ...(meta.pr ?? {}), repo: withStampHeads[0].repo, number: withStampHeads[0].number, head_sha_at_acceptance: withStampHeads[0].head_sha_at_acceptance, ...(withStampHeads[0].base ? { base: withStampHeads[0].base } : {}) };
     meta.merge_train = { ...(meta.merge_train ?? {}), state: "queued", at: Date.now(), pr: withStampHeads[0].number, repo: withStampHeads[0].repo, legs_total: withStampHeads.length };
@@ -8541,11 +8555,22 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       );
     }
     // the lane card exists before anything can lease it — one per repo the
-    // legs ride (a multi-PR parent may span repos; each lane takes its own)
+    // legs ride (a multi-PR parent may span repos; each lane takes its own).
+    // BR#4977: a RETIRED lane (card done/superseded) refuses to ensure — that
+    // refusal must not break the verifier's close (the stamps + blocked
+    // transition already landed), so it becomes a loud audit trail instead:
+    // the card rides NO live lane (the base filter scopes it out of every
+    // other lane's queue) until the PR is re-targeted or the lane re-opened.
     const laneCards = new Map<string, string>();
     for (const repo of [...new Set(withStampHeads.map((l) => l.repo))]) {
-      const laneCard = await this.laneEnsure(repo, String(meta.pr.base ?? "main"), actor);
-      laneCards.set(repo, String(laneCard?.id ?? ""));
+      try {
+        const laneCard = await this.laneEnsure(repo, String(meta.pr.base ?? "main"), actor);
+        laneCards.set(repo, String(laneCard?.id ?? ""));
+      } catch (e) {
+        if (!String((e as Error).message ?? e).includes("lane retired")) throw e;
+        this.audit(actor, "queue_skipped", parentId, { reason: String((e as Error).message ?? e).slice(0, 200), lane: `${repo}@${String(meta.pr.base ?? "main")}` });
+        this.version(parentId, actor, "train_queue_skipped", `NOT queued — ${String((e as Error).message ?? e).slice(0, 180)}`, {});
+      }
     }
     // BR#4806 event-driven tick — wake the gateways: on a lane's derived
     // queue transitioning empty → non-empty, broadcast `lane.queued {repo,
@@ -8555,8 +8580,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // the poll cadence stays as the fallback, and a push+poll double-fire
     // is serialized by the lease (the second acquirer stands down).
     for (const repo of touchedRepos) {
-      const base = String(withStampHeads.find((l) => l.repo === repo)?.base ?? meta.pr.base ?? "main");
-      const after = this.laneQueue(repo);
+      const base = String(withStampHeads.find((l) => l.repo === repo)?.base ?? meta.pr?.base ?? "main");
+      const after = this.laneQueue(repo, base);
       if ((queueBefore.get(repo) ?? 0) === 0 && after.length > 0) {
         this.audit("system:train", "lane.queued", laneCards.get(repo) ?? parentId, {
           lane: `${repo}@${base}`,
@@ -8575,8 +8600,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   /** The lane's derived queue — COMPUTED (mergeTrainQueue over blocked,
    *  merge-train-stamped cards), never stored (BR#3516 §7). Shared by the
-   *  status snapshot and the renew-arm zombie check (BR#4129). */
-  private laneQueue(repo: string) {
+   *  status snapshot and the renew-arm zombie check (BR#4129). BR#4977: the
+   *  queue is scoped to the lane's BASE — a card matches only when one of
+   *  its unlanded legs targets this repo AND this base (a leg without a
+   *  base stamp defaults to "main"), so a lane never inherits another
+   *  base's queue on the same repo. */
+  private laneQueue(repo: string, base: string) {
     const cards = this.state.storage.sql.exec(
       `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
@@ -8588,8 +8617,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // a card rides exactly the lanes that own one of its UNLANDED legs
       // (BR#3659 — and this replaces the old filter that read
       // meta.merge_train.repo, a field nothing ever set, so every queued
-      // card matched every lane)
-      return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo);
+      // card matched every lane); BR#4977 adds the base half — repo alone
+      // let a second base's lane (e.g. a retired drill base) inherit the
+      // whole repo queue
+      return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo, base);
     });
   }
 
@@ -8654,7 +8685,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  once-per-episode via the starved_since stamp. */
   private async sweepLaneStarvation(now0: number): Promise<void> {
     const lanes = this.state.storage.sql.exec(
-      `SELECT id, meta FROM artefacts
+      `SELECT id, status, meta FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const l of lanes) {
@@ -8662,7 +8693,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const meta = JSON.parse(l.meta ?? "{}");
         const lane = laneOfMeta(meta);
         if (!lane) continue;
-        const queue = this.laneQueue(lane.repo);
+        // BR#4977: a retired lane card is frozen — no starved stamps, no
+        // asks; its queue (post base-filter) is not this lane's problem.
+        if (l.status === "done" || l.status === "superseded") continue;
+        const queue = this.laneQueue(lane.repo, lane.base);
         await this.laneStarvationTick(l, meta, lane, queue, now0);
       } catch (e) {
         this.audit("system:train", "starve_sweep_error", l.id, { error: String((e as Error).message ?? e).slice(0, 160) });
@@ -8683,7 +8717,29 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const lane = laneOfMeta(meta);
       if (!lane) continue;
       if (repoFilter && lane.repo !== repoFilter) continue;
-      const queue = this.laneQueue(lane.repo);
+      // BR#4977: a done/superseded lane card is RETIRED — shown as retired
+      // (the panel names why), with an empty queue, and never meta-touched:
+      // no starvation stamps, no reason rewrites on a "never tick again"
+      // card (the BR#4772 phantom-ready class).
+      if (l.status === "done" || l.status === "superseded") {
+        out.push({
+          lane: `${lane.repo}@${lane.base}`,
+          card: l.id,
+          retired: true,
+          lease: null,
+          currently: null,
+          stop: null,
+          required_workflows: lane.required_workflows,
+          reason: "lane retired — the lane card is closed (base deleted or lane retired); the tick does not touch it (BR#4772/BR#4977)",
+          last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
+          capable: null,
+          starved: null,
+          queue: [],
+          activity: { merged_1h: 0, merged_24h: 0, last_merge_ts: null, last_event: null },
+        });
+        continue;
+      }
+      const queue = this.laneQueue(lane.repo, lane.base);
       const tp = this.state.storage.sql.exec(
         `SELECT SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h1,
                 SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h24,

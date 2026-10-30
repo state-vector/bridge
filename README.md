@@ -774,6 +774,22 @@ included) as "unmergeable — CONFLICTING".
   reads and proactively on the hub's alarm sweep, so a dead train is loud even with
   zero panel readers. Recovery is automatic: the first capable lease (or the queue
   draining) clears the starved state.
+- **Lane lifecycle: a retired lane is never ticked again (BR#4977)**: a lane card
+  that is closed (`done`/`superseded`) — a base branch deleted after a drill, or a
+  lane deliberately retired — is frozen. Every lane-touching hub op refuses it
+  (`lane retired — … re-open the lane card to re-arm`): no lease acquire/renew/
+  release, no `ready — last ticked` stamp, no reason rewrite — the BR#4772 class
+  where a card marked "never tick again" still showed `ready — last ticked by …
+  0m ago` ten minutes later. `train_status` shows the lane **visibly retired**
+  (`retired: true`, empty queue, the reason names the retirement) instead of a
+  phantom-ready row. The executor honors it from both directions: it skips any lane
+  the hub marks retired, and it probes the lane's base branch before acquiring — a
+  definitive 404 (base deleted on the remote) skips the lane with no lease and no
+  hub meta writes, while any transient gh failure fails open. **The derived queue is
+  base-scoped** (same law): a queued card rides only the lane whose base matches its
+  PR stamp (`meta.pr.base`, defaulting to `main`) — a second lane on the same repo
+  can never inherit another base's queue (the retired drill lane used to show
+  `@main`'s queue as its own).
 - **Event-driven tick (BR#4806)**: when a lane's derived queue transitions empty →
   non-empty, the hub broadcasts `lane.queued {repo, base, depth}` on the push channel
   (SSE, the same transport as `lane.starved` — subscribe at `/api/kb/sse` with a gateway

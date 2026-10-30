@@ -1232,3 +1232,69 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-carry" });
   });
 });
+
+describe("BR#4977 lane lifecycle + queue base scoping", () => {
+  it("a retired (done) lane card is frozen — the tick refuses it, its meta never moves, train_status shows it retired with an empty queue", async () => {
+    const repo = "state-vector/retire-lane";
+    // create + exercise the lane normally first (the card exists, blocked)
+    const a = await acquire(repo, "gw-retire", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
+    const laneCard: string = (await laneSnap(repo)).card;
+    const before = (await kbJson("/get", { id: laneCard })).body.meta;
+    expect(before.lane.last_lease_ts).toBeGreaterThan(0);
+
+    // retire it (the BR#4772 drill-residue shape: base deleted, card closed
+    // — via the legal lifecycle edges, exactly how that card was retired)
+    const t1 = await kbJson("/transition", { id: laneCard, to: "in_progress", actor: "drill", session: "drill", note: "retiring the drill lane" });
+    expect(t1.status, `claim failed: ${JSON.stringify(t1.body)}`).toBeLessThan(400);
+    const t = await kbJson("/transition", { id: laneCard, to: "done", actor: "drill", session: "drill", note: "DRILL RESIDUE — lane retired, will never tick again" });
+    expect(t.status, `retire transition failed: ${JSON.stringify(t.body)}`).toBeLessThan(400);
+
+    // the tick refuses — acquire/renew/release all bounce, and the lane's
+    // meta is FROZEN (no lease/CPO writes on a "never tick again" card)
+    const reArm = await acquire(repo, "gw-zombie", { merge_capable: true });
+    expect(String(reArm.body.error ?? "")).toContain("lane retired");
+    const after = (await kbJson("/get", { id: laneCard })).body.meta;
+    expect(after.lane.last_lease_ts).toBe(before.lane.last_lease_ts);
+    expect(after.lane.last_capable_lease_ts).toBe(before.lane.last_capable_lease_ts);
+    const renewal = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-zombie" });
+    expect(String(renewal.body.error ?? "")).toContain("lane retired");
+
+    // the snapshot shows the lane VISIBLY retired — empty queue, retired
+    // flag, the reason names it (never a phantom "ready" again)
+    const snap = await laneSnap(repo);
+    expect(snap.retired).toBe(true);
+    expect(snap.queue).toEqual([]);
+    expect(String(snap.reason)).toContain("retired");
+  });
+
+  it("the derived queue is base-scoped — a second lane on the same repo never inherits the other base's queue", async () => {
+    const repo = "state-vector/base-split";
+    const H1 = "1".repeat(40), H2 = "2".repeat(40);
+    const mainCard = await queueViaAccept({ repo, pr: 49771, head: H1, title: "IMPL: main-base drill" });
+    const releaseCard = await queueViaAccept({ repo, pr: 49772, head: H2, title: "IMPL: release-base drill" });
+
+    // re-target the second card to a release base (the stamp carries base;
+    // verify accepts on a non-main PR would stamp it the same way)
+    const rc = (await kbJson("/get", { id: releaseCard })).body;
+    const m = rc.meta;
+    m.pr.base = "release/1";
+    if (Array.isArray(m.prs)) m.prs = m.prs.map((l: any) => (Number(l.number) === 49772 ? { ...l, base: "release/1" } : l));
+    expect((await kbJson("/update", { id: releaseCard, meta: m })).status).toBeLessThan(400);
+
+    // a lane for the release base exists (created on demand like any lane)
+    const rl = await kbJson("/train.lane", { repo, base: "release/1", actor: "drill" });
+    expect(rl.body.error ?? "").toBe("");
+
+    const st = await kbJson("/train.status", { repo });
+    const mainLane = st.body.lanes.find((l: any) => l.lane === `${repo}@main`);
+    const releaseLane = st.body.lanes.find((l: any) => l.lane === `${repo}@release/1`);
+    expect(mainLane.queue.map((c: any) => c.id)).toEqual([mainCard]);
+    expect(releaseLane.queue.map((c: any) => c.id)).toEqual([releaseCard]);
+    // the retired-drill noise class: the main lane's queue is NOT inherited
+    // by the second base (and vice versa) on the same repo
+    expect(mainLane.queue.map((c: any) => c.id)).not.toContain(releaseCard);
+    expect(releaseLane.queue.map((c: any) => c.id)).not.toContain(mainCard);
+  });
+});

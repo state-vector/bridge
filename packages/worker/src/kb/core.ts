@@ -1804,17 +1804,21 @@ export function trainLegLanded(meta: any, leg: TrainLeg): boolean {
 }
 
 /** The legs that still keep the card queued — optionally scoped to one
- *  repo (a card rides exactly the lanes that own one of its UNLANDED legs). */
-export function trainLegsRemaining(meta: any, repo?: string): TrainLeg[] {
-  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && !trainLegLanded(meta, l));
+ *  repo (a card rides exactly the lanes that own one of its UNLANDED legs)
+ *  and, with `base`, to that repo's ONE base (BR#4977: a leg without a base
+ *  stamp defaults to "main" — the card-stamp convention — so a lane on a
+ *  second base never inherits another base's queue). */
+export function trainLegsRemaining(meta: any, repo?: string, base?: string): TrainLeg[] {
+  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && (!base || String(l.base ?? "main") === base) && !trainLegLanded(meta, l));
 }
 
 /** Does this queued card ride the given repo's lane? True when at least one
- *  of its UNLANDED legs belongs to that repo. (BR#3659: replaces the old
- *  lane filter that read meta.merge_train.repo — a field nothing ever set,
- *  so every queued card matched every lane.) */
-export function trainCardMatchesLane(meta: any, repo: string): boolean {
-  return trainLegsRemaining(meta, repo).length > 0;
+ *  of its UNLANDED legs belongs to that repo — and, when `base` is given,
+ *  to that lane's base (BR#4977). (BR#3659: replaces the old lane filter
+ *  that read meta.merge_train.repo — a field nothing ever set, so every
+ *  queued card matched every lane.) */
+export function trainCardMatchesLane(meta: any, repo: string, base?: string): boolean {
+  return trainLegsRemaining(meta, repo, base).length > 0;
 }
 
 /** Does an accepted verdict cover this LEG's head? Same law as
