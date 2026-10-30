@@ -144,10 +144,13 @@ const REFRESH_MS = 30_000;
  *  plus the lock dot, the line, and the throughput rate. A held head says
  *  WHY it is held (the now_action note), the last ledger event rides the
  *  rate column with its age, and "head"/"gate"/"bounced" are never the
- *  only words on screen. Data: GET /api/kb/train (the DO's train.status
- *  snapshot — lease/now_action are executor-fed, queue is hub-computed,
- *  oldest first). Polls every 30s (the tick is 45s); errors surface
- *  in-panel, never silent. */
+ *  only words on screen. The QUEUE column also renders the lane's Awaiting
+ *  parks (BR#4962, per BR#4960): cards parked blocked under the typed
+ *  Awaiting stamp — the human force-review queue, ◉-chip per card (amber at
+ *  the TTL, red past TTL+grace), oldest park first. Data: GET
+ *  /api/kb/train (the DO's train.status snapshot — lease/now_action are
+ *  executor-fed, queue is hub-computed, oldest first). Polls every 30s (the
+ *  tick is 45s); errors surface in-panel, never silent. */
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   useClock();
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
@@ -169,7 +172,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   }, []);
 
   const now = Date.now();
-  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently;
+  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently || (l.awaiting?.length ?? 0) > 0;
 
   return (
     <div className="train-panel">
@@ -241,6 +244,21 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
               {stalled && (
                 <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait${l.queue_awaiting_review ? ` — ${l.queue_awaiting_review} are blocked on a fresh review (their PR branches changed after their last review)` : ""}`}>
                   ⚠ nothing merged in 24h
+                </span>
+              )}
+              {(l.awaiting ?? []).length > 0 && (
+                <span className="train-awaiting" title="parked Awaiting review — the human force-review queue (BR#4962, per BR#4960); no ask was filed, the human acts from the backlog">
+                  {(l.awaiting ?? []).map((a) => (
+                    <Chip
+                      key={a.task}
+                      tone={a.lapsed ? "urgent" : a.aging ? "warn" : "scope"}
+                      className="train-awaiting-card"
+                      onClick={() => openTask?.(a.task)}
+                      title={`${a.task}${a.pr ? ` (PR #${a.pr})` : ""} parked Awaiting review — ${a.verdict ?? "verdict unrecorded"} anchored at head ${String(a.head_sha ?? "").slice(0, 9) || "?"} · parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? ", PAST the awaiting window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? ", past the awaiting window (amber)" : ""} — force-review from the backlog: approve re-queues, changes requested bounce impl (no ask was filed — BR#4960)`}
+                    >
+                      ◉ awaiting {age(Date.now() - a.age_ms, Date.now())}
+                    </Chip>
+                  ))}
                 </span>
               )}
             </span>

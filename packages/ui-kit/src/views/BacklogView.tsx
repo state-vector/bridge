@@ -86,7 +86,10 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
       byExit.set(cls.key, list);
     }
-    for (const list of byExit.values()) list.sort((a: any, b: any) => (b.t.updated_ts ?? 0) - (a.t.updated_ts ?? 0));
+    // boost-first WITHIN each exit group (BR#4068 rank seam — the ▲ pins
+    // priority 0 everywhere; the awaiting filter reads it hot: a boosted
+    // Awaiting park is one human leg from landed), then newest first.
+    for (const list of byExit.values()) list.sort((a: any, b: any) => (!!b.t.meta?.boosted ? 1 : 0) - (!!a.t.meta?.boosted ? 1 : 0) || (b.t.updated_ts ?? 0) - (a.t.updated_ts ?? 0));
     const exitGroups: BlGroup[] = [];
     for (const key of EXIT_CLASS_ORDER) {
       const rows = byExit.get(key) ?? [];
@@ -160,7 +163,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                   onClick={() => openDetails(t.id)}
                 >
                   <span className="backlog-rank" title={`pickup rank: ${r.why ?? parkedReason(t)}`}>
-                    {boosted ? "▲" : g.showRank ? rank + 1 : g.key === "human" ? "⚑" : g.key === "verify" ? "✓" : g.key === "unblocking" ? "↻" : g.key === "timeout" ? "⏱" : "▪"}
+                    {boosted ? "▲" : g.showRank ? rank + 1 : g.key === "human" ? "⚑" : g.key === "awaiting" ? "◉" : g.key === "verify" ? "✓" : g.key === "unblocking" ? "↻" : g.key === "timeout" ? "⏱" : "▪"}
                   </span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">

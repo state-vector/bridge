@@ -264,6 +264,21 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
+  // force-review — approve re-anchors the verdict at the parked head and
+  // re-queues the train; request_changes bounces impl. No ask was filed;
+  // this row is the human leg.
+  const isAwaiting = task.status === "blocked" && String((m as any).merge_train?.state ?? "") === "awaiting";
+  const forceReview = async (decision: "approve" | "request_changes") => {
+    setBusy(true);
+    try {
+      await kbApi.forceReview(task.id, decision);
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("force-review", e); } finally {
+      setBusy(false);
+    }
+  };
   const gauges: Array<[string, number | undefined]> = [
     ["done", lp?.completion_pct],
     ["conf", lp?.confidence_pct],
@@ -306,20 +321,41 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
               </ol>
             </div>
           )}
-          <div className="row" style={{ marginTop: 6 }}>
-            <Btn
-              size="sm" variant="accept" disabled={busy}
-              title={m.blocked.unblock_condition ? `Mark satisfied and resume now: "${trunc(m.blocked.unblock_condition, 110)}"` : "Resume the task now"}
-              onClick={() => void unblock()}
-            >Unblock now</Btn>
-            <span className="muted-note">
-              {m.blocked.unblock_condition ? `resume before the gate: "${trunc(m.blocked.unblock_condition, 90)}"` : "resume the task now"}
-            </span>
-            {/* BR#3910: the kill switch beside the resume switch — a dead-premise
-                card must not force "unblock" as the only exit (the BR#3905
-                timer-spin class: undiscoverable supersede → endless re-checks) */}
-            <SupersedeBtn task={task as any} onChanged={onChanged} />
-          </div>
+          {isAwaiting ? (
+            <div className="row" style={{ marginTop: 6 }}>
+              <Btn
+                size="sm" variant="accept" disabled={busy}
+                title="Approve: the accepted verdict re-anchors at the parked head (carry legs, via force-review) and the card re-queues on the train — the train's own flow lands it"
+                onClick={() => void forceReview("approve")}
+              >Approve — re-queue train</Btn>
+              <Btn
+                size="sm" variant="reject" disabled={busy}
+                title="Request changes: bounce to impl as a repair leg — the parked verdict is NOT carried (human-resolved invalidates)"
+                onClick={() => void forceReview("request_changes")}
+              >Request changes — bounce impl</Btn>
+              <span className="muted-note">
+                force-review (BR#4960): no ask was filed — this row is the human leg. Approve re-anchors the verdict at the parked head; changes requested bounce impl.
+              </span>
+              {/* BR#3910: the kill switch still rides — a wrongly-parked card
+                  can be superseded without pretending to be a review verdict */}
+              <SupersedeBtn task={task as any} onChanged={onChanged} />
+            </div>
+          ) : (
+            <div className="row" style={{ marginTop: 6 }}>
+              <Btn
+                size="sm" variant="accept" disabled={busy}
+                title={m.blocked.unblock_condition ? `Mark satisfied and resume now: "${trunc(m.blocked.unblock_condition, 110)}"` : "Resume the task now"}
+                onClick={() => void unblock()}
+              >Unblock now</Btn>
+              <span className="muted-note">
+                {m.blocked.unblock_condition ? `resume before the gate: "${trunc(m.blocked.unblock_condition, 90)}"` : "resume the task now"}
+              </span>
+              {/* BR#3910: the kill switch beside the resume switch — a dead-premise
+                  card must not force "unblock" as the only exit (the BR#3905
+                  timer-spin class: undiscoverable supersede → endless re-checks) */}
+              <SupersedeBtn task={task as any} onChanged={onChanged} />
+            </div>
+          )}
         </div>
       )}
       {/* unclaimed todo cards: the same kill switch, no blocked box to host it
