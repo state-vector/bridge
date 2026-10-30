@@ -595,8 +595,9 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
   // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
   // system sweeps) must never destroy merge-train state or a typed wait. A
-  // card the train owns (meta.merge_train queued/awaiting-ci/bounced with a
-  // live PR leg) is parked on the typed pr_merged proxy; a card with a typed
+  // card the train owns (meta.merge_train queued/awaiting-ci/bounced/awaiting
+  // with a live PR leg) is parked on the typed pr_merged proxy; a card with
+  // a typed
   // await_event or a bound ask parks on that wait — the proxy watch / the
   // answer owns the exit, not the staleness sweep. Humans and owners still
   // release freely (rule-9 / web). The sweeps hold BEFORE attempting a todo
@@ -615,11 +616,12 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     // the demote to a claimable todo destroys no queue slot; the train meta
     // rides along and the fresh accept re-queues. Keyed on the explicit body
     // flag the sweep sets + in_progress (a live re-entry, never a park) +
-    // state bounced — queued/awaiting-ci stay protected even with a forged
+    // state bounced — queued/awaiting-ci/awaiting stay protected even with a
+    // forged
     // flag, and so does a bounced card parked BLOCKED.
     const demoteReentry =
       st === "bounced" && i.status === "in_progress" && i.body?.demote_bounced_reentry === true;
-    if ((st === "queued" || st === "awaiting-ci" || st === "bounced") && pr && !demoteReentry) {
+    if ((st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") && pr && !demoteReentry) {
       const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
       return {
         ok: false,

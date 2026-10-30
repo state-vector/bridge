@@ -1686,8 +1686,9 @@ export function trainMergeReceipt(
 
 /** BR#4067 — does a release path need to HOLD? Returns the hold description
  *  when the card carries machine-wait state — a merge-train queue slot
- *  (queued/awaiting-ci/bounced on a live PR leg), a typed await_event, or a
- *  bound ask — and null when a release may proceed. Every watchdog release
+ *  (queued/awaiting-ci/bounced/awaiting on a live PR leg), a typed
+ *  await_event, or a bound ask — and null when a release may proceed. Every
+ *  watchdog release
  *  path (stall sweep, review sweep, lapsed subprocess, reaper reassign) and
  *  the machine's machine-actor backstop consult this one predicate: the
  *  PR #257 class is a card released to todo while its wait state (queue
@@ -1696,7 +1697,7 @@ export function releaseHold(meta: any): string | null {
   const m = meta ?? {};
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const st = String(mt.state ?? "");
-  if (st === "queued" || st === "awaiting-ci" || st === "bounced") {
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") {
     const pr = trainPrLeg(meta);
     if (pr) {
       const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
@@ -1712,8 +1713,10 @@ export function releaseHold(meta: any): string | null {
 
 // ---- carry-record law (BR#3516 §5) ----
 
-/** One machine-clean head move: `update-branch` (server-side, bought CI, no
- *  human resolution) — the accepted verdict CARRIES across it. A conflict
+/** One head move the delivery chain ACCEPTED: `update-branch` (server-side,
+ *  bought CI, no human resolution) or `force-review` (BR#4962 — a human's
+ *  force-review approval re-anchors the verdict at the parked head; the one
+ *  human-authored move that carries, because it IS the human leg). A conflict
  *  resolution is authored code: it never produces a carry-record, it
  *  produces a bounce. One sentence: **machine-clean carries;
  *  human-resolved invalidates.** */
@@ -1722,7 +1725,7 @@ export type CarryRecord = {
   to_head: string;
   prior_verdict_id: string | null;
   carried_ts: number;
-  via: "update-branch";
+  via: "update-branch" | "force-review";
 };
 
 /** Does an accepted verdict cover this head? The straight stamp
@@ -2150,92 +2153,38 @@ export function trainBounceBrief(input: {
   ].join("\n");
 }
 
-/** BR#4068 starvation law — the standing human-review ask for a bounced
- *  card. Deterministic per (card, PR): re-bounces of the same leg while the
- *  ask is open dedupe (identical-open-ask guard); an ANSWERED ask re-posts
- *  fresh, because a new head move past the verdict is a NEW live leg. The
- *  title carries the For Me phrasing so the band reads the leg's state
- *  ("review requested — one click from landed"). ≤240 chars, ends "?" —
- *  the ask contract. */
-export function trainReviewAskTitle(lane: { repo: string }, prNumber: number, taskId: string): string {
-  return `Review requested on ${lane.repo}#${prNumber} (${taskId}) after a merge-train bounce — one click from landed?`;
+// ---- Awaiting review park (BR#4962, per accepted BR#4960) ----
+
+/** The blocked reason a coverage-bounced card parks under. Per BR#4960 there
+ *  is NO ask: the card IS the visibility — it parks `blocked` under this
+ *  typed reason (verdict + anchored head inline, plain reading) and the
+ *  human force-reviews it from the backlog. The merge-train queue
+ *  derivation filters on `merge-train:` reasons, so an Awaiting card drops
+ *  out of the queue naturally; the backlog's Awaiting filter is how it is
+ *  seen and acted on. */
+export const TRAIN_AWAITING_REASON_PREFIX = "Awaiting review (verdict ";
+
+export function trainAwaitingReason(verdictId: string | null, headSha: string | null): string {
+  return `Awaiting review (verdict ${verdictId ?? "unrecorded"}, anchored at head ${String(headSha ?? "").slice(0, 9) || "unknown"})`;
 }
 
-/** The review ask's details: what bounced, why the human leg lapsed (a push
- *  dismisses the stale GitHub review — GitHub law), and what the live leg
- *  is. The refresh story rides here too: the ask re-files dedupe-safe on
- *  every head move past the accepted verdict until the card re-enters the
- *  train. */
-export function trainReviewAskDetails(input: { repo: string; prNumber: number; taskId: string; headSha: string | null; conflictFiles: string[] }): string {
-  const files = input.conflictFiles.length
-    ? input.conflictFiles.map((f) => `- \`${f}\``).join("\n")
-    : "- (no file list supplied — the executor enumerates them on the trial rebase)";
-  return [
-    `The merge train bounced ${input.taskId}: PR ${input.repo}#${input.prNumber} no longer merges cleanly with its base${input.headSha ? ` (head ${input.headSha.slice(0, 9)})` : ""}.`,
-    ``,
-    `**Conflicting files:**`,
-    files,
-    ``,
-    `**Why this reaches you:** the push that moved the head past the accepted verdict dismissed the stale GitHub review, so the human review leg silently lapsed. The card is verified once and one mechanical leg (rebase) plus this review away from landing — it now rides priority 0 so it cannot starve (BR#4068).`,
-    ``,
-    `This ask is the live leg. It re-files (deduped) on every further head move until the card re-enters the train; answering it retires it.`,
-    `PR: https://github.com/${input.repo}/pull/${input.prNumber}`,
-  ].join("\n");
-}
+/** The Awaiting park's visible-age window — knob `train.awaiting_ttl_h`
+ *  (legacy `train.review_ask_ttl_h` falls back), clamped 1..720, default 24.
+ *  The park NEVER expires itself (BR#4960: visibility without interruption —
+ *  a lapsed Awaiting card still reads in the backlog filter); the knob feeds
+ *  the train panel's aging chip only. */
+export const TRAIN_AWAITING_TTL_H_DEFAULT = 24;
 
-/** The dedupe-vs-leg window: an identical open ask dedupes re-bounces of the
- *  same leg — but the human leg must LAPSE-PROOF, not just spam-proof. An
- *  ask unanswered past this window re-files fresh when the PR head moved
- *  since it was last filed/refreshed (dedupe suppresses spam, not the leg).
- *  Settings knob `train.review_ask_ttl_h`, clamped 1..720. */
-export const TRAIN_REVIEW_ASK_TTL_H_DEFAULT = 24;
+/** The visible-age grace past the TTL before an Awaiting chip reads LAPSED
+ *  (red) on the train panel — `aging` (amber) starts AT the TTL. */
+export const TRAIN_AWAITING_GRACE_MS = 2 * 60 * 60_000;
 
-/** The visible-age grace past the TTL before a review ask reads LAPSED (red)
- *  on the train panel — `aging` (amber) starts AT the TTL. */
-export const TRAIN_REVIEW_ASK_GRACE_MS = 2 * 60 * 60_000;
-
-export function clampReviewAskTtlHours(v: unknown): number {
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? Math.min(720, Math.max(1, n)) : TRAIN_REVIEW_ASK_TTL_H_DEFAULT;
-}
-
-/** Should a deduped (identical-open) review ask re-file FRESH? Two facts
- *  must BOTH hold — the leg is still unmet AND time has actually passed:
- *  1. the ask has sat unanswered past the TTL window (age from the LAST ask
- *     event — filed_ts/refreshed_ts; created_ts is the legacy fallback ONLY
- *     when neither stamp exists — a backdated stamp must not lose to the
- *     row's creation time), and
- *  2. the PR head moved since the ask was last filed/refreshed (the head_sha
- *     stamp the bounce handler writes on every ask event).
- *  Fail-safes (never refile): no stamps at all (a legacy ask with neither an
- *  age nor a head stamp just refreshes), or the event carried no head sha to
- *  compare — without both signals a re-file could loop forever. Exactly one
- *  re-filed ask per TTL window falls out: the fresh ask re-stamps both
- *  signals, so the next re-bounce inside the window dedupes again. */
-export function shouldRefileReviewAsk(input: {
-  ask?: { filed_ts?: number; refreshed_ts?: number; head_sha?: string } | null;
-  createdTs?: number | null;
-  headSha: string | null;
-  now: number;
-  ttlMs: number;
-}): { refile: boolean; why: string } {
-  const a = input.ask ?? {};
-  // The last ask EVENT is the newest durability stamp; created_ts only backs
-  // a legacy ask with neither stamp — it must never out-vote a stamp, or a
-  // backdated (aged) ask reads fresh and the leg never lapses.
-  const stampTs = Math.max(Number(a.filed_ts ?? 0), Number(a.refreshed_ts ?? 0));
-  const lastTs = stampTs > 0 ? stampTs : Number(input.createdTs ?? 0);
-  const lastHead = String(a.head_sha ?? "").toLowerCase();
-  const head = String(input.headSha ?? "").toLowerCase();
-  if (!lastTs) return { refile: false, why: "ask has no age stamp (legacy) — refresh only" };
-  if (input.now - lastTs < input.ttlMs) return { refile: false, why: "ask is inside the TTL window — refresh only" };
-  if (!lastHead) return { refile: false, why: "ask has no head stamp (legacy) — refresh only" };
-  if (!head) return { refile: false, why: "bounce carried no head sha — nothing to compare" };
-  if (lastHead === head) return { refile: false, why: "head unchanged since the ask was last filed/refreshed — refresh only" };
-  return {
-    refile: true,
-    why: `ask unanswered ${Math.round((input.now - lastTs) / 60_000)}m (past the ${Math.round(input.ttlMs / 3_600_000)}h window) and the head moved since (${lastHead.slice(0, 9)}→${head.slice(0, 9)}) — dedupe suppresses spam, not the leg (BR#4633 L4.2)`,
-  };
+export function clampAwaitingTtlHours(...candidates: unknown[]): number {
+  for (const v of candidates) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return Math.min(720, Math.max(1, n));
+  }
+  return TRAIN_AWAITING_TTL_H_DEFAULT;
 }
 
 /** Deterministic stop-the-line ask title (ONE per red episode — the sha makes
