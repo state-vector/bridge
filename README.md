@@ -803,7 +803,16 @@ included) as "unmergeable — CONFLICTING".
   rebind. With NO successor the lane is deliberately retired and the BR#4977
   refusal holds (every op refuses `lane retired`; re-open the card or register
   a reseed to re-arm — BR#5061's spec'd create-fresh is superseded by the
-  accepted BR#4977 decision on that path). `train.status` shows ONE row per
+  accepted BR#4977 decision on that path) — with ONE exception (BR#5186): when
+  EVERY card for the key is terminal and the executor's first-hand probe says
+  the base branch is still LIVE on the remote (the hub holds no VCS
+  credentials), the closure was an erroneous close (the BR#5130 class that
+  killed BR#3648 and BR#5050), not a retirement — the tick asks the hub to
+  auto-reseed `v(N+1)` carrying the predecessor's lane config (supersedes
+  edge, loud `lane_reseeded` audit) and drives the fresh card in the same
+  tick. Without the live-base evidence (a deleted base, a probe with no
+  signal) the refusal stands — no resurrection on a guess. `train.status`
+  shows ONE row per
   lane — a retired card with a live successor is filtered as history, a
   retired card with no successor stays visibly `retired` (BR#4977) — and the
   hub's lane sweeps skip retired cards; the starvation clock never inits from
@@ -848,7 +857,14 @@ included) as "unmergeable — CONFLICTING".
   phantom-ready row. The executor honors it from both directions: it skips any lane
   the hub marks retired, and it probes the lane's base branch before acquiring — a
   definitive 404 (base deleted on the remote) skips the lane with no lease and no
-  hub meta writes, while any transient gh failure fails open. **The derived queue is
+  hub meta writes, while any transient gh failure fails open. **BR#5186 splits the
+  retired world in two on that same probe**: a definitive 404 is a real retirement —
+  skip; a LIVE base under a `retired: true` row means the closure was an erroneous
+  close (the BR#5130 class that killed BR#3648 and BR#5050), so the tick asks the
+  hub to auto-reseed `v(N+1)` (`train_lane` with `base_live: true` — the executor's
+  first-hand evidence; the hub holds no VCS credentials) and drives the fresh card
+  in the same tick; a probe with no signal (gh absent, network, auth) is
+  fail-closed — the refusal stands, never a reseed on a guess. **The derived queue is
   base-scoped** (same law): a queued card rides only the lane whose base matches its
   PR stamp (`meta.pr.base`, defaulting to `main`) — a second lane on the same repo
   can never inherit another base's queue (the retired drill lane used to show

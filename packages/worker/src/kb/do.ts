@@ -3035,7 +3035,11 @@ export class KnowledgeHub {
         case "train.history": return this.json(await this.trainHistory(body));
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
         case "train.carry": return this.json(await this.trainCarry(body, actor));
-        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        // BR#5186: base_live rides ONLY the executor's reseed ask — the tick
+        // probed the base branch live on the remote first-hand (the hub holds
+        // no VCS credentials, BR#3507). Any caller without the flag keeps the
+        // BR#4977 refusal (fail-closed).
+        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec, { base_live: body.base_live === true }));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
         case "reconcile.schedule": return this.json(await this.reconcileSchedule(body, actor));
@@ -7361,7 +7365,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  history goes dark. */
   private laneTerminalRows(laneKeyValue: string): any[] {
     return (this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts FROM artefacts
+      `SELECT id, status, title, meta, status_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
        ORDER BY created_ts ASC`,
       laneKeyValue,
@@ -7383,8 +7387,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     *  no re-arm — re-open the card or register a reseed to re-arm. This
     *  supersedes the BR#5061 spec's create-fresh clause on the no-successor
     *  path (an accepted decision outranks the spec; the rebind path — the
-    *  2026-10-29 outage's keystone — is unchanged). */
-  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
+    *  2026-10-29 outage's keystone — is unchanged).
+    *  BR#5186 carves ONE exception out of that refusal: when EVERY card for
+    *  the key is terminal and the executor's first-hand probe says the base
+    *  branch is still LIVE on the remote (opts.base_live — the hub holds no
+    *  VCS credentials to re-check, BR#3507), the closure was an erroneous
+    *  close (the BR#5130 class that killed BR#3648 and BR#5050), not a
+    *  retirement — the lane auto-reseeds v(N+1) and rebinds. Without the
+    *  flag the refusal stands exactly as before. */
+  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>, opts?: { base_live?: boolean }): Promise<any> {
     const key = laneKey(repo, base);
     let existing = this.laneRow(key);
     const terminals = this.laneTerminalRows(key);
@@ -7418,13 +7429,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           );
         }
         if (!live) {
-          // BR#4977 lane lifecycle: no successor means deliberately retired —
-          // the single refusal point (the BR#4772 drill-residue class): no
-          // lease/CPO meta writes, no config refresh, no re-arm, and no
-          // create-fresh resurrection (BR#5061's spec clause is superseded
-          // here by the accepted decision). Re-arm is a deliberate lifecycle
-          // act — re-open the lane card or register a reseed.
-          throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          // BR#5186: EVERY card for the key is terminal. The executor just
+          // probed the base branch on the remote first-hand (the hub holds
+          // no VCS credentials, BR#3507 — the tick's probe is the only
+          // liveness evidence):
+          //   base_live=true — the base is LIVE: the closure was an
+          //     erroneous close (the BR#5130 class that killed BR#3648 and
+          //     BR#5050 off stale provenance), not a retirement. A lane
+          //     card is INFRASTRUCTURE: landing a queued PR completes a
+          //     leg, it does not complete the LANE. Auto-reseed v(N+1)
+          //     carrying the predecessor's config and rebind.
+          //   otherwise     — the BR#4977 refusal stands (the BR#4772
+          //     drill-residue class, a deliberate retirement, or a
+          //     no-signal probe): no lease/CPO meta writes, no config
+          //     refresh, no re-arm, no create-fresh resurrection
+          //     (BR#5061's spec clause stays superseded on this path).
+          //     Re-arm is a deliberate lifecycle act — re-open the lane
+          //     card or register a reseed.
+          if (opts?.base_live === true) {
+            live = await this.laneReseed(repo, base, actor, key, terminals);
+          } else {
+            throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          }
         }
         existing = this.one(
           `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts WHERE id = ?`,
@@ -7534,6 +7560,54 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       actor,
     );
     this.audit(actor, "create", created.id, { type: "task", auto: "lane", lane_key: key });
+    return this.laneRow(key);
+  }
+
+  /** BR#5186: the all-terminal auto-reseed — every lane card for the key is
+   *  terminal (done/superseded) while the base branch is LIVE on the remote
+   *  (the executor probed it first-hand and asked with base_live; the hub
+   *  holds no VCS credentials to re-check, BR#3507). A lane card is
+   *  INFRASTRUCTURE: its closure must never kill a live repo's lane, so the
+   *  tick reseeds instead of skipping and every reconcile hiccup stops
+   *  re-killing lanes:
+   *  - v(N+1) parses off the terminal titles' "(vN" convention (the manual
+   *    reseed lineage — BR#5050 was v2, its manual successor v3); a lineage
+   *    with no versioned title starts at v2.
+   *  - config inherits the NEWEST terminal card's meta.lane — the working
+   *    copy is the operator's last word on this lane.
+   *  - the supersedes edge (fresh → newest terminal) keeps the lineage
+   *    machine-readable so BR#5061's rebind finds this card first, and
+   *    train_status folds the retired predecessor as history (one row per
+   *    lane).
+   *  The BR#4977 refusal keeps its teeth everywhere else: reseed only ever
+   *  happens on the tick's live-base claim, loudly audited (lane_reseeded). */
+  private async laneReseed(repo: string, base: string, actor: string, key: string, terminals: any[]): Promise<any> {
+    const newest = terminals[terminals.length - 1];
+    const prev = laneOfMeta(JSON.parse(newest.meta ?? "{}"));
+    let version = 2;
+    for (const t of terminals) {
+      const m = /\bv(\d+)\b/.exec(String(t.title ?? ""));
+      if (m) version = Math.max(version, Number(m[1]) + 1);
+    }
+    const cfg: Partial<LaneSpec> = prev
+      ? {
+          required_workflows: prev.required_workflows,
+          ...(prev.ci_typical_minutes != null ? { ci_typical_minutes: prev.ci_typical_minutes } : {}),
+          burst_max: prev.burst_max,
+        }
+      : {};
+    const fresh = await this.laneCreate(repo, base, actor, key, cfg);
+    const title = `${laneCardTitle(repo, base)} (v${version} — auto-reseed; predecessor ${newest.id} closed ${newest.status}; BR#5186)`;
+    this.state.storage.sql.exec(`UPDATE artefacts SET title = ? WHERE id = ?`, title, fresh.id);
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+      fresh.id, newest.id, Date.now(),
+    );
+    this.audit(actor, "lane_reseeded", fresh.id, {
+      lane: key, version, config_from: newest.id, predecessor_status: newest.status, base_live: true,
+      note: `BR#5186: every lane card for the key was terminal while the base branch stayed live on the remote (executor probe) — an erroneous close (the BR#5130 class) must not kill a live lane; reseeded v${version} with the predecessor's config`,
+    });
+    this.version(fresh.id, actor, "lane_reseeded", `auto-reseeded v${version} — all lane cards terminal while the base stayed live; config inherited from ${newest.id} (BR#5186)`, { from_terminal: newest.id });
     return this.laneRow(key);
   }
 

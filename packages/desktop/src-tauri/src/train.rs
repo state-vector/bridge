@@ -200,6 +200,10 @@ struct Ctx {
     /// with no lease, no hub meta writes). On in production; off in the
     /// test ctxs so the drills stay hermetic.
     base_probe: bool,
+    /// BR#5186 test seam: a stub base-liveness verdict that bypasses the gh
+    /// shell entirely (hermetic drills for the all-terminal reseed). None in
+    /// production — the tick always probes for real.
+    base_probe_stub: Option<fn(repo: &str, base: &str) -> BaseProbe>,
     // ---- lease liveness: proof of progress ----
     /// Last meaningful ledger action this executor took (renewals carry it).
     last_action: String,
@@ -281,6 +285,7 @@ impl Ctx {
             lane_allow: vec![],
             workdir_override: workdir_env,
             base_probe: true,
+            base_probe_stub: None,
             last_action: "executor started".into(),
             last_action_ms: now_ms(),
         })
@@ -675,6 +680,45 @@ fn release_if_idle(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Result<(
     Ok(())
 }
 
+/// BR#5186: the tri-state answer to "is the lane's base branch live on the
+/// remote?" — the executor's FIRST-HAND evidence (the hub holds no VCS
+/// credentials, BR#3507):
+///   Live     — the branch exists: a terminal lane card is an erroneous
+///              close (the BR#5130 class that killed BR#3648 and BR#5050),
+///              not a retirement — the lane must reseed;
+///   Missing  — 404 / not-found: the BR#4977 retirement is real — skip;
+///   NoSignal — gh absent / network / auth: fail-closed, the refusal
+///              stands (a flaky environment must never reseed on a guess).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseProbe {
+    Live,
+    Missing,
+    NoSignal,
+}
+
+/// The tri-state probe (BR#5186). `base_probe_stub` (tests) decides without
+/// shelling; production shells gh exactly like the BR#4977 pre-lease probe —
+/// a definitive 404 ⇒ Missing, anything else transient ⇒ NoSignal
+/// (fail-closed). Gated by `ctx.base_probe` so tests stay hermetic.
+fn probe_base_on_remote(ctx: &Ctx, repo: &str, base: &str) -> BaseProbe {
+    if let Some(stub) = ctx.base_probe_stub {
+        return stub(repo, base);
+    }
+    if !ctx.base_probe {
+        return BaseProbe::NoSignal;
+    }
+    match ctx.sh("gh", &["api", &format!("repos/{repo}/branches/{base}"), "--jq", ".name"]) {
+        Ok(_) => BaseProbe::Live,
+        Err(e) => {
+            if not_found_err(&e) {
+                BaseProbe::Missing
+            } else {
+                BaseProbe::NoSignal
+            }
+        }
+    }
+}
+
 /// BR#4977: is the lane's base branch gone from the remote? A 404 /
 /// not-found from `gh api repos/<repo>/branches/<base>` is definitive (the
 /// branch was deleted — the lane can never advance again); every other
@@ -682,13 +726,34 @@ fn release_if_idle(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Result<(
 /// OPEN — the tick proceeds and the normal paths surface the error.
 /// Gated by `ctx.base_probe` so tests stay hermetic.
 fn base_missing_on_remote(ctx: &Ctx, repo: &str, base: &str) -> bool {
-    if !ctx.base_probe {
-        return false;
-    }
-    match ctx.sh("gh", &["api", &format!("repos/{repo}/branches/{base}"), "--jq", ".name"]) {
-        Ok(_) => false,
-        Err(e) => not_found_err(&e),
-    }
+    matches!(probe_base_on_remote(ctx, repo, base), BaseProbe::Missing)
+}
+
+/// BR#5186: the reseed ask. The base was JUST probed Live on the remote —
+/// pass that first-hand evidence to the hub (`train_lane` base_live) and
+/// rebuild the lane view off the fresh card's meta (the hub already
+/// migrated any volatile in-flight state onto it) so this same tick can
+/// drive it. The queue is left empty: the next status poll re-derives it.
+fn reseed_lane(ctx: &mut Ctx, repo: &str, base: &str) -> Result<Value, String> {
+    let card = ctx.mcp("train_lane", json!({ "repo": repo, "base": base, "base_live": true }))?;
+    // the op returns the raw SQL row — meta/tags ride as JSON STRINGS
+    // (get_artefact parses; train.lane does not). Parse defensively either way.
+    let meta = match card.get("meta").cloned().unwrap_or(json!({})) {
+        Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(json!({})),
+        other => other,
+    };
+    let lane_meta = meta.get("lane").cloned().unwrap_or(json!({}));
+    Ok(json!({
+        "lane": format!("{repo}@{base}"),
+        "card": card.get("id").cloned().unwrap_or(Value::Null),
+        "required_workflows": lane_meta.get("required_workflows").cloned().unwrap_or(json!([])),
+        "ci_typical_minutes": lane_meta.get("ci_typical_minutes").cloned().unwrap_or(Value::Null),
+        "burst_max": lane_meta.get("burst_max").cloned().unwrap_or(Value::Null),
+        "lease": meta.get("lease").cloned().unwrap_or(Value::Null),
+        "currently": meta.get("currently").cloned().unwrap_or(Value::Null),
+        "stop": meta.get("stop").cloned().unwrap_or(Value::Null),
+        "queue": [],
+    }))
 }
 
 /// The missing-branch classifier: 404 / "not found" in gh's error text is a
@@ -1551,11 +1616,43 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
             continue;
         }
         // BR#4977 lane lifecycle: the hub marks a RETIRED lane (its lane card
-        // is done/superseded — the base was deleted or the lane deliberately
-        // closed, "never tick again"). The tick never touches it: no lease
-        // traffic, no hub meta writes, no workdir spin-up.
+        // is done/superseded — "never tick again"). BR#5186 splits the two
+        // worlds that refusal conflates, on the executor's first-hand probe
+        // (the hub holds no VCS credentials, BR#3507):
+        //   - base GONE on the remote (the BR#4772 drill-residue class, a
+        //     deliberate retirement) → the refusal stands, skip (no lease
+        //     traffic, no hub meta writes, no workdir spin-up);
+        //   - base LIVE → the closure was an ERRONEOUS close (the BR#5130
+        //     class that killed BR#3648 + BR#5050 off stale provenance): a
+        //     lane card is infrastructure, its death must not kill a live
+        //     repo's lane. Ask the hub to reseed v(N+1) (base_live rides the
+        //     ask) and drive the fresh card in this same tick;
+        //   - no probe signal (gh absent / network / auth) → fail-closed,
+        //     the refusal stands — a flaky environment never reseeds on a
+        //     guess.
         if lane.get("retired").and_then(|v| v.as_bool()).unwrap_or(false) {
-            log(Some(&key), "lane retired (lane card closed) — skipping (BR#4977)");
+            let (repo, base) = key.split_once('@').map(|(r, b)| (r.to_string(), b.to_string())).unwrap_or_default();
+            if repo.is_empty() || base.is_empty() {
+                log(Some(&key), "lane retired (lane card closed) — malformed lane key, skipping (BR#4977)");
+                continue;
+            }
+            match probe_base_on_remote(ctx, &repo, &base) {
+                BaseProbe::Live => match reseed_lane(ctx, &repo, &base) {
+                    Ok(fresh) => {
+                        log(
+                            Some(&key),
+                            &format!(
+                                "all lane cards terminal but base `{base}` is live on the remote — auto-reseeded {} (BR#5186), driving it now",
+                                vstr(&fresh, "card").unwrap_or("?")
+                            ),
+                        );
+                        drive_lane(ctx, &fresh);
+                    }
+                    Err(e) => log(Some(&key), &format!("reseed refused — the BR#4977 retirement stands this tick: {}", trunc(&e, 200))),
+                },
+                BaseProbe::Missing => log(Some(&key), &format!("base branch `{base}` missing on the remote — lane retired, skipping (BR#4977)")),
+                BaseProbe::NoSignal => log(Some(&key), "lane retired (lane card closed) — base probe returned no signal (gh absent / network / auth); the BR#4977 refusal stands, no reseed on a guess (BR#5186)"),
+            }
             continue;
         }
         // Daemon mode resolves the workdir per lane from the managed clone
@@ -1959,6 +2056,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         lane_allow: cfg.lanes.clone(),
         workdir_override: cfg.workdir_override.clone(),
         base_probe: true,
+        base_probe_stub: None,
         last_action: "gateway leg tick".into(),
         last_action_ms: now_ms(),
     })
@@ -2562,6 +2660,7 @@ mod tests {
             lane_allow: vec![],
             workdir_override: None,
             base_probe: false, // hermetic drills — the base probe shells out to gh
+            base_probe_stub: None,
             last_action: "test".into(),
             last_action_ms: now_ms(),
         }
@@ -2665,6 +2764,97 @@ mod tests {
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         assert_eq!(names, vec!["train_status"], "a retired lane must not be leased or driven, got {:?}", names);
+    }
+
+    // ---------- BR#5186: all-terminal reseed — a live repo keeps its lane ----------
+    // The BR#5130 incident shape (2026-10-30): reconcile closed the standing
+    // lane card done off stale provenance; at 07:54Z the tick logged "lane
+    // retired (lane card closed) — skipping" and bridge@main died for lack of
+    // a card. These drills pin the tri-state law: base LIVE (executor probe)
+    // ⇒ reseed + drive; base MISSING ⇒ the BR#4977 refusal stands; NO SIGNAL
+    // ⇒ fail-closed, no reseed on a guess.
+
+    fn base_probe_stub_live(_repo: &str, _base: &str) -> BaseProbe {
+        BaseProbe::Live
+    }
+    fn base_probe_stub_missing(_repo: &str, _base: &str) -> BaseProbe {
+        BaseProbe::Missing
+    }
+    fn base_probe_stub_no_signal(_repo: &str, _base: &str) -> BaseProbe {
+        BaseProbe::NoSignal
+    }
+
+    #[test]
+    fn all_terminal_lane_reseeds_and_drives_when_base_is_live_br5186() {
+        // The exact call script the incident demanded: train_status (the one
+        // visibly-retired row) → train_lane with base_live=true (the reseed
+        // ask) → acquire (the fresh card's inherited config rides it) →
+        // release_if_idle's status + release. A further mock request would
+        // exhaust the script loud.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "retired": true, "queue": [], "currently": null, "stop": null } ] })),
+            // the op returns the raw SQL row — meta rides as a JSON string
+            // (the parse the executor must survive)
+            ok(json!({ "id": "BR#5199", "status": "blocked", "meta": json!({ "lane": { "repo": "state-vector/bridge", "base": "main", "required_workflows": ["Test"], "ci_typical_minutes": 17, "burst_max": 5, "key": "state-vector/bridge@main" }, "lease": null, "currently": null, "stop": null }).to_string() })),
+            ok(json!({ "note": "lease granted — lane was free" })),
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "card": "BR#5199", "retired": false, "currently": null, "stop": null } ] })),
+            ok(json!({ "note": "lease released — idle" })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe_stub = Some(base_probe_stub_live);
+        tick(&mut ctx).unwrap();
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_status", "train_lane", "train_lease", "train_status", "train_lease"],
+            "reseed + drive in one tick, got {:?}",
+            names
+        );
+        let lane_args = call_args(&recorded[1]);
+        assert_eq!(
+            lane_args.get("base_live").and_then(|v| v.as_bool()),
+            Some(true),
+            "the reseed ask must carry the executor's first-hand live-base evidence"
+        );
+        let acquire_args = call_args(&recorded[2]);
+        assert_eq!(
+            acquire_args.get("required_workflows").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1),
+            "the fresh card's inherited lane config must ride the acquire"
+        );
+    }
+
+    #[test]
+    fn deleted_base_keeps_the_retirement_no_reseed_br5186() {
+        // The BR#4772 drill-residue class: the base branch is GONE. The probe
+        // answers Missing — the BR#4977 refusal stands: no train_lane ask, the
+        // tick consumes the snapshot and NOTHING else (a further mock request
+        // would exhaust the script loud).
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "retired": true, "queue": [], "currently": null, "stop": null } ] })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe_stub = Some(base_probe_stub_missing);
+        tick(&mut ctx).unwrap();
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_status"], "a missing base is a real retirement — no reseed ask, got {:?}", names);
+    }
+
+    #[test]
+    fn no_signal_probe_never_reseeds_br5186() {
+        // gh absent / network down / auth broken: fail-closed — the refusal
+        // stands and a flaky environment can never reseed on a guess.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "retired": true, "queue": [], "currently": null, "stop": null } ] })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe_stub = Some(base_probe_stub_no_signal);
+        tick(&mut ctx).unwrap();
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_status"], "no signal ⇒ no reseed, got {:?}", names);
     }
 
     #[test]
@@ -2867,6 +3057,7 @@ mod tests {
                 lane_allow: vec![],
                 workdir_override: None,
                 base_probe: false, // local git-plumbing verdicts only — no gh
+                base_probe_stub: None,
                 last_action: String::new(),
                 last_action_ms: now_ms(),
             }

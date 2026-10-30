@@ -1790,3 +1790,109 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-leg" });
   });
 });
+
+// ---------- BR#5186: all-terminal reseed — a live repo never loses its lane ----------
+// The 2026-10-30 incident, third death on state-vector/bridge@main: reconcile
+// closed the standing lane card done off stale PR #328 provenance (BR#5130
+// class), and at 07:54:42Z the tick logged "lane retired (lane card closed) —
+// skipping" — every card for the key terminal, NO reseed, the lane dead until
+// a human filed v3 by hand. These drills pin the fix: the tick's live-base
+// probe authorizes an auto-reseed (v(N+1), the predecessor's config, the
+// supersedes edge, a loud lane_reseeded audit), the refusal keeps its teeth
+// for every caller WITHOUT the live-base claim, and in-flight state migrates
+// onto the fresh card (the BR#5061 revival shape, now auto-seeded).
+
+describe("BR#5186: all-terminal reseed (real bundled worker)", () => {
+  it("base_live ask: every card terminal + the executor's live-base probe ⇒ v(N+1) carrying the predecessor's config, supersedes edge, lane_reseeded audit — and the tick binds the fresh card", async () => {
+    const repo = "state-vector/lane-rs5186";
+    await acquire(repo, "gw-rs", { required_workflows: ["Test", "CLI build (packages/cli)"], ci_typical_minutes: 17, burst_max: 5 });
+    const old = await laneSnap(repo);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rs" });
+    await kbJson("/transition", { id: old.card, to: "in_progress", actor: "gw-rs", note: "drill: claim to retire" });
+    const closed = await kbJson("/transition", { id: old.card, to: "done", actor: "web:drill", note: "drill: the BR#5050 shape — an erroneous close of a live lane (reconcile off stale provenance)" });
+    expect(closed.status, `web close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+
+    // without the live-base claim the BR#4977 refusal holds — the no-signal
+    // world (probe failed / drill residue): no resurrection on a guess
+    const refused = await kbJson("/train.lane", { repo, base: "main", actor: "gw-rs2" });
+    expect(refused.status, JSON.stringify(refused.body)).toBeGreaterThanOrEqual(400);
+    expect(String(refused.body.error)).toContain("lane retired");
+    const refusedFalse = await kbJson("/train.lane", { repo, base: "main", base_live: false, actor: "gw-rs2" });
+    expect(refusedFalse.status).toBeGreaterThanOrEqual(400);
+    expect(String(refusedFalse.body.error)).toContain("lane retired");
+
+    // the executor's probe: base LIVE on the remote → the reseed ask
+    const reseed = await kbJson("/train.lane", { repo, base: "main", base_live: true, actor: "gw-rs2" });
+    expect(reseed.body.error ?? "", `reseed failed: ${JSON.stringify(reseed.body)}`).toBe("");
+    const freshId = String(reseed.body.id);
+    expect(freshId).not.toBe(old.card);
+    expect(String(reseed.body.title)).toContain("(v2");
+    // config inherits the predecessor's working copy — the operator's last
+    // word on the lane outranks settings (the op returns the raw SQL row:
+    // meta/tags ride as JSON strings — parse defensively)
+    const metaObj = typeof reseed.body.meta === "string" ? JSON.parse(reseed.body.meta) : (reseed.body.meta ?? {});
+    const laneMeta = metaObj.lane ?? {};
+    expect(laneMeta.required_workflows).toEqual(["Test", "CLI build (packages/cli)"]);
+    expect(laneMeta.ci_typical_minutes).toBe(17);
+    expect(laneMeta.burst_max).toBe(5);
+    // lineage machine-readable: the fresh card supersedes the terminal one
+    const rels = (await kbJson("/relations", { id: freshId })).body.relations ?? [];
+    expect(rels.some((r: any) => r.relation === "supersedes" && r.artefact_id === old.card && r.dir === "out")).toBe(true);
+    // the audit is loud (a version row on the fresh card)
+    const hist = (await kbJson("/get_history", { id: freshId })).body.versions ?? [];
+    expect(hist.some((v: any) => v.action === "lane_reseeded")).toBe(true);
+
+    // the tick binds the fresh card: acquire rebinds, ONE row per lane, live
+    const a = await acquire(repo, "gw-rs2", {});
+    expect(a.body.error ?? "", JSON.stringify(a.body)).toBe("");
+    const live = await laneSnap(repo);
+    expect(live.card).toBe(freshId);
+    expect(live.retired ?? false).toBe(false);
+    const rows = (await kbJson("/train.status", { repo })).body.lanes.filter((l: any) => l.lane === `${repo}@main`);
+    expect(rows.length).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rs2" });
+  });
+
+  it("an in-flight merge survives the erroneous close: the reseed migrates the awaiting-CI onto the fresh card and it LANDS (the BR#5061 revival shape, auto-seeded)", async () => {
+    const repo = "state-vector/lane-rs-land";
+    await acquire(repo, "gw-rl", { required_workflows: ["Test"] });
+    const dead = await laneSnap(repo);
+    const deadCard: string = dead.card;
+    const HEAD = "5a".repeat(20); // unique in this DO
+    const card = await queueViaAccept({ repo, pr: 51861, head: HEAD, title: "IMPL: reseed landing drill (BR#5186)" });
+    const M = "6b".repeat(20); // unique in this DO
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-rl",
+      pr: 51861, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 10 * 60_000,
+    });
+    expect(merged.body.error ?? "", `merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // the erroneous close of the LIVE lane (web-authoritative — the BR#5151
+    // close-protection exempts web/human on purpose: it is the recovery lever)
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rl" });
+    const closed = await kbJson("/transition", { id: deadCard, to: "superseded", actor: "web:drill", note: "drill: erroneous close of a live lane (the BR#5050 shape)" });
+    expect(closed.status).toBeLessThan(400);
+
+    // the executor reseeds (base live) — no manual reseed card this time
+    const reseed = await kbJson("/train.lane", { repo, base: "main", base_live: true, actor: "gw-rl2" });
+    expect(reseed.body.error ?? "", JSON.stringify(reseed.body)).toBe("");
+    const freshId = String(reseed.body.id);
+    // the tick binds the fresh card; the in-flight merge migrated onto it
+    const a = await acquire(repo, "gw-rl2", {});
+    expect(a.body.error ?? "", JSON.stringify(a.body)).toBe("");
+    const live = await laneSnap(repo);
+    expect(live.card).toBe(freshId);
+    expect(live.currently?.pr).toBe(51861);
+    expect(live.currently?.merge_sha).toBe(M);
+    // the terminal card's volatile state is GONE (migrated, not copied)
+    const deadMeta = (await kbJson("/get", { id: deadCard })).body.meta;
+    expect(deadMeta.currently ?? null).toBeNull();
+    // the wedge cures itself: green CI on the migrated merge lands it
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-rl2", sha: M, checks: [check(1, "Test", "success")] });
+    expect(ci.body.decided).toBe("landed");
+    expect((await kbJson("/get", { id: card })).body.status).toBe("done");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rl2" });
+  });
+});
