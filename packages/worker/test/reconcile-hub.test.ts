@@ -205,7 +205,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
       meta: { pr: { repo: repoE, number: 2405 } },
     });
     const bindingId = String(binding.body.id);
-    await kbJson("/train.lane", { repo: repoE, base: "main", actor: "drill-executor" });
+    await kbJson("/train.lane", { repo: repoE, base: "main", actor: "drill-executor", spec: { required_workflows: ["Test"] } });
     const lease = await kbJson("/train.lease", { repo: repoE, base: "main", action: "acquire", actor: "drill-executor" });
     expect(lease.body.error ?? "").toBe("");
     const ev = await kbJson("/train.event", {

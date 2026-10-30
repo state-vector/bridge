@@ -168,6 +168,11 @@ struct Ctx {
     workdir: String,
     lane_filter: Option<String>,
     once: bool,
+    /// BR#4691: explicit, risk-acknowledged empty-config override — carried on
+    /// acquire so the hub leases an EMPTY required_workflows lane, stamps the
+    /// acknowledgement on the lane card, and audits it. Daemon leg never sets
+    /// this; the standalone operator opts in by hand.
+    allow_empty_workflows: bool,
     rpc_id: u64,
     // ---- gateway-native leg (BR#4104) ----
     /// true: running inside the daemon — never `std::process::exit`, per-lane
@@ -269,6 +274,7 @@ impl Ctx {
             workdir: workdir_env.clone().unwrap_or_else(|| ".".into()),
             lane_filter: Self::flag(args, "--lane"),
             once: args.iter().any(|a| a == "--once"),
+            allow_empty_workflows: args.iter().any(|a| a == "--allow-empty-workflows"),
             rpc_id: 0,
             in_process: false,
             session: SESSION.into(),
@@ -740,10 +746,21 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
 
     // ---- CAS lease (the hub decides; a conflict means ANOTHER live executor).
     // holder is ALWAYS the authenticated actor (the hub stamps it). ----
-    let lease = match ctx.train_lease(&repo, &base, "acquire", json!({ "required_workflows": required, "merge_capable": true })) {
+    // BR#4691: the explicit empty-config override rides the acquire when the
+    // operator passed --allow-empty-workflows; the hub stamps the lane card.
+    let mut acquire_body = json!({ "required_workflows": required, "merge_capable": true });
+    if ctx.allow_empty_workflows {
+        acquire_body["allow_empty_workflows"] = json!(true);
+    }
+    let lease = match ctx.train_lease(&repo, &base, "acquire", acquire_body) {
         Ok(l) => l,
         Err(e) => {
-            if e.contains("lane lease held live") {
+            if e.contains("lane config refused") {
+                // BR#4691: the hub refused an unconfigured lane — no lease was
+                // granted, so there is nothing to release. Throttled skip keeps
+                // the named reason visible without spamming every tick.
+                ctx.note_skip_throttled(&key, &e);
+            } else if e.contains("lane lease held live") {
                 log(Some(&key), "lease held live elsewhere — standing down this tick");
             } else {
                 log(Some(&key), &format!("tick error: {}", trunc(&e, 300)));
@@ -1582,7 +1599,7 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
-/// Entry: `bridge train [--once] [--lane repo@base] [--interval secs] [--method merge|squash|rebase]`.
+/// Entry: `bridge train [--once] [--lane repo@base] [--interval secs] [--method merge|squash|rebase] [--allow-empty-workflows]`.
 pub fn run(args: &[String]) -> i32 {
     // standalone CLI form: stdout logging (journald/nohup capture both, and
     // `> train.log` users expect stdout) — the in-process daemon leg keeps
@@ -1595,6 +1612,11 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if ctx.allow_empty_workflows {
+        // BR#4691: the empty-config override is loud at startup and stamped on
+        // every lane card it leases — never a silent hole.
+        log(None, "EMPTY-CONFIG OVERRIDE active (--allow-empty-workflows) — unconfigured lanes will be leased with the risk acknowledged (stamped on the lane card)");
+    }
     if let Err(e) = ctx.preflight(true) {
         emit("train", "", &format!("fatal: {e}"));
         return 1;
@@ -1947,6 +1969,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         workdir: cfg.workdir_override.clone().unwrap_or_else(|| ".".into()),
         lane_filter: None,
         once: false,
+        allow_empty_workflows: false,
         rpc_id: 0,
         in_process: true,
         session: cfg.session.clone(),
@@ -2550,6 +2573,7 @@ mod tests {
             workdir: ".".into(),
             lane_filter: None,
             once: false,
+            allow_empty_workflows: false,
             rpc_id: 0,
             in_process: true,
             session: "merge-train@test".into(),
@@ -2614,6 +2638,44 @@ mod tests {
         assert_eq!(call_args(b_acquire).get("action").and_then(|v| v.as_str()), Some("acquire"));
         // and the loser's acquire still carries the hub-attributed session.
         assert_eq!(call_args(b_acquire).get("session").and_then(|v| v.as_str()), Some("merge-train@test"));
+    }
+
+    #[test]
+    fn empty_config_refusal_is_a_throttled_skip_with_no_further_calls() {
+        // BR#4691: the hub refuses an unconfigured lane at acquire ("lane
+        // config refused: …"). No lease was granted, so the executor must NOT
+        // release, must NOT drive the lane, and must make ZERO further hub
+        // calls this lane-tick — the named reason stays visible (throttled).
+        let (hub, calls) = mock_hub(vec![Err(
+            "lane config refused: required_workflows is empty — the awaiting-CI phase would pass through unverified and a `landed` stamp would prove nothing (BR#4691). Configure the lane's real gate set (train_lane spec or the train_lane setting — enumerate from a recent green PR's checks), or pass allow_empty_workflows=true to acknowledge the risk explicitly.".into(),
+        )]);
+        let mut a = test_ctx(&hub);
+        drive_lane(&mut a, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_lease"]);
+        assert_eq!(call_args(&recorded[0]).get("action").and_then(|v| v.as_str()), Some("acquire"));
+        // the refusal is not treated as a permission defect — no demotion
+        assert!(a.demoted.is_none());
+    }
+
+    #[test]
+    fn allow_empty_workflows_flag_rides_the_acquire_and_the_lane_drives() {
+        // BR#4691: with --allow-empty-workflows the acquire carries the typed
+        // override; the hub (mocked here) grants the lease and the tick
+        // proceeds exactly like a configured lane.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — empty-config override acknowledged" })), // acquire
+            ok(card_without_lane_legs()),                                                // get_artefact
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),                              // release
+        ]);
+        let mut a = test_ctx(&hub);
+        a.allow_empty_workflows = true;
+        drive_lane(&mut a, &lane());
+        let recorded = calls.lock().unwrap();
+        assert_eq!(call_args(&recorded[0]).get("allow_empty_workflows"), Some(&json!(true)));
+        assert_eq!(call_args(&recorded[0]).get("merge_capable"), Some(&json!(true)));
     }
 
     #[test]
@@ -2855,6 +2917,7 @@ mod tests {
                 workdir: self.dir.to_string_lossy().to_string(),
                 lane_filter: None,
                 once: true,
+                allow_empty_workflows: false,
                 rpc_id: 0,
                 in_process: false,
                 session: String::new(),

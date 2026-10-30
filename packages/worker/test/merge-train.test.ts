@@ -17,6 +17,7 @@ import {
   normalizeGhMergeState,
   progressVerdict,
   renewProgressDecide,
+  requiredWorkflowsGuard,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -1236,5 +1237,23 @@ describe("burst-drain law (BR#4934)", () => {
     expect(firstRedIndex([false, true, false, true])).toBe(1);
     expect(firstRedIndex([true])).toBe(0);
     expect(firstRedIndex([])).toBeNull();
+  });
+});
+
+describe("requiredWorkflowsGuard (BR#4691 — an empty lane config is a hole, not a choice)", () => {
+  const refusal = (required: string[], allowEmpty: boolean) => requiredWorkflowsGuard(required, allowEmpty);
+
+  it("a configured lane is always legal; the override only matters for the empty set", () => {
+    expect(refusal(["Test", "CLI build (packages/cli)", "main-green gate"], false)).toBeNull();
+    expect(refusal(["Test"], true)).toBeNull();
+    expect(refusal([], true)).toBeNull();
+  });
+
+  it("the empty set refuses and the reason names BOTH fixes (configure / explicit override)", () => {
+    const r = refusal([], false)!;
+    expect(r).toContain("lane config refused");
+    expect(r).toContain("required_workflows is empty");
+    expect(r).toContain("allow_empty_workflows=true");
+    expect(r).toContain("BR#4691");
   });
 });

@@ -77,6 +77,7 @@ import {
   laneCardBody,
   laneOfMeta,
   parseBurstMax,
+  requiredWorkflowsGuard,
   type LaneSpec,
   leaseDecide,
   mergeTrainQueue,
@@ -3035,7 +3036,7 @@ export class KnowledgeHub {
         case "train.history": return this.json(await this.trainHistory(body));
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
         case "train.carry": return this.json(await this.trainCarry(body, actor));
-        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec, body.allow_empty_workflows === true));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
         case "reconcile.schedule": return this.json(await this.reconcileSchedule(body, actor));
@@ -7384,7 +7385,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     *  supersedes the BR#5061 spec's create-fresh clause on the no-successor
     *  path (an accepted decision outranks the spec; the rebind path — the
     *  2026-10-29 outage's keystone — is unchanged). */
-  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
+  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>, allowEmpty = false): Promise<any> {
     const key = laneKey(repo, base);
     let existing = this.laneRow(key);
     const terminals = this.laneTerminalRows(key);
@@ -7472,16 +7473,40 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (existing && existing.status !== "done" && existing.status !== "superseded") {
       // config updates ride the op that knows better (operator/executor):
       // required_workflows / ci_typical_minutes / burst_max refresh in place.
-      const cur = laneOfMeta(existing.meta);
-      if (cfg && cur && (cfg.required_workflows || cfg.ci_typical_minutes != null || cfg.burst_max != null) &&
-          (JSON.stringify(cfg.required_workflows ?? cur.required_workflows) !== JSON.stringify(cur.required_workflows) ||
-            (cfg.ci_typical_minutes ?? cur.ci_typical_minutes) !== cur.ci_typical_minutes ||
-            (cfg.burst_max ?? cur.burst_max) !== cur.burst_max)) {
-        const meta = JSON.parse(existing.meta ?? "{}");
-        meta.lane = { ...meta.lane, ...(cfg.required_workflows ? { required_workflows: cfg.required_workflows } : {}), ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}), ...(cfg.burst_max != null ? { burst_max: parseBurstMax(cfg.burst_max) } : {}) };
-        meta.lane.key = key;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), existing.id);
-        this.audit(actor, "train_lane_config", existing.id, { lane: meta.lane });
+      // (meta arrives as a raw SQL string — parse before laneOfMeta, or cur is
+      // always null and the refresh silently no-ops.)
+      const cur = laneOfMeta(typeof existing.meta === "string" ? JSON.parse(existing.meta || "{}") : existing.meta ?? {});
+      if (cfg && cur && (cfg.required_workflows !== undefined || cfg.ci_typical_minutes != null || cfg.burst_max != null)) {
+        const next = {
+          ...cur,
+          ...(cfg.required_workflows !== undefined ? { required_workflows: cfg.required_workflows.map(String) } : {}),
+          ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}),
+          ...(cfg.burst_max != null ? { burst_max: parseBurstMax(cfg.burst_max) } : {}),
+        };
+        // BR#4691: explicitly setting/clearing an EMPTY required set needs the
+        // same risk-acknowledged override as creating empty — a silent clear
+        // would reopen the unverified-passthrough hole on a live lane.
+        const refusal = requiredWorkflowsGuard(next.required_workflows, allowEmpty);
+        if (refusal) throw new Error(`${refusal} (lane ${key} exists — this was a config refresh)`);
+        if (JSON.stringify(next.required_workflows) !== JSON.stringify(cur.required_workflows) || next.ci_typical_minutes !== cur.ci_typical_minutes || next.burst_max !== cur.burst_max) {
+          const meta = JSON.parse(existing.meta ?? "{}");
+          meta.lane = {
+            ...meta.lane,
+            ...(cfg.required_workflows !== undefined ? { required_workflows: next.required_workflows } : {}),
+            ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: next.ci_typical_minutes } : {}),
+            ...(cfg.burst_max != null ? { burst_max: next.burst_max } : {}),
+            // a real config lands — the override stamp (if any) has done its job
+            ...(!next.empty_workflows_override || next.required_workflows.length ? { empty_workflows_override: undefined } : {}),
+          };
+          meta.lane.key = key;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ?, body_md = ? WHERE id = ?`,
+            JSON.stringify(meta),
+            laneCardBody({ ...next, required_workflows: next.required_workflows }, { alarm_sink: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID) }),
+            existing.id,
+          );
+          this.audit(actor, "train_lane_config", existing.id, { lane: meta.lane });
+        }
       }
       return existing;
     }
@@ -7490,13 +7515,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // above (status changed mid-flight) — fall through to create-fresh.
       this.audit(actor, "lane_terminal_still_bound", existing.id, { lane: key, status: existing.status, note: "BR#5061 defensive: creating a fresh standing card" });
     }
-    existing = await this.laneCreate(repo, base, actor, key, cfg ?? {});
+    existing = await this.laneCreate(repo, base, actor, key, cfg ?? {}, allowEmpty);
     return existing;
   }
 
   /** The create leg of laneEnsure — seeds config from settings unless the
    *  caller supplied an inheritance/cfg bundle. */
-  private async laneCreate(repo: string, base: string, actor: string, key: string, cfg?: Partial<LaneSpec>): Promise<any> {
+  private async laneCreate(repo: string, base: string, actor: string, key: string, cfg?: Partial<LaneSpec>, allowEmpty = false): Promise<any> {
     // seed from settings (admin.settings_set) — the operator's lane config
     let seeded: Partial<LaneSpec> = cfg ?? {};
     try {
@@ -7508,6 +7533,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     } catch { /* no/broken setting — defaults hold */ }
     const lane: LaneSpec = { repo, base, required_workflows: seeded.required_workflows ?? [], ci_typical_minutes: seeded.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES, burst_max: parseBurstMax(seeded.burst_max) };
+    // BR#4691 creation guard: an unconfigured lane refuses to exist unless the
+    // caller passes the explicit, risk-acknowledged override (typed, logged,
+    // stamped on the lane card below + in the body).
+    const refusal = requiredWorkflowsGuard(lane.required_workflows, allowEmpty);
+    if (refusal) throw new Error(refusal);
+    if (!lane.required_workflows.length) lane.empty_workflows_override = { at: Date.now(), by: actor };
     const alarmSink = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const created = await this.create(
       {
@@ -7684,9 +7715,25 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const action: LeaseAction = ["acquire", "renew", "release"].includes(String(body.action)) ? body.action : null;
     if (!action) throw new Error("action must be acquire | renew | release");
     const holder = String(body.holder ?? actor).trim() || actor;
-    const lane = await this.laneEnsure(repo, base, actor);
+    // BR#4691: the acquire's carried config rides INTO laneEnsure, so a
+    // first-contact bootstrap (lane card absent, executor names the gate set)
+    // is judged by the same creation guard — an empty carried set still
+    // refuses; a non-empty one creates the lane configured from birth.
+    const carriedWf = Array.isArray(body.required_workflows) ? body.required_workflows.map(String).filter(Boolean) : [];
+    const lane = await this.laneEnsure(repo, base, actor, carriedWf.length ? { required_workflows: carriedWf } : undefined, body.allow_empty_workflows === true);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
+    // BR#4691 lease guard: acquiring an UNCONFIGURED lane is refused — the
+    // awaiting-CI phase would pass through immediately and `landed` would
+    // prove nothing. The acquire may carry the lane's config; the only way
+    // through an empty set is the explicit, typed allow_empty_workflows flag,
+    // which STAMPS the lane card (visible) and audits the acknowledgement.
+    if (action === "acquire") {
+      const carried = Array.isArray(body.required_workflows) ? body.required_workflows.map(String).filter(Boolean) : [];
+      const effective = carried.length ? carried : (Array.isArray(meta.lane?.required_workflows) ? meta.lane.required_workflows : []).map(String).filter(Boolean);
+      const refusal = requiredWorkflowsGuard(effective, body.allow_empty_workflows === true);
+      if (refusal) throw Object.assign(new Error(refusal), { empty_workflows: true });
+    }
     const decided = leaseDecide(meta.lease ?? null, now, holder, action);
     if (decided.ok === false) throw Object.assign(new Error(decided.reason), { lease_conflict: true });
     // ---- zombie eviction (BR#4129 — the hub half of proof-of-progress,
@@ -7739,9 +7786,24 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
-    if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null || body.burst_max != null)) {
-      meta.lane = { ...meta.lane, ...(body.required_workflows ? { required_workflows: (body.required_workflows as unknown[]).map(String).filter(Boolean) } : {}), ...(body.ci_typical_minutes != null ? { ci_typical_minutes: Number(body.ci_typical_minutes) } : {}), ...(body.burst_max != null ? { burst_max: parseBurstMax(body.burst_max) } : {}) };
+    // BR#4691: only a NON-EMPTY carried list writes — an executor carrying a
+    // stale empty view must never wipe a live lane's configured gate set.
+    if (action === "acquire" && (carriedWf.length || body.ci_typical_minutes != null || body.burst_max != null)) {
+      meta.lane = { ...meta.lane, ...(carriedWf.length ? { required_workflows: carriedWf } : {}), ...(body.ci_typical_minutes != null ? { ci_typical_minutes: Number(body.ci_typical_minutes) } : {}), ...(body.burst_max != null ? { burst_max: parseBurstMax(body.burst_max) } : {}) };
       meta.lane.key = laneKey(repo, base);
+    }
+    // BR#4691: the empty-config override is stamped ON the lane card — typed,
+    // logged, visible (meta + body), never silent.
+    if (action === "acquire" && body.allow_empty_workflows === true && !(Array.isArray(meta.lane?.required_workflows) ? meta.lane.required_workflows.filter(Boolean).length : 0) && !meta.lane?.empty_workflows_override) {
+      meta.lane = { ...(meta.lane ?? {}), key: laneKey(repo, base), empty_workflows_override: { at: now, by: holder } };
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, body_md = ? WHERE id = ?`,
+        JSON.stringify(meta),
+        laneCardBody(laneOfMeta(meta)!, { alarm_sink: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID) }),
+        lane.id,
+      );
+      this.audit(actor, "train:empty_workflows_override", lane.id, { lane: laneKey(repo, base), holder, note: "risk-acknowledged empty-config lease (BR#4691)" });
+      this.version(lane.id, actor, "train:empty_workflows_override", "empty-config lease acknowledged via allow_empty_workflows (BR#4691)", { lane: meta.lane });
     }
     if (action === "release" && body.line_green) {
       meta.stop = null;
@@ -8860,15 +8922,25 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // transition already landed), so it becomes a loud audit trail instead:
     // the card rides NO live lane (the base filter scopes it out of every
     // other lane's queue) until the PR is re-targeted or the lane re-opened.
+    // BR#4691: an UNCONFIGURED repo's lane guard refusal likewise must not
+    // break the verify close — audited (train_queued_lane_refused), the card
+    // still queues on its stamps (the queue derives from blocked merge-train
+    // cards, lane-independent), and the lane becomes leasable the moment the
+    // operator seeds config.
     const laneCards = new Map<string, string>();
     for (const repo of [...new Set(withStampHeads.map((l) => l.repo))]) {
       try {
         const laneCard = await this.laneEnsure(repo, String(meta.pr.base ?? "main"), actor);
         laneCards.set(repo, String(laneCard?.id ?? ""));
       } catch (e) {
-        if (!String((e as Error).message ?? e).includes("lane retired")) throw e;
-        this.audit(actor, "queue_skipped", parentId, { reason: String((e as Error).message ?? e).slice(0, 200), lane: `${repo}@${String(meta.pr.base ?? "main")}` });
-        this.version(parentId, actor, "train_queue_skipped", `NOT queued — ${String((e as Error).message ?? e).slice(0, 180)}`, {});
+        const refusalMsg = String((e as Error).message ?? e);
+        if (refusalMsg.includes("lane config refused")) {
+          this.audit(actor, "train_queued_lane_refused", parentId, { repo, error: refusalMsg.slice(0, 300), lane: `${repo}@${String(meta.pr.base ?? "main")}` });
+          continue;
+        }
+        if (!refusalMsg.includes("lane retired")) throw e;
+        this.audit(actor, "queue_skipped", parentId, { reason: refusalMsg.slice(0, 200), lane: `${repo}@${String(meta.pr.base ?? "main")}` });
+        this.version(parentId, actor, "train_queue_skipped", `NOT queued — ${refusalMsg.slice(0, 180)}`, {});
       }
     }
     // BR#4806 event-driven tick — wake the gateways: on a lane's derived
@@ -9160,6 +9232,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         bypass_wait: meta.bypass_wait ?? null,
         required_workflows: lane.required_workflows,
         burst_max: lane.burst_max,
+        empty_workflows_override: meta.lane?.empty_workflows_override ?? null,
         reason: String(meta.blocked?.reason ?? ""),
         // BR#5114: the holder's live last action (BR#4104 seam) — WHAT the
         // executor is doing right now, verbatim from its own tick log; the

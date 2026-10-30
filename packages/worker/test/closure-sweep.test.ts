@@ -852,7 +852,9 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     const p2 = await kbJson("/create", { type: "task", title: "IMPL: parked on the train (BR#3620 bare form)", qualified: true, session: "drill-exec-p3620b" });
     const p2id = String(p2.body.id);
     // the train stamps the ledger (BR#3287): lease → merged event — zero
-    // GitHub calls; the hub owns this fact
+    // GitHub calls; the hub owns this fact. BR#4691: the lane is configured
+    // first (the operator's train_lane call — find-or-create, idempotent).
+    await kbJson("/train.lane", { repo: "state-vector/superpositional", base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     const lease = await kbJson("/train.lease", { repo: "state-vector/superpositional", base: "main", action: "acquire" });
     expect(lease.status, JSON.stringify(lease.body)).toBe(200);
     const ev = await kbJson("/train.event", {

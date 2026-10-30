@@ -1040,17 +1040,33 @@ runs on the merge commit) · `train.lane` (ensure / configure) · `train.history
 // operator/executor refreshes it in place via train.lane afterwards
 "train_lane": {
   "state-vector/bridge@main": {
-    "required_workflows": ["Test", "CLI build (packages/cli)"],
-    "ci_typical_minutes": 20
+    "required_workflows": ["Test", "CLI build (packages/cli)", "main-green gate"],
+    "ci_typical_minutes": 10
   }
 },
 "train_alarm_sink_id": "BR#3124"   // stop-the-line asks land here (default BR#3124)
 ```
 
 `required_workflows` names the checks that must be green to land (the same checks the
-main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI bound
-(unknown past 3× typical classifies red — the train never waits forever). Lane identity
-is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
+main-green gate ruleset enforces — for `state-vector/bridge@main` the real gate set,
+enumerated from a recent green PR: `Test`, `CLI build (packages/cli)`, `main-green gate`);
+`ci_typical_minutes` paces the fail-closed CI bound (unknown past 3× typical classifies
+red — the train never waits forever; the bridge lane's three required checks settle in
+~1–2 min wall-clock, so typical is 10 min and the bound 30 — generous queue headroom
+with half the hang-detection latency of the old 20/60). Lane identity is `repo@base`, so
+one repo can run several lanes (e.g. `main` and a release branch).
+
+**An empty lane config refuses to exist (BR#4691).** Lane creation, config refresh, and
+lease acquisition all REFUSE an empty `required_workflows` — an unconfigured lane would
+let the awaiting-CI phase pass through immediately and a `landed` stamp would prove
+nothing. The refusal names the fix (configure the gate set, or pass the explicit
+`allow_empty_workflows: true` override on `train.lane` / `train.lease`; the standalone
+executor takes `--allow-empty-workflows`, the gateway daemon never does). The override is
+typed, audited, and stamped on the lane card (`meta.lane.empty_workflows_override`,
+rendered in the card body and served by `train.status`) — never a silent hole. A card
+queued for a repo whose lane is not configured stays queued on its stamps (the verify
+close never fails on lane config) and becomes leasable the moment the operator seeds the
+lane; the refusal is audited at queue time.
 
 ## The knowledge channel: typed faults, never HTML (BR#4212)
 

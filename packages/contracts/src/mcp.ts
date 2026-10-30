@@ -156,6 +156,10 @@ export const TOOL_ARG_SCHEMAS = {
     holder: z.string().optional(),
     required_workflows: z.array(z.string()).optional(),
     ci_typical_minutes: z.number().optional(),
+    // BR#4691: acquire on an empty-config lane refuses unless the lane config
+    // or the call carries required_workflows — this explicit, risk-acknowledged
+    // override is the only other way through (typed, logged, stamped on the card).
+    allow_empty_workflows: z.boolean().optional(),
     line_green: z.boolean().optional(),
     // proof-of-progress (BR#4104 wire, BR#4129 hub consumption): the renewing
     // holder's last ledger action + its age. Absent on legacy renewals — the
@@ -273,6 +277,10 @@ export const TOOL_ARG_SCHEMAS = {
         ci_typical_minutes: z.number().optional(),
       })
       .optional(),
+    // BR#4691: creation/config-refresh refuse an empty required_workflows
+    // unless this explicit, risk-acknowledged override is passed (typed,
+    // logged, stamped on the lane card).
+    allow_empty_workflows: z.boolean().optional(),
   }),
   // ---- board↔GitHub reconciliation (BR#4170). The gateway daemon feeds
   // OBSERVED open-PR facts (read-only `gh pr list`; the hub holds NO VCS

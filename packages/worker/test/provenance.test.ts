@@ -177,6 +177,9 @@ async function stampViaTrain(opts: {
     });
     expect(closed.status, `verify close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
   }
+  // BR#4691: the lane exists and is configured before anything leases/events
+  // — the operator's train_lane call (find-or-create, idempotent)
+  await kbJson("/train.lane", { repo: REPO, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
   const lease = await kbJson("/train.lease", { repo: REPO, base: "main", action: "acquire", actor: "drill-executor" });
   expect(lease.body.error ?? "").toBe("");
   const ev = await kbJson("/train.event", {
