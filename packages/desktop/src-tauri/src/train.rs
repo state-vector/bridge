@@ -1065,6 +1065,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
+        // BR#5114: the gate's verdict rides the proof-of-progress wire (the
+        // renewal carries ctx.last_action; the hub renders it as the lane's
+        // NOW line). A held head must SAY why it is held — "PR #N: checks
+        // red (names)" — not die in the gateway log while the panel shows a
+        // bare "gate" pill for hours.
+        match &gate {
+            MergeAction::Note { reason } | MergeAction::Skip { reason } => {
+                ctx.note(&format!("PR #{pr} ({head_id}): {reason}"));
+            }
+            _ => {}
+        }
 
         // ---- IDENTITY GATE (BR#3181, enforced at the write boundary) ----
         // close / update-branch / merge execute only under the worker-class

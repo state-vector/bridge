@@ -114,16 +114,36 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   };
 }
 
+/** The NOW column (Ray, 2026-10-30: "I want to know WHAT is being done right
+ *  now and progress"): status pill + PR + phase age (the lane-level state)
+ *  PLUS the holder's live last action (BR#5114 now_action — the executor's
+ *  own tick log via the BR#4104 proof-of-progress seam), which says WHY a
+ *  held head is held ("PR #2588: head check RED: Meta-review nightly").
+ *  The note is shown only while fresh (lease TTL = 5 min) — a stale one is
+ *  history, not now, and rendering it would be the same lie as before. */
+function nowAction(l: KbTrainLane, now: number): { text: string; title: string } | null {
+  const na = l.now_action;
+  if (!na?.note) return null;
+  const ageSec = (now - na.at) / 1000;
+  if (ageSec > 300) return null; // older than the lease TTL — not "now"
+  return {
+    text: na.note.length > 90 ? `${na.note.slice(0, 88)}…` : na.note,
+    title: `${na.holder} · ${age(na.at, now)} ago — ${na.note}`,
+  };
+}
+
 const REFRESH_MS = 30_000;
 
-/** Merge-train table (Ray, 2026-10-29): rides the same ktable primitive as
- *  Top — lock dot · line · status · activity, columns justified identically.
- *  Dot = CAS lock state (hover names the holding machine + liveness); line =
- *  repo@base, click opens the lane card; status = one pill (stop-the-line /
- *  in-flight phase / lock held / ready / no gateway); activity = throughput,
- *  last ledger event, derived queue (clickable card ids). Data: GET
- *  /api/kb/train (the DO's train.status snapshot — lease is executor-fed,
- *  queue is hub-computed). Polls every 30s (the tick is 45s); errors surface
+/** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
+ *  labeled time-frames — NOW (what is being done right now + progress),
+ *  NEXT (the first queued head the train takes after the current work),
+ *  QUEUE (everything remaining, depth + clickable cards with their PRs) —
+ *  plus the lock dot, the line, and the throughput rate. A held head says
+ *  WHY it is held (the now_action note), the last ledger event rides the
+ *  rate column with its age, and "head"/"gate"/"bounced" are never the
+ *  only words on screen. Data: GET /api/kb/train (the DO's train.status
+ *  snapshot — lease/now_action are executor-fed, queue is hub-computed,
+ *  oldest first). Polls every 30s (the tick is 45s); errors surface
  *  in-panel, never silent. */
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   useClock();
@@ -162,14 +182,18 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         <div className="ktable-head train-head-cols">
           <span title="machine-on-lane — green a machine is on it (lock held by a live holder, or a merge-capable gateway ticking it unlocked) · amber lock lapsing · red zombie · grey nobody; hover names the machine">lock</span>
           <span>line</span>
-          <span>status</span>
-          <span title="merge throughput · last ledger event · derived queue">activity</span>
+          <span title="what the train is doing on this lane RIGHT NOW: the in-flight phase with its PR and age, or the head being gated with the reason it is held (the executor's own tick note) — plus the throughput rate and the last completed action with its age">now</span>
+          <span title="the first queued card the train takes after the current work — card + PR">next</span>
+          <span title="everything remaining in the derived queue, oldest first — click a card to open it">queue</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
         const dot = lockDot(l, now);
         const st = laneStatus(l, now);
         const repo = l.lane.split("@")[0];
+        const na = nowAction(l, now);
+        const next = l.queue[0];
+        const rest = l.queue.slice(1);
         return (
           <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
             <span className="trainc-dot">
@@ -182,48 +206,70 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             >
               {l.lane}
             </span>
-            <span className="trainc-status">
-              <Chip pill tone={st.tone} title={st.title}>{st.label}</Chip>
-              {l.currently?.pr ? (
-                <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{l.currently.pr}</a>
-              ) : null}
-              {l.currently?.merged_at ? (
-                <span className="train-dur top-num" title={`in this phase since ${new Date(l.currently.merged_at).toLocaleTimeString()}`}>
-                  {age(l.currently.merged_at, now)}
+            <span className="trainc-now">
+              <span className="train-now-state">
+                <Chip pill tone={st.tone} title={st.title}>{st.label}</Chip>
+                {l.currently?.pr ? (
+                  <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{l.currently.pr}</a>
+                ) : null}
+                {l.currently?.merged_at ? (
+                  <span className="train-dur top-num" title={`in this phase since ${new Date(l.currently.merged_at).toLocaleTimeString()}`}>
+                    {age(l.currently.merged_at, now)}
+                  </span>
+                ) : null}
+              </span>
+              {na ? <span className="train-now-note" title={na.title}>{na.text}</span> : null}
+              {l.activity ? (
+                <span className="train-tp top-num" title={`merge throughput over trailing windows (train_events ledger) — last event: what the executor did most recently, and from which machine${l.activity.last_event ? `\nlast: ${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} · ${l.activity.last_event.gateway ?? "?"} · ${age(l.activity.last_event.ts, now)} ago` : ""}`}>
+                  <span className="train-tp-rate">▸ {l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
+                  {l.activity.last_event && (
+                    <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · task ${l.activity.last_event.task_id ?? "—"}`}>
+                      last: {l.activity.last_event.kind}
+                      {l.activity.last_event.pr ? ` #${l.activity.last_event.pr}` : ""} {age(l.activity.last_event.ts, now)} ago
+                    </span>
+                  )}
                 </span>
               ) : null}
             </span>
-            <span className="trainc-info">
-              {hasSignal(l) ? (
+            <span className="trainc-next">
+              {next ? (
                 <>
-                  {l.activity && (
-                    <span className="train-tp top-num" title="merge throughput over trailing windows (train_events ledger) — last event: what the executor did most recently, and from which machine">
-                      <span className="train-tp-rate">▸ {l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
-                      {l.activity.last_event && (
-                        <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · task ${l.activity.last_event.task_id ?? "—"}`}>
-                          last: {l.activity.last_event.kind}
-                          {l.activity.last_event.pr ? ` #${l.activity.last_event.pr}` : ""} {age(l.activity.last_event.ts, now)} ago
-                        </span>
-                      )}
-                    </span>
-                  )}
-                  <span className="train-queue" title="derived queue (hub-computed, oldest first) — click a card to open it">
-                    <span className="train-queue-label top-num">depth {l.queue.length}{l.queue.length > 0 ? ` · head ${l.queue[0].id}` : ""}</span>
-                    {l.queue.map((q) => (
-                      <Chip
-                        key={q.id}
-                        tone={q.priority === "critical" ? "urgent" : "scope"}
-                        className="train-queue-card"
-                        onClick={() => openTask?.(q.id)}
-                        title={`${q.id} — ${q.priority === "critical" ? "boosted (priority 0)" : "normal priority"}`}
-                      >
-                        {q.id}
-                      </Chip>
-                    ))}
-                  </span>
+                  <Chip
+                    tone={next.priority === "critical" ? "urgent" : "scope"}
+                    className="train-queue-card"
+                    onClick={() => openTask?.(next.id)}
+                    title={`${next.id} — ${next.priority === "critical" ? "boosted (priority 0)" : "normal priority"}${next.pr ? ` · PR #${next.pr}` : ""} — the next card this lane drives after the current work`}
+                  >
+                    {next.id}
+                  </Chip>
+                  {next.pr ? (
+                    <a className="train-pr" href={`https://github.com/${repo}/pull/${next.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{next.pr}</a>
+                  ) : null}
                 </>
               ) : (
-                <span className="muted-note">{l.reason ?? "idle"}</span>
+                <span className="muted-note">—</span>
+              )}
+            </span>
+            <span className="trainc-queue">
+              {rest.length > 0 ? (
+                <>
+                  <span className="train-queue-label top-num" title="the derived queue AFTER the next head — oldest first, click a card to open it">
+                    +{rest.length} waiting
+                  </span>
+                  {rest.map((q) => (
+                    <Chip
+                      key={q.id}
+                      tone={q.priority === "critical" ? "urgent" : "scope"}
+                      className="train-queue-card"
+                      onClick={() => openTask?.(q.id)}
+                      title={`${q.id} — ${q.priority === "critical" ? "boosted (priority 0)" : "normal priority"}${q.pr ? ` · PR #${q.pr}` : ""}`}
+                    >
+                      {q.id}{q.pr ? ` ·#${q.pr}` : ""}
+                    </Chip>
+                  ))}
+                </>
+              ) : (
+                <span className="muted-note">{next ? "queue empty after next" : "queue empty"}</span>
               )}
             </span>
           </div>

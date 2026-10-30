@@ -505,6 +505,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .trainc-status { display: flex; align-items: center; gap: 6px; overflow: hidden; }
 .trainc-info { display: flex; align-items: center; gap: 10px; overflow: hidden; }
 .trainc-info .muted-note { overflow: hidden; text-overflow: ellipsis; }
+/* BR#5114 NOW / NEXT / QUEUE columns: three labeled time-frames per lane. */
+.trainc-now { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; overflow: hidden; }
+.train-now-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.train-now-note { font-size: 11px; color: var(--text-dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
+.train-now-note::before { content: "▸ "; color: var(--accent); }
+.trainc-next { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.trainc-queue { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; flex-wrap: wrap; }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
@@ -954,11 +961,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* per-table column templates — layout lives ONLY here, as --cols */
 .top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
-.train-head-cols, .train-row { --cols: 30px minmax(220px, 0.9fr) 210px minmax(260px, 1fr); }
+.train-head-cols, .train-row { --cols: 30px minmax(190px, 0.8fr) minmax(280px, 1.2fr) minmax(130px, 0.55fr) minmax(220px, 1fr); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
   .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
-  .train-head-cols, .train-row { --cols: 26px minmax(150px, 0.8fr) 170px minmax(180px, 1fr); }
+  /* narrow: NEXT folds into QUEUE (the next head renders as the first chip) */
+  .train-head-cols, .train-row { --cols: 26px minmax(150px, 0.8fr) minmax(200px, 1fr) minmax(180px, 1fr); }
+  .trainc-next { display: none; }
   .train-tp-rate { display: none; }
 }
 

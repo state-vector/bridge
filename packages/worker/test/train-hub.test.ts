@@ -1602,3 +1602,59 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     expect(lane.starved).toBeNull();
   });
 });
+
+// ---------- BR#5114: NOW / NEXT / QUEUE — the progress seam + queue PRs ----------
+// The panel restructure needs two hub facts: the lease holder's live last
+// action (BR#4104 put it on every renewal; the hub discarded it — "consuming
+// it is the filed follow-up") and the derived queue entries naming their PRs
+// ("card · #pr", not a bare id). These drills pin both.
+
+describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled worker)", () => {
+  it("a renewal carrying proof-of-progress stamps meta.lane.now_action — train.status surfaces it and the queue entries name their PRs", async () => {
+    const repo = "state-vector/lane-now";
+    await acquire(repo, "gw-now", { merge_capable: true, required_workflows: ["Test"] });
+    const card = await queueViaAccept({ repo, pr: 51141, head: "b".repeat(40), title: "IMPL: now-line drill" });
+
+    // the executor gates the head, holds, and renews carrying its last
+    // action (the exact BR#4104 wire shape train.rs sends every tick)
+    const ren = await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-now", merge_capable: true,
+      progress: { progress: `PR #51141 (${card}): head checks unsettled (Test) — not yet, skip this tick`, progress_age_ms: 1_000, holder: "gw-now" },
+    });
+    expect(ren.body.error ?? "", `renew failed: ${JSON.stringify(ren.body)}`).toBe("");
+
+    // the snapshot carries BOTH new facts for the panel
+    const st = await kbJson("/train.status", { repo });
+    const lane = st.body.lanes[0];
+    expect(lane.now_action?.note).toContain("head checks unsettled");
+    expect(lane.now_action?.holder).toBe("gw-now");
+    expect(typeof lane.now_action?.at).toBe("number");
+    expect(lane.queue.length).toBeGreaterThan(0);
+    expect(lane.queue[0].id).toBe(card);
+    expect(lane.queue[0].pr).toBe(51141);
+
+    // persisted on the lane card (laneSyncReason only writes on reason
+    // CHANGE — the stamp needs its own persist, the stale-snapshot trap)
+    const meta = (await kbJson("/get", { id: lane.card })).body.meta;
+    expect(meta.lane.now_action?.note).toContain("head checks unsettled");
+
+    // a SECOND renewal with a different note refreshes the NOW line in place
+    await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-now", merge_capable: true,
+      progress: { progress: "CI poll on ccccccccc: pending (Test)", progress_age_ms: 1_000, holder: "gw-now" },
+    });
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane2.now_action?.note).toContain("CI poll on ccccccccc");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-now" });
+  });
+
+  it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
+    const repo = "state-vector/lane-legacy-renew";
+    await acquire(repo, "gw-leg", { merge_capable: true });
+    const ren = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-leg", merge_capable: true });
+    expect(ren.body.error ?? "").toBe("");
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.now_action ?? null).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-leg" });
+  });
+});

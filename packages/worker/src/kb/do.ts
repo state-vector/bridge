@@ -7554,6 +7554,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (body.merge_capable === true && meta.lane.starved_since) {
       meta.lane.starved_since = null; // a capable executor is back — episode over
     }
+    // BR#5114: consume the proof-of-progress seam. BR#4104 put the holder's
+    // last action + age on every renewal; the hub discarded it ("consuming
+    // it is the filed follow-up"). Persist the latest as the lane's NOW
+    // line — WHAT the holder is doing this minute (the trains panel renders
+    // it; a stale one ages out client-side against the 5-min lease TTL).
+    const progNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
+    if (action === "renew" && progNote) {
+      meta.lane = { ...meta.lane, now_action: { note: progNote, holder, at: now } };
+    }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
     if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null || body.burst_max != null)) {
@@ -7568,6 +7577,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (meta.currently?.phase === "stopped") meta.currently = null;
     }
     const reason = this.laneSyncReason(lane.id, meta, now);
+    // BR#5114: laneSyncReason persists only on a reason CHANGE — the
+    // now_action stamp refreshes every renewal without one, so persist it
+    // explicitly (idempotent; ~1 write per lane per tick).
+    if (action === "renew" && progNote) {
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    }
     this.audit(actor, `train:lease_${action}`, lane.id, { lane: laneKey(repo, base), note: decided.note });
     this.version(lane.id, actor, `train:lease_${action}`, decided.note, { lease: meta.lease, reason });
     return { ok: true, lane: laneKey(repo, base), lease: meta.lease, currently: meta.currently ?? null, stop: meta.stop ?? null, reason, note: decided.note };
@@ -8822,6 +8837,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // let a second base's lane (e.g. a retired drill base) inherit the
       // whole repo queue
       return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo, base);
+    }).map((c) => {
+      // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
+      // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
+      const cm = JSON.parse(cards.find((x) => x.id === c.id)!.meta ?? "{}");
+      const leg = trainLegsRemaining(cm, repo, base)[0];
+      const pr = Number(leg?.number ?? 0) || 0;
+      return { ...c, ...(pr ? { pr } : {}) };
     });
   }
 
@@ -8991,6 +9013,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         required_workflows: lane.required_workflows,
         burst_max: lane.burst_max,
         reason: String(meta.blocked?.reason ?? ""),
+        // BR#5114: the holder's live last action (BR#4104 seam) — WHAT the
+        // executor is doing right now, verbatim from its own tick log; the
+        // panel renders it as the NOW line and ages it out at the lease TTL
+        now_action: meta.lane?.now_action ?? null,
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,
         starved,

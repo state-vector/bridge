@@ -178,7 +178,12 @@ export interface KbTrainLane {
    *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
-  queue: { id: string; priority: "critical" | "normal" }[];
+  /** BR#5114: the lease holder's live last action, verbatim from the
+   *  executor's tick log (BR#4104 proof-of-progress seam, hub-consumed) —
+   *  WHAT is being done right now and why a held head is held. Ages out at
+   *  the 5-min lease TTL; null when no holder has reported. */
+  now_action?: { note: string; holder: string; at: number } | null;
+  queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

@@ -469,6 +469,18 @@ only a lane with no capable tick inside the window says the muted pill `no gatew
 a gate in progress on the queue head reads `attempting` (with the head card and the
 last ledger action in the tooltip); a protection-blocked head reads `⏸ bypass wait`;
 a retired lane reads `retired`.
+The lane row is three labeled time-frames (BR#5114, Ray 2026-10-30: "I want to know
+WHAT is being done right now and progress, what is up next, what is in the queue
+remaining"): **NOW** — the status pill + in-flight PR + phase age PLUS the holder's
+live last action verbatim from its tick log (the BR#4104 proof-of-progress seam,
+hub-consumed: `meta.lane.now_action`, rendered only while fresh against the 5-minute
+lease TTL — a held head SAYS why it is held, e.g. "PR #2588: head check RED:
+Meta-review nightly", instead of a bare `gate` pill for hours); **NEXT** — the first
+queued card + its PR; **QUEUE** — the remaining cards with their PRs and depth. The
+executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the gate
+outcome), the hub persists the latest renewal note, and the throughput rate + last
+completed event (with age) close the NOW column so "last" and "now" are never
+conflated again.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>

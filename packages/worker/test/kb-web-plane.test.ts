@@ -225,8 +225,14 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
   });
 
   it("renders the derived queue as clickable card chips with the lane's stop-the-line flag", () => {
-    expect(trainPanelSrc).toMatch(/l\.queue\.map/);
+    // BR#5114: the queue renders in TWO labeled time-frames — NEXT (the
+    // first queued head, card + PR) and QUEUE (the remaining chips, each
+    // card carrying its PR) — never one unlabeled pile
+    expect(trainPanelSrc).toMatch(/const next = l\.queue\[0\]/);
+    expect(trainPanelSrc).toMatch(/const rest = l\.queue\.slice\(1\)/);
+    expect(trainPanelSrc).toMatch(/rest\.map/);
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(next\.id\)/);
     expect(trainPanelSrc).toContain("stop-the-line");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
@@ -236,9 +242,11 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // in-flight phase + duration (since the merge stamped merged_at)
     expect(trainPanelSrc).toMatch(/l\.currently\.phase/);
     expect(trainPanelSrc).toMatch(/age\(l\.currently\.merged_at, now\)/);
-    // queue depth with the head named
-    expect(trainPanelSrc).toMatch(/depth \{l\.queue\.length\}/);
-    expect(trainPanelSrc).toContain("head ${l.queue[0].id}");
+    // BR#5114: the NOW line — the holder's live last action (why a held
+    // head is held), aged out at the lease TTL, never a stale "now"
+    expect(trainPanelSrc).toMatch(/l\.now_action/);
+    expect(trainPanelSrc).toMatch(/nowAction\(l, now\)/);
+    expect(trainPanelSrc).toContain("ageSec > 300");
     // throughput rate over trailing windows + the last ledger event
     expect(trainPanelSrc).toMatch(/l\.activity\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
