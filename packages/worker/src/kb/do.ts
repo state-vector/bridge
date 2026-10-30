@@ -76,6 +76,7 @@ import {
   laneCardTitle,
   laneCardBody,
   laneOfMeta,
+  parseBurstMax,
   type LaneSpec,
   leaseDecide,
   mergeTrainQueue,
@@ -3029,6 +3030,8 @@ export class KnowledgeHub {
         case "train.ci": return this.json(await this.trainCi(body, actor));
         case "train.status": return this.json(await this.trainStatus(body));
         case "train.history": return this.json(await this.trainHistory(body));
+        case "train.bisect": return this.json(await this.trainBisect(body, actor));
+        case "train.carry": return this.json(await this.trainCarry(body, actor));
         case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
@@ -7204,13 +7207,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         throw new Error(`lane retired — ${key}'s lane card ${existing.id} is ${existing.status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card to re-arm`);
       }
       // config updates ride the op that knows better (operator/executor):
-      // required_workflows / ci_typical_minutes refresh in place.
+      // required_workflows / ci_typical_minutes / burst_max refresh in place.
       const cur = laneOfMeta(existing.meta);
-      if (cfg && cur && (cfg.required_workflows || cfg.ci_typical_minutes != null) &&
+      if (cfg && cur && (cfg.required_workflows || cfg.ci_typical_minutes != null || cfg.burst_max != null) &&
           (JSON.stringify(cfg.required_workflows ?? cur.required_workflows) !== JSON.stringify(cur.required_workflows) ||
-            (cfg.ci_typical_minutes ?? cur.ci_typical_minutes) !== cur.ci_typical_minutes)) {
+            (cfg.ci_typical_minutes ?? cur.ci_typical_minutes) !== cur.ci_typical_minutes ||
+            (cfg.burst_max ?? cur.burst_max) !== cur.burst_max)) {
         const meta = JSON.parse(existing.meta ?? "{}");
-        meta.lane = { ...meta.lane, ...(cfg.required_workflows ? { required_workflows: cfg.required_workflows } : {}), ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}) };
+        meta.lane = { ...meta.lane, ...(cfg.required_workflows ? { required_workflows: cfg.required_workflows } : {}), ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}), ...(cfg.burst_max != null ? { burst_max: parseBurstMax(cfg.burst_max) } : {}) };
         meta.lane.key = key;
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), existing.id);
         this.audit(actor, "train_lane_config", existing.id, { lane: meta.lane });
@@ -7224,10 +7228,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (raw) {
         const map = JSON.parse(raw);
         const s = map?.[key] ?? {};
-        seeded = { required_workflows: Array.isArray(s.required_workflows) ? s.required_workflows.map(String) : undefined, ci_typical_minutes: typeof s.ci_typical_minutes === "number" ? s.ci_typical_minutes : undefined, ...seeded };
+        seeded = { required_workflows: Array.isArray(s.required_workflows) ? s.required_workflows.map(String) : undefined, ci_typical_minutes: typeof s.ci_typical_minutes === "number" ? s.ci_typical_minutes : undefined, ...seeded, burst_max: parseBurstMax(seeded.burst_max ?? s.burst_max) };
       }
     } catch { /* no/broken setting — defaults hold */ }
-    const lane: LaneSpec = { repo, base, required_workflows: seeded.required_workflows ?? [], ci_typical_minutes: seeded.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES };
+    const lane: LaneSpec = { repo, base, required_workflows: seeded.required_workflows ?? [], ci_typical_minutes: seeded.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES, burst_max: parseBurstMax(seeded.burst_max) };
     const alarmSink = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const created = await this.create(
       {
@@ -7302,9 +7306,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // BR#4753: a failing landed close names itself — the wedge forming is
       // visible on the lane card, not silent behind a settling reason
       const lc = currently.landed_close as any;
-      reason = lc
-        ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)${nextNote}`
-        : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight${nextNote}, heads held until main settles${bwNote}`;
+      // BR#4934 burst phases: mid-drain the lane says it is merging
+      // back-to-back; settling names the pass so the queue knows a settle is
+      // pending. Legacy executors (no burst fields) keep the BR#4804 strings
+      // byte-identical (with BR#4981's nextNote/bwNote suffixes) — the
+      // strings are dedupe/pin surfaces.
+      if (currently.phase === "bursting") {
+        reason = `merge-train: leased${who} — merging burst (${Number(currently.burst_merged ?? 0)} merged, cap ${currently.burst_cap === 0 ? "unlimited" : Number(currently.burst_cap ?? 0)}) — settle pending`;
+      } else if (currently.burst_merged != null && !lc) {
+        reason = `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} after ${Number(currently.burst_merged)} merges (PR #${currently.pr}): build/deploy in flight${nextNote}, heads held until main settles${bwNote}`;
+      } else
+        reason = lc
+          ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)${nextNote}`
+          : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight${nextNote}, heads held until main settles${bwNote}`;
     } else if (bw) reason = `merge-train: awaiting bypass merge — PR #${bw.pr} by ${bw.task_id ?? "?"} blocked on branch protection (review/required checks a machine cannot satisfy); a human merge is the unblock, self-clears when it lands${queue.length ? ` — the walk continues on the other ${queue.length} queued head(s)` : ""}`;
     else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
@@ -7425,8 +7439,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
-    if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null)) {
-      meta.lane = { ...meta.lane, ...(body.required_workflows ? { required_workflows: (body.required_workflows as unknown[]).map(String).filter(Boolean) } : {}), ...(body.ci_typical_minutes != null ? { ci_typical_minutes: Number(body.ci_typical_minutes) } : {}) };
+    if (action === "acquire" && (body.required_workflows || body.ci_typical_minutes != null || body.burst_max != null)) {
+      meta.lane = { ...meta.lane, ...(body.required_workflows ? { required_workflows: (body.required_workflows as unknown[]).map(String).filter(Boolean) } : {}), ...(body.ci_typical_minutes != null ? { ci_typical_minutes: Number(body.ci_typical_minutes) } : {}), ...(body.burst_max != null ? { burst_max: parseBurstMax(body.burst_max) } : {}) };
       meta.lane.key = laneKey(repo, base);
     }
     if (action === "release" && body.line_green) {
@@ -7505,6 +7519,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the executor may report its own merge wall-clock (BR#4804 settle
       // clock): clamp to now — a future stamp would fake a settled lane
       const mergedAt = Math.min(Number(body.merged_at) || now, now);
+      // BR#4934 burst payload: the drain pass rides the merged event —
+      // burst_merged (merges in this pass, including this one), burst_cap,
+      // burst_settling (true = the pass's FINAL merge; the lane settles on
+      // it now). No payload → legacy single-merge cadence, byte-identical.
+      const burstMerged = body.burst_merged != null ? Math.max(0, Math.floor(Number(body.burst_merged) || 0)) : null;
+      const burstCap = body.burst_cap != null ? Math.max(0, Math.floor(Number(body.burst_cap) || 0)) : null;
+      const burstSettling = body.burst_settling === true;
       const chain = this.trainChain(String(body.task_id ?? "") || null);
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
@@ -7546,15 +7567,32 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           }
         }
       }
-      meta.currently = { pr, merge_sha: mergeSha, head_sha: headSha, merged_at: mergedAt, phase: "awaiting-ci", task_id: chain.task_id };
+      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      meta.currently = {
+        pr,
+        merge_sha: mergeSha,
+        head_sha: headSha,
+        merged_at: mergedAt,
+        // BR#4934: a non-settling burst merge keeps the lane in the
+        // "bursting" drain phase (no settle wait between merges); the final
+        // merge — or any legacy merge — enters the awaiting-ci settle.
+        phase: burstMerged != null && !burstSettling ? "bursting" : "awaiting-ci",
+        task_id: chain.task_id,
+        ...burstFields,
+      };
       // BR#4981: a landing clears the lane's bypass-wait for that PR — the
       // typed self-clear, covering the human/admin bypass merge too (the
       // executor's walk stamps the merged event from live state when it next
       // sees the PR MERGED, train.rs:848).
       if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")) }, chain.task_id);
-      this.version(lane.id, actor, `train:${kind}`, `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`, { currently: meta.currently, reason });
+      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined }, chain.task_id);
+      const laneNote = burstMerged == null
+        ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
+        : burstSettling
+          ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — burst pass settled (${burstMerged} merged), awaiting main CI on the final merge`
+          : `PR #${pr} merged as ${mergeSha.slice(0, 9)} — merging burst (${burstMerged} merged, cap ${burstCap === 0 ? "unlimited" : burstCap}), no settle between merges`;
+      this.version(lane.id, actor, `train:${kind}`, laneNote, { currently: meta.currently, reason });
       return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, reason };
     }
 
@@ -7767,7 +7805,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, ask: reviewAskId });
       this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)${reviewAskId ? ` — review ask ${reviewAskId}${reviewAskDeduped ? " refreshed (deduped)" : " filed"}` : ""}`, {});
-      meta.currently = null;
+      // BR#4934: the lane forgets the in-flight merge ONLY when the bounced
+      // card IS that merge's card — a bounce of a QUEUED candidate (a
+      // mid-drain gate bounce or a settle-window rebase conflict) must not
+      // destroy the burst pass / settle record it parked behind.
+      const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
+      meta.currently = inFlightBounced ? null : meta.currently;
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
       const laneNote =
@@ -7788,7 +7831,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
       // BR#4981 state 6: the stop names the culprit card so the panel reads
       // "STOP THE LINE — base red, fix card BR#X" without a ledger dig.
-      meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}) };
+      // BR#4934: a stop under a burst pass pre-stamps the bisect record —
+      // the bisect walk's state lives HERE (hub-side, crash-safe): the
+      // pass's merge count + per-sha step verdicts + the named culprit.
+      // Legacy stops keep the exact legacy shape (no bisect key beyond the
+      // culprit_task the BR#4981 vocabulary names).
+      const burstStop = meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
+      meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
       // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
       if (culprit && meta.currently) {
@@ -7860,6 +7909,71 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return this.landedFlowGuarded(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
   }
 
+  /** BR#4934 burst parks: on a GREEN settle of a burst pass, every parked
+   *  card whose awaiting-ci leg merge sha is an ANCESTOR of the settled head
+   *  closes — its runs were cancelled-by-next-push (GH#2261 law: cancelled
+   *  says nothing), the settled green pass is the evidence, and the ancestry
+   *  is EXECUTOR-FED (burst_ancestors via train.ci) because the hub holds no
+   *  VCS credentials (BR#3516). Stamps the leg landed citing the evidence
+   *  sha, then closes cards with no remaining legs via the lifecycle-legal
+   *  blocked→in_progress→done. Never throws: an intermediate-close failure
+   *  is audited and skipped — it must never bounce the pass's final card
+   *  (landedFlow's close-bounce ladder owns that card). */
+  private async closeBurstParks(lane: any, meta: any, actor: string, settledSha: string, now: number): Promise<number> {
+    const laneSpec = laneOfMeta(meta);
+    const cur: any = meta.currently ?? {};
+    const ancestors: string[] = Array.isArray(cur.burst_ancestors) ? cur.burst_ancestors.map(String) : [];
+    if (!laneSpec || !ancestors.length || cur.burst_merged == null) return 0;
+    const settled = settledSha.toLowerCase();
+    const evidence = new Set(ancestors.map((s) => s.toLowerCase()));
+    const parked = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+    ).toArray() as any[];
+    let closed = 0;
+    for (const row of parked) {
+      if (row.id === cur.task_id) continue; // the final card — landedFlow owns it
+      try {
+        const cm = JSON.parse(row.meta ?? "{}");
+        const legs = trainLegs(cm);
+        const leg = legs.find((l) => (l.repo === laneSpec.repo || !l.repo) && String(cm.merge_train?.legs?.[String(l.number)]?.state ?? "") === "awaiting-ci");
+        if (!leg) continue;
+        const legRec = cm.merge_train?.legs?.[String(leg.number)] ?? {};
+        const legSha = String(legRec.merge_sha ?? "").toLowerCase();
+        if (!legSha || legSha === settled || !evidence.has(legSha)) continue;
+        const legsMap = { ...(cm.merge_train?.legs ?? {}), [String(leg.number)]: { ...legRec, state: "landed", landed_at: now, via: "burst-settle", evidence_sha: settledSha } };
+        cm.merge_train = { ...(cm.merge_train ?? {}), legs: legsMap };
+        const remaining = trainLegsRemaining(cm);
+        this.state.storage.sql.exec(
+          `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+          now, laneSpec.repo, laneSpec.base, actor, leg.number, row.id, String(legRec.merge_sha), JSON.stringify({ burst: true, evidence_sha: settledSha, pass_merged: Number(cur.burst_merged) }),
+        );
+        if (remaining.length) {
+          // legs remain on other lanes/repos — stay queued, honestly named
+          const next = remaining[0];
+          cm.merge_train = { ...cm.merge_train, state: "queued", pr: next.number, repo: next.repo, remaining: remaining.length };
+          cm.blocked = { ...(cm.blocked ?? {}), reason: trainQueueRemainingReason(cm) };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, row.id);
+          this.audit(actor, "train:burst_leg_landed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: leg.number, task: row.id, evidence_sha: settledSha, remaining: remaining.map((l) => l.number) });
+          this.version(row.id, actor, "train:landed", `burst-settle: PR #${leg.number} leg stamped landed — its pass settled green at ${settledSha.slice(0, 9)} (ancestor evidence, runs cancelled-by-next-push); ${remaining.length} leg(s) remain`, {});
+          continue;
+        }
+        const note = `Burst-settle close (BR#4934): PR #${leg.number} merged as ${String(legRec.merge_sha).slice(0, 9)} — its runs were cancelled-by-next-push (GH#2261: cancelled says nothing); the pass settled GREEN at ${settledSha.slice(0, 9)} and this sha is a fed git ancestor of it. Closed by the merge train's burst-drain settle, zero hub GitHub calls.`;
+        if (row.status === "blocked") await this.transition({ id: row.id, to: "in_progress", session: "", note: `merge-train: landed — closing on the burst pass's green settle (evidence ${settledSha.slice(0, 9)})`, merge_train: true }, actor);
+        await this.transition({ id: row.id, to: "done", session: "", note }, actor);
+        cm.merge_train = { ...cm.merge_train, state: "landed", pr: leg.number, merge_sha: legRec.merge_sha, landed_at: now, burst_evidence: settledSha };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, row.id);
+        this.audit(actor, "train:burst_park_closed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: leg.number, task: row.id, merge_sha: legRec.merge_sha, evidence_sha: settledSha });
+        this.version(row.id, actor, "train:landed", `burst-settle: card closed — merge sha ${String(legRec.merge_sha).slice(0, 9)} is an ancestor of the green-settled pass head ${settledSha.slice(0, 9)}`, {});
+        closed += 1;
+      } catch (e) {
+        this.audit(actor, "train:burst_park_error", lane.id, { task: row.id, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+    }
+    if (closed) this.version(lane.id, actor, "train:landed", `burst-settle: ${closed} parked card(s) closed on the pass's green settle (ancestor evidence, BR#4934)`, {});
+    return closed;
+  }
+
   /** The landed close: impl card blocked→in_progress→done (lifecycle law:
    *  blocked→done is illegal) citing mergeCommit + main green — the machine
    *  proxy — then the lane idles and the derived queue advances. */
@@ -7893,6 +8007,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           cm.merge_train = { ...cm.merge_train, state: "queued", pr: next.number, repo: next.repo, remaining: remaining.length };
           cm.blocked = { ...(cm.blocked ?? {}), reason: trainQueueRemainingReason(cm) };
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, taskId);
+          await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
           meta.currently = null;
           const reason = this.laneSyncReason(lane.id, meta, now);
           this.state.storage.sql.exec(
@@ -7918,6 +8033,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
       }
     }
+    // BR#4934: the pass settled green — parked intermediate cards whose fed
+    // ancestry proves they ride this pass close here (before currently, and
+    // the burst_ancestors it carries, is cleared).
+    await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
     meta.currently = null;
     const reason = this.laneSyncReason(lane.id, meta, now);
     this.state.storage.sql.exec(
@@ -7961,6 +8080,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (taskId) {
         const card = this.one(`SELECT status FROM artefacts WHERE id = ?`, taskId);
         if (card && (card.status === "done" || card.status === "superseded")) {
+          // BR#4934: a repaired close still owes the pass its burst parks —
+          // the previous tick closed the final card then faulted.
+          await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
           meta.currently = null;
           const reason = this.laneSyncReason(lane.id, meta, now);
           this.audit(actor, "train:landed_close_repaired", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, error: error.slice(0, 160) });
@@ -8105,6 +8227,34 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const sha = String(body.sha ?? "");
     if (sha && String(meta.currently.merge_sha).toLowerCase() !== sha.toLowerCase())
       throw new Error(`stale CI report — the lane's in-flight merge is ${String(meta.currently.merge_sha).slice(0, 9)}, not ${sha.slice(0, 9)}`);
+    // BR#4934: the FIRST settle feed on a bursting lane flips phase →
+    // awaiting-ci — the drain is over, the pass settles on the final merge.
+    // Persisted immediately: every decision arm below (and the stopped flow
+    // it may call) re-reads the lane.
+    // ancestors_of_settled (BR#4934): executor-fed git ancestry — the pass's
+    // intermediate merge shas that ARE ancestors of the settled head. The hub
+    // holds no VCS creds (BR#3516); on a green verdict these close the pass's
+    // parked cards (their runs were cancelled-by-next-push, GH#2261 law:
+    // cancelled says nothing). Sha-shaped entries only — junk drops.
+    let burstFlipped = false;
+    if (meta.currently.phase === "bursting") {
+      meta.currently = { ...meta.currently, phase: "awaiting-ci" };
+      burstFlipped = true;
+    }
+    let ancestorsStamped = false;
+    if (Array.isArray(body.ancestors_of_settled) && meta.currently.burst_merged != null) {
+      const fed = (body.ancestors_of_settled as unknown[]).map((s) => String(s ?? "").toLowerCase()).filter((s) => /^[0-9a-f]{7,40}$/.test(s));
+      meta.currently = { ...meta.currently, burst_ancestors: [...new Set(fed)] };
+      ancestorsStamped = true;
+    }
+    if (burstFlipped || ancestorsStamped) {
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+      this.audit(actor, burstFlipped ? "train:burst_settle_begin" : "train:burst_ancestors", lane.id, {
+        lane: laneKey(repo, base),
+        merged: Number(meta.currently.burst_merged ?? 0),
+        ...(ancestorsStamped ? { ancestors: (meta.currently.burst_ancestors as string[]).length } : {}),
+      });
+    }
     const checks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
     const laneSpec = laneOfMeta(meta)!;
     const v: RequiredRunsVerdict = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
@@ -8129,6 +8279,180 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const reason = this.laneSyncReason(lane.id, { ...meta, currently: { ...meta.currently } }, now);
     this.audit(actor, "train:ci_pending", lane.id, { lane: laneKey(repo, base), pending: v.pending, missing: v.missing });
     return { ok: true, decided: "pending", lane: laneKey(repo, base), pending: v.pending, missing: v.missing, reason };
+  }
+
+  /** train.bisect (BR#4934): the red-settle walk while the line is stopped
+   *  on a burst-red settle. The executor probes the pass's intermediate
+   *  merge shas OLDEST→NEWEST (one step per tick) and feeds verdicts; the
+   *  hub stamps them on stop.bisect — the walk state lives hub-side,
+   *  crash-safe, so any executor can pick the walk up mid-flight. A RED
+   *  step names the ONE culprit: the hub stamps it, bounces the culprit
+   *  card (fix-forward brief, verdict invalidated, BR#4068 boost), and
+   *  RE-PARKS the wrongly stop-bounced final card (in_progress→blocked,
+   *  awaiting-ci stamp restored) so it closes on the NEXT green settle via
+   *  ancestor evidence. inconclusive stamps the walk failed — the executor
+   *  then bounces the pass oldest-first, one per tick. Requires the lease. */
+  private async trainBisect(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const lease: TrainLease | null = meta.lease ?? null;
+    if (!lease || lease.holder !== actor) throw new Error(`train.bisect requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    const stop: any = meta.stop;
+    if (!stop) throw new Error("train.bisect requires a stopped lane — no stop stamped");
+    if (!stop.bisect) throw new Error("train.bisect requires a burst-red stop — a legacy stop bisects nothing (BR#4934)");
+    const now = Date.now();
+    const step = body.step;
+    if (step != null) {
+      const sha = String(step.sha ?? "").toLowerCase();
+      const verdict = String(step.verdict ?? "");
+      if (!/^[0-9a-f]{7,40}$/.test(sha)) throw new Error("train.bisect step needs a sha-shaped sha");
+      if (!["green", "red", "dispatched", "inconclusive"].includes(verdict))
+        throw new Error("train.bisect step.verdict must be green | red | dispatched | inconclusive");
+      const prev = stop.bisect.steps[sha];
+      stop.bisect.steps[sha] = typeof prev === "object" && prev ? { ...prev, verdict, at: now } : { verdict, at: now };
+    }
+    if (body.inconclusive === true) stop.bisect.inconclusive = true;
+    let bounced: string | null = null;
+    let reparked: string | null = null;
+    const culpritTask = body.culprit_task != null ? String(body.culprit_task).trim() : "";
+    if (culpritTask) {
+      const culpritSha = String(body.culprit_sha ?? "").toLowerCase() || null;
+      stop.bisect.culprit_task = culpritTask;
+      stop.bisect.culprit_sha = culpritSha;
+      stop.bisect.named_at = now;
+      const finalTask: string | null = meta.currently?.task_id ?? null;
+      if (culpritTask !== finalTask) {
+        // ---- bounce the true culprit (the stop flow bounced the FINAL
+        // card; the walk's oldest-RED intermediate is the real one) ----
+        const card = this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, culpritTask);
+        if (card) {
+          const cm = JSON.parse(card.meta ?? "{}");
+          const pr = Number(cm.merge_train?.pr ?? cm.pr?.number ?? 0);
+          const defect = `bisect (BR#4934): merge sha ${culpritSha ?? "?"} is the pass's OLDEST RED probe — this merge broke main; fix forward or revert, then re-enter review`;
+          const lines = [
+            `Merge-train bisect verdict: your PR #${pr} landed as ${String(culpritSha ?? "").slice(0, 9)} and is the pass's oldest RED merge — the burst settle stopped the line on it.`,
+            `The burst pass settled red on a later head; the per-sha probes named THIS merge as the culprit (BR#4934 red-settle bisect).`,
+            ``,
+            `Fix forward or revert, then re-enter review. The lane stays stopped until main is green again (BR#3516 §6).`,
+          ];
+          try {
+            const nextMeta = {
+              ...cm,
+              boosted: now,
+              merge_train: { ...(cm.merge_train ?? {}), state: "bounced", bounce_kind: "gate", bisect_culprit: true, culprit_sha: culpritSha ?? undefined, defect: defect.slice(0, 300), bounced_at: now, pr, repo },
+            };
+            const bodyMd = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bisect[\s\S]*$/, "")}\n\n---\n\n${lines.join("\n")}`;
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), bodyMd, now, culpritTask);
+            if (card.status === "blocked") {
+              await this.transition({ id: culpritTask, to: "in_progress", session: "", note: `merge-train bisect — your merge ${String(culpritSha ?? "").slice(0, 9)} broke main (oldest RED probe); fix forward or revert` }, actor);
+            }
+            this.audit(actor, "boost", culpritTask, { root: culpritTask, via: "train:bisect", pr });
+          } catch (e) {
+            this.audit(actor, "train:bisect_bounce_refused", lane.id, { task: culpritTask, error: String((e as Error)?.message ?? e).slice(0, 200) });
+          }
+          bounced = culpritTask;
+        }
+        // ---- re-park the wrongly stop-bounced final card: blocked again,
+        // awaiting-ci stamp restored — the next green settle closes it via
+        // ancestor evidence (its merge sha is already on base) ----
+        if (finalTask) {
+          const fin = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, finalTask);
+          if (fin && fin.status === "in_progress") {
+            try {
+              const fm = JSON.parse(fin.meta ?? "{}");
+              fm.merge_train = { ...(fm.merge_train ?? {}), state: "awaiting-ci", reparked_at: now, reparked_by: "bisect" };
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(fm), now, finalTask);
+              await this.transition(
+                {
+                  id: finalTask,
+                  to: "blocked",
+                  session: "",
+                  note: `merge-train: re-parked — the bisect named another culprit (${String(culpritSha ?? "?").slice(0, 9)} RED); this card closes on the next green settle via ancestor evidence (BR#4934)`,
+                  merge_train: true,
+                  unblock_condition: "the merge train advances this card — it closes on the next green settle via ancestor evidence (BR#4934)",
+                },
+                actor,
+              );
+              reparked = finalTask;
+            } catch (e) {
+              this.audit(actor, "train:bisect_repark_refused", lane.id, { task: finalTask, error: String((e as Error)?.message ?? e).slice(0, 200) });
+            }
+          }
+        }
+      }
+    }
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    const stepsShown = Object.entries(stop.bisect.steps ?? {}).map(([s, v]: [string, any]) => `${s.slice(0, 9)}=${typeof v === "object" ? v.verdict : v}`).join(", ") || "none";
+    this.audit(actor, "train:bisect", lane.id, {
+      lane: laneKey(repo, base),
+      step: step != null ? { sha: String(step.sha ?? "").toLowerCase(), verdict: String(step.verdict ?? "") } : null,
+      culprit: culpritTask || null,
+      inconclusive: stop.bisect.inconclusive === true,
+      bounced,
+      reparked,
+    });
+    this.version(lane.id, actor, "train:bisect", `bisect walk: steps [${stepsShown}]${culpritTask ? ` — culprit ${culpritTask}${stop.bisect.culprit_sha ? ` @ ${String(stop.bisect.culprit_sha).slice(0, 9)}` : ""}${bounced ? " (bounced, final re-parked)" : " (the stop-bounced final card — bounce already stands)"}` : ""}${stop.bisect.inconclusive ? " — INCONCLUSIVE (pass bounces oldest-first)" : ""}`, { stop: meta.stop });
+    return { ok: true, kind: "bisect", lane: laneKey(repo, base), stop: meta.stop, bounced, reparked };
+  }
+
+  /** train.carry (BR#4934 settle-window rebase): the executor ran a
+   *  machine-clean `gh pr update-branch` on a verdict-covered queued head
+   *  during the settle window; the hub appends the carry record (BR#3516 §5
+   *  shape) so the accepted verdict covers the moved head — a mechanical,
+   *  content-preserving update carries the verdict, no re-verify. The
+   *  executor never writes card meta: the carry law (contiguity at append
+   *  time, checked here against the walked chain end) stays hub-side,
+   *  executor-fed. NOTE (coordination, BR#4689 / PR #311): this is the
+   *  minimal carry primitive the settle window needs; L1.4 remains the
+   *  carry law's owner and supersedes this op's edges when it lands. */
+  private async trainCarry(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const pr = Number(body.pr ?? 0);
+    const fromHead = String(body.from_head ?? "").toLowerCase();
+    const toHead = String(body.to_head ?? "").toLowerCase();
+    const shaLike = (s: string) => /^[0-9a-f]{7,40}$/.test(s);
+    if (!pr) throw new Error("train.carry needs pr");
+    if (!shaLike(fromHead) || !shaLike(toHead)) throw new Error("train.carry needs sha-shaped from_head/to_head");
+    if (fromHead === toHead) throw new Error("train.carry: from_head == to_head — nothing moved, no carry");
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const lease: TrainLease | null = meta.lease ?? null;
+    if (!lease || lease.holder !== actor) throw new Error(`train.carry requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    const cards = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+    ).toArray() as any[];
+    for (const row of cards) {
+      const cm = JSON.parse(row.meta ?? "{}");
+      const leg = trainLegs(cm).find((l) => l.number === pr && (l.repo === repo || !l.repo));
+      if (!leg) continue;
+      // contiguity at append time (BR#3516 §5): the carry may only extend
+      // the walked chain end — a gap would silently unverify the head.
+      const chainEnd = (l: { head_sha_at_acceptance?: string | null; carry?: unknown }): string => {
+        let cur = String(l.head_sha_at_acceptance ?? "").toLowerCase();
+        for (const c of Array.isArray(l.carry) ? (l.carry as any[]) : []) {
+          const f = String(c?.from_head ?? "").toLowerCase();
+          const t = String(c?.to_head ?? "").toLowerCase();
+          if (!t || cur !== f) return cur; // a broken chain stops the walk
+          cur = t;
+        }
+        return cur;
+      };
+      const end = chainEnd(leg);
+      if (fromHead !== end)
+        throw new Error(`train.carry: from_head ${fromHead.slice(0, 9)} is not the verdict chain's end (${end.slice(0, 9)}) — carries append contiguously (BR#3516 §5)`);
+      const chain = this.trainChain(row.id);
+      const now = Date.now();
+      const next = carryAppendLeg(cm, pr, { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, row.id);
+      this.version(row.id, actor, "train_carry", `verdict carried across the settle-window machine update ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
+      this.audit(actor, "train:carry", lane.id, { lane: laneKey(repo, base), pr, task: row.id, from_head: fromHead, to_head: toHead });
+      return { ok: true, kind: "carry", lane: laneKey(repo, base), task: row.id, pr, from_head: fromHead, to_head: toHead };
+    }
+    throw new Error(`train.carry: no queued card on ${repo}@${base} rides PR #${pr} — carries feed only the lane's queued heads`);
   }
 
   /** The ACCEPT hook (verify-side convention, BR#3516 §1): a verify duty
@@ -8441,6 +8765,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         stop: meta.stop ?? null,
         bypass_wait: meta.bypass_wait ?? null,
         required_workflows: lane.required_workflows,
+        burst_max: lane.burst_max,
         reason: String(meta.blocked?.reason ?? ""),
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,

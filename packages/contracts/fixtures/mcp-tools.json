@@ -154,6 +154,21 @@
       "required": []
     },
     {
+      "name": "train_bisect",
+      "required": [
+        "repo"
+      ]
+    },
+    {
+      "name": "train_carry",
+      "required": [
+        "repo",
+        "pr",
+        "from_head",
+        "to_head"
+      ]
+    },
+    {
       "name": "transition",
       "required": [
         "id",
