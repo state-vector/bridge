@@ -507,9 +507,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .trainc-info .muted-note { overflow: hidden; text-overflow: ellipsis; }
 /* BR#5114 round 3 (Ray's column spec): STATUS | CURRENT | PROGRESS | MSG | RATE | BACKLOG */
 .trainc-status { display: flex; align-items: center; gap: 6px; overflow: hidden; }
-.trainc-cur { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
-.train-cur-card { font-weight: 600; font-size: 12px; cursor: pointer; white-space: nowrap; }
-.train-cur-card:hover { color: var(--accent); }
 .trainc-prog { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .trainc-msg { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; overflow: hidden; }
 .train-now-note { font-size: 11px; color: var(--text-dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
@@ -983,12 +980,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* per-table column templates — layout lives ONLY here, as --cols */
 .top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
-.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) 150px 120px 110px minmax(220px, 1.2fr) 86px 150px; }
+.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) minmax(230px, 1.1fr) 120px minmax(200px, 1.1fr) 86px 160px; }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
   .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
   /* narrow: PROGRESS and RATE fold away; STATUS/CURRENT/MSG/BACKLOG stay */
-  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) 140px 110px minmax(180px, 1fr) 130px; }
+  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(200px, 1fr) minmax(170px, 1fr) 130px; }
   .trainc-prog, .trainc-rate { display: none; }
 }
 

@@ -1065,17 +1065,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
-        // BR#5114: the gate's verdict rides the proof-of-progress wire (the
-        // renewal carries ctx.last_action; the hub renders it as the lane's
-        // NOW line). A held head must SAY why it is held — "PR #N: checks
-        // red (names)" — not die in the gateway log while the panel shows a
-        // bare "gate" pill for hours.
-        match &gate {
-            MergeAction::Note { reason } | MergeAction::Skip { reason } => {
-                ctx.note(&format!("PR #{pr} ({head_id}): {reason}"));
-            }
-            _ => {}
-        }
 
         // ---- IDENTITY GATE (BR#3181, enforced at the write boundary) ----
         // close / update-branch / merge execute only under the worker-class
@@ -1096,22 +1085,25 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             return Ok(());
         }
 
-        // ONE action per tick (strict serialization): whatever the gate
-        // decided — merge, bounce, close, note, human leg — the walk ends
-        // here; the next tick re-derives the queue and continues. THE ONE
-        // EXCEPTION is the merge itself (BR#4934): the drain takes the next
-        // clean head in the SAME tick.
+        // ONE merge per tick stays the law (serialized merges), but a
+        // NOT-READY head no longer holds the queue (Ray, 2026-10-30: "PRs
+        // shouldn't be in the merge queue if they are not ready to merge —
+        // or, if they must be, we don't hold up the queue, obviously"):
+        // Skip/Note on the walk ADVANCES to the next entry in the same tick
+        // and the first READY head merges. The old strict-block let one
+        // unsettled head (checks pending, mergeability computing, no
+        // verdict) freeze every ready PR behind it — the exact "0/h with a
+        // full queue" outage shape. BR#4934's mid-drain rule is unchanged:
+        // once a pass has merged, a not-ready head settles the pass.
         match gate {
-            MergeAction::Skip { .. } | MergeAction::Note { .. } => {
-                // BR#4934: a transient no-op mid-drain means THIS head isn't
-                // clean — the pass settles on the final merge now (queue has
-                // no clean head to drain into).
+            MergeAction::Skip { reason } | MergeAction::Note { reason } => {
+                ctx.note(&format!("PR #{pr} ({head_id}) not ready — {reason}; continuing to the next queued PR"));
+                log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
                 if pass_merged > 0 {
                     burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                } else {
-                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
                 }
-                return Ok(());
+                continue;
             }
             MergeAction::HumanLeg { reason } => {
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.

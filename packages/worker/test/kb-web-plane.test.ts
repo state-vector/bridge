@@ -227,16 +227,16 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
   });
 
   it("renders Ray's column spec — STATUS / CURRENT (card+PR links) / PROGRESS / MSG / RATE / BACKLOG (BR#5114 round 3)", () => {
-    // CURRENT: the processed card opens in-app, the PR number opens GitHub
-    expect(trainPanelSrc).toMatch(/const curCard = l\.currently\?\.task_id \?\? l\.attempt\?\.card/);
-    expect(trainPanelSrc).toMatch(/openTask\?\.\(curCard\)/);
-    expect(trainPanelSrc).toMatch(/github\.com\/\$\{repo}\/pull\/\$\{curPr\}/);
+    // STATUS carries the current PR inline (Ray: combine — "Checking BR#123 (PR #456)")
+    expect(trainPanelSrc).toMatch(/checking \$\{l\.attempt\.card\}/);
+    expect(trainPanelSrc).toMatch(/github\.com\/\$\{repo}\/pull\/\$\{st\.pr\}/);
+    expect(trainPanelSrc).toContain("waiting on review");
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
     // BACKLOG: the count + how many need reviews
     expect(trainPanelSrc).toMatch(/queued\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
-    expect(trainPanelSrc).toContain("line stopped");
+    expect(trainPanelSrc).toContain("stopped — main is red");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });

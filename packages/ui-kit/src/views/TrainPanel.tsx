@@ -53,52 +53,55 @@ function lockDot(l: KbTrainLane, now: number): { sd: "live" | "lapse" | "dead" |
   return { sd: "free", title: "no machine on this lane — no merge-capable gateway has ticked inside the 15-minute window; merges wait until one runs (start a gateway / bridge train)" };
 }
 
-/** The status column: what the lane is doing right now, one pill — in plain
- *  words (BR#5114 round 2, Ray: "remove jargon — make it clear"). The full
- *  sentence always rides the NOW column beneath the pill; tooltips carry
- *  the machine detail for those who want it. */
-function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string } {
+/** The STATUS cell — the lane's current activity IN ONE LINE, combining
+ *  what + who on (Ray, 2026-10-30: "Status repeats what's in current —
+ *  maybe combine: Checking BR#1234 (PR #1234)"). "Checking" = the merge
+ *  machine evaluating that PR's review coverage, signatures, CI and
+ *  mergeability before merging it; a not-ready PR does NOT hold the queue
+ *  (the walk continues to the next ready PR). */
+function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string; card?: string; pr?: number } {
   const reason = l.reason ?? "";
+  const curPr = l.currently?.pr ?? l.queue[0]?.pr ?? undefined;
+  const curCard = l.currently?.task_id ?? l.attempt?.card ?? undefined;
   if (l.stop)
     return {
-      tone: "err",
-      label: "⛔ line stopped",
-      title: `stopped: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`,
+      tone: "err", card: curCard, pr: curPr,
+      label: `⛔ stopped — main is red${l.stop.culprit_task ? ` (${l.stop.culprit_task})` : ""}`,
+      title: `merges are halted: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""}, since ${age(l.stop.at, now)} ago. Merges resume automatically when main is green again.`,
     };
   if (reason.startsWith("merge-train: retired"))
-    return { tone: "muted", label: "retired", title: "lane card done/superseded — the train no longer ticks this lane (BR#4977)" };
+    return { tone: "muted", label: "retired", title: "this lane was retired — nothing runs on it" };
   if (reason.startsWith("merge-train: awaiting bypass merge") || l.bypass_wait) {
-    const bpm = reason.match(/PR #(\d+)/);
+    const bpm = l.bypass_wait ?? { pr: 0, task_id: undefined };
     return {
-      tone: "warn",
-      label: `⏸ needs a human merge${bpm ? ` · #${bpm[1]}` : ""}`,
-      title: reason || "this PR is blocked by branch protection (required review/checks a machine cannot satisfy) — a human merge is the unblock; it clears itself when the PR lands",
+      tone: "warn", card: bpm.task_id, pr: bpm.pr,
+      label: `needs a human merge${bpm.pr ? ` — PR #${bpm.pr}` : ""}`,
+      title: "this PR is blocked by branch protection (a required review/check a machine cannot satisfy) — a human merge is the unblock; it clears itself once merged",
     };
   }
   if (l.currently) {
-    // the in-flight phase, in words — never a raw enum like "awaiting-ci"
-    const phaseWord: Record<string, string> = {
-      "awaiting-ci": "merged — waiting on CI",
-      bursting: "merging several in a row",
-      stopped: "stopped",
-    };
+    const settling = l.currently.phase !== "bursting";
     return {
-      tone: l.currently.phase === "stopped" ? "err" : "live",
-      label: phaseWord[l.currently.phase ?? ""] ?? l.currently.phase ?? "merging",
-      title: `in flight: PR #${l.currently.pr ?? "?"} merged as ${String(l.currently.merge_sha ?? "").slice(0, 9)} — the train waits for main's build/deploy to finish green before taking the next card`,
+      tone: l.currently.phase === "stopped" ? "err" : "live", card: l.currently.task_id, pr: l.currently.pr,
+      label: l.currently.phase === "bursting"
+        ? `merging several in a row${l.currently.pr ? ` — at PR #${l.currently.pr}` : ""}`
+        : `merged PR #${l.currently.pr ?? "?"} — waiting on CI`,
+      title: settling
+        ? `PR #${l.currently.pr ?? "?"} is merged; the train waits for main's build+deploy to finish green before the next merge — this is the settle that keeps main deployable. Next: ${l.attempt?.card ?? "—"}.`
+        : `a batch is landing back-to-back; main settles when the batch finishes`,
     };
   }
   if (l.attempt) {
     return l.attempt.hold === "awaiting-review"
-      ? { tone: "warn", label: `⏸ ${l.attempt.card} · needs review`, title: l.attempt.note }
-      : { tone: "live", label: `▶ ${l.attempt.card} · checking`, title: l.attempt.note };
+      ? { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` }
+      : { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
   }
   if (l.lease?.holder) {
     const t = lockTone(l, now);
     return {
       tone: t === "ok" ? "scope" : t === "warn" || t === "err" ? "warn" : "muted",
-      label: "machine on it · idle",
-      title: `a machine (${l.lease.holder}) holds this lane — heartbeat ${age(l.lease.heartbeat_ts, now)} ago; between merges`,
+      label: "idle — nothing to merge",
+      title: `a machine (${l.lease.holder}) is on this lane — heartbeat ${age(l.lease.heartbeat_ts, now)} ago; it takes work the moment a PR is ready`,
     };
   }
   if (l.capable?.ready)
@@ -182,8 +185,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         <div className="ktable-head train-head-cols">
           <span title="machine-on-lane — green a machine is on it · amber busy/lapsing · red stuck · grey nobody; hover names the machine">mach</span>
           <span>line</span>
-          <span>status</span>
-          <span title="the card + GitHub PR the train is processing right now — click the card to open it, the PR number opens GitHub">current</span>
+          <span title="what the train is doing right now and to WHICH PR — e.g. 'checking BR#123 (PR #456)' = the merge machine evaluating that PR's review, signatures, CI and mergeability; the card opens the board, the PR number opens GitHub">status</span>
           <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
           <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
           <span title="PRs merged over the last hour / 24 hours">rate</span>
@@ -192,13 +194,9 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
       )}
       {(lanes ?? []).map((l) => {
         const dot = lockDot(l, now);
-        const st = laneStatus(l, now);
         const repo = l.lane.split("@")[0];
+        const st = laneStatus(l, now);
         const na = nowAction(l, now);
-        // CURRENT: the card + PR being processed — in-flight merge first,
-        // else the head the train is checking/holding
-        const curCard = l.currently?.task_id ?? l.attempt?.card ?? null;
-        const curPr = l.currently?.pr ?? l.queue[0]?.pr ?? null;
         // PROGRESS: x of y in the current batch (burst passes merge several
         // back-to-back; a single merge is a batch of 1)
         const prog =
@@ -231,18 +229,11 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             >
               {l.lane}
             </span>
-            <span className="trainc-status"><Chip pill tone={st.tone} title={st.title}>{st.label}</Chip></span>
-            <span className="trainc-cur">
-              {curCard ? (
-                <>
-                  <span className={`train-cur-card ${openTask ? "trainc-open" : ""}`} onClick={() => openTask?.(curCard)} title={`${curCard} — click to open the card`}>{curCard}</span>
-                  {curPr ? (
-                    <a className="train-pr" href={`https://github.com/${repo}/pull/${curPr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{curPr}</a>
-                  ) : null}
-                </>
-              ) : (
-                <span className="muted-note">—</span>
-              )}
+            <span className="trainc-status">
+              <Chip pill tone={st.tone} title={st.title}>{st.label}</Chip>
+              {st.card && st.pr ? (
+                <a className="train-pr" href={`https://github.com/${repo}/pull/${st.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} title={`open PR #${st.pr} on GitHub`}>#{st.pr}</a>
+              ) : null}
             </span>
             <span className="trainc-prog top-num" title={prog}>{prog}</span>
             <span className="trainc-msg">
