@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
   "description": "bridge shared UI kit \u2014 tokens + primitives (Btn, Chip, Card, Field, ConnDot, RelTime); one look, every surface",
   "exports": {
     ".": "./src/index.ts",
@@ -15,5 +18,8 @@
     "@bridge/specs": "*",
     "zustand": "^5.0.8",
     "snarkdown": "^2.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.1"
   }
 }

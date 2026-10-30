@@ -210,6 +210,10 @@ export interface KbTrainLane {
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
   queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
+  /** BR#5106 depth-counter honesty: every open PR the repo's last reconcile
+   *  pass listed — the derived queue above is only the actionable subset.
+   *  Null until the first reconcile lands (never a made-up zero). */
+  open_prs?: { count: number; ts: number } | null;
   /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
    *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
    *  gone: zero asks ride the lanes): one chip per parked card — amber

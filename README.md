@@ -480,7 +480,11 @@ queued card + its PR; **QUEUE** — the remaining cards with their PRs and depth
 executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the gate
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
-conflated again.
+conflated again. The depth counters are honest too (BR#5106): the lane
+row shows `queue N · open M` — the derived queue is the actionable subset (verdict-
+stamped, gate-clean heads) while `open` is every open PR the lane repo's last reconcile
+pass listed, so a lane can never read nearly-empty while GitHub shows a pile (the
+"43 open PRs, queue EMPTY" class, BR#5022).
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -769,6 +773,21 @@ string `"MERGEABLE"|"CONFLICTING"|"UNKNOWN"` — never a boolean — and
 the shared gate compares. Fed raw, the strings satisfied neither `mergeable !== true`
 nor `=== "clean"`, and every gated candidate bounced (genuinely mergeable PRs
 included) as "unmergeable — CONFLICTING".
+
+**PR status labels (BR#5106)**: each reconcile pass also stamps every open PR on the
+lane repo with exactly one `bridge:*` label, so the GitHub list view carries the per-PR
+truth where you already look: `bridge:merge-ready` when the PR sits in the lane's
+derived queue (verdict covers the live head, gate-clean — one click from landed),
+`bridge:wip` otherwise (unbound / bounced / conflicted / stale verdict / draft; drafts
+are always wip). The queue is the hub's verdict — the executor reads `train_status` and
+stamps GitHub from it, never from its own judgement; if the queue read fails, nothing
+is labeled (a blind stamp would lie). Labels are GitHub writes, identity-gated exactly
+like merge legs (BR#3181/BR#3516): a personally-authed gateway skips loudly with
+`will not label PRs`. Family labels are created per-repo on first use (fixed colors +
+descriptions); an unchanged PR costs zero API calls; every transition rides the
+reconcile report and the hub audits it as `pr_label_synced` (from→to); failures are
+logged, never fatal to the tick. The family is extensible (e.g. `bridge:conflicted`
+later) — the labeler maps best-fit.
 
 ### Lanes, leases, queues
 
