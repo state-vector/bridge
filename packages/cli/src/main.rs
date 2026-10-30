@@ -58,8 +58,14 @@ mod train_gate;
 /// red alarm to the alarm sink. Cron-friendly, same shape as `train --once`.
 mod canary;
 
+/// Host-side death-telemetry emitter (BR#4682, TRAIN-DEFENCE L0.2):
+/// `bridge alarm` posts an ops note to the alarm sink from the systemd
+/// death hook / give-up escalation unit that `bridge service install`
+/// emits. Machine infrastructure notes, session "host-supervisor".
+mod alarm;
+
 use dispatch::DispatchConfig;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The bridge agent persona, shipped in source control and installed into the
@@ -183,6 +189,11 @@ fn main() {
                 logging::emit("cli", "", &format!("error: service install failed: {e}"));
                 std::process::exit(1);
             }
+        }
+        "alarm" => {
+            // death-telemetry emitter (BR#4682): posts to the alarm sink via
+            // the hub MCP — invoked by the systemd death hook and give-up unit.
+            std::process::exit(alarm::run(&args[2..]));
         }
         "run" | "--help" | "-h" | "help" => {
             if cmd != "run" {
@@ -1043,10 +1054,13 @@ fn doctor() -> bool {
     bad
 }
 
-/// systemd user unit (linux): run forever, restart on failure, survive logout.
-/// macOS has no systemd — prints the launchd/nohup alternative.
+/// systemd user units (linux): run forever under Restart=always with
+/// exponential backoff + start jitter, death telemetry to the alarm sink on
+/// every restart-causing death, and a give-up escalation unit (BR#4682,
+/// TRAIN-DEFENCE L0.2). macOS has no systemd — prints the launchd/nohup
+/// alternative.
 ///
-/// Two things the service environment gets wrong on real hosts, both baked at
+/// Things the service environment gets wrong on real hosts, all baked at
 /// install time:
 /// - logs go to ~/bridge.log (StandardOutput/Error=append:), not the journal —
 ///   user journals are unreadable on many minimal cloud images (journald
@@ -1055,7 +1069,15 @@ fn doctor() -> bool {
 /// - PATH: systemd runs user units with a minimal default PATH that misses
 ///   ~/.local/bin, so agent CLIs that work in the operator's shell are
 ///   unrunnable under the service. The install shell's PATH is written into
-///   the unit, with the configured agent CLIs' dirs pinned first.
+///   the unit, with the configured agent CLIs' dirs pinned first;
+/// - WorkingDirectory is %h, never the installer's cwd (BR#4899: an install
+///   run from a scratch dir baked that dir into the unit; the dir was
+///   deleted later and the unit broke);
+/// - the daemon's death is LOUD: Restart=always + backoff/jitter (the
+///   BR#4431 silent-death class), a deduped death note to the alarm sink
+///   per distinct cause (ExecStopPost hook), and a give-up escalation that
+///   fires only on a true start-limit-hit (BR#4899 defect 2: never label
+///   an in-backoff retry as "GAVE UP").
 fn service_install() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         println!("no systemd on this OS. run the runner persistently with:");
@@ -1089,28 +1111,153 @@ fn service_install() -> Result<(), String> {
         .unwrap_or_else(|_| "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
 
     let log_path = PathBuf::from(&home).join("bridge.log");
-    let unit = format!(
-        "[Unit]\nDescription=bridge fleet runner\nAfter=network-online.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=10\nWorkingDirectory={}\nEnvironmentFile=-{}\nEnvironment=PATH={}\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
-        bin.display(),
-        std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
-        PathBuf::from(&home).join(".bridge/env").display(),
-        baked_path,
-        log_path.display(),
-        log_path.display(),
-    );
+    let hook_path = PathBuf::from(&home).join(".bridge/bridge-death-hook");
+    let unit = render_unit(&bin, &home, &baked_path, &log_path, &hook_path);
     let path = unit_dir.join("bridge.service");
     std::fs::write(&path, unit).map_err(|e| e.to_string())?;
     println!("wrote {}", path.display());
+
+    // Give-up escalation (BR#4682): OnFailure fires on EVERY failed start,
+    // so the @-template gates on the failed unit's Result internally and
+    // alarms only on a true start-limit-hit — never per attempt.
+    let giveup_path = unit_dir.join("bridge-death-giveup@.service");
+    std::fs::write(&giveup_path, render_giveup_unit(&bin)).map_err(|e| e.to_string())?;
+    println!("wrote {}", giveup_path.display());
+
+    // Death-telemetry hook (BR#4682): ExecStopPost on every unit exit —
+    // one alarm-sink note per distinct cause per 10-minute cooldown,
+    // deliberate TERM stops log locally only, local receipt always lands
+    // (no silent deaths even when the hub itself is unreachable).
+    std::fs::create_dir_all(hook_path.parent().expect("hook parent")).map_err(|e| e.to_string())?;
+    std::fs::write(&hook_path, render_death_hook(&bin, &home, &log_path)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    println!("wrote {}", hook_path.display());
+
     println!("next steps:");
     println!("  systemctl --user daemon-reload");
     println!("  systemctl --user enable --now bridge");
     println!("  loginctl enable-linger $USER    # survive logout / run at boot");
     println!("  tail -f ~/bridge.log            # watch the dispatch log (file logging — the journal is bypassed)");
+    println!("  tail -f ~/bridge-death-telemetry.log  # death receipts (one sink note per distinct cause / 10 min)");
     for agent_bin in &missing {
         println!("  \x1b[33mwarn\x1b[0m  {agent_bin} not found on this PATH — the service won't dispatch with it until it's runnable (`bridge doctor`)");
     }
     println!("PATH baked from this shell — re-run `bridge service install` if agent CLIs move (or set PATH in ~/.bridge/env to override)");
     Ok(())
+}
+
+/// The jitter line, verbatim. Its quoting is load-bearing: BR#4899 shipped
+/// `awk 'BEGIN{srand();printf %.1f, rand()*7}'` — the UNQUOTED format string
+/// is an awk syntax error, `sleep` got no operand, and every start attempt
+/// died before the daemon launched (the fleet executor host crash-looped for
+/// hours). Three independent guards here:
+///   1. the awk format string is quoted ("%.1f");
+///   2. jitter failure degrades to no sleep (`|| true` on the whole line
+///      body), never a failed ExecStartPre;
+///   3. the systemd `-` prefix makes even that non-fatal.
+const EXEC_START_PRE_JITTER: &str = r#"ExecStartPre=-/bin/sh -c 'sleep "$(awk "BEGIN { srand(); printf \"%.1f\", rand()*7 }" 2>/dev/null)" || true'"#;
+
+/// The systemd user unit (BR#4682): Restart=always (clean exits are the
+/// silent-death class — the daemon quitting quietly froze the merge lane,
+/// BR#4431), exponential restart backoff 5s→60s (RestartSteps on systemd
+/// ≥249; older systemd ignores the two backoff knobs and restarts at a flat
+/// 5s — degraded but correct), a start jitter that cannot fail a start, and
+/// a 50-starts/10-min start limit so give-up stays effectively unreachable
+/// at the 60s backoff cap. WorkingDirectory is %h — NEVER the installer's
+/// cwd (BR#4899: an install from a scratch dir baked that dir in; the dir
+/// was deleted and the unit broke).
+fn render_unit(bin: &Path, home: &str, baked_path: &str, log_path: &Path, hook_path: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=bridge fleet runner\nAfter=network-online.target\n# give-up escalation — the @-template alarms only on start-limit-hit\nOnFailure=bridge-death-giveup@%n.service\n\n[Service]\nExecStart={} run\n{}\n# auto-restart on ANY exit; exponential backoff 5s→60s\nRestart=always\nRestartSec=5s\nRestartSteps=4\nRestartMaxDelaySec=60s\nStartLimitIntervalSec=600\nStartLimitBurst=50\n# death telemetry: one note per distinct cause per 10 min on the alarm sink\nExecStopPost={}\nWorkingDirectory=%h\nEnvironmentFile=-{}\nEnvironment=PATH={}\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+        bin.display(),
+        EXEC_START_PRE_JITTER,
+        hook_path.display(),
+        PathBuf::from(home).join(".bridge/env").display(),
+        baked_path,
+        log_path.display(),
+        log_path.display(),
+    )
+}
+
+/// Give-up escalation unit (template; instance = the failed unit, %i).
+/// Gated: `OnFailure=` fires per failed start, so this checks the failed
+/// unit's `Result` and alarms ONLY on `start-limit-hit` — per-attempt death
+/// notes are the ExecStopPost hook's job (deduped there), false "GAVE UP"
+/// spam was BR#4899 defect 2.
+fn render_giveup_unit(bin: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=bridge supervisor give-up escalation (start-limit-hit only)\n\n[Service]\nType=oneshot\nExecStart=/bin/sh -c 'r=$(systemctl --user show %i -p Result --value 2>/dev/null); [ \"$r\" = \"start-limit-hit\" ] || exit 0; exec \"{}\" alarm --kind giveup \"supervisor GAVE UP (start-limit-hit) — %i stopped retrying and needs manual intervention (systemctl --user status %i; journalctl --user -u %i -n 50)\"'\n",
+        bin.display(),
+    )
+}
+
+/// The ExecStopPost death-telemetry hook (POSIX sh; placeholders replaced
+/// verbatim — the script is full of shell braces, so no format! here).
+/// Semantics (BR#4682): one alarm-sink note per DISTINCT cause per 10-minute
+/// cooldown; a cause change always emits; deliberate TERM stops (systemctl
+/// stop/restart) log locally without alarming; every death leaves a local
+/// receipt BEFORE the best-effort board emission (no silent deaths when the
+/// hub is down). Give-up claims are never made here — that is the give-up
+/// unit's job, gated on Result=start-limit-hit.
+fn render_death_hook(bin: &Path, home: &str, log_path: &Path) -> String {
+    r#"#!/bin/sh
+# bridge death-telemetry hook — emitted by `bridge service install` (BR#4682,
+# TRAIN-DEFENCE L0.2). Runs as ExecStopPost on every unit exit.
+set -u
+BIN="{BIN}"
+STATE="{HOME_DIR}/bridge-death-hook.state"
+RECEIPTS="{HOME_DIR}/bridge-death-telemetry.log"
+LOG="{LOG}"
+COOLDOWN=600
+
+stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+result="${SERVICE_RESULT:-unknown}"
+signal="${SIGNAL:-}"
+exit_status="${EXIT_STATUS:-}"
+
+# deliberate stop (systemctl stop/restart TERMs the unit) — local log only
+if [ "$result" = "success" ] && [ -n "$signal" ]; then
+  echo "$stamp deliberate-stop (TERM) — no alarm" >> "$RECEIPTS"
+  exit 0
+fi
+
+tail_txt=""
+if [ -f "$LOG" ]; then
+  tail_txt=$(tail -n 5 "$LOG" 2>/dev/null | tr '\n' '|' | cut -c 1-400)
+fi
+# cause signature: result + signal + exit only — NOT the log tail (log
+# timestamps would differ every attempt and defeat the cooldown that stops
+# crash-loop spam, BR#4899 defect 2)
+sig="$result|signal=$signal|exit=$exit_status"
+
+now=$(date +%s)
+last_ts=$(head -n 1 "$STATE" 2>/dev/null)
+last_sig=$(sed -n '2p' "$STATE" 2>/dev/null)
+if [ "$sig" = "$last_sig" ] && [ -n "$last_ts" ]; then
+  age=$((now - last_ts))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$COOLDOWN" ]; then
+    echo "$stamp suppressed (cooldown ${age}s) $sig" >> "$RECEIPTS"
+    exit 0
+  fi
+fi
+
+printf '%s\n%s\n' "$now" "$sig" > "$STATE" 2>/dev/null || true
+# state write must never fail the hook: it lives at the home root (no
+# subdir dependency) and a lost state file only costs one extra note
+msg="result=$result signal=${signal:-none} exit=$exit_status last-log: ${tail_txt:-unavailable}"
+echo "$stamp ALARM $msg" >> "$RECEIPTS"
+# best-effort board emission; the receipt above is the no-silent-deaths
+# guarantee when the hub itself is unreachable (fail-open by design)
+"$BIN" alarm --kind death "$msg" >> "$RECEIPTS" 2>&1 || true
+exit 0
+"#.replace("{BIN}", &bin.display().to_string())
+        .replace("{HOME_DIR}", home)
+        .replace("{LOG}", &log_path.display().to_string())
 }
 
 /// PATH lookup for a bare bin name; an absolute/relative path resolves as-is.
@@ -1193,6 +1340,118 @@ mod tests {
         assert_eq!(which(sh.to_str().unwrap()).as_deref(), Some(sh.as_path()));
         assert_eq!(which("bridge-definitely-not-a-bin-2633"), None);
     }
+
+    #[test]
+    fn unit_pins_restart_always_backoff_and_a_quoted_failsafe_jitter_br4682() {
+        // BR#4682 / BR#4899: the supervisor must auto-restart on ANY exit
+        // (clean exits are the BR#4431 silent-death class) with exponential
+        // backoff; the start jitter's awk format string MUST be quoted — the
+        // unquoted `printf %.1f` was an awk syntax error whose failed
+        // ExecStartPre killed every start attempt (host crash-looped hours).
+        let unit = render_unit(
+            Path::new("/home/u/.local/bin/bridge"),
+            "/home/u",
+            "/usr/local/bin:/usr/bin",
+            Path::new("/home/u/bridge.log"),
+            Path::new("/home/u/.bridge/bridge-death-hook"),
+        );
+        for pin in [
+            "Restart=always",
+            "RestartSec=5s",
+            "RestartSteps=4",
+            "RestartMaxDelaySec=60s",
+            "StartLimitIntervalSec=600",
+            "StartLimitBurst=50",
+            "OnFailure=bridge-death-giveup@%n.service",
+            "ExecStopPost=/home/u/.bridge/bridge-death-hook",
+            "StandardOutput=append:/home/u/bridge.log",
+            "EnvironmentFile=-/home/u/.bridge/env",
+        ] {
+            assert!(unit.contains(pin), "unit lost the pin `{pin}`:\n{unit}");
+        }
+        // the jitter line: quoted format string + whole-line fail-safety +
+        // the systemd `-` prefix (three independent guards — jitter may
+        // skip, never block a start)
+        assert!(
+            EXEC_START_PRE_JITTER.starts_with("ExecStartPre=-"),
+            "jitter line must carry the non-fatal `-` prefix: {EXEC_START_PRE_JITTER}"
+        );
+        assert!(
+            EXEC_START_PRE_JITTER.contains("printf \\\"%.1f\\\""),
+            "awk format string must be quoted (BR#4899 root cause): {EXEC_START_PRE_JITTER}"
+        );
+        assert!(
+            !EXEC_START_PRE_JITTER.contains("printf %.1f"),
+            "UNQUOTED awk format string — the BR#4899 crash-loop defect is back: {EXEC_START_PRE_JITTER}"
+        );
+        assert!(
+            EXEC_START_PRE_JITTER.contains("|| true"),
+            "jitter must degrade to no sleep, never a failed ExecStartPre: {EXEC_START_PRE_JITTER}"
+        );
+        // WorkingDirectory is the home specifier — NEVER the installer's cwd
+        // (BR#4899: a scratch-dir install baked a soon-to-be-deleted path in)
+        assert!(unit.contains("WorkingDirectory=%h"), "unit:\n{unit}");
+        assert!(
+            !unit.contains("WorkingDirectory=/"),
+            "WorkingDirectory must not be an absolute baked path: \n{unit}"
+        );
+    }
+
+    #[test]
+    fn giveup_unit_alarms_only_on_a_true_start_limit_br4682() {
+        // BR#4899 defect 2: the first hook version labelled every in-backoff
+        // failure "GAVE UP" (~60 false escalations/hour). The give-up unit
+        // must gate on the failed unit's Result=start-limit-hit.
+        let giveup = render_giveup_unit(Path::new("/home/u/.local/bin/bridge"));
+        assert!(giveup.contains("start-limit-hit"), "giveup:\n{giveup}");
+        assert!(giveup.contains("alarm --kind giveup"), "giveup:\n{giveup}");
+        assert!(giveup.contains("%i"), "giveup must name the failed unit via %i:\n{giveup}");
+        // and the death hook must never claim give-up
+        let hook = render_death_hook(
+            Path::new("/home/u/.local/bin/bridge"),
+            "/home/u",
+            Path::new("/home/u/bridge.log"),
+        );
+        assert!(
+            !hook.contains("GAVE UP"),
+            "the death hook must never make give-up claims (BR#4899 defect 2):\n{hook}"
+        );
+    }
+
+    #[test]
+    fn death_hook_dedupes_same_cause_and_fails_open_br4682() {
+        let hook = render_death_hook(
+            Path::new("/home/u/.local/bin/bridge"),
+            "/home/u",
+            Path::new("/home/u/bridge.log"),
+        );
+        // cooldown dedupe: one note per distinct cause per 10 min
+        assert!(hook.contains("COOLDOWN=600"), "hook:\n{hook}");
+        assert!(
+            hook.contains("sig=\"$result|signal=$signal|exit=$exit_status\""),
+            "cause signature must exclude the log tail (timestamps would break dedupe):\n{hook}"
+        );
+        // deliberate TERM stops never alarm
+        assert!(
+            hook.contains("[ \"$result\" = \"success\" ] && [ -n \"$signal\" ]"),
+            "deliberate-stop branch lost:\n{hook}"
+        );
+        // fail-open: local receipt lands BEFORE the best-effort emission
+        let alarm_idx = hook.find("alarm --kind death").expect("alarm call");
+        let receipt_write = hook.find(">> \"$RECEIPTS\"").expect("receipt write");
+        assert!(
+            receipt_write < alarm_idx,
+            "receipts must land before the best-effort emission"
+        );
+        assert!(
+            hook.contains("|| true"),
+            "hook must fail open (a hub outage must not break the unit's exit path):\n{hook}"
+        );
+        // placeholders all replaced
+        assert!(!hook.contains("{BIN}"), "unreplaced placeholder:\n{hook}");
+        assert!(!hook.contains("{HOME_DIR}"), "unreplaced placeholder:\n{hook}");
+        assert!(!hook.contains("{LOG}"), "unreplaced placeholder:\n{hook}");
+    }
 }
 
 fn print_help() {
@@ -1211,7 +1470,12 @@ USAGE:
                            --json       raw JSON output
   bridge agent install   install the bridge agent persona into opencode
   bridge agent check     verify the installed persona matches this version
-  bridge service install write a systemd user unit (linux) — run forever, restart on failure
+  bridge service install write systemd user units (linux): Restart=always with
+                         backoff + jitter, death telemetry to the alarm sink,
+                         give-up escalation — run forever, deaths are loud
+  bridge alarm [opts]    post an ops note to the alarm sink (used by the death
+                         telemetry hook; --sink ID, --kind death|giveup|ops,
+                         --host H, then the message text)
   bridge canary [--once] hub self-canary (BR#4177): synthetic lifecycle vs the deployed hub;
                          red alarm to the sink (BR#3124). Cron daily:
                          --sink BR#3124    alarm sink card (default BR#3124)

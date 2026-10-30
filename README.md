@@ -84,7 +84,8 @@ The runner is a long-lived process: keep it alive with systemd (linux) or a Laun
 ```bash
 bridge doctor            # checks config, token, agent CLIs + agent profiles, git, and the merge-train executor prerequisites (gh authed + repo scope + worker-class identity + lane-repo push, git) — every failure names the fix
 bridge pair https://bridge.<your-subdomain>.workers.dev
-bridge service install   # linux: writes a systemd user unit
+bridge service install   # linux: writes systemd user units — supervisor (Restart=always,
+                         # backoff + jitter) + death telemetry + give-up escalation
 systemctl --user enable --now bridge
 ```
 
@@ -99,6 +100,8 @@ bridge logs --json          # raw JSON for scripts
 ```
 
 The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
+
+**The daemon's death is loud** (BR#4682): the unit uses `Restart=always` with exponential restart backoff (5s→60s) and a 0–7s start jitter, so the runner revives from a crash **or** a clean exit without human action. Every restart-causing death fires an ExecStopPost hook that posts one `[daemon-death]` note per distinct cause (result / signal / exit code + last log lines) to the alarm sink card — deduped to one note per 10 minutes per cause, so a crash-loop can't spam the board — and always appends a local receipt to `~/bridge-death-telemetry.log` (the no-silent-deaths guarantee even when the hub itself is unreachable). Deliberate `systemctl stop`/`restart` log locally without alarming. If the supervisor ever truly gives up (`start-limit-hit`, effectively unreachable at 50 starts / 10 min against the 60s backoff cap), a separate give-up escalation unit posts one `[daemon-death ESCALATION]` note naming the manual intervention needed. The unit's `WorkingDirectory` is the user's home — never the directory the installer ran from.
 
 **Runner log format** (BR#4400): every operator-visible line from the runner — dispatch loop, in-process merge-train leg, store/session/keychain, CLI, canary — flows through one mechanism with one shape:
 
@@ -325,7 +328,7 @@ If the hub rejects the token (401), the runner attempts **one** automatic
 repair (re-vend via the live login session) and, failing that, logs out
 loudly with a human-readable reason — the token never silently vanishes.
 
-If no agent CLI is dispatchable, the runner says so loudly every tick and **exits non-zero once in-flight sessions drain** — `systemctl status bridge` shows the failure and `Restart=on-failure` retries every 10s until you fix it (`bridge doctor` diagnoses). Under systemd, use absolute `bin` paths or a `PATH` override for the unit: the service does not inherit your shell's PATH.
+If no agent CLI is dispatchable, the runner says so loudly every tick and **exits non-zero once in-flight sessions drain** — `systemctl status bridge` shows the failure and `Restart=always` (with backoff + jitter, BR#4682) revives it; a non-dispatchable agent CLI is a fix-it-then-restart situation, `bridge doctor` diagnoses. Under systemd, use absolute `bin` paths or a `PATH` override for the unit: the service does not inherit your shell's PATH.
 
 Notes:
 
