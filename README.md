@@ -620,7 +620,20 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   executor's next CI poll feeds a green classification (`train:landed`) and the hub
   releases the stop automatically. v1 stops the line; there is no auto-revert — fix
   forward or revert is the culprit card's job. Work on branches (worktrees) continues —
-  only the line stops.
+  only the line stops. Two BR#5061 refinements keep the stop honest instead of stormy:
+  **one ledger episode per stop** (the same sha + reason re-reported by a tick loop —
+  the stop arm clearing on green main while the awaiting-CI arm re-fires it — is a
+  `train:stopped_deduped` no-op, never a new ledger row every 20 seconds), and the
+  **phantom-required carve-out** (Ray ruling 2026-10-30: "if it can't merge, bounce it
+  and move onto the next one — the train goes regardless"): past the fail-closed bound,
+  if every unsettled required workflow is MISSING (no check run ever existed for it on
+  the merge commit — e.g. a PR-context-only gate that only runs on `pull_request`) while
+  at least one required workflow proved green on that very commit, waiting cannot
+  change the verdict — the merge LANDS judged on the workflows that exist, the never-run
+  names are dropped with a loud audit, and ONE config-defect ask per episode goes to the
+  alarm sink (fix `required_workflows`); a genuinely stuck OBSERVED run (or an empty,
+  zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
+  evidence.
 
 ### The deploy drift alarm's settle window (BR#3289)
 
@@ -740,8 +753,8 @@ included) as "unmergeable — CONFLICTING".
   `merge-train` + `infrastructure`, never claimable by agents, blocked at birth with the
   honest reason `merge-train: awaiting an available gateway` (merges happen when your
   machines are on). The card's blocked reason is recomputed by the hub from the card's
-  own meta — `idle` / `leased by X` / `attempting <card> (gate)` (a queue head is in
-  the gate; the tooltip carries the last ledger action) / `settling on <sha> (PR #N)`
+  own meta — `idle` / `leased by X` / `attempting <card> (gate)` (a queue head is in the
+  gate; the tooltip carries the last ledger action) / `settling on <sha> (PR #N)`
   (naming the next head) / `awaiting bypass merge — PR #N by <card>` (a head blocked
   on branch protection a machine cannot satisfy — review/required checks; a human
   merge is the unblock and it self-clears when the PR lands) / `STOPPED — … — culprit
@@ -750,6 +763,30 @@ included) as "unmergeable — CONFLICTING".
   15-minute window — the train will take work the moment it is queued) /
   `awaiting an available gateway` — so the board always shows the lane's truth, and an
   empty queue never hides which machine is driving the train.
+- **Lane cards are close-protected + terminal cards never bind (BR#5061)**: the lane
+  card IS the lane — closing one done/superseded retires a live subsystem. The
+  2026-10-29 outage: a duty session closed the `state-vector/bridge@main` lane card
+  done as a close-reflex, the find-or-create kept binding the terminal card every tick,
+  and the lane could not self-heal for hours. Two laws now hold: (1) the transition
+  gate's `infrastructure-close-protection` rule refuses done/superseded on any card
+  carrying `meta.lane` or tagged `infrastructure` unless the actor is the owner, a
+  human (`web:`/`human:`), or the machinery (`system:`) — a duty reaching this edge
+  gets a named rejection and records done-with-findings on ITS OWN card instead; and
+  (2) the lane lookup skips terminal cards: find-or-create prefers the newest
+  non-terminal card carrying the lane key and follows the `supersedes` edge to a
+  pre-registered reseed — with the volatile in-flight state (an awaiting-CI
+  merge, a line stop, a bypass wait) migrating to the live card once, loudly
+  (`lane_rebound`), so an in-flight merge finishes its landing close across the
+  rebind. With NO successor the lane is deliberately retired and the BR#4977
+  refusal holds (every op refuses `lane retired`; re-open the card or register
+  a reseed to re-arm — BR#5061's spec'd create-fresh is superseded by the
+  accepted BR#4977 decision on that path). `train.status` shows ONE row per
+  lane — a retired card with a live successor is filtered as history, a
+  retired card with no successor stays visibly `retired` (BR#4977) — and the
+  hub's lane sweeps skip retired cards; the starvation clock never inits from
+  epoch: a lane that has never recorded a merge-capable lease starts its
+  starve clock at its own last status change (the bogus "starved 29888714m"
+  alarm class is gone).
 - **The lease is CAS with a 5-minute TTL**: acquire → held across the whole queue
   (`merge-train: leased by X — idle` between items) → release. The hub stamps
   `holder = the authenticated actor`; the executor never supplies a holder, so a leaked

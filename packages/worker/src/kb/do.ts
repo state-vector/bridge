@@ -7180,32 +7180,137 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   // verify duty's close note, or the queue derive. Pinned in
   // test/merge-train.test.ts + test/train-hub.test.ts.
 
-  /** Lane card lookup by meta.lane.key (exact). */
+  /** Lane card lookup by meta.lane.key (exact). BR#5061: a lane key can have
+   *  MULTIPLE cards after an erroneous close + reseed (the terminal original
+   *  + the live successor) — the LIVE card wins, newest first; terminal
+   *  (done/superseded ⇒ retired, BR#4977) cards bind nothing ever again.
+   *  The 2026-10-29 outage: LIMIT 1 returned the retired original every
+   *  tick and the lane could not self-heal onto its reseed. */
   private laneRow(laneKeyValue: string): any {
     return this.one(
       `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? LIMIT 1`,
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
+       ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END ASC, created_ts DESC
+       LIMIT 1`,
       laneKeyValue,
     );
   }
 
-  /** Find-or-create the standing lane card for (repo, base). Seed config:
-   *  settings key `train_lane` (JSON map keyed by "repo@base" →
-   *  {required_workflows, ci_typical_minutes}); the card's meta.lane is the
-   *  working copy (config, never hardcoded — BR#3516 §1). */
+  /** BR#5061: the terminal card(s) carrying a lane key — the retired side of
+   *  a reseed. Volatile in-flight state (currently/stop/bypass_wait) may
+   *  still live there and must migrate to the live card before the lane's
+   *  history goes dark. */
+  private laneTerminalRows(laneKeyValue: string): any[] {
+    return (this.state.storage.sql.exec(
+      `SELECT id, status, meta, status_ts FROM artefacts
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
+       ORDER BY created_ts ASC`,
+      laneKeyValue,
+    ).toArray() ?? []) as any[];
+  }
+
+   /** Find-or-create the standing lane card for (repo, base). Seed config:
+    *  settings key `train_lane` (JSON map keyed by "repo@base" →
+    *  {required_workflows, ci_typical_minutes}); the card's meta.lane is the
+    *  working copy (config, never hardcoded — BR#3516 §1).
+    *  BR#5061 skip-terminal + rebind, reconciled with the BR#4977 lane
+    *  lifecycle (accepted, PR #331): a terminal (done/superseded) lane card
+    *  never binds the train. When a LIVE successor exists — the supersedes
+    *  edge (the reseed convention) or any non-terminal card carrying the
+    *  same key — the lane rebinds onto it and the volatile in-flight state
+    *  (an awaiting-CI merge, a line stop, a bypass wait) migrates once,
+    *  loudly (lane_rebound). With NO successor the lane is deliberately
+    *  RETIRED (BR#4977): every op refuses ("lane retired"), no meta writes,
+    *  no re-arm — re-open the card or register a reseed to re-arm. This
+    *  supersedes the BR#5061 spec's create-fresh clause on the no-successor
+    *  path (an accepted decision outranks the spec; the rebind path — the
+    *  2026-10-29 outage's keystone — is unchanged). */
   private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
     const key = laneKey(repo, base);
-    const existing = this.laneRow(key);
-    if (existing) {
-      // BR#4977 lane lifecycle: a done/superseded lane card is RETIRED —
-      // its base branch was deleted or the lane was deliberately closed
-      // ("never tick again"). Every lane-touching op funnels through here,
-      // so this is the single refusal point: no lease/CPO meta writes, no
-      // config refresh, no re-arm (the BR#4772 drill residue class). Re-arm
-      // is a deliberate lifecycle act — re-open the lane card first.
-      if (existing.status === "done" || existing.status === "superseded") {
-        throw new Error(`lane retired — ${key}'s lane card ${existing.id} is ${existing.status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card to re-arm`);
+    let existing = this.laneRow(key);
+    const terminals = this.laneTerminalRows(key);
+    if (terminals.length) {
+      if (!existing || existing.status === "done" || existing.status === "superseded") {
+        // resolve the live successor: supersedes edge first (the reseed
+        // convention), then any non-terminal card carrying the key (newest).
+        this.audit(actor, "lane_terminal_skipped", existing?.id ?? terminals[0].id, {
+          lane: key, retired_status: existing?.status ?? terminals[0].status,
+          rebound_to: "resolving",
+          note: "BR#5061: terminal lane card must not bind the train — rebinding",
+        });
+        let live: any = null;
+        for (const t of terminals) {
+          const viaEdge = this.one(
+            `SELECT a.id AS id FROM relations r JOIN artefacts a ON a.id = r.src_id
+             WHERE r.relation = 'supersedes' AND r.dst_id = ?
+               AND a.type = 'task' AND a.status NOT IN ('done','superseded')
+               AND json_extract(a.meta, '$.lane.key') = ?
+             ORDER BY a.created_ts DESC LIMIT 1`,
+            t.id, key,
+          );
+          if (viaEdge) { live = viaEdge; break; }
+        }
+        if (!live) {
+          live = this.one(
+            `SELECT id FROM artefacts
+             WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
+             ORDER BY created_ts DESC LIMIT 1`,
+            key,
+          );
+        }
+        if (!live) {
+          // BR#4977 lane lifecycle: no successor means deliberately retired —
+          // the single refusal point (the BR#4772 drill-residue class): no
+          // lease/CPO meta writes, no config refresh, no re-arm, and no
+          // create-fresh resurrection (BR#5061's spec clause is superseded
+          // here by the accepted decision). Re-arm is a deliberate lifecycle
+          // act — re-open the lane card or register a reseed.
+          throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+        }
+        existing = this.one(
+          `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts WHERE id = ?`,
+          live.id,
+        );
       }
+      // one-time volatile-state migration off every terminal card: an
+      // awaiting-ci merge / line stop / bypass wait survives the rebind.
+      // Idempotent — a terminal card with no volatile state is a no-op.
+      let migrated = false;
+      for (const t of terminals) {
+        const tm = JSON.parse(t.meta ?? "{}");
+        const vol = { currently: tm.currently ?? null, stop: tm.stop ?? null, bypass_wait: tm.bypass_wait ?? null };
+        if (!vol.currently && !vol.stop && !vol.bypass_wait) continue;
+        const liveRow = this.one(
+          `SELECT id, meta FROM artefacts
+           WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
+           ORDER BY created_ts DESC LIMIT 1`,
+          key,
+        );
+        if (!liveRow) break; // nothing to migrate onto — the retired refusal owns this case
+        const lm = JSON.parse(liveRow.meta ?? "{}");
+        const patched = { ...lm };
+        for (const [k2, v] of Object.entries(vol)) {
+          if (v && !patched[k2]) patched[k2] = v;
+        }
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(patched), liveRow.id);
+        for (const [k2, v] of Object.entries(vol)) {
+          if (v) tm[k2] = null;
+        }
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(tm), t.id);
+        this.audit(actor, "lane_rebound", liveRow.id, {
+          lane: key, from_terminal: t.id,
+          migrated: Object.entries(vol).filter(([, v]) => !!v).map(([k2]) => k2),
+          note: "BR#5061: volatile lane state migrated off the terminal card — in-flight merges finish their landing close on the live card",
+        });
+        this.version(liveRow.id, actor, "lane_rebound", `lane rebound off retired ${t.id} onto this card (BR#5061) — in-flight state migrated, the tick drives this card now`, { from_terminal: t.id });
+        migrated = true;
+      }
+      // the caller (trainLease/trainEvent/trainCi) parses THIS return value
+      // and writes its own meta updates from it — a stale pre-migration
+      // snapshot would STOMP the migrated state one write later. Re-fetch.
+      if (migrated) existing = this.laneRow(key);
+    }
+    if (existing && existing.status !== "done" && existing.status !== "superseded") {
       // config updates ride the op that knows better (operator/executor):
       // required_workflows / ci_typical_minutes / burst_max refresh in place.
       const cur = laneOfMeta(existing.meta);
@@ -7221,6 +7326,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
       return existing;
     }
+    if (existing) {
+      // unreachable defensive posture: a terminal card with NO terminal rows
+      // above (status changed mid-flight) — fall through to create-fresh.
+      this.audit(actor, "lane_terminal_still_bound", existing.id, { lane: key, status: existing.status, note: "BR#5061 defensive: creating a fresh standing card" });
+    }
+    existing = await this.laneCreate(repo, base, actor, key, cfg ?? {});
+    return existing;
+  }
+
+  /** The create leg of laneEnsure — seeds config from settings unless the
+   *  caller supplied an inheritance/cfg bundle. */
+  private async laneCreate(repo: string, base: string, actor: string, key: string, cfg?: Partial<LaneSpec>): Promise<any> {
     // seed from settings (admin.settings_set) — the operator's lane config
     let seeded: Partial<LaneSpec> = cfg ?? {};
     try {
@@ -7829,6 +7946,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const failing: { name: string; conclusion?: string | null; url?: string | null }[] = Array.isArray(body.failing) ? body.failing : [];
       const culprit = String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null;
       const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
+      // BR#5061 storm dedupe: the SAME stop re-reported by an executor tick
+      // loop (the stop arm clears on green main, the awaiting-ci arm re-fires
+      // it — observed as ~2 stopped events/min for hours on bridge@main)
+      // must be ONE episode in the ledger, not one row per tick. Same sha +
+      // same reason = same episode: no ledger row, no version, no ask, no
+      // culprit re-bounce — the idempotent no-op.
+      if (meta.stop && String(meta.stop.sha) === String(sha) && String(meta.stop.reason ?? "") === why) {
+        this.audit(actor, "train:stopped_deduped", lane.id, { lane: laneKey(repo, base), sha: sha.slice(0, 9), reason: why.slice(0, 140) });
+        return { ok: true, kind: "stopped", lane: laneKey(repo, base), sha, stop: meta.stop, deduped: true, reason: this.laneSyncReason(lane.id, meta, now) };
+      }
       // BR#4981 state 6: the stop names the culprit card so the panel reads
       // "STOP THE LINE — base red, fix card BR#X" without a ledger dig.
       // BR#4934: a stop under a burst pass pre-stamps the bisect record —
@@ -8272,7 +8399,57 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       return { ...out, decided: "stopped" };
     }
     // pending — the bound decides: unknown past ~3× typical ⇒ fail-closed
+    // stop. BR#5061 (Ray 2026-10-30: "if it can't merge, bounce it and move
+    // onto the next one — the train goes regardless"): when EVERY unsettled
+    // required workflow is MISSING (no check run ever existed for it on the
+    // merge commit — e.g. a PR-context-only gate like main-green gate that
+    // only runs on pull_request), waiting cannot change the verdict: the
+    // commit will never grow those runs. Halting the whole line on a
+    // provably-unchangeable classification starves the queue for nothing.
+    // Instead: land on the workflows that exist, drop the phantom names with
+    // a loud audit, and file ONE config-defect ask per episode to the alarm
+    // sink (the halt-class escalation — a human fixes required_workflows).
+    // Genuinely unsettled OBSERVED runs (a check that exists and hasn't
+    // concluded) keep the fail-closed stop, deduped per episode.
     if (v.bound_exceeded) {
+      const observedUnsettled = v.pending.filter((n) => checks.some((c) => (c.name ?? "") === n));
+      // positive evidence first: at least one required workflow PROVED green
+      // on this very commit — the carve-out never fires on an empty/zero
+      // evidence poll (an executor that reports nothing gets the stop, the
+      // honest fail-closed posture the bound exists for)
+      const greenRequired = checks.filter((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success");
+      if (!v.failing.length && v.missing.length && !observedUnsettled.length && greenRequired.length) {
+        const phantoms = v.missing.filter((n) => n !== "settle-dwell");
+        this.audit(actor, "train:required_phantom_dropped", lane.id, {
+          lane: laneKey(repo, base), pr, merge_sha: mergeSha.slice(0, 9),
+          missing_required: phantoms,
+          settled_green: greenRequired.map((c) => c.name),
+          note: "BR#5061: required workflow(s) never ran on the merge commit (PR-context-only?) — landing on the workflows that exist; lane config needs a human",
+        });
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: `Lane config defect ${repo}@${base}: required workflow(s) never run on merge commits — remove ${phantoms.join(", ")} from required_workflows?`,
+              reason: "the merge train cannot prove these required workflows on a landed merge commit — every merge past the CI bound lands on the workflows that exist instead of halting (Ray ruling 2026-10-30), but the lane config should be fixed",
+              details: [
+                `Lane ${laneKey(repo, base)} requires: ${laneSpec.required_workflows.join(", ")}.`,
+                `On merge commit ${mergeSha.slice(0, 9)} (PR #${pr}) these required workflows produced NO check run — they look PR-context-only (e.g. a pull_request-triggered gate) and can never appear on a merge commit: ${phantoms.join(", ")}.`,
+                `Effect: merges past the ~${TRAIN_CI_BOUND_MULTIPLIER}× typical CI bound LAND judged on the workflows that exist (observed green: ${greenRequired.map((c) => c.name).join(", ")}) instead of stopping the line.`,
+                `Fix: remove the PR-context-only names from the lane's required_workflows (admin settings key train_lane, or the lane card's config op) — the admission gate already judges base-main health separately.`,
+              ].join("\n\n"),
+              options: ["Fix the lane config (remove PR-context-only workflows)", "Ack — landing on existing workflows is fine", "Investigate — these should run on merge commits"],
+              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+              urgency: "time-sensitive",
+            },
+            "system:train",
+          );
+        } catch (e) {
+          this.audit(actor, "phantom_ask_suppressed", lane.id, { note: String((e as Error).message ?? e).slice(0, 160) });
+        }
+        const out = await this.landedFlowGuarded(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success")?.html_url ?? body.run_url ?? null });
+        return { ...out, decided: "landed_phantom_required", dropped_required: phantoms };
+      }
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)` }, actor);
       return { ...out, decided: "stopped_bound" };
     }
@@ -8639,7 +8816,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  episode stamp is written BEFORE the await, so concurrent callers
    *  (train.status readers + the alarm sweep) cannot double-alarm. */
   private async laneStarvationTick(l: any, meta: any, lane: { repo: string; base: string }, queue: any[], now0: number): Promise<{ since: number; mins: number } | null> {
-    const capableAge = now0 - Number(meta.lane?.last_capable_lease_ts ?? 0);
+    // BR#5061: the starve clock NEVER inits from epoch — a lane that has
+    // never recorded a capable lease (a fresh reseed) starts its clock at
+    // the card's own last status change, not 1970. The epoch-init produced
+    // the bogus "starved 29888714m" alarm class (BR#5063).
+    const capRaw = Number(meta.lane?.last_capable_lease_ts ?? 0);
+    const capEpoch = capRaw > 0 ? capRaw : Math.max(0, Number(l.status_ts ?? 0));
+    if (!capEpoch) return null; // no clock to judge — nothing recorded yet
+    const capableAge = now0 - capEpoch;
     const starved = queue.length > 0 && capableAge > TRAIN_STARVE_MS
       ? { since: now0 - capableAge + TRAIN_STARVE_MS, mins: Math.round((capableAge - TRAIN_STARVE_MS) / 60_000) }
       : null;
@@ -8684,8 +8868,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  was the outage's second failure). Same episode logic as train.status:
    *  once-per-episode via the starved_since stamp. */
   private async sweepLaneStarvation(now0: number): Promise<void> {
+    // BR#4977/BR#5061: retired lane cards never tick, never starve — skipped
+    // in the loop below (status selected for the guard); a reseeded lane
+    // alarms once, on its live card, not per duplicate card.
     const lanes = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM artefacts
+      `SELECT id, status, status_ts, meta FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const l of lanes) {
@@ -8709,8 +8896,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const now0 = Date.now();
     const lanes = this.state.storage.sql.exec(
       `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL ORDER BY title`,
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
+       ORDER BY title`,
     ).toArray() as any[];
+    // BR#5061: ONE row per lane key. A retired card whose lane has a LIVE
+    // successor (the reseed shape — the 2026-10-29 outage showed two rows
+    // for bridge@main) is superseded history: skipped. A retired card with
+    // NO successor stays visibly retired (BR#4977 — the panel names why).
+    const liveKeys = new Set(
+      (this.state.storage.sql.exec(
+        `SELECT DISTINCT json_extract(meta, '$.lane.key') AS k FROM artefacts
+         WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
+           AND status NOT IN ('done','superseded')`,
+      ).toArray() ?? []).map((r: any) => String(r.k ?? "")),
+    );
     const out: any[] = [];
     for (const l of lanes) {
       const meta = JSON.parse(l.meta ?? "{}");
@@ -8722,6 +8921,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // no starvation stamps, no reason rewrites on a "never tick again"
       // card (the BR#4772 phantom-ready class).
       if (l.status === "done" || l.status === "superseded") {
+        if (liveKeys.has(laneKey(lane.repo, lane.base))) continue; // reseeded — history
         out.push({
           lane: `${lane.repo}@${lane.base}`,
           card: l.id,

@@ -438,6 +438,7 @@ describe("loop regressions", () => {
         "done-open-children",
         "done-unreviewed",
         "human-signoff-done",
+        "infrastructure-close-protection",
         "operator-gated",
         "question-not-claimable",
         "release-needs-ownership",

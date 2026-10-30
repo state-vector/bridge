@@ -1298,3 +1298,223 @@ describe("BR#4977 lane lifecycle + queue base scoping", () => {
     expect(releaseLane.queue.map((c: any) => c.id)).not.toContain(mainCard);
   });
 });
+
+// ---------- BR#5061: lane revival — the terminal-bind outage ----------
+// The incident (2026-10-29): a duty session closed the state-vector/bridge@main
+// lane card done as a close-reflex ⇒ the card retired (BR#4977) ⇒ the tick's
+// find-or-create kept binding the TERMINAL card every cycle while the reseed
+// card was never adopted; the awaiting-CI merge wedged on the dead card. These
+// drills pin: terminal cards never bind (supersedes-edge rebind + create-fresh
+// inheritance + volatile-state migration), one row per lane in train.status,
+// close-protection on infra cards, the phantom-required landing (Ray ruling
+// 2026-10-30: "the train goes regardless"), the stopped-storm dedupe, and the
+// starved-since epoch fix.
+
+describe("BR#5061 lane revival (real bundled worker)", () => {
+  it("a terminal lane card never binds: rebind follows the supersedes edge, migrates awaiting-CI, and the merge LANDS on the live card", async () => {
+    const repo = "state-vector/lane-revive";
+    await acquire(repo, "gw-rv", { required_workflows: ["Test"] });
+    const dead = await laneSnap(repo);
+    const deadCard: string = dead.card;
+
+    // in-flight merge on the soon-to-be-terminal card (the PR #328 shape)
+    const HEAD = "1".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 50611, head: HEAD, title: "IMPL: revival drill" });
+    const M = "2".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-rv",
+      pr: 50611, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 10 * 60_000,
+    });
+    expect(merged.body.error ?? "").toBe("");
+
+    // the incident: the lane card goes terminal WHILE holding awaiting-CI
+    // (here via the legitimate retirement path — web/human, on the parked
+    // card's one drop edge blocked→superseded; close-protection pins the
+    // agent path separately below)
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rv" });
+    const closed = await kbJson("/transition", { id: deadCard, to: "superseded", actor: "web:drill", note: "drill: erroneous close of a live lane (the BR#5061 incident shape)" });
+    expect(closed.status).toBeLessThan(400);
+
+    // the reseed: a live card carrying the same lane key, supersedes-linked
+    const reseed = await kbJson("/create", {
+      type: "task",
+      title: `Merge lane: ${repo}@main (v2 — reseed drill)`,
+      meta: { lane: { repo, base: "main", required_workflows: ["Test"], key: `${repo}@main` }, lease: null, currently: null, stop: null },
+      tags: ["merge-train", "infrastructure"],
+      session: "",
+    });
+    const reseedId = String(reseed.body.id);
+    await kbJson("/link", { src: reseedId, relation: "supersedes", dst: deadCard });
+    await kbJson("/transition", { id: reseedId, to: "blocked", actor: "web:drill", note: "merge-train: awaiting an available gateway", unblock_condition: "the train advances this card — run bridge train on a gateway (doctor-gated)" });
+
+    // the next executor op rebinds: acquire binds the RESEED, the volatile
+    // awaiting-CI migrates off the terminal card, train.status shows ONE row
+    const a = await acquire(repo, "gw-rv2", { merge_capable: true });
+    expect(a.body.error ?? "").toBe("");
+    const live = await laneSnap(repo);
+    expect(live.card).toBe(reseedId);
+    expect(live.currently?.pr).toBe(50611);
+    expect(live.currently?.merge_sha).toBe(M);
+    const rows = (await kbJson("/train.status", { repo })).body.lanes.filter((l: any) => l.lane === `${repo}@main`);
+    expect(rows.length).toBe(1);
+    // the terminal card's volatile state is GONE (migrated, not copied)
+    const deadMeta = (await kbJson("/get", { id: deadCard })).body.meta;
+    expect(deadMeta.currently ?? null).toBeNull();
+
+    // and the wedge cures itself: green CI on the migrated merge lands it
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-rv2", sha: M, checks: [check(1, "Test", "success")] });
+    expect(ci.body.decided).toBe("landed");
+    expect((await kbJson("/get", { id: card })).body.status).toBe("done");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rv2" });
+  });
+
+  it("no successor registered: the BR#4977 retirement refusal holds — ops refuse 'lane retired', meta frozen (BR#5061's create-fresh clause is superseded by the accepted decision on this path)", async () => {
+    const repo = "state-vector/lane-fresh";
+    await acquire(repo, "gw-fr", { required_workflows: ["Test", "CLI build (packages/cli)"], ci_typical_minutes: 17 });
+    const old = await laneSnap(repo);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-fr" });
+    await kbJson("/transition", { id: old.card, to: "in_progress", actor: "gw-fr", note: "drill: claiming to retire" });
+    const closed = await kbJson("/transition", { id: old.card, to: "done", actor: "gw-fr", note: "drill: retire with no reseed registered (owner close)" });
+    expect(closed.status).toBeLessThan(400);
+
+    // every lane op refuses — the lane is deliberately retired, no
+    // auto-resurrection, and the terminal card's meta never moves
+    const refused = await acquire(repo, "gw-fr2", {});
+    expect(String(refused.body.error ?? "")).toContain("lane retired");
+    expect(String(refused.body.error ?? "")).toContain("reseed");
+    // …and the panel still shows the lane, VISIBLY retired, one row
+    const rows = (await kbJson("/train.status", { repo })).body.lanes.filter((l: any) => l.lane === `${repo}@main`);
+    expect(rows.length).toBe(1);
+    expect(rows[0].retired).toBe(true);
+    expect(rows[0].queue).toEqual([]);
+  });
+
+  it("close-protection: an agent/duty cannot done or supersede a lane/infra card — NAMED rejection; web retires it fine", async () => {
+    const repo = "state-vector/lane-guard";
+    await acquire(repo, "gw-gd", {});
+    const lane = await laneSnap(repo);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-gd" });
+
+    // the 2026-10-29 misfire class: a duty session closing the lane card.
+    // Lifecycle-legal edge: claim (blocked→in_progress) then done — the
+    // guard must catch the reflex regardless of which legal edge it takes.
+    const claimed = await kbJson("/transition", { id: lane.card, to: "in_progress", actor: "gw-gd", note: "drill: gateway holds the lane" });
+    expect(claimed.status).toBeLessThan(400);
+    const refused = await kbJson("/transition", { id: lane.card, to: "done", actor: "duty-BR-drill", note: "subject landed — closing" });
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    expect(String(refused.body.error)).toContain("infrastructure/merge-train lane card");
+    expect(String(refused.body.error)).toContain("BR#5061");
+    expect((await kbJson("/get", { id: lane.card })).body.status).toBe("in_progress");
+
+    // a bare infrastructure-tagged task (no meta.lane) is guarded the same way
+    const infra = await kbJson("/create", { type: "task", title: "INFRA drill card — standing subsystem", tags: ["infrastructure"], session: "" });
+    const claimed2 = await kbJson("/transition", { id: String(infra.body.id), to: "in_progress", actor: "duty-BR-drill", note: "drill: duty claims the infra card" });
+    expect(claimed2.status).toBeLessThan(400);
+    const refused2 = await kbJson("/transition", { id: String(infra.body.id), to: "done", actor: "another-duty-BR-drill", note: "closing infra by reflex" });
+    expect(refused2.status).toBeGreaterThanOrEqual(400);
+    expect(String(refused2.body.error)).toContain("infrastructure");
+
+    // the OWNER may close their own claimed infra card (ownership is the
+    // other legal path — the guard never fences the owner out)
+    const okOwner = await kbJson("/transition", { id: String(infra.body.id), to: "done", actor: "duty-BR-drill", note: "owner closes own infra card — receipts: drill" });
+    expect(okOwner.status).toBeLessThan(400);
+
+    // humans retire lanes fine (web/human actors are exempt — the recovery
+    // lever this incident needed)
+    const ok1 = await kbJson("/transition", { id: lane.card, to: "done", actor: "web:ray", note: "deliberate retirement — drill" });
+    expect(ok1.status).toBeLessThan(400);
+  });
+
+  it("phantom-required past the bound LANDS on the workflows that exist + files the config-defect ask (Ray 2026-10-30); observed-stuck keeps the stop", async () => {
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — phantom required", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+
+    // (a) the live-wedge shape: main-green gate is PR-context-only — it
+    // NEVER produces a check run on the merge commit, so the verdict can
+    // never go green and the old code stopped the line every tick
+    const repo = "state-vector/lane-phantom";
+    await acquire(repo, "gw-ph", { required_workflows: ["Test", "CLI build (packages/cli)", "main-green gate"] });
+    const HEAD = "3".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 50612, head: HEAD, title: "IMPL: phantom drill" });
+    const M = "4".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-ph",
+      pr: 50612, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 90 * 60_000, // 90m — past the 3×20m bound
+    });
+    // commit-level checks: Test + CLI green, main-green gate ABSENT (it only
+    // runs on pull_request) — exactly the b346e772d shape
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-ph", sha: M, checks: [check(1, "Test", "success"), check(2, "CLI build (packages/cli)", "success")] });
+    expect(ci.body.decided).toBe("landed_phantom_required");
+    expect(ci.body.dropped_required).toEqual(["main-green gate"]);
+    expect((await kbJson("/get", { id: card })).body.status).toBe("done");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    const asks = await kbJson("/search?q=Lane config defect&limit=50");
+    const mine = asks.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`));
+    expect(mine.length).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ph" });
+
+    // (b) a genuinely stuck OBSERVED run (check exists, never concluded)
+    // keeps the fail-closed stop — the phantom carve-out does not swallow it
+    const repo2 = "state-vector/lane-stuckrun";
+    await acquire(repo2, "gw-st", { required_workflows: ["Test"] });
+    const HEAD2 = "5".repeat(40);
+    const card2 = await queueViaAccept({ repo: repo2, pr: 50613, head: HEAD2, title: "IMPL: stuck-run drill" });
+    const M2 = "6".repeat(40);
+    await kbJson("/train.event", {
+      repo: repo2, base: "main", kind: "merged", actor: "gw-st",
+      pr: 50613, merge_sha: M2, head_sha: HEAD2, task_id: card2,
+      merged_at: Date.now() - 90 * 60_000,
+    });
+    const ci2 = await kbJson("/train.ci", { repo: repo2, base: "main", actor: "gw-st", sha: M2, checks: [check(3, "Test", null)] });
+    expect(ci2.body.decided).toBe("stopped_bound");
+    await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-st", line_green: true });
+  });
+
+  it("the SAME stop re-reported by a tick loop is ONE ledger episode (no stopped-storm)", async () => {
+    const repo = "state-vector/lane-storm";
+    await acquire(repo, "gw-sm", {});
+    const HEAD = "7".repeat(40);
+    await queueViaAccept({ repo, pr: 50614, head: HEAD, title: "IMPL: storm drill" });
+    const M = "8".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-sm",
+      pr: 50614, merge_sha: M, head_sha: HEAD,
+      merged_at: Date.now() - 90 * 60_000,
+    });
+    const stop1 = await kbJson("/train.event", {
+      repo, base: "main", kind: "stopped", actor: "gw-sm", pr: 50614, merge_sha: M,
+      reason: "CI unknown past the fail-closed bound (~3× typical)",
+    });
+    expect(stop1.body.deduped ?? false).toBe(false);
+    // the tick loop re-fires the identical stop (the storm shape: ~2/min)
+    for (let i = 0; i < 5; i++) {
+      const again = await kbJson("/train.event", {
+        repo, base: "main", kind: "stopped", actor: "gw-sm", pr: 50614, merge_sha: M,
+        reason: "CI unknown past the fail-closed bound (~3× typical)",
+      });
+      expect(again.body.deduped).toBe(true);
+    }
+    // NB: GET /train.history carries no body — the repo/kind filters are
+    // request-body params — so filter client-side
+    const hist = await kbJson(`/train.history`);
+    const stops = hist.body.events.filter((e: any) => e.kind === "stopped" && e.repo === repo);
+    if (stops.length !== 1) for (const e of stops) console.log("STORM-ROW", e.seq, e.gateway, e.pr, JSON.stringify(e.detail).slice(0, 120));
+    expect(stops.length).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-sm", line_green: true });
+  });
+
+  it("starved_since never inits from epoch — a never-capable lane with a queue reports NOT starved until its own clock ages", async () => {
+    const repo = "state-vector/lane-epoch";
+    // fresh lane card (blocked at birth — status_ts ≈ now), NO capable lease
+    // ever recorded, then a queued card: the OLD code computed starve minutes
+    // off epoch-zero (the "starved 29888714m" alarm class, BR#5063)
+    await queueViaAccept({ repo, pr: 50615, head: "9".repeat(40), title: "IMPL: epoch drill" });
+    const lane = await laneSnap(repo);
+    expect(lane.queue.length).toBeGreaterThan(0);
+    expect(lane.last_capable_lease_ts ?? null).toBeNull();
+    expect(lane.starved).toBeNull();
+  });
+});
