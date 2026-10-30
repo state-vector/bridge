@@ -8066,6 +8066,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // Legacy stops keep the exact legacy shape (no bisect key beyond the
       // culprit_task the BR#4981 vocabulary names).
       const burstStop = meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
+      // culprit_task rides the stop record (BR#4849): the Top view banner
+      // answers "who broke it" from the stop itself, not session memory.
       meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
       // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
@@ -9151,6 +9153,35 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         })
         .sort((x, y) => y.age_ms - x.age_ms)
         .slice(0, 20);
+      // BR#4849: the red-main episode, hub-derived. The hub holds no VCS
+      // credentials (BR#3516) — it cannot see GitHub red itself — but every
+      // episode leaves a board record: the open root-blocker/main-red task.
+      // Derive the newest open one in the lane's project so the Top view
+      // banner answers "who is fixing it" — including the loudest possible
+      // answer: UNOWNED. last_merge (the lane's newest landed event) anchors
+      // "who broke it" when no machine culprit was stamped on the stop.
+      const project = lane.repo.split("/").pop() ?? "";
+      const redTask = this.state.storage.sql.exec(
+        `SELECT id, title, status, owner, meta, created_ts FROM artefacts
+         WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+           AND project = ? AND (tags LIKE '%"main-red"%' OR tags LIKE '%"root-blocker%"')
+         ORDER BY created_ts DESC LIMIT 1`,
+        project,
+      ).toArray()[0] ?? null;
+      let executorSession = "";
+      if (redTask) {
+        // the executor lease is meta.session, surfaced as executor_session for
+        // in_progress/in_review only (mirrors the orient serving, BR#3361 d)
+        try {
+          const rm = JSON.parse(String(redTask.meta ?? "{}"));
+          if (["in_progress", "in_review"].includes(String(redTask.status ?? ""))) executorSession = String(rm.session ?? "");
+        } catch { executorSession = ""; }
+      }
+      const lastMerge = this.state.storage.sql.exec(
+        `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
+         WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+        lane.repo, lane.base,
+      ).toArray()[0] ?? null;
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9172,6 +9203,25 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         starved,
         queue,
         awaiting: awaitingRows,
+        red_main: redTask
+          ? {
+              task_id: String(redTask.id),
+              title: String(redTask.title ?? ""),
+              status: String(redTask.status ?? ""),
+              owner: String(redTask.owner ?? ""),
+              executor_session: executorSession,
+              created_ts: Number(redTask.created_ts ?? 0),
+            }
+          : null,
+        last_merge: lastMerge
+          ? {
+              ts: Number(lastMerge.ts ?? 0),
+              pr: lastMerge.pr == null ? undefined : Number(lastMerge.pr),
+              task_id: lastMerge.task_id == null ? undefined : String(lastMerge.task_id),
+              gateway: lastMerge.gateway == null ? undefined : String(lastMerge.gateway),
+              merge_sha: lastMerge.merge_sha == null ? undefined : String(lastMerge.merge_sha),
+            }
+          : null,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
           merged_24h: Number(tp.h24 ?? 0),

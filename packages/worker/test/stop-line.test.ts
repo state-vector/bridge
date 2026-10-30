@@ -442,3 +442,71 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(rel.body.lease).toBeNull();
   });
 });
+
+describe("train.status red-main episode — who broke it / who is fixing it (BR#4849)", () => {
+  it("derives red_main from the lane project's open root-blocker/main-red task (UNOWNED until claimed), stamps the stop's culprit_task, and drops it when the episode closes", async () => {
+    const repo = "state-vector/red-banner";
+    await acquire(repo, "gw-banner");
+
+    // a landing first: the ledger's newest merged event anchors "who broke it"
+    const anchorCard = await kbJson("/create", { type: "task", title: "IMPL: banner drill — last landed" });
+    expect(anchorCard.status).toBe(200);
+    const anchor = String(anchorCard.body.id);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-banner",
+      pr: 2710, merge_sha: "b".repeat(40), head_sha: "a".repeat(40), task_id: anchor,
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // no episode task yet → red_main null, but the landing anchor is served
+    let snap = await laneSnap(repo);
+    expect(snap.red_main).toBeNull();
+    expect(snap.last_merge?.pr).toBe(2710);
+    expect(snap.last_merge?.gateway).toBe("gw-banner");
+    expect(snap.last_merge?.task_id).toBe(anchor);
+
+    // the episode record: an open root-blocker/main-red task in the lane's
+    // project, unowned — exactly how a real main-red lives on the board
+    // (BR#4724/BR#4728 class: filed by a session, nobody owns it)
+    const ep = await kbJson("/create", {
+      type: "task",
+      title: "ROOT BLOCKER (main-red): banner drill — Deploy Dev red on main tip deadbeef",
+      tags: ["root-blocker", "main-red"],
+      project: "red-banner",
+    });
+    expect(ep.status, `create failed: ${JSON.stringify(ep.body)}`).toBeLessThan(400);
+    const epId = String(ep.body.id);
+
+    snap = await laneSnap(repo);
+    expect(snap.red_main?.task_id).toBe(epId);
+    expect(snap.red_main?.status).toBe("todo");
+    expect(snap.red_main?.owner).toBe("");
+    expect(snap.red_main?.executor_session).toBe("");
+
+    // a fed stop stamps the machine culprit on the stop record itself — the
+    // banner's "who broke it" then points at the card, not a guess
+    const stopped = await kbJson("/train.event", {
+      repo, base: "main", kind: "stopped", actor: "gw-banner",
+      merge_sha: "c".repeat(40), culprit_task: epId,
+      failing: [{ name: "Deploy Dev", conclusion: "failure", url: "https://example/ci/deploy-red" }],
+    });
+    expect(stopped.body.error ?? "", `train:stopped failed: ${JSON.stringify(stopped.body)}`).toBe("");
+    expect((await laneSnap(repo)).stop?.culprit_task).toBe(epId);
+
+    // "who is fixing it" going from UNOWNED to named is board fact
+    const claim = await kbJson("/transition", {
+      id: epId, to: "in_progress", session: "banner-drill-fixer", note: "diagnosing the query-engine invoke failure",
+    });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBeLessThan(400);
+    snap = await laneSnap(repo);
+    expect(snap.red_main?.status).toBe("in_progress");
+    expect(snap.red_main?.executor_session).toBe("banner-drill-fixer");
+
+    // the line recovers → the episode task leaves the open set → banner gone
+    const out = await kbJson("/transition", { id: epId, to: "done", session: "banner-drill-fixer", note: "drill: main settled green — Deploy Dev SUCCESS at tip, merge gate cleared" });
+    expect(out.status, `close failed: ${JSON.stringify(out.body)}`).toBeLessThan(400);
+    snap = await laneSnap(repo);
+    expect(snap.red_main).toBeNull();
+    expect(snap.last_merge?.pr).toBe(2710);
+  });
+});
