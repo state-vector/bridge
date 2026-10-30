@@ -60,6 +60,7 @@ import {
   isValidAskTarget,
   tagsSayGateway,
   parseTags,
+  isStandingCard,
   resolveRolePlaybook,
   selfProvisionLabel,
   graceActive,
@@ -7822,6 +7823,33 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (kind === "merged") {
       if (!mergeSha) throw new Error("train:merged needs merge_sha");
       if (!pr) throw new Error("train:merged needs pr");
+      // BR#5151 (a): merged events target TASK cards, never lanes — a merged
+      // event naming the standing lane card itself is how the BR#5050 lane
+      // got a provenance row stamped onto it. Named reject, no writes.
+      const chainTask = String(body.task_id ?? "") || null;
+      if (chainTask) {
+        const trow = this.one(`SELECT meta, tags FROM artefacts WHERE id = ?`, chainTask) as any;
+        if (trow && isStandingCard(JSON.parse(trow.meta ?? "{}"), parseTags(trow.tags)))
+          throw new Error(`train:merged task ${chainTask} is a standing lane card — merged events settle task cards, never lanes (BR#5151)`);
+      }
+      // BR#5151 (b): stateful dedupe — a PR merges exactly once. ANY later
+      // identical (repo, pr, merged) event (crash-recovery re-report,
+      // duplicate lease pass) collapses to an ack; a DIFFERENT merge_sha for
+      // a PR already recorded merged is a named protocol reject, never a
+      // silent overwrite of the provenance stamp. Ledger first, provenance
+      // fallback second (the train's own stamp is a merge receipt).
+      const priorEv = this.one(
+        `SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
+        repo, pr,
+      ) as any;
+      const priorProv = priorEv ? null : (this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, pr) as any);
+      const seenSha = priorEv ? String(priorEv.merge_sha ?? "") : priorProv ? String(priorProv.merge_sha ?? "") : "";
+      if (seenSha) {
+        if (mergeSha.toLowerCase() !== seenSha.toLowerCase())
+          throw new Error(`train:merged ${repo}#${pr} already recorded merged as ${seenSha.slice(0, 9)} — a different merge_sha for a merged PR is a protocol violation (BR#5151)`);
+        this.audit(actor, "train:merged_deduped", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha });
+        return { ok: true, deduped: true };
+      }
       // the executor may report its own merge wall-clock (BR#4804 settle
       // clock): clamp to now — a future stamp would fake a settled lane
       const mergedAt = Math.min(Number(body.merged_at) || now, now);
@@ -9390,7 +9418,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
     // ---- board projection: open cards bound to this repo via a PR leg ----
     const openCards = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')`,
+      `SELECT id, status, meta, tags FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')`,
     ).toArray() as any[];
     const openPrs = new Set(prs.map((p) => p.number));
     const bindings: ReconcileBinding[] = [];
@@ -9413,6 +9441,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           missing: !openPrs.has(leg.number),
           missing_set_before_report: !!seen && Number(seen.missing) === 1,
           provenance: prov ? { merge_sha: String(prov.merge_sha), signer: String(prov.signer) } : null,
+          // BR#5151: standing lane cards never enter the spawn/close legs.
+          lane: isStandingCard(meta, parseTags(row.tags)),
         });
       }
     }
@@ -9456,6 +9486,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           );
           break;
         }
+        case "lane_exempt": {
+          // BR#5151: standing lane card — account-only leg. Clear any stale
+          // missing marker so an exempt card never re-enters the reverse
+          // legs after a rule upgrade.
+          this.state.storage.sql.exec(
+            `INSERT INTO reconcile_seen (repo, pr, card, missing, missing_ts, updated_ts) VALUES (?, ?, ?, 0, NULL, ?)
+             ON CONFLICT(repo, pr) DO UPDATE SET missing = 0, missing_ts = NULL, updated_ts = excluded.updated_ts, card = excluded.card`,
+            repo, j.pr, a.card, now,
+          );
+          break;
+        }
         case "mark_missing": {
           this.state.storage.sql.exec(
             `INSERT INTO reconcile_seen (repo, pr, card, missing, missing_ts, updated_ts) VALUES (?, ?, ?, 1, ?, ?)
@@ -9468,6 +9509,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // card given → the standard duty on the EXISTING bound card (never
           // a second card); card null → orphan: project it first, then duty.
           const parent = a.card ?? await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "approved+mergeable and unbound — the board projection was missing (the #2466 class)", actor, now);
+          // BR#5151: never parent a duty onto a standing lane card — a duty
+          // child of the lane is the foothold for the provenance mis-stamp
+          // (the BR#5050 class). The join already lane-exempts; defense in depth.
+          const parentRow = parent ? (this.one(`SELECT meta, tags FROM artefacts WHERE id = ?`, parent) as any) : null;
+          if (parentRow && isStandingCard(JSON.parse(parentRow.meta ?? "{}"), parseTags(parentRow.tags))) {
+            this.audit(actor, "reconcile_verify_spawn_skipped_lane", parent, { pr: `${repo}#${j.pr}`, note: "standing lane card — reconcile never parents duties onto it (BR#5151)" });
+            break;
+          }
           const duty = await this.reconcileSpawnVerify(repo, j.pr, parent, actor, now);
           spawned.push({ pr: j.pr, action: "verify", card: parent, duty });
           break;
@@ -9510,6 +9559,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           break;
         }
         case "reverse_close": {
+          // BR#5151 hard stop: a standing lane card is NEVER provenance-
+          // closed — this was the exact mechanism that retired the BR#5050
+          // lane. The join already lane-exempts; this guard covers a stale
+          // projection racing a lane re-creation.
+          const target = this.one(`SELECT id, meta, tags FROM artefacts WHERE id = ?`, a.card) as any;
+          if (target && isStandingCard(JSON.parse(target.meta ?? "{}"), parseTags(target.tags))) {
+            this.audit(actor, "reconcile_reverse_close_skipped_lane", a.card, { pr: `${repo}#${j.pr}`, merge_sha: a.merge_sha.slice(0, 9), note: "standing lane card — provenance on it never closes it (BR#5151)" });
+            break;
+          }
           // Two consecutive misses + a provenance row: the train stamped the
           // merge — close the zombie binding via the machine proxy (the same
           // unblock-then-close the landed flow uses; BR#3287 provenance).

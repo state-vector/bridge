@@ -1173,7 +1173,16 @@ daemon never writes the board; the hub never touches GitHub. A report per repo p
 **Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
 open list starts a missing clock; two consecutive misses with a provenance row close the
 zombie binding via the machine proxy (BR#3287 — the train stamped the merge); with NO
-provenance it spawns a ruling duty instead — someone rules, never silence.
+provenance it spawns a ruling duty instead — someone rules, never silence. Standing
+merge-lane cards are exempt from ALL of it (BR#5151, the BR#5050 incident): a lane card
+bound to a PR — even with a provenance row stamped on it and past the two-miss guard — is
+accounted `lane-exempt` and never closed, never dutied, never clocked; the train's settle
+path is the only lane writer. The close-protection gate matches: owner identity is no
+longer a close path for a standing card (the reconcile daemon's actor WAS the lane's
+owner) — humans (`web:`/`human:`) and the machinery (`system:`) only. And `train:merged`
+is stateful about merges: a PR merges exactly once, so an identical re-report collapses
+to an ack (crash-recovery is free) while a different merge sha for a recorded merge is a
+named protocol reject — never a silent provenance overwrite.
 
 Knobs: `reconcile.enabled` / `RECONCILE_ENABLED` (default on),
 `reconcile.interval_secs` / `RECONCILE_INTERVAL_SECS` (default 1800, clamped 300..21600),
