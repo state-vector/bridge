@@ -24,6 +24,17 @@ export function isArtefactType(t: unknown): t is ArtefactType {
   return typeof t === "string" && (ARTEFACT_TYPES as readonly string[]).includes(t);
 }
 
+/** Standing merge-lane card (BR#5151): a meta.lane card or anything tagged
+ *  "infrastructure" IS a live subsystem. Reconcile never closes one, verify
+ *  duties never parent onto one, and the settle path (train:merged) is the
+ *  only writer that may touch it. Pure — callers parse tags defensively via
+ *  parseTags before handing them here. */
+export function isStandingCard(meta: unknown, tags: unknown): boolean {
+  const m = (meta ?? {}) as Record<string, unknown>;
+  const t = Array.isArray(tags) ? tags.map(String) : [];
+  return !!m.lane || t.includes("infrastructure");
+}
+
 /** Task kinds — one task type, distinguished by TYPE + ROLES (phase-3
  *  classification: type and roles are structural, tags are inert user
  *  labels — a tag can never change system behaviour). meta.kind is legacy
