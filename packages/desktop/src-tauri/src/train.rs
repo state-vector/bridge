@@ -977,15 +977,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         release_if_idle(ctx, key, repo, base)?;
         return Ok(());
     }
-    // PHASE A prelude (BR#4996): the lane's base sha and verdict are read
-    // ONCE for the whole classification walk — every candidate is gated on
-    // the same base truth: the REAL verdict while the pass hasn't landed
-    // (BR#3009: the pass's FIRST landing still gates on it), FORCED green
-    // mid-pass (destination-green is the pass settle's, BR#4934 — the
-    // per-member tip RED check owns the stop).
-    let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-    let gate_base = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
     let mut candidates: Vec<BatchCandidate> = Vec::new();
+    // the walk's lazily-read base verdict (BR#4996) — Some after the first
+    // gate-reaching entry, shared by every candidate in the walk
+    let mut base_cache: Option<MainVerdict> = None;
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1109,9 +1104,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
-        // base_sha / gate_base were read ONCE for this walk (phase A prelude,
-        // BR#4996): the real verdict on a fresh pass (BR#3009), forced green
-        // mid-pass (BR#4934).
+        // BR#4996: the lane's base sha + verdict are read ONCE per
+        // classification walk, LAZILY — only an entry that reaches the gate
+        // pays the read (the BR#3935 advance paths stay gh-free), and every
+        // candidate gates on the same base truth: the REAL verdict while the
+        // pass hasn't landed (BR#3009: the pass's FIRST landing still gates
+        // on it), FORCED green mid-pass (destination-green is the pass
+        // settle's, BR#4934 — the per-member tip RED check owns the stop).
+        if base_cache.is_none() {
+            let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+            let verdict = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
+            base_cache = Some(verdict);
+        }
+        let gate_base = base_cache.clone().unwrap_or(MainVerdict::Green);
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
