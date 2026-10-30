@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_BURST_MAX,
+  conflictsFromFileSets,
   drainBurstDecision,
   firstRedIndex,
   laneCardBody,
@@ -17,6 +18,7 @@ import {
   normalizeGhMergeState,
   progressVerdict,
   renewProgressDecide,
+  selectBatch,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -1236,5 +1238,46 @@ describe("burst-drain law (BR#4934)", () => {
     expect(firstRedIndex([false, true, false, true])).toBe(1);
     expect(firstRedIndex([true])).toBe(0);
     expect(firstRedIndex([])).toBeNull();
+  });
+});
+
+// ---------- batch-merge selection law (BR#4996, Ray ruling 2026-10-29) ----------
+
+describe("batch-merge law (BR#4996)", () => {
+  it("selectBatch: maximal mutually non-conflicting set, queue order = landing order", () => {
+    // 0 conflicts with 2: the batch is [0, 1]; 2 waits for the next pass
+    expect(selectBatch([true, true, true], [[0, 2]], 0)).toEqual([0, 1]);
+    // chain 0+1 conflict, 1+2 conflict: only 1 is skipped — [0, 2] land together
+    // (conflicts are checked against SELECTED heads only)
+    expect(selectBatch([true, true, true], [[0, 1], [1, 2]], 0)).toEqual([0, 2]);
+    // both pair orientations are checked
+    expect(selectBatch([true, true, true], [[2, 0]], 0)).toEqual([0, 1]);
+  });
+
+  it("selectBatch: cap binds; cap 0 is unlimited", () => {
+    expect(selectBatch([true, true, true], [], 2)).toEqual([0, 1]);
+    expect(selectBatch([true, true, true], [], 0)).toEqual([0, 1, 2]);
+    expect(selectBatch([true], [], 0)).toEqual([0]);
+    expect(selectBatch([], [], 0)).toEqual([]);
+  });
+
+  it("selectBatch: fail-closed — not-known-clean excludes just that member", () => {
+    expect(selectBatch([false, true, true], [], 0)).toEqual([1, 2]);
+    expect(selectBatch([false, false, false], [], 0)).toEqual([]);
+    // an excluded member shields nothing: conflicts are vs SELECTED only
+    expect(selectBatch([false, true], [[0, 1]], 0)).toEqual([1]);
+  });
+
+  it("conflictsFromFileSets: pairwise set intersection; empty set conflicts with nothing", () => {
+    expect(conflictsFromFileSets([new Set(["a.rs", "b.ts"]), new Set(["c.rs"]), new Set(["b.ts", "d.md"])])).toEqual([[0, 2]]);
+    expect(conflictsFromFileSets([new Set(["a.rs"]), new Set(["b.rs"])])).toEqual([]);
+    expect(conflictsFromFileSets([new Set<string>(), new Set(["a.rs"])])).toEqual([]);
+  });
+
+  it("laneCardBody names the batch law: mutually non-conflicting members, one settle, conflicts wait", () => {
+    const body = laneCardBody({ repo: "r", base: "main", required_workflows: [], burst_max: 4 }, { alarm_sink: "sink" });
+    expect(body).toContain("MUTUALLY non-conflicting");
+    expect(body).toContain("BR#4996");
+    expect(body).toContain("waits for the next pass");
   });
 });
