@@ -10,7 +10,7 @@ import { TopView } from "./components/TopView";
 import { WorkspacePicker } from "./components/WorkspacePicker";
 import type { WsFrame } from "@bridge/specs";
 import { cardIdFromPathSegment, cardPath } from "@bridge/specs";
-import { Btn, Chip, StatusLights, TaskDetail } from "@bridge/ui-kit";
+import { Btn, Chip, StatusLights, ReportsView, TaskDetail } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "@bridge/ui-kit/tokens.css";
@@ -21,9 +21,10 @@ import "./App.css";
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
-type Tab = "top" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
+type Tab = "top" | "reports" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "top", label: "Top" },
+  { key: "reports", label: "Reports" },
   { key: "backlog", label: "Backlog" },
   { key: "completed", label: "Completed" },
   { key: "log", label: "Log" },
@@ -152,6 +153,7 @@ export default function App() {
       )}
       <main className="main">
         {tab === "top" && <TopView openTask={openCard} />}
+        {tab === "reports" && <ReportsView />}
         {tab === "backlog" && <BacklogView openTask={openCard} />}
         {tab === "completed" && <CompletedView openTask={openCard} />}
         {tab === "log" && <LogView />}

@@ -20,7 +20,7 @@ export interface FallbackDone {
 }
 
 export interface ThroughputBucket {
-  /** bucket start, epoch ms (UTC day/week alignment) */
+  /** bucket start, epoch ms (UTC hour/day/week alignment) */
   t: number;
   /** done transitions in this bucket */
   n: number;
@@ -29,14 +29,18 @@ export interface ThroughputBucket {
 }
 
 export interface ThroughputOptions {
-  /** "day" | "week" */
+  /** "hour" | "day" | "week" */
   bucket: string;
-  /** range length in days, 1-365 */
+  /** range length in days, 1-365 (1-30 for hour buckets) */
   rangeDays: number;
   now: number;
 }
 
-export const BUCKET_MS: Record<string, number> = { day: 86_400_000, week: 7 * 86_400_000 };
+export const BUCKET_MS: Record<string, number> = { hour: 3_600_000, day: 86_400_000, week: 7 * 86_400_000 };
+
+/** Finest-bucket response-size cap, in range days (BR#5126: hour × 365d would
+ *  be 8,760 buckets — the Reports view wants dense but not unbounded grids). */
+const MAX_RANGE_DAYS: Record<string, number> = { hour: 30, day: 365, week: 365 };
 
 export function parseThroughputParams(bucket: unknown, range: unknown): { bucket: string; rangeDays: number } | { error: string } {
   const b = String(bucket ?? "day");
@@ -44,7 +48,8 @@ export function parseThroughputParams(bucket: unknown, range: unknown): { bucket
   const m = /^(\d{1,3})d?$/.exec(String(range ?? "30d"));
   if (!m) return { error: `range must look like '30d' or '30' (got '${String(range)}')` };
   const days = parseInt(m[1], 10);
-  if (days < 1 || days > 365) return { error: `range must be 1-365 days (got ${days})` };
+  const max = MAX_RANGE_DAYS[b];
+  if (days < 1 || days > max) return { error: `range must be 1-${max} days for ${b} buckets (got ${days})` };
   return { bucket: b, rangeDays: days };
 }
 

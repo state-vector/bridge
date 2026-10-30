@@ -115,6 +115,27 @@ export interface KbThroughput {
   buckets: Array<{ t: number; n: number; cumulative: number }>;
 }
 
+/** Reports view (BR#5126): tasks-done + PR merge throughput, one shared grid. */
+export interface KbReportBucket {
+  /** bucket start, epoch ms */
+  t: number;
+  /** events in this bucket */
+  n: number;
+  /** cumulative within the range */
+  cumulative: number;
+  /** PR series only: gate bounces in this bucket */
+  bounced?: number;
+}
+
+export interface KbReports {
+  bucket: string;
+  range_days: number;
+  from_ts: number;
+  to_ts: number;
+  tasks: { total: number; buckets: KbReportBucket[] };
+  prs: { total: number; bounced_total: number; buckets: KbReportBucket[] };
+}
+
 /** One entry of an artefact's version history: every mutation, who/when/what. */
 export interface KbVersion {
   seq: number;
@@ -235,9 +256,14 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const kbApi = {
   board: () => j<KbBoard>("/api/kb/board"),
-  throughput: (q?: { bucket?: "day" | "week"; range?: string }) => {
+  throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
     return j<KbThroughput>(`/api/kb/metrics/throughput${p.size ? `?${p}` : ""}`);
+  },
+  // BR#5126 Reports view: tasks-done + PR merge series on one shared bucket grid
+  reports: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
+    const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
+    return j<KbReports>(`/api/kb/metrics/reports${p.size ? `?${p}` : ""}`);
   },
   events: (since: number) => j<{ events: KbEvent[]; last_seq: number }>(`/api/kb/events?since=${since}&limit=200`),
   artefacts: (q?: { type?: string; status?: string; limit?: number }) => {

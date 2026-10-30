@@ -526,6 +526,23 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tp-toggle { display: inline-flex; gap: 2px; }
 .tp-toggle button { background: var(--bg-hover); color: var(--text-dim); border: none; border-radius: 4px; padding: 1px 7px; font-size: 10.5px; cursor: pointer; }
 .tp-toggle button.tp-on { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text); font-weight: 600; }
+
+/* ---------- reports (BR#5126): high-res task/h + PR throughput charts ---------- */
+.reports { display: flex; flex-direction: column; gap: 14px; }
+.rep-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rep-title { font-size: 10.5px; letter-spacing: 0.08em; color: var(--text-dim); font-weight: 700; }
+.rep-stats { display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline; }
+.rep-stat { color: var(--text-dim); font-size: 11.5px; }
+.rep-stat b { color: var(--text); }
+.rep-error { color: var(--red); font-size: 11px; }
+.rep-chart { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 8px; display: flex; flex-direction: column; gap: 6px; }
+.rep-chart svg { width: 100%; height: auto; display: block; }
+.rep-axis { font-size: 9px; fill: var(--text-dim); font-family: inherit; }
+.rep-grid-line { stroke: var(--line); stroke-width: 0.5; stroke-dasharray: 2 3; }
+.rep-bar { fill: var(--accent); }
+.rep-bar.zero { fill: var(--bg-hover); }
+.rep-bar.bounce { fill: var(--red); opacity: 0.8; }
+.rep-cum { fill: none; stroke: var(--green); stroke-width: 1.5; opacity: 0.8; }
 .fc { padding: 2px 8px; border-radius: 99px; font-weight: 600; }
 .fc-todo { background: var(--bg-hover); color: var(--text-dim); }
 .fc-in_progress { background: color-mix(in srgb, var(--amber) 15%, transparent); color: var(--amber); }

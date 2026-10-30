@@ -13,8 +13,13 @@ describe("parseThroughputParams", () => {
     expect(parseThroughputParams("week", "90d")).toEqual({ bucket: "week", rangeDays: 90 });
     expect(parseThroughputParams("day", "14")).toEqual({ bucket: "day", rangeDays: 14 });
   });
+  it("accepts hour with a tighter 1-30d cap (BR#5126)", () => {
+    expect(parseThroughputParams("hour", "3d")).toEqual({ bucket: "hour", rangeDays: 3 });
+    expect(parseThroughputParams("hour", "30d")).toEqual({ bucket: "hour", rangeDays: 30 });
+    expect(parseThroughputParams("hour", "60d")).toMatchObject({ error: expect.stringContaining("1-30") });
+  });
   it("rejects unknown bucket, malformed and out-of-bounds range", () => {
-    expect(parseThroughputParams("hour", "30d")).toMatchObject({ error: expect.stringContaining("bucket") });
+    expect(parseThroughputParams("fortnight", "30d")).toMatchObject({ error: expect.stringContaining("bucket") });
     expect(parseThroughputParams("day", "abc")).toMatchObject({ error: expect.stringContaining("range") });
     expect(parseThroughputParams("day", "400d")).toMatchObject({ error: expect.stringContaining("1-365") });
     expect(parseThroughputParams("day", "0d")).toMatchObject({ error: expect.stringContaining("1-365") });
@@ -53,6 +58,17 @@ describe("aggregateThroughput", () => {
     expect(out[out.length - 1].n).toBe(1);
     expect(out[out.length - 2].n).toBe(2);
     expect(out[out.length - 1].cumulative).toBe(3);
+  });
+
+  it("hour buckets: 24 buckets per day, events land on their hour edge (BR#5126)", () => {
+    const out = aggregateThroughput([{ ts: NOW - 2 * 3_600_000, artefact_id: "BR#1" }], [], { bucket: "hour", rangeDays: 1, now: NOW });
+    expect(out).toHaveLength(24);
+    // bucket edges align to the hour: last bucket is NOW's hour, the event
+    // (10:00Z) sits in bucket 22
+    expect(out[out.length - 1].n).toBe(0);
+    expect(out[out.length - 3].n).toBe(1);
+    expect(out[out.length - 3].cumulative).toBe(1);
+    expect(out[0].t % 3_600_000).toBe(0); // hour-aligned
   });
 
   it("fallback: currently-done rows without history count at status_ts; event-covered ids never double-count", () => {

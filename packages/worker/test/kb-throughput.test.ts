@@ -100,10 +100,53 @@ describe("GET /api/kb/metrics/throughput", () => {
   });
 
   it("bad params → 400 with the message, auth still gates", async () => {
-    const bad = await api("/api/kb/metrics/throughput?bucket=hour");
+    const bad = await api("/api/kb/metrics/throughput?bucket=fortnight");
     expect(bad.status).toBe(400);
     expect(String(((await bad.json()) as any).error)).toContain("bucket");
+    // hour's tighter range cap (BR#5126): 60d > 30d max
+    const cap = await api("/api/kb/metrics/throughput?bucket=hour&range=60d");
+    expect(cap.status).toBe(400);
+    expect(String(((await cap.json()) as any).error)).toContain("1-30");
     const anon = await mf.dispatchFetch("https://main/api/kb/metrics/throughput", { headers: { accept: "application/json" } });
+    expect(anon.status).toBe(401);
+  });
+});
+
+describe("GET /api/kb/metrics/reports (BR#5126)", () => {
+  it("serves tasks + PR series on one shared hour grid, defaults hour/3d", async () => {
+    await seedDone("reports smoke 1");
+    await seedDone("reports smoke 2");
+    const res = await api("/api/kb/metrics/reports");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.bucket).toBe("hour");
+    expect(body.range_days).toBe(3);
+    expect(body.tasks.buckets).toHaveLength(72);
+    expect(body.prs.buckets).toHaveLength(72); // same shared grid
+    expect(body.tasks.total).toBeGreaterThanOrEqual(2);
+    expect(body.tasks.buckets[body.tasks.buckets.length - 1].n).toBeGreaterThanOrEqual(2);
+    // prs buckets carry the bounce field even when empty (train_events seeded elsewhere)
+    expect(body.prs.total).toBeGreaterThanOrEqual(0);
+    expect(typeof body.prs.bounced_total).toBe("number");
+    const lastPr = body.prs.buckets[body.prs.buckets.length - 1];
+    expect(lastPr).toHaveProperty("bounced");
+  });
+
+  it("day toggle shares the grid at day grain", async () => {
+    const res = await api("/api/kb/metrics/reports?bucket=day&range=7d");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.bucket).toBe("day");
+    expect(body.tasks.buckets).toHaveLength(7);
+    expect(body.prs.buckets).toHaveLength(7);
+    expect(body.tasks.total).toBeGreaterThanOrEqual(2);
+  });
+
+  it("bad params → 400; anon → 401", async () => {
+    const bad = await api("/api/kb/metrics/reports?bucket=hour&range=90d");
+    expect(bad.status).toBe(400);
+    expect(String(((await bad.json()) as any).error)).toContain("1-30");
+    const anon = await mf.dispatchFetch("https://main/api/kb/metrics/reports", { headers: { accept: "application/json" } });
     expect(anon.status).toBe(401);
   });
 });

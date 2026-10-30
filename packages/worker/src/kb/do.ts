@@ -123,7 +123,7 @@ import {
   type MainCheckRun,
   type RequiredRunsVerdict,
 } from "./core.ts";
-import { aggregateThroughput, parseThroughputParams } from "./throughput.ts";
+import { aggregateThroughput, parseThroughputParams, type DoneEvent, type FallbackDone } from "./throughput.ts";
 import { parseProvenanceSha } from "./provenance.ts";
 import {
   accountingLine,
@@ -2988,6 +2988,7 @@ export class KnowledgeHub {
             ?? this.json(await this.boardPayload());
           case "/stats": return this.json(await this.stats());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
+          case "/metrics.reports": return this.json(await this.metricsReports(url.searchParams));
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
           case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
           case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
@@ -4657,22 +4658,18 @@ export class KnowledgeHub {
     return { id, relations: out };
   }
 
-  /** Task-done throughput (BR#2937): done transitions per bucket + cumulative,
-   *  aggregated from ledger mutation rows (true transition events — immune to
-   *  later status flips) with a status_ts fallback for rows whose history has
-   *  compacted. Read-only; no audit (reads don't ledger). */
-  private async metricsThroughput(sp: URLSearchParams) {
-    const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
-    if ("error" in parsed) throw new Error(parsed.error);
-    const now = Date.now();
-    const from = now - parsed.rangeDays * 86_400_000;
+  /** Done-transition events in range: true transition rows from the ledger
+   *  (immune to later status flips) + the status_ts fallback for currently-done
+   *  tasks whose history has compacted. Shared by metrics.throughput (BR#2937)
+   *  and metrics.reports (BR#5126). */
+  private doneEventsInRange(from: number): { events: DoneEvent[]; fallback: FallbackDone[] } {
     // task ids — only tasks count (decisions/goals have their own lifecycles)
     const taskIds = new Set(
       (this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task'`).toArray() as any[]).map((r) => String(r.id)),
     );
     // done transition events in range (LIKE prefilter, JSON.parse for truth —
     // data carries {from, to}; ask-answer rows carry {status:'done'} instead)
-    const events: Array<{ ts: number; artefact_id: string }> = [];
+    const events: DoneEvent[] = [];
     for (const r of this.state.storage.sql.exec(
       `SELECT ts, artefact_id, data FROM ledger
        WHERE kind = 'mutation' AND action = 'transition' AND ts >= ? AND data LIKE '%"to":"done"%'`,
@@ -4688,6 +4685,19 @@ export class KnowledgeHub {
       `SELECT id, status_ts FROM artefacts WHERE type = 'task' AND status = 'done' AND status_ts >= ?`,
       from,
     ).toArray() as any[]).map((r) => ({ id: String(r.id), status_ts: Number(r.status_ts) }));
+    return { events, fallback };
+  }
+
+  /** Task-done throughput (BR#2937): done transitions per bucket + cumulative,
+   *  aggregated from ledger mutation rows (true transition events — immune to
+   *  later status flips) with a status_ts fallback for rows whose history has
+   *  compacted. Read-only; no audit (reads don't ledger). */
+  private async metricsThroughput(sp: URLSearchParams) {
+    const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
+    if ("error" in parsed) throw new Error(parsed.error);
+    const now = Date.now();
+    const from = now - parsed.rangeDays * 86_400_000;
+    const { events, fallback } = this.doneEventsInRange(from);
     const buckets = aggregateThroughput(events, fallback, { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now });
     return {
       bucket: parsed.bucket,
@@ -4696,6 +4706,46 @@ export class KnowledgeHub {
       to_ts: now,
       total: buckets.reduce((n, b) => n + b.n, 0),
       buckets,
+    };
+  }
+
+  /** Reports view (BR#5126): tasks-done + PR merge throughput on ONE shared
+   *  bucket grid. Tasks ride the same ledger aggregation as metrics.throughput;
+   *  PRs aggregate the train_events ledger (kind=merged, bounces per bucket for
+   *  merge-health context). Read-only; no audit (reads don't ledger). */
+  private async metricsReports(sp: URLSearchParams) {
+    const parsed = parseThroughputParams(sp.get("bucket") ?? "hour", sp.get("range") ?? "3d");
+    if ("error" in parsed) throw new Error(parsed.error);
+    const now = Date.now();
+    const from = now - parsed.rangeDays * 86_400_000;
+    const opts = { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now };
+    const { events, fallback } = this.doneEventsInRange(from);
+    const taskBuckets = aggregateThroughput(events, fallback, opts);
+
+    const mergeEvents: DoneEvent[] = [];
+    const bounceEvents: DoneEvent[] = [];
+    for (const r of this.state.storage.sql.exec(
+      `SELECT ts, pr, repo, kind FROM train_events WHERE kind IN ('merged','bounced') AND ts >= ?`,
+      from,
+    ).toArray() as any[]) {
+      const ev: DoneEvent = { ts: Number(r.ts), artefact_id: `${String(r.repo)}#${Number(r.pr)}` };
+      (r.kind === "merged" ? mergeEvents : bounceEvents).push(ev);
+    }
+    // identical opts ⇒ identical grid — zip the bounce counts onto the merge buckets
+    const prBuckets = aggregateThroughput(mergeEvents, [], opts);
+    const bounceBuckets = aggregateThroughput(bounceEvents, [], opts);
+    for (let i = 0; i < prBuckets.length; i++) (prBuckets[i] as any).bounced = bounceBuckets[i]?.n ?? 0;
+    return {
+      bucket: parsed.bucket,
+      range_days: parsed.rangeDays,
+      from_ts: taskBuckets[0]?.t ?? from,
+      to_ts: now,
+      tasks: { total: taskBuckets.reduce((n, b) => n + b.n, 0), buckets: taskBuckets },
+      prs: {
+        total: prBuckets.reduce((n, b) => n + b.n, 0),
+        bounced_total: bounceBuckets.reduce((n, b) => n + b.n, 0),
+        buckets: prBuckets,
+      },
     };
   }
 

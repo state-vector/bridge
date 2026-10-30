@@ -21,6 +21,7 @@ export {
 export type {
   KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
   KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk, KbConsensus,
+  KbReports, KbReportBucket,
 } from "./server/kb";
 export { useKb, kbConnected, setKbAuthEscalator, type BoardPrefs } from "./server/kbStore";
 export {
@@ -34,6 +35,7 @@ export {
   SENTIMENT_CHIP, HISTORY_CHIP, HISTORY_LABEL,
 } from "./views/TaskDetail";
 export { TopView } from "./views/TopView";
+export { ReportsView } from "./views/ReportsView";
 export { BacklogView, CompletedView } from "./views/BacklogView";
 export { StatusLights } from "./views/StatusLights";
 export { ForMeView } from "./views/ForMeView";

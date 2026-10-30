@@ -57,6 +57,7 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 - **Everything is knowledge.** Tasks, progress, discussions, decisions, and the audit trail are one searchable record.
 - **Small sessions, fresh context.** Each claim is one session with one job. Verification runs in a session that never saw the implementation. Analysis hands off to a fresh implementation session. Agents report context pressure (`context_pct`) so the board shows when a session should hand off.
 - **Gauges stick until updated.** A progress post without gauge fields preserves the previous gauges on the card — gauges persist across gauge-less posts (heartbeats, relay lines, auto-notes) and only a gauge-bearing post overwrites them. The freshest gauge-bearing call wins; the board never shows dashes just because a relay logged a plain heartbeat.
+- **Reports (BR#5126).** The web board's Reports tab renders delivery metrics at full resolution: tasks closed per bucket (hour/day/week, windows 1d–365d) with the average task/h, and PR merge throughput from the train ledger — merged PRs per bucket plus gate bounces for merge-health context. Same data via `GET /api/kb/metrics/reports`; the compact throughput cell stays on Top.
 
 ## Agent integration: one MCP server
 
