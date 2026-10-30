@@ -1168,41 +1168,43 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             MergeAction::Merge { .. } => {
-                // ---- the merge leg: machine-clean update first, then merge ----
+                // ---- the merge leg (Ray, 2026-10-30: "if it's still
+                // mergeable, go (squash merges). We only need a rebase if
+                // there are conflicts") ---- The gate passed mergeable=true,
+                // so NO update-branch round trip — no machine push, no
+                // PR-branch CI cycle, no extra tick. Conflicts never reach
+                // the merge leg: the gate bounces CONFLICTING with a
+                // trial-merge file list first (impl rebases, re-verify,
+                // re-queue at the back). The machine update-branch survives
+                // ONLY as the strict-branch-protection fallback: repos that
+                // refuse to merge an out-of-date branch get ONE machine
+                // update-branch (verdict carries, BR#3516 §5) and merge on
+                // the next tick.
                 renew_lease(ctx, repo, base);
-                ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
-                ctx.fetch_pr_head(pr)?;
-                // BR#3935: fail-closed — a locally-unreadable head is a tick
-                // error, never a fabricated "behind" (and via trial_merge, never
-                // a fabricated "conflict" with an empty file list).
-                let behind = !ctx.is_ancestor(&format!("origin/{base}"), &head_sha)?;
-                // BR#3659: the behind-check reads THIS leg's accepted-at head, not
-                // the card-level first-leg stamp — each leg carries its own verdict.
-                if behind && head_sha == leg.head_sha_at_acceptance.clone().unwrap_or_default().to_lowercase() {
-                    // base advanced past a verdict-covered head: update-branch is
-                    // the MACHINE-clean rebase — if it lands, the verdict carries
-                    // (BR#3516 §5); if it conflicts, that's human-resolved.
-                    let (clean, tm_files) = ctx.trial_merge(base, &head_sha)?;
-                    if !clean {
-                        let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
-                        ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
-                        log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
-                        release_if_idle(ctx, key, repo, base)?;
-                        return Ok(());
-                    }
-                    ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-                    ctx.note(&format!("machine update-branch PR #{pr} (verdict carries)"));
-                    let updated = ctx.pr_facts(repo, pr)?;
-                    let new_head = vstr(&updated, "headRefOid").unwrap_or("").to_string();
-                    log(Some(key), &format!("machine update-branch clean: {} → {} (verdict carries)", &head_sha[..head_sha.len().min(9)], &new_head[..new_head.len().min(9)]));
-                    if updated.get("mergeable").and_then(|v| v.as_bool()) != Some(true) {
-                        log(Some(key), "mergeability recomputing after update-branch — next tick");
-                        release_if_idle(ctx, key, repo, base)?;
-                        return Ok(());
-                    }
-                }
                 let method_flag = match ctx.method.as_str() { "squash" => "--squash", "rebase" => "--rebase", _ => "--merge" };
-                ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag])?;
+                if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
+                    let low = err.to_lowercase();
+                    if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
+                        // strict protection wants the branch current — the
+                        // one case the machine rebase exists for. Conflicted
+                        // (not machine-clean) ⇒ conflict bounce to impl.
+                        ctx.fetch_pr_head(pr)?;
+                        let (clean, tm_files) = ctx.trial_merge(base, &head_sha)?;
+                        if !clean {
+                            let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
+                            log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
+                            release_if_idle(ctx, key, repo, base)?;
+                            return Ok(());
+                        }
+                        ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
+                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
+                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
+                        release_if_idle(ctx, key, repo, base)?;
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
                 let merged = ctx.pr_facts(repo, pr)?;
                 let merge_sha = merged.pointer("/mergeCommit/oid").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 if vstr(&merged, "state") != Some("MERGED") || merge_sha.is_empty() {
@@ -1347,38 +1349,22 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
         // coverage extends, never created: the verdict must cover the head
         // AS IT IS now (stamp/carry) — an uncovered head is verify's business
         if !verdict_covers_head_leg(Some(&leg), &head_sha) {
-            log(Some(key), &format!("settle-window rebase: queue[{qi}] {head_id} leg {leg_number} uncovered at head — verify owns it, skipping"));
+            log(Some(key), &format!("settle-window probe: queue[{qi}] {head_id} leg {leg_number} uncovered at head — verify owns it, skipping"));
             continue;
         }
         let (clean, files) = ctx.trial_merge(base, &head_sha)?;
         if !clean {
-            let reason = format!("settle-window rebase (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
             ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": files, "bounce_kind": "conflict", "reason": reason }))?;
-            log(Some(key), &format!("settle-window rebase: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
+            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
             return Ok(());
         }
-        if !ctx.write_allowed() {
-            log(Some(key), "IDENTITY GATE: settle-window update-branch withheld — gh is NOT a worker-class credential (BR#3181)");
-            return Ok(());
-        }
-        ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-        let updated = ctx.pr_facts(repo, pr)?;
-        let new_head = vstr(&updated, "headRefOid").unwrap_or("").to_lowercase();
-        if new_head.is_empty() || new_head == head_sha {
-            log(Some(key), &format!("settle-window rebase: PR #{pr} update-branch produced no head move — next tick"));
-            return Ok(());
-        }
-        ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head_sha, "to_head": new_head }))?;
-        ctx.note(&format!("settle-window machine rebase PR #{pr} (verdict carries)"));
-        log(
-            Some(key),
-            &format!(
-                "settle-window rebase: PR #{pr} (queue[{qi}]) machine-clean {} → {} — verdict carried (BR#3516 §5)",
-                &head_sha[..head_sha.len().min(9)],
-                &new_head[..new_head.len().min(9)]
-            ),
-        );
-        return Ok(()); // ONE rebase leg per tick
+        // Ray 2026-10-30: "if it's still mergeable, go — we only need a
+        // rebase if there are conflicts." Clean ⇒ NO proactive update-branch
+        // (no machine push, no PR-branch CI churn): the drain merges this
+        // head directly. The probe's only job now is surfacing conflicts
+        // during the settle wait so impl work pipelines.
+        log(Some(key), &format!("settle-window probe: PR #{pr} merges cleanly against base — the drain merges it directly (no rebase)"));
     }
     Ok(())
 }
