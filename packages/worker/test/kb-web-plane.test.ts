@@ -241,14 +241,18 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders aging review asks as age chips, worst (lapsed) tone winning (BR#4633 L4.2 / BR#4693)", () => {
-    // the DO sorts review_asks oldest-first; the panel renders the tones only —
-    // no ask may sit on the lane without a visible age, and a lapsed ask
-    // (past TTL + grace) must read as urgent, aging as warn.
-    expect(trainPanelSrc).toMatch(/\(l\.review_asks \?\? \[\]\)\.map/);
+  it("renders Awaiting parks as age chips, worst (lapsed) tone winning — the force-review queue replaces the ask band (BR#4962 per BR#4960)", () => {
+    // the DO sorts awaiting parks oldest-first; the panel renders the tones
+    // only — no parked card may sit without a visible age, and a lapsed park
+    // (past TTL + grace) must read urgent, aging warn. The ask-era chips are
+    // GONE: zero asks ride the lanes (BR#4960), the parks are the visibility.
+    expect(trainPanelSrc).toMatch(/\(l\.awaiting \?\? \[\]\)\.map/);
     expect(trainPanelSrc).toMatch(/a\.lapsed \? "urgent" : a\.aging \? "warn" : "scope"/);
     expect(trainPanelSrc).toMatch(/age\(Date\.now\(\) - a\.age_ms, Date\.now\(\)\)/);
-    expect(trainPanelSrc).toContain("oldest first");
+    expect(trainPanelSrc).toContain("◉ awaiting");
+    expect(trainPanelSrc).toContain("force-review from the backlog");
+    // a parked card keeps the lane's signal lit even with an empty queue
+    expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
   });
 
   it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {
@@ -263,5 +267,42 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
     expect(trainPanelSrc).toMatch(/l\.activity\.last_event\.kind/);
+  });
+});
+
+describe("POST /api/kb/force_review — the human force-review plane (BR#4962)", () => {
+  // The pull model's ONE human writer: web session cookie only (BR#4960 —
+  // zero asks, so the route is the answer path). Behavioral leg: a
+  // session-cookie POST reaches the DO op — a bogus id comes back as the
+  // DO's typed validation error, proving the route forwarded (a route miss
+  // would 404 "not found" at the web plane instead). Source legs: the route
+  // maps sub force_review → card.force_review and rejects gateway bearers
+  // 403 web/human-only.
+  const indexSrc = readFileSync(new URL("../src/index.js", import.meta.url).pathname, "utf8");
+
+  it("a session-cookie POST forwards to the DO op (bogus id → the DO's 'no such artefact' error, not a 404 route miss)", async () => {
+    const res = await api("/api/kb/force_review", {
+      method: "POST",
+      body: JSON.stringify({ id: "BR#999999", decision: "approve" }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as any;
+    expect(String(body.error)).toContain("no such artefact");
+  });
+
+  it("route maps sub force_review → card.force_review and 403s bearer auth (web/human-only, BR#4960)", () => {
+    expect(indexSrc).toContain('if (sub === "force_review" && request.method === "POST")');
+    expect(indexSrc).toContain('"https://kb/card.force_review"');
+    expect(indexSrc).toContain("force_review is web/human-only (BR#4960)");
+  });
+
+  it("views: the awaiting exit class parses the typed park reason BEFORE the ask checks and orders after ask in EXIT_CLASS_ORDER (BR#4962)", () => {
+    const viewsSrc = readFileSync(new URL("../../ui-kit/src/server/views.ts", import.meta.url).pathname, "utf8");
+    expect(viewsSrc).toContain("const AWAITING_RX = /^Awaiting review \\(verdict /i");
+    // ordering: the park reason must classify as awaiting even though a
+    // blocked shape the ask check would otherwise eat reaches it first
+    expect(viewsSrc.indexOf("AWAITING_RX.test(reason)")).toBeGreaterThan(-1);
+    expect(viewsSrc.indexOf("AWAITING_RX.test(reason)")).toBeLessThan(viewsSrc.indexOf('ev === "ask"'));
+    expect(viewsSrc).toContain('"ask", "awaiting"');
   });
 });
