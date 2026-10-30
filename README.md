@@ -746,6 +746,23 @@ the fix); the executor re-probes the cheap ones every start. It merges as whatev
 identity that `gh` is authed as — the identity gate refuses the write legs unless that
 is the worker-class credential per BR#3181, never a personal one.
 
+**Token rot is loud, never blind (BR#4754)**: a hub token rotation invalidates a
+long-running train executor's stored credential. Both forms of the executor — the
+standalone `bridge train` loop and the in-process daemon leg — classify an
+auth-rejected tick (the hub answers `unknown auth token`; there is no HTTP status in
+the JSON-RPC error) and run the same paced self-heal ladder the gateway dispatch loop
+uses (BR#4113): reload the credential store, then re-vend by principal
+(`/api/token/repair` — the principal is the credential, so this works even while the
+bearer is fully dead). Backoff between ladder runs is 5s → 300s (the hub rate-limits
+repairs at 6/hour per row). The standalone daemon **exits non-zero after 5 failed
+ladder runs** with a `TOKEN-BLIND` line naming the cause — a supervisor restart then
+starts fresh — instead of the old behavior: ticking blindly forever, one silent
+`tick failed` per interval (the 2026-10-29 incident: ~1,684 unnoticed failures on one
+lane). Once healed, the executor posts **one note per episode** to the lane card
+naming the blind window and the remedy, so the board holds the cause — a token-blind
+process cannot post mid-episode (every board write needs the bearer the hub just
+rejected), which is exactly why the note fires on recovery.
+
 **Dedicated merge node (`role: train`, BR#4489)**: a normal gateway in a named mode —
 set `"role": "train"` in the config (`~/.bridge/config.json`) or `BRIDGE_ROLE=train` in
 the environment, and the daemon skips task dispatch entirely while the connection and
