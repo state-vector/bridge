@@ -8,6 +8,7 @@ import {
   parseBurstMax,
   carryAppend,
   carryAppendLeg,
+  carryChainTip,
   classifyRequiredRuns,
   decideMergeAction,
   decideTrainGate,
@@ -477,6 +478,103 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     const dirty = decideTrainGate(clean({ mergeable: false, mergeStateStatus: "dirty" }));
     expect(dirty.kind).toBe("bounce");
     if (dirty.kind === "bounce") expect(dirty.bounceKind).toBe("conflict");
+  });
+});
+
+// ---------- BR#4689 (L1.4): mechanical head moves carry by default ----------
+
+describe("decideTrainGate mechanical carry (BR#4689 L1.4 — carry is the default path, bounce only on substantive change)", () => {
+  const STAMP = "a".repeat(40);
+  const NEW = "b".repeat(40);
+  const green = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "success", html_url: `https://example/${id}` });
+  const clean = (over: Partial<Parameters<typeof decideTrainGate>[0]> = {}): Parameters<typeof decideTrainGate>[0] => ({
+    prNumber: 42,
+    headSha: NEW,
+    cardMeta: { pr: { head_sha_at_acceptance: STAMP } },
+    cardStatus: "blocked",
+    baseVerdict: "green",
+    mergeable: true,
+    mergeStateStatus: "clean",
+    commits: [{ sha: NEW, verified: true }],
+    headChecks: [green(1, "Test")],
+    ...over,
+  });
+  const proof = (over: Partial<{ fromHead: string; toHead: string; evidence: string }> = {}) => ({
+    fromHead: STAMP,
+    toHead: NEW,
+    evidence: "git range-diff a…a...b…b — 2 patch-id pair(s), all '=' (content-preserving rebase)",
+    ...over,
+  });
+
+  it("a rebase-only head update CARRIES the verdict — no bounce, no re-verify duty, no review re-ask", () => {
+    const d = decideTrainGate(clean({ mechanicalMove: proof() }));
+    expect(d.kind).toBe("carry");
+    if (d.kind === "carry") {
+      expect(d.fromHead).toBe(STAMP);
+      expect(d.toHead).toBe(NEW);
+      expect(d.evidence).toContain("all '='");
+      expect(d.receipt).toContain("BR#4689");
+      expect(d.receipt).toContain("same patch-ids");
+    }
+  });
+
+  it("a one-commit CONTENT change still bounces (no proof, or a proof that names another head)", () => {
+    // the executor proved nothing (range-diff showed a rewritten patch, or the
+    // objects were unreadable) → absent proof → the unchanged fail-closed bounce
+    const noProof = decideTrainGate(clean());
+    expect(noProof.kind).toBe("bounce");
+    if (noProof.kind === "bounce") {
+      expect(noProof.bounceKind).toBe("coverage");
+      expect(noProof.defect).toContain("not covered by the accepted verdict");
+    }
+    // a stale proof naming a DIFFERENT live head must never carry
+    const staleProof = decideTrainGate(clean({ mechanicalMove: proof({ toHead: "c".repeat(40) }) }));
+    expect(staleProof.kind).toBe("bounce");
+    if (staleProof.kind === "bounce") expect(staleProof.bounceKind).toBe("coverage");
+  });
+
+  it("a carry must extend the leg's chain tip — a skipping link is refused", () => {
+    // chain a→c already stamped: the tip is c; a proof claiming from=a skips a link
+    const chained = clean({
+      cardMeta: { pr: { head_sha_at_acceptance: STAMP, carry: [{ from_head: STAMP, to_head: "c".repeat(40), prior_verdict_id: null, carried_ts: 1, via: "update-branch" }] } },
+    });
+    const skip = decideTrainGate(chained);
+    expect(skip.kind).toBe("bounce");
+    const extend = decideTrainGate(clean({
+      headSha: "d".repeat(40),
+      commits: [{ sha: "d".repeat(40), verified: true }],
+      cardMeta: { pr: { head_sha_at_acceptance: STAMP, carry: [{ from_head: STAMP, to_head: "c".repeat(40), prior_verdict_id: null, carried_ts: 1, via: "update-branch" }] } },
+      mechanicalMove: proof({ fromHead: "c".repeat(40), toHead: "d".repeat(40) }),
+    }));
+    expect(extend.kind).toBe("carry");
+    if (extend.kind === "carry") expect(extend.fromHead).toBe("c".repeat(40));
+  });
+
+  it("a BROKEN chain can never be extended — even a fresh proof bounces (re-verify owns it)", () => {
+    const broken = clean({
+      cardMeta: { pr: { head_sha_at_acceptance: STAMP, carry: [{ from_head: STAMP, to_head: "c".repeat(40), prior_verdict_id: null, carried_ts: 1, via: "update-branch" }, { from_head: "e".repeat(40), to_head: "f".repeat(40), prior_verdict_id: null, carried_ts: 2, via: "update-branch" }] } },
+      mechanicalMove: proof({ fromHead: "c".repeat(40) }),
+    });
+    const d = decideTrainGate(broken);
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.bounceKind).toBe("coverage");
+  });
+
+  it("coverage is judged per LEG — a mechanical move carries the cited leg's chain only", () => {
+    const d = decideTrainGate(clean({
+      legNumber: 2,
+      cardMeta: { prs: [{ repo: "r", number: 1, head_sha_at_acceptance: STAMP }, { repo: "r", number: 2, head_sha_at_acceptance: "9".repeat(40) }] },
+      mechanicalMove: proof(),
+    }));
+    // leg 2 stamps 9…9, not a…a — the a…a proof cannot carry leg 2
+    expect(d.kind).toBe("bounce");
+  });
+
+  it("carryChainTip walks contiguously and refuses breaks (the hub stamps against THIS tip)", () => {
+    expect(carryChainTip(STAMP, undefined)).toBe(STAMP.toLowerCase());
+    expect(carryChainTip(STAMP.slice(0, 9), [{ from_head: STAMP.slice(0, 9), to_head: "c".repeat(40) }])).toBe("c".repeat(40));
+    expect(carryChainTip(STAMP, [{ from_head: STAMP, to_head: "c".repeat(40) }, { from_head: "e".repeat(40), to_head: "f".repeat(40) }])).toBeNull();
+    expect(carryChainTip("zzz", undefined)).toBeNull();
   });
 });
 

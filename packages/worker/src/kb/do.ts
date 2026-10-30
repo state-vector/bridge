@@ -87,6 +87,7 @@ import {
   trainCardMatchesLane,
   verdictCoversHeadLeg,
   carryAppendLeg,
+  carryChainTip,
   trainQueueRemainingReason,
   trainParseNoteLegs,
   classifyRequiredRuns,
@@ -7801,7 +7802,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const kind = String(body.kind ?? "").trim();
-    if (!["merged", "bounced", "stopped", "landed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed");
+    if (!["merged", "bounced", "stopped", "landed", "carried"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed | carried");
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
@@ -7900,6 +7901,43 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           : `PR #${pr} merged as ${mergeSha.slice(0, 9)} — merging burst (${burstMerged} merged, cap ${burstCap === 0 ? "unlimited" : burstCap}), no settle between merges`;
       this.version(lane.id, actor, `train:${kind}`, laneNote, { currently: meta.currently, reason });
       return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, reason };
+    }
+
+    // BR#4689 L1.4: a MECHANICAL head move (same patch-ids, no content delta —
+    // the executor proved it with git range-diff all-'=') carries the accepted
+    // verdict as a new chain leg. The hub re-proves what the executor only
+    // claims: the carry must extend the leg's CURRENT chain tip — a skipping
+    // or fabricated leg is refused loud. No bounce, no re-verify duty, no
+    // review re-ask; the card stays queued and the merge re-gates next tick.
+    if (kind === "carried") {
+      if (!pr) throw new Error("train:carried needs pr");
+      const toHead = headSha ? String(headSha).toLowerCase() : "";
+      const fromHead = String(body.from_head ?? "").trim().toLowerCase();
+      if (!/^[0-9a-f]{7,40}$/.test(toHead)) throw new Error("train:carried needs head_sha (the live head the move lands on)");
+      if (!/^[0-9a-f]{7,40}$/.test(fromHead)) throw new Error("train:carried needs from_head (the chain tip the move extends)");
+      if (fromHead === toHead) throw new Error("train:carried refused: from_head == head_sha — a no-op move is not a carry");
+      const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
+      const card = taskId ? row(taskId) : null;
+      if (!card) throw new Error(`train:carried could not resolve the impl card (task_id ${taskId ?? "none"})`);
+      if (card.status !== "blocked") throw new Error(`train:carried expects the card queued on the train (blocked) — ${taskId} is ${card.status}`);
+      const cm = JSON.parse(card.meta ?? "{}");
+      const chain = this.trainChain(taskId);
+      const leg = trainLegs(cm).find((l) => l.number === Number(pr));
+      const stamp = String(leg?.head_sha_at_acceptance ?? cm.pr?.head_sha_at_acceptance ?? "");
+      const carrySrc = leg?.carry ?? cm.pr?.carry;
+      // CONTIGUITY, re-proved server-side: from_head must be the leg's exact
+      // chain tip. Carry is the default path, not a bypass — a leg that skips
+      // a link (or a broken chain) can never be extended, only re-verified.
+      const tip = carryChainTip(stamp, carrySrc);
+      if (tip === null || tip !== fromHead)
+        throw new Error(`train:carried refused: from_head ${fromHead.slice(0, 9)} is not the leg's chain tip (${tip ? tip.slice(0, 9) : "none — stamp missing or chain broken"}) — the chain must stay contiguous`);
+      const evidence = String(body.evidence ?? "").slice(0, 300);
+      const next = carryAppendLeg(cm, Number(pr), { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "rebase" as const });
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, taskId);
+      this.version(taskId, actor, "train_carry", `verdict carried across mechanical head move ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} (same patch-ids; prior verdict ${chain.verdict_id ?? "unrecorded"} cited)${evidence ? ` — ${evidence}` : ""}`, {});
+      ev({ task: taskId, verdict: chain.verdict_id, session: chain.session, carry: true, from_head: fromHead, to_head: toHead, evidence }, taskId);
+      this.version(lane.id, actor, `train:${kind}`, `PR #${pr} head moved mechanically ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} — verdict carried (BR#4689 L1.4), card stays queued`, {});
+      return { ok: true, kind, lane: laneKey(repo, base), pr, carried: { from: fromHead, to: toHead }, task: taskId };
     }
 
     if (kind === "bounced") {

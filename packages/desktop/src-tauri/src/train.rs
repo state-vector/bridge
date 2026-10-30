@@ -40,9 +40,10 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, drain_burst_decision, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
-    DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
+    carry_chain_tip, classify_main_check_runs, decide_train_gate, drain_burst_decision, merge_sweep_human_leg_title,
+    normalize_gh_mergeable, normalize_gh_merge_state, parse_burst_max, train_leg_landed, train_leg_state, train_legs,
+    verdict_covers_head_leg, DrainDecision, MainCheckRun, MainVerdict, MergeAction, MechanicalMove,
+    TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES, TrainLeg,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -618,6 +619,70 @@ impl Ctx {
         self.sh("git", &["fetch", "--quiet", "origin", &format!("+refs/pull/{n}/head")]).map(|_| ())
     }
 
+    /// BR#4689 L1.4: is `new_head` a MECHANICAL move of `old_head` — the same
+    /// patch series rebased (same patch-ids, same order, no content delta)?
+    /// The two ranges EXCLUDE the base branch explicitly (`base_ref..old` vs
+    /// `base_ref..new`): the merge-base-anchored `old...new` form would count
+    /// the base's own advance as an added patch and read every rebase onto a
+    /// moved main as substantive. `git range-diff` answers the patch-ids:
+    /// every line an `=` pair ⇒ mechanical; any added/removed/rewritten patch
+    /// (`<` / `>` / `!`) ⇒ substantive. Three-valued like `is_ancestor`: a git
+    /// failure is an Err, never a silent "not mechanical" — the caller treats
+    /// cannot-prove as NO carry (fail-closed to the coverage bounce).
+    fn mechanical_rebase(&self, base_ref: &str, old_head: &str, new_head: &str) -> Result<String, String> {
+        self.sh("git", &["fetch", "--quiet", "origin", base_ref.trim_start_matches("origin/")])?;
+        for obj in [format!("{base_ref}^{{commit}}"), old_head.to_string(), new_head.to_string()] {
+            let known = Command::new("git")
+                .args(["cat-file", "-e", &obj])
+                .current_dir(&self.workdir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !known && obj != format!("{base_ref}^{{commit}}") {
+                // the stamped head of a force-pushed-away rebase is under no
+                // fetched ref — GitHub serves fetch-by-sha; a miss stays an
+                // honest cannot-prove, never a carry
+                self.sh("git", &["fetch", "--quiet", "origin", &obj.trim_end_matches("^commit").to_string()])?;
+            }
+        }
+        for obj in [format!("{base_ref}^{{commit}}"), old_head.to_string(), new_head.to_string()] {
+            let known = Command::new("git")
+                .args(["cat-file", "-e", &obj])
+                .current_dir(&self.workdir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !known {
+                return Err(format!(
+                    "mechanical check aborted: {obj} is not a commit object in {} — cannot prove the head move content-preserving (BR#3935 posture: fail closed)",
+                    self.workdir
+                ));
+            }
+        }
+        let out = Command::new("git")
+            .args([
+                "range-diff",
+                "--no-color",
+                &format!("{base_ref}..{old_head}"),
+                &format!("{base_ref}..{new_head}"),
+            ])
+            .current_dir(&self.workdir)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "git range-diff {base_ref}..{old_head} {base_ref}..{new_head} failed ({}) — cannot prove the head move mechanical, fail-closed: {}",
+                out.status,
+                trunc(String::from_utf8_lossy(&out.stderr).trim(), 300)
+            ));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pairs = range_diff_equal_pairs(&text).ok_or_else(|| {
+            format!("git range-diff shows a NON-mechanical move (added/removed/rewritten patch lines) old {old_head} → new {new_head}")
+        })?;
+        Ok(format!("git range-diff {base_ref}..{old} {base_ref}..{new} — {pairs} patch-id pair(s), all '=' (content-preserving rebase)", old = &old_head[..old_head.len().min(9)], new = &new_head[..new_head.len().min(9)]))
+    }
+
     /// Ancestry is a three-valued answer: true / false / CANNOT-READ. Only
     /// the first two are bools — a git failure (exit ∉ {0, 1}, e.g. a bad
     /// object) is an Err, never a silent `false` (BR#3935: exit 128 used to
@@ -643,6 +708,61 @@ impl Ctx {
 
 fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
+}
+
+/// Pure parse of `git range-diff --no-color old...new` output (BR#4689 L1.4):
+/// `Some(pairs)` iff EVERY line is an `=` pair (`1: abc1234 = 2: def5678 fix`)
+/// and there is at least one — same patch-ids, same order, no content delta.
+/// Any added (`-:  ------- > 2: …`), removed (`1: … < -:  -------`) or
+/// rewritten (`… ! …`) row, or unparseable output, is `None` — a substantive
+/// move; the caller never carries on a None.
+fn range_diff_equal_pairs(text: &str) -> Option<usize> {
+    let mut pairs = 0usize;
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let (idx, rest) = t.split_once(": ")?;
+        if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+            return None; // an added patch's row starts "-: …"
+        }
+        let mut it = rest.split_whitespace();
+        it.next()?; // the old-side abbreviated sha
+        match it.next()? {
+            "=" => pairs += 1,
+            _ => return None, // "!" rewritten · "<" removed · ">" added · anything else unparsed
+        }
+    }
+    (pairs > 0).then_some(pairs)
+}
+
+/// BR#4689 L1.4 probe: when the live head is NOT covered by the leg's chain,
+/// try to prove the move mechanical (same patch-ids, content-preserving
+/// rebase). Returns the proof only when the chain has a contiguous tip, the
+/// tip ≠ live head, both objects are readable, and range-diff says all-'='.
+/// Anything else is None — the coverage bounce stands: carry is the DEFAULT
+/// path for mechanical moves, never a bypass for authored ones.
+fn probe_mechanical_move(
+    ctx: &Ctx,
+    pr: i64,
+    base: &str,
+    leg: &TrainLeg,
+    head_sha: &str,
+) -> Option<MechanicalMove> {
+    let tip = carry_chain_tip(leg.head_sha_at_acceptance.as_deref().unwrap_or(""), leg.carry.as_ref())?;
+    if tip.eq_ignore_ascii_case(head_sha) {
+        return None; // covered after all — no probe needed
+    }
+    // fetch the live head explicitly before any local op names it (BR#3935)
+    let _ = ctx.fetch_pr_head(pr);
+    match ctx.mechanical_rebase(base, &tip, head_sha) {
+        Ok(evidence) => Some(MechanicalMove { from_head: tip, to_head: head_sha.to_string(), evidence }),
+        Err(e) => {
+            log(None, &format!("mechanical-carry probe (PR #{pr}): cannot prove — {e}; the coverage bounce stands"));
+            None
+        }
+    }
 }
 
 /// Lease renewal carries proof-of-progress (BR#4104): the last ledger action
@@ -1044,6 +1164,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let gate_base = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
+        // BR#4689 L1.4: an uncovered head earns ONE mechanical-carry probe —
+        // a content-preserving rebase (same patch-ids) carries the verdict
+        // instead of bouncing into a re-verify + review re-ask cascade.
+        let mechanical_move = if verdict_covers_head_leg(Some(&leg), &head_sha) {
+            None
+        } else {
+            probe_mechanical_move(ctx, pr, base, &leg, &head_sha)
+        };
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -1055,6 +1183,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             commits: &commits,
             head_checks: &head_checks,
             leg_number: Some(leg_number),
+            mechanical_move,
         });
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
@@ -1063,6 +1192,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::Carry { from_head, to_head, .. } => (
+                "carry",
+                format!(" — mechanical head move {}→{} (same patch-ids): verdict carries", &from_head[..from_head.len().min(9)], &to_head[..to_head.len().min(9)]),
+            ),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
 
@@ -1127,6 +1260,36 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 log(Some(key), &format!("PR #{pr} closed (superseded card)"));
                 release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
+            }
+            MergeAction::Carry { from_head, to_head, evidence, receipt } => {
+                renew_lease(ctx, repo, base);
+                // ONE action per tick (strict serialization): stamp the carry
+                // leg — the hub re-validates contiguity server-side and
+                // refuses a skipping leg — and end the walk. The merge itself
+                // re-gates next tick on the now-covered head: no bounce, no
+                // re-verify duty, no review re-ask (BR#4689 L1.4).
+                let ev = json!({
+                    "repo": repo, "base": base, "kind": "carried", "pr": pr, "task_id": head_id,
+                    "head_sha": head_sha, "from_head": from_head, "evidence": evidence,
+                    "reason": receipt, "signer": ctx.holder,
+                });
+                if let Err(e) = ctx.mcp("train_event", ev) {
+                    log(Some(key), &format!("PR #{pr} carry stamp FAILED ({e}) — the head stays uncovered this tick; next tick re-probes"));
+                    ctx.note(&format!("carry stamp failed for PR #{pr}"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
+                ctx.note(&format!("carried verdict across mechanical head move PR #{pr} {from_head}→{to_head}"));
+                log(
+                    Some(key),
+                    &format!(
+                        "queue[{qi}] PR #{pr} head moved mechanically {f}→{t} (same patch-ids) — verdict carried as a new chain leg (BR#4689 L1.4); merge re-gates next tick",
+                        f = &from_head[..from_head.len().min(9)],
+                        t = &to_head[..to_head.len().min(9)],
+                    ),
+                );
+                release_if_idle(ctx, key, repo, base)?;
+                Ok(())
             }
             MergeAction::Bounce { defect, bounce_kind } => {
                 renew_lease(ctx, repo, base);
@@ -3109,5 +3272,60 @@ mod tests {
         let args = call_args(&recorded[0]);
         assert_eq!(args.get("action").and_then(|v| v.as_str()), Some("acquire"));
         assert_eq!(args.get("merge_capable"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn range_diff_parsing_all_pairs_or_substantive() {
+        // BR#4689 L1.4: every line an `=` pair (and ≥1 line) = mechanical;
+        // added / removed / rewritten rows = substantive; empty = nothing proved
+        assert_eq!(range_diff_equal_pairs("1:  abc1234 = 2:  def5678 fix thing\n"), Some(1));
+        assert_eq!(
+            range_diff_equal_pairs("1:  abc1234 = 1:  abc1234 one\n2:  1111111 = 2:  2222222 two\n"),
+            Some(2)
+        );
+        assert_eq!(range_diff_equal_pairs("1:  abc1234 ! 2:  def5678 rewritten\n"), None);
+        assert_eq!(range_diff_equal_pairs("-:  ------- > 1:  abc1234 added\n"), None);
+        assert_eq!(range_diff_equal_pairs("1:  abc1234 < -:  -------\n"), None);
+        assert_eq!(range_diff_equal_pairs(""), None);
+        assert_eq!(range_diff_equal_pairs("garbage without the shape\n"), None);
+    }
+
+    #[test]
+    fn mechanical_rebase_proves_a_rebase_and_refuses_a_content_change() {
+        // BR#4689 L1.4 against real git: the same patch rebased onto a moved
+        // main proves mechanical (all-'=' range-diff); an amended commit
+        // (different patch-id) is a substantive move; a bad object is an Err —
+        // never a silent carry (fail-closed, the BR#3935 posture).
+        let repo = Repo::new("mech");
+        let ctx = repo.ctx();
+        // the patch touches a NEW file — main's advance (f.txt) never overlaps
+        repo.git(&["checkout", "-q", "-b", "pr8", "main"]);
+        std::fs::write(repo.dir.join("g.txt"), "pr content\n").unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-m", "add g.txt"]);
+        let old_head = repo.git(&["rev-parse", "HEAD"]);
+        let _main_tip = repo.advance_main("main line");
+        // the mechanical case: rebase onto the moved main — same patch-id, new head
+        repo.git(&["checkout", "-q", "pr8"]);
+        repo.git(&["rebase", "-q", "main"]);
+        let new_head = repo.git(&["rev-parse", "HEAD"]);
+        assert_ne!(old_head, new_head, "the rebase must have moved the head");
+        let evidence = ctx
+            .mechanical_rebase("origin/main", &old_head, &new_head)
+            .expect("a content-preserving rebase must prove mechanical");
+        assert!(evidence.contains("all '='"), "evidence names the proof: {evidence}");
+        assert!(evidence.contains("1 patch-id pair(s)"));
+
+        // the substantive case: amend the patch — different patch-id → never a carry
+        std::fs::write(repo.dir.join("g.txt"), "pr content CHANGED\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "add g.txt v2"]);
+        let changed_head = repo.git(&["rev-parse", "HEAD"]);
+        assert!(
+            ctx.mechanical_rebase("origin/main", &old_head, &changed_head).is_err(),
+            "an authored content change must not prove mechanical"
+        );
+
+        // the unreadable case: a bad object is an Err, never a silent carry
+        assert!(ctx.mechanical_rebase("origin/main", BOGUS_SHA, &new_head).is_err());
     }
 }

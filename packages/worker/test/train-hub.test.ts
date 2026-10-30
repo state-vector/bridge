@@ -346,6 +346,70 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(hist).not.toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict");
   });
 
+  it("a MECHANICAL head move CARRIES the verdict (BR#4689 L1.4) — carry leg stamped, card stays queued, no bounce cascade", async () => {
+    const repo = "state-vector/lane-mech-carry";
+    const oldHead = "a".repeat(40);
+    const newHead = "b".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 2631, head: oldHead, title: "IMPL: mechanical carry drill" });
+    await acquire(repo, "gw-m", { required_workflows: ["Test"] });
+
+    // the head moved mechanically (a content-preserving rebase — the executor
+    // proved it with git range-diff all-'=' pairs): the carry stamps a chain
+    // leg and the card STAYS queued — no bounce, no re-verify duty, no
+    // review re-ask (the BR#4502 starvation cascade this law deletes).
+    const carried = await kbJson("/train.event", {
+      repo, base: "main", kind: "carried", actor: "gw-m", pr: 2631, head_sha: newHead,
+      task_id: c1, from_head: oldHead,
+      evidence: "git range-diff aaa...bbb — 2 patch-id pair(s), all '=' (content-preserving rebase)",
+      reason: "mechanical head move (same patch-ids) — verdict carries (BR#4689 L1.4)",
+    });
+    expect(carried.body.error ?? "", `train:carried failed: ${JSON.stringify(carried.body)}`).toBe("");
+    expect(carried.body.carried).toEqual({ from: oldHead, to: newHead });
+
+    const card1 = (await kbJson("/get", { id: c1 })).body;
+    expect(card1.status).toBe("blocked"); // still queued — the merge re-gates next tick
+    const cm = card1.meta;
+    const leg = Array.isArray(cm?.prs) ? cm.prs.find((l: any) => l.number === 2631) : cm?.pr;
+    expect(String(leg?.head_sha_at_acceptance ?? "")).toBe(oldHead); // the stamp is history — the chain extends it
+    expect(leg?.carry).toEqual([
+      expect.objectContaining({ from_head: oldHead, to_head: newHead, via: "rebase" }),
+    ]);
+    // no bounce artifacts anywhere on the card
+    expect(cm?.merge_train?.state ?? "").not.toBe("bounced");
+    expect(String(card1.body_md)).not.toContain("Merge-train bounce");
+    // no re-verify duty was spawned and no review re-ask filed
+    const openDuties = ((await kbJson("/list", { type: "task", limit: 200 })).body?.artefacts ?? [])
+      .filter((a: any) => a.title.startsWith("Verify: IMPL: mechanical carry drill") && a.status !== "done");
+    expect(openDuties, "a mechanical carry must NOT spawn a re-verify duty").toEqual([]);
+    const asks = ((await kbJson("/list", { type: "question", limit: 200 })).body?.artefacts ?? [])
+      .filter((a: any) => String(a.title).includes("2631"));
+    expect(asks, "a mechanical carry must NOT file a review re-ask").toEqual([]);
+    // the ledger names the carry
+    const hist = (await kbJson("/train.history", { repo })).body.events;
+    const ev = hist.find((e: any) => e.kind === "carried");
+    expect(ev).toBeTruthy();
+    expect(ev.gateway).toBe("gw-m");
+    expect(ev.head_sha).toBe(newHead);
+    expect(ev.detail).toEqual(expect.objectContaining({
+      task: c1, carry: true, from_head: oldHead, to_head: newHead,
+    }));
+    expect(String(ev.detail.evidence)).toContain("range-diff");
+    // the card-side version note is the human-readable carry receipt
+    const cardHist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 10 })).body);
+    expect(cardHist).toContain("carried across mechanical head move");
+
+    // the guard survives: a SECOND carried event claiming the OLD tip (from
+    // before the stamp) is refused — the chain must stay contiguous
+    const skip = await kbJson("/train.event", {
+      repo, base: "main", kind: "carried", actor: "gw-m", pr: 2631, head_sha: "c".repeat(40),
+      task_id: c1, from_head: oldHead, evidence: "forged",
+    });
+    expect(skip.status).toBeGreaterThanOrEqual(400);
+    expect(String(skip.body.error)).toContain("chain tip");
+    const card2 = (await kbJson("/get", { id: c1 })).body;
+    expect((card2.meta?.pr?.carry ?? []).filter((r: any) => r.via === "rebase")).toHaveLength(1);
+  });
+
   it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
     const repo = "state-vector/lane-gate";
     const c1 = await queueViaAccept({ repo, pr: 2621, head: "f".repeat(40), title: "IMPL: gate bounce drill" });
