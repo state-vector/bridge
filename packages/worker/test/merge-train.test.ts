@@ -208,7 +208,7 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.map((x) => x.id)).toEqual(["A"]);
   });
 
-  it("CRITICAL (meta.boosted) first, FIFO within class by blocked-since", () => {
+  it("BOOSTED (meta.boosted) first among mortals, FIFO within class by blocked-since (BR#5190 renamed the old CRITICAL label)", () => {
     const q = mergeTrainQueue([
       card("N1", 10, "merge-train: queued"),
       card("C2", 30, "merge-train: queued", true),
@@ -216,8 +216,50 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
       card("C1", 40, "merge-train: queued", true),
     ]);
     expect(q.map((x) => x.id)).toEqual(["C2", "C1", "N1", "N2"]);
-    expect(q[0].priority).toBe("critical");
+    expect(q[0].priority).toBe("boosted");
     expect(q[2].priority).toBe("normal");
+  });
+
+  // ---- BR#5190: the root-fix fast lane — absolute p0 above every boost ----
+  const rootFix = (id: string, ts: number, sha?: string) => ({
+    id,
+    status_ts: ts,
+    meta: {
+      blocked: { reason: "merge-train: queued" },
+      root_fix: { repo: "o/r", head_sha: sha ?? "a".repeat(40), failing: ["Deploy Dev"], bound_at: ts },
+    },
+    tags: ["root_blocker", "main-red", "p0"],
+  });
+
+  it("ROOT-FIX tier 0: the bound main-breakage fix jumps boosts and normals — absolute p0 (BR#5189 §2)", () => {
+    const q = mergeTrainQueue([
+      card("N1", 10, "merge-train: queued"),
+      card("B1", 5, "merge-train: queued", true),
+      rootFix("R1", 50),
+    ]);
+    expect(q.map((x) => x.id)).toEqual(["R1", "B1", "N1"]);
+    expect(q[0].priority).toBe("root_fix");
+    expect(q[0].root_fix).toBe(true);
+    expect(q[1].priority).toBe("boosted");
+  });
+
+  it("qualification is tags AND binding — a tagged-but-unbound or bound-but-untagged card never reaches tier 0", () => {
+    const taggedOnly = { ...rootFix("R1", 10), meta: { blocked: { reason: "merge-train: queued" } } }; // binding stripped
+    const boundOnly = card("B9", 20, "merge-train: queued");
+    (boundOnly.meta as any).root_fix = { repo: "o/r", head_sha: "a".repeat(40) }; // tags missing
+    const q = mergeTrainQueue([taggedOnly, boundOnly]);
+    expect(q.map((x) => x.id)).toEqual(["R1", "B9"]);
+    expect(q.every((x) => x.priority !== "root_fix")).toBe(true);
+  });
+
+  it("baseRed (a stopped lane) parks EVERYTHING except the root-fix card — the base-red law, BR#4365 precedent", () => {
+    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)], { baseRed: true });
+    expect(q.map((x) => x.id)).toEqual(["R1"]);
+    expect(q[0].priority).toBe("root_fix");
+  });
+
+  it("baseRed with NO root-fix card → an empty queue: every head stays parked until the fix is bound or the line greens", () => {
+    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")], { baseRed: true })).toEqual([]);
   });
 
   it("empty input → empty queue (vacuity)", () => {
