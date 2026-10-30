@@ -658,6 +658,45 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
   evidence.
 
+### The root-fix fast lane (BR#5190, steering BR#5189)
+
+A stop-the-line episode now spawns its own cure, and the cure jumps every queue.
+When the stop fires, the hub ensures ONE root-fix card for the red — tagged
+`root_blocker` + `main-red` + `p0`, role impl, a child of the lane relation —
+binding the culprit facts (`repo`, culprit `head_sha`, `base`, `why`, the
+`failing` checks, `bound_at`), with repair legs riding it as they open (`pr`
+stamped on the binding). Three paths, never a duplicate: the culprit card is
+still open and qualified → it is re-bound in place; another open card in the
+same repo qualifies → the binding moves to it; nothing qualifies → a fresh card
+spawns. The red and the repair share one identity: the card the train was
+stopped for IS the ticket that fixes it.
+
+The queue sorts in four absolute tiers — `root_fix` > `boosted` > `critical` >
+`normal` — root-fix beats even a human ▲ boost (the old `boosted` meta label
+`critical` is renamed accordingly), and a red base halves the walk further:
+when the lane's base is red the queue offers ONLY tier 0 — every other head
+parks until main greens again (two reds never merge, and queuing green heads
+behind a red base just rehearses the block). While the line is stopped, the
+executor's stop arm falls through to the drain walk ONLY when the queue head IS
+the cure — the bisect stays parked while the fix is in flight — and the
+post-stop residue arm keeps its stop-null guard, so a cleared stop can never
+re-arm from residue.
+
+At the gate the cure fast-tracks: a queue head that is a root-fix card, with the
+base red and its own head green, is not `blocked` by the base — the gate merges
+it and stamps the receipt `ROOT-FIX FAST-TRACK (BR#5189)` (the merged train
+event carries `root_fix: true` and a note suffix, so provenance shows the lane
+was cured, not blocked). One circular case cannot self-serve: when the base's
+red is the deploy-health alarm itself — the gate is judging the check that
+reports drift while the drift is the breakage — the gate files ONE human ask,
+"Merge the cure now" / "Not yet — hold the line", with a title byte-identical in
+the Rust executor and the TypeScript hub (one implementation shared as fixture
+tables, `decideTrainGate`) so the identical-open-ask dedupe matches whichever
+side fires first; every other red-head fall-through stays under standing law.
+Verify duty on a qualified root-fix card (tag + a stamped PR) names the fast
+lane in its body, so the reviewer knows the merge path is pre-cleared before
+they accept.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in
