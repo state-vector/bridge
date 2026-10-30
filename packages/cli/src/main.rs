@@ -64,6 +64,12 @@ mod canary;
 /// emits. Machine infrastructure notes, session "host-supervisor".
 mod alarm;
 
+/// The merge-train canary (BR#4694, BR#4633 L4.3): `bridge train-canary` —
+/// a synthetic signed PR rides the full lane daily (claim → queue → gate →
+/// merge → CI → landed → closed); red alarm to the sink on any phase stuck
+/// past its bound. Cron-friendly, same shape as `canary`.
+mod train_canary;
+
 use dispatch::DispatchConfig;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -162,6 +168,11 @@ fn main() {
             // hub self-canary (BR#4177): `bridge canary [--once]` — single
             // lifecycle pass; cron re-runs it daily.
             std::process::exit(canary::run(&args[2..]));
+        }
+        "train-canary" => {
+            // merge-train canary (BR#4694): a synthetic PR rides the full
+            // lane; single pass, cron re-runs it daily.
+            std::process::exit(train_canary::run(&args[2..]));
         }
         "doctor" => {
             let bad = doctor();
@@ -1480,11 +1491,18 @@ USAGE:
                          red alarm to the sink (BR#3124). Cron daily:
                          --sink BR#3124    alarm sink card (default BR#3124)
                          --fixture-pr N    fake PR number for the queue fixture (default 999901)
+  bridge train-canary    merge-train canary (BR#4694): a synthetic signed, labeled PR rides the
+                         full lane daily (claim → queue → gate → merge → CI → landed → close);
+                         red alarm to the sink on any stuck phase (claim/work 15m, queue 30m,
+                         CI 60m, park 15m). Cron daily:
+                         --sink BR#3124              alarm sink card (default BR#3124)
+                         --repo state-vector/bridge  the lane to ride (default the hub's own)
   --max-sessions N       cap concurrent agent sessions (default 1)
 
 ENV:
   BRIDGE_URL, BRIDGE_TOKEN, BRIDGE_WORKDIR, BRIDGE_AGENT, BRIDGE_POLL_SECS, BRIDGE_MAX_SESSIONS
   CANARY_SINK_ID, CANARY_FIXTURE_PR (canary overrides, same as the flags above)
+  TRAIN_CANARY_SINK_ID, TRAIN_CANARY_REPO (train-canary overrides, same as the flags above)
 
 State: ~/.bridge/config.json (auth) · ~/.bridge/dispatch/ (ephemeral runner state)
 The hub owns all authoritative state — killing the runner leaves nothing inconsistent.
