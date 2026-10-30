@@ -1169,6 +1169,14 @@ daemon never writes the board; the hub never touches GitHub. A report per repo p
 - **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
   repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
   silently respawning over the corpse.
+- **empty review decision ⇒ age-bound, not exempt (BR#4761)**: a head move dismisses bot
+  reviews and GitHub then reports NO `reviewDecision`; a PR in that state is the
+  dismissed-bot-review class. Inside `disposition_age_h` it is the informational
+  `(+N unreviewed)` tail (owner mid-review); past it the PR enters the same precedence as
+  every other unbound state — one disposition duty ("get a review on record, or rule it
+  off with `reconcile.ignore`"), in-flight while that duty lives, a dead-duty ALARM if it
+  dies unbound. The tail can no longer absorb a PR forever (the BR#4678 sweep found 10
+  such orphans, some days old, invisible to every mechanism).
 
 **Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
 open list starts a missing clock; two consecutive misses with a provenance row close the
@@ -1178,7 +1186,8 @@ provenance it spawns a ruling duty instead — someone rules, never silence.
 Knobs: `reconcile.enabled` / `RECONCILE_ENABLED` (default on),
 `reconcile.interval_secs` / `RECONCILE_INTERVAL_SECS` (default 1800, clamped 300..21600),
 `reconcile.repos` (CSV, default both bridge repos), `reconcile.verify_age_h` (2),
-`reconcile.disposition_age_h` (24), `reconcile_alarm_sink_id` (default BR#3124).
+`reconcile.disposition_age_h` (24 — also bounds the empty-review-decision class,
+BR#4761), `reconcile_alarm_sink_id` (default BR#3124).
 `reconcile_status` is the operator view: settings, the accounting lines (the canary —
 `N open reviewed / N bound / N ignored-with-reason / N in-flight — N accounted`, ALARM
 tail on failure), the duty ledger, ignores, and the missing clock.

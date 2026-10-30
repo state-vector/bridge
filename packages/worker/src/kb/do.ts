@@ -9478,7 +9478,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           break;
         }
         case "spawn_disposition": {
-          const card = await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "changes requested / conflicting past the disposition age — fix the PR, or rule it off the board (reconcile.ignore)", actor, now);
+          // BR#4761: which class fired matters — an EMPTY review decision
+          // (dismissed bot review) needs a review on record, not a fix.
+          const p = prs.find((q) => q.number === j.pr);
+          const why = p && !p.reviewDecision
+            ? "review decision EMPTY past the disposition age (the dismissed-bot-review class, BR#4761) — get a review on record, or rule it off the board (reconcile.ignore)"
+            : "changes requested / conflicting past the disposition age — fix the PR, or rule it off the board (reconcile.ignore)";
+          const card = await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, why, actor, now);
           this.reconcileLedgerDuty(repo, j.pr, "disposition", card, now);
           spawned.push({ pr: j.pr, action: "disposition", card });
           break;

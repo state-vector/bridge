@@ -11,10 +11,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * duties ledger dedupes across reports, destination-blocked PRs bind WITHOUT
  * a verify duty until the base greens, a dead duty on an unbound actionable
  * PR fails the run AND alarms the sink, an ignore-with-reason accounts a PR,
- * and reverse reconcile closes the zombie binding via provenance (two
- * consecutive misses) or spawns a ruling duty (no provenance — never a
- * silent close). The daemon leg feeding these endpoints is pinned in
- * train.rs (packages/desktop).
+ * an EMPTY review decision past the disposition age duties ONCE while a
+ * fresh one stays unreviewed (BR#4761), and reverse reconcile closes the
+ * zombie binding via provenance (two consecutive misses) or spawns a ruling
+ * duty (no provenance — never a silent close). The daemon leg feeding these
+ * endpoints is pinned in train.rs (packages/desktop).
  */
 
 let mf: Miniflare;
@@ -195,6 +196,39 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     const st = (await kbJson("/reconcile.status", { repo })).body;
     expect(st.ignores.length).toBe(1);
     expect(st.ignores[0].reason).toContain("roller");
+  });
+
+  it("an EMPTY review decision past the disposition age spawns a disposition duty ONCE; a fresh one stays unreviewed (BR#4761)", async () => {
+    const repo = "state-vector/reconcile-drill-g";
+    // the dismissed-bot-review class: head moves dismissed the bot review and
+    // GitHub reports NO reviewDecision. Pre-BR#4761 both rows sat in the
+    // informational (+N unreviewed) tail forever — no duty, no alarm.
+    const aged = prRow(2407, { reviewDecision: null, updatedAt: iso(30) });
+    const fresh = prRow(2408, { reviewDecision: null, updatedAt: iso(5) });
+    const r1 = await report(repo, [aged, fresh]);
+    expect(r1.body.ok).toBe(true);
+    expect(r1.body.accounting.unreviewed).toBe(1); // only the fresh one
+    expect(r1.body.accounting.spawned).toBe(1); // only the aged one
+    expect(r1.body.line).toContain("1 open reviewed");
+    expect(r1.body.spawned[0].action).toBe("disposition");
+    const cardId: string = r1.body.spawned[0].card;
+    // the projection names the class and the two legal exits
+    const card = (await kbJson("/get", { id: cardId })).body;
+    expect(card.meta?.pr).toEqual({ repo, number: 2407 });
+    expect(String(card.body_md)).toContain("EMPTY");
+    expect(String(card.body_md)).toContain("reconcile_ignore");
+    // one duty per PR ever: the re-report dedupes — the ledger row plus the
+    // projection's meta.pr mean the PR now reads as BOUND (the disposition
+    // duty's card IS the projection, unlike a verify duty's child card), so
+    // no second spawn, no second card
+    const r2 = await report(repo, [aged, fresh]);
+    expect(r2.body.ok).toBe(true);
+    expect(r2.body.accounting.bound).toBe(1);
+    expect(r2.body.accounting.inflight).toBe(0);
+    expect(r2.body.accounting.spawned).toBe(0);
+    expect(r2.body.spawned).toHaveLength(0);
+    expect((await dutiesOf(repo)).map((d: any) => d.kind)).toEqual(["disposition"]);
+    expect((await dutiesOf(repo)).length).toBe(1);
   });
 
   it("reverse reconcile: two misses + provenance closes the zombie binding; no provenance spawns a ruling duty (once)", async () => {

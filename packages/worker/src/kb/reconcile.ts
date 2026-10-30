@@ -9,6 +9,15 @@
  *  #2466 class: a session died post-open and the PR sat APPROVED+MERGEABLE
  *  34h, invisible to every stamp-gated mechanism).
  *
+ *  BR#4761 closed the last silent tail: an EMPTY review decision (GitHub
+ *  reports no decision after a head move dismisses bot reviews) used to sit
+ *  in the informational `unreviewed` count FOREVER — bound to nothing,
+ *  dutyable by nothing, invisible to the alarm. Now the class is age-bound
+ *  like every other unbound state: inside `disposition_age_ms` it is a
+ *  genuinely-fresh grace (owner mid-review); past it, the PR enters the
+ *  normal precedence and a disposition duty demands a review on record or
+ *  a reconcile.ignore ruling — exactly once, then the ledger rules.
+ *
  *  Division of labour (accepted BR#3507/BR#3499: the hub holds NO VCS
  *  credentials): a gateway daemon runs the read-only `gh pr list` and feeds
  *  observations via reconcile.report; the HUB owns this join, the decisions,
@@ -29,7 +38,9 @@
 export interface ReconcilePr {
   number: number;
   title: string | null;
-  /** APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | null (nobody reviewed yet). */
+  /** APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | null (nobody reviewed
+   *  yet, OR a dismissed bot review after a head move — the BR#4761 class:
+   *  GitHub reports UNKNOWN/empty either way). */
   reviewDecision: string | null;
   /** MERGEABLE | CONFLICTING | UNKNOWN | null. */
   mergeable: string | null;
@@ -150,7 +161,8 @@ export interface ReconcileJudgement {
 
 export interface ReconcileAccounting {
   repo: string;
-  /** Open PRs with a review decision (drafts excluded). */
+  /** Open non-draft PRs in the invariant's scope: a review decision, or an
+   *  empty decision past the disposition age (BR#4761). Drafts excluded. */
   open_reviewed: number;
   bound: number;
   ignored: number;
@@ -162,7 +174,8 @@ export interface ReconcileAccounting {
   grace: number;
   /** Past every grace and still none of the three — fails the run. */
   unaccounted: number;
-  /** Informational: no review decision yet (mid-review, owner active) + drafts. */
+  /** Informational: no review decision yet INSIDE the disposition age
+   *  (owner mid-review — BR#4761 bounds this tail) + drafts. */
   unreviewed: number;
   /** Reverse reconcile: bindings whose PR left the open list. */
   reverse_missing: number;
@@ -235,13 +248,20 @@ export function reconcileJoin(args: {
   const drafts = prs.filter((p) => p.isDraft);
   const reviewed = prs.filter((p) => !p.isDraft);
   for (const p of reviewed) {
-    if (!p.reviewDecision) {
+    const age = prAgeMs(p.updatedAt, cfg.now);
+    // BR#4761: an EMPTY review decision is out of the invariant's scope ONLY
+    // while fresh — inside the disposition age the owner is mid-review
+    // (informational tail). Past it the class falls into the full precedence
+    // below (bound / ignored / in-flight / dead-duty alarm / one disposition
+    // duty) like every other unbound state — the dismissed-bot-review drift
+    // (a head move dismisses bot reviews; GitHub then reports no decision)
+    // may never sit unreviewed forever.
+    if (!p.reviewDecision && age <= cfg.disposition_age_ms) {
       acc.unreviewed++;
-      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: "no review decision yet — owner active, out of the invariant's scope" });
+      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: `no review decision yet, ${Math.round(age / 3_600_000)}h of the ${Math.round(cfg.disposition_age_ms / 3_600_000)}h disposition age — owner active, out of the invariant's scope for now` });
       continue;
     }
     acc.open_reviewed++;
-    const age = prAgeMs(p.updatedAt, cfg.now);
     const approved = p.reviewDecision === "APPROVED";
     // verify-eligible = the PR could pass the 5c gate TODAY: mergeable AND a
     // clean destination. BLOCKED/BEHIND is the base-fix class (bind-only — a
@@ -250,6 +270,8 @@ export function reconcileJoin(args: {
     const destinationBlocked = approved && (p.mergeStateStatus === "BLOCKED" || p.mergeStateStatus === "BEHIND");
     const conflicting = p.mergeable === "CONFLICTING" || p.mergeStateStatus === "DIRTY";
     const changesRequested = p.reviewDecision === "CHANGES_REQUESTED";
+    const undecided = !p.reviewDecision;
+    const dispositionDue = (changesRequested || conflicting || undecided) && age > cfg.disposition_age_ms;
     // 1. bound — an open card rides this PR (the #2466 fix: a card that
     //    exists but was never queued still accounts the PR; if its verify
     //    never spawned and the PR is verify-eligible past the grace, spawn
@@ -294,7 +316,7 @@ export function reconcileJoin(args: {
       continue;
     }
     const dead = ds.find((d) => !isActionableDutyCard(d.card_status));
-    const actionable = (verifyEligible || destinationBlocked || ((changesRequested || conflicting) && age > cfg.disposition_age_ms)) && age > cfg.verify_age_ms;
+    const actionable = (verifyEligible || destinationBlocked || dispositionDue) && age > cfg.verify_age_ms;
     if (dead && actionable) {
       acc.unaccounted++;
       judgements.push({ pr: p.number, decision: { action: "alarm_unaccounted", why: `${dead.kind} duty ${dead.duty_id} ended (${dead.card_status ?? "deleted"}) without binding the PR` }, reason: `past the actionable age and none of the three — the prior duty died unbound` });
@@ -313,10 +335,16 @@ export function reconcileJoin(args: {
       judgements.push({ pr: p.number, decision: { action: "spawn_tracking" }, reason: `approved but destination-blocked (${p.mergeStateStatus}) — binding so it is visible; verify comes when the base greens` });
       continue;
     }
-    if ((changesRequested || conflicting) && age > cfg.disposition_age_ms) {
+    if (dispositionDue) {
       acc.spawned++;
       acc.accounted++;
-      judgements.push({ pr: p.number, decision: { action: "spawn_disposition" }, reason: `${changesRequested ? "changes requested" : "conflicting"} unbound ${Math.round(age / 3_600_000)}h — spawning a disposition duty (fix, or close-with-reason)` });
+      judgements.push({
+        pr: p.number,
+        decision: { action: "spawn_disposition" },
+        reason: undecided
+          ? `review decision EMPTY ${Math.round(age / 3_600_000)}h (the dismissed-bot-review class, BR#4761) — spawning a disposition duty: get a review on record, or rule it off with reconcile.ignore`
+          : `${changesRequested ? "changes requested" : "conflicting"} unbound ${Math.round(age / 3_600_000)}h — spawning a disposition duty (fix, or close-with-reason)`,
+      });
       continue;
     }
     // 5. inside the grace window.

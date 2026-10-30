@@ -21,8 +21,9 @@ import {
  * past the actionable age is an ALARM — plus the precedence order (binding >
  * ignore > duty-live > duty-dead-alarm > spawn matrix > grace), the
  * verify-eligibility refinement (mergeStateStatus CLEAN, or bind-only
- * tracking for BLOCKED/BEHIND), and the reverse-reconcile guard
- * (two-consecutive-missing, provenance-only close).
+ * tracking for BLOCKED/BEHIND), the age-bound empty-decision class (fresh =
+ * informational tail, aged = a disposition duty; BR#4761), and the
+ * reverse-reconcile guard (two-consecutive-missing, provenance-only close).
  *
  * Tier 2 (the real DO drill) lives in train-hub.test.ts — the application of
  * these decisions against the bundled worker.
@@ -301,6 +302,61 @@ describe("reconcileJoin — forward", () => {
     expect(one(r, 1).decision.action).toBe("grace");
     expect(r.accounting.grace).toBe(1);
     expect(r.accounting.ok).toBe(true);
+  });
+});
+
+// ---------- reconcileJoin: the empty-decision class (BR#4761) ----------
+
+describe("reconcileJoin — reviewDecision EMPTY (BR#4761, the dismissed-bot-review drift)", () => {
+  it("a FRESH empty decision stays in the informational unreviewed tail — owner mid-review, no alarm", () => {
+    const r = join({ prs: [pr(1, { reviewDecision: null, updatedAt: iso(5) })] }); // 5h of the 24h disposition age
+    expect(one(r, 1).decision.action).toBe("grace");
+    expect(one(r, 1).reason).toContain("no review decision yet");
+    expect(one(r, 1).reason).toContain("24h disposition age");
+    expect(r.accounting.unreviewed).toBe(1);
+    expect(r.accounting.open_reviewed).toBe(0);
+    expect(r.accounting.accounted).toBe(0);
+    expect(r.accounting.ok).toBe(true);
+  });
+
+  it("an empty decision past the disposition age enters the invariant — spawns a disposition duty exactly once", () => {
+    const aged = { reviewDecision: null, updatedAt: iso(30) } as Partial<ReconcilePr>;
+    const r = join({ prs: [pr(1, aged)] });
+    const j = one(r, 1);
+    expect(j.decision.action).toBe("spawn_disposition");
+    expect(j.reason).toContain("EMPTY");
+    expect(j.reason).toContain("get a review on record");
+    expect(r.accounting.spawned).toBe(1);
+    expect(r.accounting.accounted).toBe(1);
+    expect(r.accounting.unreviewed).toBe(0);
+    expect(r.accounting.open_reviewed).toBe(1);
+    expect(r.accounting.ok).toBe(true);
+    // the spawn is ONCE: the ledger row it leaves makes the next cycle
+    // in-flight, never a second spawn
+    const r2 = join({ prs: [pr(1, aged)], duties: [duty(1, { kind: "disposition", card_status: "todo" })] });
+    expect(one(r2, 1).decision).toEqual({ action: "inflight", duty_id: "BR#8001", via: "duty" });
+    expect(r2.accounting.inflight).toBe(1);
+    expect(r2.accounting.spawned).toBe(0);
+  });
+
+  it("an empty decision that aged on a DEAD duty is the ALARM — no silent respawn over the corpse", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: null, updatedAt: iso(30) })],
+      duties: [duty(1, { kind: "disposition", card_status: "done" })],
+    });
+    expect(one(r, 1).decision.action).toBe("alarm_unaccounted");
+    expect(r.accounting.unaccounted).toBe(1);
+    expect(r.accounting.ok).toBe(false);
+  });
+
+  it("a bound or ignored empty-decision PR is accounted by its ruling, not the unreviewed tail", () => {
+    const bound = join({ prs: [pr(1, { reviewDecision: null, updatedAt: iso(30) })], bindings: [binding(1)] });
+    expect(one(bound, 1).decision.action).toBe("bound");
+    expect(bound.accounting.bound).toBe(1);
+    expect(bound.accounting.unreviewed).toBe(0);
+    const ignored = join({ prs: [pr(2, { reviewDecision: null, updatedAt: iso(30) })], ignores: [{ pr: 2, reason: "bot roller" }] });
+    expect(one(ignored, 2).decision.action).toBe("ignored");
+    expect(ignored.accounting.ignored).toBe(1);
   });
 });
 
