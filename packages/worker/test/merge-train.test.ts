@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   DEFAULT_BURST_MAX,
   drainBurstDecision,
@@ -17,6 +18,7 @@ import {
   normalizeGhMergeState,
   progressVerdict,
   renewProgressDecide,
+  replayBounceBudget,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -24,6 +26,8 @@ import {
   trainCloseFailAskDetails,
   trainCloseFailAskTitle,
   trainLandedCloseEdge,
+  trainEscalationAskTitle,
+  trainEscalationClosedReason,
   trainLandedCloseNote,
   trainLegLanded,
   trainLegs,
@@ -38,6 +42,8 @@ import {
   clampAwaitingTtlHours,
   verdictCoversHead,
   verdictCoversHeadLeg,
+  TRAIN_BOUNCE_BUDGET,
+  TRAIN_BOUNCE_GRACE_HOURS,
   TRAIN_CI_BOUND_MULTIPLIER,
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_HEAD_STAMP_RE,
@@ -1236,5 +1242,141 @@ describe("burst-drain law (BR#4934)", () => {
     expect(firstRedIndex([false, true, false, true])).toBe(1);
     expect(firstRedIndex([true])).toBe(0);
     expect(firstRedIndex([])).toBeNull();
+  });
+});
+
+// ---- bounce budget (TRAIN-DEFENCE L1.3, BR#4688) — the pure law ----
+
+describe("replayBounceBudget — the per-(PR, bounce-kind) ceiling (BR#4688)", () => {
+  const ev = (ts: number, pr: number, kind = "gate", extra: Record<string, unknown> = {}) => ({
+    ts,
+    kind: "bounced",
+    repo: "state-vector/bridge",
+    base: "main",
+    pr,
+    task_id: `BR#${4000 + pr}`,
+    detail: { bounce_kind: kind },
+    ...extra,
+  });
+
+  it("budget 5: bounces 1-5 serve normally, the 6th same-kind bounce IS the escalation", () => {
+    const events = [1, 2, 3, 4, 5, 6].map((i) => ev(1000 + i, 42));
+    expect(TRAIN_BOUNCE_BUDGET).toBe(5);
+    expect(replayBounceBudget(events.slice(0, 5))).toEqual([]); // the storm's first 5 bounces: no escalation
+    const out = replayBounceBudget(events);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ pr: 42, repo: "state-vector/bridge", base: "main", bounce_kind: "gate", bounce_no: 6, at: 1006, task_id: "BR#4042" });
+    expect(out[0].grace_until).toBe(1006 + TRAIN_BOUNCE_GRACE_HOURS * 3_600_000);
+  });
+
+  it("one escalation per (pr, kind) episode — a 7th and 8th bounce never re-fire", () => {
+    const events = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => ev(1000 + i, 42));
+    expect(replayBounceBudget(events)).toHaveLength(1);
+  });
+
+  it("kinds count separately: 5 gate + 5 coverage interleaved never escalates; the 6th of ONE kind does", () => {
+    const events: any[] = [];
+    for (let i = 1; i <= 5; i++) events.push(ev(i, 42, "gate"), ev(100 + i, 42, "coverage"));
+    expect(replayBounceBudget(events)).toEqual([]);
+    events.push(ev(200, 42, "gate")); // 6th gate — coverage stays at 5
+    const out = replayBounceBudget(events);
+    expect(out).toHaveLength(1);
+    expect(out[0].bounce_kind).toBe("gate");
+    expect(out[0].bounce_no).toBe(6);
+  });
+
+  it("separate (repo, base, pr) are separate budgets", () => {
+    const events = [1, 2, 3, 4, 5, 6].map((i) => ev(i, 42)).concat([1.5, 2.5, 3.5, 4.5, 5.5, 6.5].map((t) => ev(t, 43)));
+    const out = replayBounceBudget(events);
+    expect(out.map((e) => e.pr).sort()).toEqual([42, 43]);
+  });
+
+  it("episode reset: a cleared budget re-arms — the post-clear slice escalates again at its own 6th", () => {
+    // the DO floors the count at meta.merge_train.escalated.cleared_at; the
+    // replay mirrors it by consuming the post-clear slice (train_history
+    // serves ts-filterable rows)
+    const postClear = [1, 2, 3, 4, 5, 6].map((i) => ev(50_000 + i, 42));
+    const out = replayBounceBudget(postClear);
+    expect(out).toHaveLength(1);
+    expect(out[0].at).toBe(50_006);
+  });
+
+  it("order-independent (train_history serves DESC; the replay sorts ASC) and blind to non-bounced rows", () => {
+    const events = [6, 2, 4, 1, 5, 3].map((i) => ev(i * 100, 42));
+    events.push({ ts: 350, kind: "merged", repo: "state-vector/bridge", base: "main", pr: 42, merge_sha: "abc" } as any);
+    events.push({ ts: 360, kind: "landed", repo: "state-vector/bridge", base: "main", pr: 42 } as any);
+    expect(replayBounceBudget(events)[0]?.at).toBe(600);
+    // missing pr / repo rows are skipped, not crashes
+    expect(replayBounceBudget([{ ts: 1, kind: "bounced", repo: "state-vector/bridge", base: "main", pr: null } as any])).toEqual([]);
+  });
+
+  it("custom budget/grace opts (the DO tests drive the same knobs)", () => {
+    const events = [1, 2, 3].map((i) => ev(i, 42));
+    const out = replayBounceBudget(events, { budget: 2, graceHours: 1 });
+    expect(out).toHaveLength(1);
+    expect(out[0].bounce_no).toBe(3);
+    expect(out[0].grace_until - out[0].at).toBe(3_600_000);
+  });
+
+  it("escalation ask title: deterministic, ≤240 chars, ends in '?', names the PR/card/kind/clock", () => {
+    const t = trainEscalationAskTitle("state-vector/bridge", 279, "BR#4263", "gate", 6, 48);
+    expect(t.length).toBeLessThanOrEqual(240);
+    expect(t.endsWith("?")).toBe(true);
+    expect(t).toContain("PR #279");
+    expect(t).toContain("BR#4263");
+    expect(t).toContain("bounced 6× gate");
+    expect(t).toContain("48h");
+    // deterministic → the identical-open-ask guard dedupes re-fires of the SAME episode
+    expect(t).toBe(trainEscalationAskTitle("state-vector/bridge", 279, "BR#4263", "gate", 6, 48));
+    // a new episode (new bounce_no) titles differently → a post-clear storm files fresh
+    expect(t).not.toBe(trainEscalationAskTitle("state-vector/bridge", 279, "BR#4263", "gate", 7, 48));
+    // absurd card id still respects the cap
+    const long = trainEscalationAskTitle("state-vector/bridge", 279, "BR#" + "x".repeat(300), "gate", 6, 48);
+    expect(long.length).toBeLessThanOrEqual(240);
+  });
+
+  it("expiry close reason cites the ask, the breach facts, and the revive path (closures are reversible)", () => {
+    const r = trainEscalationClosedReason({ repo: "state-vector/bridge", prNumber: 279, kind: "gate", bounceNo: 6, askId: "BR#9999", escalatedAt: 1793205599448, graceHours: 48 });
+    expect(r).toContain("BR#9999");
+    expect(r).toContain("6× gate");
+    expect(r).toContain("48h");
+    expect(r).toContain("Revive");
+    expect(r).toContain("survives as the record");
+  });
+});
+
+describe("replayBounceBudget over the LIVE 2026-10-28 storm ledger (BR#4688 acceptance)", () => {
+  // the state-vector/bridge@main bounce storms: PR #279 (card BR#4263) bounced
+  // 31× (28 gate + 3 coverage), PR #281 (card BR#4282) 33× gate before
+  // merging. The RCA that finally noticed (BR#4630) was filed ~11h later.
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/train-2026-10-28-bounce-storm.json", import.meta.url).pathname, "utf8"));
+
+  it("both storms escalate at bounce 6 — hours before any human noticed", () => {
+    const out = replayBounceBudget(fixture.events);
+    expect(out).toHaveLength(2);
+    const bypr = new Map(out.map((e) => [e.pr, e]));
+    const e279 = bypr.get(279)!;
+    const e281 = bypr.get(281)!;
+    expect(e279).toMatchObject({ repo: "state-vector/bridge", base: "main", bounce_kind: "gate", bounce_no: 6, at: 1793205599448, task_id: "BR#4263" });
+    expect(e281).toMatchObject({ repo: "state-vector/bridge", base: "main", bounce_kind: "gate", bounce_no: 6, at: 1793205611590, task_id: "BR#4282" });
+  });
+
+  it("#279's 3 coverage bounces stay under their own budget — the coverage kind never escalates", () => {
+    const out = replayBounceBudget(fixture.events);
+    expect(out.find((e: any) => e.bounce_kind === "coverage")).toBeUndefined();
+  });
+
+  it("both escalations fire ≥4h before the RCA (BR#4630) and before #281 merged", () => {
+    const out = replayBounceBudget(fixture.events);
+    const lead = (at: number) => fixture.rca_filed_ts - at;
+    for (const e of out) {
+      expect(lead(e.at)).toBeGreaterThanOrEqual(4 * 3_600_000);
+    }
+    // ~11h of churn the budget would have cut short
+    expect(lead(1793205599448)).toBeGreaterThan(11 * 3_600_000 - 60_000);
+    // #281 kept bouncing for ~9.4h AFTER its escalation point before it merged
+    const merged281 = fixture.events.find((e: any) => e.kind === "merged" && e.pr === 281);
+    expect(merged281.ts).toBe(1793239458292);
+    expect(merged281.ts - 1793205611590).toBeGreaterThan(9 * 3_600_000);
   });
 });

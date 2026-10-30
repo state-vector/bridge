@@ -1790,3 +1790,155 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-leg" });
   });
 });
+
+// ---- bounce budget (TRAIN-DEFENCE L1.3, BR#4688) — DO lifecycle drills ----
+
+describe("bounce budget: 6 same-kind bounces escalate once and de-queue (BR#4688)", () => {
+  const repo = "state-vector/budget-drill";
+  const PR = 2651;
+  const bounce = (card: string, head: string | null) =>
+    kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-budget", pr: PR, head_sha: head, task_id: card, reason: "PR mergeStateStatus=behind — not clean (drill)", bounce_kind: "gate" });
+  /** The production storm cycle: the bounced card re-enters review and a
+   *  fresh verify accept re-queues it — one bounce per queue admission. */
+  const requeue = async (card: string, head: string, n: number, rp = repo, prNum = PR) => {
+    const ir = await kbJson("/transition", { id: card, to: "in_review", session: "", note: `drill: re-verify after bounce — PR https://github.com/${rp}/pull/${prNum}` });
+    expect(ir.status, `in_review failed: ${JSON.stringify(ir.body)}`).toBeLessThan(400);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: budget drill ${card} r${n}`, roles: ["review"], session: `bridge-task-BR-drill-verify-${n}` });
+    expect(verify.status).toBe(200);
+    const vid = String(verify.body.id);
+    await kbJson("/link", { src: vid, relation: "child_of", dst: card });
+    await kbJson("/transition", { id: vid, to: "in_progress", actor: "drill-verifier", note: "drill: verifying" });
+    const done = await kbJson("/transition", { id: vid, to: "done", actor: "drill-verifier", note: `verified head ${head} (drill r${n}) — PR https://github.com/${rp}/pull/${prNum}` });
+    expect(done.status, `verify close failed: ${JSON.stringify(done.body)}`).toBeLessThan(400);
+  };
+  const escalationAsks = async (card: string, phrase: string) =>
+    ((await kbJson("/search", { q: card, type: "question", limit: 50 })).body?.artefacts ?? []).filter(
+      (x: any) => x.type === "question" && String(x.title).includes(phrase),
+    );
+
+  it("bounces 1-5 serve; the 6th fires EXACTLY ONE escalation ask and de-queues; a 7th event never re-asks; a head-move clears and re-queues", async () => {
+    await acquire(repo, "gw-budget");
+    const heads = Array.from({ length: 8 }, (_, i) => (0xb0 + i).toString(16).padStart(2, "0").repeat(20));
+    const card = await queueViaAccept({ repo, pr: PR, head: heads[0], title: "IMPL: bounce budget drill" });
+
+    // bounces 1-5: the budget absorbs them (bounce 1 folds the review ask;
+    // bounces 2-5 ride the production re-queue cycle between admissions)
+    for (let n = 1; n <= 5; n++) {
+      const r = await bounce(card, heads[n - 1]);
+      expect(r.status, `bounce ${n} failed: ${JSON.stringify(r.body)}`).toBeLessThan(400);
+      expect(r.body.escalated ?? false).toBe(false);
+      const m = (await kbJson("/get", { id: card })).body.meta ?? {};
+      expect(m.merge_train?.escalated ?? null).toBeNull();
+      // every bounce leaves the card in_progress (the fix-up brief) — the
+      // production storm cycle re-enters review and re-queues before the next
+      await requeue(card, heads[n - 1], n);
+    }
+
+    // the 6th SAME-KIND bounce breaches: one bound ask, de-queued, no 7th
+    const sixth = await bounce(card, heads[5]);
+    expect(sixth.status, `breach bounce failed: ${JSON.stringify(sixth.body)}`).toBeLessThan(400);
+    expect(sixth.body.escalated).toBe(true);
+    expect(sixth.body.bounce_no).toBe(6);
+    expect(String(sixth.body.ask ?? "")).toMatch(/^BR#\d+$/);
+    const askId = String(sixth.body.ask);
+    const cardAfter = (await kbJson("/get", { id: card })).body;
+    expect(cardAfter.status).toBe("blocked"); // parked on the ask — the de-queue
+    const esc = cardAfter.meta.merge_train.escalated;
+    expect(esc).toMatchObject({ bounce_kind: "gate", bounce_no: 6, budget: 5, pr: PR, repo, grace_hours: 48, ask_id: askId });
+    expect(esc.head_sha.toLowerCase()).toBe(heads[5]);
+    expect(cardAfter.meta.awaiting_ask?.ask_id).toBe(askId);
+    // de-queued: the derived queue no longer serves it; the lane shows the escalation
+    const snap = await laneSnap(repo);
+    expect(snap.queue.find((q: any) => q.id === card) ?? null).toBeNull();
+    expect(snap.escalations).toHaveLength(1);
+    expect(snap.escalations[0]).toMatchObject({ task_id: card, pr: PR, bounce_kind: "gate", bounce_no: 6 });
+    expect(snap.escalations[0].expired).toBe(false);
+    // exactly ONE escalation ask exists
+    const mine = await escalationAsks(card, `bounced 6× gate`);
+    expect(mine).toHaveLength(1);
+    expect(mine[0].id).toBe(askId);
+
+    // the raw-7th event: the SAME ask is reused — never a second ask, the
+    // card re-parks (still de-queued)
+    const seventh = await bounce(card, heads[6]);
+    expect(seventh.status, `7th bounce failed: ${JSON.stringify(seventh.body)}`).toBeLessThan(400);
+    expect(seventh.body.escalated).toBe(true);
+    expect(seventh.body.ask).toBe(askId);
+    expect(((await kbJson("/get", { id: card })).body).status).toBe("blocked");
+    expect(await escalationAsks(card, "bounced 6× gate")).toHaveLength(1); // still exactly the one ask
+    expect(await escalationAsks(card, "bounced 7× gate")).toHaveLength(0); // no 7th ask
+
+    // owner acts: a NEW head at the escalated leg + fresh verify accept →
+    // the escalation clears (head-moved), the episode resets, the card re-queues
+    await kbJson("/transition", { id: card, to: "in_progress", session: "", note: "owner leg: rebased onto main — new head pushed" });
+    await requeue(card, heads[7], 9);
+    const cleared = (await kbJson("/get", { id: card })).body;
+    expect(cleared.status).toBe("blocked");
+    expect(cleared.meta.merge_train.escalated.cleared_at).toBeGreaterThan(0);
+    expect(cleared.meta.merge_train.escalated.cleared_via).toBe("head-moved");
+    const snap2 = await laneSnap(repo);
+    expect(snap2.escalations ?? []).toHaveLength(0);
+    expect(snap2.queue.find((q: any) => q.id === card) ?? null).toBeTruthy();
+    // the episode RESET: the next gate bounce counts from 1 — no instant re-escalation
+    const fresh = await bounce(card, heads[7]);
+    expect(fresh.status).toBeLessThan(400);
+    expect(fresh.body.escalated ?? false).toBe(false);
+    expect(fresh.body.bounce_no).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-budget" });
+  });
+
+  it("grace expiry: the hub composes the close reason, and escalation_closed (executor gh leg) settles the record — never self-certified", async () => {
+    const repo2 = "state-vector/budget-expiry-drill";
+    const PR2 = 2661;
+    await acquire(repo2, "gw-budget");
+    const head = "e1".repeat(20);
+    const card = await queueViaAccept({ repo: repo2, pr: PR2, head, title: "IMPL: budget expiry drill" });
+    // drive to the breach in one lane (bounce 1 folds; 2-5 re-queue; 6 breaches)
+    for (let n = 1; n <= 5; n++) {
+      const r = await kbJson("/train.event", { repo: repo2, base: "main", kind: "bounced", actor: "gw-budget", pr: PR2, head_sha: n === 1 ? head : null, task_id: card, reason: "behind (drill)", bounce_kind: "gate" });
+      expect(r.status).toBeLessThan(400);
+      await requeue(card, head, n, repo2, PR2);
+    }
+    const sixth = await kbJson("/train.event", { repo: repo2, base: "main", kind: "bounced", actor: "gw-budget", pr: PR2, head_sha: null, task_id: card, reason: "behind (drill)", bounce_kind: "gate" });
+    expect(sixth.body.escalated).toBe(true);
+    const askId = String(sixth.body.ask);
+
+    // backdate the episode past its 48h clock (the starve drill's backdating precedent)
+    const c0 = (await kbJson("/get", { id: card })).body;
+    c0.meta.merge_train.escalated.at -= 49 * 3_600_000;
+    c0.meta.merge_train.escalated.grace_until -= 49 * 3_600_000;
+    await kbJson("/update", { id: card, meta: c0.meta });
+    const snap = await laneSnap(repo2);
+    const escRow = snap.escalations.find((e: any) => e.task_id === card);
+    expect(escRow.expired).toBe(true);
+    expect(escRow.close_reason).toContain("Bounce-budget expiry (BR#4688");
+    expect(escRow.close_reason).toContain(askId);
+
+    // NEVER self-certified: a close report names an ACTIVE escalation on the
+    // card — wrong PR and escalation-less cards are both rejected loud
+    const mismatch = await kbJson("/train.event", { repo: repo2, base: "main", kind: "escalation_closed", actor: "gw-budget", pr: 9999, task_id: card });
+    expect(String(mismatch.body.error ?? "")).toContain("not #9999");
+    const bare = await kbJson("/create", { type: "task", title: "drill: card with no escalation", session: "" });
+    const noEsc = await kbJson("/train.event", { repo: repo2, base: "main", kind: "escalation_closed", actor: "gw-budget", pr: PR2, task_id: String(bare.body.id) });
+    expect(String(noEsc.body.error ?? "")).toContain("no ACTIVE bounce-budget escalation");
+
+    // the executor's gh leg reports the close: the hub validates the ACTIVE
+    // escalation, answers the ask with the receipt, and the card survives
+    // as the record (todo) per BR#3312
+    const closed = await kbJson("/train.event", { repo: repo2, base: "main", kind: "escalation_closed", actor: "gw-budget", pr: PR2, task_id: card });
+    expect(closed.status, `escalation_closed failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    const after = (await kbJson("/get", { id: card })).body;
+    expect(after.status).toBe("todo"); // survives as the record, unclaimed
+    expect(after.meta.merge_train.escalated.closed_at).toBeGreaterThan(0);
+    expect(after.meta.merge_train.escalation_closed.ask_id).toBe(askId);
+    expect(after.meta.awaiting_ask ?? null).toBeNull();
+    const ask = (await kbJson("/get", { id: askId })).body;
+    expect(ask.status).toBe("done"); // the ask is answered with the receipt
+    const hist = (await kbJson("/train.history", { repo: repo2 })).body.events;
+    const closedEv = hist.find((e: any) => e.kind === "escalation_closed");
+    expect(closedEv).toBeTruthy();
+    expect(closedEv.pr).toBe(PR2);
+    expect(JSON.stringify(closedEv.detail)).toContain("Bounce-budget expiry");
+    await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-budget" });
+  });
+});

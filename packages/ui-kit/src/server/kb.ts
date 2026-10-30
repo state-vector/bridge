@@ -209,7 +209,10 @@ export interface KbTrainLane {
   /** how many queued cards are waiting on a fresh review (the honest
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
-  queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
+  /** Derived queue, oldest-first. BR#4688: each entry carries its PR leg and
+   *  the LEDGER bounce count for it — `over_budget` mirrors the hub's
+   *  bounce-budget rule (the 6th same-kind bounce escalates + de-queues). */
+  queue: { id: string; priority: "critical" | "normal"; pr?: number; bounces?: number; over_budget?: boolean }[];
   /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
    *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
    *  gone: zero asks ride the lanes): one chip per parked card — amber
@@ -217,6 +220,9 @@ export interface KbTrainLane {
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
   awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
+  /** Active bounce-budget escalations (BR#4688): de-queued PRs riding out
+   *  their owner clock; `expired` ones are closed by the executor's gh leg. */
+  escalations?: { task_id: string; pr: number; bounce_kind?: string | null; bounce_no: number; at: number; grace_until: number; ask_id?: string | null; expired: boolean; close_reason?: string }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

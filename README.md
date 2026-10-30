@@ -462,6 +462,26 @@ silence issues one fresh round instead of flooding for an hour. The spawner cap 
 the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
 card, carries the recurring block to the human ledger.
+
+**The bounce budget caps the loop** (BR#4688): same-kind bounces on one PR are budgeted at
+**5** — the hub counts `train_events` per (repo, base, PR, bounce kind) since the last
+cleared escalation, and the **6th bounce of the same kind escalates** per the BR#3312
+disposition instead of re-entering the queue: the card is stamped
+`meta.merge_train.escalated` (kind, bounce number, head sha, grace window), folded
+**blocked-on-ask**, and exactly **one bound ask** is filed — the fold is itself the
+de-queue, so a 7th bounce is unrepresentable (the BR#279/#281 storm class: 31 gate bounces
+on one PR in a day; replaying the 2026-10-28 ledger, this budget escalates both PRs at
+bounce 6, ~11h before the RCA was filed). Re-queueing an escalated card requires real
+movement — the head must move past the escalation's stamped sha, or the ask must be
+answered; either stamps `cleared_at` + `cleared_via` (audit `bounce_budget_cleared`) and
+resets the episode's counter. A different bounce kind still bounces normally — new
+information, not the loop. If the grace lapses (`pr_grace_hours`, default 48, never 0), the
+executor's expiry leg probes the PR live via `gh`, closes it with the reason as a comment,
+and reports `escalation_closed`; the hub acts only when it can validate an ACTIVE escalation
+of its own (the executor never self-certifies), answers the ask, and leaves the card `todo`
+as the record — the storm ends, the history survives. The trains panel renders the count
+live: a ×N ledger-bounce chip per queued PR (red once over budget) plus the escalation
+clock chips while an episode is open.
 The trains panel is honest about capability and activity (BR#4981): a held lock names
 its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
 shows the pill `train ready` (the tooltip names the machine and its last tick age);

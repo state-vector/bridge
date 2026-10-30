@@ -261,10 +261,32 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   ))}
                 </span>
               )}
+              {(l.escalations ?? []).map((e) => (
+                <Chip
+                  key={`${e.task_id}-${e.pr}`}
+                  pill
+                  tone={e.expired ? "err" : "warn"}
+                  title={`bounce budget (BR#4688): ${e.task_id} PR #${e.pr} breached at ${e.bounce_no}× ${e.bounce_kind ?? "?"} bounces — de-queued, escalation ask ${e.ask_id ?? "?"}; owner clock ${e.expired ? `expired ${age(e.grace_until, now)} ago (executor closes the PR)` : `${age(e.grace_until, now)} left`}`}
+                >
+                  ⏳ {e.pr ? `#${e.pr}` : e.task_id} ×{e.bounce_no}
+                </Chip>
+              ))}
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
             <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}`}>
               {l.queue.length} queued{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+                {l.queue.map((q) => (
+                  <Chip
+                    key={q.id}
+                    tone={q.over_budget ? "err" : q.priority === "critical" ? "urgent" : "scope"}
+                    className="train-queue-card"
+                    onClick={() => openTask?.(q.id)}
+                    title={`${q.id} — ${q.over_budget ? "OVER bounce budget (escalated, de-queued)" : q.priority === "critical" ? "boosted (priority 0)" : "normal priority"}${q.bounces != null ? ` · ${q.bounces} train bounce(s) on PR #${q.pr ?? "?"} (budget 5 same-kind — BR#4688)` : ""}`}
+                  >
+                    {q.id}
+                    {q.bounces ? <span className={`train-bounce-chip${q.over_budget ? " over-budget" : ""}`} title={`bounce budget (BR#4688): ${q.bounces} same-kind-bounce limit is 5`}> ×{q.bounces}</span> : null}
+                  </Chip>
+                ))}
             </span>
           </div>
         );

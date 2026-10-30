@@ -904,6 +904,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     };
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
     if queue.is_empty() {
+        // An escalated card is DE-QUEUED, so empty-queue is the escalation
+        // state's normal shape — the expiry sweep MUST run here, not only
+        // after a queue walk (BR#4688).
+        close_expired_escalations(ctx, lane, key, repo, base)?;
         if pass_merged > 0 {
             // a bursting lane with an empty queue still owes its settle —
             // all pass heads merged, nothing clean left behind them
@@ -1245,6 +1249,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
         return Ok(());
     }
+    // ---- bounce-budget escalations (BR#4688): EXPIRED owner clocks close
+    // the PR with reason (BR#3312 disposition). ----
+    close_expired_escalations(ctx, lane, key, repo, base)?;
+    // every entry was walked and none could act — the lane is honestly idle
     release_if_idle(ctx, key, repo, base)?;
     Ok(())
 }
@@ -1521,6 +1529,45 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The gh-capable hand for BR#4688 expiry: closes each EXPIRED bounce-budget
+/// escalation's PR with the hub-composed reason (BR#3312 disposition). The
+/// hub composes the law text (close_reason on the snapshot) and owns the
+/// ledger; this leg is the hand — never a personal identity (drive_lane gated
+/// write_allowed above). Idempotent: an already-closed/merged PR is reported
+/// for board reconciliation, never re-closed; a failed state probe defers to
+/// the next tick.
+fn close_expired_escalations(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str) -> Result<(), String> {
+    for esc in lane.get("escalations").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+        if !esc.get("expired").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let Some(esc_pr) = esc.get("pr").and_then(|v| v.as_i64()) else { continue };
+        let Some(esc_task) = esc.get("task_id").and_then(|v| v.as_str()).map(String::from) else { continue };
+        let reason = vstr(esc, "close_reason")
+            .unwrap_or("Bounce-budget expiry (BR#4688): the escalation clock lapsed unanswered — closing per the BR#3312 disposition; the card survives as the record. Revive: re-open once the work resumes.")
+            .to_string();
+        let state = match ctx.sh("gh", &["pr", "view", &esc_pr.to_string(), "--repo", repo, "--json", "state", "--jq", ".state"]) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => String::new(),
+        };
+        if state.is_empty() {
+            log(Some(key), &format!("escalation: PR #{esc_pr} state probe failed — deferring the expiry close to the next tick"));
+            continue;
+        }
+        renew_lease(ctx, repo, base);
+        if state == "OPEN" {
+            log(Some(key), &format!("escalation expired: PR #{esc_pr} ({esc_task}) — closing with reason (BR#4688)"));
+            ctx.sh("gh", &["pr", "close", &esc_pr.to_string(), "--repo", repo, "--comment", &trunc(&reason, 240)])?;
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "escalation_closed", "pr": esc_pr, "task_id": esc_task, "reason": reason }))?;
+            ctx.note(&format!("escalation_closed: PR #{esc_pr} closed with reason (bounce budget, BR#4688)"));
+        } else {
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "escalation_closed", "pr": esc_pr, "task_id": esc_task, "reason": format!("PR already {state} on GitHub — board reconciliation for the expired bounce-budget escalation (BR#4688)") }))?;
+            ctx.note(&format!("escalation_closed (reconcile): PR #{esc_pr} was already {state}"));
         }
     }
     Ok(())
@@ -3020,6 +3067,51 @@ mod tests {
         }
     }
 
+    /// A fake `gh` on PATH: logs every invocation to a file, answers
+    /// `pr view … --jq .state` with the scripted state, succeeds everything.
+    struct FakeGh {
+        dir: PathBuf,
+        log: PathBuf,
+        orig_path: String,
+    }
+    impl FakeGh {
+        fn new(state: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("br4688-gh-{}-{}", std::process::id(), now_ms()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("gh.log");
+            let gh = dir.join("gh");
+            std::fs::write(
+                &gh,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then echo \"{state}\"; exit 0; fi\nexit 0\n",
+                    log.display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let orig_path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), orig_path));
+            Self { dir, log, orig_path }
+        }
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log).unwrap_or_default().lines().map(String::from).collect()
+        }
+        fn clear(&self) {
+            let _ = std::fs::remove_file(&self.log);
+        }
+    }
+    impl Drop for FakeGh {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.orig_path);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
     #[test]
     fn rollup_pending_is_transient_and_empty_rollup_is_transient() {
         let rollup = json!([{ "name": "Test", "conclusion": null, "status": "IN_PROGRESS" }]);
@@ -3109,5 +3201,87 @@ mod tests {
         let args = call_args(&recorded[0]);
         assert_eq!(args.get("action").and_then(|v| v.as_str()), Some("acquire"));
         assert_eq!(args.get("merge_capable"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn expired_bounce_budget_escalation_closes_the_pr_br4688() {
+        // BR#4688 expiry leg (BR#3312 disposition): an EXPIRED escalation's PR
+        // is closed with the hub-composed reason and reported
+        // (escalation_closed); a non-expired entry is untouched; an
+        // already-closed PR is reported for reconciliation, never re-closed;
+        // a failed state probe defers to the next tick. The empty-queue shape
+        // is the escalation state's NORMAL shape (the card is de-queued), so
+        // the sweep must run on it.
+        let repo_name = "state-vector/bridge";
+        let lane = |expired_pr: i64, task: &str| {
+            json!({
+                "lane": "state-vector/bridge@main",
+                "queue": [],
+                "escalations": [
+                    { "expired": false, "pr": 90, "task_id": "BR#90",
+                      "close_reason": "Bounce-budget expiry (BR#4688): not yet due — the clock is running" },
+                    { "expired": true, "pr": expired_pr, "task_id": task,
+                      "close_reason": "Bounce-budget expiry (BR#4688): drill reason — the card survives as the record" },
+                ],
+            })
+        };
+
+        // phase 1: OPEN → gh close + train_event escalation_closed
+        let gh = FakeGh::new("OPEN");
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease renewed" })),        // sweep: renew before the close
+            ok(json!({ "ok": true })),                     // sweep: train_event escalation_closed
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })), // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane_inner(&mut ctx, &lane(99, "BR#99"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000).unwrap();
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_lease", "train_event", "train_status", "train_lease"]);
+        let ev = call_args(&recorded[1]);
+        assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("escalation_closed"));
+        assert_eq!(ev.get("pr").and_then(|v| v.as_i64()), Some(99));
+        assert_eq!(ev.get("task_id").and_then(|v| v.as_str()), Some("BR#99"));
+        assert!(ev.get("reason").and_then(|v| v.as_str()).unwrap_or("").contains("drill reason"), "the hub-composed close reason rides the event");
+        let gh_lines = gh.calls().join("\n");
+        assert!(gh_lines.contains("pr view 99"), "the state probe precedes the close, got: {gh_lines}");
+        assert!(gh_lines.contains("pr close 99"), "an OPEN expired PR is closed, got: {gh_lines}");
+        assert!(!gh_lines.contains("pr view 90") && !gh_lines.contains("pr close 90"), "a non-expired entry is never probed, never touched");
+        drop(recorded);
+        drop(gh);
+
+        // phase 2: already CLOSED → reconciliation report, never a re-close
+        let gh = FakeGh::new("CLOSED");
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease renewed" })),
+            ok(json!({ "ok": true })),
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })),
+            ok(json!({ "note": "lease released — idle" })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane_inner(&mut ctx, &lane(98, "BR#98"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000).unwrap();
+        let recorded = calls.lock().unwrap();
+        let ev = call_args(&recorded[1]);
+        assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("escalation_closed"));
+        assert!(ev.get("reason").and_then(|v| v.as_str()).unwrap_or("").contains("already CLOSED"), "a closed PR is reported, not re-closed");
+        let gh_lines = gh.calls().join("\n");
+        assert!(gh_lines.contains("pr view 98"));
+        assert!(!gh_lines.contains("pr close 98"), "never re-close an already-closed PR");
+        drop(recorded);
+        drop(gh);
+
+        // phase 3: state probe fails → defer to the next tick, ZERO writes
+        let gh = FakeGh::new(""); // placeholder; the script is rewritten to fail below
+        std::fs::write(gh.dir.join("gh"), format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n", gh.log.display())).unwrap();
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })),
+            ok(json!({ "note": "lease released — idle" })),
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane_inner(&mut ctx, &lane(97, "BR#97"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000).unwrap();
+        let names: Vec<String> = calls.lock().unwrap().iter().map(call_name).collect();
+        assert_eq!(names, vec!["train_status", "train_lease"], "a failed probe defers: no renew, no close, no event");
+        assert!(gh.calls().iter().all(|c| c.contains("pr view 97")), "only the probe ran");
     }
 }
