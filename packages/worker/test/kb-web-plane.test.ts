@@ -226,31 +226,31 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/label: "no machine"/);
   });
 
-  it("renders the derived queue as clickable card chips with the lane's stop-the-line flag", () => {
-    // BR#5114: the queue renders in TWO labeled time-frames — NEXT (the
-    // first queued head, card + PR) and QUEUE (the remaining chips, each
-    // card carrying its PR) — never one unlabeled pile
-    expect(trainPanelSrc).toMatch(/const next = l\.queue\[0\]/);
-    expect(trainPanelSrc).toMatch(/const rest = l\.queue\.slice\(1\)/);
-    expect(trainPanelSrc).toMatch(/rest\.map/);
-    expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
-    expect(trainPanelSrc).toMatch(/openTask\?\.\(next\.id\)/);
+  it("renders Ray's column spec — STATUS / CURRENT (card+PR links) / PROGRESS / MSG / RATE / BACKLOG (BR#5114 round 3)", () => {
+    // CURRENT: the processed card opens in-app, the PR number opens GitHub
+    expect(trainPanelSrc).toMatch(/const curCard = l\.currently\?\.task_id \?\? l\.attempt\?\.card/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(curCard\)/);
+    expect(trainPanelSrc).toMatch(/github\.com\/\$\{repo}\/pull\/\$\{curPr\}/);
+    // PROGRESS: x of y in the current batch
+    expect(trainPanelSrc).toMatch(/merged this batch/);
+    expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
+    // BACKLOG: the count + how many need reviews
+    expect(trainPanelSrc).toMatch(/queued\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
     expect(trainPanelSrc).toContain("line stopped");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
   it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {
-    // in-flight phase + duration (since the merge stamped merged_at)
+    // in-flight phase (STATUS pill maps phases to words)
     expect(trainPanelSrc).toMatch(/l\.currently\.phase/);
-    expect(trainPanelSrc).toMatch(/age\(l\.currently\.merged_at, now\)/);
-    // BR#5114: the NOW line — the holder's live last action (why a held
-    // head is held), aged out at the lease TTL, never a stale "now"
+    // MSG: the freshest true message — the live machine note (aged out at
+    // the lease TTL), else the attempt sentence, else the last ledger action
     expect(trainPanelSrc).toMatch(/l\.now_action/);
     expect(trainPanelSrc).toMatch(/nowAction\(l, now\)/);
     expect(trainPanelSrc).toContain("ageSec > 300");
-    // throughput rate over trailing windows + the last ledger event
-    expect(trainPanelSrc).toMatch(/l\.activity\.merged_1h/);
+    // RATE: merges per hour / 24h
+    expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
     expect(trainPanelSrc).toMatch(/l\.activity\.last_event\.kind/);
   });

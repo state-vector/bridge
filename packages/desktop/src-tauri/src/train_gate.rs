@@ -455,7 +455,14 @@ pub fn decide_merge_action(
         };
     }
     // (5) verify lineage
-    if card_status == Some("in_review") && verify_accepted_any && !verify_accepted_on_head {
+    // BR#5114 round 2 (Ray ruling 2026-10-30: "if it can't merge, bounce it
+    // and move onto the next one — the train goes regardless"): an ACCEPTED
+    // verdict that no longer covers the live head is a coverage BOUNCE for
+    // ANY card status. The old in_review-only condition made a QUEUED card
+    // with a stale stamp Skip silently every tick — no ledger event, no
+    // bounce, the lane frozen behind an invisible head (observed:
+    // superpositional@main — 64 minutes of ledger silence, 12-deep queue).
+    if verify_accepted_any && !verify_accepted_on_head {
         return MergeAction::Bounce {
             defect: format!("PR #{pr_number} head {short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)"),
             bounce_kind: BounceKind::Coverage,
@@ -816,6 +823,33 @@ mod tests {
                 assert_eq!(bounce_kind, BounceKind::Coverage);
             }
             other => panic!("expected bounce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_stale_verdict_head_bounces_too_br5114() {
+        // BR#5114 round 2 (Ray: "if it can't merge, bounce it and move onto
+        // the next one"): a QUEUED (blocked) card whose accepted verdict no
+        // longer covers the live head bounces — the old in_review-only law
+        // Skipped it silently every tick, freezing the lane behind an
+        // invisible head (superpositional@main: 64 min of ledger silence).
+        let meta = serde_json::json!({ "pr": { "repo": "state-vector/superpositional", "number": 2458, "head_sha_at_acceptance": "1234567890" } });
+        let head = "8888888aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 2458,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[],
+            leg_number: Some(1),
+        });
+        match gate {
+            MergeAction::Bounce { bounce_kind, .. } => assert_eq!(bounce_kind, BounceKind::Coverage),
+            other => panic!("expected coverage bounce for a queued stale-verdict head, got {other:?}"),
         }
     }
 

@@ -223,7 +223,7 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
     if (a.kind === "skip") expect(a.reason).toContain("unsettled");
   });
 
-  it("head moved past the accepted verify verdict (card in_review) -> bounce to re-verify, kind COVERAGE (BR#4066)", () => {
+  it("head moved past the accepted verify verdict -> bounce to re-verify, kind COVERAGE — ANY card status (BR#4066 + BR#5114 round 2)", () => {
     const a = decideMergeAction(base({ verifyAcceptedOnHead: false }));
     expect(a.kind).toBe("bounce");
     if (a.kind === "bounce") {
@@ -231,6 +231,14 @@ describe("decideMergeAction — the standing order (BR#3033 + BR#3198)", () => {
       expect(a.defect).toContain("re-verify");
       expect(a.bounceKind).toBe("coverage");
     }
+    // the old law skipped a QUEUED card forever (the silent head-of-line
+    // block: superpositional@main sat 64 minutes with a 12-deep queue and
+    // zero ledger events). A queued stale-verdict head bounces too — the
+    // lane moves on, the card goes to the review pipeline (Ray ruling
+    // 2026-10-30: "if it can't merge, bounce it and move onto the next one").
+    const queued = decideMergeAction(base({ cardStatus: "blocked", verifyAcceptedOnHead: false }));
+    expect(queued.kind).toBe("bounce");
+    if (queued.kind === "bounce") expect(queued.bounceKind).toBe("coverage");
   });
 
   it("no accepted verify verdict at all -> skip (the verify pool owns the verdict)", () => {

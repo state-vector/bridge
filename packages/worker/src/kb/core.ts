@@ -1059,9 +1059,15 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
   }
   if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) — not yet, skip this tick` };
   // (5) verify lineage: an ACCEPTED verify verdict must cover THIS head.
-  //     Head moved past an accepted verdict → the sweep's own bounce
-  //     (re-verify on head change triggers the normal verify pool).
-  if (i.cardStatus === "in_review" && i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
+  //     Head moved past an accepted verdict → coverage BOUNCE — for ANY card
+  //     status (BR#5114 round 2, Ray ruling 2026-10-30: "if it can't merge,
+  //     bounce it and move onto the next one"). The old in_review-only
+  //     condition made a QUEUED card with a stale stamp Skip silently every
+  //     tick — no event, no bounce, the lane frozen behind an invisible head
+  //     (observed: superpositional@main, 64 minutes of ledger silence with a
+  //     12-deep queue). Bouncing puts the card into the review pipeline and
+  //     the lane moves on; a fresh verify re-queues it at the back.
+  if (i.verifyAcceptedAny && !i.verifyAcceptedOnHead)
     return { kind: "bounce", defect: `PR #${i.prNumber} head ${short} moved past the accepted verify verdict — re-verify the new head (a mechanical rebase is content-preserving; fresh 5c only)`, bounceKind: "coverage" };
   if (!i.verifyAcceptedOnHead)
     return { kind: "skip", reason: `no accepted verify verdict covering head ${short} — the verify pool owns the verdict; the sweep merges only verified PRs` };

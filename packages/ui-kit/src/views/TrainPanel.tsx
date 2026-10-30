@@ -180,11 +180,14 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
       )}
       {(lanes ?? []).length > 0 && (
         <div className="ktable-head train-head-cols">
-          <span title="machine-on-lane — green a machine is on it (lock held by a live holder, or a merge-capable gateway ticking it unlocked) · amber lock lapsing · red zombie · grey nobody; hover names the machine">lock</span>
+          <span title="machine-on-lane — green a machine is on it · amber busy/lapsing · red stuck · grey nobody; hover names the machine">mach</span>
           <span>line</span>
-          <span title="what the train is doing on this lane RIGHT NOW: the in-flight phase with its PR and age, or the head being gated with the reason it is held (the executor's own tick note) — plus the throughput rate and the last completed action with its age">now</span>
-          <span title="the first queued card the train takes after the current work — card + PR">next</span>
-          <span title="everything remaining in the derived queue, oldest first — click a card to open it">queue</span>
+          <span>status</span>
+          <span title="the card + GitHub PR the train is processing right now — click the card to open it, the PR number opens GitHub">current</span>
+          <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
+          <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
+          <span title="PRs merged over the last hour / 24 hours">rate</span>
+          <span title="how many cards are waiting to merge, and how many of those waiting cards are blocked on a fresh review">backlog</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
@@ -192,8 +195,30 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         const st = laneStatus(l, now);
         const repo = l.lane.split("@")[0];
         const na = nowAction(l, now);
-        const next = l.queue[0];
-        const rest = l.queue.slice(1);
+        // CURRENT: the card + PR being processed — in-flight merge first,
+        // else the head the train is checking/holding
+        const curCard = l.currently?.task_id ?? l.attempt?.card ?? null;
+        const curPr = l.currently?.pr ?? l.queue[0]?.pr ?? null;
+        // PROGRESS: x of y in the current batch (burst passes merge several
+        // back-to-back; a single merge is a batch of 1)
+        const prog =
+          l.currently?.phase === "bursting"
+            ? `${Number(l.currently.burst_merged ?? 0)} of ${l.currently.burst_cap === 0 ? "∞" : Number(l.currently.burst_cap ?? 0)} merged this batch`
+            : l.currently
+              ? "1 of 1 merged — settling"
+              : l.queue.length > 0
+                ? "0 of 1 — batch not started"
+                : "—";
+        // MSG: the freshest true message — the machine's live note first,
+        // else the current attempt sentence, else the last ledger action
+        const msg = na
+          ? { text: na.text, title: na.title }
+          : l.attempt
+            ? { text: l.attempt.note, title: l.attempt.note }
+            : l.activity?.last_event
+              ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
+              : null;
+        const stalled = l.queue.length > 0 && (l.activity?.merged_24h ?? 0) === 0;
         return (
           <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
             <span className="trainc-dot">
@@ -206,77 +231,31 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             >
               {l.lane}
             </span>
-            <span className="trainc-now">
-              <span className="train-now-state">
-                <Chip pill tone={st.tone} title={st.title}>{st.label}</Chip>
-                {l.currently?.pr ? (
-                  <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{l.currently.pr}</a>
-                ) : null}
-                {l.currently?.merged_at ? (
-                  <span className="train-dur top-num" title={`in this phase since ${new Date(l.currently.merged_at).toLocaleTimeString()}`}>
-                    {age(l.currently.merged_at, now)}
-                  </span>
-                ) : null}
-              </span>
-              {l.attempt ? <span className="train-now-note" title={l.attempt.note}>{l.attempt.note}</span> : null}
-              {na ? <span className="train-now-note" title={na.title}>{na.text}</span> : null}
-              {l.activity ? (
-                <span className="train-tp top-num" title={`merges over the last hour / 24 hours${l.activity.last_event ? ` — most recent completed action: ${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} by ${l.activity.last_event.gateway ?? "?"}, ${age(l.activity.last_event.ts, now)} ago` : ""}`}>
-                  <span className="train-tp-rate">{l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
-                  {l.activity.last_event && (
-                    <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · ${age(l.activity.last_event.ts, now)} ago (history — not the current activity)`}>
-                      last: {l.activity.last_event.kind}
-                      {l.activity.last_event.pr ? ` #${l.activity.last_event.pr}` : ""} {age(l.activity.last_event.ts, now)} ago
-                    </span>
-                  )}
-                  {l.queue.length > 0 && l.activity.merged_24h === 0 && (
-                    <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait — ${l.queue_awaiting_review ? `${l.queue_awaiting_review} of them are waiting on a fresh review (their PR branches changed after their last review)` : "see the NOW line for what holds the first card"}`}>
-                      ⚠ nothing merged in 24h · {l.queue.length} waiting{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
-                    </span>
-                  )}
-                </span>
-              ) : null}
-            </span>
-            <span className="trainc-next">
-              {next ? (
+            <span className="trainc-status"><Chip pill tone={st.tone} title={st.title}>{st.label}</Chip></span>
+            <span className="trainc-cur">
+              {curCard ? (
                 <>
-                  <Chip
-                    tone={next.priority === "critical" ? "urgent" : "scope"}
-                    className="train-queue-card"
-                    onClick={() => openTask?.(next.id)}
-                    title={`${next.id} — ${next.priority === "critical" ? "boosted (priority 0)" : "normal priority"}${next.pr ? ` · PR #${next.pr}` : ""} — the next card this lane drives after the current work`}
-                  >
-                    {next.id}
-                  </Chip>
-                  {next.pr ? (
-                    <a className="train-pr" href={`https://github.com/${repo}/pull/${next.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{next.pr}</a>
+                  <span className={`train-cur-card ${openTask ? "trainc-open" : ""}`} onClick={() => openTask?.(curCard)} title={`${curCard} — click to open the card`}>{curCard}</span>
+                  {curPr ? (
+                    <a className="train-pr" href={`https://github.com/${repo}/pull/${curPr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>#{curPr}</a>
                   ) : null}
                 </>
               ) : (
                 <span className="muted-note">—</span>
               )}
             </span>
-            <span className="trainc-queue">
-              {rest.length > 0 ? (
-                <>
-                  <span className="train-queue-label top-num" title="the cards after the next one — click to open">
-                    +{rest.length} waiting{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
-                  </span>
-                  {rest.map((q) => (
-                    <Chip
-                      key={q.id}
-                      tone={q.priority === "critical" ? "urgent" : "scope"}
-                      className="train-queue-card"
-                      onClick={() => openTask?.(q.id)}
-                      title={`${q.id} — ${q.priority === "critical" ? "boosted (priority 0)" : "normal priority"}${q.pr ? ` · PR #${q.pr}` : ""}`}
-                    >
-                      {q.id}{q.pr ? ` ·#${q.pr}` : ""}
-                    </Chip>
-                  ))}
-                </>
-              ) : (
-                <span className="muted-note">{next ? "nothing after the next card" : "queue empty"}</span>
+            <span className="trainc-prog top-num" title={prog}>{prog}</span>
+            <span className="trainc-msg">
+              {msg ? <span className="train-now-note" title={msg.title}>{msg.text}</span> : <span className="muted-note">—</span>}
+              {stalled && (
+                <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait${l.queue_awaiting_review ? ` — ${l.queue_awaiting_review} are blocked on a fresh review (their PR branches changed after their last review)` : ""}`}>
+                  ⚠ nothing merged in 24h
+                </span>
               )}
+            </span>
+            <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
+            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}`}>
+              {l.queue.length} queued{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
             </span>
           </div>
         );
