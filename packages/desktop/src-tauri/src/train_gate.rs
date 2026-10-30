@@ -370,6 +370,12 @@ pub struct TrainGateInput<'a> {
     pub commits: &'a [(String, bool)],
     pub head_checks: &'a [MainCheckRun],
     pub leg_number: Option<usize>,
+    /// BR#4687 (L1.2): every commit's GitHub author login is on the worker
+    /// allowlist — the branch belongs to the train's own fleet. Provenance
+    /// gate for the behind pre-clear below: the train machine-updates its
+    /// OWN branches; a protected human branch still bounces to its owner.
+    /// Fail-closed: absent/false is human-treated.
+    pub train_owned_branch: bool,
 }
 
 /// core.ts decideMergeAction (907): the 5c gate + verify lineage as one
@@ -521,11 +527,17 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
     // the bounce flow updates the branch). Coverage is already settled above:
     // an uncovered head bounced before this line, so behind reaching the
     // compose is always a §5-carryable head.
+    // BR#4687 (L1.2): the pre-clear is PROVENANCE-GATED. The train machine-
+    // updates branches its own fleet authored (every commit's GitHub author on
+    // the worker allowlist); a protected human branch is not the train's to
+    // move — it still bounces to its owner with the named state. Fail-closed:
+    // behind without provenance is human-treated.
     let behind = i
         .merge_state_status
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("behind"))
         .unwrap_or(false);
+    let behind_precleared = behind && i.train_owned_branch;
     // BR#3727: blocked with head checks merely PENDING is a clock, not a
     // defect — strict branch protection re-runs the required checks on the
     // head right after every machine-clean update-branch, so the tick after
@@ -566,7 +578,7 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
         }
     }
     let composed_state: Option<&str> = match i.merge_state_status.as_deref() {
-        Some(s) if behind || blocked => Some("clean"),
+        Some(s) if behind_precleared || blocked => Some("clean"),
         other => other,
     };
     let gate = decide_merge_action(
@@ -589,8 +601,8 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 L = leg_number,
                 M = if legs.is_empty() { 1 } else { legs.len() },
                 h = &i.head_sha[..i.head_sha.len().min(9)],
-                state = if behind {
-                    "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
+                state = if behind_precleared {
+                    "behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687)"
                 } else if blocked {
                     "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
                 } else {
@@ -828,6 +840,7 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[],
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -866,6 +879,7 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[],
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Bounce { bounce_kind, .. } => assert_eq!(bounce_kind, BounceKind::Coverage),
@@ -892,6 +906,7 @@ mod tests {
             commits: &[(head.clone(), true)],
             head_checks: &checks,
             leg_number: Some(1),
+            train_owned_branch: true,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -922,6 +937,7 @@ mod tests {
             commits: &commits,
             head_checks: &pending,
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Skip { reason } => {
@@ -943,6 +959,7 @@ mod tests {
             commits: &commits,
             head_checks: &red,
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Note { reason } => assert!(reason.contains("head check RED"), "reason: {reason}"),
@@ -969,6 +986,7 @@ mod tests {
             commits: &[(head.clone(), true)],
             head_checks: &checks,
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -1030,6 +1048,7 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[run(1, "ci", Some("success"))],
             leg_number: Some(1),
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("leg 1/1") && receipt.contains("BR#3516")),
@@ -1094,6 +1113,35 @@ mod tests {
             commits,
             head_checks,
             leg_number: Some(1),
+            train_owned_branch: true,
+        }
+    }
+
+    // ---- BR#4687 (L1.2): the provenance-gated behind pre-clear + the
+    // BR#3727 blocked rows, one row per gate input ----
+
+    #[cfg(test)]
+    fn gate_input_provenance<'a>(
+        head: &'a str,
+        meta: &'a Value,
+        status: Option<&'a str>,
+        state: Option<&str>,
+        checks: &'a [MainCheckRun],
+        commits: &'a [(String, bool)],
+        owned: bool,
+    ) -> TrainGateInput<'a> {
+        TrainGateInput {
+            pr_number: 7,
+            head_sha: head,
+            card_meta: meta,
+            card_status: status,
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: state.map(String::from),
+            commits,
+            head_checks: checks,
+            leg_number: Some(1),
+            train_owned_branch: owned,
         }
     }
 
@@ -1101,11 +1149,12 @@ mod tests {
     fn train_gate_behind_preclear_receipts_byte_identical() {
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
-        // BEHIND uppercase → normalized, pre-cleared, merge carries
+        // BEHIND uppercase → normalized, pre-cleared, merge carries (BR#4687:
+        // the receipt names the worker-authored branch provenance)
         let gate = decide_train_gate(gate_input(&meta, Some("BEHIND"), &[run(1, "ci", Some("success"))]));
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains(
-                "5c gate pass (mergeable, behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5), 1 verified commits)"
+                "5c gate pass (mergeable, behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687), 1 verified commits)"
             )),
             other => panic!("expected merge, got {other:?}"),
         }
@@ -1117,6 +1166,20 @@ mod tests {
                 assert!(!receipt.contains("behind pre-cleared"));
             }
             other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_behind_worker_authored_preclears_to_merge() {
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Merge { receipt } => {
+                assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}");
+                assert!(receipt.contains("BR#4687"), "receipt: {receipt}");
+            }
+            other => panic!("expected merge with pre-clear, got {other:?}"),
         }
     }
 
@@ -1184,5 +1247,62 @@ mod tests {
         assert_eq!(first_red_index(&[false, false]), None);
         assert_eq!(first_red_index(&[]), None);
         assert_eq!(first_red_index(&[true]), Some(0));
+    }
+
+    #[test]
+    fn train_gate_behind_human_branch_still_bounces() {
+        let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], false));
+        match gate {
+            MergeAction::Bounce { defect, bounce_kind } => {
+                assert!(defect.contains("behind"), "defect must name the state: {defect}");
+                assert_eq!(bounce_kind, BounceKind::Gate);
+            }
+            other => panic!("expected gate bounce for a human-owned behind branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_blocked_pending_checks_skip_a_tick() {
+        // BR#3727: blocked + re-running required checks is a clock, not a defect
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let checks = [run(1, "ci", Some("in_progress"))];
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("blocked"), &checks, &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Skip { reason } => assert!(reason.contains("pending, not a defect"), "reason: {reason}"),
+            other => panic!("expected skip-a-tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_blocked_red_checks_note_not_bounce() {
+        // blocked + RED on a QUEUED card: the linked session owns it — a Note,
+        // never a bounce cascade (core.ts verbatim parity)
+        let head = "dddddddddddddddddddddddddddddddddddddddd";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let checks = [run(1, "ci", Some("failure"))];
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("blocked"), Some("blocked"), &checks, &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Note { reason } => assert!(reason.contains("no bounce"), "reason: {reason}"),
+            other => panic!("expected note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_repeated_behind_on_carried_verdict_still_preclears() {
+        // stamp → carry → head: the leg's verdict covers the post-update head,
+        // so a SECOND behind machine-updates again instead of attempting a
+        // doomed merge (BR#3659's per-leg coverage + BR#4687's carry)
+        let stamp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let carry = serde_json::json!([{ "from_head": stamp, "to_head": head, "prior_verdict_id": null, "carried_ts": 0, "via": "update-branch" }]);
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": stamp, "carry": carry } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Merge { receipt } => assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}"),
+            other => panic!("expected carried verdict to pre-clear a second behind, got {other:?}"),
+        }
     }
 }

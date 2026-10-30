@@ -1058,13 +1058,77 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     }
     // UNKNOWN → null → skip this tick (never a bounce)
     expect(decideTrainGate(gh("UNKNOWN", "UNKNOWN")).kind).toBe("skip");
-    // uppercase behind PRE-CLEARS at the train gate (BR#3727 — the §5 carry
-    // is reachable; supersedes this block's original "BEHIND bounces naming
-    // behind" pin: the shared decideMergeAction still bounces behind, and
-    // the BR#3727 describe below pins that).
-    expect(decideTrainGate(gh("MERGEABLE", "BEHIND")).kind).toBe("merge");
+    // uppercase behind PRE-CLEARS at the train gate for a WORKER-AUTHORED
+    // branch (BR#3727 pre-clear, provenance-gated by BR#4687 L1.2 — the §5
+    // carry is reachable; supersedes this block's original "BEHIND bounces
+    // naming behind" pin: the shared decideMergeAction still bounces behind,
+    // and the BR#3727 describe below pins that).
+    expect(decideTrainGate({ ...gh("MERGEABLE", "BEHIND"), trainOwnedBranch: true }).kind).toBe("merge");
+    // BR#4687: the SAME behind state on a branch the train cannot prove is
+    // its own fleet's (a human's commits, or an unknown author) still
+    // bounces naming behind — the train never moves human branches.
+    const humanBehind = decideTrainGate(gh("MERGEABLE", "BEHIND"));
+    expect(humanBehind.kind).toBe("bounce");
+    if (humanBehind.kind === "bounce") {
+      expect(humanBehind.bounceKind).toBe("gate");
+      expect(humanBehind.defect).toContain("mergeStateStatus=behind");
+    }
     // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
     expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
+  });
+
+  // BR#4687 (L1.2): the tick AFTER a machine update-branch — strict branch
+  // protection re-runs the required checks on the new head, so mergeStateStatus
+  // reads blocked while the head checks are unsettled. That is a clock, not a
+  // defect: skip, and the carried verdict holds the queue slot silently.
+  it("blocked-with-pending-checks after a machine update waits (never bounces the carry) — BR#3727 executor parity", () => {
+    const HEAD = "c".repeat(40);
+    const green = [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }];
+    const pending = [{ id: 2, name: "Test", status: "in_progress", conclusion: null, html_url: "https://example/2" }];
+    const red = [{ id: 3, name: "Test", status: "completed", conclusion: "failure", html_url: "https://example/3" }];
+    const input = (checks: unknown, status: string): Parameters<typeof decideTrainGate>[0] => ({
+      prNumber: 320,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 320, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: normalizeGhMergeable("MERGEABLE"),
+      mergeStateStatus: normalizeGhMergeState(status),
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: checks as Parameters<typeof decideTrainGate>[0]["headChecks"],
+      trainOwnedBranch: true,
+    });
+    const mk = (checks: unknown, status: string) => decideTrainGate(input(checks, status));
+    // pending checks on blocked → wait this tick, NO bounce
+    const waiting = mk(pending, "BLOCKED");
+    expect(waiting.kind).toBe("skip");
+    if (waiting.kind === "skip") expect(waiting.reason).toContain("required checks re-running");
+    // red checks on blocked → note, never bounce — the linked session owns it
+    // (the shared law's own non-in_review row, taken early by the blocked arm)
+    expect(mk(red, "BLOCKED").kind).toBe("note");
+    // green checks + blocked → protection wants something checks can't give → bounce
+    expect(mk(green, "BLOCKED").kind).toBe("bounce");
+  });
+
+  // BR#4687 (L1.2): the merge receipt must name the provenance-qualified
+  // pre-clear, so the ledger and the verify round can tell a machine-updated
+  // worker branch from a plain clean merge.
+  it("behind pre-clear receipt names the worker-authored branch and the update-branch carry", () => {
+    const HEAD = "d".repeat(40);
+    const r = decideTrainGate({
+      prNumber: 311,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 311, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: normalizeGhMergeable("MERGEABLE"),
+      mergeStateStatus: normalizeGhMergeState("BEHIND"),
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }],
+      trainOwnedBranch: true,
+    });
+    expect(r.kind).toBe("merge");
+    if (r.kind === "merge") expect(r.receipt).toContain("behind pre-cleared");
   });
 });
 

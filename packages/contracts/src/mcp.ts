@@ -171,10 +171,11 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   train_event: z.looseObject({
     repo: z.string(),
-    kind: z.enum(["merged", "bounced", "stopped", "landed"]),
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "updated"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
+    from_head: z.string().optional(),
     merge_sha: z.string().optional(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
