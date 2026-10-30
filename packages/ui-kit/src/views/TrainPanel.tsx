@@ -53,18 +53,17 @@ function lockDot(l: KbTrainLane, now: number): { sd: "live" | "lapse" | "dead" |
   return { sd: "free", title: "no machine on this lane — no merge-capable gateway has ticked inside the 15-minute window; merges wait until one runs (start a gateway / bridge train)" };
 }
 
-/** The status column: what the lane is doing right now, one pill.
- *  BR#4981: the honest activity vocabulary — retired / bypass wait /
- *  attempting (gate in progress on the queue head) join stop-the-line /
- *  in-flight phase / lock held / ready / no gateway; the full lane reason
- *  always rides the tooltip. */
+/** The status column: what the lane is doing right now, one pill — in plain
+ *  words (BR#5114 round 2, Ray: "remove jargon — make it clear"). The full
+ *  sentence always rides the NOW column beneath the pill; tooltips carry
+ *  the machine detail for those who want it. */
 function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string } {
   const reason = l.reason ?? "";
   if (l.stop)
     return {
       tone: "err",
-      label: "⛔ stop-the-line",
-      title: `stop-the-line: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`,
+      label: "⛔ line stopped",
+      title: `stopped: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""} (sha ${String(l.stop.sha ?? "").slice(0, 9)}, since ${age(l.stop.at, now)} ago)`,
     };
   if (reason.startsWith("merge-train: retired"))
     return { tone: "muted", label: "retired", title: "lane card done/superseded — the train no longer ticks this lane (BR#4977)" };
@@ -72,45 +71,46 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
     const bpm = reason.match(/PR #(\d+)/);
     return {
       tone: "warn",
-      label: `⏸ bypass wait${bpm ? ` · #${bpm[1]}` : ""}`,
-      title: reason || "a queue head is blocked on branch protection (review/required checks) — a human merge is the unblock; self-clears when it lands (BR#4981)",
+      label: `⏸ needs a human merge${bpm ? ` · #${bpm[1]}` : ""}`,
+      title: reason || "this PR is blocked by branch protection (required review/checks a machine cannot satisfy) — a human merge is the unblock; it clears itself when the PR lands",
     };
   }
-  if (l.currently)
+  if (l.currently) {
+    // the in-flight phase, in words — never a raw enum like "awaiting-ci"
+    const phaseWord: Record<string, string> = {
+      "awaiting-ci": "merged — waiting on CI",
+      bursting: "merging several in a row",
+      stopped: "stopped",
+    };
     return {
       tone: l.currently.phase === "stopped" ? "err" : "live",
-      label: l.currently.phase ?? "merging",
-      title: `in-flight: ${JSON.stringify(l.currently)}`,
+      label: phaseWord[l.currently.phase ?? ""] ?? l.currently.phase ?? "merging",
+      title: `in flight: PR #${l.currently.pr ?? "?"} merged as ${String(l.currently.merge_sha ?? "").slice(0, 9)} — the train waits for main's build/deploy to finish green before taking the next card`,
     };
-  if (reason.includes("attempting ")) {
-    // The subject rides the LABEL, not just the tooltip (Ray, 2026-10-30:
-    // "it says attempting but I can't see what") — reason reads
-    // "…attempting BR#4678 (gate), last ticked …" → "▶ BR#4678 · gate".
-    const am = reason.match(/attempting (BR#\d+)(?: \(([^)]+)\))?/);
-    return {
-      tone: "live",
-      label: am ? `▶ ${am[1]}${am[2] ? ` · ${am[2]}` : ""}` : "attempting",
-      title: reason,
-    };
+  }
+  if (l.attempt) {
+    return l.attempt.hold === "awaiting-review"
+      ? { tone: "warn", label: `⏸ ${l.attempt.card} · needs review`, title: l.attempt.note }
+      : { tone: "live", label: `▶ ${l.attempt.card} · checking`, title: l.attempt.note };
   }
   if (l.lease?.holder) {
     const t = lockTone(l, now);
     return {
       tone: t === "ok" ? "scope" : t === "warn" || t === "err" ? "warn" : "muted",
-      label: "lock held · idle",
-      title: `CAS lane lease held by ${l.lease.holder} — heartbeat ${age(l.lease.heartbeat_ts, now)} ago, expires in ${age(l.lease.expires_ts, now)}; between merge phases`,
+      label: "machine on it · idle",
+      title: `a machine (${l.lease.holder}) holds this lane — heartbeat ${age(l.lease.heartbeat_ts, now)} ago; between merges`,
     };
   }
   if (l.capable?.ready)
     return {
       tone: "ok",
-      label: "train ready",
-      title: `train ready — merge-capable gateway ${l.capable.holder} ticked this lane ${age(l.capable.at, now)} ago; it acquires the lock on its next tick (every ~45s) once work is queued`,
+      label: "ready",
+      title: `a merge machine (${l.capable.holder}) checked this lane ${age(l.capable.at, now)} ago — it takes the next card the moment one is queued`,
     };
   return {
     tone: "muted",
-    label: "no gateway",
-    title: "no merge-capable gateway has ticked this lane inside the 15-minute window — merges wait until one runs (start a gateway / bridge train)",
+    label: "no machine",
+    title: "no merge-capable machine has checked this lane inside the 15-minute window — merges wait until one runs (start a gateway / bridge train)",
   };
 }
 
@@ -218,14 +218,20 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   </span>
                 ) : null}
               </span>
+              {l.attempt ? <span className="train-now-note" title={l.attempt.note}>{l.attempt.note}</span> : null}
               {na ? <span className="train-now-note" title={na.title}>{na.text}</span> : null}
               {l.activity ? (
-                <span className="train-tp top-num" title={`merge throughput over trailing windows (train_events ledger) — last event: what the executor did most recently, and from which machine${l.activity.last_event ? `\nlast: ${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} · ${l.activity.last_event.gateway ?? "?"} · ${age(l.activity.last_event.ts, now)} ago` : ""}`}>
-                  <span className="train-tp-rate">▸ {l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
+                <span className="train-tp top-num" title={`merges over the last hour / 24 hours${l.activity.last_event ? ` — most recent completed action: ${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} by ${l.activity.last_event.gateway ?? "?"}, ${age(l.activity.last_event.ts, now)} ago` : ""}`}>
+                  <span className="train-tp-rate">{l.activity.merged_1h}/h · {l.activity.merged_24h}/24h</span>
                   {l.activity.last_event && (
-                    <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · task ${l.activity.last_event.task_id ?? "—"}`}>
+                    <span className="train-last-event" title={`${l.activity.last_event.kind} · ${l.activity.last_event.gateway ?? "?"} · ${age(l.activity.last_event.ts, now)} ago (history — not the current activity)`}>
                       last: {l.activity.last_event.kind}
                       {l.activity.last_event.pr ? ` #${l.activity.last_event.pr}` : ""} {age(l.activity.last_event.ts, now)} ago
+                    </span>
+                  )}
+                  {l.queue.length > 0 && l.activity.merged_24h === 0 && (
+                    <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait — ${l.queue_awaiting_review ? `${l.queue_awaiting_review} of them are waiting on a fresh review (their PR branches changed after their last review)` : "see the NOW line for what holds the first card"}`}>
+                      ⚠ nothing merged in 24h · {l.queue.length} waiting{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
                     </span>
                   )}
                 </span>
@@ -253,8 +259,8 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             <span className="trainc-queue">
               {rest.length > 0 ? (
                 <>
-                  <span className="train-queue-label top-num" title="the derived queue AFTER the next head — oldest first, click a card to open it">
-                    +{rest.length} waiting
+                  <span className="train-queue-label top-num" title="the cards after the next one — click to open">
+                    +{rest.length} waiting{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
                   </span>
                   {rest.map((q) => (
                     <Chip
@@ -269,7 +275,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   ))}
                 </>
               ) : (
-                <span className="muted-note">{next ? "queue empty after next" : "queue empty"}</span>
+                <span className="muted-note">{next ? "nothing after the next card" : "queue empty"}</span>
               )}
             </span>
           </div>

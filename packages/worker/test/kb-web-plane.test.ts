@@ -219,9 +219,11 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // per the status-pill redesign: labels "train ready" / "no gateway" (the
     // machine + tick age live in the pill's tooltip).
     expect(trainPanelSrc).not.toContain("lock free");
-    expect(trainPanelSrc).toContain('"train ready"');
+    // BR#5114 round 2: the pills speak human — "ready" / "no machine" —
+    // and the machine detail lives in the tooltip
+    expect(trainPanelSrc).toMatch(/label: "ready"/);
     expect(trainPanelSrc).toMatch(/l\.capable\?\.ready/);
-    expect(trainPanelSrc).toContain('"no gateway"');
+    expect(trainPanelSrc).toMatch(/label: "no machine"/);
   });
 
   it("renders the derived queue as clickable card chips with the lane's stop-the-line flag", () => {
@@ -233,7 +235,7 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/rest\.map/);
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
     expect(trainPanelSrc).toMatch(/openTask\?\.\(next\.id\)/);
-    expect(trainPanelSrc).toContain("stop-the-line");
+    expect(trainPanelSrc).toContain("line stopped");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });

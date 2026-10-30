@@ -183,6 +183,15 @@ export interface KbTrainLane {
    *  WHAT is being done right now and why a held head is held. Ages out at
    *  the 5-min lease TTL; null when no holder has reported. */
   now_action?: { note: string; holder: string; at: number } | null;
+  /** BR#5114 round 2 (Ray: "remove jargon — make it clear"): the current
+   *  attempt in plain words — which card the train is on and WHY it is or
+   *  isn't moving. hold: "awaiting-review" = the PR branch changed after
+   *  its last review (a fresh review unblocks it); "merge-checks" = review,
+   *  signatures and CI being checked before the merge. */
+  attempt?: { card: string; hold: "awaiting-review" | "merge-checks"; note: string } | null;
+  /** how many queued cards are waiting on a fresh review (the honest
+   *  explanation behind a "0/h" rate with a full queue). */
+  queue_awaiting_review?: number;
   queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {

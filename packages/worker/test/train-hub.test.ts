@@ -820,10 +820,13 @@ describe("merge train DO drill (real bundled worker)", () => {
     const card2 = await queueViaAccept({ repo, pr: 3402, head: H2, title: "IMPL: vocab drill leg 2" });
     await acquire(repo, "gw-vocab", { required_workflows: ["Test"] });
 
-    // attempting: a queue head is in the gate — the reason names it (Ray: the
-    // panel must show the train TRYING, never a bare `ready` over a queue)
+    // the head is being worked — the reason says it in plain words (Ray
+    // 2026-10-30: "'gate' is meaningless — remove jargon"), and the
+    // structured attempt field carries the same sentence for the panel
     const snap1 = await laneSnap(repo);
-    expect(String(snap1.reason)).toContain(`attempting ${card1} (gate)`);
+    expect(String(snap1.reason)).toContain(`working on ${card1} — checking review, signatures and CI before merging`);
+    expect(snap1.attempt).toMatchObject({ card: card1, hold: "merge-checks" });
+    expect(String(snap1.attempt.note)).toContain("checking review, signatures and CI");
 
     // gate bounce blocked on protection ⇒ the honest bypass-wait state
     expect((await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-vocab", pr: 3401, task_id: card1, head_sha: H1, bounce_kind: "gate", merge_state_status: "blocked", reason: "review required by branch protection" })).body.error ?? "").toBe("");
@@ -1157,7 +1160,7 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
     // the merged card itself is the queue head (awaiting-ci cards are blocked
     // with a merge-train reason) → BR#4981's nextNote rides the settle string
-    expect(merged.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M.slice(0, 9)} (PR #5001): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect(merged.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M.slice(0, 9)} (PR #5001): build/deploy in flight, then ${card}, heads held until main settles`);
     expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
 
     // a burst merged event (mid-drain) flips the phase string to the drain view
@@ -1172,7 +1175,7 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-bcfg", sha: M2, checks: [check(61, "Test", null)] });
     expect(ci.body.decided).toBe("pending");
     // queue head = the older parked card (the legacy-merged card 5001) — nextNote names it (BR#4981)
-    expect(ci.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M2.slice(0, 9)} after 1 merges (PR #5002): build/deploy in flight, attempting ${card} next, heads held until main settles`);
+    expect(ci.body.reason).toBe(`merge-train: leased by gw-bcfg — settling on ${M2.slice(0, 9)} after 1 merges (PR #5002): build/deploy in flight, then ${card}, heads held until main settles`);
     expect((await laneSnap(repo)).currently.phase).toBe("awaiting-ci");
 
     // cap 0 renders "unlimited" in the drain string
@@ -1646,6 +1649,37 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane2.now_action?.note).toContain("CI poll on ccccccccc");
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-now" });
+  });
+
+  it("a bounced head reads as awaiting-review in plain words, and the queue counts how many wait on reviews (the 0/h story)", async () => {
+    const repo = "state-vector/lane-plain";
+    await acquire(repo, "gw-plain", { merge_capable: true, required_workflows: ["Test"] });
+    const H1 = "c".repeat(40), H2 = "d".repeat(40);
+    const card1 = await queueViaAccept({ repo, pr: 51143, head: H1, title: "IMPL: plain drill 1" });
+    const card2 = await queueViaAccept({ repo, pr: 51144, head: H2, title: "IMPL: plain drill 2" });
+
+    // queued fresh: the head reads merge-checks, nothing awaits review
+    let lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.attempt).toMatchObject({ card: card1, hold: "merge-checks" });
+    expect(lane.queue_awaiting_review).toBe(0);
+
+    // the head bounces (coverage) — its hold flips to awaiting-review and
+    // the reason speaks human: no "gate", no "attempting", no jargon
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-plain", pr: 51143, task_id: card1,
+      head_sha: H1, bounce_kind: "coverage",
+      reason: "PR #51143 live head is not covered by the accepted verdict — re-verify at the new head",
+    });
+    // the bounced card LEAVES the queue for its review (in_progress) — the
+    // next card becomes the head, and the bounced one counts as awaiting a
+    // review OUTSIDE the queue: the "0/h with a full queue" story
+    lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.attempt.card).toBe(card2);
+    expect(lane.attempt.hold).toBe("merge-checks");
+    expect(String(lane.reason)).not.toContain("(gate)");
+    expect(lane.queue.length).toBe(1);
+    expect(lane.queue_awaiting_review).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-plain" });
   });
 
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {

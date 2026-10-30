@@ -7408,6 +7408,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ? `; last: ${lastAct.kind}${lastAct.pr ? ` PR #${lastAct.pr}` : ""}${lastAct.task_id ? ` (${lastAct.task_id})` : ""}`
       : "";
     const bw = meta.bypass_wait ?? null;
+    // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
+    // the lane's activity line speaks human. The hub knows the head card's
+    // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
+    // PR branch changed after the last review, so that review no longer
+    // covers it); anything else is the pre-merge check running. No "gate",
+    // no "verdict", no "attempting" — plain sentences.
+    const headHold = head
+      ? (() => {
+          const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
+          const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
+          return st === "bounced"
+            ? { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` }
+            : { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
+        })()
+      : null;
     let reason: string;
     if (retired) reason = `merge-train: retired — the lane card is done/superseded (BR#4977); the train no longer ticks it`;
     else if (stop) {
@@ -7416,7 +7431,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     else if (currently) {
       const who = lease ? ` by ${lease.holder}` : "";
-      const nextNote = head ? `, attempting ${head} next` : "";
+      const nextNote = head ? `, then ${head}` : "";
       const bwNote = meta.bypass_wait ? ` — bypass wait: PR #${meta.bypass_wait.pr}${meta.bypass_wait.task_id ? ` (${meta.bypass_wait.task_id})` : ""}` : "";
       // BR#4804 back-pressure: the settling phase is the queue's pressure
       // valve — the reason names what main is doing and that heads are held
@@ -7445,8 +7460,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const queued = Number(z.queue_len ?? 0);
       reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
     } else if (lease && lease.expires_ts > now) {
-      reason = head
-        ? `merge-train: leased by ${lease.holder} — attempting ${head} (gate)${actSuffix}`
+      reason = head && headHold
+        ? `merge-train: leased by ${lease.holder} — ${headHold.note}${actSuffix}`
         : `merge-train: leased by ${lease.holder} — idle`;
     } else {
       // Ray 2026-10-29: idle no longer reads as a gateway shortage — a recent
@@ -7456,8 +7471,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const capHolder = String(meta.lane?.last_capable_holder ?? "");
       const mins = Math.max(0, Math.round((now - capAt) / 60_000));
       reason = capAt && capHolder && now - capAt < TRAIN_READY_MS
-        ? (head
-          ? `merge-train: ready — attempting ${head} (gate), last ticked by ${capHolder} ${mins}m ago${actSuffix}`
+        ? (head && headHold
+          ? `merge-train: ready — ${headHold.note}, last ticked by ${capHolder} ${mins}m ago${actSuffix}`
           : `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`)
         : "merge-train: awaiting an available gateway";
     }
@@ -9003,6 +9018,31 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const capable = capableAt
         ? { holder: String(meta.lane?.last_capable_holder ?? ""), at: capableAt, age_ms: now0 - capableAt, ready: now0 - capableAt < TRAIN_READY_MS }
         : null;
+      // BR#5114 round 2: plain-language facts for the panel — the current
+      // attempt (card + hold class + a human sentence) and how much of the
+      // queue is waiting on a fresh review (the whole-queue-stalled story
+      // the raw "0/h" rate never told).
+      const head = queue[0]?.id ? String(queue[0].id) : null;
+      const headHold = head
+        ? (() => {
+            const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
+            const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
+            return st === "bounced"
+              ? { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` }
+              : { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
+          })()
+        : null;
+      // cards bounced off this lane and not yet re-accepted — they sit
+      // OUTSIDE the derived queue (in_progress, awaiting a fresh review),
+      // which is exactly why a stalled lane reads "0/h" with a full queue:
+      // the train bounces each head, the head leaves for a review, the next
+      // head bounces… count them so the panel can tell that story.
+      const awaitingReview = (this.state.storage.sql.exec(
+        `SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.merge_train.state') = 'bounced'`,
+      ).toArray() as any[]).filter((c) => {
+        const m = JSON.parse(c.meta ?? "{}");
+        return trainCardMatchesLane(m, lane.repo, lane.base);
+      }).length;
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9017,6 +9057,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // executor is doing right now, verbatim from its own tick log; the
         // panel renders it as the NOW line and ages it out at the lease TTL
         now_action: meta.lane?.now_action ?? null,
+        attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,
+        queue_awaiting_review: awaitingReview,
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,
         starved,

@@ -510,6 +510,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-now-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .train-now-note { font-size: 11px; color: var(--text-dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
 .train-now-note::before { content: "▸ "; color: var(--accent); }
+.train-stall { color: var(--amber, #d29a4b); font-weight: 600; white-space: nowrap; cursor: help; }
 .trainc-next { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .trainc-queue { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; flex-wrap: wrap; }
 
