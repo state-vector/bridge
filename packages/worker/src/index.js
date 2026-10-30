@@ -266,6 +266,21 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
+      if (sub === "force_review" && request.method === "POST") {
+        // BR#4962 (per accepted BR#4960): one-click human force-review on an
+        // Awaiting park — approve re-anchors the accepted verdict at the
+        // parked head (carry legs via "force-review") and re-queues the
+        // train's own flow; request_changes bounces impl. Web/human-only —
+        // the pull model has NO agent ask for the human leg to answer; the
+        // session cookie is the human. ZERO ask artefacts on either path
+        // (BR#4960): the parked card in the backlog IS the human leg.
+        if (auth.bearer) return kbCors(json({ error: "force_review is web/human-only (BR#4960) — agents cannot force-review; the card stays parked Awaiting until a human acts in the backlog" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(env.KB.get(kbId).fetch("https://kb/card.force_review", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        }));
+      }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
