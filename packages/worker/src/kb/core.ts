@@ -1611,19 +1611,112 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
 export const MERGE_TRAIN_REASON_PREFIX = "merge-train:";
 export const MERGE_TRAIN_QUEUED_REASON = "merge-train: queued";
 
-export type TrainCandidate = { id: string; status_ts: number; meta: any };
+export type TrainCandidate = { id: string; status_ts: number; meta: any; tags?: string[] };
 
-/** Queue order: CRITICAL class first, FIFO within class. The board's existing
- *  boost stamp (meta.boosted) is the CRITICAL class; everything else orders by
- *  blocked-since (status_ts ascending). */
-export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "critical" | "normal" }[] {
+// ---- BR#5190 root-fix fast lane: the board half of the main-breakage law ----
+
+/** The root-fix tags — a card is THE main-breakage fix iff it carries both
+ *  AND is bound to a failing main-HEAD run (meta.root_fix, BR#5189 §1). */
+export const ROOT_FIX_TAG = "root_blocker";
+export const MAIN_RED_TAG = "main-red";
+
+/** The deploy-health gate check — matched as a lowercase substring against
+ *  the check NAME ("Deploy health (merge gate)" matches). A head red of this
+ *  class is exactly main's own deploy red: the circular class no machine leg
+ *  can pass — the one-click human merge ask is the fast lane (BR#5189 §5,
+ *  SP #2617 precedent). MUST stay byte-identical to train_gate.rs. */
+export const DEPLOY_HEALTH_PATTERN = "deploy health";
+
+/** The failing-main binding a root-fix card must carry: the repo + the exact
+ *  failing main-HEAD run sha it cures. */
+export type RootFixBinding = { repo: string; head_sha: string };
+
+/** meta.root_fix read off a card — null unless it names repo + head_sha. */
+export function mainRedBinding(meta: any): RootFixBinding | null {
+  const b = meta?.root_fix;
+  if (!b || typeof b !== "object") return null;
+  const repo = typeof b.repo === "string" ? b.repo : "";
+  const sha = typeof b.head_sha === "string" ? b.head_sha : "";
+  return repo && sha ? { repo, head_sha: sha } : null;
+}
+
+/** The qualification (Rust is_root_fix_card mirror): tags root_blocker +
+ *  main-red AND a bound failing main-HEAD run. Tags alone never qualify —
+ *  the binding does. */
+export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
+  const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
+  if (!tags.includes(ROOT_FIX_TAG) || !tags.includes(MAIN_RED_TAG)) return false;
+  return mainRedBinding(card?.meta) !== null;
+}
+
+/** The deterministic one-click human merge ask title for the circular
+ *  deploy-health class. BYTE-IDENTICAL to root_fix_fast_lane_title in
+ *  train_gate.rs (ask-dedupe keys on exact wording; hub + executor must
+ *  produce the same string). ≤240 chars, ends "?" per the ask contract. */
+export function rootFixFastLaneTitle(repo: string, pr: number | string): string {
+  return `Root-fix fast lane (BR#5189): merge ${repo} PR #${pr} now? Main is red on the exact red this PR cures — the train cannot merge it while the line it fixes is stopped; one click merges the cure?`;
+}
+
+/** The auto-spawned root-fix card title (BR#5189 §3): deterministic per red
+ *  episode — the failing checks name the red, the sha pins the run. ≤240
+ *  chars so ask/title guards never trip on it. */
+export function rootFixCardTitle(repo: string, sha: string, failing: string[]): string {
+  const prefix = `ROOT-FIX (BR#5189 p0): fix main — ${repo} red at ${sha.slice(0, 9)} (`;
+  const suffix = `)`;
+  let text = failing.join(", ");
+  if (prefix.length + text.length + suffix.length > 240) text = text.slice(0, Math.max(0, 240 - prefix.length - suffix.length - 1)).trimEnd() + "…";
+  return prefix + text + suffix;
+}
+
+/** The auto-spawned root-fix card body: what is red, the exact failing
+ *  main-HEAD checks, and the fast-lane law the card rides (BR#5189). */
+export function rootFixCardBody(repo: string, sha: string, failing: { name: string; conclusion?: string | null; url?: string | null }[]): string {
+  const lines = [
+    `Main is RED — stop-the-line (BR#5189). This card is THE main-breakage fix.`,
+    ``,
+    `Failing main-HEAD checks at \`${sha.slice(0, 9)}\`:`,
+    ...failing.map((f) => `- ${f.name}${f.conclusion ? ` (${f.conclusion})` : ""}${f.url ? ` — ${f.url}` : ""}`),
+    ``,
+    `Bound to the failing main-HEAD run (meta.root_fix: repo ${repo}, head_sha ${sha.slice(0, 9)}), tags \`root_blocker\` + \`main-red\`.`,
+    ``,
+    `While the line is stopped, the merge train parks every other head for ${repo} — this card gets the first gate slot and its PR fast-tracks: base red + head green merges onto the red base (receipt stamps \`root_fix_fast_tracked\`); if the base red is the circular deploy-health class (the gate red because main itself is red), the one-click human merge ask is the fast lane.`,
+    ``,
+    `Deliver the fix PR through the normal train (verify → queue). Tags and the binding ride the card — they are the qualification, don't strip them.`,
+  ];
+  return lines.join("\n");
+}
+
+/** Queue order: a FOUR-tier priority ladder (BR#5189 §2):
+ *  tier 0 "root_fix" — THE bound main-breakage fix (isRootFixCard), above
+ *      every other card including boosts;
+ *  tier 1 "boosted" — the human/starvation boost stamp (meta.boosted), the
+ *      old CRITICAL class under its own honest label;
+ *  tier 2 "critical" — cards explicitly marked critical (meta.priority ===
+ *      "critical"), the manual rung;
+ *  tier 3 "normal" — everything else.
+ *  FIFO within tier by blocked-since (status_ts ascending). opts.baseRed
+ *  (a STOPPED lane — the lane card's stop facts are the hub-visible proxy
+ *  for base red) offers ONLY tier 0: every other head stays parked on the
+ *  base-red law (BR#4365 precedent) until the fix merges or the line goes
+ *  green. */
+export function mergeTrainQueue(cards: TrainCandidate[], opts?: { baseRed?: boolean }): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
   const queued = cards.filter((c) =>
     [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX)),
   );
-  const rank = (c: TrainCandidate) => (c.meta?.boosted ? 0 : 1);
+  const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
+  const baseRed = opts?.baseRed === true;
   return [...queued]
+    .filter((c) => !baseRed || rank(c) === 0)
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
-    .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
+    .map((c) => {
+      const r = rank(c);
+      const e: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true } = {
+        id: c.id,
+        priority: r === 0 ? "root_fix" : r === 1 ? "boosted" : r === 2 ? "critical" : "normal",
+      };
+      if (r === 0) e.root_fix = true;
+      return e;
+    });
 }
 
 // ---- typed-proxy preservation (BR#4067) ----

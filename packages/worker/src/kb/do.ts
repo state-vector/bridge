@@ -81,6 +81,12 @@ import {
   type LaneSpec,
   leaseDecide,
   mergeTrainQueue,
+  // BR#5190 root-fix fast lane: the board half of the main-breakage law
+  ROOT_FIX_TAG,
+  MAIN_RED_TAG,
+  isRootFixCard,
+  rootFixCardTitle,
+  rootFixCardBody,
   renewProgressDecide,
   trainLegs,
   trainLegLanded,
@@ -235,8 +241,15 @@ export function headMatches(observed: string, expected: string): boolean {
  *  imitated the prose, the text parsed to 2 atoms, the multi-atom gate
  *  refused, and (pre-#288) the refusal rode as a retryable 503 — three
  *  blind retries, three transition_rejected events, a breach card. */
-export function verifyDutyBody(parentId: string, rootTitle: string, prLink: string, leg?: { repo: string; n: number }): string {
-  return `Verification duty for ${parentId} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${parentId} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${parentId} to blocked with note \`merge-train: queued\` AND the ONE typed machine leg on the same call — pass await_event ${leg ? `{event:"pr_merged", repo:"${leg.repo}", n:${leg.n}}` : `{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}`}. One typed leg per park (BR#3986): conjunction prose ("…merges (mergeCommit non-null) AND main CI green after") parses to 2 machine atoms and is refused loud at the door (breach class gate:multi-atom-condition — specimens BR#4425, BR#4303); carry the conjunction as plain prose in unblock_condition — the typed leg is the gate the train flips. The train gates it, merges it, waits out main CI, and closes it citing the mergeCommit.\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`;
+export function verifyDutyBody(parentId: string, rootTitle: string, prLink: string, leg?: { repo: string; n: number }, rootFix?: { repo: string; pr: number }): string {
+  // BR#5190: the fast-lane note rides ONLY for a QUALIFIED root-fix parent
+  // (the caller derives it from isRootFixCard + a live PR stamp — no stamp,
+  // no fast lane to name). The verifier's duty is unchanged; the note exists
+  // so the fresh session knows why this parent will jump every queue tier.
+  const fastLane = rootFix
+    ? `\n\nROOT-FIX FAST LANE (BR#5189): this parent is THE bound main-breakage fix (${rootFix.repo}#${rootFix.pr} — tags root_blocker + main-red, meta.root_fix binding to the failing main-HEAD run). Verify as usual; on accept it queues tier 0 — a stopped lane offers NOTHING else until it merges. If the base red is the circular deploy-health class (the gate red because main itself is red), the train's deterministic one-click human merge ask is the fast lane — you neither merge nor file it; the train owns both.`
+    : "";
+  return `Verification duty for ${parentId} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${parentId} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.${fastLane}\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${parentId} to blocked with note \`merge-train: queued\` AND the ONE typed machine leg on the same call — pass await_event ${leg ? `{event:"pr_merged", repo:"${leg.repo}", n:${leg.n}}` : `{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}`}. One typed leg per park (BR#3986): conjunction prose ("…merges (mergeCommit non-null) AND main CI green after") parses to 2 machine atoms and is refused loud at the door (breach class gate:multi-atom-condition — specimens BR#4425, BR#4303); carry the conjunction as plain prose in unblock_condition — the typed leg is the gate the train flips. The train gates it, merges it, waits out main CI, and closes it citing the mergeCommit.\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`;
 }
 
 /** Body for a reconcile-spawned binding card (BR#4170): the card's whole job
@@ -4526,6 +4539,12 @@ export class KnowledgeHub {
               : fx.pr && isClonableRepoRef(fx.pr)
                 ? fx.pr
                 : "see note";
+          // BR#5190: the fast-lane note rides the duty only for a QUALIFIED
+          // root-fix parent (tags + binding) with a PR stamp — no stamp, no
+          // fast lane to name.
+          const parentIsRootFix =
+            isRootFixCard({ tags: parseTags(row.tags), meta }) &&
+            typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
           const created = await this.create(
             {
               type: "task",
@@ -4537,6 +4556,7 @@ export class KnowledgeHub {
                 typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
                   ? { repo: stamp.repo, n: Number(stamp.number) }
                   : undefined,
+                parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
               ),
               roles: ["review"],
             },
@@ -7795,6 +7815,82 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     );
   }
 
+  private async ensureRootFixCard(a: {
+    repo: string;
+    base: string;
+    sha: string;
+    failing: { name: string; conclusion?: string | null; url?: string | null }[];
+    why: string;
+    actor: string;
+    now: number;
+    laneId: string;
+    culpritId: string | null;
+    pr: number | null;
+  }): Promise<string | null> {
+    const bind = (m: any) => {
+      m.root_fix = {
+        repo: a.repo,
+        head_sha: a.sha,
+        base: a.base,
+        why: a.why,
+        failing: a.failing.map((f) => f.name),
+        bound_at: a.now,
+        lane: laneKey(a.repo, a.base),
+        ...(a.pr ? { pr: a.pr } : {}),
+      };
+      return m;
+    };
+    // (1) culprit-qualified-in-place
+    if (a.culpritId) {
+      const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
+      if (c && c.status !== "done" && c.status !== "superseded") {
+        const cm = JSON.parse(c.meta ?? "{}");
+        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm })) {
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
+          this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
+          return c.id;
+        }
+      }
+    }
+    // (2) re-bind an open root-fix card for this repo
+    const open = this.state.storage.sql.exec(
+      `SELECT id, meta, tags FROM artefacts
+       WHERE type = 'task' AND status NOT IN ('done', 'superseded')
+       AND json_extract(meta, '$.root_fix.repo') = ?
+       ORDER BY created_ts DESC LIMIT 1`,
+      a.repo,
+    ).toArray() as any[];
+    if (open.length) {
+      const o = open[0];
+      const om = JSON.parse(o.meta ?? "{}");
+      if (isRootFixCard({ tags: parseTags(o.tags), meta: om })) {
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(om)), o.id);
+        this.version(o.id, a.actor, "update", `root-fix card rebound to the live failing run ${a.sha.slice(0, 9)} (stop-the-line, BR#5190)`, {});
+        return o.id;
+      }
+    }
+    // (3) spawn fresh — absolute p0
+    const created = await this.create(
+      {
+        type: "task",
+        title: rootFixCardTitle(a.repo, a.sha, a.failing.map((f) => f.name)),
+        body_md: rootFixCardBody(a.repo, a.sha, a.failing),
+        tags: [ROOT_FIX_TAG, MAIN_RED_TAG, "p0"],
+        roles: ["impl"],
+        session: "", // machine spawn: a FRESH session must own the fix (separation of duties)
+        meta: bind({ child_of_lane: a.laneId }),
+      },
+      a.actor,
+    );
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+      created.id, a.laneId, a.now,
+    );
+    this.audit(a.actor, "root_fix_spawned", created.id, { lane: laneKey(a.repo, a.base), sha: a.sha.slice(0, 9), failing: a.failing.map((f) => f.name), culprit: a.culpritId, pr: a.pr });
+    this.version(created.id, a.actor, "create", `root-fix card auto-spawned at absolute p0 — main is red, the train parks every other head until this merges (BR#5190)`, {});
+    return created.id;
+  }
+
   /** train.event — kind merged | bounced | stopped | landed. The acting
    *  gateway (actor) must hold the lease; every event is audited with the
    *  gateway for attribution and written to the train_events ledger. */
@@ -8148,6 +8244,27 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       } catch (e) {
         // an identical ask is already open for this episode — that IS one per class
         this.audit(actor, "train:stopped", lane.id, { ask_deduped: String((e as Error).message ?? e).slice(0, 160) });
+      }
+      // BR#5190: auto-spawn (or re-bind) THE root-fix card at absolute p0 —
+      // it jumps every queue tier, and the stopped executor's walk fast-tracks
+      // its PR (or opens the human fast-lane ask for the circular
+      // deploy-health class). Best-effort: a spawn failure must never eat the
+      // stop event itself — the ledger entry below still fires.
+      try {
+        await this.ensureRootFixCard({
+          repo,
+          base,
+          sha,
+          failing,
+          why,
+          actor,
+          now,
+          laneId: lane.id,
+          culpritId: culprit,
+          pr,
+        });
+      } catch (e) {
+        this.audit(actor, "root_fix_spawn_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
       ev({ reason: why, failing, culprit }, culprit);
       this.version(lane.id, actor, `train:${kind}`, `line stopped — ${why}`, { stop: meta.stop, reason });
@@ -8938,11 +9055,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  base's queue on the same repo. */
   private laneQueue(repo: string, base: string) {
     const cards = this.state.storage.sql.exec(
-      `SELECT id, status_ts, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+      `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
+    // BR#5190: a STOPPED lane offers ONLY tier 0 — the lane card's stop facts
+    // are the hub-visible proxy for base red (the hub holds no VCS
+    // credentials), and every other head stays parked on the base-red law
+    // (BR#4365 precedent) until the bound fix merges or the line goes green.
+    const laneRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneKey(repo, base)) as any;
+    const baseRed = !!JSON.parse(String(laneRow?.meta ?? "{}") || "{}")?.stop?.sha;
     return mergeTrainQueue(
-      cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}") })),
+      cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}"), tags: parseTags(c.tags) })),
+      { baseRed },
     ).filter((c) => {
       const cm = cards.find((x) => x.id === c.id);
       // a card rides exactly the lanes that own one of its UNLANDED legs
@@ -9363,11 +9487,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       `INSERT INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, 'verify', '', NULL, ?)`,
       repo, pr, now,
     );
-    const parent = this.one(`SELECT id, title, meta FROM artefacts WHERE id = ?`, parentId) as any;
+    const parent = this.one(`SELECT id, title, meta, tags FROM artefacts WHERE id = ?`, parentId) as any;
     if (!parent) return null;
     const pm = JSON.parse(parent.meta ?? "{}");
     const rootTitle = String(parent.title ?? `PR #${pr}`).replace(/^(?:Verify:\s*)+/, "");
     const stamp = (pm.pr ?? {}) as { repo?: unknown; number?: unknown };
+    // BR#5190: the fast-lane note rides only for a QUALIFIED root-fix parent
+    // (tags + binding) with a PR stamp — no stamp, no fast lane to name.
+    const parentIsRootFix =
+      isRootFixCard({ tags: parseTags(parent.tags), meta: pm }) &&
+      typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
     const prLink: string =
       typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
         ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
@@ -9377,7 +9506,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         type: "task",
         title: `Verify: ${rootTitle.slice(0, 200)}`,
         session: "", // machine spawn: a FRESH session must verify (separation of duties)
-        body_md: verifyDutyBody(parentId, rootTitle, prLink, { repo, n: pr }),
+        body_md: verifyDutyBody(parentId, rootTitle, prLink, { repo, n: pr }, parentIsRootFix ? { repo, pr } : undefined),
         roles: ["review"],
       },
       actor,
