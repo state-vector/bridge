@@ -267,6 +267,10 @@ export const TOOL_ARG_SCHEMAS = {
   train_lane: z.looseObject({
     repo: z.string(),
     base: z.string().optional(),
+    // BR#5186: the executor's reseed ask — its first-hand probe says the
+    // base branch is LIVE on the remote while every lane card for the key is
+    // terminal. Omitted/false keeps the BR#4977 retirement refusal.
+    base_live: z.boolean().optional(),
     spec: z
       .looseObject({
         required_workflows: z.array(z.string()).optional(),
