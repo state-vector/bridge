@@ -38,6 +38,8 @@ export const TOOL_NAMES = [
   "search_knowledge",
   "session_alive",
   "stats",
+  "train_bisect",
+  "train_carry",
   "train_ci",
   "train_event",
   "train_history",
@@ -209,6 +211,34 @@ export const TOOL_ARG_SCHEMAS = {
     run_url: z.string().optional(),
   }),
   train_status: z.looseObject({ repo: z.string().optional() }),
+  // ---- burst-drain settle (BR#4934): the red-settle bisect + the
+  // settle-window machine-rebase carry. Same executor-fed / hub-decided
+  // split; both require the lane lease (hub-side check). ----
+  train_bisect: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    /** one bisect step: sha of the probed intermediate merge + its verdict */
+    step: z
+      .looseObject({
+        sha: z.string(),
+        verdict: z.enum(["green", "red", "dispatched", "inconclusive"]),
+      })
+      .optional(),
+    /** a RED step names the ONE culprit card (provenance ledger task_id) */
+    culprit_task: z.string().optional(),
+    culprit_sha: z.string().optional(),
+    /** the walk could not name one culprit — the pass bounces oldest-first */
+    inconclusive: z.boolean().optional(),
+  }),
+  train_carry: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    pr: z.number().int(),
+    /** the verdict-covered head before the machine-clean update-branch */
+    from_head: z.string(),
+    /** the head after it — coverage extends here via the appended record */
+    to_head: z.string(),
+  }),
   // ---- proxy verification probes (BR#4658): the sweep enqueues probes for
   // run_success / pr_checks_green parks it cannot verify itself (the hub
   // holds no VCS credentials — BR#3516); a worker-executor daemon leg polls

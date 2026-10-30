@@ -40,9 +40,9 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, train_leg_landed, train_legs, MainCheckRun, MainVerdict, MergeAction,
-    TRAIN_CI_TYPICAL_MINUTES,
+    classify_main_check_runs, decide_train_gate, drain_burst_decision, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
+    DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -683,6 +683,8 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let typical_ms = lane.get("ci_typical_minutes").and_then(|v| v.as_u64()).unwrap_or(TRAIN_CI_TYPICAL_MINUTES) * 60_000;
+    // BR#4934 lane config: the burst-drain cap per settle pass (0 = unlimited).
+    let burst_cap = parse_burst_max(lane.get("burst_max").unwrap_or(&Value::Null));
 
     // ---- BR#4489 capability honesty: a host that cannot merge does not
     // contend the lock. Claiming without capability made the lane LOOK
@@ -710,7 +712,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     };
     log(Some(&key), &format!("lease: {} (holder={})", vstr(&lease, "note").unwrap_or("acquired"), ctx.holder));
 
-    if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms) {
+    if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap) {
         // BR#4489: a permission refusal mid-merge demotes the host for the
         // process lifetime — startup truth was runtime falsehood; fail closed.
         let low = e.to_lowercase();
@@ -731,7 +733,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     }
 }
 
-fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64) -> Result<(), String> {
+fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
         let stop = lane.get("stop").unwrap();
@@ -744,6 +746,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
             log(Some(key), "main green again — stop cleared, lane released");
         } else {
+            // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
+            // drive the walk ONE step per tick while the line holds (state
+            // hub-side, crash-safe: any executor picks it up mid-flight).
+            match bisect_step(ctx, key, repo, base, stop) {
+                Ok(()) => {}
+                Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
+            }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             log(Some(key), &format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") }));
         }
@@ -788,7 +797,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
         renew_lease(ctx, repo, base);
         let runs = ctx.check_runs(repo, &merge_sha);
-        let ci = ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": merge_sha, "checks": runs }))?;
+        // BR#4934: the settle feed carries executor-fed git ancestry — the
+        // pass's earlier merge shas verified on base — so the hub can close
+        // the pass's parked cards on a green verdict (BR#3516: no hub
+        // GitHub calls; BR#3935: unreadable shas are excluded, never faked).
+        let mut ci_body = json!({ "repo": repo, "base": base, "sha": merge_sha, "checks": runs });
+        let ancestors = settle_ancestors(ctx, repo, base, &merge_sha)?;
+        if !ancestors.is_empty() {
+            ci_body.as_object_mut().unwrap().insert("ancestors_of_settled".into(), json!(ancestors));
+        }
+        let ci = ctx.mcp("train_ci", ci_body)?;
         ctx.note(&format!("CI poll on {}: {}", &merge_sha[..merge_sha.len().min(9)], vstr(&ci, "decided").unwrap_or("?")));
         let pend = ci.get("pending").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
         let missing = ci.get("missing").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
@@ -809,32 +827,85 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 log(Some(key), &format!("fail-closed bound in ~{}m", (left / 60_000).max(1)));
             }
         }
+        // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
+        // update-branch per tick on the first behind+covered queued head, so
+        // conflicts surface during the wait, not at the drain.
+        settle_window_rebase(ctx, key, repo, base, lane)?;
         return Ok(());
     }
 
-    // ---- idle arm: walk the derived queue IN ORDER and drive the first
-    // entry the tick can act on (STRICT serialization — ONE action per lane
-    // per tick; a transient no-op — mergeability computing, unsettled checks,
-    // no verdict — still blocks the train). A PERMANENTLY unlandable entry —
-    // PR CLOSED, a leg with no PR stamp, no unlanded leg on this lane — must
-    // NOT starve the lane (BR#3935: the executor used to drop the head,
-    // release, and return; the hub re-derived the same queue next tick and
-    // every queued card behind it rotted). It is logged and the walk advances
-    // to the next entry in the SAME tick; the card itself stays queued for
-    // the humans.
+    // ---- drain arm (idle, or mid-pass "bursting"): walk the derived queue
+    // IN ORDER and drive entries the tick can act on. ONE merge at a time is
+    // the OLD law — since BR#4934 (decision BR#4932, amending BR#4804) the
+    // walk DRAINS: after a merge it keeps going in the SAME tick, merging
+    // every gate-clean head back-to-back with NO settle between merges —
+    // exactly ONE settle wait per drain pass, on the FINAL merge commit. The
+    // pass state is the HUB's (currently.phase/​burst_*), never executor-
+    // local — crash-safe. The drain continues past MERGES only; a bounce,
+    // note, or human leg still ends the tick walk. A PERMANENTLY unlandable
+    // entry — PR CLOSED, a leg with no PR stamp, no unlanded leg on this
+    // lane — must NOT starve the lane (BR#3935): it is logged and the walk
+    // advances to the next entry in the SAME tick. A red pass sha (tip
+    // classify) stops the line IMMEDIATELY (GH#2261) — it never waits for
+    // the settle; earlier pass-sha reds surface at the settle (and its
+    // bisect, if the settle lands red).
+    let cur = lane.get("currently").filter(|c| !c.is_null());
+    let bursting = lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("bursting");
+    let mut pass_merged: u32 = if bursting {
+        cur.and_then(|c| c.get("burst_merged")).and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32
+    } else {
+        0
+    };
+    let mut tip_sha: String = if bursting {
+        cur.and_then(|c| c.get("merge_sha")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
     if queue.is_empty() {
+        if pass_merged > 0 {
+            // a bursting lane with an empty queue still owes its settle —
+            // all pass heads merged, nothing clean left behind them
+            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+            return Ok(());
+        }
         release_if_idle(ctx, key, repo, base)?;
         return Ok(());
     }
     for (qi, head) in queue.iter().enumerate() {
+        // BR#4934 cap: at burst_max merges per pass the drain settles even
+        // with clean heads queued (drain_burst_decision: Settle, not Drain).
+        if pass_merged > 0 && drain_burst_decision(pass_merged, burst_cap, true, false) != DrainDecision::Drain {
+            log(Some(key), &format!(
+                "burst cap {} reached after {} merge(s) — settling the pass on {}",
+                if burst_cap == 0 { "∞".to_string() } else { burst_cap.to_string() },
+                pass_merged,
+                &tip_sha[..tip_sha.len().min(9)]
+            ));
+            break;
+        }
+        // BR#4934 mid-drain tip check: before each merge, classify the pass
+        // tip's fed checks — RED stops the line immediately (GH#2261 law);
+        // pending/green keeps draining (destination-green is the settle's).
+        if pass_merged > 0 && !tip_sha.is_empty() {
+            let tip_runs = ctx.check_runs(repo, &tip_sha);
+            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+                renew_lease(ctx, repo, base);
+                ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
+                ctx.note(&format!("burst drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
+                log(Some(key), &format!("burst drain: pass tip {} went RED — stop-the-line fed, drain aborted", &tip_sha[..tip_sha.len().min(9)]));
+                return Ok(());
+            }
+        }
         let head_id = vstr(head, "id").unwrap_or("").to_string();
         let card = ctx.mcp("get_artefact", json!({ "id": head_id }))?;
         let card_meta = card.get("meta").cloned().unwrap_or(json!({}));
         let card_status = card.get("status").and_then(|v| v.as_str()).map(String::from);
         // BR#3659: the card is a LIST of legs (meta.prs; meta.pr stays the first
-        // for legacy readers). THIS lane drives the first UNLANDED leg whose
-        // repo is this lane's.
+        // for legacy readers). THIS lane drives the first UNLANDED, UNPARKED
+        // leg whose repo is this lane's — BR#4934: a leg stamped awaiting-ci
+        // is PARKED on this pass (its merge is in; the settle owns it) and
+        // must never re-gate as if unmerged.
         let legs = train_legs(&card_meta);
         let lane_legs: Vec<usize> = legs
             .iter()
@@ -867,8 +938,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("queue[{qi}] {head_id} has no unlanded leg on this lane ({} leg(s) cited) — advancing to the next queue entry", legs.len()));
             continue;
         }
-        let leg = legs[lane_legs[0]].clone();
-        let leg_number = lane_legs[0] + 1;
+        // BR#4934 parked filter: advance past awaiting-ci legs to the first
+        // leg this tick can actually drive; ALL parked → the pass settle
+        // owns the card, advance.
+        let drive_idx = lane_legs.iter().find(|&&i| train_leg_state(&card_meta, &legs[i]) != Some("awaiting-ci"));
+        let leg_idx = match drive_idx {
+            Some(&i) => i,
+            None => {
+                log(Some(key), &format!("queue[{qi}] {head_id} is parked awaiting-ci on this lane — the pass settle owns it, advancing"));
+                continue;
+            }
+        };
+        let leg = legs[leg_idx].clone();
+        let leg_number = leg_idx + 1;
         let pr = leg.number;
         if pr == 0 || leg.repo.is_empty() {
             // BR#3935: a stamp-less leg can never drive — advance (the hub
@@ -914,7 +996,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let base_verdict = classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict;
+        // BR#4934 mid-drain: destination-green is owned by the pass settle
+        // (decision BR#4932) — the gate composes with base FORCED green; the
+        // tip RED check at the loop head owns the stop (GH#2261). The first
+        // merge of a pass still gates under the standing law (real verdict).
+        let gate_base = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
@@ -922,7 +1008,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             head_sha: &head_sha,
             card_meta: &card_meta,
             card_status: card_status.as_deref(),
-            base_verdict,
+            base_verdict: gate_base,
             mergeable: facts.get("mergeable").and_then(|v| v.as_bool()),
             merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
             commits: &commits,
@@ -960,11 +1046,20 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
 
         // ONE action per tick (strict serialization): whatever the gate
         // decided — merge, bounce, close, note, human leg — the walk ends
-        // here; the next tick re-derives the queue and continues.
-        return match gate {
+        // here; the next tick re-derives the queue and continues. THE ONE
+        // EXCEPTION is the merge itself (BR#4934): the drain takes the next
+        // clean head in the SAME tick.
+        match gate {
             MergeAction::Skip { .. } | MergeAction::Note { .. } => {
-                release_if_idle(ctx, key, repo, base)?;
-                Ok(())
+                // BR#4934: a transient no-op mid-drain means THIS head isn't
+                // clean — the pass settles on the final merge now (queue has
+                // no clean head to drain into).
+                if pass_merged > 0 {
+                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                } else {
+                    release_if_idle(ctx, key, repo, base)?;
+                }
+                return Ok(());
             }
             MergeAction::HumanLeg { reason } => {
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
@@ -979,7 +1074,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 ctx.note(&format!("filed human-leg ask for {head_id}"));
                 log(Some(key), &format!("human leg filed: {reason}"));
                 release_if_idle(ctx, key, repo, base)?;
-                Ok(())
+                return Ok(());
             }
             MergeAction::CloseSuperseded { reason } => {
                 renew_lease(ctx, repo, base);
@@ -987,7 +1082,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 ctx.note(&format!("closed superseded PR #{pr}"));
                 log(Some(key), &format!("PR #{pr} closed (superseded card)"));
                 release_if_idle(ctx, key, repo, base)?;
-                Ok(())
+                return Ok(());
             }
             MergeAction::Bounce { defect, bounce_kind } => {
                 renew_lease(ctx, repo, base);
@@ -1026,7 +1121,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 };
                 log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
                 release_if_idle(ctx, key, repo, base)?;
-                Ok(())
+                return Ok(());
             }
             MergeAction::Merge { .. } => {
                 // ---- the merge leg: machine-clean update first, then merge ----
@@ -1072,15 +1167,332 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         vstr(&merged, "state").unwrap_or("?")
                     ));
                 }
-                ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder }))?;
-                ctx.note(&format!("merged PR #{pr} as {}", &merge_sha[..merge_sha.len().min(9)]));
-                log(Some(key), &format!("PR #{pr} merged as {} — awaiting CI on the merge commit", &merge_sha[..merge_sha.len().min(9)]));
-                Ok(())
+                // BR#4934: the burst pass rides the merged event — count
+                // INCLUDES this merge; the settle comes later as the walk's
+                // single settle feed (the hub flips bursting → awaiting-ci
+                // on the first settle poll, not here).
+                pass_merged = pass_merged.saturating_add(1);
+                ctx.mcp("train_event", json!({
+                    "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder,
+                    "burst_merged": pass_merged, "burst_cap": burst_cap, "burst_settling": false,
+                }))?;
+                tip_sha = merge_sha.clone();
+                ctx.note(&format!("merged PR #{pr} as {}", &tip_sha[..tip_sha.len().min(9)]));
+                log(
+                    Some(key),
+                    &format!(
+                        "PR #{pr} merged as {} — bursting ({pass_merged} merged, cap {}): drain continues back-to-back, no settle between merges",
+                        &tip_sha[..tip_sha.len().min(9)],
+                        if burst_cap == 0 { "unlimited".to_string() } else { burst_cap.to_string() }
+                    ),
+                );
+                // THE DRAIN (BR#4934): another gate-clean head is taken in
+                // the SAME tick — the loop continues to the next queue entry.
+                continue;
             }
-        };
+        }
     }
-    // every entry was walked and none could act — the lane is honestly idle
+    // the walk ended: if a pass drained this tick, it settles NOW — exactly
+    // ONE settle wait per drain pass, on the FINAL merge commit (BR#4934).
+    // Otherwise the lane is honestly idle.
+    if pass_merged > 0 && !tip_sha.is_empty() {
+        burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+        return Ok(());
+    }
     release_if_idle(ctx, key, repo, base)?;
+    Ok(())
+}
+
+/// BR#4934 settle feed: the pass's ONE settle wait, entered when the drain
+/// ends (queue empty of clean heads / burst_max reached). Feeds the tip's
+/// checks + executor-fed ancestry; the HUB classifies and flips bursting →
+/// awaiting-ci on this first settle poll.
+fn burst_settle_feed(ctx: &mut Ctx, key: &str, repo: &str, base: &str, tip_sha: &str, pass_merged: u32) -> Result<(), String> {
+    renew_lease(ctx, repo, base);
+    let ancestors = settle_ancestors(ctx, repo, base, tip_sha)?;
+    let tip_runs = ctx.check_runs(repo, tip_sha);
+    let mut body = json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs });
+    if !ancestors.is_empty() {
+        body.as_object_mut().unwrap().insert("ancestors_of_settled".into(), json!(ancestors));
+    }
+    let ci = ctx.mcp("train_ci", body)?;
+    ctx.note(&format!("burst settle on {}: {}", &tip_sha[..tip_sha.len().min(9)], vstr(&ci, "decided").unwrap_or("?")));
+    log(
+        Some(key),
+        &format!(
+            "burst settle: pass of {pass_merged} merge(s) settles on {} — hub decides{}",
+            &tip_sha[..tip_sha.len().min(9)],
+            if ancestors.is_empty() { String::new() } else { format!(" ({} fed ancestor(s))", ancestors.len()) }
+        ),
+    );
+    Ok(())
+}
+
+/// BR#4934: the pass's earlier merge shas (provenance ledger, BR#3287),
+/// verified on-base — executor-fed ancestry for the hub's burst-park closes
+/// (the hub holds no VCS creds, BR#3516). Three-valued law (BR#3935): a sha
+/// git cannot read is EXCLUDED, never faked as ancestor-or-not. Bounded at
+/// 50 verifications per settle.
+fn settle_ancestors(ctx: &mut Ctx, repo: &str, base: &str, tip_sha: &str) -> Result<Vec<String>, String> {
+    ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
+    let hist = ctx.mcp("train_history", json!({ "repo": repo, "base": base, "kind": "merged", "limit": 200 }))?;
+    let tip = tip_sha.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for e in hist.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        if out.len() >= 50 {
+            break;
+        }
+        let sha = e.get("merge_sha").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        if sha.len() < 7 || sha == tip || out.contains(&sha) {
+            continue;
+        }
+        if ctx.is_ancestor(&sha, &tip).unwrap_or(false) {
+            out.push(sha);
+        }
+    }
+    Ok(out)
+}
+
+/// BR#4934 §6: the settle wait is the rebase window. ONE machine-clean leg
+/// per tick: the first queued head that is BEHIND base and verdict-covered
+/// at its CURRENT head gets `gh pr update-branch` (trial-merge first — a
+/// conflict bounces with the file list, human-resolved), then the hub
+/// appends the carry record (train.carry) so the verdict covers the moved
+/// head (BR#3516 §5). Parked awaiting-ci legs are skipped — the settle owns
+/// them; the identity gate withholds the write from a non-worker credential.
+fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) -> Result<(), String> {
+    let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
+    for (qi, head) in queue.iter().enumerate() {
+        let head_id = vstr(head, "id").unwrap_or("").to_string();
+        if head_id.is_empty() {
+            continue;
+        }
+        let card = ctx.mcp("get_artefact", json!({ "id": head_id }))?;
+        if card.get("status").and_then(|v| v.as_str()) != Some("blocked") {
+            continue;
+        }
+        let card_meta = card.get("meta").cloned().unwrap_or(json!({}));
+        let legs = train_legs(&card_meta);
+        let leg = legs
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.repo == repo && !train_leg_landed(&card_meta, l) && train_leg_state(&card_meta, l) != Some("awaiting-ci"))
+            .map(|(i, l)| (i + 1, l.clone()));
+        let (leg_number, leg) = match leg {
+            Some(x) => x,
+            None => continue,
+        };
+        let pr = leg.number;
+        if pr == 0 {
+            continue;
+        }
+        let facts = ctx.pr_facts(repo, pr)?;
+        if vstr(&facts, "state") != Some("OPEN") {
+            continue;
+        }
+        let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_lowercase();
+        if head_sha.is_empty() {
+            continue;
+        }
+        // behind: base tip is NOT an ancestor of the head
+        ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
+        ctx.fetch_pr_head(pr)?;
+        if ctx.is_ancestor(&format!("origin/{base}"), &head_sha).unwrap_or(true) {
+            continue;
+        }
+        // coverage extends, never created: the verdict must cover the head
+        // AS IT IS now (stamp/carry) — an uncovered head is verify's business
+        if !verdict_covers_head_leg(Some(&leg), &head_sha) {
+            log(Some(key), &format!("settle-window rebase: queue[{qi}] {head_id} leg {leg_number} uncovered at head — verify owns it, skipping"));
+            continue;
+        }
+        let (clean, files) = ctx.trial_merge(base, &head_sha)?;
+        if !clean {
+            let reason = format!("settle-window rebase (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": files, "bounce_kind": "conflict", "reason": reason }))?;
+            log(Some(key), &format!("settle-window rebase: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
+            return Ok(());
+        }
+        if !ctx.write_allowed() {
+            log(Some(key), "IDENTITY GATE: settle-window update-branch withheld — gh is NOT a worker-class credential (BR#3181)");
+            return Ok(());
+        }
+        ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
+        let updated = ctx.pr_facts(repo, pr)?;
+        let new_head = vstr(&updated, "headRefOid").unwrap_or("").to_lowercase();
+        if new_head.is_empty() || new_head == head_sha {
+            log(Some(key), &format!("settle-window rebase: PR #{pr} update-branch produced no head move — next tick"));
+            return Ok(());
+        }
+        ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head_sha, "to_head": new_head }))?;
+        ctx.note(&format!("settle-window machine rebase PR #{pr} (verdict carries)"));
+        log(
+            Some(key),
+            &format!(
+                "settle-window rebase: PR #{pr} (queue[{qi}]) machine-clean {} → {} — verdict carried (BR#3516 §5)",
+                &head_sha[..head_sha.len().min(9)],
+                &new_head[..new_head.len().min(9)]
+            ),
+        );
+        return Ok(()); // ONE rebase leg per tick
+    }
+    Ok(())
+}
+
+/// BR#4934 red-settle bisect driver — ONE step per tick while the line is
+/// stopped on a burst-red settle. All walk state lives hub-side
+/// (stop.bisect.steps/pass/culprit), crash-safe. Walk order: the pass's
+/// intermediate merge shas OLDEST→NEWEST; the first RED probe names the ONE
+/// culprit (train_bisect bounces it and re-parks the final card); all-green
+/// probes pin the final card; an unreadable or bound-stalled probe stamps
+/// inconclusive and the pass bounces oldest-first, one per tick. GitHub
+/// re-run dispatch (check-runs rerequest) is a WRITE — worker-class only.
+fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -> Result<(), String> {
+    let bisect = match stop.get("bisect").filter(|b| !b.is_null()) {
+        Some(b) => b,
+        None => return Ok(()), // legacy stop — nothing to bisect
+    };
+    if bisect.get("culprit_task").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+        || bisect.get("inconclusive").and_then(|v| v.as_bool()).unwrap_or(false)
+    {
+        log(Some(key), "bisect settled — holding the stop until main is green again");
+        return Ok(());
+    }
+    let step_verdict = |steps: &Value, sha: &str| -> Option<String> {
+        steps.get(sha).map(|v| {
+            if v.is_string() {
+                v.as_str().unwrap_or("").to_string()
+            } else {
+                v.get("verdict").and_then(|x| x.as_str()).unwrap_or("").to_string()
+            }
+        })
+    };
+    let steps = bisect.get("steps").cloned().unwrap_or(json!({}));
+    // an inconclusive probe anywhere → the whole walk failed: bounce the
+    // pass's still-queued cards OLDEST-FIRST, one per tick, then stamp it
+    let inconclusive = steps.as_object().map(|m| {
+        m.values().any(|v| {
+            let s = if v.is_string() { v.as_str().unwrap_or("").to_string() } else { v.get("verdict").and_then(|x| x.as_str()).unwrap_or("").to_string() };
+            s == "inconclusive"
+        })
+    }).unwrap_or(false);
+    let pass_merged = bisect.pointer("/pass/merged").and_then(|v| v.as_u64()).unwrap_or(0).min(200) as usize;
+    let hist = ctx.mcp("train_history", json!({ "repo": repo, "base": base, "kind": "merged", "limit": 200 }))?;
+    let events = hist.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut pass: Vec<(String, String, i64)> = Vec::new(); // (sha, task_id, pr), newest first
+    for e in &events {
+        if pass.len() >= pass_merged.max(1) {
+            break;
+        }
+        let sha = e.get("merge_sha").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        if sha.len() < 7 {
+            continue;
+        }
+        pass.push((sha, e.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string(), e.get("pr").and_then(|v| v.as_i64()).unwrap_or(0)));
+    }
+    if pass.len() < 2 {
+        log(Some(key), "bisect: the pass has no intermediate merges — the stop-bounced card owns the red; holding");
+        return Ok(());
+    }
+    let (final_sha, final_task, _) = pass[0].clone();
+    let inters: Vec<(String, String, i64)> = pass[1..].iter().rev().cloned().collect(); // oldest → newest
+    if inconclusive {
+        for (sha, task, pr) in &inters {
+            if task.is_empty() {
+                continue;
+            }
+            let card = ctx.mcp("get_artefact", json!({ "id": task }))?;
+            if card.get("status").and_then(|v| v.as_str()) != Some("blocked") {
+                continue; // already bounced (or closed) — sweep advances
+            }
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_event", json!({
+                "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": task,
+                "bounce_kind": "coverage",
+                "reason": format!("bisect inconclusive (BR#4934): the red settle's per-sha probes could not name one culprit — this pass card (merge {}) re-verifies and re-queues (oldest-first sweep)", &sha[..sha.len().min(9)]),
+            }))?;
+            ctx.note(&format!("bisect inconclusive: bounced pass card {task} (oldest-first sweep)"));
+            log(Some(key), &format!("bisect inconclusive: PR #{pr} ({}) bounced — re-verify, re-queue (one per tick)", &sha[..sha.len().min(9)]));
+            return Ok(());
+        }
+        renew_lease(ctx, repo, base);
+        ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "inconclusive": true }))?;
+        log(Some(key), "bisect inconclusive: pass fully swept — stamped on the lane stop");
+        return Ok(());
+    }
+    // the walk: first intermediate without a stamped verdict
+    let target = inters.iter().find(|(sha, _, _)| step_verdict(&steps, sha).is_none()).cloned();
+    let (sha, task, pr) = match target {
+        Some(t) => t,
+        None => {
+            // every intermediate probed GREEN → the culprit is the final
+            // card (already stop-bounced — this just pins the verdict)
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "culprit_task": final_task, "culprit_sha": final_sha }))?;
+            ctx.note(&format!("bisect: all intermediates green — culprit pinned to final card {final_task}"));
+            log(Some(key), &format!("bisect: intermediates all green — culprit = the final merge {}", &final_sha[..final_sha.len().min(9)]));
+            return Ok(());
+        }
+    };
+    let runs = ctx.check_runs(repo, &sha);
+    match classify_main_check_runs(&runs).verdict {
+        MainVerdict::Red => {
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "red" }, "culprit_task": task, "culprit_sha": sha }))?;
+            ctx.note(&format!("bisect: {} RED — culprit {task}", &sha[..sha.len().min(9)]));
+            log(Some(key), &format!("bisect: intermediate {} RED — ONE culprit named: {task} (PR #{pr})", &sha[..sha.len().min(9)]));
+        }
+        MainVerdict::Green => {
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "green" } }))?;
+            log(Some(key), &format!("bisect: intermediate {} green — walk advances next tick", &sha[..sha.len().min(9)]));
+        }
+        _ => {
+            // unsettled: dispatch a re-run once, then hold for the bound;
+            // stalled past the CI bound → inconclusive (the sweep takes over)
+            let bound_ms = TRAIN_CI_BOUND_MULTIPLIER * TRAIN_CI_TYPICAL_MINUTES * 60_000;
+            match step_verdict(&steps, &sha).as_deref() {
+                Some("dispatched") => {
+                    let at = steps.get(&sha).and_then(|v| v.get("at")).and_then(|x| x.as_u64()).unwrap_or(0);
+                    if at > 0 && now_ms().saturating_sub(at) > bound_ms {
+                        renew_lease(ctx, repo, base);
+                        ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "inconclusive" } }))?;
+                        log(Some(key), &format!("bisect: probe {} unsettled past the CI bound — inconclusive, pass sweeps oldest-first", &sha[..sha.len().min(9)]));
+                    } else {
+                        log(Some(key), &format!("bisect: probe {} re-run in flight — bound in ~{}m", &sha[..sha.len().min(9)], ((bound_ms - now_ms().saturating_sub(at)) / 60_000).max(1)));
+                    }
+                }
+                _ => {
+                    if !ctx.write_allowed() {
+                        log(Some(key), "IDENTITY GATE: bisect re-run dispatch withheld — gh is NOT a worker-class credential (BR#3181)");
+                        return Ok(());
+                    }
+                    renew_lease(ctx, repo, base);
+                    let mut seen = std::collections::HashSet::new();
+                    let mut dispatched = 0usize;
+                    for r in &runs {
+                        if !seen.insert(r.name.clone()) {
+                            continue; // newest run per name only
+                        }
+                        let ok = ctx.sh("gh", &["api", &format!("repos/{}/check-runs/{}/rerequest", repo, r.id), "-X", "POST"]).is_ok();
+                        if ok {
+                            dispatched += 1;
+                        }
+                    }
+                    if dispatched == 0 {
+                        // no runs to re-run (workflows never ran on this sha) —
+                        // the walk cannot classify it
+                        ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "inconclusive" } }))?;
+                        log(Some(key), &format!("bisect: probe {} has no re-runnable checks — inconclusive", &sha[..sha.len().min(9)]));
+                    } else {
+                        ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "dispatched" } }))?;
+                        ctx.note(&format!("bisect: dispatched {dispatched} re-run(s) on {}", &sha[..sha.len().min(9)]));
+                        log(Some(key), &format!("bisect: dispatched {dispatched} re-run(s) on {} — polling next tick", &sha[..sha.len().min(9)]));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
