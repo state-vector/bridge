@@ -933,6 +933,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         String::new()
     };
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
+    // BR#5114: per-entry gate verdicts in walk (rank) order — stamped onto
+    // the lane at the end of the walk; the panel renders them as the queue
+    // block row (ready blocks = the current batch, Ray 2026-10-30: "we
+    // merge what we can in batches").
+    let mut qfacts: Vec<serde_json::Value> = Vec::new();
     if queue.is_empty() {
         if pass_merged > 0 {
             // a bursting lane with an empty queue still owes its settle —
@@ -1112,6 +1117,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
+        qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
+            MergeAction::Merge { .. } => "ready",
+            MergeAction::Bounce { bounce_kind, .. } => match bounce_kind {
+                crate::train_gate::BounceKind::Conflict => "conflict",
+                crate::train_gate::BounceKind::Coverage => "needs-review",
+                _ => "blocked",
+            },
+            MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            _ => "blocked",
+        } }));
 
         // ---- IDENTITY GATE (BR#3181, enforced at the write boundary) ----
         // close / update-branch / merge execute only under the worker-class
@@ -1316,6 +1331,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 continue;
             }
         }
+    }
+    // BR#5114: stamp this walk's per-entry verdicts (rank order preserved —
+    // collected as the walk touched them) so the panel's queue blocks show
+    // the truth of this pass: which entries are ready (the next batch) and
+    // which wait/leave. One write per tick; failures never break the tick.
+    if !qfacts.is_empty() {
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts }));
     }
     // the walk ended: if a pass drained this tick, it settles NOW — exactly
     // ONE settle wait per drain pass, on the FINAL merge commit (BR#4934).

@@ -234,8 +234,14 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
-    // BACKLOG: the count + how many need reviews
-    expect(trainPanelSrc).toMatch(/queued\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
+    // BACKLOG: one row of colored blocks in walk order (BR#5114 final):
+    // green=ready (merges this pass), amber=waiting, red=conflict,
+    // grey=needs-review; head ringed; click opens the card
+    expect(trainPanelSrc).toMatch(/train-blocks/);
+    expect(trainPanelSrc).toMatch(/tb-\$\{cls\}/);
+    expect(trainPanelSrc).toMatch(/l\.queue_facts\?\.entries\.find/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
+    expect(trainPanelSrc).toContain("merges this pass");
     expect(trainPanelSrc).toContain("stopped — main is red");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);

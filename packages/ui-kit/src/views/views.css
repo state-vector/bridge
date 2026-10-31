@@ -513,7 +513,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-now-note::before { content: "▸ "; color: var(--accent); }
 .train-stall { color: var(--amber, #d29a4b); font-weight: 600; white-space: nowrap; cursor: help; }
 .trainc-rate { white-space: nowrap; }
-.trainc-backlog { white-space: nowrap; cursor: help; }
+.trainc-backlog { min-width: 0; overflow: hidden; }
+.train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; }
+.train-block { width: 11px; height: 16px; border-radius: 3px; cursor: pointer; flex: none; border: 1px solid transparent; }
+.train-block:hover { filter: brightness(1.2); }
+.tb-ready { background: var(--green, #3fb26a); }
+.tb-waiting { background: var(--amber, #d29a4b); }
+.tb-conflict { background: var(--red, #d9534f); }
+.tb-needs-review { background: var(--text-faint, #8b94a7); }
+.tb-blocked { background: repeating-linear-gradient(45deg, var(--text-faint, #8b94a7), var(--text-faint, #8b94a7) 3px, transparent 3px, transparent 6px); }
+.tb-unknown { background: transparent; border: 1px solid var(--text-faint, #8b94a7); }
+.tb-head { box-shadow: 0 0 0 2px var(--accent, #6ea8fe); }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }

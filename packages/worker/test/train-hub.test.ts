@@ -1785,6 +1785,29 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-plain" });
   });
 
+  it("train.queue_facts stamps the executor's per-entry walk verdicts — train.status serves them in walk order (the queue block row)", async () => {
+    const repo = "state-vector/lane-qf";
+    await acquire(repo, "gw-qf", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 51145, head: "e".repeat(40), title: "IMPL: qf drill 1" });
+    const c2 = await queueViaAccept({ repo, pr: 51146, head: "f".repeat(40), title: "IMPL: qf drill 2" });
+
+    // the lease-holder stamps what its walk decided, in rank order
+    const r = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-qf",
+      entries: [
+        { id: c1, pr: 51145, cls: "ready" },
+        { id: c2, pr: 51146, cls: "waiting" },
+      ],
+    });
+    expect(r.body.error ?? "").toBe("");
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.queue_facts.entries.map((e: any) => [e.id, e.cls])).toEqual([[c1, "ready"], [c2, "waiting"]]);
+    // a NON-holder cannot stamp (executor-fed facts only)
+    const no = await kbJson("/train.queue_facts", { repo, base: "main", actor: "gw-other", entries: [{ id: c1, cls: "ready" }] });
+    expect(no.status).toBeGreaterThanOrEqual(400);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-qf" });
+  });
+
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
     const repo = "state-vector/lane-legacy-renew";
     await acquire(repo, "gw-leg", { merge_capable: true });

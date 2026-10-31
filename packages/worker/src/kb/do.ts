@@ -3049,6 +3049,7 @@ export class KnowledgeHub {
         case "train.history": return this.json(await this.trainHistory(body));
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
         case "train.carry": return this.json(await this.trainCarry(body, actor));
+        case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
         case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
@@ -8831,6 +8832,27 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  executor-fed. NOTE (coordination, BR#4689 / PR #311): this is the
    *  minimal carry primitive the settle window needs; L1.4 remains the
    *  carry law's owner and supersedes this op's edges when it lands. */
+  /** train.queue_facts (BR#5114): the executor's per-tick per-entry gate
+   *  verdicts for the whole derived queue, in walk (rank) order — stored
+   *  whole-of-row on the lane (meta.lane.queue_facts = {at, entries}) and
+   *  served verbatim by train.status. This is the truth behind the panel's
+   *  queue blocks: ready blocks are the current batch (the executor merges
+   *  every ready entry back-to-back, skipping the rest — Ray 2026-10-30:
+   *  "we merge what we can in batches"). Requires the lease (executor-fed). */
+  private async trainQueueFacts(body: any, actor: string): Promise<any> {
+    const repo = String(body.repo ?? "").trim();
+    const base = String(body.base ?? "main").trim();
+    const entries = Array.isArray(body.entries) ? body.entries : [];
+    const lane = await this.laneEnsure(repo, base, actor);
+    const meta = JSON.parse(lane.meta ?? "{}");
+    const lease: TrainLease | null = meta.lease ?? null;
+    if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    meta.lane = { ...(meta.lane ?? {}), queue_facts: { at: Date.now(), entries } };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length });
+    return { ok: true, lane: laneKey(repo, base), n: entries.length };
+  }
+
   private async trainCarry(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
@@ -9319,6 +9341,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         now_action: meta.lane?.now_action ?? null,
         attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,
         queue_awaiting_review: awaitingReview,
+        // BR#5114: per-entry executor gate verdicts in walk order (panel
+        // blocks) — null until the first executor tick stamps them
+        queue_facts: meta.lane?.queue_facts ?? null,
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,
         starved,

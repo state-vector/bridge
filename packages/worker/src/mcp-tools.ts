@@ -291,6 +291,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_bisect,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.bisect", args), null, 1)),
   },
+  train_queue_facts: {
+    description: "Feed the executor's per-tick per-entry gate verdicts for the whole derived queue, in walk (rank) order — stored on the lane and served to the trains panel (queue blocks). Classes: ready | waiting | conflict | needs-review | blocked. Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_queue_facts,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.queue_facts", args), null, 1)),
+  },
   train_carry: {
     description: "Feed one machine-clean carry (BR#4934 settle-window rebase): after gh pr update-branch moved a verdict-covered head from_head→to_head content-preserving, the hub appends the carry record so the accepted verdict covers the new head (BR#3516 §5 shape). The hub appends via the carry law; the executor never writes card meta. Requires the lane lease.",
     schema: TOOL_ARG_SCHEMAS.train_carry,

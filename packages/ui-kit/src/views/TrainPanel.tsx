@@ -263,8 +263,22 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
               )}
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
-            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}`}>
-              {l.queue.length} queued{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+            <span className="trainc-backlog">
+              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), amber waits on checks, red conflicts, grey needs a review${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}`}>
+                {l.queue.map((q, i) => {
+                  const fact = l.queue_facts?.entries.find((e) => e.id === q.id);
+                  const cls = fact?.cls ?? "unknown";
+                  const word = cls === "ready" ? "merges this pass" : cls === "waiting" ? "waiting on checks" : cls === "conflict" ? "conflicted — back to impl" : cls === "needs-review" ? "needs a review" : cls === "blocked" ? "blocked (protection)" : "no machine verdict yet";
+                  return (
+                    <span
+                      key={q.id}
+                      className={`train-block tb-${cls}${i === 0 ? " tb-head" : ""}`}
+                      title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word}${i === 0 ? " · head of the queue" : ""}`}
+                      onClick={() => openTask?.(q.id)}
+                    />
+                  );
+                })}
+              </span>
             </span>
           </div>
         );
