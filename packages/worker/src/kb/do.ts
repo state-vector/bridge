@@ -103,6 +103,8 @@ import {
   clampAwaitingTtlHours,
   TRAIN_AWAITING_GRACE_MS,
   trainAwaitingReason,
+  trainAwaitingHumanLeg,
+  trainRequeueSwap,
   trainStopAskTitle,
   trainLandedCloseNote,
   trainLandedCloseEdge,
@@ -546,6 +548,15 @@ export class KnowledgeHub {
     // method (stallSweep below) so the admin.stall_sweep drill runs it in
     // isolation, mirroring admin.unblock_proxy_sweep.
     await this.stallSweep(now0);
+    // (A1) BR#5226 awaiting-park re-evaluation — the migration + steady-state
+    // pass: every Awaiting park whose anchored accepted verdict covers the
+    // head it parked on re-queues (the machine verdict IS the review);
+    // genuine human-leg parks stay parked. Idempotent, converges.
+    try {
+      await this.awaitingRequeueSweep(now0);
+    } catch (e) {
+      this.audit("system:watchdog", "awaiting_requeue_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
     // BR#4489: judge train-lane starvation on the alarm cadence too — a
     // queued lane with no merge-capable executor alarms even with zero
     // panel readers (the outage's silence failure).
@@ -927,6 +938,52 @@ export class KnowledgeHub {
   private staleMinutes(): number {
     const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
     return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+  }
+
+  /** (A1) BR#5226 awaiting-park re-evaluation — the migration for the
+   *  already-parked coverage cards AND the steady-state net. The machine
+   *  verdict IS the review (BR#4960): an Awaiting park whose anchored
+   *  ACCEPTED verdict still covers the head it parked on (the live head at
+   *  park time) never needed the human force-review — it re-queues onto the
+   *  train (same stamps, queued reason, boost decayed, refresh in place).
+   *  Genuine human-leg parks (human-resolved conflicts, dismissed external
+   *  review, signing environment) never satisfy the coverage test — their
+   *  verdict is dead at the parked head — so they stay parked. Runs every
+   *  alarm tick, idempotent: a flipped card leaves the awaiting set, so the
+   *  sweep converges; admin.awaiting_requeue_sweep drills it in isolation. */
+  private async awaitingRequeueSweep(_now0: number): Promise<number> {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts
+       WHERE type = 'task' AND status = 'blocked'
+         AND json_extract(meta, '$.merge_train.state') = 'awaiting'`,
+    ).toArray() as any[];
+    let flipped = 0;
+    for (const r of rows) {
+      try {
+        const cm = JSON.parse(r.meta ?? "{}");
+        const mt = (cm.merge_train ?? {}) as Record<string, any>;
+        const aw = (mt.awaiting ?? null) as { at?: number; head_sha?: string; verdict_id?: string } | null;
+        const parkedHead = String(aw?.head_sha ?? "").toLowerCase();
+        if (!parkedHead) continue; // fail-closed: no anchor, no flip
+        const legsAll = trainLegs(cm);
+        const leg = legsAll.find((l) => Number(l.number) === Number(mt.pr ?? 0)) ?? (legsAll.length === 1 ? legsAll[0] : undefined);
+        if (!leg) continue;
+        const verdictId = String(aw?.verdict_id ?? "") || this.trainChain(String(r.id)).verdict_id;
+        const vrow = verdictId ? this.one(`SELECT status FROM artefacts WHERE id = ?`, verdictId) : null;
+        if (!vrow || String((vrow as any).status ?? "") !== "done") continue; // the anchored verdict is not an accepted one
+        if (!verdictCoversHeadLeg(leg, parkedHead)) continue; // genuine lapse or human-leg park — stays parked
+        const now = Date.now();
+        const m2 = trainRequeueSwap(cm);
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(m2), now, String(r.id));
+        flipped++;
+        this.audit("system:watchdog", "awaiting_requeue", String(r.id), { pr: Number(mt.pr) || undefined, head: parkedHead.slice(0, 9), verdict: verdictId ?? null });
+        this.version(String(r.id), "system:watchdog", "update", `tick re-evaluation: the parked verdict (${verdictId ?? "unrecorded"}) covers the head it parked on (${parkedHead.slice(0, 9)}) — machine re-queue, no human leg (BR#4960: the machine verdict IS the review)`, {});
+      } catch (e) {
+        // one bad card must not kill the sweep — log and keep going
+        this.audit("system:watchdog", "sweep_error", String(r.id), { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
+    return flipped;
   }
 
   private async stallSweep(nowIn: number) {
@@ -3120,6 +3177,7 @@ export class KnowledgeHub {
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
         case "admin.stall_sweep":
+        case "admin.awaiting_requeue_sweep":
         case "admin.ask_escalation_sweep":
         case "admin.question_claim_sweep":
         case "admin.alarm_sweep":
@@ -3152,6 +3210,14 @@ export class KnowledgeHub {
             // window of its own).
             await this.stallSweep(Number(body.now ?? Date.now()));
             return this.json({ ok: true });
+          }
+          if (op === "admin.awaiting_requeue_sweep") {
+            // drill/liveness path for the BR#5226 awaiting-park re-evaluation:
+            // runs ONLY that pass (the migration for the already-parked
+            // coverage cards). Pass now=<future epoch ms> for drill symmetry;
+            // the pass itself is clockless (verdict coverage, not age).
+            const flipped = await this.awaitingRequeueSweep(Number(body.now ?? Date.now()));
+            return this.json({ ok: true, flipped });
           }
           if (op === "admin.ask_escalation_sweep") {
             // drill/liveness path for the ask TTL escalation (BR#3942): the
@@ -3983,12 +4049,8 @@ export class KnowledgeHub {
       // derivation picks the card back up naturally), the awaiting stamp
       // cleared, the boost DECAYED (BR#4068: decay is the accept hook's job
       // — re-queue deletes it), the typed pr_merged await_event PRESERVED
-      // (the queue's exit leg is still live).
-      const m2: any = { ...next };
-      m2.merge_train = { ...(m2.merge_train ?? {}), state: "queued" };
-      delete m2.merge_train.awaiting;
-      delete m2.boosted;
-      m2.blocked = { ...(m2.blocked ?? {}), reason: MERGE_TRAIN_QUEUED_REASON };
+      // (the queue's exit leg is still live). Shared swap (BR#5226).
+      const m2: any = trainRequeueSwap(next);
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(m2), now, id);
       this.audit(actor, "force_review", id, { decision, verdict: verdictId ?? null, ...(parkedHead ? { head: parkedHead } : {}), legs_carried: carried, ...(prNum ? { pr: prNum } : {}), ...(note ? { note: note.slice(0, 300) } : {}) });
       this.version(id, actor, "force_review", `force-review approved (human)${verdictId ? ` — verdict ${verdictId} re-anchored` : ""}${carried.length ? ` — coverage carried ${carried.join(", ")}` : " — heads already matched"} — re-queued on the merge train (BR#4960 pull model)${note ? ` — “${note.slice(0, 160)}”` : ""}`, { decision });
@@ -8044,16 +8106,49 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
-      // BR#4962 (per accepted BR#4960): a COVERAGE bounce is a lapsed
-      // verdict, not a defect — the card parks `blocked` under a typed
-      // Awaiting reason and the human force-reviews it from the backlog.
-      // ZERO asks: the BR#4068 standing review ask and the BR#4633 L4.2 TTL
-      // re-file retire here — ask-as-visibility is retired, the parked card
-      // IS the visibility. The park refreshes IN PLACE (blocked→blocked is
-      // an illegal edge) and PRESERVES the typed pr_merged await_event leg,
-      // so the proxy still owns a legal exit if the PR merges while parked.
+      // BR#4962 (per accepted BR#4960), AMENDED BR#5226: a coverage bounce
+      // is judged by what the card's ACCEPTED verdict actually covers. The
+      // machine verdict IS the review: a bounce whose accepted stamp (or
+      // contiguous carry chain) covers the LIVE head is a stale executor
+      // read, not a lapse — the card re-queues IN PLACE, zero human. A
+      // genuine lapse parks Awaiting ONLY for the human-leg classes
+      // (human-resolved conflicts / dismissed external review / signing
+      // environment); every other lapse falls through to the impl bounce
+      // below — the verify pool re-verifies at the new head. Nobody waits
+      // for a human click a machine verdict already gave (BR#4960).
       if (bounceKind === "coverage") {
-        const verdictId = this.trainChain(taskId).verdict_id;
+        const chain = this.trainChain(taskId);
+        const verdictId = chain.verdict_id;
+        const liveHead = headSha ? String(headSha).toLowerCase() : "";
+        const legsAll = trainLegs(cm);
+        const leg = legsAll.find((l) => Number(l.number) === Number(pr)) ?? (legsAll.length === 1 ? legsAll[0] : undefined);
+        const vrow = verdictId ? this.one(`SELECT status FROM artefacts WHERE id = ?`, verdictId) : null;
+        const verdictAccepted = !!vrow && String((vrow as any).status ?? "") === "done";
+        // MACHINE PATH: the accepted verdict anchors the live head —
+        // re-queue (queued reason, awaiting never minted, boost decayed,
+        // stamps + the typed pr_merged await_event intact). The train's own
+        // gate re-checks coverage fail-closed at merge time, so a head that
+        // moved again since bounces afresh — re-queueing on a covered head
+        // can never merge unverified code.
+        if (verdictAccepted && leg && liveHead && verdictCoversHeadLeg(leg, liveHead)) {
+          const m2 = trainRequeueSwap(cm);
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(m2), now, taskId);
+          this.audit(actor, "train:bounce_machine_requeue", taskId, { lane: laneKey(repo, base), pr, ...(headSha ? { head_sha: headSha } : {}), ...(verdictId ? { verdict: verdictId } : {}) });
+          // BR#4934: the lane forgets the in-flight merge ONLY when the
+          // bounced card IS that merge's card — same rule as the park.
+          const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
+          meta.currently = inFlightBounced ? null : meta.currently;
+          const reason = this.laneSyncReason(lane.id, meta, now);
+          ev({ task: taskId, bounce_kind: "coverage", merge_state_status: mergeStateStatus, reason: defect, machine_requeue: true }, taskId);
+          this.version(taskId, actor, "update", `coverage bounce discarded — the accepted verdict (${verdictId ?? "unrecorded"}) covers the live head${headSha ? ` ${String(headSha).slice(0, 9)}` : ""}; machine re-queue, no human leg (BR#4960: the machine verdict IS the review)`, {});
+          this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (coverage) — stale: the accepted verdict covers the live head; machine re-queue (BR#5226)`, { reason });
+          return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: "coverage", machine_requeue: true, reason };
+        }
+        // GENUINE HUMAN LEG — the only Awaiting park. The park refreshes IN
+        // PLACE (blocked→blocked is an illegal edge) and PRESERVES the typed
+        // pr_merged await_event leg, so the proxy still owns a legal exit if
+        // the PR merges while parked.
+        if (trainAwaitingHumanLeg(defect, conflictFiles)) {
         const awaitingReason = trainAwaitingReason(verdictId, headSha);
         // BR#4068 starvation law still stamps the boost: a coverage-bounced
         // card is one HUMAN leg from landed — the backlog's Awaiting filter
@@ -8075,7 +8170,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now, taskId);
         this.audit(actor, "train:bounce_awaiting_park", taskId, { lane: laneKey(repo, base), pr, ...(headSha ? { head_sha: headSha } : {}), ...(verdictId ? { verdict: verdictId } : {}) });
         this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr, awaiting: true });
-        this.version(taskId, actor, "update", `parked Awaiting review — coverage bounce (head moved past the accepted verdict${headSha ? ` ${String(headSha).slice(0, 9)}` : ""}); no ask filed (BR#4960): force-review from the backlog — approve re-anchors the verdict at the parked head, changes-requested bounces impl`, {});
+        this.version(taskId, actor, "update", `parked Awaiting review — coverage bounce needs a human leg (human-resolved conflict / dismissed external review / signing environment — BR#4960): force-review from the backlog — approve re-anchors the verdict at the parked head, changes-requested bounces impl`, {});
         // BR#4934: the lane forgets the in-flight merge ONLY when the bounced
         // card IS that merge's card — a bounce of a QUEUED candidate (a
         // mid-drain gate bounce or a settle-window rebase conflict) must not
@@ -8084,19 +8179,27 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         meta.currently = inFlightBounced ? null : meta.currently;
         const reason = this.laneSyncReason(lane.id, meta, now);
         ev({ task: taskId, bounce_kind: "coverage", merge_state_status: mergeStateStatus, reason: defect, awaiting_park: true }, taskId);
-        this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (coverage) — the card parks Awaiting review (zero asks, BR#4960); force-review from the backlog re-queues or bounces it`, { reason });
+        this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (coverage) — human leg, the card parks Awaiting review (zero asks, BR#4960); force-review from the backlog re-queues or bounces it`, { reason });
         return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: "coverage", awaiting_park: true, reason };
+        }
+        // PLAIN MACHINE LAPSE — fall through to the impl bounce below: the
+        // coverage brief hands the card to the verify pool; the repair leg
+        // re-enters review through the normal handoff, which auto-spawns the
+        // fresh verify duty (BR#3516 §5). NO human leg, NO ask.
       }
-      // gate | conflict — the impl bounce (BR#3516 §5): blocked → in_progress
-      // with the fix-up brief; resolution invalidates the verdict — the card
-      // re-enters the queue only after a fresh verify. NO ask legs here
-      // either (BR#4960): the repair leg re-enters review through the normal
-      // in_review handoff, which auto-spawns the fresh verify duty.
+      // gate | conflict | plain-coverage-lapse (BR#5226 fall-through) — the
+      // impl bounce (BR#3516 §5): blocked → in_progress with the fix-up
+      // brief; resolution invalidates the verdict — the card re-enters the
+      // queue only after a fresh verify. NO ask legs here either (BR#4960):
+      // the repair leg re-enters review through the normal in_review
+      // handoff, which auto-spawns the fresh verify duty.
       const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
       const bounceNote =
         bounceKind === "gate"
           ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
-          : `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`;
+          : bounceKind === "conflict"
+            ? `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
+            : `merge-train bounce (coverage) — PR #${pr} head moved past the accepted verdict${headSha ? ` ${String(headSha).slice(0, 9)}` : ""} — the verify pool re-verifies at the new head`;
       // BR#4981 state 7: a gate bounce whose mergeStateStatus is `blocked` is
       // branch protection the machine cannot satisfy (review/required checks
       // on the PR head) — surface it as the honest bypass-wait state instead
@@ -8162,7 +8265,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const laneNote =
         bounceKind === "gate"
           ? `PR #${pr} bounced (gate) — named defect; impl fixes it, then re-verify and re-queue at the back`
-          : `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`;
+          : bounceKind === "conflict"
+            ? `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`
+            : `PR #${pr} bounced (coverage) — head moved past the verdict; the verify pool re-verifies at the new head, then re-queue at the back`;
       this.version(lane.id, actor, `train:${kind}`, laneNote, { reason });
       return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason };
     }

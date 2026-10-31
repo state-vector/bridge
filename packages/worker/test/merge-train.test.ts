@@ -32,6 +32,8 @@ import {
   trainQueueRemainingReason,
   trainStopAskTitle,
   trainAwaitingReason,
+  trainAwaitingHumanLeg,
+  trainRequeueSwap,
   TRAIN_AWAITING_REASON_PREFIX,
   TRAIN_AWAITING_TTL_H_DEFAULT,
   TRAIN_AWAITING_GRACE_MS,
@@ -659,6 +661,57 @@ describe("clampAwaitingTtlHours (the park never expires itself — the knob feed
     expect(clampAwaitingTtlHours("abc")).toBe(24);
     expect(clampAwaitingTtlHours("9999")).toBe(720); // the 1..720 clamp
     expect(clampAwaitingTtlHours()).toBe(24);
+  });
+});
+
+// ---------- BR#5226: the human-leg park classes + the shared re-queue swap ----------
+
+describe("trainAwaitingHumanLeg (the ONLY Awaiting parks — BR#4960: human legs for genuine human cases)", () => {
+  it("human-resolved conflicts invalidate the verdict — conflict files on the event park", () => {
+    expect(trainAwaitingHumanLeg("head moved past the accepted verdict", ["src/a.ts"])).toBe(true);
+    expect(trainAwaitingHumanLeg(null, ["a.ts", "b.ts"])).toBe(true);
+    // zero files = no conflict invalidation
+    expect(trainAwaitingHumanLeg("head moved past the accepted verdict", [])).toBe(false);
+  });
+  it("a dismissed external review with no machine replacement parks; a plain machine lapse does not", () => {
+    expect(trainAwaitingHumanLeg("external review dismissed on the head move — no machine replacement", [])).toBe(true);
+    expect(trainAwaitingHumanLeg("the GitHub approval was dismissed when the head moved", [])).toBe(true);
+    expect(trainAwaitingHumanLeg("reviewer dismissed the review", [])).toBe(true);
+    // the plain lapse text the executor renders — machine-reviable, never a park
+    expect(trainAwaitingHumanLeg("PR #1 live head abc is not covered by the accepted verdict (leg 1 stamped def, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head", [])).toBe(false);
+    expect(trainAwaitingHumanLeg(null, [])).toBe(false);
+    expect(trainAwaitingHumanLeg("", [])).toBe(false);
+  });
+  it("the signing-environment class parks (the verify gate's only human escalation)", () => {
+    expect(trainAwaitingHumanLeg("signing environment broken — key unavailable", [])).toBe(true);
+    expect(trainAwaitingHumanLeg("commit author NO_USER — no signing identity", [])).toBe(true);
+    // an ordinary unsigned-commit gate defect is NOT the environment class
+    expect(trainAwaitingHumanLeg("PR #1 unmergeable — unsigned commits", [])).toBe(false);
+  });
+});
+
+describe("trainRequeueSwap (the shared in-place machine re-entry — BR#5226)", () => {
+  it("state queued, awaiting cleared, boost decayed, queued reason restored — stamps and the typed await_event untouched", () => {
+    const H = "a".repeat(40);
+    const m = trainRequeueSwap({
+      pr: { repo: "state-vector/bridge", number: 1, head_sha_at_acceptance: H, carry: [{ from_head: H, to_head: "b".repeat(40), prior_verdict_id: "BR#1", carried_ts: 1, via: "update-branch" }] },
+      merge_train: { state: "awaiting", bounce_kind: "coverage", awaiting: { at: 1, head_sha: H, verdict_id: "BR#9" }, pr: 1, repo: "state-vector/bridge" },
+      boosted: 123,
+      blocked: { reason: "Awaiting review (verdict BR#9, anchored at head aaaaaaaaa)", await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 1 } },
+    });
+    expect(m.merge_train.state).toBe("queued");
+    expect(m.merge_train.awaiting).toBeUndefined();
+    expect(m.boosted).toBeUndefined();
+    expect(m.blocked.reason).toBe("merge-train: queued");
+    // the machine proxy exit + the verdict stamps survive the swap
+    expect(m.blocked.await_event).toEqual({ event: "pr_merged", repo: "state-vector/bridge", n: 1 });
+    expect(m.pr.head_sha_at_acceptance).toBe(H);
+    expect(m.pr.carry).toHaveLength(1);
+  });
+  it("tolerates a bare meta (no merge_train, no blocked box) — the swap still renders the queued state", () => {
+    const m = trainRequeueSwap({});
+    expect(m.merge_train.state).toBe("queued");
+    expect(m.blocked.reason).toBe("merge-train: queued");
   });
 });
 

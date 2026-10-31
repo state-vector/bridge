@@ -2272,6 +2272,41 @@ export function trainAwaitingReason(verdictId: string | null, headSha: string | 
   return `Awaiting review (verdict ${verdictId ?? "unrecorded"}, anchored at head ${String(headSha ?? "").slice(0, 9) || "unknown"})`;
 }
 
+/** BR#5226: the coverage-bounce classes that genuinely need a HUMAN leg — the
+ *  only Awaiting parks (BR#4960: a human is involved only where a machine
+ *  verdict cannot be). A machine-clean lapse (the head moved, no files, the
+ *  verdict merely lapsed) is the verify pool's business and bounces to impl
+ *  instead. These classes invalidated the verdict by HUMAN action or name a
+ *  human-only environment defect:
+ *  - human-resolved conflicts (the event carries conflict files — resolution
+ *    is authored code, the verdict is dead at the new head);
+ *  - a dismissed external review with no machine replacement;
+ *  - the signing-environment class (key unavailable / NO_USER — the verify
+ *    gate's only human escalation). */
+export const TRAIN_HUMAN_LEG_DISMISS_RE =
+  /\bdismiss\w*[\s\S]{0,60}\b(?:review|approval)s?\b|\b(?:review|approval)s?\b[\s\S]{0,60}\bdismiss\w*\b/i;
+export const TRAIN_HUMAN_LEG_SIGNING_RE = /\bsigning environment\b|\bkey unavailable\b|\bNO_USER\b/i;
+
+export function trainAwaitingHumanLeg(defect: string | null | undefined, conflictFiles: readonly string[]): boolean {
+  if (conflictFiles.length) return true;
+  const d = String(defect ?? "");
+  return TRAIN_HUMAN_LEG_DISMISS_RE.test(d) || TRAIN_HUMAN_LEG_SIGNING_RE.test(d);
+}
+
+/** BR#5226: the in-place re-queue swap every machine re-entry shares —
+ *  blocked→blocked is an illegal edge, so the parked reason refreshes under
+ *  the card: merge_train back to `queued`, the awaiting stamp cleared, the
+ *  BR#4068 boost decayed (re-entry rejoins the normal ranks), the typed
+ *  pr_merged await_event and every stamp untouched. */
+export function trainRequeueSwap(meta: any): any {
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  m.merge_train = { ...(m.merge_train ?? {}), state: "queued" };
+  delete m.merge_train.awaiting;
+  delete m.boosted;
+  m.blocked = { ...(m.blocked ?? {}), reason: MERGE_TRAIN_QUEUED_REASON };
+  return m;
+}
+
 /** The Awaiting park's visible-age window — knob `train.awaiting_ttl_h`
  *  (legacy `train.review_ask_ttl_h` falls back), clamped 1..720, default 24.
  *  The park NEVER expires itself (BR#4960: visibility without interruption —
