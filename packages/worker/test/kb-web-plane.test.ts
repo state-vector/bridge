@@ -234,23 +234,31 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
-    // BACKLOG: the count + how many need reviews
-    expect(trainPanelSrc).toMatch(/queued\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
+    // BACKLOG: one row of colored blocks in walk order (BR#5114 final):
+    // green=ready (merges this pass), amber=waiting, red=conflict,
+    // grey=needs-review; head ringed; click opens the card
+    expect(trainPanelSrc).toMatch(/train-blocks/);
+    expect(trainPanelSrc).toMatch(/tb-\$\{cls\}/);
+    expect(trainPanelSrc).toMatch(/l\.queue_facts\?\.entries\.find/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
+    expect(trainPanelSrc).toContain("merges this pass");
     expect(trainPanelSrc).toContain("stopped — main is red");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders Awaiting parks as age chips, worst (lapsed) tone winning — the force-review queue replaces the ask band (BR#4962 per BR#4960)", () => {
-    // the DO sorts awaiting parks oldest-first; the panel renders the tones
-    // only — no parked card may sit without a visible age, and a lapsed park
-    // (past TTL + grace) must read urgent, aging warn. The ask-era chips are
-    // GONE: zero asks ride the lanes (BR#4960), the parks are the visibility.
+  it("renders Awaiting parks as blocks in the backlog row — the force-review queue in the one-row block language (BR#4962 per BR#4960, BR#5114 form)", () => {
+    // The DO sorts awaiting parks oldest-first; the panel renders them as
+    // blocks AFTER the queue blocks (divider between): grey (parked), amber
+    // (aging, past the review window), red (lapsed, past window + grace) —
+    // no parked card may sit without a visible state, click opens the card,
+    // age + anchored verdict ride the tooltip. No text chips, no commentary.
     expect(trainPanelSrc).toMatch(/\(l\.awaiting \?\? \[\]\)\.map/);
-    expect(trainPanelSrc).toMatch(/a\.lapsed \? "urgent" : a\.aging \? "warn" : "scope"/);
+    expect(trainPanelSrc).toMatch(/tb-awaiting\$\{a\.lapsed \? " tb-awaiting-lapsed" : a\.aging \? " tb-awaiting-aging" : ""\}/);
+    expect(trainPanelSrc).toMatch(/train-block-gap/);
     expect(trainPanelSrc).toMatch(/age\(Date\.now\(\) - a\.age_ms, Date\.now\(\)\)/);
-    expect(trainPanelSrc).toContain("◉ awaiting");
     expect(trainPanelSrc).toContain("force-review from the backlog");
+    expect(trainPanelSrc).not.toContain("◉ awaiting");
     // a parked card keeps the lane's signal lit even with an empty queue
     expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
   });

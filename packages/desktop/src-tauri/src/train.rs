@@ -40,8 +40,8 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, drain_burst_decision, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
+    classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
@@ -818,6 +818,19 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     }
 }
 
+/// BR#5190: the root-fix fast lane's stop carve-out condition — the DERIVED
+/// queue's head is the bound root-fix card (the hub offers only tier 0 while
+/// the base is red, so "head is the cure" == "a cure is in flight"). Only
+/// then does the stopped lane fall through to the walk, so the gate can see
+/// base red + the cure's head.
+fn root_fix_head_under_stop(lane: &Value) -> bool {
+    lane.get("queue")
+        .and_then(|q| q.as_array())
+        .and_then(|q| q.first())
+        .map(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// BR#4996: one gate-clean queue head, classified in phase A of the drain
 /// walk, eligible for phase B's batch selection and phase C's back-to-back
 /// landing. Landing order is queue order (oldest-first).
@@ -828,6 +841,7 @@ struct BatchCandidate {
     leg_number: usize,
     pr: i64,
     head_sha: String,
+    root_fix: bool,
 }
 
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
@@ -842,6 +856,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
             log(Some(key), "main green again — stop cleared, lane released");
+            return Ok(());
+        }
+        // BR#5190 root-fix fast lane: while the line holds, a bound root-fix
+        // card at the queue head falls through to the walk below — the gate
+        // sees base red + the cure's head and either fast-tracks the merge
+        // (head green) or opens the human fast-lane ask (the circular
+        // deploy-health class). Without this carve-out the stop arm returned
+        // before the queue walk, so the fast lane was unreachable exactly
+        // when it mattered. The bisect walk is PARKED while the cure is in
+        // flight — its state lives hub-side (stop.bisect) and resumes once
+        // the fix lands or the head stops being the cure.
+        if root_fix_head_under_stop(lane) {
+            log(Some(key), "root-fix card heads the queue — fast lane under stop: falling through to the walk (bisect parked, BR#5190)");
         } else {
             // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
             // drive the walk ONE step per tick while the line holds (state
@@ -852,14 +879,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             log(Some(key), &format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") }));
+            return Ok(());
         }
-        return Ok(());
     }
 
     // ---- post-stop residue: the stop cleared (main green again) but the
     // in-flight record is the broken merge commit — never poll it toward a
-    // landing. The culprit card was bounced at stop time; lane is idle. ----
-    if lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("stopped") {
+    // landing. The culprit card was bounced at stop time; lane is idle.
+    // BR#5190: runs ONLY when the stop is actually gone — a live stop that
+    // fell through above (root-fix head) must not read as residue. ----
+    if lane.get("stop").map(|s| s.is_null()).unwrap_or(true)
+        && lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("stopped")
+    {
         log(Some(key), "stop cleared — stale in-flight record; lane idle (culprit card re-enters via verify)");
         release_if_idle(ctx, key, repo, base)?;
         return Ok(());
@@ -967,6 +998,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         String::new()
     };
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
+    // BR#5114: per-entry gate verdicts in walk (rank) order — stamped onto
+    // the lane at the end of the walk; the panel renders them as the queue
+    // block row (ready blocks = the current batch, Ray 2026-10-30: "we
+    // merge what we can in batches").
+    let mut qfacts: Vec<serde_json::Value> = Vec::new();
     if queue.is_empty() {
         if pass_merged > 0 {
             // a bursting lane with an empty queue still owes its settle —
@@ -978,9 +1014,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         return Ok(());
     }
     let mut candidates: Vec<BatchCandidate> = Vec::new();
-    // the walk's lazily-read base verdict (BR#4996) — Some after the first
-    // gate-reaching entry, shared by every candidate in the walk
-    let mut base_cache: Option<MainVerdict> = None;
+    // the walk's lazily-read base verdict + the base's failing check NAMES
+    // (BR#4996: Some after the first gate-reaching entry, shared by every
+    // candidate in the walk; BR#5190: the names ride the root-fix gate)
+    let mut base_cache: Option<(MainVerdict, Vec<String>)> = None;
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1111,12 +1148,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // pass hasn't landed (BR#3009: the pass's FIRST landing still gates
         // on it), FORCED green mid-pass (destination-green is the pass
         // settle's, BR#4934 — the per-member tip RED check owns the stop).
+        // BR#5190: the base's failing check NAMES ride the gate too — the
+        // root-fix fast lane matches the circular deploy-health class off
+        // them (the receipt names the red the fix cures).
         if base_cache.is_none() {
             let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-            let verdict = if pass_merged > 0 { MainVerdict::Green } else { classify_main_check_runs(&ctx.check_runs(repo, &base_sha)).verdict };
-            base_cache = Some(verdict);
+            let base_class = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+            let verdict = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict };
+            let red_names = if pass_merged > 0 {
+                Vec::new()
+            } else {
+                base_class.red.iter().map(|r| r.name.clone()).collect()
+            };
+            base_cache = Some((verdict, red_names));
         }
-        let gate_base = base_cache.clone().unwrap_or(MainVerdict::Green);
+        let (gate_base, base_red_names) = base_cache.clone().unwrap_or((MainVerdict::Green, Vec::new()));
+        // BR#5190: the candidate IS the main-breakage fix iff it is the
+        // bound root-fix card (tags + meta.root_fix binding) — the executor
+        // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
+        // on the card row, the binding under meta.root_fix).
+        let root_fix = is_root_fix_card(&card);
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
@@ -1130,6 +1181,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             commits: &commits,
             head_checks: &head_checks,
             leg_number: Some(leg_number),
+            root_fix,
+            base_red_names: &base_red_names,
         });
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
@@ -1140,6 +1193,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
+        qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
+            MergeAction::Merge { .. } => "ready",
+            MergeAction::Bounce { bounce_kind, .. } => match bounce_kind {
+                crate::train_gate::BounceKind::Conflict => "conflict",
+                crate::train_gate::BounceKind::Coverage => "needs-review",
+                _ => "blocked",
+            },
+            MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            _ => "blocked",
+        } }));
 
         // ONE write action per tick (strict serialization): a Bounce /
         // HumanLeg / CloseSuperseded fires ON SIGHT and the walk ends — the
@@ -1164,6 +1227,31 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 continue;
             }
             MergeAction::HumanLeg { reason } => {
+                // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
+                // deploy-health class — the deterministic one-click merge ask
+                // (title byte-identical to the hub's, ask-dedupe keys on exact
+                // wording). First option IS the recommendation: one click
+                // merges the cure onto the red base.
+                if root_fix {
+                    renew_lease(ctx, repo, base);
+                    let fast_details = [
+                        format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
+                        "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
+                        "Merging the cure is what turns main green again; declining holds the line (bisect stays parked on the cure).".to_string(),
+                    ].join("\n\n");
+                    ctx.mcp("ask_agent", json!({
+                        "to": "human",
+                        "question": root_fix_fast_lane_title(repo, pr),
+                        "reason": reason,
+                        "details": fast_details,
+                        "options": ["Merge the cure now", "Not yet — hold the line"],
+                        "artefact_id": head_id,
+                    }))?;
+                    ctx.note(&format!("root-fix fast lane: filed the one-click merge ask for PR #{pr} (circular deploy-health class)"));
+                    log(Some(key), &format!("root-fix fast lane: human merge ask filed for PR #{pr} — the train cannot merge through the circular gate"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
                 renew_lease(ctx, repo, base);
                 ctx.mcp("ask_agent", json!({
@@ -1246,11 +1334,20 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     leg_number,
                     pr,
                     head_sha: head_sha.clone(),
+                    root_fix,
                 });
                 continue;
             }
         }
     }
+    // BR#5114: stamp this walk's per-entry verdicts (rank order preserved —
+    // collected as the walk touched them) so the panel's queue blocks show
+    // the truth of this pass: which entries are ready (the next batch) and
+    // which wait/leave. One write per tick; failures never break the tick.
+    if !qfacts.is_empty() {
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts }));
+    }
+
 
     // ---- PHASE B (BR#4996): select the batch — the maximal set of MUTUALLY
     // non-conflicting candidates, queue order = landing order. Conflict
@@ -1411,17 +1508,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // settle feed (the hub flips bursting → awaiting-ci on the first
         // settle poll, not here).
         pass_merged = pass_merged.saturating_add(1);
-        ctx.mcp("train_event", json!({
+        // BR#5190: the event carries root_fix so the hub knows the
+        // lane was cured by this landing (settle copy + fast receipt).
+        let mut merged_ev = json!({
             "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder,
             "burst_merged": pass_merged, "burst_cap": burst_cap, "burst_settling": false,
             "batch_members": batch_prs,
-        }))?;
+        });
+        if cand.root_fix {
+            merged_ev.as_object_mut().unwrap().insert("root_fix".into(), json!(true));
+        }
+        ctx.mcp("train_event", merged_ev)?;
         tip_sha = merge_sha.clone();
-        ctx.note(&format!("merged PR #{pr} as {}", &tip_sha[..tip_sha.len().min(9)]));
+        // BR#5190: the fast-track receipt rides the merged note when this
+        // landing IS the cure (root_fix wired into the event above).
+        let fast_note = if cand.root_fix { " — ROOT-FIX FAST-TRACK (BR#5189): the cure is in flight; the line greens when its CI settles" } else { "" };
+        ctx.note(&format!("merged PR #{pr} as {}{}", &tip_sha[..tip_sha.len().min(9)], fast_note));
         log(
             Some(key),
             &format!(
-                "PR #{pr} merged as {} — batch member {}/{} ({pass_merged} merged this pass, cap {}): no settle between members",
+                "PR #{pr} merged as {} — batch member {}/{} ({pass_merged} merged this pass, cap {}): no settle between members{fast_note}",
                 &tip_sha[..tip_sha.len().min(9)],
                 bi + 1,
                 batch.len(),

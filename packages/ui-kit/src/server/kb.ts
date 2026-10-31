@@ -209,7 +209,10 @@ export interface KbTrainLane {
   /** how many queued cards are waiting on a fresh review (the honest
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
-  queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
+  /** BR#5190 four-tier ladder: root_fix (the bound main-breakage fix, tier 0)
+   *  > boosted (the human/starvation boost stamp) > critical (manual
+   *  meta.priority rung) > normal; under a stopped lane only root_fix rides. */
+  queue: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true; pr?: number }[];
   /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
    *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
    *  gone: zero asks ride the lanes): one chip per parked card — amber
@@ -217,6 +220,11 @@ export interface KbTrainLane {
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
   awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
+  /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
+   *  (rank) order — the queue block row. cls: ready (merges this pass) |
+   *  waiting (checks/mergeability pending) | conflict | needs-review |
+   *  blocked. null until the first executor tick stamps them. */
+  queue_facts?: { at: number; entries: { id: string; pr?: number; cls: string }[] } | null;
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

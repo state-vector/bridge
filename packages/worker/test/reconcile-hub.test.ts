@@ -250,3 +250,63 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repoF)).length).toBe(1);
   });
 });
+
+// ---------- BR#5151: standing lane cards survive reconcile ----------
+
+describe("BR#5151 lane survival (real bundled worker)", () => {
+  it("a lane card with a stamped provenance row and a vanished bootstrap PR is never closed, never dutied — lease intact", async () => {
+    const repo = "state-vector/lane-survival";
+    // the standing lane card + a live lease: the state under protection
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    expect(lane.body.error ?? "").toBe("");
+    const laneId = String(lane.body.id);
+    await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-keep", required_workflows: ["Test"] });
+    // the incident's foothold: a PR leg on the lane + a provenance row for it
+    const cur = (await kbJson("/get", { id: laneId })).body;
+    const upd = await kbJson("/update", { id: laneId, meta: { ...cur.meta, pr: { repo, number: 5153 } }, actor: "drill" });
+    expect(upd.status, `lane meta.pr update failed: ${JSON.stringify(upd.body)}`).toBeLessThan(400);
+    const merged = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-keep", pr: 5153, merge_sha: "2".repeat(40) });
+    expect(merged.body.error ?? "", `stamp merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // reconcile: the PR is NOT in the open list — reported twice (past the
+    // two-consecutive guard). The provenance row is exactly what retired the
+    // BR#5050 lane; the lane flag must make both runs account-and-move-on.
+    const r1 = await report(repo, []);
+    expect(r1.status).toBe(200);
+    expect(r1.body.ok).toBe(true);
+    expect(r1.body.accounting.reverse_lane_exempt).toBe(1);
+    expect(r1.body.accounting.reverse_closed).toBe(0);
+    const r2 = await report(repo, []);
+    expect(r2.body.ok).toBe(true);
+    expect(r2.body.accounting.reverse_closed).toBe(0);
+    expect(r2.body.accounting.reverse_dutied).toBe(0);
+
+    // the lane card survived: non-terminal, meta.lane intact, LEASE INTACT
+    const after = (await kbJson("/get", { id: laneId })).body;
+    expect(["todo", "in_progress", "in_review", "blocked"]).toContain(after.status);
+    expect(after.meta?.lane?.key).toBe(`${repo}@main`);
+    expect(after.meta?.lease?.holder).toBe("gw-keep");
+    // and no ruling duty was spawned at it
+    expect(((await dutiesOf(repo)) as any[]).filter((d) => d.kind === "reverse")).toHaveLength(0);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-keep" });
+  });
+
+  it("a lane card bound to an OPEN actionable PR is accounted bound — reconcile never spawns a verify duty at it", async () => {
+    const repo = "state-vector/lane-forward";
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    const laneId = String(lane.body.id);
+    const cur = (await kbJson("/get", { id: laneId })).body;
+    const upd = await kbJson("/update", { id: laneId, meta: { ...cur.meta, pr: { repo, number: 5154 } }, actor: "drill" });
+    expect(upd.status).toBeLessThan(400);
+    // approved + mergeable + 72h old: on ANY normal bound card this spawns
+    // the standard verify duty; on a lane card it must not
+    const r = await report(repo, [prRow(5154, { updatedAt: iso(72) })]);
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(r.body.accounting.bound).toBe(1);
+    expect(r.body.accounting.spawned).toBe(0);
+    expect((await dutiesOf(repo) as any[]).length).toBe(0);
+    const after = (await kbJson("/get", { id: laneId })).body;
+    expect(after.status).toBe("blocked");
+  });
+});
