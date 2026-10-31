@@ -524,6 +524,10 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tb-blocked { background: repeating-linear-gradient(45deg, var(--text-faint, #8b94a7), var(--text-faint, #8b94a7) 3px, transparent 3px, transparent 6px); }
 .tb-unknown { background: transparent; border: 1px solid var(--text-faint, #8b94a7); }
 .tb-head { box-shadow: 0 0 0 2px var(--accent, #6ea8fe); }
+.tb-awaiting { background: var(--text-faint, #8b94a7); opacity: 0.55; }
+.tb-awaiting-aging { background: var(--amber, #d29a4b); opacity: 0.8; }
+.tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
+.train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
