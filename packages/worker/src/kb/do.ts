@@ -263,6 +263,21 @@ function reconcileTrackingBody(repo: string, pr: number, title: string | null, w
   return `Reconcile binding card (BR#4170) — ${repo}#${pr}${title ? ` "${title}"` : ""}.\n\nGitHub is the source of truth for this PR; this card is its board projection (meta.pr binds them). Why it exists: ${why}\nPR: ${url}\n\nWhat happens next is automatic while the PR stays actionable: once it is approved+mergeable with a clean destination, the hub spawns the standard verify duty as a child of THIS card (5c gate) — its ACCEPT queues this card onto the merge train; the train merges and closes it. You never merge, never queue by hand.\n\nIf this PR should not be carried on the board at all, rule it off the record instead of closing silently: reconcile_ignore with {"repo": "${repo}", "pr": ${pr}, "reason": "<why>"} — the report then accounts it as ignored-with-reason.`;
 }
 
+/** BR#4996: the batch composition riding a train:merged event — the batch's
+ *  PR numbers in landing order. Sanitized fail-closed: positive integers
+ *  only, deduped keeping first occurrence, order kept; absent/junk → null
+ *  (legacy ledger rows stay byte-identical). */
+function sanitizeBatchMembers(raw: unknown): number[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: number[] = [];
+  for (const v of raw) {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) continue;
+    if (!out.includes(n)) out.push(n);
+  }
+  return out.length ? out : null;
+}
+
 /** BR#3787 layer 2 — repair rate limit: a device may re-vend its own row at
  *  most this many times per rolling hour. A crash loop must not mint
  *  infinitely; past the limit the device parks and retries later. */
@@ -8019,6 +8034,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const burstMerged = body.burst_merged != null ? Math.max(0, Math.floor(Number(body.burst_merged) || 0)) : null;
       const burstCap = body.burst_cap != null ? Math.max(0, Math.floor(Number(body.burst_cap) || 0)) : null;
       const burstSettling = body.burst_settling === true;
+      // BR#4996 batch payload: the batch composition — the selected members'
+      // PR numbers in landing order. Sanitized (positive ints, deduped,
+      // order kept); absent → legacy byte-identical rows.
+      const batchMembers = sanitizeBatchMembers(body.batch_members);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
@@ -8079,7 +8098,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // sees the PR MERGED, train.rs:848).
       if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined }, chain.task_id);
+      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}) }, chain.task_id);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
         : burstSettling

@@ -741,6 +741,56 @@ pub fn first_red_index(reds: &[bool]) -> Option<usize> {
     reds.iter().position(|r| *r)
 }
 
+/// BR#4996 batch inputs: one candidate head's changed-file set (`git diff
+/// --name-only merge-base(origin/base, head)..head`), keyed by file path.
+pub type FileSet = std::collections::BTreeSet<String>;
+
+/// BR#4996: conflict pairs among batch candidates, from their changed-file
+/// sets — two heads are pair-candidates when their sets INTERSECT. A pure
+/// set law, testable without git; the executor's plumbing that PRODUCES the
+/// sets fails closed per BR#3935 (an unreadable head never yields a silent
+/// empty set), and each intersecting pair is merge-tree-confirmed before it
+/// gates a landing (train.rs).
+pub fn conflicts_from_file_sets(file_sets: &[FileSet]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..file_sets.len() {
+        for j in (i + 1)..file_sets.len() {
+            if file_sets[i].iter().any(|f| file_sets[j].contains(f)) {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// The batch-merge law (BR#4996, Ray ruling 2026-10-29, amending the
+/// BR#4934 burst-drain): select the maximal set of MUTUALLY non-conflicting
+/// heads from the gate-clean queue, in queue order — which is landing order
+/// (oldest-first). Greedy: a head joins the batch unless it conflicts
+/// (either pair orientation) with an already-selected head; `clean[i] ==
+/// false` excludes just that member (fail-closed: only KNOWN-clean heads
+/// are eligible — an exclusion never poisons its neighbours, so a chain
+/// A↔B↔C lands [A, C] and skips only B); `cap > 0` binds when the batch
+/// reaches it, `cap == 0` is unlimited.
+pub fn select_batch(clean: &[bool], conflict_pairs: &[(usize, usize)], cap: usize) -> Vec<usize> {
+    let mut selected: Vec<usize> = Vec::new();
+    for (i, ok) in clean.iter().enumerate() {
+        if !ok {
+            continue;
+        }
+        if cap > 0 && selected.len() >= cap {
+            break;
+        }
+        let clashing = selected.iter().any(|&s| {
+            conflict_pairs.iter().any(|&(a, b)| (a == i && b == s) || (a == s && b == i))
+        });
+        if !clashing {
+            selected.push(i);
+        }
+    }
+    selected
+}
+
 /// core.ts mergeSweepHumanLegTitle (953): deterministic class-ask title,
 /// ≤240 chars, ends "?" (the ask contract).
 pub fn merge_sweep_human_leg_title(repo: &str, reasons: &[String]) -> String {
@@ -1289,6 +1339,51 @@ mod tests {
         assert_eq!(first_red_index(&[false, false]), None);
         assert_eq!(first_red_index(&[]), None);
         assert_eq!(first_red_index(&[true]), Some(0));
+    }
+
+    #[test]
+    fn select_batch_skips_conflicting_members_greedily() {
+        // 0 conflicts with 2: the batch is [0, 1]; 2 waits for the next pass
+        assert_eq!(select_batch(&[true, true, true], &[(0, 2)], 0), vec![0, 1]);
+        // chain 0+1 conflict, 1+2 conflict: only 1 is skipped — [0, 2] land
+        // together (conflicts are checked against SELECTED heads only)
+        assert_eq!(select_batch(&[true, true, true], &[(0, 1), (1, 2)], 0), vec![0, 2]);
+        // both pair orientations are checked: (2, 0) is the same conflict
+        assert_eq!(select_batch(&[true, true, true], &[(2, 0)], 0), vec![0, 1]);
+    }
+
+    #[test]
+    fn select_batch_cap_binds_and_zero_is_unlimited() {
+        assert_eq!(select_batch(&[true, true, true], &[], 2), vec![0, 1]);
+        assert_eq!(select_batch(&[true, true, true], &[], 0), vec![0, 1, 2]);
+        assert_eq!(select_batch(&[true], &[], 0), vec![0]);
+        assert_eq!(select_batch(&[], &[], 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn select_batch_fail_closed_not_known_clean_excludes_just_that_member() {
+        assert_eq!(select_batch(&[false, true, true], &[], 0), vec![1, 2]);
+        assert_eq!(select_batch(&[false, false, false], &[], 0), Vec::<usize>::new());
+        // an excluded member shields nothing: conflicts are vs SELECTED only
+        assert_eq!(select_batch(&[false, true], &[(0, 1)], 0), vec![1]);
+    }
+
+    #[test]
+    fn conflicts_from_file_sets_pairwise_intersection() {
+        let sets: Vec<FileSet> = vec![
+            ["a.rs", "b.ts"].iter().map(|s| s.to_string()).collect(),
+            ["c.rs"].iter().map(|s| s.to_string()).collect(),
+            ["b.ts", "d.md"].iter().map(|s| s.to_string()).collect(),
+        ];
+        assert_eq!(conflicts_from_file_sets(&sets), vec![(0, 2)]);
+        let disjoint: Vec<FileSet> = vec![
+            ["a.rs"].iter().map(|s| s.to_string()).collect(),
+            ["b.rs"].iter().map(|s| s.to_string()).collect(),
+        ];
+        assert!(conflicts_from_file_sets(&disjoint).is_empty());
+        // an empty set (no files changed) conflicts with nothing
+        let with_empty: Vec<FileSet> = vec![FileSet::new(), ["a.rs"].iter().map(|s| s.to_string()).collect()];
+        assert!(conflicts_from_file_sets(&with_empty).is_empty());
     }
 
     // ---------- BR#5190 root-fix fast lane ----------

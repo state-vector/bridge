@@ -1573,6 +1573,51 @@ export function firstRedIndex(reds: boolean[]): number | null {
   return i === -1 ? null : i;
 }
 
+/** BR#4996 batch inputs: one candidate head's changed-file set (`git diff
+ *  --name-only merge-base(origin/base, head)..head`), keyed by file path. */
+export type FileSet = Set<string>;
+
+/** BR#4996: conflict pairs among batch candidates, from their changed-file
+ *  sets — two heads are pair-candidates when their sets INTERSECT. A pure
+ *  set law, testable without git; the executor's plumbing that PRODUCES the
+ *  sets fails closed per BR#3935 (train.rs), and each intersecting pair is
+ *  merge-tree-confirmed before it gates a landing. Mirror of train_gate.rs
+ *  conflicts_from_file_sets — one law, two implementations, fixture-locked. */
+export function conflictsFromFileSets(fileSets: FileSet[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < fileSets.length; i++) {
+    for (let j = i + 1; j < fileSets.length; j++) {
+      for (const f of fileSets[i]) {
+        if (fileSets[j].has(f)) {
+          out.push([i, j]);
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** The batch-merge law (BR#4996, Ray ruling 2026-10-29, amending the
+ *  BR#4934 burst-drain): select the maximal set of MUTUALLY non-conflicting
+ *  heads from the gate-clean queue, in queue order — which is landing order
+ *  (oldest-first). Greedy: a head joins the batch unless it conflicts
+ *  (either pair orientation) with an already-selected head; clean[i] ===
+ *  false excludes just that member (fail-closed: only KNOWN-clean heads are
+ *  eligible — an exclusion never poisons its neighbours, so a chain A↔B↔C
+ *  lands [A, C] and skips only B); cap > 0 binds when the batch reaches it,
+ *  cap === 0 is unlimited. Mirror of train_gate.rs select_batch. */
+export function selectBatch(clean: boolean[], conflictPairs: [number, number][], cap: number): number[] {
+  const selected: number[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    if (!clean[i]) continue;
+    if (cap > 0 && selected.length >= cap) break;
+    const clashing = selected.some((s) => conflictPairs.some(([a, b]) => (a === i && b === s) || (a === s && b === i)));
+    if (!clashing) selected.push(i);
+  }
+  return selected;
+}
+
 /** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
  *  the caller fails loud, a guessed lane config would gate the wrong CI. */
 export function laneOfMeta(meta: any): LaneSpec | null {
@@ -1596,6 +1641,7 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
     `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_"}`,
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
     `**Burst drain (BR#4934):** up to ${lane.burst_max === 0 ? "unlimited" : lane.burst_max} gate-clean heads merge back-to-back per pass, then ONE settle wait on the final merge commit; red anywhere stops the line instantly; a red settle bisects the pass to ONE culprit. Rebase work rides the settle wait.`,
+    `**Batch merges (BR#4996):** each pass lands a maximal set of MUTUALLY non-conflicting gate-clean heads back-to-back (conflict-checked via changed-file sets + merge-tree, fail-closed) and settles ONCE; a head conflicting with a selected member waits for the next pass.`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
     `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`bridge train\` on a gateway to work it.`,

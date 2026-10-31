@@ -947,6 +947,31 @@ included) as "unmergeable — CONFLICTING".
   BR#4068 boost while the wrongly stop-bounced final card re-parks to close on
   the next green settle; probes that stall past the CI bound (or leave nothing
   re-runnable) stamp the walk INCONCLUSIVE and the pass bounces oldest-first.
+- **Batch merges: one settle window per batch, not per merge (BR#4996, Ray
+  ruling 2026-10-29)** — the drain classifies the whole queue first, then
+  lands a maximal set of MUTUALLY non-conflicting gate-clean heads
+  back-to-back (`select_batch` + `conflicts_from_file_sets`, one law with
+  two fixture-locked implementations, Rust executor-side and TypeScript
+  hub-side like the gate): conflict pairs come from the candidates'
+  changed-file sets (`git diff --name-only merge-base..head`), each
+  intersecting pair confirmed head-vs-head with `git merge-tree
+  --write-tree` (BR#3935 fail-closed — a probe that cannot run counts as
+  conflicting, an unreadable file set excludes just that member as
+  not-known-clean), and queue order is landing order (oldest-first). A
+  transient Skip/Note head no longer settles the pass or ends the tick —
+  the walk classifies past it (the BR#4934 behavior starved a whole batch
+  behind one skipped head); bounces, human legs and superseded closes still
+  fire on sight. The per-member merge leg law is unchanged: the pass's
+  FIRST landing still gates on the real base verdict (BR#3009), the burst
+  cap and the mid-drain tip RED check re-run before EACH member (GH#2261),
+  the mergeability recompute after a machine update-branch is polled
+  in-tick (lease-bounded ladder) instead of deferred, and every merged
+  event carries `batch_members` — the batch composition in landing order,
+  sanitized into the provenance ledger (positive ints, deduped, order
+  kept; absent payload keeps legacy rows byte-identical). A merge refused
+  mid-batch soft-breaks: the landed prefix settles, the refused member
+  waits for the next pass (a fresh pass keeps the loud tick error); the
+  pass still runs exactly ONE settle wait, on the FINAL merge commit.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the

@@ -269,6 +269,39 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(act.last_event.task_id).toBe(card);
   });
 
+  it("the batch composition rides the merged event: batch_members is sanitized into the ledger detail (BR#4996)", async () => {
+    const repo = "state-vector/batch-ledger";
+    const card = await queueViaAccept({ repo, pr: 2650, head: "d".repeat(40), title: "IMPL: batch ledger drill" });
+    await acquire(repo, "gw-batch");
+    const M = "e".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-batch",
+      pr: 2650, merge_sha: M, head_sha: "d".repeat(40), task_id: card,
+      burst_merged: 2, burst_cap: 10, burst_settling: false,
+      batch_members: [2610, 0, -3, "x", 2611, 2610], // junk filtered, deduped, order kept
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const hist = (await kbJson("/train.history", { repo })).body.events;
+    const row = hist.find((e: any) => e.kind === "merged" && e.pr === 2650 && e.merge_sha === M);
+    expect(row).toBeTruthy();
+    expect(row.detail.batch_members).toEqual([2610, 2611]);
+
+    // absent payload → legacy byte-identical: no batch_members key at all.
+    // BR#5151 (a PR merges exactly once) forbids a second merged event with a
+    // different sha for the same PR — the legacy cadence rides a fresh PR.
+    const legacyCard = await queueViaAccept({ repo, pr: 2651, head: "d".repeat(40), title: "IMPL: batch ledger drill (legacy cadence)" });
+    const legacy = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-batch",
+      pr: 2651, merge_sha: "f".repeat(40), head_sha: "d".repeat(40), task_id: legacyCard,
+    });
+    expect(legacy.body.error ?? "", `legacy train:merged failed: ${JSON.stringify(legacy.body)}`).toBe("");
+    const hist2 = (await kbJson("/train.history", { repo })).body.events;
+    const row2 = hist2.find((e: any) => e.kind === "merged" && e.pr === 2651 && e.merge_sha === "f".repeat(40));
+    expect(row2).toBeTruthy();
+    expect("batch_members" in row2.detail).toBe(false);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-batch" });
+  });
+
   it("a merge-tree conflict bounces the head card with the fix-up brief (verdict INVALID) and the queue advances", async () => {
     const repo = "state-vector/lane-bounce";
     const c1 = await queueViaAccept({ repo, pr: 2601, head: "b".repeat(40), title: "IMPL: bounce drill head" });

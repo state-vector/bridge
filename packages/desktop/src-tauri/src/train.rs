@@ -618,6 +618,50 @@ impl Ctx {
         self.sh("git", &["fetch", "--quiet", "origin", &format!("+refs/pull/{n}/head")]).map(|_| ())
     }
 
+    /// BR#4996 batch plumbing: a candidate head's changed-file set — `git
+    /// diff --name-only merge-base(origin/base, head)..head`. The PR head is
+    /// fetched EXPLICITLY first (BR#3935); a git failure is an Err, never a
+    /// silently-empty set (the caller excludes the member as not-known-clean).
+    fn pr_file_set(&self, base: &str, n: i64, head_sha: &str) -> Result<crate::train_gate::FileSet, String> {
+        self.fetch_pr_head(n)?;
+        let mb = self.sh("git", &["merge-base", &format!("origin/{base}"), head_sha])?;
+        let out = self.sh("git", &["diff", "--name-only", &mb, head_sha])?;
+        Ok(out.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    }
+
+    /// BR#4996 batch plumbing: do two candidate heads conflict head-vs-head?
+    /// Three-valued (BR#3935): true / false / CANNOT-READ (Err) — a merge-tree
+    /// exit ∉ {0, 1} is never folded into a conflict verdict.
+    fn heads_conflict(&self, a: &str, b: &str) -> Result<bool, String> {
+        for obj in [a.to_string(), b.to_string()] {
+            let known = Command::new("git")
+                .args(["cat-file", "-e", &format!("{obj}^{{commit}}")])
+                .current_dir(&self.workdir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !known {
+                return Err(format!(
+                    "conflict probe aborted: {obj} is not a commit object in {} — fetch it explicitly first (BR#3935: merge-tree cannot be trusted to say so)",
+                    self.workdir
+                ));
+            }
+        }
+        let out = Command::new("git")
+            .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", a, b])
+            .current_dir(&self.workdir)
+            .output()
+            .map_err(|e| e.to_string())?;
+        match out.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            code => Err(format!(
+                "git merge-tree {a} {b} failed ({code:?}) — not a conflict verdict, fail-closed: {}",
+                trunc(String::from_utf8_lossy(&out.stderr).trim(), 300)
+            )),
+        }
+    }
+
     /// Ancestry is a three-valued answer: true / false / CANNOT-READ. Only
     /// the first two are bools — a git failure (exit ∉ {0, 1}, e.g. a bad
     /// object) is an Err, never a silent `false` (BR#3935: exit 128 used to
@@ -787,6 +831,19 @@ fn root_fix_head_under_stop(lane: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// BR#4996: one gate-clean queue head, classified in phase A of the drain
+/// walk, eligible for phase B's batch selection and phase C's back-to-back
+/// landing. Landing order is queue order (oldest-first).
+struct BatchCandidate {
+    qi: usize,
+    head_id: String,
+    leg: crate::train_gate::TrainLeg,
+    leg_number: usize,
+    pr: i64,
+    head_sha: String,
+    root_fix: bool,
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
@@ -905,21 +962,29 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         return Ok(());
     }
 
-    // ---- drain arm (idle, or mid-pass "bursting"): walk the derived queue
-    // IN ORDER and drive entries the tick can act on. ONE merge at a time is
-    // the OLD law — since BR#4934 (decision BR#4932, amending BR#4804) the
-    // walk DRAINS: after a merge it keeps going in the SAME tick, merging
-    // every gate-clean head back-to-back with NO settle between merges —
-    // exactly ONE settle wait per drain pass, on the FINAL merge commit. The
-    // pass state is the HUB's (currently.phase/​burst_*), never executor-
-    // local — crash-safe. The drain continues past MERGES only; a bounce,
-    // note, or human leg still ends the tick walk. A PERMANENTLY unlandable
-    // entry — PR CLOSED, a leg with no PR stamp, no unlanded leg on this
-    // lane — must NOT starve the lane (BR#3935): it is logged and the walk
-    // advances to the next entry in the SAME tick. A red pass sha (tip
-    // classify) stops the line IMMEDIATELY (GH#2261) — it never waits for
-    // the settle; earlier pass-sha reds surface at the settle (and its
-    // bisect, if the settle lands red).
+    // ---- drain arm (idle, or mid-pass "bursting"): THREE phases (BR#4996,
+    // Ray ruling 2026-10-29, amending the BR#4934 burst-drain). PHASE A
+    // classifies the whole derived queue IN ORDER without landing anything:
+    // gate-clean heads become batch candidates; Skip/Note entries are
+    // skipped past (a transient no-op no longer settles the pass or ends
+    // the walk); Bounce / HumanLeg / CloseSuperseded still fire ON SIGHT
+    // and end the tick. PHASE B selects the batch: the maximal set of
+    // MUTUALLY non-conflicting candidates (select_batch — file-set
+    // intersection, merge-tree-confirmed, BR#3935 fail-closed; queue order
+    // = landing order, oldest-first; burst_max caps the batch). PHASE C
+    // lands the batch back-to-back with NO settle between members — the
+    // per-member merge leg law is unchanged — and the pass runs exactly
+    // ONE settle wait, on the FINAL merge commit. The pass state is the
+    // HUB's (currently.phase/​burst_*), never executor-local — crash-safe.
+    // A PERMANENTLY unlandable entry — PR CLOSED, a leg with no PR stamp,
+    // no unlanded leg on this lane — must NOT starve the lane (BR#3935):
+    // it is logged and classification advances to the next entry. A red
+    // pass sha (tip classify, re-checked before EACH member) stops the
+    // line IMMEDIATELY (GH#2261) — it never waits for the settle; earlier
+    // pass-sha reds surface at the settle (and its bisect, if the settle
+    // lands red). A merge refused mid-batch soft-breaks: the landed prefix
+    // settles, the refused member waits for the next pass (a fresh pass —
+    // pass_merged == 0 — keeps the loud tick error).
     let cur = lane.get("currently").filter(|c| !c.is_null());
     let bursting = lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("bursting");
     let mut pass_merged: u32 = if bursting {
@@ -948,6 +1013,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         release_if_idle(ctx, key, repo, base)?;
         return Ok(());
     }
+    let mut candidates: Vec<BatchCandidate> = Vec::new();
+    // the walk's lazily-read base verdict + the base's failing check NAMES
+    // (BR#4996: Some after the first gate-reaching entry, shared by every
+    // candidate in the walk; BR#5190: the names ride the root-fix gate)
+    let mut base_cache: Option<(MainVerdict, Vec<String>)> = None;
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1071,22 +1141,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
-        let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        // BR#4934 mid-drain: destination-green is owned by the pass settle
-        // (decision BR#4932) — the gate composes with base FORCED green; the
-        // tip RED check at the loop head owns the stop (GH#2261). The first
-        // merge of a pass still gates under the standing law (real verdict).
-        // BR#5190: the base's failing check NAMES ride the gate — the
+        // BR#4996: the lane's base sha + verdict are read ONCE per
+        // classification walk, LAZILY — only an entry that reaches the gate
+        // pays the read (the BR#3935 advance paths stay gh-free), and every
+        // candidate gates on the same base truth: the REAL verdict while the
+        // pass hasn't landed (BR#3009: the pass's FIRST landing still gates
+        // on it), FORCED green mid-pass (destination-green is the pass
+        // settle's, BR#4934 — the per-member tip RED check owns the stop).
+        // BR#5190: the base's failing check NAMES ride the gate too — the
         // root-fix fast lane matches the circular deploy-health class off
         // them (the receipt names the red the fix cures).
-        let base_runs = ctx.check_runs(repo, &base_sha);
-        let base_class = classify_main_check_runs(&base_runs);
-        let base_red_names: Vec<String> = if pass_merged > 0 {
-            Vec::new()
-        } else {
-            base_class.red.iter().map(|r| r.name.clone()).collect()
-        };
-        let gate_base = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict.clone() };
+        if base_cache.is_none() {
+            let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+            let base_class = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+            let verdict = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict };
+            let red_names = if pass_merged > 0 {
+                Vec::new()
+            } else {
+                base_class.red.iter().map(|r| r.name.clone()).collect()
+            };
+            base_cache = Some((verdict, red_names));
+        }
+        let (gate_base, base_red_names) = base_cache.clone().unwrap_or((MainVerdict::Green, Vec::new()));
         // BR#5190: the candidate IS the main-breakage fix iff it is the
         // bound root-fix card (tags + meta.root_fix binding) — the executor
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
@@ -1099,7 +1175,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             head_sha: &head_sha,
             card_meta: &card_meta,
             card_status: card_status.as_deref(),
-            base_verdict: gate_base,
+            base_verdict: gate_base.clone(),
             mergeable: facts.get("mergeable").and_then(|v| v.as_bool()),
             merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
             commits: &commits,
@@ -1128,43 +1204,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             _ => "blocked",
         } }));
 
-        // ---- IDENTITY GATE (BR#3181, enforced at the write boundary) ----
-        // close / update-branch / merge execute only under the worker-class
-        // credential. A personally-authed or unclassifiable gateway reports
-        // read-only, releases the lease (a worker gateway can take the lane), and
-        // names the refusal loudly — NEVER writes GitHub as a personal identity.
-        let write_leg = matches!(gate, MergeAction::Merge { .. } | MergeAction::CloseSuperseded { .. });
-        if write_leg && !ctx.write_allowed() {
-            ctx.note("identity gate: write leg withheld");
-            log(
-                Some(key),
-                &format!(
-                    "IDENTITY GATE: {} leg for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); lease released for a worker gateway",
-                    if matches!(gate, MergeAction::Merge { .. }) { "merge" } else { "close" }
-                ),
-            );
-            release_if_idle(ctx, key, repo, base)?;
-            return Ok(());
-        }
-
-        // ONE merge per tick stays the law (serialized merges), but a
-        // NOT-READY head no longer holds the queue (Ray, 2026-10-30: "PRs
+        // ONE write action per tick (strict serialization): a Bounce /
+        // HumanLeg / CloseSuperseded fires ON SIGHT and the walk ends — the
+        // next tick re-derives the queue and continues. THE ONE EXCEPTION is
+        // the merge (BR#4934): gate-clean heads ride the phase-B/C batch
+        // (BR#4996) — classified here, landed back-to-back after the walk.
+        // A NOT-READY head no longer holds the queue (Ray, 2026-10-30: "PRs
         // shouldn't be in the merge queue if they are not ready to merge —
         // or, if they must be, we don't hold up the queue, obviously"):
-        // Skip/Note on the walk ADVANCES to the next entry in the same tick
-        // and the first READY head merges. The old strict-block let one
-        // unsettled head (checks pending, mergeability computing, no
-        // verdict) freeze every ready PR behind it — the exact "0/h with a
-        // full queue" outage shape. BR#4934's mid-drain rule is unchanged:
-        // once a pass has merged, a not-ready head settles the pass.
+        // Skip/Note ADVANCES past it in the same walk. The identity gate
+        // (BR#3181) is enforced at each write boundary: the close arm
+        // below, and the batch landing (phase C).
         match gate {
             MergeAction::Skip { reason } | MergeAction::Note { reason } => {
+                // BR#4996: a transient no-op means THIS head isn't landable —
+                // it no longer settles the pass or ends the walk (the BR#4934
+                // behavior starved a whole batch behind one skipped head).
+                // The walk classifies past it; the pass still settles exactly
+                // once, on the final merge of the batch (phase C tail).
                 ctx.note(&format!("PR #{pr} ({head_id}) not ready — {reason}; continuing to the next queued PR"));
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
-                if pass_merged > 0 {
-                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                    return Ok(());
-                }
                 continue;
             }
             MergeAction::HumanLeg { reason } => {
@@ -1208,6 +1267,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             MergeAction::CloseSuperseded { reason } => {
+                // identity gate at the write boundary (BR#3181)
+                if !ctx.write_allowed() {
+                    ctx.note("identity gate: write leg withheld");
+                    log(Some(key), &format!("IDENTITY GATE: close leg for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); lease released for a worker gateway"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
                 renew_lease(ctx, repo, base);
                 ctx.sh("gh", &["pr", "close", &pr.to_string(), "--repo", repo, "--comment", &trunc(&reason, 240)])?;
                 ctx.note(&format!("closed superseded PR #{pr}"));
@@ -1255,79 +1321,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             MergeAction::Merge { .. } => {
-                // ---- the merge leg (Ray, 2026-10-30: "if it's still
-                // mergeable, go (squash merges). We only need a rebase if
-                // there are conflicts") ---- The gate passed mergeable=true,
-                // so NO update-branch round trip — no machine push, no
-                // PR-branch CI cycle, no extra tick. Conflicts never reach
-                // the merge leg: the gate bounces CONFLICTING with a
-                // trial-merge file list first (impl rebases, re-verify,
-                // re-queue at the back). The machine update-branch survives
-                // ONLY as the strict-branch-protection fallback: repos that
-                // refuse to merge an out-of-date branch get ONE machine
-                // update-branch (verdict carries, BR#3516 §5) and merge on
-                // the next tick.
-                renew_lease(ctx, repo, base);
-                let method_flag = match ctx.method.as_str() { "squash" => "--squash", "rebase" => "--rebase", _ => "--merge" };
-                if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
-                    let low = err.to_lowercase();
-                    if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
-                        // strict protection wants the branch current — the
-                        // one case the machine rebase exists for. Conflicted
-                        // (not machine-clean) ⇒ conflict bounce to impl.
-                        ctx.fetch_pr_head(pr)?;
-                        let (clean, tm_files) = ctx.trial_merge(base, &head_sha)?;
-                        if !clean {
-                            let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
-                            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
-                            log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
-                            release_if_idle(ctx, key, repo, base)?;
-                            return Ok(());
-                        }
-                        ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
-                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
-                        release_if_idle(ctx, key, repo, base)?;
-                        return Ok(());
-                    }
-                    return Err(err);
-                }
-                let merged = ctx.pr_facts(repo, pr)?;
-                let merge_sha = merged.pointer("/mergeCommit/oid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if vstr(&merged, "state") != Some("MERGED") || merge_sha.is_empty() {
-                    return Err(format!(
-                        "gh pr merge reported ok but PR #{pr} is {} with no mergeCommit — DO NOT trust this tick; investigate",
-                        vstr(&merged, "state").unwrap_or("?")
-                    ));
-                }
-                // BR#4934: the burst pass rides the merged event — count
-                // INCLUDES this merge; the settle comes later as the walk's
-                // single settle feed (the hub flips bursting → awaiting-ci
-                // on the first settle poll, not here).
-                pass_merged = pass_merged.saturating_add(1);
-                // BR#5190: the event carries root_fix so the hub knows the
-                // pass head is the cure (settle copy + the fast-lane receipt).
-                let mut merged_ev = json!({
-                    "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder,
-                    "burst_merged": pass_merged, "burst_cap": burst_cap, "burst_settling": false,
+                // PHASE A (BR#4996): gate-clean — this head becomes a batch
+                // candidate; the landing is phase C (one batch selection,
+                // then back-to-back with no settle between members). The
+                // per-member merge leg is Ray's 2026-10-30 law (mergeable ⇒
+                // merge directly; update-branch only on strict-protection
+                // refusal), applied at the phase C write boundary below.
+                candidates.push(BatchCandidate {
+                    qi,
+                    head_id: head_id.clone(),
+                    leg: leg.clone(),
+                    leg_number,
+                    pr,
+                    head_sha: head_sha.clone(),
+                    root_fix,
                 });
-                if root_fix {
-                    merged_ev.as_object_mut().unwrap().insert("root_fix".into(), json!(true));
-                }
-                ctx.mcp("train_event", merged_ev)?;
-                tip_sha = merge_sha.clone();
-                let fast_note = if root_fix { " — ROOT-FIX FAST-TRACK (BR#5189): the cure is in flight; the line greens when its CI settles" } else { "" };
-                ctx.note(&format!("merged PR #{pr} as {}{}", &tip_sha[..tip_sha.len().min(9)], fast_note));
-                log(
-                    Some(key),
-                    &format!(
-                        "PR #{pr} merged as {} — bursting ({pass_merged} merged, cap {}): drain continues back-to-back, no settle between merges{fast_note}",
-                        &tip_sha[..tip_sha.len().min(9)],
-                        if burst_cap == 0 { "unlimited".to_string() } else { burst_cap.to_string() }
-                    ),
-                );
-                // THE DRAIN (BR#4934): another gate-clean head is taken in
-                // the SAME tick — the loop continues to the next queue entry.
                 continue;
             }
         }
@@ -1339,8 +1347,199 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     if !qfacts.is_empty() {
         let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts }));
     }
-    // the walk ended: if a pass drained this tick, it settles NOW — exactly
-    // ONE settle wait per drain pass, on the FINAL merge commit (BR#4934).
+
+
+    // ---- PHASE B (BR#4996): select the batch — the maximal set of MUTUALLY
+    // non-conflicting candidates, queue order = landing order. Conflict
+    // pairs come from the candidates' changed-file sets (merge-base diff),
+    // then each intersecting pair is CONFIRMED head-vs-head with merge-tree
+    // (BR#3935 fail-closed: a probe that cannot run counts as conflicting,
+    // and a candidate whose file set cannot be computed is excluded as
+    // not-known-clean — select_batch's clean[i] == false law).
+    let mut batch: Vec<usize> = Vec::new();
+    if !candidates.is_empty() {
+        let mut clean: Vec<bool> = vec![true; candidates.len()];
+        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
+                Ok(set) => file_sets.push(set),
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
+                    clean[i] = false;
+                    file_sets.push(crate::train_gate::FileSet::new());
+                }
+            }
+        }
+        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
+        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
+            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
+                Ok(true) => conflict_pairs.push((i, j)),
+                Ok(false) => {}
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
+                    conflict_pairs.push((i, j));
+                }
+            }
+        }
+        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
+        if batch.len() < candidates.len() {
+            let dropped: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !batch.contains(i))
+                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
+                .collect();
+            log(Some(key), &format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
+        }
+        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
+        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", batch.len()));
+        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", batch.len(), batch_ids.join(", ")));
+    }
+
+    // identity gate at the write boundary (BR#3181): the batch's merge legs
+    // execute only under the worker-class credential — checked ONCE, before
+    // the first write.
+    if !batch.is_empty() && !ctx.write_allowed() {
+        ctx.note("identity gate: write leg withheld");
+        log(Some(key), &format!("IDENTITY GATE: batch merge legs ({} PR(s)) withheld — gh is NOT a worker-class credential (BR#3181); lease released for a worker gateway", batch.len()));
+        release_if_idle(ctx, key, repo, base)?;
+        return Ok(());
+    }
+
+    // ---- PHASE C (BR#4996): land the batch back-to-back — no settle
+    // between members. The per-member merge leg law is the standing law
+    // (BR#4934): machine-clean update first (the verdict carries), then
+    // merge. Before EACH member: the burst cap (drain_burst_decision) and
+    // the mid-drain tip RED classify (GH#2261). A refused merge
+    // soft-breaks: pass_merged > 0 settles the landed prefix and ends the
+    // tick; pass_merged == 0 keeps the loud tick error. Every merged event
+    // carries batch_members — the batch composition in landing order (the
+    // hub sanitizes it; do.ts).
+    let batch_prs: Vec<i64> = batch.iter().map(|&i| candidates[i].pr).collect();
+    for (bi, &ci) in batch.iter().enumerate() {
+        let cand = &candidates[ci];
+        let head_id = cand.head_id.as_str();
+        let pr = cand.pr;
+        let head_sha = cand.head_sha.as_str();
+        // BR#4934 cap: at burst_max merges per pass the drain settles even
+        // with batch members left (drain_burst_decision: Settle, not Drain).
+        if pass_merged > 0 && drain_burst_decision(pass_merged, burst_cap, true, false) != DrainDecision::Drain {
+            log(Some(key), &format!(
+                "burst cap {} reached after {} merge(s) — settling the pass on {}",
+                if burst_cap == 0 { "∞".to_string() } else { burst_cap.to_string() },
+                pass_merged,
+                &tip_sha[..tip_sha.len().min(9)]
+            ));
+            break;
+        }
+        // BR#4934 mid-drain tip check: before each member, classify the pass
+        // tip's fed checks — RED stops the line immediately (GH#2261 law);
+        // pending/green keeps landing (destination-green is the settle's).
+        if pass_merged > 0 && !tip_sha.is_empty() {
+            let tip_runs = ctx.check_runs(repo, &tip_sha);
+            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+                renew_lease(ctx, repo, base);
+                ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
+                ctx.note(&format!("batch drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
+                log(Some(key), &format!("batch drain: pass tip {} went RED — stop-the-line fed, batch aborted", &tip_sha[..tip_sha.len().min(9)]));
+                return Ok(());
+            }
+        }
+        // ---- the merge leg (Ray, 2026-10-30: "if it's still mergeable, go
+        // (squash merges). We only need a rebase if there are conflicts") ----
+        // The gate passed mergeable=true, so NO proactive update-branch — no
+        // machine push, no PR-branch CI cycle, no extra tick. Conflicts never
+        // reach the merge leg: the gate bounces CONFLICTING with a trial-merge
+        // file list first (impl rebases, re-verify, re-queue at the back).
+        // The machine update-branch survives ONLY as the
+        // strict-branch-protection fallback: repos that refuse to merge an
+        // out-of-date branch get ONE machine update-branch (verdict carries,
+        // BR#3516 §5) and the batch's landed prefix settles (BR#4996).
+        renew_lease(ctx, repo, base);
+        let method_flag = match ctx.method.as_str() { "squash" => "--squash", "rebase" => "--rebase", _ => "--merge" };
+        if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
+            let low = err.to_lowercase();
+            if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
+                // strict protection wants the branch current — the one case
+                // the machine rebase exists for. Conflicted (not
+                // machine-clean) ⇒ conflict bounce to impl.
+                ctx.fetch_pr_head(pr)?;
+                let (tm_clean, tm_files) = ctx.trial_merge(base, head_sha)?;
+                if !tm_clean {
+                    let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                    ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
+                    log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
+                    // BR#4996: mid-batch the landed prefix still owes its
+                    // settle; a fresh pass releases honestly (the bounce
+                    // already ended the batch walk).
+                    if pass_merged > 0 {
+                        burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                    } else {
+                        release_if_idle(ctx, key, repo, base)?;
+                    }
+                    return Ok(());
+                }
+                ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
+                ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
+                log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
+                break; // BR#4996: the batch tail below settles the landed prefix honestly
+            }
+            // BR#4996 soft-break: a refused merge mid-batch must not fail the
+            // whole tick — the landed prefix settles, the refused member
+            // waits for the next pass. A fresh pass keeps the loud error.
+            if pass_merged > 0 {
+                log(Some(key), &format!("batch soft-break: gh pr merge refused PR #{pr} mid-batch ({}) — settling the landed prefix of {} merge(s)", trunc(&err, 200), pass_merged));
+                burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+        let merged = ctx.pr_facts(repo, pr)?;
+        let merge_sha = merged.pointer("/mergeCommit/oid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if vstr(&merged, "state") != Some("MERGED") || merge_sha.is_empty() {
+            return Err(format!(
+                "gh pr merge reported ok but PR #{pr} is {} with no mergeCommit — DO NOT trust this tick; investigate",
+                vstr(&merged, "state").unwrap_or("?")
+            ));
+        }
+        // BR#4934/BR#4996: the burst pass rides the merged event — count
+        // INCLUDES this merge; batch_members carries the batch composition
+        // in landing order. The settle comes later as the pass's single
+        // settle feed (the hub flips bursting → awaiting-ci on the first
+        // settle poll, not here).
+        pass_merged = pass_merged.saturating_add(1);
+        // BR#5190: the event carries root_fix so the hub knows the
+        // lane was cured by this landing (settle copy + fast receipt).
+        let mut merged_ev = json!({
+            "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": merge_sha, "head_sha": head_sha, "task_id": head_id, "signer": ctx.holder,
+            "burst_merged": pass_merged, "burst_cap": burst_cap, "burst_settling": false,
+            "batch_members": batch_prs,
+        });
+        if cand.root_fix {
+            merged_ev.as_object_mut().unwrap().insert("root_fix".into(), json!(true));
+        }
+        ctx.mcp("train_event", merged_ev)?;
+        tip_sha = merge_sha.clone();
+        // BR#5190: the fast-track receipt rides the merged note when this
+        // landing IS the cure (root_fix wired into the event above).
+        let fast_note = if cand.root_fix { " — ROOT-FIX FAST-TRACK (BR#5189): the cure is in flight; the line greens when its CI settles" } else { "" };
+        ctx.note(&format!("merged PR #{pr} as {}{}", &tip_sha[..tip_sha.len().min(9)], fast_note));
+        log(
+            Some(key),
+            &format!(
+                "PR #{pr} merged as {} — batch member {}/{} ({pass_merged} merged this pass, cap {}): no settle between members{fast_note}",
+                &tip_sha[..tip_sha.len().min(9)],
+                bi + 1,
+                batch.len(),
+                if burst_cap == 0 { "unlimited".to_string() } else { burst_cap.to_string() }
+            ),
+        );
+        // THE DRAIN (BR#4934, batched by BR#4996): the next batch member is
+        // landed in the SAME tick — the loop continues.
+    }
+    // the batch ended: if a pass drained this tick — or a mid-pass tick
+    // found nothing more to land — it settles NOW: exactly ONE settle wait
+    // per drain pass, on the FINAL merge commit (BR#4934, unchanged).
     // Otherwise the lane is honestly idle.
     if pass_merged > 0 && !tip_sha.is_empty() {
         burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
