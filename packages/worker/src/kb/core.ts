@@ -333,6 +333,47 @@ export function tagsSayGateway(tags: unknown): boolean {
 }
 
 /**
+ * The reap decision for one auth_tokens row — roster hygiene (BR#4684,
+ * train-defence L0.5). Pure and fixture-testable like graceActive: the
+ * alarm sweep pre-filters candidates in SQL and re-judges each row here.
+ *   - "never_seen": provisioned past the cutoff with zero authentications —
+ *     registration debris of any class (pairing churn minted
+ *     `<hostname>/<variant>` labels nobody ever authenticated as);
+ *   - "gateway_stale": gateway-class infrastructure with no auth signal
+ *     past the cutoff — the roster's dead-machine half;
+ *   - "keep": everything else — once-seen agent identities keep their board
+ *     history regardless of silence, fresh rows are not yet the sweep's
+ *     business, and `_`-prefixed system namespaces are plumbing, not roster.
+ * A row of unknown provenance (never seen, no created_ts) keeps — the reap
+ * archives, it never guesses.
+ */
+export function rosterReapVerdict(
+  row: { label: unknown; tags: unknown; created_ts?: number | null; last_seen_ts?: number | null },
+  cutoff: number,
+): "never_seen" | "gateway_stale" | "keep" {
+  if (String(row.label ?? "").startsWith("_")) return "keep";
+  const seen = Number(row.last_seen_ts ?? 0);
+  const created = Number(row.created_ts ?? 0);
+  if (seen) return seen < cutoff && tagsSayGateway(row.tags) ? "gateway_stale" : "keep";
+  return created > 0 && created < cutoff ? "never_seen" : "keep";
+}
+
+/**
+ * The roster reap's pacing decision (BR#4684): `roster_reap_hours` gates the
+ * sweep leg off the 60s alarm tick — 0 explicitly disables, garbage falls
+ * back to the 6h default (an explicit 0 must never fold into the fallback:
+ * `parseInt(x) || 6` would), the window clamps to a week. Pure like the
+ * verdict so the disable knob is fixture-locked.
+ */
+export function rosterReapPace(hoursRaw: unknown, lastTs: unknown, now: number): "disabled" | "skip" | "run" {
+  const n = parseInt(String(hoursRaw ?? "").trim(), 10);
+  const hours = Math.max(0, Math.min(168, Number.isFinite(n) ? n : 6));
+  if (hours === 0) return "disabled";
+  if (now - (Number(lastTs) || 0) < hours * 3_600_000) return "skip";
+  return "run";
+}
+
+/**
  * Deterministic gateway label for a self-provisioned desktop (credential-class
  * ADR, desktop gateway leg): <host-slug>, derived from the hostname per the
  * BR#899 identity convention — NO class prefix: gateway-ness is a TAG on the

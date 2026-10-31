@@ -64,6 +64,8 @@ import {
   resolveRolePlaybook,
   selfProvisionLabel,
   graceActive,
+  rosterReapVerdict,
+  rosterReapPace,
   sanitizeTags,
   validateRelation,
   // serialized merge train (BR#3516)
@@ -864,6 +866,16 @@ export class KnowledgeHub {
       await this.trainWatchSweep(now);
     } catch (e) {
       this.audit("system:merge-train", "sweep_error", "train_watch", { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+
+    // (H) roster hygiene (BR#4684): reap dead gateway registrations + never-
+    // seen provisioning debris — archive (revoke), never delete, paced off
+    // the settings table. Isolated like its siblings: a reaper fault must
+    // never take the watchdog down.
+    try {
+      await this.rosterReap(now);
+    } catch (e) {
+      this.audit("system:roster-reap", "sweep_error", "roster_reap", { error: String((e as Error).message ?? e).slice(0, 300) });
     }
 
     // observability: the board can answer "is the watchdog alive?" via
@@ -3123,6 +3135,7 @@ export class KnowledgeHub {
         case "admin.ask_escalation_sweep":
         case "admin.question_claim_sweep":
         case "admin.alarm_sweep":
+        case "admin.roster_reap":
           if (!isAdmin) return this.json({ error: "admin only" }, 403);
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.alias") return this.json(await this.adminAliasSet(body, actor));
@@ -3172,6 +3185,13 @@ export class KnowledgeHub {
             // are untouched.
             await this.alarmSweep();
             return this.json({ ok: true });
+          }
+          if (op === "admin.roster_reap") {
+            // drill/liveness path for the roster reap (BR#4684): the alarm
+            // sweep paces it via roster_reap_hours; the drill FORCES a pass
+            // with an injectable clock — pass now=<future epoch ms> to age
+            // rows past the staleness threshold without waiting the 7d.
+            return this.json({ roster: await this.rosterReap(Number(body.now ?? Date.now()), true) });
           }
           // admin.stop_line_sweep / admin.merge_queue_sweep /
           // admin.provenance_sweep / admin.closure_audit_sweep DELETED with
@@ -7319,6 +7339,56 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, Date.now(), id);
     this.audit("admin", "revoke", id, { label: row.label });
     return { id, revoked: true };
+  }
+
+  /** Roster hygiene (BR#4684, train-defence L0.5) — reap dead registrations,
+   *  self-maintaining, never a one-off delete. Two rules over auth_tokens:
+   *  (1) gateway-class rows (the roster's infrastructure half) with no auth
+   *  signal for `roster_reap_days` (default 7) are ARCHIVED — revoked_ts set,
+   *  row + audit trail kept, the roster (listAgents) hides revoked rows; the
+   *  same principal re-pairing rotates the row back to life in place and the
+   *  old label rides along as an identity alias (BR#3787 replace semantics),
+   *  so a returning machine is one approval click, not a data loss;
+   *  (2) rows provisioned but NEVER seen (created past the threshold with
+   *  zero authentications) are registration debris of any class — the
+   *  pairing churn that minted `<hostname>/<variant>` labels nobody ever
+   *  authenticated as. Once-seen agent identities are NOT reaped on silence
+   *  (their labels are board history); `_`-prefixed system namespaces are
+   *  plumbing, not roster: exempt. Paced by `roster_reap_hours` (default 6,
+   *  0 disables) off the 60s alarm tick; `force` (the admin drill) skips the
+   *  pace window and takes an injectable clock. */
+  private async rosterReap(now: number, force = false): Promise<{ reaped: number; labels: string[]; disabled?: boolean }> {
+    const last = Number(this.settingValue("roster_reap_last_ts", "0")) || 0;
+    const pace = force ? "run" : rosterReapPace(this.settingValue("roster_reap_hours", "6"), last, now);
+    if (pace !== "run") return { reaped: 0, labels: [], ...(pace === "disabled" ? { disabled: true } : {}) };
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('roster_reap_last_ts', ?)`, String(now),
+    );
+    const daysRaw = this.settingValue("roster_reap_days", "7").trim();
+    const daysN = parseInt(daysRaw, 10);
+    const days = Math.max(1, Math.min(90, Number.isFinite(daysN) ? daysN : 7));
+    const cutoff = now - days * 86_400_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, label, tags, created_ts, last_seen_ts FROM auth_tokens
+       WHERE revoked_ts IS NULL AND (
+         (last_seen_ts IS NOT NULL AND last_seen_ts < ?) OR
+         (last_seen_ts IS NULL AND created_ts < ?)
+       )`,
+      cutoff, cutoff,
+    ).toArray() as any[];
+    const reaped: string[] = [];
+    for (const r of rows) {
+      const verdict = rosterReapVerdict(r, cutoff);
+      if (verdict === "keep") continue;
+      this.state.storage.sql.exec(`UPDATE auth_tokens SET revoked_ts = ? WHERE id = ?`, now, r.id);
+      this.audit("system:roster-reap", "roster_reaped", r.id, {
+        label: r.label, kind: verdict,
+        last_seen_ts: Number(r.last_seen_ts ?? 0) || null,
+        quiet_days: Math.round((now - (Number(r.last_seen_ts ?? 0) || Number(r.created_ts ?? now))) / 86_400_000),
+      });
+      reaped.push(String(r.label));
+    }
+    return { reaped: reaped.length, labels: reaped };
   }
 
   /** Update an agent's tags (roles/capabilities) in place — no re-mint, the secret stays valid. */

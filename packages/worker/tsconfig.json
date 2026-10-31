@@ -34,6 +34,8 @@
     "test/br3819-self-edge.test.ts",
     // BR#3942: same rig as do.test.ts (miniflare + workerd fetch types)
     "test/ask-escalation.test.ts",
-    "test/ws-members.test.ts"
+    "test/ws-members.test.ts",
+    // BR#4684: same rig as rotation.test.ts (miniflare + workerd fetch types)
+    "test/roster-reap.test.ts"
   ]
 }
