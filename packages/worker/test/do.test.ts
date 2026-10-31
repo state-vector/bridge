@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  */
 
 let mf: Miniflare;
+let ns: any; // DurableObjectNamespace "KB" — hoisted for the warm-isolate test
 let kb: (path: string, init?: RequestInit) => Promise<Response>;
 
 beforeAll(async () => {
@@ -45,7 +46,8 @@ beforeAll(async () => {
         KB: { className: "KnowledgeHub", useSQLite: true },
       },
     }],
-  });  const ns = await mf.getDurableObjectNamespace("KB");
+  });
+  ns = await mf.getDurableObjectNamespace("KB");
   const stub = await ns.get(ns.idFromName("global"));
   kb = (path, init) => stub.fetch(`https://kb${path}`, init);
   // warm + cold ensureSchema paths both exercised
@@ -142,6 +144,33 @@ describe("session registration (the migration that never ran in prod)", () => {
     });
     expect(status).toBeLessThan(500);
     expect(body.session).toBeTruthy();
+  });
+});
+
+describe("warm isolate (the frozen-migration class)", () => {
+  // The prod incident: ensureSchema set a done-flag on first boot, so every
+  // migration added later NEVER ran on the warm singleton (do.ts keeps the
+  // "NO early-return flag" comment as the scar tissue). This test pins the
+  // contract the flag broke: the SECOND schema pass on a live isolate must
+  // stay safe, and features must keep working after it.
+  it("ensureSchema runs twice, then features (no early-return freeze)", async () => {
+    // a fresh idFromName is a cold SQLite instance — every DO owns its DB
+    const stub = await ns.get(ns.idFromName("warm-frozen-migration"));
+    const call = (path: string, body?: unknown) =>
+      stub.fetch(`https://kb${path}`, body === undefined
+        ? undefined
+        : { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body) });
+    const o1 = await call("/orient"); // cold pass: CREATE TABLE IF NOT EXISTS …
+    expect(o1.status).toBeLessThan(500);
+    const o2 = await call("/orient"); // warm pass: where an early-return flag would freeze
+    expect(o2.status).toBeLessThan(500);
+    // features after the double pass — INSERT through the guarded ALTERed
+    // columns is exactly what the frozen flag silently broke in production
+    const r = await call("/admin.mint", { label: "test-warm-isolate", tags: [] });
+    const body = await r.json().catch(() => ({}));
+    expect(r.status).toBeLessThan(500);
+    expect(body.error).toBeUndefined();
+    expect(body.secret).toBeTruthy();
   });
 });
 
