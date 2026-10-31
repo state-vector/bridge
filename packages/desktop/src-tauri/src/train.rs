@@ -40,7 +40,7 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    classify_base_for_lane, classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card, merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
@@ -827,7 +827,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     };
     log(Some(&key), &format!("lease: {} (holder={})", vstr(&lease, "note").unwrap_or("acquired"), ctx.holder));
 
-    if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap) {
+    if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, &required, typical_ms, burst_cap) {
         // BR#4489: a permission refusal mid-merge demotes the host for the
         // process lifetime — startup truth was runtime falsehood; fail closed.
         let low = e.to_lowercase();
@@ -861,6 +861,18 @@ fn root_fix_head_under_stop(lane: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// BR#5265: the walk's lazily-read base facts — the verdict the gate GATES
+/// on (scoped to the lane's required_workflows) + the red/unsettled check
+/// NAMES + the classified tip sha. Stamped into the lane via queue_facts so
+/// the hub renders the honest BLOCKED line (never "checking CI" while every
+/// car skips) and files ONE ask per class to the alarm sink.
+struct BaseFacts {
+    verdict: MainVerdict,
+    red: Vec<String>,
+    unsettled: Vec<String>,
+    sha: String,
+}
+
 /// BR#4996: one gate-clean queue head, classified in phase A of the drain
 /// walk, eligible for phase B's batch selection and phase C's back-to-back
 /// landing. Landing order is queue order (oldest-first).
@@ -874,14 +886,17 @@ struct BatchCandidate {
     root_fix: bool,
 }
 
-fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
+fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, required: &[String], _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
+    // BR#5265: the line's own green is judged by the lane's REQUIRED
+    // workflows (scoped base classification) — a nightly/canary red on the
+    // tip stops its own pipeline, never the train's resume.
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
         let stop = lane.get("stop").unwrap();
         let stop_sha = vstr(stop, "sha").unwrap_or("");
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+        let v = classify_base_for_lane(&ctx.check_runs(repo, &base_sha), required);
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
@@ -1046,8 +1061,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     let mut candidates: Vec<BatchCandidate> = Vec::new();
     // the walk's lazily-read base verdict + the base's failing check NAMES
     // (BR#4996: Some after the first gate-reaching entry, shared by every
-    // candidate in the walk; BR#5190: the names ride the root-fix gate)
-    let mut base_cache: Option<(MainVerdict, Vec<String>)> = None;
+    // candidate in the walk; BR#5190: the names ride the root-fix gate).
+    // BR#5265: the classification is SCOPED to the lane's required_workflows
+    // — the base-green gate judges the lane's own deploy-required list, so a
+    // nightly/battery/canary red stops its own pipeline, never the train.
+    let mut base_cache: Option<BaseFacts> = None;
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1183,16 +1201,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // them (the receipt names the red the fix cures).
         if base_cache.is_none() {
             let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-            let base_class = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+            let base_class = classify_base_for_lane(&ctx.check_runs(repo, &base_sha), required);
             let verdict = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict };
-            let red_names = if pass_merged > 0 {
-                Vec::new()
+            let (red_names, unsettled_names) = if pass_merged > 0 {
+                (Vec::new(), Vec::new())
             } else {
-                base_class.red.iter().map(|r| r.name.clone()).collect()
+                (
+                    base_class.red.iter().map(|r| r.name.clone()).collect(),
+                    base_class.unsettled.clone(),
+                )
             };
-            base_cache = Some((verdict, red_names));
+            base_cache = Some(BaseFacts { verdict, red: red_names, unsettled: unsettled_names, sha: base_sha });
         }
-        let (gate_base, base_red_names) = base_cache.clone().unwrap_or((MainVerdict::Green, Vec::new()));
+        let cached = base_cache.as_ref().unwrap();
+        let gate_base = cached.verdict.clone();
+        let base_red_names = cached.red.clone();
         // BR#5190: the candidate IS the main-breakage fix iff it is the
         // bound root-fix card (tags + meta.root_fix binding) — the executor
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
@@ -1374,8 +1397,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // collected as the walk touched them) so the panel's queue blocks show
     // the truth of this pass: which entries are ready (the next batch) and
     // which wait/leave. One write per tick; failures never break the tick.
-    if !qfacts.is_empty() {
-        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts }));
+    // BR#5265 fix A: the walk ALSO stamps the base verdict it gated on (with
+    // the red/unsettled NAMES and the classified tip sha) into the same
+    // payload — the hub renders the honest `BLOCKED — base main RED: …`
+    // reason (instead of the fake-busy "checking review, signatures and CI")
+    // and files ONE ask per class to the alarm sink. Stamped ONLY on a
+    // zero-merge walk: a bursting lane is merging (not blocked) and its base
+    // tip advances under it; the settled truth rides the next idle tick.
+    let base_stamp = match (pass_merged, base_cache.as_ref()) {
+        (0, Some(bf)) => Some(json!({
+            "verdict": bf.verdict.as_str(),
+            "red_names": bf.red.clone(),
+            "unsettled_names": bf.unsettled.clone(),
+            "sha": bf.sha.clone(),
+        })),
+        _ => None,
+    };
+    if !qfacts.is_empty() || base_stamp.is_some() {
+        let mut body = json!({ "repo": repo, "base": base, "entries": qfacts });
+        if let Some(bv) = &base_stamp {
+            body.as_object_mut().unwrap().insert("base_verdict".into(), bv.clone());
+        }
+        let _ = ctx.mcp("train_queue_facts", body);
     }
 
 

@@ -697,6 +697,28 @@ Verify duty on a qualified root-fix card (tag + a stamped PR) names the fast
 lane in its body, so the reviewer knows the merge path is pre-cleared before
 they accept.
 
+The base-green judgment itself is scoped to the lane (BR#5265): the executor
+classifies the base against the lane's `required_workflows` — an unset/empty
+list keeps the old full-run law (fail-safe), a scoped set matching no run on
+the base keeps it too (an empty set is never evidence of green), and
+otherwise only the required names judge the base (per name: newest
+non-cancelled run wins, red beats unsettled beats green). Non-required noise
+on main — nightly backfills, republication gates, dashboards — no longer
+freezes the lane while every required check is green. The scoping applies at
+the two base-green decisions (the stop-arm's green-again resume and the
+drain-walk's base cache); the red-settle bisect keeps the full-run law, since
+culprit attribution wants the whole picture. And a red base is LOUD, not
+silent: whenever the executor holds cars past a merged batch on a red or
+unsettled base, it stamps the base verdict (verdict, red/unsettled names,
+sha) into `train_queue_facts`; the hub renders the honest lane reason
+`merge-train: BLOCKED — base main RED: <names> — N cars held; the fix
+unblocks it` (unsettled variant: `…waiting for the required checks to
+settle`), resyncs it off on freshness (15-minute stamp TTL) or a green stamp,
+and files ONE per-class ask to the alarm sink — GO (bypass-merge / fix
+forward now) or hold — deduped by the identical-open-ask guard. The pre-5265
+livelock is exactly what this kills: cars held for hours on a base that was
+only cosmetically red, the lane reason frozen on a stale line, no ask filed.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in

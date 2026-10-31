@@ -197,6 +197,11 @@ const TRAIN_STARVE_MS = 10 * 60_000;
  *  vague "awaiting an available gateway"; readiness must be visible when
  *  there is no work so the lane is trusted the moment work arrives. */
 const TRAIN_READY_MS = 15 * 60_000;
+/** BR#5265: the executor-stamped base verdict (queue_facts.base) is trusted
+ *  for this long — the executor re-stamps every tick while the walk runs, so
+ *  an aged-out stamp means the executor stopped gating (the lane falls back
+ *  to the pre-stamp branches; the watch sweep resyncs the drifted reason). */
+const TRAIN_BASE_STAMP_TTL_MS = 15 * 60_000;
 
 // ---- BR#4658 worker-executor verification probes ----
 /** A failed probe re-arms after this backoff (the executor re-polls pending
@@ -7666,6 +7671,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ? `; last: ${lastAct.kind}${lastAct.pr ? ` PR #${lastAct.pr}` : ""}${lastAct.task_id ? ` (${lastAct.task_id})` : ""}`
       : "";
     const bw = meta.bypass_wait ?? null;
+    // BR#5265: the executor's walk stamps the base verdict it GATED on (scoped
+    // to the lane's required_workflows, red/unsettled names included) into
+    // queue_facts — trusted within TRAIN_BASE_STAMP_TTL_MS; an aged-out stamp
+    // means the executor stopped gating and the pre-stamp branches own the
+    // reason again.
+    const qf = meta.lane?.queue_facts ?? null;
+    const baseStamp = qf?.base ?? null;
+    const baseStampLive = !!baseStamp && now - Number(qf.at ?? 0) < TRAIN_BASE_STAMP_TTL_MS;
     // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
     // the lane's activity line speaks human. The hub knows the head card's
     // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
@@ -7717,6 +7730,22 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const mins = Math.max(1, Math.round(Number(z.age_ms ?? 0) / 60_000));
       const queued = Number(z.queue_len ?? 0);
       reason = `merge-train: zombie holder evicted — ${z.holder ?? "?"} made no progress for ${mins}m on a non-empty queue (${queued} queued) — awaiting an available gateway`;
+    } else if (baseStampLive && baseStamp.verdict !== "green" && queue.length > 0) {
+      // BR#5265 fix A: the base is RED (or unsettled) on the lane's REQUIRED
+      // workflows and cars are held — say so, with the names and the held
+      // count. Never the fake-busy "checking review, signatures and CI"
+      // line while the gate skips every car silently: the lane names the
+      // blocker and who unblocks it. (stop / currently / bypass-wait / zombie
+      // outrank this — those states carry their own honest line already.)
+      const held = queue.length;
+      const names: string[] = String(baseStamp.verdict) === "red"
+        ? (Array.isArray(baseStamp.red_names) ? baseStamp.red_names : [])
+        : (Array.isArray(baseStamp.unsettled_names) ? baseStamp.unsettled_names : []);
+      const joined = names.join(", ");
+      const shown = joined.length > 220 ? `${joined.slice(0, 219)}…` : joined;
+      reason = String(baseStamp.verdict) === "red"
+        ? `merge-train: BLOCKED — base main RED: ${shown || "required checks"} — ${held} car${held === 1 ? "" : "s"} held; the fix unblocks it`
+        : `merge-train: BLOCKED — base main unsettled: ${shown || "required checks"} — ${held} car${held === 1 ? "" : "s"} held; waiting for the required checks to settle`;
     } else if (lease && lease.expires_ts > now) {
       reason = head && headHold
         ? `merge-train: leased by ${lease.holder} — ${headHold.note}${actSuffix}`
@@ -7764,8 +7793,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           const reason = this.laneSyncReason(r.id, meta, now);
           this.audit("system:merge-train", "lease_lapsed", r.id, { holder, expired_at: new Date(lease!.expires_ts).toISOString(), reason });
           this.version(r.id, "system:merge-train", "lease_lapsed", `lease of ${holder} lapsed — ${reason}`, {});
-        } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:")) {
-          // reason drifted (older class version) — resync to the truth
+        } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:") || String(meta.blocked?.reason ?? "").startsWith("merge-train: BLOCKED")) {
+          // reason drifted (older class version) — resync to the truth.
+          // BR#5265: a stamped BLOCKED reason must resync too — its source is
+          // the executor's base stamp (TTL-bounded); when the stamp ages out
+          // or the base greens, the lane must fall back to the honest
+          // non-blocked line instead of freezing on a stale BLOCKED.
           this.laneSyncReason(r.id, meta, now);
         }
       } catch (e) {
@@ -8962,7 +8995,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  served verbatim by train.status. This is the truth behind the panel's
    *  queue blocks: ready blocks are the current batch (the executor merges
    *  every ready entry back-to-back, skipping the rest — Ray 2026-10-30:
-   *  "we merge what we can in batches"). Requires the lease (executor-fed). */
+   *  "we merge what we can in batches"). Requires the lease (executor-fed).
+   *  BR#5265 fix A: the payload may carry `base_verdict` — the walk's base
+   *  verdict (scoped to the lane's required_workflows) with the red/unsettled
+   *  NAMES and the classified tip sha. Stored with the facts; laneSyncReason
+   *  renders the honest BLOCKED line from it, and a RED base with cars held
+   *  files ONE ask per class to the alarm sink (identical-open-ask dedupe —
+   *  the livelock used to be silent: no event, no bounce, no ask). */
   private async trainQueueFacts(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
@@ -8971,10 +9010,56 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(lane.meta ?? "{}");
     const lease: TrainLease | null = meta.lease ?? null;
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
-    meta.lane = { ...(meta.lane ?? {}), queue_facts: { at: Date.now(), entries } };
+    const bv = body.base_verdict && typeof body.base_verdict === "object" ? body.base_verdict : null;
+    const baseStamp = bv && ["red", "green", "unsettled"].includes(String(bv.verdict))
+      ? {
+          verdict: String(bv.verdict),
+          red_names: Array.isArray(bv.red_names) ? bv.red_names.map(String).slice(0, 20) : [],
+          unsettled_names: Array.isArray(bv.unsettled_names) ? bv.unsettled_names.map(String).slice(0, 20) : [],
+          sha: String(bv.sha ?? "").slice(0, 40),
+        }
+      : null;
+    meta.lane = { ...(meta.lane ?? {}), queue_facts: { at: Date.now(), entries, ...(baseStamp ? { base: baseStamp } : {}) } };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
-    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length });
-    return { ok: true, lane: laneKey(repo, base), n: entries.length };
+    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length, base: baseStamp?.verdict ?? null });
+    // BR#5265 fix A (the ask): base RED on the lane's required workflows with
+    // cars held = the train is blocked on main itself. ONE ask per class
+    // (repo + base + the red name set — the title is deterministic so the
+    // identical-open-ask guard dedupes every re-stamp); bound to the alarm
+    // sink, never to a queued card (an open ask child would fence its close,
+    // the BR#4068 class). Any other failure is loud in the audit, never a
+    // raw throw — the stamp itself must always land.
+    if (baseStamp?.verdict === "red" && baseStamp.red_names.length > 0) {
+      const held = this.laneQueue(repo, base).length;
+      if (held > 0) {
+        const names = [...baseStamp.red_names].sort().join(", ");
+        const prefix = `Main is RED on ${repo}@${base}: `;
+        const suffix = " — the train is BLOCKED; bypass-merge the fix / fix forward?";
+        let shown = names;
+        if (prefix.length + shown.length + suffix.length > 240) {
+          const budget = Math.max(0, 240 - prefix.length - suffix.length);
+          shown = `${names.slice(0, Math.max(0, budget - 1)).trimEnd()}…`;
+        }
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: `${prefix}${shown}${suffix}`,
+              reason: "the serialized train never merges onto a red base (BR#3009) — while the required deploy checks are red, every queued car skips silently each tick; the fix must land by human bypass-merge or a fix-forward push",
+              details: `Lane ${repo}@${base}: the executor's merge-train walk stamped base RED on the lane's required workflows: ${names} (tip ${baseStamp.sha.slice(0, 9)}).\n\n${held} queued card(s) are held — the walk runs every tick but the gate skips every car, and until now the lane looked busy ("checking review, signatures and CI") while nothing could merge.\n\nUnblock: bypass-merge the fix PR to main, or push a fix-forward — main green on the required workflows releases the train (BR#5265; scoped classification means non-required reds like nightlies never block the lane).`,
+              options: ["(Recommended) GO — bypass-merge / fix forward now", "Not yet — hold the line"],
+              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+              urgency: "time-sensitive",
+            },
+            actor,
+          );
+        } catch (ae) {
+          const am = String((ae as Error)?.message ?? ae);
+          this.audit(actor, am.startsWith("an identical ask is already open") ? "train:base_red_ask_deduped" : "train:base_red_ask_failed", lane.id, { reason: am.slice(0, 160) });
+        }
+      }
+    }
+    return { ok: true, lane: laneKey(repo, base), n: entries.length, base: baseStamp?.verdict ?? null };
   }
 
   private async trainCarry(body: any, actor: string): Promise<any> {

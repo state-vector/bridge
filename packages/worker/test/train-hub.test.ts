@@ -2008,6 +2008,104 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
   });
 });
 
+// ---------- BR#5265: base-red is LOUD — BLOCKED lane reason + one ask per class ----------
+
+describe("BR#5265 base-red loud lane (real bundled worker)", () => {
+  it("an executor-stamped base RED renders the honest BLOCKED reason and files ONE ask per class (re-stamps dedupe); a green stamp un-blocks", async () => {
+    const repo = "state-vector/lane-base-red";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — base red", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+
+    await acquire(repo, "gw-br", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 52651, head: "1".repeat(40), title: "IMPL: base-red drill 1" });
+    const c2 = await queueViaAccept({ repo, pr: 52652, head: "2".repeat(40), title: "IMPL: base-red drill 2" });
+
+    // the executor's walk stamps base RED (scoped to the lane's required
+    // workflows) with the red names — the livelock's truth, previously silent
+    const stamp = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [{ id: c1, pr: 52651, cls: "waiting" }, { id: c2, pr: 52652, cls: "waiting" }],
+      base_verdict: { verdict: "red", red_names: ["Republish gate on open PR heads"], unsettled_names: [], sha: "a".repeat(40) },
+    });
+    expect(stamp.body.error ?? "", `queue_facts failed: ${JSON.stringify(stamp.body)}`).toBe("");
+    expect(stamp.body.base).toBe("red");
+
+    // a lease op resyncs the reason (the executor's next tick) — the lane
+    // names the blocker, never the fake-busy "checking review…" line
+    await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-br", merge_capable: true,
+      progress: { progress: "walk: base red, every car skips", progress_age_ms: 1_000, holder: "gw-br" },
+    });
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(String(lane.reason)).toContain("merge-train: BLOCKED — base main RED: Republish gate on open PR heads");
+    expect(String(lane.reason)).toContain("2 cars held; the fix unblocks it");
+    expect(String(lane.reason)).not.toContain("checking review, signatures and CI");
+
+    // ONE ask per class to the alarm sink; the identical re-stamp dedupes
+    const asks = async () => {
+      const r = await kbJson(`/search?q=${encodeURIComponent("Main is RED on state-vector/lane-base-red")}&type=question&limit=50`);
+      return r.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(repo));
+    };
+    expect((await asks()).length).toBe(1);
+    const restamp = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [{ id: c1, pr: 52651, cls: "waiting" }, { id: c2, pr: 52652, cls: "waiting" }],
+      base_verdict: { verdict: "red", red_names: ["Republish gate on open PR heads"], unsettled_names: [], sha: "a".repeat(40) },
+    });
+    expect(restamp.body.error ?? "").toBe("");
+    expect((await asks()).length).toBe(1); // deduped — one ask per class
+
+    // the base greens (scoped classification) — the stamp clears the BLOCKED
+    const green = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [{ id: c1, pr: 52651, cls: "ready" }, { id: c2, pr: 52652, cls: "waiting" }],
+      base_verdict: { verdict: "green", red_names: [], unsettled_names: [], sha: "a".repeat(40) },
+    });
+    expect(green.body.error ?? "").toBe("");
+    await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-br", merge_capable: true,
+      progress: { progress: "walk: base green, batch ready", progress_age_ms: 1_000, holder: "gw-br" },
+    });
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(String(lane2.reason)).not.toContain("BLOCKED");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-br" });
+  });
+
+  it("an unsettled base gets its own honest BLOCKED line, and a red stamp on an EMPTY queue files no ask", async () => {
+    const repo = "state-vector/lane-base-unsettled";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — base unsettled", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+
+    await acquire(repo, "gw-bu", { merge_capable: true, required_workflows: ["Test"] });
+    // red on an EMPTY queue — nothing is held, no ask, no BLOCKED
+    const empty = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-bu", entries: [],
+      base_verdict: { verdict: "red", red_names: ["Deploy to dev"], unsettled_names: [], sha: "b".repeat(40) },
+    });
+    expect(empty.body.error ?? "", `queue_facts failed: ${JSON.stringify(empty.body)}`).toBe("");
+    expect(empty.body.base).toBe("red");
+    const askRows = await kbJson(`/search?q=${encodeURIComponent("Main is RED on state-vector/lane-base-unsettled")}&type=question&limit=50`);
+    expect(askRows.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(repo)).length).toBe(0);
+
+    // an unsettled REQUIRED workflow with a held car — the honest unsettled line
+    const c1 = await queueViaAccept({ repo, pr: 52653, head: "3".repeat(40), title: "IMPL: base-unsettled drill" });
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-bu",
+      entries: [{ id: c1, pr: 52653, cls: "waiting" }],
+      base_verdict: { verdict: "unsettled", red_names: [], unsettled_names: ["Deploy to dev (in_progress)"], sha: "b".repeat(40) },
+    });
+    await kbJson("/train.lease", {
+      repo, base: "main", action: "renew", actor: "gw-bu", merge_capable: true,
+      progress: { progress: "walk: base unsettled", progress_age_ms: 1_000, holder: "gw-bu" },
+    });
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(String(lane.reason)).toContain("merge-train: BLOCKED — base main unsettled: Deploy to dev (in_progress)");
+    expect(String(lane.reason)).toContain("1 car held; waiting for the required checks to settle");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-bu" });
+  });
+});
+
 // ---------- BR#5151: train:merged is the only lane writer, and it dedupes ----------
 
 describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {

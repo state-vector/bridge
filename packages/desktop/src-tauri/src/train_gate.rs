@@ -121,6 +121,33 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
     finish_verdict(red, unsettled, vec![], green)
 }
 
+/// BR#5265: the BASE-green gate scoped to the lane's OWN required_workflows
+/// (the deploy-required list the lane config carries, served in
+/// train_status). A nightly/battery/canary red on the tip stops its own
+/// pipeline and its own cards — NOT the train: only the declared required
+/// workflows judge the base. Per name the law is unchanged (newest
+/// non-cancelled run judges; red beats unsettled beats green). Two fail-safes
+/// fall back to the full-run classification (the standing law, unchanged):
+/// an EMPTY required list (undeclared — nothing to scope by) and a scoped set
+/// that matched NO run at all (config drift or the workflows did not run — an
+/// empty set is never evidence of green). Head-check classification keeps the
+/// full run list (externals exempt) — this scoping is base-only.
+pub fn classify_base_for_lane(runs: &[MainCheckRun], required_workflows: &[String]) -> CheckVerdict {
+    if required_workflows.is_empty() {
+        return classify_main_check_runs(runs);
+    }
+    let scoped: Vec<MainCheckRun> = runs
+        .iter()
+        .filter(|r| required_workflows.iter().any(|w| w.trim() == r.name.trim()))
+        .cloned()
+        .collect();
+    let v = classify_main_check_runs(&scoped);
+    if v.verdict == MainVerdict::Empty {
+        return classify_main_check_runs(runs);
+    }
+    v
+}
+
 /// core.ts classifyHeadChecks (846): same rule, but exempt-external failures
 /// are pulled OUT of red into `external` (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
@@ -828,6 +855,57 @@ mod tests {
         let green = classify_main_check_runs(&[run(1, "ci", Some("success")), run(2, "ci", Some("cancelled")), run(3, "lint", Some("skipped"))]);
         assert!(matches!(green.verdict, MainVerdict::Green));
         assert_eq!(green.green, 2);
+    }
+
+    /// BR#5265: the base-green gate scoped to the lane's required_workflows.
+    /// The live class (superpositional@main 2026-11-01): a nightly + a
+    /// republish-gate red on the tip while ALL four required deploy workflows
+    /// are green — the full-run law read base RED and skip-locked the whole
+    /// 10-car queue; the scoped law reads GREEN and the train merges.
+    #[test]
+    fn classify_base_scoped_to_required_workflows() {
+        let required: Vec<String> = vec![
+            "deploy / Deploy to dev".into(),
+            "post-deploy / Post-Deploy Smoke".into(),
+            "post-deploy / DNS chain (front doors)".into(),
+            "post-deploy / Lodestar Storage Health".into(),
+        ];
+        let nightly_reds = vec![
+            run(1, "Quality Replay (corpus → verdicts → full battery)", Some("failure")),
+            run(2, "Republish gate on open PR heads", Some("failure")),
+            run(3, "deploy / Deploy to dev", Some("success")),
+            run(4, "post-deploy / Post-Deploy Smoke", Some("success")),
+            run(5, "post-deploy / DNS chain (front doors)", Some("success")),
+            run(6, "post-deploy / Lodestar Storage Health", Some("success")),
+        ];
+        // the full-run law (unchanged) reads RED — the livelock's cause
+        assert!(matches!(classify_main_check_runs(&nightly_reds).verdict, MainVerdict::Red));
+        // the scoped law reads GREEN — the train merges
+        let scoped = classify_base_for_lane(&nightly_reds, &required);
+        assert!(matches!(scoped.verdict, MainVerdict::Green));
+        assert!(scoped.red.is_empty());
+        // a REQUIRED red names itself — the verdict is Red (and red beats green)
+        let mut required_red = nightly_reds.clone();
+        required_red.push(run(7, "deploy / Deploy to dev", Some("failure")));
+        let scoped_red = classify_base_for_lane(&required_red, &required);
+        assert!(matches!(scoped_red.verdict, MainVerdict::Red));
+        assert_eq!(scoped_red.red[0].name, "deploy / Deploy to dev");
+        // a required workflow unsettled → Unsettled (never green)
+        let mut required_pending = nightly_reds.clone();
+        required_pending.push(run(8, "post-deploy / Post-Deploy Smoke", Some("in_progress")));
+        let scoped_unsettled = classify_base_for_lane(&required_pending, &required);
+        assert!(matches!(scoped_unsettled.verdict, MainVerdict::Unsettled));
+        assert!(scoped_unsettled.unsettled.iter().any(|u| u.contains("Post-Deploy Smoke")));
+        // newest non-cancelled per name judges (inherited law, scoped set):
+        // cancelled newest falls back to the older run's conclusion
+        let mut cancelled_newest = nightly_reds.clone();
+        cancelled_newest.push(run(9, "post-deploy / DNS chain (front doors)", Some("cancelled")));
+        assert!(matches!(classify_base_for_lane(&cancelled_newest, &required).verdict, MainVerdict::Green));
+        // EMPTY required list → the full-run law (undeclared cannot scope)
+        assert!(matches!(classify_base_for_lane(&nightly_reds, &[]).verdict, MainVerdict::Red));
+        // scoped set matches NO run (config drift) → the full-run law — an
+        // empty set is never evidence of green
+        assert!(matches!(classify_base_for_lane(&nightly_reds, &["ghost / Renamed workflow".to_string()]).verdict, MainVerdict::Red));
     }
 
     #[test]
