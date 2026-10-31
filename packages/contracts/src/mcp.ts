@@ -44,6 +44,7 @@ export const TOOL_NAMES = [
   "train_event",
   "train_history",
   "train_lane",
+  "train_queue_facts",
   "train_lease",
   "train_status",
   "transition",
@@ -238,6 +239,21 @@ export const TOOL_ARG_SCHEMAS = {
     from_head: z.string(),
     /** the head after it — coverage extends here via the appended record */
     to_head: z.string(),
+  }),
+  // BR#5114: the executor's per-tick per-entry gate verdicts for the WHOLE
+  // derived queue, in walk (rank) order — the truth behind the panel's
+  // queue blocks. Executor-fed facts (it gates every entry it walks);
+  // hub stores + serves them; classes: ready (merges this pass) |
+  // waiting (checks/mergeability pending) | conflict | needs-review |
+  // blocked (protection/other).
+  train_queue_facts: z.looseObject({
+    repo: z.string(),
+    base: z.string().optional(),
+    entries: z.array(z.looseObject({
+      id: z.string(),
+      pr: z.number().int().optional(),
+      cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]),
+    })),
   }),
   // ---- proxy verification probes (BR#4658): the sweep enqueues probes for
   // run_success / pr_checks_green parks it cannot verify itself (the hub

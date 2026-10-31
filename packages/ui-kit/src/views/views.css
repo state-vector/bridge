@@ -513,7 +513,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-now-note::before { content: "▸ "; color: var(--accent); }
 .train-stall { color: var(--amber, #d29a4b); font-weight: 600; white-space: nowrap; cursor: help; }
 .trainc-rate { white-space: nowrap; }
-.trainc-backlog { white-space: nowrap; cursor: help; }
+.trainc-backlog { min-width: 0; overflow: hidden; display: flex; align-items: center; gap: 8px; }
+.train-depth { flex: none; cursor: help; }
+.train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; }
+.train-block { width: 11px; height: 16px; border-radius: 3px; cursor: pointer; flex: none; border: 1px solid transparent; }
+.train-block:hover { filter: brightness(1.2); }
+.tb-ready { background: var(--green, #3fb26a); }
+.tb-waiting { background: var(--amber, #d29a4b); }
+.tb-conflict { background: var(--red, #d9534f); }
+.tb-needs-review { background: var(--text-faint, #8b94a7); }
+.tb-blocked { background: repeating-linear-gradient(45deg, var(--text-faint, #8b94a7), var(--text-faint, #8b94a7) 3px, transparent 3px, transparent 6px); }
+.tb-unknown { background: transparent; border: 1px solid var(--text-faint, #8b94a7); }
+.tb-head { box-shadow: 0 0 0 2px var(--accent, #6ea8fe); }
+.tb-awaiting { background: var(--text-faint, #8b94a7); opacity: 0.55; }
+.tb-awaiting-aging { background: var(--amber, #d29a4b); opacity: 0.8; }
+.tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
+.train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
@@ -980,7 +995,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* per-table column templates — layout lives ONLY here, as --cols */
 .top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
-.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) minmax(230px, 1.1fr) 120px minmax(200px, 1.1fr) 86px 160px; }
+.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) minmax(230px, 1.1fr) 120px minmax(200px, 1.1fr) 86px minmax(210px, auto); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
   .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }

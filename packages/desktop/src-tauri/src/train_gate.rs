@@ -348,6 +348,50 @@ pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize)
     }
 }
 
+// ---------- BR#5190 root-fix fast lane: the main-breakage law's gate half ----------
+
+/// The deploy-health gate check — matched as a lowercase substring against the
+/// check NAME ("Deploy health (merge gate)" matches). A head red of this class
+/// is exactly main's own deploy red: the circular class no machine leg can
+/// pass — the one-click human merge ask is the fast lane (BR#5189 §5, SP #2617
+/// precedent). MUST stay byte-identical to core.ts DEPLOY_HEALTH_PATTERN.
+pub const DEPLOY_HEALTH_PATTERN: &str = "deploy health";
+
+/// The deterministic one-click human merge ask title for the circular
+/// deploy-health class. BYTE-IDENTICAL to core.ts rootFixFastLaneTitle: the
+/// executor files this ask and the hub re-classifies executor-fed reports, so
+/// ask-dedupe keys on exact wording across hub + executor. ≤240 chars, ends
+/// "?" per the ask contract.
+pub fn root_fix_fast_lane_title(repo: &str, pr: impl std::fmt::Display) -> String {
+    format!(
+        "Root-fix fast lane (BR#5189): merge {repo} PR #{pr} now? Main is red on the exact red this PR cures — the train cannot merge it while the line it fixes is stopped; one click merges the cure?"
+    )
+}
+
+/// The main-breakage qualification (BR#5189 §1): the card is THE root fix iff
+/// it is tagged `root_blocker` + `main-red` AND bound to a failing main-HEAD
+/// run (meta.root_fix with repo + head_sha). Tags alone never qualify — the
+/// binding does (an ambient "main is red" tag without a named run would pin
+/// the whole queue to a stale episode). MUST stay behaviour-identical to the
+/// TS mirror (core.ts isRootFixCard, tag match case-insensitive).
+pub fn is_root_fix_card(card: &Value) -> bool {
+    let tags: Vec<String> = card
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_lowercase())).collect())
+        .unwrap_or_default();
+    if !tags.iter().any(|t| t == "root_blocker") || !tags.iter().any(|t| t == "main-red") {
+        return false;
+    }
+    let b = match card.get("meta").and_then(|m| m.get("root_fix")) {
+        Some(b) if b.is_object() => b,
+        _ => return false,
+    };
+    let repo = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+    let sha = b.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
+    !repo.is_empty() && !sha.is_empty()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MergeAction {
     Merge { receipt: String },
@@ -370,6 +414,14 @@ pub struct TrainGateInput<'a> {
     pub commits: &'a [(String, bool)],
     pub head_checks: &'a [MainCheckRun],
     pub leg_number: Option<usize>,
+    /// BR#5190: the candidate IS the bound main-breakage fix (is_root_fix_card
+    /// over the WHOLE card — tags live on the card row, the binding under
+    /// meta.root_fix — the executor mirror of the hub's isRootFixCard).
+    pub root_fix: bool,
+    /// BR#5190: the base's failing check NAMES ride the gate — the fast lane
+    /// matches the circular deploy-health class off them (the receipt names
+    /// the red the fix cures).
+    pub base_red_names: &'a [String],
 }
 
 /// core.ts decideMergeAction (907): the 5c gate + verify lineage as one
@@ -565,6 +617,43 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             };
         }
     }
+    // ---- BR#5190 root-fix fast lane pre-clear (steering BR#5189): main is
+    // RED and the candidate is THE bound main-breakage fix — the shared law's
+    // base-red row would park the cure forever behind the very red it cures
+    // (the lane is stopped; nothing else merges until main greens). Two rows:
+    // (a) head green — merge the cure onto the red base NOW (receipt stamps
+    //     root_fix_fast_tracked); the cure's own merge is what turns main
+    //     green again.
+    // (b) circular deploy-health class — the base's red NAMES the deploy
+    //     health gate, which is red BECAUSE main is red: the head can never go
+    //     green while the line it fixes is stopped, so no machine leg can ever
+    //     pass — the one-click human merge ask is the fast lane (SP #2617
+    //     precedent).
+    // Coverage is settled above (an uncovered head bounced), so both rows see
+    // a verified, covered head. Base red but NOT circular with a non-green
+    // head falls through — the standing law's own rows own that wait; the
+    // fast lane is never invented for a red the cure doesn't cure. ----
+    if i.root_fix && i.base_verdict == MainVerdict::Red {
+        let head = classify_head_checks(i.head_checks);
+        if head.verdict == MainVerdict::Green {
+            return MergeAction::Merge {
+                receipt: format!(
+                    "ROOT-FIX FAST-TRACK (BR#5189): PR #{n} is the bound main-breakage fix and its head is GREEN — merging onto the red base to turn the line green (root_fix_fast_tracked); base red: {reds}",
+                    n = i.pr_number,
+                    reds = if i.base_red_names.is_empty() { "required checks".to_string() } else { i.base_red_names.join(", ") }
+                ),
+            };
+        }
+        let base_circular = i.base_red_names.iter().any(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN));
+        if base_circular {
+            return MergeAction::HumanLeg {
+                reason: format!(
+                    "PR #{n} is the bound main-breakage fix but the circular deploy-health class stands (BR#5189, SP #2617 precedent): the gate is red because MAIN is red — the head cannot go green while the line it fixes is stopped; the one-click human merge ask is the fast lane",
+                    n = i.pr_number
+                ),
+            };
+        }
+    }
     let composed_state: Option<&str> = match i.merge_state_status.as_deref() {
         Some(s) if behind || blocked => Some("clean"),
         other => other,
@@ -650,6 +739,56 @@ pub fn drain_burst_decision(merged: u32, cap: u32, has_next: bool, red_seen: boo
 /// shas, oldest first — the first RED one names the ONE culprit merge.
 pub fn first_red_index(reds: &[bool]) -> Option<usize> {
     reds.iter().position(|r| *r)
+}
+
+/// BR#4996 batch inputs: one candidate head's changed-file set (`git diff
+/// --name-only merge-base(origin/base, head)..head`), keyed by file path.
+pub type FileSet = std::collections::BTreeSet<String>;
+
+/// BR#4996: conflict pairs among batch candidates, from their changed-file
+/// sets — two heads are pair-candidates when their sets INTERSECT. A pure
+/// set law, testable without git; the executor's plumbing that PRODUCES the
+/// sets fails closed per BR#3935 (an unreadable head never yields a silent
+/// empty set), and each intersecting pair is merge-tree-confirmed before it
+/// gates a landing (train.rs).
+pub fn conflicts_from_file_sets(file_sets: &[FileSet]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..file_sets.len() {
+        for j in (i + 1)..file_sets.len() {
+            if file_sets[i].iter().any(|f| file_sets[j].contains(f)) {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// The batch-merge law (BR#4996, Ray ruling 2026-10-29, amending the
+/// BR#4934 burst-drain): select the maximal set of MUTUALLY non-conflicting
+/// heads from the gate-clean queue, in queue order — which is landing order
+/// (oldest-first). Greedy: a head joins the batch unless it conflicts
+/// (either pair orientation) with an already-selected head; `clean[i] ==
+/// false` excludes just that member (fail-closed: only KNOWN-clean heads
+/// are eligible — an exclusion never poisons its neighbours, so a chain
+/// A↔B↔C lands [A, C] and skips only B); `cap > 0` binds when the batch
+/// reaches it, `cap == 0` is unlimited.
+pub fn select_batch(clean: &[bool], conflict_pairs: &[(usize, usize)], cap: usize) -> Vec<usize> {
+    let mut selected: Vec<usize> = Vec::new();
+    for (i, ok) in clean.iter().enumerate() {
+        if !ok {
+            continue;
+        }
+        if cap > 0 && selected.len() >= cap {
+            break;
+        }
+        let clashing = selected.iter().any(|&s| {
+            conflict_pairs.iter().any(|&(a, b)| (a == i && b == s) || (a == s && b == i))
+        });
+        if !clashing {
+            selected.push(i);
+        }
+    }
+    selected
 }
 
 /// core.ts mergeSweepHumanLegTitle (953): deterministic class-ask title,
@@ -828,6 +967,8 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[],
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -866,6 +1007,8 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[],
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Bounce { bounce_kind, .. } => assert_eq!(bounce_kind, BounceKind::Coverage),
@@ -892,6 +1035,8 @@ mod tests {
             commits: &[(head.clone(), true)],
             head_checks: &checks,
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -922,6 +1067,8 @@ mod tests {
             commits: &commits,
             head_checks: &pending,
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Skip { reason } => {
@@ -943,6 +1090,8 @@ mod tests {
             commits: &commits,
             head_checks: &red,
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Note { reason } => assert!(reason.contains("head check RED"), "reason: {reason}"),
@@ -969,6 +1118,8 @@ mod tests {
             commits: &[(head.clone(), true)],
             head_checks: &checks,
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -1030,6 +1181,8 @@ mod tests {
             commits: &[(head.into(), true)],
             head_checks: &[run(1, "ci", Some("success"))],
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("leg 1/1") && receipt.contains("BR#3516")),
@@ -1094,6 +1247,8 @@ mod tests {
             commits,
             head_checks,
             leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
         }
     }
 
@@ -1184,5 +1339,244 @@ mod tests {
         assert_eq!(first_red_index(&[false, false]), None);
         assert_eq!(first_red_index(&[]), None);
         assert_eq!(first_red_index(&[true]), Some(0));
+    }
+
+    #[test]
+    fn select_batch_skips_conflicting_members_greedily() {
+        // 0 conflicts with 2: the batch is [0, 1]; 2 waits for the next pass
+        assert_eq!(select_batch(&[true, true, true], &[(0, 2)], 0), vec![0, 1]);
+        // chain 0+1 conflict, 1+2 conflict: only 1 is skipped — [0, 2] land
+        // together (conflicts are checked against SELECTED heads only)
+        assert_eq!(select_batch(&[true, true, true], &[(0, 1), (1, 2)], 0), vec![0, 2]);
+        // both pair orientations are checked: (2, 0) is the same conflict
+        assert_eq!(select_batch(&[true, true, true], &[(2, 0)], 0), vec![0, 1]);
+    }
+
+    #[test]
+    fn select_batch_cap_binds_and_zero_is_unlimited() {
+        assert_eq!(select_batch(&[true, true, true], &[], 2), vec![0, 1]);
+        assert_eq!(select_batch(&[true, true, true], &[], 0), vec![0, 1, 2]);
+        assert_eq!(select_batch(&[true], &[], 0), vec![0]);
+        assert_eq!(select_batch(&[], &[], 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn select_batch_fail_closed_not_known_clean_excludes_just_that_member() {
+        assert_eq!(select_batch(&[false, true, true], &[], 0), vec![1, 2]);
+        assert_eq!(select_batch(&[false, false, false], &[], 0), Vec::<usize>::new());
+        // an excluded member shields nothing: conflicts are vs SELECTED only
+        assert_eq!(select_batch(&[false, true], &[(0, 1)], 0), vec![1]);
+    }
+
+    #[test]
+    fn conflicts_from_file_sets_pairwise_intersection() {
+        let sets: Vec<FileSet> = vec![
+            ["a.rs", "b.ts"].iter().map(|s| s.to_string()).collect(),
+            ["c.rs"].iter().map(|s| s.to_string()).collect(),
+            ["b.ts", "d.md"].iter().map(|s| s.to_string()).collect(),
+        ];
+        assert_eq!(conflicts_from_file_sets(&sets), vec![(0, 2)]);
+        let disjoint: Vec<FileSet> = vec![
+            ["a.rs"].iter().map(|s| s.to_string()).collect(),
+            ["b.rs"].iter().map(|s| s.to_string()).collect(),
+        ];
+        assert!(conflicts_from_file_sets(&disjoint).is_empty());
+        // an empty set (no files changed) conflicts with nothing
+        let with_empty: Vec<FileSet> = vec![FileSet::new(), ["a.rs"].iter().map(|s| s.to_string()).collect()];
+        assert!(conflicts_from_file_sets(&with_empty).is_empty());
+    }
+
+    // ---------- BR#5190 root-fix fast lane ----------
+
+    fn root_fix_row(head: &str) -> serde_json::Value {
+        // the WHOLE card row as the executor's get_artefact sees it (tags are a
+        // row column, the binding nests under meta)
+        serde_json::json!({
+            "tags": ["root_blocker", "main-red", "p0"],
+            "meta": {
+                "root_fix": { "repo": "o/r", "head_sha": "deadbeef0000" },
+                "prs": [ { "repo": "o/r", "number": 339, "head_sha_at_acceptance": head } ],
+            },
+        })
+    }
+
+    fn root_fix_meta(head: &str) -> serde_json::Value {
+        // the card META as the gate receives it (card_meta)
+        serde_json::json!({
+            "root_fix": { "repo": "o/r", "head_sha": "deadbeef0000" },
+            "prs": [ { "repo": "o/r", "number": 339, "head_sha_at_acceptance": head } ],
+        })
+    }
+
+    #[test]
+    fn root_fix_qualification_needs_tags_and_binding() {
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        assert!(is_root_fix_card(&root_fix_row(head)));
+        // tags without a binding never qualify
+        assert!(!is_root_fix_card(&serde_json::json!({ "tags": ["root_blocker", "main-red"], "meta": { "root_fix": {} } })));
+        // binding without tags never qualifies
+        assert!(!is_root_fix_card(&serde_json::json!({ "meta": { "root_fix": { "repo": "o/r", "head_sha": "deadbeef0000" } } })));
+        // empty binding halves never qualify
+        assert!(!is_root_fix_card(&serde_json::json!({ "tags": ["root_blocker", "main-red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "" } } })));
+        // tag match is case-insensitive (the executor sees gh/board casing)
+        assert!(is_root_fix_card(&serde_json::json!({ "tags": ["ROOT_BLOCKER", "Main-Red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "d" } } })));
+    }
+
+    #[test]
+    fn root_fix_fast_lane_title_contract() {
+        let t = root_fix_fast_lane_title("state-vector/bridge", 339);
+        assert!(t.ends_with("?") && t.len() <= 240);
+        assert!(t.starts_with("Root-fix fast lane (BR#5189): merge state-vector/bridge PR #339"));
+        // byte-identity with the TS mirror is pinned on the core side by the
+        // shared wording here; ask-dedupe keys on exact wording
+        assert_eq!(
+            t,
+            "Root-fix fast lane (BR#5189): merge state-vector/bridge PR #339 now? Main is red on the exact red this PR cures — the train cannot merge it while the line it fixes is stopped; one click merges the cure?"
+        );
+    }
+
+    #[test]
+    fn base_red_head_green_root_fix_merges_fast_tracked() {
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &["Deploy health (merge gate)".to_string(), "Deploy Dev".to_string()],
+        });
+        match gate {
+            MergeAction::Merge { receipt } => {
+                assert!(receipt.contains("ROOT-FIX FAST-TRACK") && receipt.contains("root_fix_fast_tracked"), "{receipt}");
+                assert!(receipt.contains("Deploy health (merge gate)"), "{receipt}");
+            }
+            other => panic!("expected fast-track merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base_red_head_green_without_root_fix_stays_parked() {
+        // the SAME shape but unqualified — the standing law's base-red row owns it
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "o/r", "number": 340, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 340,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &["Deploy Dev".to_string()],
+        });
+        assert!(matches!(gate, MergeAction::Skip { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn circular_deploy_health_class_is_the_human_fast_lane() {
+        // head RED (it carries the same deploy-health red main has) + base red
+        // naming deploy health — no machine leg can ever pass: HumanLeg
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "Deploy health (merge gate)", Some("failure"))],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &["Deploy health (merge gate)".to_string()],
+        });
+        match gate {
+            MergeAction::HumanLeg { reason } => {
+                assert!(reason.contains("circular deploy-health class") && reason.contains("BR#5189"), "{reason}");
+            }
+            other => panic!("expected human fast lane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn circular_human_lane_never_fires_for_an_unqualified_card() {
+        // same circular base, same red head — but NOT the root fix: standing law
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "o/r", "number": 341, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 341,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "Deploy health (merge gate)", Some("failure"))],
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &["Deploy health (merge gate)".to_string()],
+        });
+        assert!(!matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn base_red_non_circular_head_red_root_fix_waits_like_everyone() {
+        // base red (real red, not deploy-health) + the cure's own head red —
+        // no fast lane is invented for a red the cure doesn't cure: the
+        // standing law's note row owns the wait
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "Rust Tests", Some("failure"))],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &["Deploy Dev".to_string()],
+        });
+        assert!(!matches!(gate, MergeAction::Merge { .. }) && !matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn base_green_root_fix_is_a_noop_on_the_standing_law() {
+        // base green — the fast lane is silent and the standing law merges
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "ci", Some("success"))],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &[],
+        });
+        assert!(matches!(gate, MergeAction::Merge { .. }), "got {gate:?}");
     }
 }

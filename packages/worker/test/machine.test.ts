@@ -469,6 +469,26 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
   });
 
+  it("BR#5151: infrastructure close-protection no longer exempts the owner's own actor", async () => {
+    // The BR#5050 hole: the reconcile daemon's actor IS the lane card's
+    // owner, so the old `i.owner !== i.actor` leg let the provenance-close
+    // through. Owner identity must NOT exempt a standing card anymore.
+    const laneClose = { status: "in_progress" as const, to: "done" as const, meta: { lane: { key: "state-vector/bridge@main" } }, tags: ["merge-train", "infrastructure"], owner: "worker-gw-1", actor: "worker-gw-1" };
+    const v = await decide(input(laneClose), baseCtx());
+    expect(v.ok).toBe(false);
+    if (v.ok === false) {
+      expect(v.rule).toBe("infrastructure-close-protection");
+      expect(v.code).toBe("guard-failed");
+    }
+    // humans and the machinery still close standing cards; web: too
+    expect((await decide(input({ ...laneClose, actor: "web:ray" }), baseCtx())).ok).toBe(true);
+    expect((await decide(input({ ...laneClose, actor: "human:ray" }), baseCtx())).ok).toBe(true);
+    expect((await decide(input({ ...laneClose, actor: "system:proxy-train" }), baseCtx())).ok).toBe(true);
+    // ordinary (non-standing) cards keep the owner leg — the owner may
+    // still close its own normal task
+    expect((await decide(input({ status: "in_progress", to: "done", owner: "agent-x", actor: "agent-x" }), baseCtx())).ok).toBe(true);
+  });
+
   // BR#3611: a gateway's claim is ATTRIBUTED — owner = attributedAgent
   // (do.ts claim path), so the gateway's raw actor never equals the owner and
   // the gate structurally refused every self-release (the stale-claim path in

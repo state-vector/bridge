@@ -87,6 +87,11 @@ export interface ReconcileBinding {
   missing_set_before_report: boolean;
   /** Provenance row for (repo, pr), when the train stamped the merge. */
   provenance: { merge_sha: string; signer: string } | null;
+  /** BR#5151: a standing merge-lane card (meta.lane / infrastructure tag).
+   *  Live subsystem — reconcile never spawns at it, never duties it, and
+   *  NEVER provenance-closes it (the BR#5050 incident); the train's settle
+   *  path is the only lane writer. */
+  lane: boolean;
 }
 
 /** A recorded ignore-with-reason (reconcile_ignores). */
@@ -130,6 +135,9 @@ export type ReconcileDecision =
   | { action: "grace" }
   /** Reverse reconcile: the PR was seen this cycle — clear any missing marker. */
   | { action: "seen"; card: string }
+  /** BR#5151: the binding is a standing merge-lane card — the train owns it
+   *  forever; account it and move on (never spawn, duty, clock, or close). */
+  | { action: "lane_exempt"; card: string }
   /** First miss: start the missing clock (no action yet). */
   | { action: "mark_missing"; card: string }
   /** Second consecutive miss + a provenance row: close the card (machine
@@ -168,6 +176,9 @@ export interface ReconcileAccounting {
   reverse_missing: number;
   reverse_closed: number;
   reverse_dutied: number;
+  /** BR#5151: standing lane bindings — accounted, exempt from the reverse
+   *  legs entirely (no close, no duty, no missing clock). */
+  reverse_lane_exempt: number;
   accounted: number;
   /** false ⇒ the run FAILED — alarm to the sink. */
   ok: boolean;
@@ -192,7 +203,7 @@ export function accountingLine(a: ReconcileAccounting): string {
   const base = `${a.open_reviewed} open reviewed / ${a.bound} bound / ${a.ignored} ignored-with-reason / ${inflight} in-flight — ${a.accounted} accounted`;
   const alarm = a.ok ? "" : ` — ALARM: ${a.unaccounted} unaccounted`;
   const info = a.grace || a.unreviewed ? ` (+${a.grace} in age grace, +${a.unreviewed} unreviewed)` : "";
-  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied]` : "";
+  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}]` : a.reverse_lane_exempt ? ` [reverse: ${a.reverse_lane_exempt} lane-exempt]` : "";
   return base + alarm + info + reverse;
 }
 
@@ -227,6 +238,7 @@ export function reconcileJoin(args: {
     reverse_missing: 0,
     reverse_closed: 0,
     reverse_dutied: 0,
+    reverse_lane_exempt: 0,
     accounted: 0,
     ok: true,
   };
@@ -256,7 +268,15 @@ export function reconcileJoin(args: {
     //    the standard duty on the EXISTING card — never a second card).
     const b = bindings.get(p.number);
     if (b) {
-      if (b.queued) {
+      if (b.lane) {
+        // BR#5151: the bound card is a standing merge-lane lane — the train
+        // owns it forever. Account it as bound and never spawn at it (the
+        // BR#5050 class: a verify duty parented onto the lane card is the
+        // foothold for the provenance mis-stamp).
+        acc.bound++;
+        acc.accounted++;
+        judgements.push({ pr: p.number, decision: { action: "lane_exempt", card: b.card }, reason: "standing merge-lane card (BR#5151) — the train owns it; reconcile never spawns or closes at it" });
+      } else if (b.queued) {
         acc.bound++;
         acc.accounted++;
         judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: "queued on the merge train (BR#4079 stamp) — the train owns it" });
@@ -330,6 +350,14 @@ export function reconcileJoin(args: {
   // ---- reverse reconcile: bindings whose PR is gone from the open list ----
   const openPrs = new Set(prs.map((p) => p.number));
   for (const b of args.bindings) {
+    if (b.lane) {
+      // BR#5151: a standing lane card is never a zombie — its bootstrap PR
+      // leaving the open list (or a stray provenance row on the card) is not
+      // a merge to close over. No missing clock, no ruling duty, no close.
+      acc.reverse_lane_exempt++;
+      judgements.push({ pr: b.pr, decision: { action: "lane_exempt", card: b.card }, reason: "standing merge-lane card (BR#5151) — exempt from reverse reconcile: never closed, never dutied, never clocked" });
+      continue;
+    }
     if (!b.missing) {
       judgements.push({ pr: b.pr, decision: { action: "seen", card: b.card }, reason: "PR still open — missing clock cleared" });
       continue;

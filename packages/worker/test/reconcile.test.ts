@@ -56,6 +56,7 @@ const binding = (pr_: number, over: Partial<ReconcileBinding> = {}): ReconcileBi
   missing: false,
   missing_set_before_report: false,
   provenance: null,
+  lane: false,
   ...over,
 });
 
@@ -149,7 +150,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 3, bound: 1, ignored: 1, inflight: 0, spawned: 1,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, accounted: 3, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 3, ok: true,
     });
     expect(line).toBe("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
   });
@@ -158,7 +159,7 @@ describe("accountingLine", () => {
     const a = {
       repo: "r", open_reviewed: 1, bound: 0, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, accounted: 0, ok: false,
+      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 0, ok: false,
     };
     expect(accountingLine(a)).toContain("ALARM: 1 unaccounted");
     expect(accountingLine({ ...a, unaccounted: 0, ok: true, accounted: 1, bound: 1 })).not.toContain("ALARM");
@@ -168,10 +169,19 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1,
-      reverse_dutied: 0, accounted: 1, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("(+2 in age grace, +3 unreviewed)");
     expect(line).toContain("[reverse: 1 missing, 1 closed, 0 dutied]");
+  });
+
+  it("BR#5151: lane-exempt bindings render in the reverse tail", () => {
+    const line = accountingLine({
+      repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
+      grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
+      reverse_dutied: 0, reverse_lane_exempt: 2, accounted: 1, ok: true,
+    });
+    expect(line).toContain("[reverse: 2 lane-exempt]");
   });
 });
 
@@ -371,5 +381,76 @@ describe("reconcileJoin — reverse", () => {
     expect(r.judgements.filter((j) => j.pr === 1)).toHaveLength(0);
     expect(r.accounting.reverse_missing).toBe(1);
     expect(r.accounting.reverse_dutied).toBe(0);
+  });
+});
+
+// ---------- BR#5151: standing merge-lane cards are exempt from reconcile ----------
+
+describe("reconcileJoin — lane exemption (BR#5151)", () => {
+  it("a bound lane card accounts as bound — never spawn_verify at it (forward)", () => {
+    const r = join({
+      prs: [pr(1)],
+      bindings: [binding(1, { lane: true, status: "blocked" })],
+      cfg: { verify_age_ms: 0 },
+    });
+    const d: any = one(r, 1).decision;
+    expect(d.action).toBe("lane_exempt");
+    expect(d.card).toBe("BR#9001");
+    expect(r.accounting.bound).toBe(1);
+    expect(r.accounting.spawned).toBe(0);
+    expect(r.accounting.accounted).toBe(1);
+    expect(r.accounting.ok).toBe(true);
+  });
+
+  it("lane exemption outranks the queued stamp — the train owns the card either way", () => {
+    const r = join({
+      prs: [pr(1)],
+      bindings: [binding(1, { lane: true, status: "blocked", queued: true })],
+    });
+    expect(one(r, 1).decision.action).toBe("lane_exempt");
+  });
+
+  it("a lane card with a stamped provenance row and a vanished bootstrap PR is NOT reverse-closed", () => {
+    // the BR#5050 incident, pinned: provenance on the lane + two misses used
+    // to fire reverse_close; the lane flag must short-circuit before it.
+    const r = join({
+      prs: [],
+      bindings: [binding(1, { lane: true, missing: true, missing_set_before_report: true, provenance: { merge_sha: "a".repeat(40), signer: "detached-cody" } })],
+    });
+    const d: any = one(r, 1).decision;
+    expect(d.action).toBe("lane_exempt");
+    expect(r.accounting.reverse_closed).toBe(0);
+    expect(r.accounting.reverse_missing).toBe(0);
+    expect(r.accounting.reverse_dutied).toBe(0);
+    expect(r.accounting.reverse_lane_exempt).toBe(1);
+  });
+
+  it("a lane binding past the actionable age never spawns a verify/disposition duty (forward)", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: "CHANGES_REQUESTED", updatedAt: iso(72) })],
+      bindings: [binding(1, { lane: true })],
+      cfg: { disposition_age_ms: 0, verify_age_ms: 0 },
+    });
+    expect(one(r, 1).decision.action).toBe("lane_exempt");
+    expect(r.accounting.spawned).toBe(0);
+  });
+
+  it("a non-lane card with the same provenance + missing shape still reverse-closes (no over-exemption)", () => {
+    const r = join({
+      prs: [],
+      bindings: [binding(1, { missing: true, missing_set_before_report: true, provenance: { merge_sha: "b".repeat(40), signer: "detached-cody" } })],
+    });
+    expect(one(r, 1).decision.action).toBe("reverse_close");
+    expect(r.accounting.reverse_closed).toBe(1);
+    expect(r.accounting.reverse_lane_exempt).toBe(0);
+  });
+
+  it("accountingLine renders the lane-exempt reverse tail", () => {
+    const r = join({
+      prs: [],
+      bindings: [binding(1, { lane: true, missing: true, missing_set_before_report: true })],
+    });
+    expect(r.accounting.reverse_lane_exempt).toBe(1);
+    expect(accountingLine(r.accounting)).toContain("1 lane-exempt");
   });
 });

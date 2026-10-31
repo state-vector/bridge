@@ -204,7 +204,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
           <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
           <span title="PRs merged over the last hour / 24 hours">rate</span>
-          <span title="how many cards are waiting to merge, and how many of those waiting cards are blocked on a fresh review">backlog</span>
+          <span title="how many cards are waiting to merge (`queue N`) and how many open PRs the repo's last reconcile pass listed (`open M`) — the derived queue is only the actionable subset (BR#5106); the blocks show the queue in walk order (BR#5114)">backlog</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
@@ -231,7 +231,6 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             : l.activity?.last_event
               ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
               : null;
-        const stalled = l.queue.length > 0 && (l.activity?.merged_24h ?? 0) === 0;
         return (
           <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
             <span className="trainc-dot">
@@ -253,30 +252,40 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             <span className="trainc-prog top-num" title={prog}>{prog}</span>
             <span className="trainc-msg">
               {msg ? <span className="train-now-note" title={msg.title}>{msg.text}</span> : <span className="muted-note">—</span>}
-              {stalled && (
-                <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait${l.queue_awaiting_review ? ` — ${l.queue_awaiting_review} are blocked on a fresh review (their PR branches changed after their last review)` : ""}`}>
-                  ⚠ nothing merged in 24h
-                </span>
-              )}
-              {(l.awaiting ?? []).length > 0 && (
-                <span className="train-awaiting" title="parked Awaiting review — the human force-review queue (BR#4962, per BR#4960); no ask was filed, the human acts from the backlog">
-                  {(l.awaiting ?? []).map((a) => (
-                    <Chip
-                      key={a.task}
-                      tone={a.lapsed ? "urgent" : a.aging ? "warn" : "scope"}
-                      className="train-awaiting-card"
-                      onClick={() => openTask?.(a.task)}
-                      title={`${a.task}${a.pr ? ` (PR #${a.pr})` : ""} parked Awaiting review — ${a.verdict ?? "verdict unrecorded"} anchored at head ${String(a.head_sha ?? "").slice(0, 9) || "?"} · parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? ", PAST the awaiting window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? ", past the awaiting window (amber)" : ""} — force-review from the backlog: approve re-queues, changes requested bounce impl (no ask was filed — BR#4960)`}
-                    >
-                      ◉ awaiting {age(Date.now() - a.age_ms, Date.now())}
-                    </Chip>
-                  ))}
-                </span>
-              )}
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
-            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed — the derived queue is only the actionable subset (${age(l.open_prs.ts, now)} ago; BR#5106/BR#5022)` : ""}`}>
-              {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+            <span className="trainc-backlog">
+              <span className="train-depth top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed — the derived queue is only the actionable subset (${age(l.open_prs.ts, now)} ago; BR#5106/BR#5022)` : ""}`}>
+                {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+              </span>
+              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), amber waits on checks, red conflicts, grey needs a review${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${(l.awaiting ?? []).length ? ` · grey blocks after the divider: ${(l.awaiting ?? []).length} waiting on a review (amber past the window, red past window + grace)` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed — the derived queue is only the actionable subset (${age(l.open_prs.ts, now)} ago; BR#5106/BR#5022)` : ""}`}>
+                {l.queue.map((q, i) => {
+                  const fact = l.queue_facts?.entries.find((e) => e.id === q.id);
+                  const cls = fact?.cls ?? "unknown";
+                  const word = cls === "ready" ? "merges this pass" : cls === "waiting" ? "waiting on checks" : cls === "conflict" ? "conflicted — back to impl" : cls === "needs-review" ? "needs a review" : cls === "blocked" ? "blocked (protection)" : "no machine verdict yet";
+                  return (
+                    <span
+                      key={q.id}
+                      className={`train-block tb-${cls}${i === 0 ? " tb-head" : ""}`}
+                      title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word}${i === 0 ? " · head of the queue" : ""}`}
+                      onClick={() => openTask?.(q.id)}
+                    />
+                  );
+                })}
+                {(l.awaiting ?? []).length > 0 && (
+                  <>
+                    <span className="train-block-gap" title={`${(l.awaiting ?? []).length} parked Awaiting review — after the queue, oldest first`} />
+                    {(l.awaiting ?? []).map((a) => (
+                      <span
+                        key={a.task}
+                        className={`train-block tb-awaiting${a.lapsed ? " tb-awaiting-lapsed" : a.aging ? " tb-awaiting-aging" : ""}`}
+                        title={`${a.task}${a.pr ? ` · PR #${a.pr}` : ""} — waiting on a review, parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? " · PAST the review window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? " · past the review window (amber)" : ""}${a.verdict ? `\nanchored verdict: ${a.verdict}` : ""}\nforce-review from the backlog: approve re-queues, changes requested bounce impl`}
+                        onClick={() => openTask?.(a.task)}
+                      />
+                    ))}
+                  </>
+                )}
+              </span>
             </span>
           </div>
         );

@@ -364,25 +364,28 @@ export const RULES: Rule[] = [
       `task ${i.id} cannot be superseded by an agent session — dropping a card is a human-authority act (BR#2480). Route it through an answered ask whose options offer SUPERSEDE (the answer is the authorisation) or the web.`,
   },
   {
-    // BR#5061 infrastructure close-protection: standing-state cards —
-    // merge-train lanes (meta.lane) and anything tagged infrastructure —
-    // ARE live subsystems; closing one retires it (a done lane card stops
-    // the train from ever ticking that lane again, BR#4977). The 2026-10-29
-    // outage: a duty session closed the state-vector/bridge@main lane card
-    // done as a close-reflex and the lane could not self-heal for hours.
-    // done/superseded on these cards is owner-, human- (web:/human:), or
-    // machinery-only (system:) — a duty reaching this edge gets a NAMED
-    // rejection and records its findings instead (done-with-findings is the
-    // duty's own terminal state, never the lane's).
+    // BR#5061 infrastructure close-protection, tightened by BR#5151:
+    // standing-state cards — merge-train lanes (meta.lane) and anything
+    // tagged infrastructure — ARE live subsystems; closing one retires it
+    // (a done lane card stops the train from ever ticking that lane again,
+    // BR#4977). The 2026-10-29 outage: a duty session closed the
+    // state-vector/bridge@main lane card done as a close-reflex and the lane
+    // could not self-heal for hours. done/superseded on these cards is
+    // human- (web:/human:) or machinery-only (system:) — NO owner leg: the
+    // BR#5050 incident was the reconcile daemon itself, whose actor IS the
+    // lane card's owner, closing it via the provenance path (the old
+    // `i.owner !== i.actor` exemption let it through). A duty reaching this
+    // edge gets a NAMED rejection and records its findings instead
+    // (done-with-findings is the duty's own terminal state, never the
+    // lane's).
     name: "infrastructure-close-protection",
     when: (i) =>
       isTask(i) &&
       (i.to === "done" || i.to === "superseded") &&
       (!!i.meta?.lane || (i.tags ?? []).includes("infrastructure")) &&
-      !OWNER_RELEASE_EXEMPT.test(i.actor) &&
-      i.owner !== i.actor,
+      !OWNER_RELEASE_EXEMPT.test(i.actor),
     guard: (i) =>
-      `task ${i.id} is an infrastructure/merge-train lane card — closing it retires a live subsystem (BR#4977: a done lane card is never ticked again; BR#5061). Only the owner, a human (web/human:), or the machinery (system:) may close it. If your duty reached this card, close YOURSELF done-with-findings instead — never the lane card.`,
+      `task ${i.id} is an infrastructure/merge-train lane card — closing it retires a live subsystem (BR#4977: a done lane card is never ticked again; BR#5061; owner identity removed as an exemption by BR#5151). Only a human (web/human:) or the machinery (system:) may close it. If your duty reached this card, close YOURSELF done-with-findings instead — never the lane card.`,
   },
   {
     name: "human-signoff-done",
