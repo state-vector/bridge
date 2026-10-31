@@ -742,6 +742,36 @@ fn not_found_err(e: &str) -> bool {
     low.contains("404") || low.contains("not found")
 }
 
+/// BR#5252 — the merge-refusal fallback's decision law, pure so the fixture
+/// locks it in both implementations (the `gh pr merge` refusal arm and the
+/// settle-window probe). The refusal that reaches this fallback can be
+/// PHANTOM (PR #332 episode, 2026-10-31: an out-of-date-shaped gh error on a
+/// 0-behind MERGEABLE/CLEAN head), so the local ground truth — ancestry +
+/// trial merge — outranks the gh error text:
+/// - trial merge clean → the branch merges cleanly after all: the machine
+///   update-branch leg (verdict carries, BR#3516 §5), merge next tick;
+/// - not clean AND base tip ∉ head ancestry AND files enumerated → a real
+///   conflict: bounce conflict-class with the file list (fail-closed stays);
+/// - anything else → stale-or-infra garbage, NEVER a conflict bounce: a
+///   file-less not-clean read is structurally impossible for a real text
+///   conflict (`merge-tree --name-only` always lists paths), and a 0-behind
+///   head (base tip ∈ head ancestry) is structurally conflict-free.
+enum RefusalFallback {
+    UpdateBranch,
+    ConflictBounce,
+    StaleOrInfra,
+}
+
+fn merge_refusal_fallback(zero_behind: bool, trial_clean: bool, conflict_files: &[String]) -> RefusalFallback {
+    if trial_clean {
+        RefusalFallback::UpdateBranch
+    } else if !zero_behind && !conflict_files.is_empty() {
+        RefusalFallback::ConflictBounce
+    } else {
+        RefusalFallback::StaleOrInfra
+    }
+}
+
 /// One lane, one tick. Port of the former Node executor's driveLane.
 fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     let key = vstr(lane, "lane").unwrap_or("").to_string();
@@ -1461,28 +1491,82 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             let low = err.to_lowercase();
             if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
                 // strict protection wants the branch current — the one case
-                // the machine rebase exists for. Conflicted (not
-                // machine-clean) ⇒ conflict bounce to impl.
+                // the machine rebase exists for. But the refusal can be
+                // PHANTOM (BR#5252, PR #332 episode 2026-10-31: an
+                // out-of-date-shaped error on a 0-behind MERGEABLE/CLEAN
+                // head) — the legs below are judged from LOCAL ground truth,
+                // never the gh text, and the bounce rides the BR#4066
+                // refinement so a lying file-less "conflict" can never fire.
+                ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
                 ctx.fetch_pr_head(pr)?;
-                let (tm_clean, tm_files) = ctx.trial_merge(base, head_sha)?;
-                if !tm_clean {
-                    let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
-                    ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": tm_files, "bounce_kind": "conflict", "defect": conflict_reason, "reason": conflict_reason }))?;
-                    log(Some(key), &format!("PR #{pr} bounced (rebase conflicts: {}{})", tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" }));
-                    // BR#4996: mid-batch the landed prefix still owes its
-                    // settle; a fresh pass releases honestly (the bounce
-                    // already ended the batch walk).
-                    if pass_merged > 0 {
-                        burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                    } else {
-                        release_if_idle(ctx, key, repo, base)?;
+                // BR#3935: ancestry is three-valued — a cannot-read fails the
+                // tick closed (retry next tick), never a silent `behind`
+                // (the lying-bounce ingredient).
+                let zero_behind = ctx.is_ancestor(&format!("origin/{base}"), head_sha)?;
+                let (clean, tm_files) = ctx.trial_merge(base, head_sha)?;
+                match merge_refusal_fallback(zero_behind, clean, &tm_files) {
+                    RefusalFallback::UpdateBranch => {
+                        ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
+                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
+                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
+                        break; // BR#4996: the batch tail below settles the landed prefix honestly
                     }
-                    return Ok(());
+                    RefusalFallback::ConflictBounce => {
+                        // BR#4066: the event kind is REFINED from the
+                        // trial-merge ground truth, same as the generic Bounce
+                        // arm. BR#5252 (c): the raw gh refusal rides the
+                        // event — diagnosis needs no archaeology.
+                        let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                        let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, tm_files.len());
+                        let mut ev = json!({
+                            "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha,
+                            "bounce_kind": event_kind, "defect": conflict_reason, "reason": conflict_reason,
+                            "gh_refusal": trunc(&err, 300),
+                        });
+                        if event_kind == "conflict" {
+                            ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(tm_files));
+                        }
+                        ctx.mcp("train_event", ev)?;
+                        ctx.note(&format!("bounced PR #{pr} [{event_kind}] — {}", trunc(&conflict_reason, 120)));
+                        let files_note = format!("conflicts in {} file(s): {}{}", tm_files.len(), tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" });
+                        log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
+                        // BR#4996: mid-batch the landed prefix still owes its
+                        // settle; a fresh pass releases honestly (the bounce
+                        // already ended the batch walk).
+                        if pass_merged > 0 {
+                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                        } else {
+                            release_if_idle(ctx, key, repo, base)?;
+                        }
+                        return Ok(());
+                    }
+                    RefusalFallback::StaleOrInfra => {
+                        // BR#5252 (b): a file-less not-clean read (real text
+                        // conflicts always enumerate paths) or a not-clean
+                        // read on a 0-behind head (merge-base == base tip —
+                        // conflict is structurally impossible) is
+                        // stale-or-infra garbage, NOT a conflict. NO bounce —
+                        // the PR stays queued and the next tick re-reads
+                        // mergeable fresh (the PR #332 episode bounced here
+                        // and burned 2 dispatches + a watchdog cycle).
+                        ctx.note(&format!(
+                            "PR #{pr}: gh merge refused as out-of-date but the local read disagrees ({}{}) — phantom/stale refusal (BR#5252), no bounce; retrying next tick. gh: {}",
+                            if clean { "trial merge clean" } else { "trial merge not-clean, 0 conflict files" },
+                            if zero_behind { "; head is 0 behind (base tip ∈ ancestry)" } else { "" },
+                            trunc(&err, 200)
+                        ));
+                        log(Some(key), &format!("PR #{pr}: phantom merge refusal (BR#5252) — no bounce, retrying next tick"));
+                        // Same batch courtesy as a soft-break: the landed
+                        // prefix settles, the phantom-refused member waits
+                        // for the next pass (BR#4996).
+                        if pass_merged > 0 {
+                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                        } else {
+                            release_if_idle(ctx, key, repo, base)?;
+                        }
+                        return Ok(());
+                    }
                 }
-                ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-                ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
-                log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
-                break; // BR#4996: the batch tail below settles the landed prefix honestly
             }
             // BR#4996 soft-break: a refused merge mid-batch must not fail the
             // whole tick — the landed prefix settles, the refused member
@@ -1654,8 +1738,24 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
         }
         let (clean, files) = ctx.trial_merge(base, &head_sha)?;
         if !clean {
+            // BR#5252: the same decision law as the merge-refusal arm — a
+            // file-less not-clean read is structurally impossible for a real
+            // text conflict (merge-tree --name-only always lists paths), so
+            // it is stale-or-infra garbage: NO bounce, the probe just skips
+            // and the next tick re-reads. (A 0-behind head cannot reach here
+            // — the ancestry skip above excludes it.)
+            if files.is_empty() {
+                log(Some(key), &format!("settle-window probe: PR #{pr} not-clean with NO conflict files — stale/infra read (BR#5252), skipping the probe without a bounce"));
+                continue;
+            }
+            // BR#4066 refinement rides here too — one law, both implementations.
+            let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, files.len());
             let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
-            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "conflict_files": files, "bounce_kind": "conflict", "reason": reason }))?;
+            let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "bounce_kind": event_kind, "reason": reason });
+            if event_kind == "conflict" {
+                ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
+            }
+            ctx.mcp("train_event", ev)?;
             log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
             return Ok(());
         }
@@ -3110,6 +3210,10 @@ mod tests {
             run(&base_dir, &["init", "-q", "-b", "main", "work"]);
             run(&work, &["config", "user.email", "train@test"]);
             run(&work, &["config", "user.name", "train"]);
+            // BR#5252: hermetic on signing machines — a global commit-gpgsign
+            // (1Password SSH agent) breaks `git commit` in a non-interactive
+            // test process; the fixture's commits must never sign.
+            run(&work, &["config", "commit.gpgsign", "false"]);
             run(&work, &["remote", "add", "origin", base_dir.join("origin.git").to_str().unwrap()]);
             std::fs::write(work.join("f.txt"), "base line\n").unwrap();
             run(&work, &["add", "."]);
@@ -3218,6 +3322,59 @@ mod tests {
         assert!(!clean, "same-line divergent edits must conflict");
         assert_eq!(files, vec!["f.txt"]);
         assert!(ctx.trial_merge("main", BOGUS_SHA).is_err(), "a git failure must not read as a conflict");
+    }
+
+    #[test]
+    fn merge_refusal_fallback_law_br5252() {
+        // The pure law (BR#5252): the trial-merge ground truth + the ancestry
+        // read outrank the gh error text — a refusal arm bounce must survive
+        // BOTH guards or it is not a conflict.
+        use crate::train_gate::BounceKind;
+        // trial merge clean → the machine update-branch carry (unchanged).
+        assert!(matches!(merge_refusal_fallback(false, true, &[]), RefusalFallback::UpdateBranch));
+        assert!(matches!(merge_refusal_fallback(true, true, &["f.txt".to_string()]), RefusalFallback::UpdateBranch));
+        // a real conflict: base tip NOT in the head's ancestry + files enumerated.
+        assert!(matches!(merge_refusal_fallback(false, false, &["f.txt".to_string()]), RefusalFallback::ConflictBounce));
+        // FILE-LESS not-clean read (the PR #332 episode's exact shape):
+        // structurally impossible for a real text conflict — stale-or-infra,
+        // NEVER a conflict bounce.
+        assert!(matches!(merge_refusal_fallback(false, false, &[]), RefusalFallback::StaleOrInfra));
+        // a 0-behind head (base tip ∈ ancestry) can NEVER bounce conflict —
+        // even against a lying not-clean read with files.
+        assert!(matches!(merge_refusal_fallback(true, false, &[]), RefusalFallback::StaleOrInfra));
+        assert!(matches!(merge_refusal_fallback(true, false, &["f.txt".to_string()]), RefusalFallback::StaleOrInfra));
+        // the two guards compose with the BR#4066 refinement: whatever the
+        // event kind, a ConflictBounce only fires for enumerated files, and
+        // the refinement lands every other conflict-class read as gate.
+        assert_eq!(crate::train_gate::bounce_event_kind(&BounceKind::Conflict, false, 2), "conflict");
+        assert_eq!(crate::train_gate::bounce_event_kind(&BounceKind::Conflict, false, 0), "gate");
+        assert_eq!(crate::train_gate::bounce_event_kind(&BounceKind::Conflict, true, 0), "gate");
+    }
+
+    #[test]
+    fn zero_behind_head_is_structurally_conflict_free_br5252() {
+        // BR#5252 (d), pinned at the plumbing level: a head whose base tip is
+        // its ANCESTOR (0 behind — the PR #332 episode's shape) trials CLEAN
+        // and reads 0-behind, so the merge-refusal fallback can only take the
+        // update-branch leg for it. The episode's "conflict" bounce was the
+        // gh refusal lying, never the merge state.
+        let repo = Repo::new("br5252");
+        let ctx = repo.ctx();
+        let side_sha = repo.side_commit("side", "side line"); // base NOT advanced → 0 behind
+        let zero_behind = ctx.is_ancestor("origin/main", &side_sha).unwrap();
+        assert!(zero_behind, "an unadvanced base tip must be the head's ancestor");
+        let (clean, files) = ctx.trial_merge("main", &side_sha).unwrap();
+        assert!(clean && files.is_empty(), "a 0-behind head cannot conflict with base");
+        assert!(matches!(merge_refusal_fallback(zero_behind, clean, &files), RefusalFallback::UpdateBranch));
+        // the contrast: base advances → the SAME head is genuinely behind and
+        // conflicts — files enumerate, and the law takes the conflict leg
+        // (fail-closed stays).
+        let _ = repo.advance_main("main line");
+        assert!(!ctx.is_ancestor("origin/main", &side_sha).unwrap());
+        let (clean2, files2) = ctx.trial_merge("main", &side_sha).unwrap();
+        assert!(!clean2, "same-line divergent edits must conflict");
+        assert_eq!(files2, vec!["f.txt"]);
+        assert!(matches!(merge_refusal_fallback(false, clean2, &files2), RefusalFallback::ConflictBounce));
     }
 
     #[test]

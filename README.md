@@ -1006,6 +1006,20 @@ machine-clean carry chain:
   bounce's conflict-file list is exactly the conflicted files (`--no-messages` keeps
   git's prose out of it). The old behavior — a 128 folded into `behind=true` and a
   bounce with an empty conflict list — is dead.
+- **A phantom merge refusal is never a conflict (BR#5252)**: the merge-refusal
+  fallback (the strict-branch-protection arm where `gh pr merge` answers
+  up-to-date/out-of-date) judges from LOCAL ground truth — ancestry + trial merge —
+  never the gh error text: a 0-behind head (base tip ∈ head ancestry) is
+  structurally conflict-free, and a not-clean read with NO enumerated files is
+  structurally impossible for a real text conflict (`merge-tree --name-only` always
+  lists paths). Either shape parks an honest lane note with the raw gh refusal and
+  retries the read next tick — the PR #332 episode (2026-10-31) bounced exactly this
+  shape as "conflict" with an empty file list and burned a one-leg-from-landed card
+  two extra dispatches. The fallback now runs the same `bounce_event_kind` refinement
+  as the generic bounce arm, and a genuine conflict (behind + enumerated files)
+  still bounces conflict-class with the file list — fail-closed stays. Fixture-locked
+  in both implementations (the merge-refusal arm and the settle-window probe) at the
+  pure decision law + the git plumbing.
 - **Carry law (BR#3516 §5)**: the base advanced and the executor's `gh pr
   update-branch` lands machine-clean → the accepted verdict CARRIES (the hub appends
   the carry record on `train:merged`). A conflict resolved by hand means authored code
