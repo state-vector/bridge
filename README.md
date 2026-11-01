@@ -476,7 +476,14 @@ live last action verbatim from its tick log (the BR#4104 proof-of-progress seam,
 hub-consumed: `meta.lane.now_action`, rendered only while fresh against the 5-minute
 lease TTL — a held head SAYS why it is held, e.g. "PR #2588: head check RED:
 Meta-review nightly", instead of a bare `gate` pill for hours); **NEXT** — the first
-queued card + its PR; **QUEUE** — the remaining cards with their PRs and depth. The
+queued card + its PR; **QUEUE** — plain counts (X in the queue, plus a muted Y
+waiting on review when parked cards exist) above the batch blocks: only the cars
+the machine's walk stamped ready to merge this pass render, contiguous, no divider
+fence — awaiting-review parks are not train cars and the audit-trail classes do not
+show (BR#5412, Ray 2026-11-01: "if red is awaiting review, then they are not part
+of the release train. That just adds noise" — the panel shows the mergeable set,
+not the audit trail; the status pill column is narrower, the NOW msg and backlog
+columns wider). The
 executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the gate
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
@@ -1156,10 +1163,12 @@ machine-clean carry chain:
   which auto-spawns the fresh verify). Only a **genuine human-leg bounce parks the
   card `blocked` in place** under the typed reason
   `Awaiting review (verdict BR#N, anchored at head <9hex>)` with the typed `pr_merged`
-  await_event preserved and `merge_train.awaiting` stamped, so the trains panel renders
-  it as an `◉ awaiting <age>` chip — amber past the `train.awaiting_ttl_h` window
-  (legacy `train.review_ask_ttl_h`), red past TTL + 2h grace, a lapsed park still
-  listed (visibility without interruption). The human-leg classes: human-resolved
+  await_event preserved and `merge_train.awaiting` stamped — the trains panel renders
+  no chip or band for it (BR#5412, Ray 2026-11-01: "if red is awaiting review, then
+  they are not part of the release train. That just adds noise" — parks are not
+  train cars): the backlog count cell shows the parked count as one muted number
+  with its own tooltip; amber/red aging data still rides `train.status`, and a
+  lapsed park still counts (visibility without interruption). The human-leg classes: human-resolved
   conflicts that invalidate the verdict (the event carries conflict files), a
   dismissed external review with no machine replacement, and the signing-environment
   class. **Zero asks and zero lane digests on every path**: the
