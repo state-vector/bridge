@@ -15,6 +15,7 @@ import {
   taskKind,
   validateTransition,
   verifyVerdictStatement,
+  canonicalVerdictTitle,
 } from "../src/kb/core.ts";
 
 describe("tag parsing (stored column is untrusted)", () => {
@@ -329,8 +330,8 @@ describe("BR#3352 completed_result_lost — session-trail classification", () =>
   });
 });
 
-describe("verify-verdict decision statement (human-facing ask prepended at creation)", () => {
-  it("PASS frames the accept-and-close ask with target, receipts source and round", () => {
+describe("verify-verdict decision statement (machine-application reality, BR#5377 F4)", () => {
+  it("PASS states the machine-apply: accepted on filing, no GO/NO-GO, supersede is the human leg", () => {
     const s = verifyVerdictStatement({
       decision_class: "verify-verdict",
       verify_target: "BR#1865",
@@ -338,37 +339,75 @@ describe("verify-verdict decision statement (human-facing ask prepended at creat
       round: "1",
       session: "dispatch-BR-2391",
     });
-    expect(s).toContain("What you are deciding");
-    expect(s).toContain("agents propose, only a human accepts");
-    expect(s).toContain("closes **BR#1865** as **done**");
+    expect(s).toContain("machine-applied");
+    expect(s).toContain("no human GO/NO-GO");
+    expect(s).toContain("accepted **BR#1865**");
+    expect(s).toContain("merge train");
+    expect(s).toContain("Supersede");
     expect(s).toContain("dispatch-BR-2391");
-    expect(s).toContain("round 1");
     expect(s).toContain("auto-added"); // clearly marked as machine-generated
+    expect(s).not.toContain("What you are deciding"); // the human-gate framing is gone
   });
 
-  it("BOUNCE frames the bounce-back ask", () => {
+  it("BOUNCE states the applied bounce", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#42", verdict: "bounce" });
-    expect(s).toContain("bounces **BR#42** back to `in_progress` with the findings");
-    expect(s).not.toContain("closes **");
+    expect(s).toContain("bounced **BR#42** back to `in_progress` with the findings");
+    expect(s).not.toContain("accepted **");
   });
 
   it("falls back gracefully when meta fields are missing", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict" });
     expect(s).toContain("the task");
     expect(s).not.toContain("by session"); // no session clause when absent
-    expect(s).not.toContain("round ");
   });
 
-  it("accepts meta-shaped round numbers and prefers task over verify_target", () => {
+  it("prefers task over verify_target", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#9", verify_target: "BR#8", verdict: "pass", round: 4, session: "s1" });
     expect(s).toContain("**BR#9**");
     expect(s).not.toContain("BR#8");
-    expect(s).toContain("round 4");
   });
 
   it("stays well under the body limit so prepending never trips checkLimits", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", verify_target: "BR#123456", verdict: "pass", round: "12", session: "a-very-long-session-name-indeed" });
     expect(s.length).toBeLessThan(1000);
+  });
+});
+
+describe("canonical verify-verdict title (BR#5377 F3 — hub-minted, plain language)", () => {
+  it("mints ACCEPT with pr number + repo and the target card", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#5370", verdict: "SUBSTANCE_VERIFIED_ACCEPT",
+      pr: 346, repo: "state-vector/bridge",
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/bridge#346 → BR#5370");
+  });
+
+  it("mints from a /pull/ URL meta.pr (the receipts-dense verifier shape)", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#5305", verdict: "verified",
+      pr: "https://github.com/state-vector/superpositional/pull/2623",
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/superpositional#2623 → BR#5305");
+  });
+
+  it("mints from an object meta.pr {repo, number} (the train stamp shape)", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#3574", verdict: "verified",
+      pr: { repo: "state-vector/superpositional", number: 2432 },
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/superpositional#2432 → BR#3574");
+  });
+
+  it("BOUNCE head for a bounce verdict; digits-only pr without repo stays readable", () => {
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", task: "BR#7", verdict: "bounce", pr: "77" }))
+      .toBe("Verify verdict — BOUNCE — PR #77 → BR#7");
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", task: "BR#7", verdict: "bounce", pr: 77, repo: "o/r" }))
+      .toBe("Verify verdict — BOUNCE — PR o/r#77 → BR#7");
+  });
+
+  it("target-only verdicts mint without a PR clause; nothing resolvable returns null (authored title stands)", () => {
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", verify_target: "BR#5305", verdict: "pass" }))
+      .toBe("Verify verdict — ACCEPT — BR#5305");
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", verdict: "pass" })).toBeNull();
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", pr: "not-a-pr" })).toBeNull();
+    expect(canonicalVerdictTitle(null)).toBeNull();
   });
 });
 

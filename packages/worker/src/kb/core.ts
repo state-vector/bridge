@@ -601,29 +601,68 @@ export function checkLimits(title: string, body: string, meta?: unknown): string
 
 // ---------- verify-verdict decision statement ----------
 
-/** Human-facing ask for verify-verdict decisions, prepended to body_md at
- *  creation (do.ts). Verifiers file receipts-dense cards whose title/body
- *  never say what the human is deciding or why it lands on them — BR#2453
- *  taught us that. The statement mirrors the accept-side effect EXACTLY
- *  (do.ts transition: accept + verdict=bounce → target in_progress, else
- *  target done) so the card never overpromises. Pure: meta in, markdown out. */
+/** BR#5377 F3 — the canonical human-readable verify-verdict title, minted by
+ *  the hub from meta at create (do.ts). Verifier-authored titles are
+ *  internals-dense (BOUNCE_NARROW classes, head SHAs, mergeCommit prose) and
+ *  render as the card title on EVERY surface; the canonical form is plain
+ *  language and says what the verdict does: "Verify verdict — ACCEPT — PR
+ *  owner/repo#N → card BR#X". The authored title rides at the top of the
+ *  body instead (nothing is lost). Tolerant: meta.pr arrives as a number, a
+ *  /pull/ URL, or {repo, number}; meta.repo + numeric meta.pr also resolves.
+ *  Returns null when neither a PR nor a target resolves — the authored title
+ *  stands (a title that says nothing is worse than the jargon). Pure. */
+export function canonicalVerdictTitle(meta: unknown): string | null {
+  const m = (meta ?? {}) as Record<string, unknown>;
+  const target = String(m.task ?? m.verify_target ?? "").trim();
+  const rawVerdict = String(m.verdict ?? "").trim();
+  if (!rawVerdict && !target) return null;
+  // Same strict test the accept-side hook (do.ts) uses to route the effect —
+  // the title describes what WILL happen to the target, never the jargon.
+  const head = rawVerdict.toLowerCase() === "bounce" ? "BOUNCE" : "ACCEPT";
+  let pr = "";
+  const prv = m.pr;
+  const repo = typeof m.repo === "string" ? m.repo.trim() : "";
+  if (typeof prv === "number" && Number.isInteger(prv) && prv > 0) {
+    pr = repo ? `${repo}#${prv}` : `#${prv}`;
+  } else if (typeof prv === "string" && prv.trim()) {
+    const u = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/.exec(prv.trim());
+    if (u) pr = `${u[1]}/${u[2]}#${u[3]}`;
+    else if (/^\d+$/.test(prv.trim())) pr = repo ? `${repo}#${prv.trim()}` : `#${prv.trim()}`;
+  } else if (prv && typeof prv === "object") {
+    const o = prv as { repo?: unknown; number?: unknown };
+    if (typeof o.repo === "string" && o.repo.trim() && Number(o.number) > 0) pr = `${o.repo.trim()}#${Number(o.number)}`;
+  }
+  let title = `Verify verdict — ${head}`;
+  if (pr) title += ` — PR ${pr}`;
+  else if (target) title += ` — ${target}`;
+  else return null;
+  if (pr && target) title += ` → ${target}`;
+  return title;
+}
+
+/** Human-facing banner for verify-verdict decisions, prepended to body_md at
+ *  creation (do.ts). Verifiers file receipts-dense cards whose body never
+ *  says what the verdict does or who applied it — BR#2453 taught us that.
+ *  BR#5377 F4: verdicts are MACHINE verdicts now — they accept on filing
+ *  (actor system:verifier) and the accept-side hook applies them to their
+ *  target; the human is not a per-merge GO/NO-GO gate. The statement states
+ *  machine-application reality (and the one remaining human leg: supersede).
+ *  Pure: meta in, markdown out. */
 export function verifyVerdictStatement(meta: unknown): string {
   const m = (meta ?? {}) as Record<string, unknown>;
   const target = String(m.task ?? m.verify_target ?? "").trim() || "the task";
+  // Same strict test the accept-side hook (do.ts) uses to route the effect.
   const isBounce = String(m.verdict ?? "").toLowerCase() === "bounce";
   const session = String(m.session ?? "").trim();
-  const roundRaw = m.round ?? m.verify_round;
-  const round = roundRaw == null || roundRaw === "" ? null : Number(roundRaw);
   const effect = isBounce
-    ? `bounces **${target}** back to \`in_progress\` with the findings`
-    : `closes **${target}** as **done**`;
-  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}${round ? ` (round ${round})` : ""}`;
+    ? `bounced **${target}** back to \`in_progress\` with the findings`
+    : `accepted **${target}** — impl work queues on the merge train (the train owns delivery); verify duties close done`;
+  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}`;
   return [
-    `> ⚖️ **What you are deciding** — *auto-added, not part of the verifier's receipts*`,
+    `> ⚖️ **Verify verdict — machine-applied** — *auto-added, not part of the verifier's receipts*`,
     `>`,
-    `> You are the acceptance gate: agents propose, only a human accepts. Your click settles the verdict.`,
-    `> - **Accept** = ratify it — the verdict ${effect}.`,
-    `> - **Supersede** = the verdict doesn't hold; record why.`,
+    `> This is a machine verdict (BR#5377): it accepted on filing (actor \`system:verifier\`) — no human GO/NO-GO step. The verdict ${effect}.`,
+    `> - Doesn't hold? **Supersede** it (decisions panel) — superseding records why; the target re-enters the normal flow.`,
     `> You are NOT being asked to re-verify — ${checked}.`,
   ].join("\n");
 }
