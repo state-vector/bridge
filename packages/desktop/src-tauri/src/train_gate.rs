@@ -121,6 +121,26 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
     finish_verdict(red, unsettled, vec![], green)
 }
 
+/// BR#5265 Fix B: the base-green gate classifies ONLY the lane's required
+/// workflows when the lane configures them (newest non-cancelled run per
+/// name, red beats unsettled beats green — the same law
+/// classify_main_check_runs applies to its set). Un-configured lanes keep
+/// the legacy whole-tip read. A nightly/battery/canary red stops its own
+/// pipeline and its own cards — never the train: the observed 2026-10-31
+/// outage was three non-required nightly reds parking a 10-car queue ~30h
+/// while the four deploy-required workflows sat green on the same tip.
+pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> CheckVerdict {
+    if required.is_empty() {
+        return classify_main_check_runs(runs);
+    }
+    let scoped: Vec<MainCheckRun> = runs
+        .iter()
+        .filter(|r| required.iter().any(|n| n == &r.name))
+        .cloned()
+        .collect();
+    classify_main_check_runs(&scoped)
+}
+
 /// core.ts classifyHeadChecks (846): same rule, but exempt-external failures
 /// are pulled OUT of red into `external` (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
@@ -847,6 +867,50 @@ mod tests {
         assert!(matches!(v.verdict, MainVerdict::Green)); // exempt in-flight says nothing
         let v = classify_head_checks(&[run(1, "ci", None)]);
         assert!(matches!(v.verdict, MainVerdict::Unsettled));
+    }
+
+    #[test]
+    fn base_class_scopes_to_required_workflows() {
+        // BR#5265 Fix B: the 2026-10-31 outage shape — deploy-required
+        // workflows green on the tip, three non-required nightly reds
+        // parking the train. Scoped to the required list the verdict is
+        // GREEN (nightly reds never gate the train); un-scoped (legacy,
+        // empty required list) the same tip reads RED.
+        let tip = [
+            run(1, "deploy / Deploy to dev", Some("success")),
+            run(2, "post-deploy / Lodestar Storage Health", Some("success")),
+            run(3, "Quality Replay (corpus → verdicts → full battery)", Some("failure")),
+            run(4, "Meta-review nightly", Some("failure")),
+            run(5, "Republish gate on open PR heads", Some("failure")),
+        ];
+        let required: Vec<String> = vec![
+            "deploy / Deploy to dev".into(),
+            "post-deploy / Lodestar Storage Health".into(),
+        ];
+        let scoped = classify_base_check_runs(&tip, &required);
+        assert!(matches!(scoped.verdict, MainVerdict::Green), "nightly reds must not park the train: got {:?}", scoped.verdict);
+        // a REQUIRED red still stops the train — scoping narrows the judge
+        // set, it never blinds the gate to its own workflows
+        let required_red = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "Meta-review nightly", Some("failure"))],
+            &required,
+        );
+        assert!(matches!(required_red.verdict, MainVerdict::Red));
+        assert_eq!(required_red.red.len(), 1);
+        assert_eq!(required_red.red[0].name, "deploy / Deploy to dev");
+        // newest non-cancelled per name still judges inside the scope
+        let healed = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success"))],
+            &required,
+        );
+        assert!(matches!(healed.verdict, MainVerdict::Green));
+        // required set matching NOTHING on the tip → Empty (a lane-config
+        // defect, rendered loud by the Fix A BLOCKED line — never green)
+        let phantom = classify_base_check_runs(&tip, &["ci / Never Runs".to_string()]);
+        assert!(matches!(phantom.verdict, MainVerdict::Empty));
+        // un-configured lane keeps the legacy whole-tip read
+        let legacy = classify_base_check_runs(&tip, &[]);
+        assert!(matches!(legacy.verdict, MainVerdict::Red));
     }
 
     #[test]

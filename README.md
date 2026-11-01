@@ -654,9 +654,37 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   at least one required workflow proved green on that very commit, waiting cannot
   change the verdict — the merge LANDS judged on the workflows that exist, the never-run
   names are dropped with a loud audit, and ONE config-defect ask per episode goes to the
-  alarm sink (fix `required_workflows`); a genuinely stuck OBSERVED run (or an empty,
-  zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
-  evidence.
+   alarm sink (fix `required_workflows`); a genuinely stuck OBSERVED run (or an empty,
+   zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
+   evidence.
+
+### Base-red is loud and scoped (BR#5265)
+
+The stop above guards the line AFTER a merge. The admission gate guards it BEFORE —
+and its base-green leg was the 2026-10-31 outage: three non-required nightly reds
+(`Quality Replay`, `Meta-review nightly`, `Republish gate`) on main's tip parked a
+10-car queue ~30h while every deploy-required workflow sat green on that same tip,
+and the skip was SILENT — no ledger event, no bounce, no ask, the lane reading a
+fake-busy `working on <head> — checking review, signatures and CI before merging`
+every tick. Two laws now hold:
+
+- **Scoped base classification (the gate)**: the base verdict classifies ONLY the
+  lane's `required_workflows` when the lane configures them (`classifyBaseCheckRuns`,
+  `train_gate.rs` — newest non-cancelled run per name, red beats unsettled beats
+  green; an un-configured lane keeps the legacy whole-tip read). A nightly, battery
+  or canary red stops its own pipeline and its own cards — never the train.
+- **Loud BLOCKED (the lane)**: every walk stamps its base verdict into the lane
+  (`train.queue_facts` carries `base_state: {verdict, scoped_to_required, red[],
+  unsettled[]}`, served whole by `train.status`), and a non-green base holding
+  queued cars renders the lane `merge-train: BLOCKED — base main RED: <names> — N
+  car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks
+  the whole queue` (lane card reason + trains panel status pill, red) — never a
+  fake-busy checking line — with ONE time-sensitive alarm ask per red episode to the
+  alarm sink (`trainBaseRedAskTitle`, deduped by the identical-open-ask guard),
+  options `Fixing forward — hold the line` / `Bypass-merge a cure PR`. The stamp is
+  freshness-guarded (<15m, executor refreshes every tick) so a dead daemon's stale
+  stamp can never pin a false BLOCKED; a stale or green stamp falls back to the
+  normal lane vocabulary.
 
 ### The root-fix fast lane (BR#5190, steering BR#5189)
 

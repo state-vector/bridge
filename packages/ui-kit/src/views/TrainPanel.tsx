@@ -79,6 +79,18 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
       title: "this PR is blocked by branch protection (a required review/check a machine cannot satisfy) — a human merge is the unblock; it clears itself once merged",
     };
   }
+  // BR#5265 Fix A: base-red is LOUD — a non-green base (scoped to the
+  // lane's required workflows) holding queued cars shows BLOCKED with
+  // the red names, never a fake-busy "checking" line.
+  const bs = l.queue_facts?.base_state;
+  if (bs && bs.verdict !== "green" && l.queue.length > 0 && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
+    const reds = (bs.red ?? []).map((r) => r.name).join(", ");
+    return {
+      tone: "err", card: curCard, pr: curPr,
+      label: `⛔ blocked — base is red${reds ? ` (${reds})` : ""}`,
+      title: `main is RED${reds ? `: ${reds}` : ` (${bs.verdict})`} — the standing order (never merge onto a non-green destination) holds all ${l.queue.length} queued car(s) until it clears. Fix forward, re-run a transient check, or bypass-merge a cure — the queue then drains automatically.`,
+    };
+  }
   if (l.currently) {
     const settling = l.currently.phase !== "bursting";
     return {
