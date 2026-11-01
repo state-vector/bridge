@@ -132,6 +132,46 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     }
   };
 
+  // churn parks (timeout exit class): the watchdog drains them automatically
+  // (BR#2893); Release is the human early-exit lever. The transition rides the
+  // SAME machine gates as any pool release — a protected card (typed await,
+  // train-queue state) refuses server-side and surfaces here, never routed
+  // around.
+  const releaseOne = async (t: any, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    try {
+      await kbApi.transition(t.id, "todo", { note: "released early from the churn park (human, Backlog)" });
+      return true;
+    } catch (err) {
+      setMsg(`${t.id} refused: ${String((err as Error).message ?? err).slice(0, 160)}`);
+      return false;
+    }
+  };
+  const releaseAndMsg = async (t: any, e: React.MouseEvent) => {
+    const ok = await releaseOne(t, e);
+    if (ok) {
+      await useKb.getState().refresh();
+      setMsg(`released ${t.id} to the pool`);
+      setTimeout(() => setMsg(""), 2500);
+    }
+  };
+  const releaseAll = async (rows: any[]) => {
+    let ok = 0;
+    const refused: string[] = [];
+    for (const r of rows) {
+      const t = r.t ?? r;
+      if (t.status !== "blocked") {
+        refused.push(`${t.id} (not blocked)`);
+        continue;
+      }
+      if (await releaseOne(t)) ok++;
+      else refused.push(t.id);
+    }
+    await useKb.getState().refresh();
+    setMsg(`released ${ok}/${rows.length} to the pool` + (refused.length ? ` — refused: ${refused.join(", ")}` : ""));
+    setTimeout(() => setMsg(""), 6000);
+  };
+
   const total = groups.reduce((n, g) => n + g.rows.length, 0);
 
   return (
@@ -148,6 +188,15 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
           <div className="view-head backlog-group-head">
             <h2>{g.title}</h2>
             <span className="muted-note">{g.rows.length} · {g.note}</span>
+            {g.key === "timeout" && g.rows.length > 0 && (
+              <Btn
+                size="sm"
+                title="release every card in this section to the pool — protected cards (typed awaits, train-queue) refuse server-side and are listed"
+                onClick={() => void releaseAll(g.rows)}
+              >
+                Release all
+              </Btn>
+            )}
           </div>
           <div className="backlog-list">
             {g.rows.map((r: any) => {
@@ -187,6 +236,16 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     )}
                   </span>
                   <span className="backlog-meta">
+                    {g.key === "timeout" && t.status === "blocked" && (
+                      <Btn
+                        size="sm"
+                        className="release-btn"
+                        title="release this card to the pool now — the watchdog would drain it automatically later"
+                        onClick={(e) => void releaseAndMsg(t, e)}
+                      >
+                        Release
+                      </Btn>
+                    )}
                     {g.showBoost && (
                       <Btn
                         size="sm"
