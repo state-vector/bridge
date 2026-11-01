@@ -40,7 +40,8 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    classify_base_check_runs, classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
+    merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
@@ -1044,10 +1045,30 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         return Ok(());
     }
     let mut candidates: Vec<BatchCandidate> = Vec::new();
-    // the walk's lazily-read base verdict + the base's failing check NAMES
-    // (BR#4996: Some after the first gate-reaching entry, shared by every
-    // candidate in the walk; BR#5190: the names ride the root-fix gate)
-    let mut base_cache: Option<(MainVerdict, Vec<String>)> = None;
+    // BR#5265 Fix B + Fix A: ONE base read per walk, hoisted before the
+    // loop (the old lazy base_cache re-fetched per gate-reaching entry —
+    // same values, wasted calls) — classified SCOPED to the lane's
+    // required workflows when configured (Fix B: nightly/battery reds
+    // never park the train), and stamped whole into the queue_facts
+    // payload (Fix A) so the hub renders a loud BLOCKED lane + files the
+    // ONE-per-episode human alarm ask while cars are held.
+    let required: Vec<String> = lane
+        .get("required_workflows")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+    let base_class = classify_base_check_runs(&ctx.check_runs(repo, &base_sha), &required);
+    let base_state = json!({
+        // mid-drain (pass_merged > 0): destination-green is owned by the
+        // pass settle (BR#4934) — the gate composes with base FORCED green;
+        // the stamp mirrors the gate so the panel never shows a false red
+        // mid-burst.
+        "verdict": if pass_merged > 0 { "green" } else { base_class.verdict.as_str() },
+        "scoped_to_required": !required.is_empty(),
+        "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
+        "unsettled": base_class.unsettled,
+    });
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1180,19 +1201,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // settle's, BR#4934 — the per-member tip RED check owns the stop).
         // BR#5190: the base's failing check NAMES ride the gate too — the
         // root-fix fast lane matches the circular deploy-health class off
-        // them (the receipt names the red the fix cures).
-        if base_cache.is_none() {
-            let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-            let base_class = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
-            let verdict = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict };
-            let red_names = if pass_merged > 0 {
-                Vec::new()
-            } else {
-                base_class.red.iter().map(|r| r.name.clone()).collect()
-            };
-            base_cache = Some((verdict, red_names));
-        }
-        let (gate_base, base_red_names) = base_cache.clone().unwrap_or((MainVerdict::Green, Vec::new()));
+        // them (the receipt names the red the fix cures). BR#5265: the
+        // verdict is the hoisted per-walk read (scoped, Fix B) — mid-drain
+        // composes with base FORCED green (BR#4934).
+        let (gate_base, base_red_names) = if pass_merged > 0 {
+            (MainVerdict::Green, Vec::new())
+        } else {
+            (
+                base_class.verdict.clone(),
+                base_class.red.iter().map(|r| r.name.clone()).collect(),
+            )
+        };
         // BR#5190: the candidate IS the main-breakage fix iff it is the
         // bound root-fix card (tags + meta.root_fix binding) — the executor
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
@@ -1374,8 +1393,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // collected as the walk touched them) so the panel's queue blocks show
     // the truth of this pass: which entries are ready (the next batch) and
     // which wait/leave. One write per tick; failures never break the tick.
-    if !qfacts.is_empty() {
-        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts }));
+    // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
+    // the walk produced verdicts — entries can short-circuit pre-gate) and
+    // carries base_state (Fix A): the hub renders the lane BLOCKED with
+    // the base red names + files the one-per-episode human alarm ask.
+    if !queue.is_empty() {
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }));
     }
 
 
@@ -3006,7 +3029,10 @@ mod tests {
         drive_lane(&mut b, &lane());
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
-        assert_eq!(names, vec!["train_lease", "get_artefact", "train_status", "train_lease", "train_lease"]);
+        // BR#5265: the base_state stamp rides train_queue_facts whenever cars
+        // are queued (even when the walk produced no verdicts — this card has
+        // no unlanded legs), between the card fetch and release_if_idle.
+        assert_eq!(names, vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"]);
         // BR#4489: the acquire declares capability so the hub can starve-detect
         assert_eq!(call_args(&recorded[0]).get("merge_capable"), Some(&json!(true)));
         // B's only call is the failed acquire — it never touched the lane.
@@ -3024,6 +3050,7 @@ mod tests {
             Err("lane lease held live by merge-train@other until 2026-10-28T00:00:00Z — stand down this tick".into()), // tick 1: conflict
             ok(json!({ "note": "lease granted — prior holder merge-train@other lapsed" })),                            // tick 2: acquire
             ok(card_without_lane_legs()),                                                                              // tick 2: get_artefact
+            ok(json!({ "ok": true })),                                                                                // tick 2: train_queue_facts (BR#5265 base_state stamp)
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // tick 2: status
             ok(json!({ "note": "lease released — idle" })),                                                            // tick 2: release
         ]);
@@ -3032,7 +3059,9 @@ mod tests {
         drive_lane(&mut ctx, &lane()); // takes over
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
-        assert_eq!(names, vec!["train_lease", "train_lease", "get_artefact", "train_status", "train_lease"]);
+        // BR#5265: the takeover tick stamps base_state (queue_facts) before
+        // release_if_idle — the walk always reports the base verdict now.
+        assert_eq!(names, vec!["train_lease", "train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"]);
         let acquire2 = call_args(&recorded[1]);
         assert_eq!(acquire2.get("action").and_then(|v| v.as_str()), Some("acquire"));
     }

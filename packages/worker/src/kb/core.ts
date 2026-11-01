@@ -2384,6 +2384,19 @@ export function trainStopAskTitle(lane: { repo: string; base: string }, sha: str
   return prefix + names + suffix;
 }
 
+/** Deterministic base-red alarm ask title (BR#5265 Fix A — ONE per red
+ *  episode; the red-name set makes it unique per episode, askCreate's
+ *  identical-open-ask guard dedupes the per-tick repeats). ≤240 chars,
+ *  ends "?" — the ask contract. */
+export function trainBaseRedAskTitle(lane: { repo: string; base: string }, reds: string[]): string {
+  const prefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base} RED (`;
+  const suffix = `) — the queue is held until it clears. Fix it?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let names = reds.join(", ") || "unknown check";
+  if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + names + suffix;
+}
+
 /** The machine-proxy close note for train:landed — cites the merge commit
  *  (mergeCommit non-null) and main green, per the done-when's machine proxy.
  *  BR#3659: a multi-PR card's FINAL close cites EVERY leg's merge commit. */

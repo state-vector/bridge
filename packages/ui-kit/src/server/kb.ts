@@ -223,8 +223,20 @@ export interface KbTrainLane {
   /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
    *  (rank) order — the queue block row. cls: ready (merges this pass) |
    *  waiting (checks/mergeability pending) | conflict | needs-review |
-   *  blocked. null until the first executor tick stamps them. */
-  queue_facts?: { at: number; entries: { id: string; pr?: number; cls: string }[] } | null;
+   *  blocked. null until the first executor tick stamps them.
+   *  BR#5265 Fix A: base_state rides the same stamp — the walk's base
+   *  verdict (scoped to the lane's required workflows, Fix B); non-green
+   *  holding cars renders the lane BLOCKED (laneStatus + laneSyncReason). */
+  queue_facts?: {
+    at: number;
+    entries: { id: string; pr?: number; cls: string }[];
+    base_state?: {
+      verdict: "green" | "red" | "unsettled" | "empty";
+      scoped_to_required?: boolean;
+      red?: { name: string; url?: string }[];
+      unsettled?: string[];
+    };
+  } | null;
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

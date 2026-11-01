@@ -106,6 +106,7 @@ import {
   trainAwaitingHumanLeg,
   trainRequeueSwap,
   trainStopAskTitle,
+  trainBaseRedAskTitle,
   trainLandedCloseNote,
   trainLandedCloseEdge,
   trainCloseBounceBrief,
@@ -7666,6 +7667,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ? `; last: ${lastAct.kind}${lastAct.pr ? ` PR #${lastAct.pr}` : ""}${lastAct.task_id ? ` (${lastAct.task_id})` : ""}`
       : "";
     const bw = meta.bypass_wait ?? null;
+    // BR#5265 Fix A: the walk's base-state stamp (executor-fed via
+    // train.queue_facts, whole-of-row) — truthy only when non-green AND
+    // fresh (<15m; the executor refreshes every tick) so a dead daemon's
+    // stale stamp can never pin a false BLOCKED.
+    const bsQf: any = lane ? meta.lane?.queue_facts ?? null : null;
+    const baseBlock: any = bsQf?.base_state && String(bsQf.base_state?.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
+      ? bsQf.base_state
+      : null;
     // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
     // the lane's activity line speaks human. The hub knows the head card's
     // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
@@ -7710,6 +7719,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ? `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): landed close FAILED ${lc.failures}× (${lc.breach_class ?? "?"}) — retrying, close-bounce at ≤${TRAIN_LANDED_CLOSE_MAX_RETRIES} or the bound (BR#4753)${nextNote}`
           : `merge-train: leased${who} — settling on ${String(currently.merge_sha ?? "").slice(0, 9)} (PR #${currently.pr}): build/deploy in flight${nextNote}, heads held until main settles${bwNote}`;
     } else if (bw) reason = `merge-train: awaiting bypass merge — PR #${bw.pr} by ${bw.task_id ?? "?"} blocked on branch protection (review/required checks a machine cannot satisfy); a human merge is the unblock, self-clears when it lands${queue.length ? ` — the walk continues on the other ${queue.length} queued head(s)` : ""}`;
+    // BR#5265 Fix A: base-red is LOUD. A non-green base (scoped to the
+    // lane's required workflows, Fix B) holding queued cars renders
+    // BLOCKED with the red names — never the fake-busy "checking"
+    // vocabulary that hid the 2026-10-31 ~30h park. The stamp is fresh
+    // (<15m — the executor refreshes it every tick); a stale stamp (dead
+    // daemon) falls through to the normal vocabulary so a corpse never
+    // pins a false BLOCKED.
+    else if (queue.length > 0 && baseBlock) {
+      const bs: any = baseBlock;
+      const redNames = (Array.isArray(bs.red) ? bs.red : []).map((r: any) => String(r?.name ?? "")).filter(Boolean);
+      reason = String(bs.verdict) === "red" && redNames.length
+        ? `merge-train: BLOCKED — base main RED: ${redNames.join(", ")} — ${queue.length} car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks the whole queue`
+        : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? "carries none of the lane's required workflow runs (config?)" : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
+    }
     else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
       // free until the next acquire clears the stamp (board visibility).
@@ -8971,9 +8994,58 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(lane.meta ?? "{}");
     const lease: TrainLease | null = meta.lease ?? null;
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
-    meta.lane = { ...(meta.lane ?? {}), queue_facts: { at: Date.now(), entries } };
+    // BR#5265 Fix A: the executor stamps the walk's base verdict
+    // (scoped to the lane's required workflows, Fix B) alongside the
+    // entries — whole-of-row, served verbatim by train.status. The lane
+    // card renders a loud BLOCKED off it (laneSyncReason) and a RED
+    // verdict holding cars files the ONE-per-episode human alarm ask
+    // (bound to the standing alarm sink; askCreate's identical-open-ask
+    // guard dedupes the per-tick repeats — same shape as the stopped
+    // flow's stop ask).
+    const baseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
+    meta.lane = {
+      ...(meta.lane ?? {}),
+      queue_facts: { at: Date.now(), entries, ...(baseState ? { base_state: baseState } : {}) },
+    };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
-    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length });
+    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null });
+    // BR#5265 Fix A: train.status serves meta.blocked.reason — the STORED
+    // string, re-written only when laneSyncReason runs. The stamp changed
+    // the lane's truth (base verdict + entries); re-render the reason NOW
+    // so the lane card reads BLOCKED/normal the moment the walk reports,
+    // not on the next lease op.
+    this.laneSyncReason(lane.id, meta, Date.now());
+    if (baseState && String(baseState.verdict ?? "") === "red" && entries.length > 0) {
+      const reds = (Array.isArray(baseState.red) ? baseState.red : [])
+        .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+        .filter((r: { name: string }) => r.name);
+      const held = entries.length;
+      const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: `base ${repo}@${base} RED — the standing order (BR#3009) holds every queued car until it clears`,
+            details: [
+              `Lane ${laneKey(repo, base)} base is RED — the train holds ${held} queued car(s): the standing order never merges onto a non-green destination.`,
+              reds.length
+                ? `Failing required workflow(s) on main's tip:\n${reds.map((r: { name: string; url: string }) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")}`
+                : "The base carries a failing required check (names unavailable this tick).",
+              `Fix forward (a base-fix card/PR), re-run a transient check, or bypass-merge a cure PR directly to main — any of the three unblocks the whole queue at once.`,
+              `Resume is automatic: the next walk classifies base green and merges the first ready car.`,
+            ].join("\n\n"),
+            options: ["Fixing forward — hold the line", "Bypass-merge a cure PR (I'll reply with the number)"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        // an identical ask is already open for this episode — that IS one per episode
+        this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+      }
+    }
     return { ok: true, lane: laneKey(repo, base), n: entries.length };
   }
 

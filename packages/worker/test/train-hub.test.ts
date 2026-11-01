@@ -1997,6 +1997,60 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-qf" });
   });
 
+  it("BR#5265 Fix A+B: base_state rides the walk stamp — a RED base holding cars renders the lane BLOCKED (loud, red names) and files the ONE-per-episode human alarm ask (per-tick repeats dedupe); a GREEN base restores the normal vocabulary and never asks", async () => {
+    const repo = "state-vector/lane-base-red";
+    await acquire(repo, "gw-br", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 52651, head: "a".repeat(40), title: "IMPL: base-red drill 1" });
+    const c2 = await queueViaAccept({ repo, pr: 52652, head: "b".repeat(40), title: "IMPL: base-red drill 2" });
+
+    // RED base (scoped to the lane's required workflows, Fix B) holding 2
+    // cars: stamped whole-of-row, the lane renders the loud BLOCKED line
+    const r = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [
+        { id: c1, pr: 52651, cls: "waiting" },
+        { id: c2, pr: 52652, cls: "waiting" },
+      ],
+      base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "Test", url: "https://example.test/1" }], unsettled: [] },
+    });
+    expect(r.body.error ?? "").toBe("");
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.queue_facts.base_state.verdict).toBe("red");
+    expect(lane.queue_facts.base_state.red[0].name).toBe("Test");
+    expect(lane.reason).toContain("merge-train: BLOCKED — base main RED: Test");
+    expect(lane.reason).toContain("2 car(s) held");
+
+    // ONE ask per red episode — the executor repeats this stamp every tick;
+    // askCreate's identical-open-ask guard must dedupe them to one
+    const askCount = async () =>
+      (await kbJson("/search?q=MERGE+TRAIN+BLOCKED&type=question&limit=50")).body.artefacts.filter(
+        (x: any) => x.type === "question" && String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`),
+      ).length;
+    expect(await askCount()).toBe(1);
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [{ id: c1, pr: 52651, cls: "waiting" }],
+      base_state: { verdict: "red", red: [{ name: "Test" }] },
+    });
+    expect(await askCount()).toBe(1);
+
+    // GREEN base: the normal lane vocabulary returns (no false BLOCKED) and
+    // no further ask exists
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-br",
+      entries: [
+        { id: c1, pr: 52651, cls: "ready" },
+        { id: c2, pr: 52652, cls: "ready" },
+      ],
+      base_state: { verdict: "green", scoped_to_required: true, red: [], unsettled: [] },
+    });
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane2.queue_facts.base_state.verdict).toBe("green");
+    expect(lane2.reason).not.toContain("BLOCKED — base main RED");
+    expect(await askCount()).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-br" });
+  });
+
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
     const repo = "state-vector/lane-legacy-renew";
     await acquire(repo, "gw-leg", { merge_capable: true });
