@@ -43,6 +43,7 @@ const baseCtx = (): RuleCtx => ({
   parent: () => null,
   openChildren: () => 0,
   openChildIds: () => [],
+  openChildDetails: () => [],
   spawnGuard: () => null,
   openVerifyChild: () => null,
   openUnblockChild: () => null,
@@ -177,11 +178,16 @@ describe("transition matrix (task: role × from × to)", () => {
     expect(await check(input({ status: "in_review", to: "done" }), ok)).toBeNull();
   });
 
-  it("open children fence the parent's done", async () => {
+  it("open children fence the parent's done — and the refusal NAMES them (ids + statuses, BR#5370)", async () => {
     const c = baseCtx();
     c.openChildren = () => 2;
+    c.openChildDetails = () => [{ id: "BR#21", status: "in_progress" }, { id: "BR#22", status: "todo" }];
     const msg = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), c);
     expect(msg).toContain("still has 2 open child task(s)");
+    // BR#5370 finding B: the rejection carries child ids + statuses so
+    // attempt 1 points at the right action (the BR#5349 duty session
+    // misattributed its blocker and retried a terminal rejection 3x)
+    expect(msg).toContain("Open child: BR#21 (in_progress), BR#22 (todo)");
   });
 
   it("BR#3819: force-close passes only when EVERY open child is named, with a reason", async () => {
