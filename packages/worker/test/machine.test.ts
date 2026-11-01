@@ -227,6 +227,36 @@ describe("transition matrix (task: role × from × to)", () => {
     ).toBeNull();
   });
 
+  it("BR#5377 F1: machine verdicts accept as system:verifier — the narrow decision-acceptance exception", async () => {
+    // the exemption: verify-verdict + system:verifier → the hub applies the
+    // verdict at create; no human GO/NO-GO leg
+    expect(
+      await check(input({
+        type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+        meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "SUBSTANCE_VERIFIED_ACCEPT" },
+      }), baseCtx()),
+    ).toBeNull();
+    // narrow by actor: an agent session filing the same verdict cannot accept it
+    const agent = await check(input({
+      type: "decision", status: "proposed", to: "accepted", actor: "agent-x",
+      meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "SUBSTANCE_VERIFIED_ACCEPT" },
+    }), baseCtx());
+    expect(agent).toContain("human-authoritative");
+    // narrow by class: system:verifier accepting any OTHER decision class is refused
+    const otherClass = await check(input({
+      type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+      meta: { decision_class: "policy", topic: "not a verdict" },
+    }), baseCtx());
+    expect(otherClass).toContain("human-authoritative");
+    // a bounced verdict shape applies under the same narrow pair
+    expect(
+      await check(input({
+        type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+        meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "bounce" },
+      }), baseCtx()),
+    ).toBeNull();
+  });
+
   it("claim separation: the analysis session cannot implement the same task", async () => {
     const c = baseCtx();
     c.qualify = () => ({ ok: true, via: "BR#9" });
