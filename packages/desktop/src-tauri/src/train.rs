@@ -43,7 +43,7 @@ use crate::train_gate::{
     classify_base_check_runs, classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
     merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
-    DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
+    CheckVerdict, DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -1057,8 +1057,29 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-    let base_class = classify_base_check_runs(&ctx.check_runs(repo, &base_sha), &required);
+    let base_class = if !ctx.base_probe {
+        // BR#5265 fix-up (verify bounce, CI run 41261611797 — the PR's own
+        // drills failed in CI): the hoisted read is HERMETIC — the drills
+        // (base_probe=false) never shell out to gh; the Unsettled stamp
+        // names why. In production it also DEGRADES instead of erroring:
+        // a gh flake used to `?`-error the walk before the first card
+        // fetch (no gate, no stamp, no queue_facts — the lane stayed
+        // fake-busy). Now it stamps Unsettled with the failure NAMED and
+        // walks on — the gate still refuses to merge onto a non-green
+        // destination (leg 3), so the fail-closed law holds; the lane just
+        // says WHY it holds.
+        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0 }
+    } else {
+        match ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])
+            .map(|base_sha| {
+                let runs = ctx.check_runs(repo, &base_sha);
+                (base_sha, runs)
+            })
+        {
+            Ok((_, runs)) => classify_base_check_runs(&runs, &required),
+            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0 },
+        }
+    };
     let base_state = json!({
         // mid-drain (pass_merged > 0): destination-green is owned by the
         // pass settle (BR#4934) — the gate composes with base FORCED green;
@@ -3017,6 +3038,7 @@ mod tests {
         let (hub, calls) = mock_hub(vec![
             ok(json!({ "note": "lease granted — lane was free" })),                       // A: acquire
             ok(card_without_lane_legs()),                                                 // A: get_artefact
+            ok(json!({ "ok": true })),                                                    // A: train_queue_facts (BR#5265 base_state stamp)
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // A: release_if_idle status
             ok(json!({ "note": "lease released — idle" })),                               // A: release
             Err("lane lease held live by merge-train@other until 2026-10-28T00:00:00Z — stand down this tick".into()), // B: acquire CONFLICT
@@ -3031,8 +3053,10 @@ mod tests {
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         // BR#5265: the base_state stamp rides train_queue_facts whenever cars
         // are queued (even when the walk produced no verdicts — this card has
-        // no unlanded legs), between the card fetch and release_if_idle.
-        assert_eq!(names, vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"]);
+        // no unlanded legs), between the card fetch and release_if_idle; the
+        // walk closes with release_if_idle's status + release, and B's only
+        // hub call is the losing acquire.
+        assert_eq!(names, vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease", "train_lease"]);
         // BR#4489: the acquire declares capability so the hub can starve-detect
         assert_eq!(call_args(&recorded[0]).get("merge_capable"), Some(&json!(true)));
         // B's only call is the failed acquire — it never touched the lane.
