@@ -252,11 +252,11 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
-    // BACKLOG: one row of colored blocks in walk order (BR#5114 final):
-    // green=ready (merges this pass), amber=waiting, red=conflict,
-    // grey=needs-review; head ringed; click opens the card
+    // BACKLOG (BR#5412, Ray: the queue-block row = THE BATCH): only the
+    // cars the machine's walk stamped ready this pass render — the
+    // mergeable set, not the audit trail; head ringed; click opens the card
     expect(trainPanelSrc).toMatch(/train-blocks/);
-    expect(trainPanelSrc).toMatch(/tb-\$\{cls\}/);
+    expect(trainPanelSrc).toMatch(/cls === "ready"/);
     expect(trainPanelSrc).toMatch(/l\.queue_facts\?\.entries\.find/);
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
     expect(trainPanelSrc).toContain("merges this pass");
@@ -265,18 +265,26 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders Awaiting parks as blocks in the backlog row — the force-review queue in the one-row block language (BR#4962 per BR#4960, BR#5114 form)", () => {
-    // The DO sorts awaiting parks oldest-first; the panel renders them as
-    // blocks AFTER the queue blocks (divider between): grey (parked), amber
-    // (aging, past the review window), red (lapsed, past window + grace) —
-    // no parked card may sit without a visible state, click opens the card,
-    // age + anchored verdict ride the tooltip. No text chips, no commentary.
-    expect(trainPanelSrc).toMatch(/\(l\.awaiting \?\? \[\]\)\.map/);
-    expect(trainPanelSrc).toMatch(/tb-awaiting\$\{a\.lapsed \? " tb-awaiting-lapsed" : a\.aging \? " tb-awaiting-aging" : ""\}/);
-    expect(trainPanelSrc).toMatch(/train-block-gap/);
-    expect(trainPanelSrc).toMatch(/age\(Date\.now\(\) - a\.age_ms, Date\.now\(\)\)/);
+  it("renders the QUEUE column as plain counts + batch-only blocks — no awaiting band (BR#5412, Ray: 'if red is awaiting review, then they are not part of the release train. That just adds noise')", () => {
+    // Awaiting-review parks are not train cars: they render nowhere on the
+    // panel — the backlog cell shows a plain count (X in queue, Y waiting on
+    // review as a muted number with its own tooltip), and the block row is
+    // THE BATCH: only the cars the machine's walk stamped ready this pass,
+    // contiguous, no divider fence between groups that all land in one pass.
+    expect(trainPanelSrc).not.toMatch(/tb-awaiting/);
+    expect(trainPanelSrc).not.toMatch(/train-block-gap/);
+    expect(trainPanelSrc).not.toContain("grey blocks after the divider");
+    expect(trainPanelSrc).not.toContain("waiting on reviews outside the queue");
+    // the batch: only walk-stamped ready entries render
+    expect(trainPanelSrc).toMatch(/cls === "ready"/);
+    expect(trainPanelSrc).toMatch(/merges this pass/);
+    // plain counts: X in queue + muted Y waiting on review
+    expect(trainPanelSrc).toMatch(/train-queued-count/);
+    expect(trainPanelSrc).toMatch(/train-await-count/);
+    expect(trainPanelSrc).toContain("in queue");
+    expect(trainPanelSrc).toContain("waiting on review");
+    // the force-review affordance hint rides the muted count's tooltip
     expect(trainPanelSrc).toContain("force-review from the backlog");
-    expect(trainPanelSrc).not.toContain("◉ awaiting");
     // a parked card keeps the lane's signal lit even with an empty queue
     expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
   });
