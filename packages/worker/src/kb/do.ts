@@ -2094,7 +2094,10 @@ export class KnowledgeHub {
         type: "task",
         title: `Unblock: ${rootTitle.slice(0, 190)}`,
         session: "", // session-less spawn: the closer stamps it when they claim
-        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts (the done note itself must cite receipts — ${RECEIPTS_DOC}).\n\nBR#4282 — if the parent is NOT blocked (it is in_progress or in_review: the exit flipped while it worked or while it awaited verify), do NOT resume it — it owes only the done-close. Order matters: close YOURSELF done citing the receipts first (the done-open-children gate needs the child closed), then transition ${r.id} → done citing the same receipts.\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
+        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (auto-spawned by the hub proxy-watch, BR#3361).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the exit condition TRUE at ${new Date(ts).toISOString()} (receipts):\n${atomLines}\n\nThe predicate the card parked on has flipped. Do the terminal work the card promised: execute the exit condition (live re-verify first — this sweep is a trigger, not an authority), transition ${r.id} → in_progress with the resolution note, then close yourself done citing these receipts (the done note itself must cite receipts — ${RECEIPTS_DOC}).\n\nBR#4282 — if the parent is NOT blocked (it is in_progress or in_review: the exit flipped while it worked or while it awaited verify), do NOT resume it — it owes only the done-close. Order matters: close YOURSELF done citing the receipts first, then transition ${r.id} → done citing the same receipts (BR#5370: the done-open-children gate now ignores machine-duty children, so the ordering is no longer load-bearing — it stays as the polite sequence).\n\nContract: if the live state does NOT hold (the sweep mis-read), record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
+        // BR#5370: machine-duty marker — the done-open-children gate ignores
+        // it (a duty ABOUT the card must never fence the card's close).
+        meta: { machine_duty: { by: "hub:proxy-watch", kind: "unblock", subject: r.id } },
         roles: ["unblock"],
       },
       "hub:proxy-watch",
@@ -2940,6 +2943,78 @@ export class KnowledgeHub {
       }
     } catch (e) {
       console.log("self_edges_v1 migration:", String(e).slice(0, 200));
+    }
+
+    // ---------- duties_v1: machine duty children stop fencing their close-targets (BR#5370) ----------
+    // Two one-time repairs over state the new spawn path can no longer
+    // produce:
+    //   (a) reverse-reconcile duties were child_of their close-target — the
+    //       duty pair was itself the open child gating the parent's done
+    //       (occurrence #7: breach BR#5367 on BR#5349). Every reverse-kind
+    //       duty edge is rewritten to 'relates' (BR#4894 spec b).
+    //   (b) machine-spawned duty cards get the meta.machine_duty marker so
+    //       the done-open-children gate ignores them (BR#4894 spec c).
+    //       Existing cards are identified precisely: the reconcile duties
+    //       ledger (duty_id), the guard/proxy-watch unblock spawns (ledger
+    //       create rows with auto:"unblock" / auto:"close_leg", and
+    //       proxy_flip rows' $.spawned), and the reconcile-reverse /
+    //       reconcile-verify create rows. The in_review flow's own Verify
+    //       spawn (auto:"verification") is deliberately NOT stamped — that
+    //       child IS the review acceptance and keeps fencing done.
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'duties_v1'`)) {
+        // (a) rewrite reverse-duty edges: child_of → relates
+        const reverseEdges = this.state.storage.sql.exec(
+          `SELECT r.src_id AS src, r.dst_id AS dst, r.created_ts AS ts FROM relations r
+           JOIN reconcile_duties d ON d.duty_id = r.src_id AND d.kind = 'reverse'
+           WHERE r.relation = 'child_of'`,
+        ).toArray() as any[];
+        for (const e of reverseEdges) {
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
+            String(e.src), String(e.dst), Number(e.ts ?? Date.now()),
+          );
+          this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`, String(e.src), String(e.dst));
+          this.audit("system:migration", "duty_edge_relates", String(e.src), { was: "child_of", now: "relates", dst: String(e.dst), why: "BR#5370: reverse duties are relates-linked, never child_of their close-target" });
+          this.version(String(e.src), "system:migration", "note", `BR#5370 migration: this duty was child_of its close-target (${String(e.dst)}) — rewritten to 'relates'; a duty ABOUT a card must never gate the card's done`, { dst: String(e.dst) });
+        }
+        // (b) stamp the machine-duty marker on every existing machine-spawned
+        // duty card (all kinds, any status — done cards are harmless to stamp)
+        const dutyIds = new Set<string>(
+          (this.state.storage.sql.exec(`SELECT duty_id FROM reconcile_duties WHERE duty_id != ''`).toArray() as any[]).map((r) => String(r.duty_id)),
+        );
+        for (const r of this.state.storage.sql.exec(
+          `SELECT artefact_id AS id, data FROM ledger WHERE action = 'proxy_flip' AND data LIKE '%"spawned"%'`,
+        ).toArray() as any[]) {
+          const spawned = String((JSON.parse(String(r.data ?? "{}")) as any)?.spawned ?? "");
+          if (/^BR#\d+$/.test(spawned)) dutyIds.add(spawned);
+        }
+        for (const r of this.state.storage.sql.exec(
+          `SELECT artefact_id AS id FROM ledger WHERE action = 'create'
+           AND (data LIKE '%"auto":"unblock"%' OR data LIKE '%"auto":"close_leg"%'
+                OR data LIKE '%"auto":"reconcile-reverse"%' OR data LIKE '%"auto":"reconcile-verify"%')`,
+        ).toArray() as any[]) {
+          if (/^BR#\d+$/.test(String(r.id ?? ""))) dutyIds.add(String(r.id));
+        }
+        let stamped = 0, rewritten = reverseEdges.length;
+        for (const dutyId of dutyIds) {
+          const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, dutyId) as any;
+          if (!row) continue; // hard-deleted card — ledger row only
+          const m = JSON.parse(String(row.meta ?? "{}"));
+          if (m.machine_duty) continue;
+          m.machine_duty = { by: "migration", kind: "legacy", migrated: "BR#5370" };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), dutyId);
+          stamped++;
+          this.version(dutyId, "system:migration", "note", "BR#5370 migration: machine-duty marker stamped — the done-open-children gate no longer counts this duty against its close-target", {});
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('duties_v1', ?)`,
+          JSON.stringify({ stamped, rewritten, ts: Date.now() }),
+        );
+        this.audit("system:migration", "duties_v1", null, { stamped, rewritten });
+      }
+    } catch (e) {
+      console.log("duties_v1 migration:", String(e).slice(0, 200));
     }
 
     // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
@@ -3927,7 +4002,9 @@ export class KnowledgeHub {
         title: `Close-leg duty: ${rootTitle.slice(0, 160)}`.slice(0, 200),
         session: "", // session-less spawn: the closer stamps it when they claim (a
         // pre-attributed child would trip review-separation against the real closer)
-        body_md: `Terminal close-leg duty for ${parentId} — "${rootTitle}".\n\nThe parent's done was gate-rejected by done-close-legs (BR#3361): its Done-when ends in a terminal GitHub close leg that was not receipted. The hub auto-derived this duty so the leg has an owner — no orphan terminal legs.\n\nLegs:\n${legLines}\n\nEvery receipt must carry: ${RECEIPT_CONTRACT}.\n\nContract: (1) verify live state first (gh issue view <N> --repo <repo> --json state). If the issue is already CLOSED, capture the receipt and close yourself done citing it. If it is OPEN: execute the close per the parent's grammar (bug-corpus scenario id, or scenario: none with justification), capture the receipt, close yourself done with the receipt in the note. (2) Then transition ${parentId} → done citing the receipt — the parent's gate accepts a receipted note or this closed child.`,
+        body_md: `Terminal close-leg duty for ${parentId} — "${rootTitle}".\n\nThe parent's done was gate-rejected by done-close-legs (BR#3361): its Done-when ends in a terminal GitHub close leg that was not receipted. The hub auto-derived this duty so the leg has an owner — no orphan terminal legs.\n\nLegs:\n${legLines}\n\nEvery receipt must carry: ${RECEIPT_CONTRACT}.\n\nContract: (1) verify live state first (gh issue view <N> --repo <repo> --json state). If the issue is already CLOSED, capture the receipt and close yourself done citing it. If it is OPEN: execute the close per the parent's grammar (bug-corpus scenario id, or scenario: none with justification), capture the receipt, close yourself done with the receipt in the note. (2) Then transition ${parentId} → done citing the receipt — the parent's gate accepts a receipted note or this closed child (BR#5370: machine-duty children no longer fence the parent's done).`,
+        // BR#5370: machine-duty marker — the done-open-children gate ignores it.
+        meta: { machine_duty: { by: actor, kind: "close_leg", subject: parentId } },
         roles: ["unblock"],
       },
       actor,
@@ -4152,20 +4229,41 @@ export class KnowledgeHub {
       // BR#3819 (B): every child_of reader excludes self-edges — a gate must
       // never read state that cannot exist (the BR#3423 class: the parent
       // counted as its own open child, done forever unpassable).
+      // BR#5370 (BR#4894 spec c): machine-spawned DUTY children (reconcile
+      // verify/reverse, unblock, close-leg — meta.machine_duty) never fence
+      // the parent's done either. Occurrence #7 (BR#5349): the reconciler-
+      // spawned reverse duty itself counted as the "1 open child" and gated
+      // the landed close; the duty session burned 3 audited breach events
+      // discovering it must close itself first. The in_review flow's own
+      // Verify spawn stays UNMARKED — that one IS the review acceptance.
       openChildren: () =>
         this.one(
           `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')`,
+             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')
+             AND c.meta NOT LIKE '%"machine_duty"%'`,
           id,
         )?.n ?? 0,
       openChildIds: () =>
         (this.state.storage.sql.exec(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND r.src_id != r.dst_id`,
+             AND r.src_id != r.dst_id AND c.meta NOT LIKE '%"machine_duty"%'`,
           id,
         ).toArray() as any[]).map((r) => String(r.id)),
+      // BR#5370 (finding B): the rejection names the open children — ids AND
+      // statuses — so attempt 1 points at the right action (close the named
+      // child, or first-line force-close-children). Same exclusions as
+      // openChildren (self-edges, review-leg asks, machine-duty children).
+      openChildDetails: () =>
+        (this.state.storage.sql.exec(
+          `SELECT c.id AS id, c.status AS status FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
+             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')
+             AND c.meta NOT LIKE '%"machine_duty"%'
+           ORDER BY c.id`,
+          id,
+        ).toArray() as any[]).map((r) => ({ id: String(r.id), status: String(r.status) })),
       // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
       spawnGuard: () => {
         let cursor = id, depth = 0;
@@ -4678,6 +4776,8 @@ export class KnowledgeHub {
               session: "", // session-less spawn: the unblock contract is "then a
               // FRESH session" — a pre-attributed child would trip review-separation against the legitimate closer
               body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${fx.reason || "see parent"}.\nExit condition: ${fx.exit_condition || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it (the done note must cite receipts — ${RECEIPTS_DOC}). If it does not: record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
+              // BR#5370: machine-duty marker — the done-open-children gate ignores it.
+              meta: { machine_duty: { by: actor, kind: "unblock", subject: id } },
               roles: ["unblock"],
             },
             actor,
@@ -9789,17 +9889,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   }
 
   /** Spawn the STANDARD verify duty (the shared 5c template) as a child of
-   *  `parentId`, ledgered FIRST — the reconcile_duties row is the dedupe, so
-   *  a second report (or a racing cycle) can never double-spawn one PR's
-   *  verify. Returns the duty card id, or null when the ledger already has
-   *  this PR's verify (one per PR ever — a dead one alarms, not respawns). */
+   *  `parentId`, ledgered FIRST — the reconcile_duties claim IS the dedupe
+   *  (BR#5370: INSERT-path, not a pass-level SELECT-then-INSERT), so a
+   *  second report (or a same-pass duplicate judgement, or a racing cycle)
+   *  can never double-spawn one PR's verify. Returns the duty card id, or
+   *  null when the ledger already holds this PR's verify (one per PR ever —
+   *  a dead one alarms, not respawns). */
   private async reconcileSpawnVerify(repo: string, pr: number, parentId: string, actor: string, now: number): Promise<string | null> {
-    const held = this.one(`SELECT duty_id FROM reconcile_duties WHERE repo = ? AND pr = ? AND kind = 'verify'`, repo, pr) as any;
-    if (held) return null;
-    this.state.storage.sql.exec(
-      `INSERT INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, 'verify', '', NULL, ?)`,
-      repo, pr, now,
-    );
+    if (!this.reconcileClaimDuty(repo, pr, "verify", now)) return null;
     const parent = this.one(`SELECT id, title, meta, tags FROM artefacts WHERE id = ?`, parentId) as any;
     if (!parent) return null;
     const pm = JSON.parse(parent.meta ?? "{}");
@@ -9820,6 +9917,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         title: `Verify: ${rootTitle.slice(0, 200)}`,
         session: "", // machine spawn: a FRESH session must verify (separation of duties)
         body_md: verifyDutyBody(parentId, rootTitle, prLink, { repo, n: pr }, parentIsRootFix ? { repo, pr } : undefined),
+        // BR#5370: machine-duty marker — the done-open-children gate ignores
+        // it (a duty ABOUT the card must never fence the card's close; the
+        // in_review flow's own verify spawn stays UNMARKED — that one IS the
+        // review acceptance).
+        meta: { machine_duty: { by: "reconcile", kind: "verify", subject: parentId, pr: `${repo}#${pr}` } },
         roles: ["review"],
       },
       actor,
@@ -9828,20 +9930,54 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
       created.id, parentId, now,
     );
-    this.state.storage.sql.exec(
-      `UPDATE reconcile_duties SET duty_id = ?, card_status = 'todo' WHERE repo = ? AND pr = ? AND kind = 'verify'`,
-      created.id, repo, pr,
-    );
+    this.reconcileSettleDuty(repo, pr, "verify", created.id);
     this.audit(actor, "create", created.id, { type: "task", auto: "reconcile-verify", parent: parentId, pr: `${repo}#${pr}` });
     return created.id;
   }
 
-  /** Ledger a non-verify duty (disposition / reverse) — INSERT OR IGNORE so
-   *  the one-per-PR-ever rule holds across reports. */
-  private reconcileLedgerDuty(repo: string, pr: number, kind: "disposition" | "reverse", dutyId: string, now: number): void {
+  /** BR#5370 — claim the duties-ledger row FIRST: the INSERT is the dedupe.
+   *  `INSERT OR IGNORE` against the (repo, pr, kind) primary key claims the
+   *  slot atomically; only the caller whose claim read-back shows its own
+   *  empty row may create the duty card. The old pass-level
+   *  SELECT-then-INSERT left a window the occurrence ledger kept falling
+   *  into: two judgements for one (repo, pr) inside a single report
+   *  (BR#5365/5366 — created_ts identical to the ms, the 5th same-ms pair;
+   *  prior: BR#4370/4371, BR#4585/4586, BR#4718/4719, BR#4927/4928) each
+   *  created a card before either ledger row existed. Returns true iff THIS
+   *  call holds the claim. An abandoned '' row (a spawn that died between
+   *  claim and settle) older than a minute is adopted — a crash must never
+   *  silence a PR's duties forever. */
+  private reconcileClaimDuty(repo: string, pr: number, kind: "verify" | "disposition" | "reverse", now: number): boolean {
     this.state.storage.sql.exec(
-      `INSERT OR IGNORE INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, ?, ?, 'todo', ?)`,
-      repo, pr, kind, dutyId, now,
+      `INSERT OR IGNORE INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, ?, '', 'spawning', ?)`,
+      repo, pr, kind, now,
+    );
+    const row = this.one(
+      `SELECT duty_id, created_ts FROM reconcile_duties WHERE repo = ? AND pr = ? AND kind = ?`,
+      repo, pr, kind,
+    ) as any;
+    if (!row) return false; // unreachable absent a storage fault — fail closed
+    if (String(row.duty_id ?? "") !== "") return false; // a prior duty owns the slot
+    const claimedAt = Number(row.created_ts);
+    if (!Number.isFinite(claimedAt)) return false;
+    return claimedAt === now || now - claimedAt > 60_000;
+  }
+
+  /** Settle a claimed ledger row with the created duty card. */
+  private reconcileSettleDuty(repo: string, pr: number, kind: "verify" | "disposition" | "reverse", dutyId: string): void {
+    this.state.storage.sql.exec(
+      `UPDATE reconcile_duties SET duty_id = ?, card_status = 'todo' WHERE repo = ? AND pr = ? AND kind = ?`,
+      dutyId, repo, pr, kind,
+    );
+  }
+
+  /** Release an unclaimed ('' duty_id) row — the spawn aborted after the
+   *  claim (e.g. the live queue re-check) and the slot must free up for a
+   *  later genuine vanish. */
+  private reconcileReleaseDuty(repo: string, pr: number, kind: "verify" | "disposition" | "reverse"): void {
+    this.state.storage.sql.exec(
+      `DELETE FROM reconcile_duties WHERE repo = ? AND pr = ? AND kind = ? AND duty_id = ''`,
+      repo, pr, kind,
     );
   }
 
@@ -9969,33 +10105,66 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           break;
         }
         case "spawn_disposition": {
+          // BR#5370: claim-first — two same-pass judgements for one (repo, pr)
+          // can never both create cards (the 5th same-ms pair was exactly
+          // this shape on the reverse leg).
+          if (!this.reconcileClaimDuty(repo, j.pr, "disposition", now)) {
+            this.audit(actor, "reconcile_disposition_spawn_deduped", null, { pr: `${repo}#${j.pr}`, note: "duties ledger already holds this slot — same-pass duplicate spawn is a no-op (BR#5370)" });
+            break;
+          }
           const card = await this.reconcileTrackingCard(repo, j.pr, titleByPr.get(j.pr) ?? null, "changes requested / conflicting past the disposition age — fix the PR, or rule it off the board (reconcile.ignore)", actor, now);
-          this.reconcileLedgerDuty(repo, j.pr, "disposition", card, now);
+          this.reconcileSettleDuty(repo, j.pr, "disposition", card);
           spawned.push({ pr: j.pr, action: "disposition", card });
           break;
         }
         case "spawn_reverse": {
           // The PR left open state with NO provenance row: spawn a ruling
-          // duty as a child of the zombie binding card. Never meta.pr on the
+          // duty ABOUT the zombie binding card. Never meta.pr on the
           // ruling card itself — it is a duty ABOUT a binding, not a
           // projection (a second binding would double-count the PR).
           const b = bindings.find((x) => x.pr === j.pr);
           const boundCard = b?.card ?? "no-open-binding-card";
+          // BR#5370 (BR#4894 Finding A, defense in depth): the join's binding
+          // snapshot was taken at report start — re-read the bound card's
+          // LIVE meta before spawning. A card that got queued on the merge
+          // train between the snapshot and the apply is not a zombie
+          // (queued/mid-rebase is not vanished); release the claim so a
+          // later genuine vanish can still rule.
+          const liveBound = boundCard === "no-open-binding-card" ? null : this.one(`SELECT meta FROM artefacts WHERE id = ?`, boundCard) as any;
+          if (liveBound && Number((JSON.parse(liveBound.meta ?? "{}").merge_train ?? {}).pr ?? 0) > 0) {
+            this.reconcileReleaseDuty(repo, j.pr, "reverse");
+            this.audit(actor, "reconcile_reverse_spawn_skipped_queued", boundCard, { pr: `${repo}#${j.pr}`, note: "bound card is queued on the merge train — queued/mid-rebase is not vanished (BR#4894 Finding A); no ruling duty" });
+            break;
+          }
+          // BR#5370: claim-first dedupe — the INSERT is the guard; a same-pass
+          // duplicate judgement (identical ms, body, actor — the BR#5365/5366
+          // class, 5 instances strong) is a no-op from here on.
+          if (!this.reconcileClaimDuty(repo, j.pr, "reverse", now)) {
+            this.audit(actor, "reconcile_reverse_spawn_deduped", boundCard, { pr: `${repo}#${j.pr}`, note: "duties ledger already holds this (repo, pr, kind) — same-pass duplicate spawn is a no-op (BR#5370)" });
+            break;
+          }
           const created = await this.create(
             {
               type: "task",
               title: `Reverse-reconcile: ${repo}#${j.pr} left the open list unrecorded`.slice(0, 200),
               session: "", // machine spawn: a FRESH session must rule
-              body_md: `Reverse-reconcile duty (BR#4170) — ${repo}#${j.pr} vanished from \`gh pr list\` with NO provenance row, but board card ${boundCard} still binds it.\n\nRule what happened, on the record:\n1. gh pr view ${j.pr} --repo ${repo} --json state,mergedAt,mergeCommit — was it MERGED (outside the train), CLOSED unmerged, or is the disappearance a gh/API flake?\n2. MERGED outside the train: close ${boundCard} done citing the merge commit sha + URL (the human merge is the receipt; provenance stays unstamped — that is the train-signer's job).\n3. CLOSED unmerged: close ${boundCard} done citing the close receipt. FLAKE (still open): record findings via log_progress on ${boundCard} and close yourself done — next report re-binds normally.\n4. Never close ${boundCard} without a receipt, never delete it — a silent close here is exactly the failure this duty exists to prevent (BR#3287).`,
+              body_md: `Reverse-reconcile duty (BR#4170) — ${repo}#${j.pr} vanished from \`gh pr list\` with NO provenance row, but board card ${boundCard} still binds it.\n\nRule what happened, on the record:\n1. gh pr view ${j.pr} --repo ${repo} --json state,mergedAt,mergeCommit — was it MERGED (outside the train), CLOSED unmerged, or is the disappearance a gh/API flake?\n2. MERGED outside the train: close ${boundCard} done citing the merge commit sha + URL (the human merge is the receipt; provenance stays unstamped — that is the train-signer's job).\n3. CLOSED unmerged: close ${boundCard} done citing the close receipt. FLAKE (still open): record findings via log_progress on ${boundCard} and close yourself done — next report re-binds normally.\n4. Never close ${boundCard} without a receipt, never delete it — a silent close here is exactly the failure this duty exists to prevent (BR#3287).\n\nStructural note (BR#4894 spec b / BR#5370): this duty is relates-linked to ${boundCard}, never child_of it — it is a duty ABOUT the card, not decomposition work, and must never gate the card's done (the closed-pair deadlock class).`,
+              // BR#5370: machine-duty marker — the done-open-children gate
+              // ignores it (the BR#5349 class: the reconciler-spawned duty
+              // itself gated the landed close and burned 3 audited breaches).
+              meta: { machine_duty: { by: "reconcile", kind: "reverse", subject: boundCard, pr: `${repo}#${j.pr}` } },
               roles: ["review"],
             },
             actor,
           );
+          // BR#4894 spec b / BR#5370: relates, NEVER child_of the close-target
+          // — the duty pair must not be the open child that gates its own
+          // close-target's done.
           this.state.storage.sql.exec(
-            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
             created.id, boundCard, now,
           );
-          this.reconcileLedgerDuty(repo, j.pr, "reverse", created.id, now);
+          this.reconcileSettleDuty(repo, j.pr, "reverse", created.id);
           this.audit(actor, "create", created.id, { type: "task", auto: "reconcile-reverse", parent: boundCard, pr: `${repo}#${j.pr}` });
           spawned.push({ pr: j.pr, action: "reverse", card: created.id });
           break;

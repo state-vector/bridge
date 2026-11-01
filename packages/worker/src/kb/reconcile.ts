@@ -179,6 +179,10 @@ export interface ReconcileAccounting {
   /** BR#5151: standing lane bindings — accounted, exempt from the reverse
    *  legs entirely (no close, no duty, no missing clock). */
   reverse_lane_exempt: number;
+  /** BR#5370: queued bindings whose PR left the open list — the train owns
+   *  them (queued/mid-rebase is not vanished); the missing clock is cleared
+   *  and no ruling duty spawns (BR#4894 Finding A). */
+  reverse_train_exempt: number;
   accounted: number;
   /** false ⇒ the run FAILED — alarm to the sink. */
   ok: boolean;
@@ -203,7 +207,7 @@ export function accountingLine(a: ReconcileAccounting): string {
   const base = `${a.open_reviewed} open reviewed / ${a.bound} bound / ${a.ignored} ignored-with-reason / ${inflight} in-flight — ${a.accounted} accounted`;
   const alarm = a.ok ? "" : ` — ALARM: ${a.unaccounted} unaccounted`;
   const info = a.grace || a.unreviewed ? ` (+${a.grace} in age grace, +${a.unreviewed} unreviewed)` : "";
-  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}]` : a.reverse_lane_exempt ? ` [reverse: ${a.reverse_lane_exempt} lane-exempt]` : "";
+  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? `, ${a.reverse_train_exempt} train-owned` : ""}]` : a.reverse_lane_exempt || a.reverse_train_exempt ? ` [reverse:${a.reverse_lane_exempt ? ` ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? ` ${a.reverse_train_exempt} train-owned` : ""}]` : "";
   return base + alarm + info + reverse;
 }
 
@@ -239,6 +243,7 @@ export function reconcileJoin(args: {
     reverse_closed: 0,
     reverse_dutied: 0,
     reverse_lane_exempt: 0,
+    reverse_train_exempt: 0,
     accounted: 0,
     ok: true,
   };
@@ -349,7 +354,16 @@ export function reconcileJoin(args: {
 
   // ---- reverse reconcile: bindings whose PR is gone from the open list ----
   const openPrs = new Set(prs.map((p) => p.number));
+  // BR#5370: a card whose meta binds the same PR twice (meta.pr + a meta.prs
+  // row) produces TWO bindings for one pr — the reverse loop is the only
+  // per-binding loop, so without a per-pr guard it emitted the spawn decision
+  // TWICE in one pass (BR#5365/5366: created_ts identical to the ms — the
+  // 5th same-ms duty pair). First binding wins, exactly as the apply path's
+  // `bindings.find` resolves the parent.
+  const reverseJudged = new Set<number>();
   for (const b of args.bindings) {
+    if (reverseJudged.has(b.pr)) continue;
+    reverseJudged.add(b.pr);
     if (b.lane) {
       // BR#5151: a standing lane card is never a zombie — its bootstrap PR
       // leaving the open list (or a stray provenance row on the card) is not
@@ -363,6 +377,18 @@ export function reconcileJoin(args: {
       continue;
     }
     acc.reverse_missing++;
+    if (b.queued) {
+      // BR#4894 Finding A / BR#5370: queued/mid-rebase is NOT vanished. A
+      // queued binding (blocked + the merge_train stamp) is the train's
+      // business — its PR leaving the open list (rebase window, gh page
+      // drift) must not start the missing clock or spawn a ruling duty.
+      // Occurrence #7: BR#5349 was queued on PR #345 when the false-positive
+      // spawn fired (the PR merged 7.1 minutes LATER). Clear the clock so
+      // the two-consecutive guard re-arms fresh if the binding ever unqueues.
+      acc.reverse_train_exempt++;
+      judgements.push({ pr: b.pr, decision: { action: "seen", card: b.card }, reason: "queued on the merge train — queued/mid-rebase is not vanished (BR#4894 Finding A); missing clock cleared, no ruling duty" });
+      continue;
+    }
     if (!b.missing_set_before_report) {
       judgements.push({ pr: b.pr, decision: { action: "mark_missing", card: b.card }, reason: "first cycle absent from the open list — starting the two-consecutive-missing guard" });
       continue;
@@ -370,12 +396,12 @@ export function reconcileJoin(args: {
     if (b.provenance) {
       acc.reverse_closed++;
       judgements.push({ pr: b.pr, decision: { action: "reverse_close", card: b.card, merge_sha: b.provenance.merge_sha, signer: b.provenance.signer }, reason: `PR left the open list and the train stamped the merge (${b.provenance.merge_sha.slice(0, 9)}) — closing via provenance, no zombie card` });
-    } else {
-      const ruled = (dutiesByPr.get(b.pr) ?? []).some((d) => d.kind === "reverse");
-      if (ruled) continue; // already accounted by the prior cycle's duty
-      acc.reverse_dutied++;
-      judgements.push({ pr: b.pr, decision: { action: "spawn_reverse" }, reason: "PR left the open list with NO provenance row — spawning a ruling duty (merged outside the train, or closed: someone rules, never silence)" });
+      continue;
     }
+    const ruled = (dutiesByPr.get(b.pr) ?? []).some((d) => d.kind === "reverse");
+    if (ruled) continue; // already accounted by the prior cycle's duty
+    acc.reverse_dutied++;
+    judgements.push({ pr: b.pr, decision: { action: "spawn_reverse" }, reason: "PR left the open list with NO provenance row — spawning a ruling duty (merged outside the train, or closed: someone rules, never silence)" });
   }
 
   return { judgements, accounting: acc };

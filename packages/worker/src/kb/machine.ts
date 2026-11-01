@@ -62,6 +62,10 @@ export interface RuleCtx {
   /** every OPEN child id (self-edges excluded — BR#3819: state that cannot
    *  exist is never read); the force-close grammar validates against it */
   openChildIds(): string[] | Promise<string[]>;
+  /** the open children WITH their statuses (BR#5370: the done-open-children
+   *  rejection names ids + statuses so attempt 1 points at the right
+   *  action); same exclusions as openChildren */
+  openChildDetails(): { id: string; status: string }[] | Promise<{ id: string; status: string }[]>;
   /** verify-of-verify / nesting-cap guard: the spawn-blocker reason or null */
   spawnGuard(): string | null | Promise<string | null>;
   /** newest OPEN role:review child (reuse candidate), or null */
@@ -561,7 +565,13 @@ export const RULES: Rule[] = [
           return `force-close must name EVERY open child task — missing: ${missing.join(", ")}. ${FORCE_CLOSE_DOC}`;
         return null; // deliberate, complete, reasoned — do.ts logs the repair
       }
-      return `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children). If a child is genuinely unclosable, ${FORCE_CLOSE_DOC}`;
+      // BR#5370 (occurrence #7 finding B): name the open children — ids AND
+      // statuses — so attempt 1 points at the right action. The old bare
+      // count sent the BR#5349 duty session chasing its already-closed twin
+      // and retrying a terminal semantic rejection 3x (BR#4403 breaches).
+      const details = await c.openChildDetails();
+      const named = details.length ? ` Open child: ${details.map((d) => `${d.id} (${d.status})`).join(", ")}.` : "";
+      return `parent ${i.id} still has ${open} open child task(s) — finish or close them first (decomposition owns its children).${named} If a child is genuinely unclosable, ${FORCE_CLOSE_DOC}`;
     },
   },
   {

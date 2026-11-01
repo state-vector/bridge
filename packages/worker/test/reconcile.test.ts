@@ -150,7 +150,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 3, bound: 1, ignored: 1, inflight: 0, spawned: 1,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 3, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 3, ok: true,
     });
     expect(line).toBe("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
   });
@@ -159,7 +159,7 @@ describe("accountingLine", () => {
     const a = {
       repo: "r", open_reviewed: 1, bound: 0, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 0, ok: false,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 0, ok: false,
     };
     expect(accountingLine(a)).toContain("ALARM: 1 unaccounted");
     expect(accountingLine({ ...a, unaccounted: 0, ok: true, accounted: 1, bound: 1 })).not.toContain("ALARM");
@@ -169,7 +169,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1,
-      reverse_dutied: 0, reverse_lane_exempt: 0, accounted: 1, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("(+2 in age grace, +3 unreviewed)");
     expect(line).toContain("[reverse: 1 missing, 1 closed, 0 dutied]");
@@ -179,7 +179,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 2, accounted: 1, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 2, reverse_train_exempt: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("[reverse: 2 lane-exempt]");
   });
@@ -381,6 +381,45 @@ describe("reconcileJoin — reverse", () => {
     expect(r.judgements.filter((j) => j.pr === 1)).toHaveLength(0);
     expect(r.accounting.reverse_missing).toBe(1);
     expect(r.accounting.reverse_dutied).toBe(0);
+  });
+
+  it("BR#5370: a queued binding whose PR left the open list is train-owned — the clock never arms, no ruling duty (occurrence #7)", () => {
+    // occurrence #7: BR#5349 was blocked + queued on PR #345 (mid-train) when
+    // the false-positive spawn fired; the PR merged 7.1 minutes LATER. A
+    // queued binding (merge-train stamp) is the train's business —
+    // queued/mid-rebase is not vanished (BR#4894 Finding A).
+    const r = join({ prs: [], bindings: [binding(1, { status: "blocked", queued: true, missing: true })] });
+    expect(one(r, 1).decision.action).toBe("seen"); // the clock is CLEARED, never armed
+    expect(r.accounting.reverse_train_exempt).toBe(1);
+    expect(r.accounting.reverse_dutied).toBe(0);
+    expect(r.accounting.reverse_closed).toBe(0);
+    // the accounting line shows the exemption — the canary sees the class
+    expect(accountingLine(r.accounting)).toContain("1 train-owned");
+  });
+
+  it("BR#5370: a queued binding stays train-owned past the first miss — the exemption is not a one-cycle grace", () => {
+    const r = join({ prs: [], bindings: [binding(1, { status: "blocked", queued: true, missing: true, missing_set_before_report: true })] });
+    expect(one(r, 1).decision.action).toBe("seen");
+    expect(r.accounting.reverse_train_exempt).toBe(1);
+    expect(r.accounting.reverse_dutied).toBe(0);
+  });
+
+  it("BR#5370: the same PR bound twice (meta.pr + a meta.prs row) is judged ONCE in the reverse leg — no same-pass duplicate spawn", () => {
+    // the deterministic same-ms pair (BR#5365/5366, the 5th instance): the
+    // reverse loop iterated bindings raw, so a double-bound card emitted
+    // spawn_reverse TWICE in one pass and the apply phase created both cards
+    // before the ledger could dedupe. First binding wins (the same one the
+    // apply path's bindings.find resolves).
+    const r = join({
+      prs: [],
+      bindings: [
+        binding(1, { missing: true, missing_set_before_report: true }),
+        binding(1, { missing: true, missing_set_before_report: true }),
+      ],
+    });
+    const spawns = r.judgements.filter((j) => j.decision.action === "spawn_reverse");
+    expect(spawns).toHaveLength(1);
+    expect(r.accounting.reverse_dutied).toBe(1);
   });
 });
 

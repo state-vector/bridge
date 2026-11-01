@@ -1313,8 +1313,22 @@ daemon never writes the board; the hub never touches GitHub. A report per repo p
 **Reverse reconcile** guards the other direction: a bound card whose PR vanishes from the
 open list starts a missing clock; two consecutive misses with a provenance row close the
 zombie binding via the machine proxy (BR#3287 — the train stamped the merge); with NO
-provenance it spawns a ruling duty instead — someone rules, never silence. Standing
-merge-lane cards are exempt from ALL of it (BR#5151, the BR#5050 incident): a lane card
+provenance it spawns a ruling duty instead — someone rules, never silence. Three BR#5370
+laws harden the spawner (the 5th same-ms duplicate duty pair, BR#5365/5366 — occurrence
+#7, breach BR#5367 on BR#5349). **Queued is not vanished** (BR#4894 Finding A): a
+queued binding (blocked + the `merge_train` stamp) whose PR leaves the open list is the
+train's business — a rebase window or gh page drift — so it is accounted `train-owned`,
+the missing clock never arms, and no duty spawns (BR#5349 was queued on a PR that
+merged 7.1 minutes LATER when the false positive fired). **One PR is judged once per
+pass**: a card double-binding one PR (`meta.pr` + a `meta.prs` row) used to emit two
+spawn judgements in a single pass — the loop judges each PR exactly once, first binding
+wins. **The claim IS the dedupe**: a spawn first takes its `reconcile_duties` ledger
+row (INSERT OR IGNORE, duty id read back) before any card is created, so two passes can
+never both mint a card for one PR — the same one-row-per-repo+pr+kind-forever ledger
+that powers the dead-duty alarm. A ruling duty rides a `relates` link to its
+close-target, never `child_of` — see *Machine duties never fence their close-target*
+below. Standing merge-lane cards are exempt from ALL of it (BR#5151, the BR#5050
+incident): a lane card
 bound to a PR — even with a provenance row stamped on it and past the two-miss guard — is
 accounted `lane-exempt` and never closed, never dutied, never clocked; the train's settle
 path is the only lane writer. The close-protection gate matches: owner identity is no
@@ -1430,6 +1444,40 @@ onto runners that had already finished. Four laws close the class:
 
 Drill: `packages/worker/test/br3819-self-edge.test.ts` (real DO: per-relation self-edge
 rejection, migration stamp, partial/complete force-close, live-resume vs dead-release).
+
+## Machine duties never fence their close-target (BR#5370)
+
+The done-open-children gate exists so no card is buried under open work — but a
+machine-spawned duty ABOUT a card gating that card's close is the reverse of the
+gate's intent. The specimen (occurrence #7, breach BR#5367): a zombie binding's close
+was fenced by the very ruling duty the reverse spawner had minted for it — and its
+web-created twin burned three gate rejections (BR#4403) on a bare count that named
+nothing. Three laws:
+
+- **Machine-duty children are invisible to the done gate**: every machine spawn (the
+  reconcile verify/reverse duties, the proxy-watch unblock duty, the auto-derived
+  close-leg duty) stamps `meta.machine_duty`, and the done-open-children gate (and its
+  force-close reader) excludes marked children — the close-target closes on its own
+  Done-while, the duty rules when it rules. The boundary is exact: the in_review flow's
+  auto-spawned Verify child is NOT marked — it IS the review acceptance, and keeps
+  fencing done.
+- **Reverse duties never parent their close-target** (BR#4894 spec b): a reverse
+  ruling duty is `relates`-linked to the zombie binding it rules on, never `child_of` —
+  the duty can no longer be the open child that gates its own close-target's done, so
+  the binding closes first-line with the duty open.
+- **The refusal names the blockers** (finding B): a done the gate still refuses renders
+  every remaining open child as `Open child: BR#x (status)` — ids AND statuses on the
+  FIRST rejection, never a bare count.
+
+A one-time migration (`duties_v1`, settings-stamped, idempotent across boots — the
+BR#3819 pattern) stamps the machine-duty marker on existing reconcile-ledger duty cards
+and rewrites legacy reverse-duty `child_of` edges to `relates`, per-edge audited.
+
+Drill: `packages/worker/test/br5370-reconcile-duties.test.ts` (real DO: the same-ms
+duplicate spawn structurally impossible; `relates` link + first-line close with the duty
+open; gate exclusion with the verify-fence control; queued-vanish + the migration
+stamp) — plus the tier-1 additions in `test/reconcile.test.ts` (queued exemption,
+double-binding single spawn) and `test/machine.test.ts` (the refusal names children).
 
 ## 5 · Use it
 
