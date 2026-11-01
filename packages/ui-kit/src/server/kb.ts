@@ -236,6 +236,16 @@ export interface KbTrainLane {
       red?: { name: string; url?: string }[];
       unsettled?: string[];
     };
+    /** BR#5376: the ACTIVE batch-stall episode — members were selected,
+     *  merges attempted, NOTHING landed for K consecutive ticks. The next
+     *  stamp after a landing omits it (clears by itself). */
+    stalled?: {
+      batch: number[];
+      ticks: number;
+      since: number;
+      for_ms?: number;
+      last_error?: string;
+    };
   } | null;
   /** BR#5349 (Ray directive: "THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED
    *  TO DO — loud and clear, no jargon"): served while a non-green base
@@ -249,6 +259,20 @@ export interface KbTrainLane {
     held: number;
     ask: { id: string; url: string; question: string; options: string[] } | null;
     fix_card: { id: string; url: string; title: string; status: string } | null;
+  };
+  /** BR#5376: served while a fresh stall episode rides the stamp — the
+   *  batch, how long nothing has landed (ticks + wall-clock), WHY (the
+   *  executor's last error), the episode's OPEN alarm ask, and the unblock
+   *  (restart the executor). Suppressed while base-red owns the lane;
+   *  absent the moment anything lands. */
+  stalled_resolution?: {
+    batch: number[];
+    ticks: number;
+    since: number | null;
+    for_ms: number;
+    last_error: string | null;
+    ask: { id: string; url: string; question: string; options: string[] } | null;
+    unblock: string;
   };
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {

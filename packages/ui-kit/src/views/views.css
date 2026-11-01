@@ -493,6 +493,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-blocked-banner a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .train-blocked-banner .train-banner-line { min-width: 0; }
 .train-blocked-banner .train-banner-dim { opacity: 0.75; }
+/* BR#5376: the stalled banner rides the amber blocked-banner base; the
+   executor's raw error line renders mono + breaks so a long gh refusal
+   ("Merge commits are not allowed on this repository.") stays readable. */
+.train-blocked-banner .train-banner-mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  word-break: break-word;
+  opacity: 0.95;
+}
 .train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
 .train-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
 .train-lane {

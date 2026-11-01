@@ -2438,6 +2438,16 @@ export function trainBaseRedAskTitle(lane: { repo: string; base: string }, reds:
   return prefix + names + suffix;
 }
 
+/** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall
+ *  episode. Unlike the base-red title it carries NO varying names (the
+ *  episode's identity IS the lane): askCreate's identical-open-ask guard
+ *  dedupes the per-tick repeats on the exact string, so the title must
+ *  contain no tick counts, no ages, no PR lists. ≤240 chars, ends "?" —
+ *  the ask contract. */
+export function trainStallAskTitle(lane: { repo: string; base: string }): string {
+  return `MERGE TRAIN STALLED: ${lane.repo}@${lane.base} — PRs selected to merge are not landing. Restart the executor?`;
+}
+
 /** The machine-proxy close note for train:landed — cites the merge commit
  *  (mergeCommit non-null) and main green, per the done-when's machine proxy.
  *  BR#3659: a multi-PR card's FINAL close cites EVERY leg's merge commit. */

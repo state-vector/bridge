@@ -2106,6 +2106,110 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brr" });
   });
 
+  it("BR#5376: a stalled batch rides the walk stamp — the lane renders the loud STALLED reason (batch, duration, WHY), train.status serves stalled_resolution (batch/ticks/for_ms/last_error/ask/unblock), the ONE-per-episode ask dedupes the per-tick repeats, base-red suppresses the stall banner, and the next stamp WITHOUT the episode clears everything by itself", async () => {
+    const repo = "state-vector/lane-stall";
+    await acquire(repo, "gw-stall", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 53761, head: "e".repeat(40), title: "IMPL: stall drill 1" });
+    const c2 = await queueViaAccept({ repo, pr: 53762, head: "f".repeat(40), title: "IMPL: stall drill 2" });
+
+    const stamp = (stalled: unknown) =>
+      kbJson("/train.queue_facts", {
+        repo, base: "main", actor: "gw-stall",
+        entries: [ { id: c1, pr: 53761, cls: "ready" }, { id: c2, pr: 53762, cls: "ready" } ],
+        ...(stalled ? { stalled } : {}),
+      });
+
+    const r = await stamp({ batch: [53761, 53762], ticks: 3, since: Date.now() - 4 * 60_000, for_ms: 4 * 60_000, last_error: "GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)" });
+    expect(r.body.error ?? "").toBe("");
+    const lane = await laneSnap(repo);
+    expect(lane.reason).toContain("merge-train: STALLED");
+    expect(lane.reason).toContain("0 landed in 4m (3 tick(s))");
+    expect(lane.reason).toContain("Merge commits are not allowed on this repository");
+    expect(lane.reason).toContain("restart the gateway");
+    const sr = lane.stalled_resolution;
+    expect(sr).toBeTruthy();
+    expect(sr.batch).toEqual([53761, 53762]);
+    expect(sr.ticks).toBe(3);
+    expect(sr.last_error).toContain("Merge commits are not allowed");
+    expect(sr.unblock).toContain("restart");
+    // the episode's OPEN alarm ask rides verbatim (one click to answer)
+    const ask = (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts
+      .find((x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`));
+    expect(ask).toBeTruthy();
+    expect(sr.ask.id).toBe(ask.id);
+    expect(sr.ask.options).toEqual(["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"]);
+
+    // ONE ask per episode — the per-tick stamp repeats dedupe on the
+    // numberless title (no tick counts, no ages)
+    await stamp({ batch: [53761, 53762], ticks: 4, since: Date.now() - 5 * 60_000, for_ms: 5 * 60_000, last_error: "same refusal" });
+    const askCount = async () =>
+      (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts.filter(
+        (x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`),
+      ).length;
+    expect(await askCount()).toBe(1);
+
+    // base-red owns the story when BOTH ride the same stamp — the STALLED
+    // banner is suppressed while the lane reads BLOCKED
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-stall",
+      entries: [ { id: c1, pr: 53761, cls: "waiting" }, { id: c2, pr: 53762, cls: "waiting" } ],
+      base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "Test", url: "https://example.test/5376" }], unsettled: [] },
+      stalled: { batch: [53761, 53762], ticks: 5, since: Date.now() - 60_000, for_ms: 60_000, last_error: "refused" },
+    });
+    const laneBR = await laneSnap(repo);
+    expect(laneBR.base_red_resolution).toBeTruthy();
+    expect(laneBR.stalled_resolution ?? null).toBeNull();
+    expect(laneBR.reason).toContain("BLOCKED — base main RED");
+
+    // the next stamp WITHOUT the episode clears everything by itself — the
+    // banner's own off-switch (no lingering state after a landing)
+    await stamp(null);
+    const lane2 = await laneSnap(repo);
+    expect(lane2.reason).not.toContain("STALLED");
+    expect(lane2.stalled_resolution ?? null).toBeNull();
+    expect(await askCount()).toBe(1);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-stall" });
+  });
+
+  it("BR#5376: train.event kind 'stalled' writes ONE ledger row per episode (dedupe by the episode's since) and files the numberless alarm ask; a re-fire of the SAME episode is an ack, a NEW since is a fresh row with still exactly one ask", async () => {
+    const repo = "state-vector/lane-stall-ev";
+    const T0 = Date.now() - 7 * 60_000; // fixed episode start for the dedupe key
+    await acquire(repo, "gw-sev", { merge_capable: true, required_workflows: ["Test"] });
+
+    const ev = (since: number, ticks: number) =>
+      kbJson("/train.event", {
+        repo, base: "main", actor: "gw-sev", kind: "stalled", pr: 0,
+        batch_members: [53763], ticks, since,
+        last_error: "GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)",
+        reason: "selected 1 PR(s) to merge, landed 0 across 3 tick(s) — likely executor breakage; restart the gateway onto the current build",
+      });
+
+    const r1 = await ev(T0, 3);
+    expect(r1.body.error ?? "").toBe("");
+    expect(r1.body.deduped ?? false).toBe(false);
+    // a crash-recovery re-fire of the SAME episode dedupes to an ack
+    const r2 = await ev(T0, 4);
+    expect(r2.body.deduped).toBe(true);
+    let hist = (await kbJson("/train.history", { repo, kind: "stalled" })).body.events;
+    expect(hist.length).toBe(1);
+    expect(hist[0].detail.since).toBe(T0);
+    expect(hist[0].detail.batch_members).toEqual([53763]);
+    expect(hist[0].detail.last_error).toContain("Merge commits are not allowed");
+    // a NEW episode (new since) = a fresh ledger row, still exactly ONE ask
+    const r3 = await ev(T0 + 10 * 60_000, 3);
+    expect(r3.body.deduped ?? false).toBe(false);
+    hist = (await kbJson("/train.history", { repo, kind: "stalled" })).body.events;
+    expect(hist.length).toBe(2);
+    const asks = (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts.filter(
+      (x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`),
+    );
+    expect(asks.length).toBe(1);
+    // a non-holder cannot fire the alarm (the lane lease is required)
+    const no = await kbJson("/train.event", { repo, base: "main", actor: "gw-other", kind: "stalled", pr: 0, batch_members: [1], ticks: 3, since: T0 + 60_000 });
+    expect(no.status).toBeGreaterThanOrEqual(400);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-sev" });
+  });
+
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
     const repo = "state-vector/lane-legacy-renew";
     await acquire(repo, "gw-leg", { merge_capable: true });
