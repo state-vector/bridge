@@ -7,6 +7,10 @@ import {
   laneCardBody,
   laneOfMeta,
   parseBurstMax,
+  // BR#5385 mid-walk merged receipt
+  leaseLossHolder,
+  midWalkReceiptDecide,
+  type LeaseLossTransition,
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
@@ -129,6 +133,50 @@ describe("leaseDecide (the CAS check — read-check-write is atomic in the DO)",
     expect(leaseDecide(lease("gw-1", 0, 1000), 1000, "gw-2", "acquire").ok).toBe(true);
     expect(leaseDecide(lease("gw-1", 0, 1001), 1000, "gw-2", "acquire").ok).toBe(false);
     expect(at(1000)).toContain("1970");
+  });
+});
+
+// ---------- the mid-walk merged receipt (BR#5385) ----------
+
+describe("midWalkReceiptDecide (a lease lost mid-walk does not destroy a real landing's receipt)", () => {
+  const NOW = 1_000_000_000;
+  const loss = (action: string, ageMs: number, holder: string | null = "gw-1", actor = "gw-1"): LeaseLossTransition =>
+    ({ ts: NOW - ageMs, action, actor, holder });
+
+  it("accepts: the holder itself released mid-walk (the incident shape — a same-actor peer release)", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_release", 2_000), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("accepts: the watch sweep lapsed the holder's lease mid-walk (holder rides the sweep stamp)", () => {
+    expect(midWalkReceiptDecide(loss("lease_lapsed", 30_000, "gw-1"), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("accepts: the zombie eviction removed the holder mid-walk (holder rides the zombie stamp)", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_evicted", 60_000, "gw-1"), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("refuses: an actor that never held the lease cannot report a mid-walk merge", () => {
+    const d = midWalkReceiptDecide(loss("train:lease_release", 2_000), "gw-rogue", NOW);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) expect(d.reason).toContain("held by gw-1");
+  });
+  it("refuses: the loss is older than the lease TTL — history, not mid-walk", () => {
+    const d = midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS + 1), "gw-1", NOW);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) expect(d.reason).toContain("past the lease TTL");
+  });
+  it("refuses: no lease-loss record at all (a fresh lane — the original gate error stands)", () => {
+    expect(midWalkReceiptDecide(null, "gw-1", NOW).ok).toBe(false);
+    expect(midWalkReceiptDecide(undefined, "gw-1", NOW).ok).toBe(false);
+  });
+  it("leaseLossHolder: release rows resolve from the actor; lapsed/evicted rows from the payload; anything else resolves nothing", () => {
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_release", actor: "gw-1", holder: null })).toBe("gw-1");
+    expect(leaseLossHolder({ ts: 0, action: "lease_lapsed", actor: "system:merge-train", holder: "gw-2" })).toBe("gw-2");
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_evicted", actor: "gw-3", holder: "gw-2" })).toBe("gw-2");
+    expect(leaseLossHolder({ ts: 0, action: "lease_lapsed", actor: "system:merge-train", holder: null })).toBeNull();
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_acquire", actor: "gw-1", holder: null })).toBeNull();
+  });
+  it("the TTL boundary is exact: lost at TTL-1ms admits; at TTL+1ms refuses", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS - 1), "gw-1", NOW).ok).toBe(true);
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS), "gw-1", NOW).ok).toBe(true);
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS + 1), "gw-1", NOW).ok).toBe(false);
   });
 });
 

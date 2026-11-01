@@ -1454,6 +1454,55 @@ export function leaseDecide(
   return { ok: true, lease: null, note: "lease released" };
 }
 
+// ---- BR#5385 mid-walk merged receipt ----
+// The 2026-11-01 11:18Z incident: a lane ran TWO walkers (the hand-installed
+// daemon units + the runner gateway's in-process train leg) under ONE actor
+// (one gateway token), so the CAS read every peer release as "already mine".
+// The peer released the lease MID-WALK and the winner's `merged` event died
+// at the gate — a real landing lost its provenance, the batch aborted, and
+// the lane ping-ponged (meta.currently null ⇒ release_if_idle legitimately
+// releases). A merged event is a receipt of an already-done GitHub fact, not
+// a lane write: the hub re-admits it from the LOST holder when the ledger
+// proves the lease was lost mid-walk (within the TTL) to the same
+// authenticated identity — "the signer is the recorded holder". Fail-closed
+// everywhere else: a live holder on the lane, an actor that never held the
+// lease, or a loss older than the TTL ⇒ the original gate error stands.
+
+/** One lease-LOSS transition as the DO reads it from the ledger (BR#5385).
+ *  `holder` is resolved per row shape: `train:lease_release` rows carry the
+ *  releaser in `actor` (leaseDecide: only the holder releases);
+ *  `lease_lapsed` / `train:lease_evicted` rows carry it in the data payload
+ *  (the watch sweep / zombie eviction stamps). */
+export type LeaseLossTransition = { ts: number; action: string; actor: string; holder: string | null };
+
+export function leaseLossHolder(t: LeaseLossTransition): string | null {
+  if (t.action === "train:lease_release") return t.actor || null; // only the holder releases (leaseDecide)
+  if (t.action === "train:lease_evicted") return t.holder || null; // the zombie stamp carries the evicted holder
+  if (t.action === "lease_lapsed") return t.holder || null; // the watch sweep carries the lapsed holder
+  return null;
+}
+
+/** THE mid-walk receipt decision (BR#5385) — pure so the incident replay is
+ *  unit-testable: the lane's last lease-loss transition + the presenting
+ *  actor ⇒ admit the merged receipt or name the refusal. The window is the
+ *  lease TTL itself: the holder renewed within it throughout the walk, so a
+ *  loss younger than the TTL is by construction "mid-walk", not history. */
+export function midWalkReceiptDecide(
+  loss: LeaseLossTransition | null | undefined,
+  actor: string,
+  now: number,
+): { ok: true } | { ok: false; reason: string } {
+  const holder = loss ? leaseLossHolder(loss) : null;
+  if (!loss || !holder)
+    return { ok: false, reason: "the ledger shows no lease loss on this lane — nothing anchors a mid-walk receipt" };
+  if (holder !== actor)
+    return { ok: false, reason: `the lane's last lease was held by ${holder}, not by you — only the recorded holder may report a mid-walk merge` };
+  const age = now - loss.ts;
+  if (age > TRAIN_LEASE_TTL_MS)
+    return { ok: false, reason: `the lane's lease was lost ${Math.round(age / 1000)}s ago — past the lease TTL (${TRAIN_LEASE_TTL_MS / 60_000}m); too stale to be mid-walk` };
+  return { ok: true };
+}
+
 // ---- zombie eviction (BR#4129 — the hub half of proof-of-progress) ----
 // The 2026-10-28 incident: a live holder renewed the lease for hours, took
 // zero actions, and the queue starved behind it (the CAS did its job — too

@@ -269,6 +269,43 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(act.last_event.task_id).toBe(card);
   });
 
+  it("BR#5385 mid-walk merged receipt: a same-actor peer release mid-walk no longer destroys the landing's provenance (the 2026-11-01 11:18Z incident)", async () => {
+    const repo = "state-vector/midwalk";
+    const HEAD = "a".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 5385, head: HEAD, title: "IMPL: mid-walk receipt drill" });
+    await acquire(repo, "gw-walk");
+    // THE INCIDENT: a peer walker under the SAME actor (one gateway token —
+    // the CAS reads every op as "already mine") releases the lease mid-walk.
+    const rel = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-walk" });
+    expect(rel.body.error ?? "").toBe("");
+    // the winner's merged event arrives with the lane UNHELD — admitted, not
+    // lost: provenance stamps, the lane settles, the batch is not aborted.
+    const M = "d".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-walk",
+      pr: 5385, merge_sha: M, head_sha: HEAD, task_id: card,
+    });
+    expect(merged.body.error ?? "", `mid-walk receipt refused: ${JSON.stringify(merged.body)}`).toBe("");
+    expect(merged.body.merge_sha).toBe(M);
+    const mid = await laneSnap(repo);
+    expect(mid.currently.pr).toBe(5385);
+    expect(mid.currently.phase).toBe("awaiting-ci");
+    expect(mid.currently.merge_sha).toBe(M);
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.meta?.provenance?.merge_sha).toBe(M);
+    // the receipt is loud on the ledger: mid_walk_receipt rides the event detail
+    const ev = (await kbJson("/train.history", { repo, kind: "merged", pr: 5385 })).body.events[0];
+    expect(ev.detail.mid_walk_receipt).toEqual({ lost_via: "train:lease_release", lost_at: expect.any(String) });
+    // and the fail-closed legs hold: a fresh lane (no lease loss on record)
+    // still refuses; an actor that never held the lease still refuses.
+    const fresh = await kbJson("/train.event", { repo: "state-vector/midwalk-fresh", base: "main", kind: "merged", actor: "gw-stranger", pr: 1, merge_sha: "e".repeat(40) });
+    expect(fresh.status).toBe(400);
+    expect(String(fresh.body.error)).toContain("train events require the lane lease");
+    const rogue = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-rogue", pr: 5385, merge_sha: "f".repeat(40) });
+    expect(rogue.status).toBe(400);
+    expect(String(rogue.body.error)).toContain("held by gw-walk");
+  });
+
   it("the batch composition rides the merged event: batch_members is sanitized into the ledger detail (BR#4996)", async () => {
     const repo = "state-vector/batch-ledger";
     const card = await queueViaAccept({ repo, pr: 2650, head: "d".repeat(40), title: "IMPL: batch ledger drill" });

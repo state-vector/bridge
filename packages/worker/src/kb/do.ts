@@ -80,6 +80,10 @@ import {
   parseBurstMax,
   type LaneSpec,
   leaseDecide,
+  // BR#5385 mid-walk merged receipt
+  leaseLossHolder,
+  midWalkReceiptDecide,
+  type LeaseLossTransition,
   mergeTrainQueue,
   // BR#5190 root-fix fast lane: the board half of the main-breakage law
   ROOT_FIX_TAG,
@@ -8026,6 +8030,34 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     };
   }
 
+  /** BR#5385: the lane's most recent lease-LOSS transition, read from the
+   *  ledger (cold path — only the mid-walk merged receipt consults it).
+   *  `train:lease_release` carries the releaser in `actor` (leaseDecide: only
+   *  the holder releases); `lease_lapsed` / `train:lease_evicted` carry the
+   *  holder in the data payload. One fact can write BOTH a signal and a
+   *  mutation row (unpaired audit) — the newest row with a resolvable holder
+   *  wins; they resolve the same holder. */
+  private lastLaneLeaseLoss(laneId: string): LeaseLossTransition | null {
+    const rows = this.state.storage.sql.exec(
+      `SELECT ts, actor, action, data FROM ledger
+       WHERE artefact_id = ? AND action IN ('train:lease_release', 'lease_lapsed', 'train:lease_evicted')
+       ORDER BY seq DESC LIMIT 6`,
+      laneId,
+    ).toArray() as any[];
+    for (const r of rows) {
+      let d: any = {};
+      try { d = JSON.parse(r.data ?? "{}"); } catch { d = {}; }
+      const t: LeaseLossTransition = {
+        ts: Number(r.ts),
+        action: String(r.action ?? ""),
+        actor: String(r.actor ?? ""),
+        holder: d.holder ?? d.zombie?.holder ?? null,
+      };
+      if (leaseLossHolder(t)) return t;
+    }
+    return null;
+  }
+
   /** Stamp the provenance index (BR#3287 chain) from a train:merged event —
    *  board-side storage of record; the lookup endpoint serves it with zero
    *  hub GitHub calls. */
@@ -8128,7 +8160,29 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
     const lease: TrainLease | null = meta.lease ?? null;
-    if (!lease || lease.holder !== actor) throw new Error(`train events require the lane lease — held by ${lease?.holder ?? "nobody"}, you are ${actor}`);
+    // BR#5385 mid-walk merged receipt — ONLY for kind=merged on an UNHELD
+    // lane (a live holder still refuses; that lane is owned). A merge is an
+    // already-done GitHub fact, not a lane write: when the ledger proves the
+    // lease was lost MID-WALK (within the TTL) to this same authenticated
+    // identity, the receipt is admitted instead of destroying the landing's
+    // provenance (the 2026-11-01 11:18Z incident). Everything else fails
+    // closed with the original gate error.
+    let midWalk: LeaseLossTransition | null = null;
+    if (!lease || lease.holder !== actor) {
+      const relaxable =
+        kind === "merged" &&
+        !lease &&
+        !(meta.currently && Number(meta.currently.pr) !== Number(body.pr ?? -1));
+      if (!relaxable) throw new Error(`train events require the lane lease — held by ${lease?.holder ?? "nobody"}, you are ${actor}`);
+      const loss = this.lastLaneLeaseLoss(lane.id);
+      const midWalkDecided = midWalkReceiptDecide(loss, actor, now);
+      if (midWalkDecided.ok === false)
+        throw new Error(
+          `train events require the lane lease — held by ${lease?.holder ?? "nobody"}, you are ${actor}` +
+            ` (mid-walk receipt, BR#5385: ${midWalkDecided.reason})`,
+        );
+      midWalk = loss!;
+    }
     const pr = Number(body.pr ?? 0) || null;
     const headSha = body.head_sha ? String(body.head_sha) : null;
     const mergeSha = body.merge_sha ? String(body.merge_sha) : null;
@@ -8245,13 +8299,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // sees the PR MERGED, train.rs:848).
       if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}) }, chain.task_id);
+      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}), ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) }, chain.task_id);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
         : burstSettling
           ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — burst pass settled (${burstMerged} merged), awaiting main CI on the final merge`
           : `PR #${pr} merged as ${mergeSha.slice(0, 9)} — merging burst (${burstMerged} merged, cap ${burstCap === 0 ? "unlimited" : burstCap}), no settle between merges`;
-      this.version(lane.id, actor, `train:${kind}`, laneNote, { currently: meta.currently, reason });
+      this.version(lane.id, actor, `train:${kind}`, laneNote + (midWalk ? ` — lease lost mid-walk (${midWalk.action}), receipt admitted by the mid-walk law (BR#5385)` : ""), { currently: meta.currently, reason });
       return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, reason };
     }
 

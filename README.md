@@ -831,6 +831,23 @@ releases the lease. Lease renewals carry proof-of-progress (last ledger action +
 and the hub consumes it (BR#4129): a holder whose action note freezes while cards queue
 is evicted — see the lease law below.
 
+**A merged receipt survives a mid-walk lease loss (BR#5385)**: the 2026-11-01 11:18Z
+incident ran two walkers per lane (the hand-installed daemon units + the gateway's
+in-process train leg) under ONE actor — one gateway token — so the CAS read every
+peer release as "already mine"; the raced merge released the lease mid-walk and the
+winner's `merged` event died at the gate ("held by nobody"), a real landing lost its
+provenance, and the lane ping-ponged. A merged event is a receipt of an already-done
+GitHub fact, not a lane write: when the lane is UNHELD and the ledger proves the
+lease was lost within the TTL (a release / lapse sweep / zombie eviction) to the
+same authenticated identity, the hub admits the receipt (`mid_walk_receipt` rides
+the event detail and the lane version), stamps provenance, and the settle proceeds —
+the batch is not aborted. Everything else fails closed with the original gate error:
+a live holder, an actor that never held the lease, or a loss older than the TTL.
+GitHub truth still guards the stamp: the BR#5151 dedupe refuses a different
+merge_sha for an already-merged PR, and the executor's live PR-state re-read
+re-stamps any contradiction (the hub holds no VCS credentials — the executor is the
+only GitHub-talking leg).
+
 **Capability honesty (BR#4489, ADR BR#4487)**: a gateway that cannot merge does not
 pretend to serve the lane. `bridge doctor` classifies the host (`gh api user` against
 `MERGE_TRAIN_WORKER_IDENTITIES`) and checks push permission on the lane repos; an
