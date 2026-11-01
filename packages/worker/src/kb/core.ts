@@ -2253,6 +2253,25 @@ export function resolveTrainBounceKind(input: {
  *  defect. The prior brief rendered EVERY bounce as "conflicts with its base
  *  … (no file list supplied)", which sent impl hunting for conflicts that
  *  were never there. */
+/** BR#5349 (Ray directive 2026-11-01): the base-red gate-bounce class — the
+ *  PR is mechanically clean (mergeable, signed) and its RED is MAIN's own,
+ *  not the PR's. Two shapes name it: the executor's head-check defect where
+ *  a red name is the circular deploy-health gate (DEPLOY_HEALTH_PATTERN —
+ *  the check exists to judge main), and any defect that names main red
+ *  directly. Telling impl "rebase / re-sign / re-approve" for this class is
+ *  the BR#5193 circular-park waste (verify sessions re-prove clean PRs while
+ *  main stays red). Returns the red check names the defect carries (possibly
+ *  empty), or null when the bounce is genuinely the PR's to fix. */
+export function trainBaseRedDefect(defect: string | null | undefined): string[] | null {
+  const d = String(defect ?? "");
+  if (!d) return null;
+  const names = (d.match(/head check RED: ([^.;]+)/i)?.[1] ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  if (names.some((n) => n.toLowerCase().includes(DEPLOY_HEALTH_PATTERN))) return names;
+  if (/\bmain\b[^.;]{0,60}\bRED\b/i.test(d) || /\bbase[-_ ]?red\b/i.test(d)) return names;
+  return null;
+}
+
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
@@ -2265,6 +2284,11 @@ export function trainBounceBrief(input: {
   mergeStateStatus?: string | null;
   /** the gate's defect text (the train_event's reason) */
   defect?: string | null;
+  /** BR#5349: the lane's active fix-forward card (OPEN task tagged
+   *  hotfix+main-red in the lane's project) — named by the base-red plain
+   *  brief so impl knows WHERE the cure lives instead of re-proving a clean
+   *  PR. Absent → the brief says so honestly. */
+  fixCard?: { id: string; url?: string; title?: string; status?: string } | null;
 }): string {
   const kind = resolveTrainBounceKind(input);
   const at = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
@@ -2280,6 +2304,23 @@ export function trainBounceBrief(input: {
   }
   if (kind === "gate") {
     const defect = (input.defect ?? "").trim();
+    // BR#5349: base-red class — the PR is fine, MAIN is red. Plain words,
+    // zero jargon (Ray: "loud and clear and direct with no jargon") — never
+    // the mechanical rebase/re-sign loop on a clean PR.
+    const baseRed = trainBaseRedDefect(defect);
+    if (baseRed) {
+      const names = baseRed.join(", ") || "the required checks";
+      const fix = input.fixCard
+        ? `${input.fixCard.id}${input.fixCard.status === "in_progress" ? " (in progress)" : input.fixCard.status === "in_review" ? " (in review)" : input.fixCard.status === "todo" ? " (not started)" : input.fixCard.status === "blocked" ? " (parked)" : ""}`
+        : "the base-fix card (none open yet — the episode's MERGE TRAIN BLOCKED ask names the cure)";
+      return [
+        `Merge-train bounce (base-red): PR #${input.prNumber} (${input.repo}) is mechanically clean${at} — MAIN is red (${names}), and this PR's merge-gate red inherits it.`,
+        ``,
+        `**Your PR is fine — nothing to do on this PR.** It is held until main clears: the fix lives on ${fix} · or re-run the flaky check · or bypass-merge a cure PR.`,
+        ``,
+        `Once main is green the train re-queues this PR at the back${verdict} and a fresh verify accepts it (BR#3516 §5).`,
+      ].join("\n");
+    }
     return [
       `Merge-train bounce (gate): PR #${input.prNumber} (${input.repo}) failed the mechanical merge gate${at}.${input.mergeStateStatus ? ` mergeStateStatus=${String(input.mergeStateStatus).toUpperCase()}.` : ""}`,
       ``,

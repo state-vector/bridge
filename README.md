@@ -685,6 +685,26 @@ every tick. Two laws now hold:
   freshness-guarded (<15m, executor refreshes every tick) so a dead daemon's stale
   stamp can never pin a false BLOCKED; a stale or green stamp falls back to the
   normal lane vocabulary.
+- **The resolution rides the lane, not the weeds (BR#5349, Ray directive 2026-11-01
+  ~07:55Z — "THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED TO DO — loud and clear and
+  direct with no jargon")**: while a non-green base holds cars, `train.status` serves
+  a `base_red_resolution` block per lane — `whats_broken` (the red checks + run URLs,
+  from the walk's base_state), `held` (queue depth), `ask` (the episode's OPEN alarm
+  ask verbatim: id, canonical url, question, options) and `fix_card` (the OPEN task
+  tagged hotfix+main-red in the lane card's project — the active fix-forward card).
+  The trains panel renders it as a red banner PINNED to the very top of the panel,
+  above the lane table, in plain words only — `⛔ Merge train STOPPED — main's checks
+  are failing on <repo> · N PRs held`, `BROKEN: <checks with run links>`,
+  `WHAT FIXES IT: <fix card, plain status> · or re-run a flaky check · or you
+  bypass-merge a fix PR`, `WHAT WE NEED FROM YOU: answer the ask (→ BR#…) — one
+  click` — no "gate", no "verdict", no admission-class vocabulary, and it disappears
+  by itself the moment base_state goes green. And the base-red bounce/park brief
+  speaks the same plain language: a gate bounce whose red is MAIN's own (the circular
+  deploy-health class, or a defect naming main red) tells impl `your PR is fine —
+  MAIN is red (<names>); held until it clears; fix lives on <fix card>; nothing to do
+  on this PR` (`trainBaseRedDefect` + the base-red branch of `trainBounceBrief`) —
+  never the mechanical rebase/re-sign/re-approve loop that made verify sessions
+  re-prove clean PRs while main stayed red (the BR#5193 circular-park class).
 
 ### The root-fix fast lane (BR#5190, steering BR#5189)
 

@@ -237,6 +237,19 @@ export interface KbTrainLane {
       unsettled?: string[];
     };
   } | null;
+  /** BR#5349 (Ray directive: "THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED
+   *  TO DO — loud and clear, no jargon"): served while a non-green base
+   *  holds cars — what's broken (red names + run URLs), how many PRs are
+   *  held, the episode's OPEN alarm ask (one click to answer), and the
+   *  active fix-forward card. Freshness-guarded hub-side (<15m); absent
+   *  the moment base_state goes green. */
+  base_red_resolution?: {
+    verdict: "red" | "unsettled" | "empty" | string;
+    whats_broken: { name: string; url?: string }[];
+    held: number;
+    ask: { id: string; url: string; question: string; options: string[] } | null;
+    fix_card: { id: string; url: string; title: string; status: string } | null;
+  };
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;

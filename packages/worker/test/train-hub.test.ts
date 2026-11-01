@@ -2051,6 +2051,61 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-br" });
   });
 
+  it("BR#5349: a non-green base holding cars serves base_red_resolution on train.status — whats_broken + held + the episode's OPEN alarm ask (id/url/question/options verbatim) + the lane's OPEN hotfix+main-red fix card; green drops the block (the banner's own off-switch)", async () => {
+    const repo = "state-vector/lane-brr";
+    await acquire(repo, "gw-brr", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 53491, head: "c".repeat(40), title: "IMPL: brr drill 1" });
+    const c2 = await queueViaAccept({ repo, pr: 53492, head: "d".repeat(40), title: "IMPL: brr drill 2" });
+
+    // RED base holding 2 cars — the walk stamp (which also files the
+    // ONE-per-episode alarm ask, BR#5265) is the resolution's data source
+    const r = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-brr",
+      entries: [ { id: c1, pr: 53491, cls: "waiting" }, { id: c2, pr: 53492, cls: "waiting" } ],
+      base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "Test", url: "https://example.test/5349" }], unsettled: [] },
+    });
+    expect(r.body.error ?? "").toBe("");
+
+    // the RESOLUTION rides the lane snapshot, plain and complete
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    const brr = lane.base_red_resolution;
+    expect(brr).toBeTruthy();
+    expect(brr.verdict).toBe("red");
+    expect(brr.whats_broken).toEqual([{ name: "Test", url: "https://example.test/5349" }]);
+    expect(brr.held).toBe(2);
+    // the episode's OPEN alarm ask — verbatim id / canonical url / question / options
+    const ask = (await kbJson("/search", { q: "MERGE TRAIN BLOCKED", type: "question", limit: 50 })).body.artefacts
+      .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
+    expect(ask).toBeTruthy();
+    expect(brr.ask.id).toBe(ask.id);
+    expect(brr.ask.url).toBe(`https://hub.fleetbridge.run/card/${String(ask.id).replace("#", "-")}`);
+    expect(brr.ask.question).toBe(ask.title);
+    expect(brr.ask.options).toEqual(["Fixing forward — hold the line", "Bypass-merge a cure PR (I'll reply with the number)"]);
+    // no fix card yet → null, never a lie
+    expect(brr.fix_card).toBeNull();
+
+    // an OPEN hotfix+main-red task in the LANE CARD's project becomes the fix card
+    const laneProject = String((await kbJson("/get", { id: lane.card })).body.project ?? "");
+    expect(laneProject).not.toBe("");
+    const fix = await kbJson("/create", { type: "task", title: "HOTFIX P0: fix main red (brr drill)", tags: ["hotfix", "main-red", "p0"], project: laneProject, body_md: "drill fix card" });
+    expect(fix.status).toBe(200);
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane2.base_red_resolution.fix_card).toBeTruthy();
+    expect(lane2.base_red_resolution.fix_card.id).toBe(fix.body.id);
+    expect(lane2.base_red_resolution.fix_card.status).toBe("todo");
+    expect(lane2.base_red_resolution.fix_card.url).toBe(`https://hub.fleetbridge.run/card/${String(fix.body.id).replace("#", "-")}`);
+
+    // GREEN base: the block disappears by itself — the banner never lingers
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-brr",
+      entries: [ { id: c1, pr: 53491, cls: "ready" }, { id: c2, pr: 53492, cls: "ready" } ],
+      base_state: { verdict: "green", scoped_to_required: true, red: [], unsettled: [] },
+    });
+    const lane3 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane3.base_red_resolution ?? null).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brr" });
+  });
+
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
     const repo = "state-vector/lane-legacy-renew";
     await acquire(repo, "gw-leg", { merge_capable: true });
