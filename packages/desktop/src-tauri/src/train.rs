@@ -206,6 +206,26 @@ struct Ctx {
     last_action: String,
     /// When `last_action` happened (ms epoch).
     last_action_ms: u64,
+    // ---- BR#5376: the batch-stall tracker + merge-method fallback ----
+    /// Per-lane (`repo@base`) batch-stall state: a batch that selects
+    /// members and attempts merges but lands NOTHING, consecutive ticks.
+    /// At the threshold the walk fires ONE "stalled" train event per
+    /// episode; the hub renders the loud STALLED lane and files the
+    /// one-per-episode alarm ask (the same dedupe law as base-red).
+    stall: std::collections::HashMap<String, BatchStall>,
+    /// Per-repo merge method discovered by the BR#5376 fallback (the repo
+    /// refuses the configured method — GitHub enforces its merge policy at
+    /// the mutation even when REST still reads the flag true). Remembered
+    /// for the process so a batch lands back-to-back without one wasted
+    /// refusal per member.
+    method_sub: std::collections::HashMap<String, String>,
+    /// Per-tick scratch (drive_lane resets, drive_lane_inner fills,
+    /// stall_settle reads): the batch this tick selected, whether a merge
+    /// attempt ran, how many members landed, the error that ended the tick.
+    tick_batch: Vec<i64>,
+    tick_attempted: bool,
+    tick_landed: u32,
+    tick_error: Option<String>,
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -284,6 +304,12 @@ impl Ctx {
             base_probe: true,
             last_action: "executor started".into(),
             last_action_ms: now_ms(),
+            stall: std::collections::HashMap::new(),
+            method_sub: std::collections::HashMap::new(),
+            tick_batch: Vec::new(),
+            tick_attempted: false,
+            tick_landed: 0,
+            tick_error: None,
         })
     }
 
@@ -720,6 +746,88 @@ fn release_if_idle(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Result<(
     Ok(())
 }
 
+/// BR#5376 method fallback: the repo refused a merge METHOD — retry the
+/// remaining allowed methods (squash first), loud, and land the member.
+/// The working method is remembered per-repo for the process so the batch's
+/// next members go straight to it (no wasted refusal per member).
+fn method_fallback_merge(ctx: &mut Ctx, key: &str, repo: &str, pr: i64, refused_err: &str) -> Result<(), String> {
+    let configured = ctx.method.clone();
+    let candidates = merge_fallback_candidates(&configured, refused_merge_method(refused_err), true);
+    let mut last: Option<String> = None;
+    for m in candidates {
+        match ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag_for(&m)]) {
+            Ok(_) => {
+                ctx.note(&format!(
+                    "merge-method fallback: repo refuses {} — landed PR #{pr} as {} (if unintended, check the repo/org merge-commit policy)",
+                    configured, m
+                ));
+                log(Some(key), &format!("BR#5376 method fallback: {} refused → PR #{pr} landed via {}", configured, m));
+                ctx.method_sub.insert(repo.to_string(), m);
+                return Ok(());
+            }
+            Err(e) => {
+                log(Some(key), &format!("method fallback {} refused PR #{pr}: {}", m, trunc(&e, 160)));
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "no merge method left to try".into()))
+}
+
+/// BR#5376: per-tick stall bookkeeping, called from `drive_lane` after the
+/// inner walk returns (Ok or Err) with the tick's landing truth. Pure-state
+/// update; the EVENT itself fires on the next walk under the lease
+/// (`stall_fire_check` at the queue_facts stamp) — the lease is guaranteed
+/// there, which the event handler requires.
+fn stall_settle(ctx: &mut Ctx, key: &str) {
+    let batch = std::mem::take(&mut ctx.tick_batch);
+    let attempted = ctx.tick_attempted;
+    let landed = ctx.tick_landed;
+    let err = ctx.tick_error.clone().unwrap_or_default();
+    let (next, _fire) = stall_next(ctx.stall.get(key), &batch, attempted, landed, &err, now_ms(), stall_alarm_ticks());
+    match next {
+        Some(st) => {
+            log(
+                Some(key),
+                &format!(
+                    "batch stall: {} member(s) selected, 0 landed, {} tick(s) this episode{}",
+                    st.members.len(),
+                    st.ticks,
+                    if st.fired { " — alarm fired" } else { "" }
+                ),
+            );
+            ctx.stall.insert(key.to_string(), st);
+        }
+        None => {
+            if ctx.stall.remove(key).is_some() {
+                log(Some(key), "stall episode cleared — the batch landed (or the lane stopped attempting)");
+            }
+        }
+    }
+}
+
+/// BR#5376: fires the ONE-per-episode stalled event, under the walk's lease
+/// (called right after the queue_facts stamp, before phase C), when the
+/// tracker crossed the threshold on a previous settle. Returns the event
+/// payload and marks the episode fired.
+fn stall_fire_check(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Option<Value> {
+    let threshold = stall_alarm_ticks();
+    let st = ctx.stall.get_mut(key)?;
+    if st.fired || st.ticks < threshold {
+        return None;
+    }
+    st.fired = true;
+    Some(json!({
+        "repo": repo, "base": base, "kind": "stalled",
+        "pr": 0,
+        "batch_members": st.members,
+        "ticks": st.ticks,
+        "since": st.since_ms,
+        "last_error": st.last_error,
+        "reason": format!("selected {} PR(s) to merge, landed 0 across {} tick(s) — likely executor breakage; restart the gateway onto the current build", st.members.len(), st.ticks),
+    }))
+}
+
 /// BR#4977: is the lane's base branch gone from the remote? A 404 /
 /// not-found from `gh api repos/<repo>/branches/<base>` is definitive (the
 /// branch was deleted — the lane can never advance again); every other
@@ -741,6 +849,134 @@ fn base_missing_on_remote(ctx: &Ctx, repo: &str, base: &str) -> bool {
 fn not_found_err(e: &str) -> bool {
     let low = e.to_lowercase();
     low.contains("404") || low.contains("not found")
+}
+
+/// BR#5376 (hotfix P0, Ray directive 2026-11-01: "im still not convinced that
+/// sp main is running… just says 'checking' — which doesnt take that long").
+/// The receipt: state-vector/superpositional@main selected batches every
+/// tick, attempted `gh pr merge --merge` every tick, and GitHub refused EVERY
+/// attempt ("GraphQL: Merge commits are not allowed on this repository") from
+/// 2026-10-30T11:30:23Z onward — 945+ consecutive attempts, logged to the
+/// executor's local log only, ZERO hub events, while the lane read fake-busy
+/// "checking review, signatures and CI" for days. Two laws close the class:
+///
+/// 1. LOUD STALL (this tracker): a batch that selects members and attempts
+///    merges but lands NOTHING for `STALL_ALARM_TICKS` consecutive ticks
+///    fires ONE "stalled" train event per episode — the hub renders the
+///    STALLED lane/banner and files the one-per-episode alarm ask (the same
+///    dedupe law as base-red, BR#5265).
+/// 2. METHOD FALLBACK (`is_merge_method_refusal` + `method_fallback_merge`):
+///    a merge-method refusal is a REPO POLICY mismatch, not a PR defect —
+///    fall back to an allowed method (squash first, the standing sp law,
+///    Ray 2026-10-30) and land the member instead of failing the tick.
+const STALL_ALARM_TICKS_DEFAULT: u32 = 3;
+
+/// Env override (`MERGE_TRAIN_STALL_TICKS`) for ops; clamped to ≥2 — a
+/// single transient gh blip must never page a human.
+fn stall_alarm_ticks() -> u32 {
+    std::env::var("MERGE_TRAIN_STALL_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.max(2))
+        .unwrap_or(STALL_ALARM_TICKS_DEFAULT)
+}
+
+/// One lane's batch-stall episode state.
+#[derive(Clone, Debug, PartialEq)]
+struct BatchStall {
+    /// Consecutive land-0 ticks (batch non-empty + a merge attempt ran +
+    /// nothing landed).
+    ticks: u32,
+    /// Episode start (ms epoch) — the display's "none landed in Xm".
+    since_ms: u64,
+    /// The batch members (landing order) as of the last land-0 tick.
+    members: Vec<i64>,
+    /// The error that ended the last land-0 tick (truncated) — the display
+    /// says WHY, never a bare "stalled".
+    last_error: String,
+    /// true once the threshold event fired for THIS episode; resets only
+    /// when the episode clears (any landing / a land-0-free tick).
+    fired: bool,
+}
+
+/// The stall counter's transition law, pure for the fixture. Called once per
+/// lane per tick (after the walk's landing leg settled, Ok or Err). A tick
+/// counts as STALLED only when a batch was selected, a merge attempt ran,
+/// and NOTHING landed — a lane that never attempts is idle, not stalled, and
+/// any landing resets the episode (progress is the anti-alarm).
+/// Returns the next state (None = no active episode) and whether the
+/// threshold event should fire this tick.
+fn stall_next(
+    prev: Option<&BatchStall>,
+    batch: &[i64],
+    attempted: bool,
+    landed: u32,
+    last_error: &str,
+    now_ms: u64,
+    threshold: u32,
+) -> (Option<BatchStall>, bool) {
+    if batch.is_empty() || !attempted || landed > 0 {
+        return (None, false);
+    }
+    let (ticks, since_ms, was_fired) = match prev {
+        Some(p) => (p.ticks.saturating_add(1), p.since_ms, p.fired),
+        None => (1, now_ms, false),
+    };
+    let fire = ticks >= threshold && !was_fired;
+    (
+        Some(BatchStall {
+            ticks,
+            since_ms,
+            members: batch.to_vec(),
+            last_error: trunc(last_error, 200),
+            fired: was_fired || fire,
+        }),
+        fire,
+    )
+}
+
+/// BR#5376: does this gh refusal name a MERGE METHOD the repo disallows?
+/// GitHub's mergePullRequest answers "Merge commits are not allowed on this
+/// repository." (squash/rebase variants exist) — that phrase is specific to
+/// the merge-method policy; every other refusal is NOT a method mismatch.
+fn is_merge_method_refusal(err: &str) -> bool {
+    err.to_lowercase().contains("not allowed on this repository")
+}
+
+/// Which merge method did the refusal name? (Drives the fallback's skip.)
+fn refused_merge_method(err: &str) -> Option<&'static str> {
+    let low = err.to_lowercase();
+    if low.contains("merge commit") {
+        Some("merge")
+    } else if low.contains("squash") {
+        Some("squash")
+    } else if low.contains("rebase") {
+        Some("rebase")
+    } else {
+        None
+    }
+}
+
+/// The fallback's method order: squash FIRST (the standing sp landing shape,
+/// Ray 2026-10-30: "if it's still mergeable, go (squash merges)"), rebase
+/// second, merge last. The just-refused method is skipped; the configured
+/// method is skipped when the PRIMARY attempt itself was the refusal (it
+/// already failed once — a second refused attempt is one wasted call).
+fn merge_fallback_candidates(configured: &str, refused: Option<&str>, primary_refused: bool) -> Vec<String> {
+    ["squash", "rebase", "merge"]
+        .iter()
+        .map(|m| m.to_string())
+        .filter(|m| Some(m.as_str()) != refused)
+        .filter(|m| !(primary_refused && m.as_str() == configured))
+        .collect()
+}
+
+fn method_flag_for(m: &str) -> &'static str {
+    match m {
+        "squash" => "--squash",
+        "rebase" => "--rebase",
+        _ => "--merge",
+    }
 }
 
 /// BR#5252 — the merge-refusal fallback's decision law, pure so the fixture
@@ -828,7 +1064,21 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     };
     log(Some(&key), &format!("lease: {} (holder={})", vstr(&lease, "note").unwrap_or("acquired"), ctx.holder));
 
-    if let Err(e) = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap) {
+    // BR#5376: per-tick scratch reset — the inner walk fills, stall_settle
+    // reads after it returns (Ok or Err).
+    ctx.tick_batch.clear();
+    ctx.tick_attempted = false;
+    ctx.tick_landed = 0;
+    ctx.tick_error = None;
+    let result = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap);
+    // BR#5376: the tick's landing truth feeds the stall tracker BEFORE the
+    // error path releases the lease. Pure state here; the EVENT fires on the
+    // next walk under the lease (stall_fire_check at the queue_facts stamp).
+    if let Err(e) = &result {
+        ctx.tick_error = Some(e.clone());
+    }
+    stall_settle(ctx, &key);
+    if let Err(e) = result {
         // BR#4489: a permission refusal mid-merge demotes the host for the
         // process lifetime — startup truth was runtime falsehood; fail closed.
         let low = e.to_lowercase();
@@ -1419,7 +1669,31 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // carries base_state (Fix A): the hub renders the lane BLOCKED with
     // the base red names + files the one-per-episode human alarm ask.
     if !queue.is_empty() {
-        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }));
+        // BR#5376: an ACTIVE stall episode rides the stamp — the hub renders
+        // the loud STALLED lane/banner off it (freshness-guarded, same law as
+        // base_state); the next stamp after a landing omits it, which clears
+        // the state by itself.
+        let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state });
+        if let Some(st) = ctx.stall.get(key) {
+            qf.as_object_mut().unwrap().insert(
+                "stalled".into(),
+                json!({
+                    "batch": st.members,
+                    "ticks": st.ticks,
+                    "since": st.since_ms,
+                    "for_ms": now_ms().saturating_sub(st.since_ms),
+                    "last_error": st.last_error,
+                }),
+            );
+        }
+        let _ = ctx.mcp("train_queue_facts", qf);
+        // BR#5376: the ONE-per-episode stall alarm — fired under the walk's
+        // lease (the handler requires it), only when a previous settle
+        // crossed the threshold. The hub renders the STALLED banner and
+        // files the alarm ask off this event + the stamp above.
+        if let Some(ev) = stall_fire_check(ctx, key, repo, base) {
+            ctx.mcp("train_event", ev)?;
+        }
     }
 
 
@@ -1490,6 +1764,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // carries batch_members — the batch composition in landing order (the
     // hub sanitizes it; do.ts).
     let batch_prs: Vec<i64> = batch.iter().map(|&i| candidates[i].pr).collect();
+    ctx.tick_batch = batch_prs.clone();
     for (bi, &ci) in batch.iter().enumerate() {
         let cand = &candidates[ci];
         let head_id = cand.head_id.as_str();
@@ -1530,7 +1805,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // out-of-date branch get ONE machine update-branch (verdict carries,
         // BR#3516 §5) and the batch's landed prefix settles (BR#4996).
         renew_lease(ctx, repo, base);
-        let method_flag = match ctx.method.as_str() { "squash" => "--squash", "rebase" => "--rebase", _ => "--merge" };
+        // BR#5376: a remembered working method (the repo refused the
+        // configured one earlier) goes straight there — no wasted refusal
+        // per member.
+        let method_flag = match ctx.method_sub.get(repo) {
+            Some(m) => method_flag_for(m),
+            None => method_flag_for(&ctx.method),
+        };
+        ctx.tick_attempted = true;
         if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
             let low = err.to_lowercase();
             if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
@@ -1612,15 +1894,38 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     }
                 }
             }
-            // BR#4996 soft-break: a refused merge mid-batch must not fail the
-            // whole tick — the landed prefix settles, the refused member
-            // waits for the next pass. A fresh pass keeps the loud error.
-            if pass_merged > 0 {
-                log(Some(key), &format!("batch soft-break: gh pr merge refused PR #{pr} mid-batch ({}) — settling the landed prefix of {} merge(s)", trunc(&err, 200), pass_merged));
-                burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                return Ok(());
+            // BR#5376: a merge-METHOD refusal ("Merge commits are not allowed
+            // on this repository.") is a repo-policy mismatch, not a PR
+            // defect — GitHub refuses the mutation even when REST still reads
+            // the flag true (the 2026-10-30 → 11-01 sp outage: 945+ refused
+            // attempts over 5 days, zero hub events). Fall back to an allowed
+            // method (squash first — Ray's 2026-10-30 law) and LAND the
+            // member; the refusal that precedes it is the episode's receipt.
+            if is_merge_method_refusal(&err) {
+                match method_fallback_merge(ctx, key, repo, pr, &err) {
+                    Ok(()) => {
+                        // landed via the fallback — control falls through to
+                        // the post-merge verification below.
+                    }
+                    Err(fb_err) => {
+                        // every allowed method refused — the combined error
+                        // feeds the tick error → the stall tracker → the
+                        // alarm ask. Bouncing would be wrong: the PR is fine,
+                        // the executor's method book is stale.
+                        return Err(format!("{}; merge-method fallback also failed: {}", trunc(&err, 240), trunc(&fb_err, 240)));
+                    }
+                }
+            } else {
+                // BR#4996 soft-break: a refused merge mid-batch must not fail the
+                // whole tick — the landed prefix settles, the refused member
+                // waits for the next pass. A fresh pass keeps the loud error.
+                if pass_merged > 0 {
+                    log(Some(key), &format!("batch soft-break: gh pr merge refused PR #{pr} mid-batch ({}) — settling the landed prefix of {} merge(s)", trunc(&err, 200), pass_merged));
+                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                    return Ok(());
+                }
+                return Err(err);
             }
-            return Err(err);
         }
         let merged = ctx.pr_facts(repo, pr)?;
         let merge_sha = merged.pointer("/mergeCommit/oid").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1636,6 +1941,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // settle feed (the hub flips bursting → awaiting-ci on the first
         // settle poll, not here).
         pass_merged = pass_merged.saturating_add(1);
+        ctx.tick_landed += 1;
         // BR#5190: the event carries root_fix so the hub knows the
         // lane was cured by this landing (settle copy + fast receipt).
         let mut merged_ev = json!({
@@ -2405,6 +2711,12 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         base_probe: true,
         last_action: "gateway leg tick".into(),
         last_action_ms: now_ms(),
+        stall: std::collections::HashMap::new(),
+        method_sub: std::collections::HashMap::new(),
+        tick_batch: Vec::new(),
+        tick_attempted: false,
+        tick_landed: 0,
+        tick_error: None,
     })
 }
 
@@ -2803,6 +3115,103 @@ mod tests {
     use std::io::{Read, Write as IoWrite};
     use std::sync::Mutex;
 
+    // ---- BR#5376: the batch-stall tracker + merge-method fallback laws ----
+
+    const T0: u64 = 1_790_000_000_000;
+
+    fn stall(threshold: u32) -> (Vec<i64>, bool, u32) {
+        (vec![2679, 2676, 2432], true, threshold)
+    }
+
+    #[test]
+    fn stall_never_starts_without_an_attempt_or_a_batch_br5376() {
+        let (batch, attempted, th) = stall(3);
+        // no batch → idle, never stalled
+        assert_eq!(stall_next(None, &[], attempted, 0, "", T0, th).0, None);
+        // batch but no attempt (identity gate, pre-merge skip) → not a stall
+        assert_eq!(stall_next(None, &batch, false, 0, "", T0, th).0, None);
+        // any landing resets (or never starts) the episode — progress is the
+        // anti-alarm
+        let (next, fire) = stall_next(None, &batch, attempted, 1, "", T0, th);
+        assert_eq!(next, None);
+        assert!(!fire);
+    }
+
+    #[test]
+    fn stall_accumulates_and_fires_exactly_once_per_episode_br5376() {
+        let (batch, attempted, th) = stall(3);
+        let (s1, f1) = stall_next(None, &batch, attempted, 0, "refused: not allowed", T0, th);
+        let s1 = s1.unwrap();
+        assert!(!f1);
+        assert_eq!(s1.ticks, 1);
+        assert_eq!(s1.since_ms, T0);
+        assert_eq!(s1.last_error, "refused: not allowed");
+        let (s2, f2) = stall_next(Some(&s1), &batch, attempted, 0, "refused: not allowed", T0 + 45_000, th);
+        let s2 = s2.unwrap();
+        assert!(!f2);
+        assert_eq!(s2.ticks, 2);
+        assert_eq!(s2.since_ms, T0, "episode start never re-inits");
+        let (s3, f3) = stall_next(Some(&s2), &batch, attempted, 0, "refused: not allowed", T0 + 90_000, th);
+        let s3 = s3.unwrap();
+        assert!(f3, "threshold crossing fires");
+        assert!(s3.fired, "the episode remembers its own alarm");
+        // a REPEAT crossing never re-fires — one event per episode
+        let (_s4, f4) = stall_next(Some(&s3), &batch, attempted, 0, "refused: not allowed", T0 + 135_000, th);
+        assert!(!f4);
+    }
+
+    #[test]
+    fn stall_resets_the_moment_anything_lands_br5376() {
+        let (batch, attempted, th) = stall(3);
+        let (s1, _) = stall_next(None, &batch, attempted, 0, "e", T0, th);
+        let s1 = s1.unwrap();
+        let (s2, f2) = stall_next(Some(&s1), &batch, attempted, 2, "e", T0 + 45_000, th);
+        assert_eq!(s2, None, "a landed prefix settles the episode");
+        assert!(!f2);
+    }
+
+    #[test]
+    fn merge_method_refusal_matches_githubs_exact_class_br5376() {
+        // the 2026-10-30 → 11-01 sp outage text, verbatim from the executor log
+        assert!(is_merge_method_refusal("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"));
+        assert!(is_merge_method_refusal("Squash merges are not allowed on this repository."));
+        assert!(is_merge_method_refusal("Rebase merges are not allowed on this repository."));
+        // a PR defect or a permission refusal is NOT a method mismatch
+        assert!(!is_merge_method_refusal("gh: permission denied"));
+        assert!(!is_merge_method_refusal("Pull request is not up to date"));
+        assert!(!is_merge_method_refusal(""));
+    }
+
+    #[test]
+    fn refused_method_parse_and_fallback_order_br5376() {
+        assert_eq!(refused_merge_method("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"), Some("merge"));
+        assert_eq!(refused_merge_method("Squash merges are not allowed on this repository."), Some("squash"));
+        assert_eq!(refused_merge_method("gh: something else"), None);
+        // sp class: configured merge refused → squash first (Ray's law), then rebase
+        assert_eq!(
+            merge_fallback_candidates("merge", Some("merge"), true),
+            vec!["squash".to_string(), "rebase".to_string()]
+        );
+        // a squash-configured lane refused squash → rebase, then merge
+        assert_eq!(
+            merge_fallback_candidates("squash", Some("squash"), true),
+            vec!["rebase".to_string(), "merge".to_string()]
+        );
+        // the just-refused method never re-tries even when the primary
+        // refusal came from a remembered sub-method
+        assert_eq!(
+            merge_fallback_candidates("merge", Some("squash"), false),
+            vec!["rebase".to_string(), "merge".to_string()]
+        );
+    }
+
+    #[test]
+    fn method_flag_covers_all_three() {
+        assert_eq!(method_flag_for("squash"), "--squash");
+        assert_eq!(method_flag_for("rebase"), "--rebase");
+        assert_eq!(method_flag_for("merge"), "--merge");
+    }
+
     // ---- pure helpers: the identity law and its plumbing (BR#4104) ----
 
     #[test]
@@ -3008,6 +3417,12 @@ mod tests {
             base_probe: false, // hermetic drills — the base probe shells out to gh
             last_action: "test".into(),
             last_action_ms: now_ms(),
+            stall: std::collections::HashMap::new(),
+            method_sub: std::collections::HashMap::new(),
+            tick_batch: Vec::new(),
+            tick_attempted: false,
+            tick_landed: 0,
+            tick_error: None,
         }
     }
 
@@ -3326,6 +3741,12 @@ mod tests {
                 base_probe: false, // local git-plumbing verdicts only — no gh
                 last_action: String::new(),
                 last_action_ms: now_ms(),
+                stall: std::collections::HashMap::new(),
+                method_sub: std::collections::HashMap::new(),
+                tick_batch: Vec::new(),
+                tick_attempted: false,
+                tick_landed: 0,
+                tick_error: None,
             }
         }
     }

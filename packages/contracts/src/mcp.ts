@@ -172,7 +172,12 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   train_event: z.looseObject({
     repo: z.string(),
-    kind: z.enum(["merged", "bounced", "stopped", "landed"]),
+    // BR#5376 "stalled": the executor's one-per-episode batch-stall alarm —
+    // a batch was selected, merges were attempted, and NOTHING landed for
+    // STALL_ALARM_TICKS consecutive ticks (default 3, env
+    // MERGE_TRAIN_STALL_TICKS). The hub renders the STALLED lane/banner and
+    // files the one-per-episode alarm ask.
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
@@ -194,6 +199,12 @@ export const TOOL_ARG_SCHEMAS = {
       .optional(),
     culprit_task: z.string().optional(),
     checks: z.array(z.looseObject({ name: z.string().optional(), conclusion: z.string().nullish(), html_url: z.string().nullish() })).optional(),
+    // BR#5376 stalled-episode facts (pr is 0 — the alarm names the BATCH, not
+    // one PR; the members ride here).
+    batch_members: z.array(z.number().int()).optional(),
+    ticks: z.number().int().optional(),
+    since: z.number().optional(),
+    last_error: z.string().optional(),
   }),
   train_ci: z.looseObject({
     repo: z.string(),
@@ -254,6 +265,20 @@ export const TOOL_ARG_SCHEMAS = {
       pr: z.number().int().optional(),
       cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]),
     })),
+    // BR#5376: the ACTIVE batch-stall episode, executor-fed (freshness law:
+    // the next stamp after a landing omits it, which clears the state by
+    // itself). batch = the members in landing order; ticks = consecutive
+    // land-0 ticks; since = episode start (ms epoch); for_ms = episode age;
+    // last_error = WHY (the executor's truncated merge refusal).
+    stalled: z
+      .looseObject({
+        batch: z.array(z.number().int()),
+        ticks: z.number().int(),
+        since: z.number(),
+        for_ms: z.number().optional(),
+        last_error: z.string().optional(),
+      })
+      .optional(),
   }),
   // ---- proxy verification probes (BR#4658): the sweep enqueues probes for
   // run_success / pr_checks_green parks it cannot verify itself (the hub

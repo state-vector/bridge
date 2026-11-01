@@ -91,6 +91,20 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
       title: `main is RED${reds ? `: ${reds}` : ` (${bs.verdict})`} — the standing order (never merge onto a non-green destination) holds all ${l.queue.length} queued car(s) until it clears. Fix forward, re-run a transient check, or bypass-merge a cure — the queue then drains automatically.`,
     };
   }
+  // BR#5376: a STALLED batch is LOUD — members were selected, merges were
+  // attempted, and NOTHING landed for K consecutive ticks. Never the
+  // fake-busy "checking" vocabulary that hid the 2026-10-30 refusal loop
+  // (945+ attempts, zero hub events) for days. Freshness-guarded like
+  // base-red (<15m); the next stamp after a landing omits the episode.
+  const stall = l.queue_facts?.stalled;
+  if (stall && l.queue.length > 0 && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
+    const mins = Math.max(1, Math.round((stall.for_ms ?? 0) / 60_000));
+    return {
+      tone: "warn", card: curCard, pr: curPr,
+      label: `⚠ stalled — 0 landed in ${mins}m`,
+      title: `${(stall.batch ?? []).map((p) => "#" + p).join(", ") || "the batch"} was selected to merge and merges were attempted, but nothing landed for ${stall.ticks} consecutive tick(s)${stall.last_error ? ` — last error: ${stall.last_error}` : ""}. Likely executor breakage, not a PR defect — restart the gateway/executor onto the current build.`,
+    };
+  }
   if (l.currently) {
     const settling = l.currently.phase !== "bursting";
     return {
@@ -225,6 +239,53 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
   );
 }
 
+/** BR#5376: the stalled-lane banner, pinned at the top of the trains panel
+ *  right below the blocked banner (Ray's law: the resolution must not be
+ *  buried). Plain words: the batch was selected, merges were attempted, and
+ *  NOTHING landed — the receipt says executor breakage, so the unblock is
+ *  operational (restart the gateway/executor onto the current build), never
+ *  a code change. Amber tone — the train is not stopped, it is pretending
+ *  to work ("checking review, signatures and CI" was the lie that hid the
+ *  2026-10-30 refusal loop for days). The hub serves `stalled_resolution`
+ *  only while a fresh stall episode rides the stamp, so the banner
+ *  disappears the moment anything lands. */
+function StalledBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: string) => void }) {
+  const r = lane.stalled_resolution!;
+  const repo = lane.lane.split("@")[0];
+  const mins = Math.max(1, Math.round(r.for_ms / 60_000));
+  const batch = r.batch.map((p) => `#${p}`).join(", ");
+  return (
+    <div className="train-blocked-banner train-blocked-banner-amber" role="alert">
+      <span className="train-banner-line">
+        {`⚠ Merge train STALLED on ${repo} — ${batch || "the batch"} selected to merge, 0 landed in ${mins}m (${r.ticks} tick${r.ticks === 1 ? "" : "s"})`}
+      </span>
+      <span className="train-banner-line">
+        {"WHY: "}
+        {r.last_error
+          ? <span className="train-banner-mono">{r.last_error}</span>
+          : <span className="train-banner-dim">the executor's last merge error was not stamped</span>}
+      </span>
+      <span className="train-banner-line">
+        {"WHAT FIXES IT: "}
+        <span className="train-banner-dim">{r.unblock} — any landing clears this by itself</span>
+      </span>
+      {r.ask && (
+        <span className="train-banner-line">
+          {"WHAT WE NEED FROM YOU: "}
+          <a
+            className="train-banner-card"
+            href={r.ask.url}
+            title={r.ask.question}
+            onClick={(e) => { if (openTask) { e.preventDefault(); openTask(r.ask!.id); } }}
+          >
+            answer the ask (→ {r.ask.id}) — one click
+          </a>
+        </span>
+      )}
+    </div>
+  );
+}
+
 const REFRESH_MS = 30_000;
 
 /** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
@@ -271,9 +332,14 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         <span className="muted-note">per-lane CAS lock + derived queue · 45s tick, 30s poll</span>
       </div>
       {/* BR#5349: the blocked-lane resolution banners — pinned at the very top,
-          above the lane table (Ray: the resolution must not be buried). */}
+          above the lane table (Ray: the resolution must not be buried).
+          BR#5376: the STALLED banner rides right below them (amber — the
+          lane pretends to work; base-red, when present, owns the story). */}
       {(lanes ?? []).filter((l) => l.base_red_resolution).map((l) => (
         <BlockedBanner key={l.lane} lane={l} openTask={openTask} />
+      ))}
+      {(lanes ?? []).filter((l) => !l.base_red_resolution && l.stalled_resolution).map((l) => (
+        <StalledBanner key={l.lane} lane={l} openTask={openTask} />
       ))}
       {error && <div className="train-lane train-lane-err" title={error}>⚠ train status unavailable — {error.slice(0, 120)}</div>}
       {!error && lanes?.length === 0 && (

@@ -706,6 +706,47 @@ every tick. Two laws now hold:
   never the mechanical rebase/re-sign/re-approve loop that made verify sessions
   re-prove clean PRs while main stayed red (the BR#5193 circular-park class).
 
+### Stalled is loud + the merge-method fallback (BR#5376)
+
+The base-red gate above guards the base. BR#5376 closes the OTHER silent-failure
+class — the executor itself breaking while the lane pretends to work. The 2026-10-30
+receipt: `state-vector/superpositional@main` selected batches every tick, attempted
+`gh pr merge --merge` every tick, and GitHub refused EVERY attempt
+(`GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)`)
+from 11:30:23Z onward — 945+ consecutive attempts, logged to the executor's LOCAL log
+only, ZERO hub events, no ledger row, no ask — while the lane read the fake-busy
+`working on <head> — checking review, signatures and CI before merging` for days and
+main landed nothing. Two laws close the class:
+
+- **Loud stall**: a batch that selects members and ATTEMPTS merges but lands NOTHING
+  for `MERGE_TRAIN_STALL_TICKS` consecutive ticks (default 3, env-clamped to ≥2 so a
+  single transient gh blip never pages a human) is a STALL EPISODE: the walk's
+  `queue_facts` stamp carries `stalled: {batch, ticks, since, for_ms, last_error}`
+  (freshness-guarded <15m and omitted the moment anything lands — the state clears
+  by itself), the executor fires ONE `train.event kind:"stalled"` per episode under
+  the lane lease (a ledger row, deduped by the episode's `since`), and the hub files
+  the ONE-per-episode time-sensitive alarm ask `MERGE TRAIN STALLED: <repo>@<base> —
+  PRs selected to merge are not landing. Restart the executor?` to the alarm sink —
+  the title carries NO changing numbers (no tick counts, no ages) so the
+  identical-open-ask guard dedupes the per-tick repeats. The lane card reads
+  `merge-train: STALLED — #N, #M selected to merge, 0 landed in Xm (K tick(s)) —
+  last error: <the executor's raw gh refusal> — likely executor breakage; restart
+  the gateway onto the current build` (lane reason + panel status pill, amber) —
+  never the fake-busy checking vocabulary — and `train.status` serves a
+  `stalled_resolution` block (batch / ticks / for_ms / last_error / the episode's
+  OPEN alarm ask verbatim / the unblock) that the trains panel renders as an AMBER
+  banner pinned directly below the red blocked banner, suppressed while base-red
+  owns the lane, and gone the moment anything lands. A tick that never attempts
+  (empty batch, no merge leg) is idle, not stalled; any landing resets the episode.
+- **Merge-method fallback**: a merge-method refusal (`…not allowed on this
+  repository`) is a REPO POLICY mismatch, never a PR defect — the executor retries
+  the refused member with an allowed method, SQUASH first (the standing
+  superpositional landing shape — sp main's history is all squash), then rebase,
+  then merge, and remembers the working method per repo for the process lifetime
+  so a policy mismatch lands the member instead of looping 945 times. A fallback
+  success still rides the full merged-event path (provenance stamp, awaiting-CI
+  settle) — nothing is waved through.
+
 ### The root-fix fast lane (BR#5190, steering BR#5189)
 
 A stop-the-line episode now spawns its own cure, and the cure jumps every queue.

@@ -107,6 +107,7 @@ import {
   trainRequeueSwap,
   trainStopAskTitle,
   trainBaseRedAskTitle,
+  trainStallAskTitle,
   trainBaseRedDefect,
   trainLandedCloseNote,
   trainLandedCloseEdge,
@@ -7778,6 +7779,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const baseBlock: any = bsQf?.base_state && String(bsQf.base_state?.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
       ? bsQf.base_state
       : null;
+    // BR#5376: the walk's batch-stall episode stamp (executor-fed via
+    // train.queue_facts) — truthy only when fresh (<15m; the executor
+    // refreshes every tick and OMITS it the moment a landing clears the
+    // episode) so a dead daemon's stale stamp can never pin a false STALLED.
+    const stalledBlock: any = bsQf?.stalled && now - Number(bsQf.at ?? 0) < 15 * 60_000
+      ? bsQf.stalled
+      : null;
     // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
     // the lane's activity line speaks human. The hub knows the head card's
     // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
@@ -7835,6 +7843,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       reason = String(bs.verdict) === "red" && redNames.length
         ? `merge-train: BLOCKED — base main RED: ${redNames.join(", ")} — ${queue.length} car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks the whole queue`
         : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? "carries none of the lane's required workflow runs (config?)" : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
+    }
+    // BR#5376: a STALLED batch is LOUD. Members were selected, merges were
+    // attempted, and NOTHING landed for K consecutive ticks — the receipt
+    // says executor breakage, never the fake-busy "checking" vocabulary
+    // that hid the 2026-10-30 refusal loop. Names the batch, the duration,
+    // and WHY (the executor's last error); the unblock is the restart.
+    else if (queue.length > 0 && stalledBlock) {
+      const st: any = stalledBlock;
+      const batchStr = (Array.isArray(st.batch) ? st.batch : []).map((p: any) => `#${Number(p)}`).filter((s: string) => s !== "#0").join(", ");
+      const ticks = Math.max(0, Math.floor(Number(st.ticks ?? 0) || 0));
+      const mins = Math.max(1, Math.round(Number(st.for_ms ?? 0) / 60_000));
+      const errNote = String(st.last_error ?? "").trim();
+      reason = `merge-train: STALLED — ${batchStr || "the batch"} selected to merge, 0 landed in ${mins}m (${ticks} tick(s))${errNote ? ` — last error: ${errNote.slice(0, 160)}` : ""} — likely executor breakage; restart the gateway onto the current build`;
     }
     else if (meta.zombie) {
       // BR#4129: the last holder was evicted mid-queue — show WHY the lane is
@@ -8102,7 +8123,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const kind = String(body.kind ?? "").trim();
-    if (!["merged", "bounced", "stopped", "landed"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed");
+    if (!["merged", "bounced", "stopped", "landed", "stalled"].includes(kind)) throw new Error("kind must be merged | bounced | stopped | landed | stalled");
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
@@ -8533,6 +8554,62 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ev({ reason: why, failing, culprit }, culprit);
       this.version(lane.id, actor, `train:${kind}`, `line stopped — ${why}`, { stop: meta.stop, reason });
       return { ok: true, kind, lane: laneKey(repo, base), sha, stop: meta.stop, reason };
+    }
+
+    // BR#5376: the executor's ONE-per-episode batch-stall alarm. A batch was
+    // selected, merges were attempted, and NOTHING landed for
+    // STALL_ALARM_TICKS consecutive ticks (default 3) — the receipt says
+    // executor breakage, never a PR defect (the 2026-10-30 merge-method
+    // refusal loop wrote 945+ attempts to the executor's LOCAL log with zero
+    // hub events while the lane read fake-busy "checking"). One ledger row
+    // per episode + the one-per-episode alarm ask; dedupe by the episode's
+    // `since` — a re-fire of the SAME episode is an ack, a NEW since is a
+    // fresh alarm.
+    if (kind === "stalled") {
+      const since = Number(body.since ?? 0) || 0;
+      if (!since) throw new Error("train:stalled needs since (the episode start, ms epoch)");
+      const prior = this.one(
+        `SELECT seq FROM train_events WHERE repo = ? AND base = ? AND kind = 'stalled' AND CAST(json_extract(detail, '$.since') AS INTEGER) = ? LIMIT 1`,
+        repo, base, since,
+      ) as any;
+      if (prior) {
+        this.audit(actor, "train:stalled_deduped", lane.id, { lane: laneKey(repo, base), since });
+        return { ok: true, kind, lane: laneKey(repo, base), since, deduped: true };
+      }
+      const members: number[] = (Array.isArray(body.batch_members) ? body.batch_members : []).map(Number).filter((n: number) => Number.isInteger(n) && n > 0);
+      const ticks = Math.max(0, Math.floor(Number(body.ticks ?? 0) || 0));
+      const lastError = String(body.last_error ?? "").slice(0, 300);
+      ev({ batch_members: members, ticks, since, last_error: lastError || undefined, reason: String(body.reason ?? "") }, null);
+      // The ONE-per-episode alarm ask — the title carries NO changing numbers
+      // (no tick counts, no ages): askCreate's identical-open-ask guard
+      // dedupes on the exact title, so the per-tick repeats (the stamp files
+      // the same one) collapse to one ask per episode.
+      const askTitle = trainStallAskTitle({ repo, base });
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed since ${new Date(since).toISOString()} — likely executor breakage, not a PR defect`,
+            details: [
+              `Lane ${laneKey(repo, base)} is STALLED: batch ${members.length ? members.map((p) => "#" + p).join(", ") : "(none)"} was selected to merge, merges were attempted every tick, and 0 landed across ${ticks} tick(s) (since ${new Date(since).toISOString()}).`,
+              lastError ? `The last merge attempt ended: ${lastError}` : "The executor's last merge error text was not supplied.",
+              `This is the BR#5376 class: executor breakage that logs only to the executor's local log while the lane reads fake-busy "checking review, signatures and CI". The fix is operational, not a code change.`,
+              `Unblock: restart the merge-train gateway/executor onto the current build (the executor's method fallback lands via squash per the sp landing law). Any landing clears the episode by itself.`,
+            ].join("\n\n"),
+            options: ["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        // an identical ask is already open for this episode — that IS one per class
+        this.audit(actor, "train:stalled_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+      }
+      const reason = this.laneSyncReason(lane.id, meta, now);
+      this.version(lane.id, actor, `train:${kind}`, `batch STALLED — ${members.length} PR(s) selected (${members.map((p) => "#" + p).join(", ") || "none"}), 0 landed across ${ticks} tick(s) since ${new Date(since).toISOString()}${lastError ? ` — last error: ${lastError.slice(0, 160)}` : ""}`, { reason });
+      return { ok: true, kind, lane: laneKey(repo, base), since, ticks, batch_members: members, reason };
     }
 
     // kind === "landed": the hub decides from facts — checks ride the event
@@ -9119,9 +9196,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // guard dedupes the per-tick repeats — same shape as the stopped
     // flow's stop ask).
     const baseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
+    // BR#5376: the ACTIVE batch-stall episode rides the stamp (executor-fed;
+    // the next stamp after a landing omits it, which clears the state by
+    // itself). The lane renders a loud STALLED reason/banner off it and the
+    // ONE-per-episode alarm ask files below — same dedupe law as base-red.
+    const stalled = body.stalled && typeof body.stalled === "object" ? body.stalled : null;
     meta.lane = {
       ...(meta.lane ?? {}),
-      queue_facts: { at: Date.now(), entries, ...(baseState ? { base_state: baseState } : {}) },
+      queue_facts: { at: Date.now(), entries, ...(baseState ? { base_state: baseState } : {}), ...(stalled ? { stalled } : {}) },
     };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
     this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null });
@@ -9162,7 +9244,42 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
       }
     }
-    return { ok: true, lane: laneKey(repo, base), n: entries.length };
+    // BR#5376: the STALLED alarm ask — one per episode, filed while the
+    // fresh stamp carries the episode (the per-tick repeats collapse in
+    // askCreate's identical-open-ask guard on the numberless title; the
+    // train_event "stalled" leg files the same title as belt-and-braces).
+    if (stalled && entries.length > 0 && !baseState) {
+      const members: number[] = (Array.isArray(stalled.batch) ? stalled.batch : []).map(Number).filter((n: number) => Number.isInteger(n) && n > 0);
+      const ticks = Math.max(0, Math.floor(Number(stalled.ticks ?? 0) || 0));
+      const sinceMs = Math.max(0, Math.floor(Number(stalled.since ?? 0) || 0));
+      const lastError = String(stalled.last_error ?? "").slice(0, 300);
+      const askTitle = trainStallAskTitle({ repo, base });
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: sinceMs
+              ? `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed since ${new Date(sinceMs).toISOString()} — likely executor breakage, not a PR defect`
+              : `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed across ${ticks} tick(s) — likely executor breakage, not a PR defect`,
+            details: [
+              `Lane ${laneKey(repo, base)} is STALLED: batch ${members.length ? members.map((p) => "#" + p).join(", ") : "(none)"} was selected to merge, merges were attempted every tick, and 0 landed across ${ticks} tick(s)${sinceMs ? ` (since ${new Date(sinceMs).toISOString()})` : ""}.`,
+              lastError ? `The last merge attempt ended: ${lastError}` : "The executor's last merge error text was not supplied.",
+              `This is the BR#5376 class: executor breakage that logs only to the executor's local log while the lane reads fake-busy "checking review, signatures and CI". The fix is operational, not a code change.`,
+              `Unblock: restart the merge-train gateway/executor onto the current build (the executor's method fallback lands via squash per the sp landing law). Any landing clears the episode by itself.`,
+            ].join("\n\n"),
+            options: ["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"],
+            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        // an identical ask is already open for this episode — that IS one per episode
+        this.audit(actor, "train:stalled_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+      }
+    }
+    return { ok: true, lane: laneKey(repo, base), n: entries.length, stalled: !!stalled };
   }
 
   private async trainCarry(body: any, actor: string): Promise<any> {
@@ -9710,6 +9827,42 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           fix_card: this.trainFixCard(String((l as any).project ?? "")),
         };
       }
+      // BR#5376: the STALLED resolution beside the lane — the batch members,
+      // how long nothing has landed (ticks + wall-clock), WHY (the
+      // executor's last error), the episode's OPEN alarm ask, and the
+      // unblock. Same freshness law as base_red (<15m — the executor
+      // refreshes every tick and omits `stalled` the moment anything
+      // lands); suppressed while base-red is the story (that banner owns
+      // the lane then).
+      const stQf: any = brQf?.stalled ?? null;
+      let stalled_resolution: any = null;
+      if (stQf && !brBase && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0) {
+        const askPrefixS = `MERGE TRAIN STALLED: ${lane.repo}@${lane.base}`;
+        const askRowS = ((this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts
+           WHERE type = 'question' AND status = 'todo' AND created_ts > ?
+           ORDER BY created_ts DESC LIMIT 200`,
+          now0 - 7 * 86_400_000,
+        ).toArray() as any[]).find((r) => String(r.title ?? "").startsWith(askPrefixS))) ?? null;
+        const askMetaS = askRowS ? JSON.parse(String(askRowS.meta ?? "{}") || "{}") : null;
+        const forMs = Number(stQf.for_ms ?? 0) || Math.max(0, now0 - Number(stQf.since ?? 0));
+        stalled_resolution = {
+          batch: (Array.isArray(stQf.batch) ? stQf.batch : []).map(Number).filter((n: number) => Number.isInteger(n) && n > 0),
+          ticks: Math.max(0, Math.floor(Number(stQf.ticks ?? 0) || 0)),
+          since: Number(stQf.since ?? 0) || null,
+          for_ms: forMs,
+          last_error: String(stQf.last_error ?? "").trim() || null,
+          ask: askRowS
+            ? {
+                id: String(askRowS.id),
+                url: this.cardUrl(String(askRowS.id)),
+                question: String(askRowS.title),
+                options: Array.isArray(askMetaS?.ask?.options) ? askMetaS.ask.options.map(String) : [],
+              }
+            : null,
+          unblock: "restart the merge-train gateway/executor onto the current build",
+        };
+      }
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9732,6 +9885,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // BR#5349: the plain-words resolution block (whats_broken/held/ask/
         // fix_card) while a non-green base holds cars — absent once green
         ...(base_red_resolution ? { base_red_resolution } : {}),
+        // BR#5376: the plain-words STALLED block (batch/ticks/for_ms/
+        // last_error/ask/unblock) while a fresh stall episode rides the
+        // stamp — absent the moment anything lands
+        ...(stalled_resolution ? { stalled_resolution } : {}),
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,
         starved,
