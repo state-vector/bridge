@@ -591,6 +591,39 @@ describe("train event copy", () => {
     expect(g).not.toContain("no file list supplied");
   });
 
+  it("trainBounceBrief BASE-RED class (BR#5349, Ray directive): a gate bounce whose red is MAIN's own — the circular deploy-health merge gate, or a defect naming main red — renders the PLAIN brief (your PR is fine, nothing to do on this PR, the fix card named), never the rebase/re-sign/re-approve loop on a clean PR", () => {
+    // the circular class: the red check named by the executor's head-check
+    // defect is the deploy-health gate, which only judges MAIN
+    const b = trainBounceBrief({
+      prNumber: 2623, repo: "state-vector/superpositional", headSha: "9".repeat(40),
+      conflictFiles: [], verdictId: "BR#5103", bounceKind: "gate",
+      defect: "PR #2623 head check RED: Deploy health (merge gate). Fix or bounce to impl",
+      fixCard: { id: "BR#5346", status: "in_progress" },
+    });
+    expect(b).toContain("Merge-train bounce (base-red): PR #2623 (state-vector/superpositional)");
+    expect(b).toContain("MAIN is red (Deploy health (merge gate))");
+    expect(b).toContain("**Your PR is fine — nothing to do on this PR.**");
+    expect(b).toContain("the fix lives on BR#5346 (in progress)");
+    expect(b).toContain("or re-run the flaky check");
+    expect(b).toContain("or bypass-merge a cure PR");
+    // the BR#5193 circular-park lie is gone: a clean PR is never told to
+    // rebase/re-sign/re-approve
+    expect(b).not.toContain("rebase");
+    expect(b).not.toContain("re-sign");
+    expect(b).not.toContain("re-approve");
+    // no fix card open → the brief says so honestly (plain, still no loop)
+    const noFix = trainBounceBrief({ prNumber: 1, repo: "o/r", headSha: null, conflictFiles: [], verdictId: null, bounceKind: "gate", defect: "base main RED — the standing order never merges onto a non-green destination" });
+    expect(noFix).toContain("MAIN is red");
+    expect(noFix).toContain("none open yet");
+    expect(noFix).toContain("nothing to do on this PR");
+    // a genuinely PR-owned red keeps the mechanical brief (impl fixes the
+    // named defect) — the base-red class must not swallow real failures
+    const prOwned = trainBounceBrief({ prNumber: 1, repo: "o/r", headSha: null, conflictFiles: [], verdictId: null, bounceKind: "gate", defect: "PR #1 head check RED: TypeScript Tests. Fix or bounce to impl" });
+    expect(prOwned).toContain("Merge-train bounce (gate): PR #1 (o/r)");
+    expect(prOwned).toContain("**Next owner: impl**");
+    expect(prOwned).not.toContain("Your PR is fine");
+  });
+
   it("resolveTrainBounceKind: explicit kind wins; legacy events infer from files then defect text; a kindless file-less event is an honest GATE bounce, never a manufactured conflict", () => {
     expect(resolveTrainBounceKind({ bounceKind: "coverage" })).toBe("coverage");
     expect(resolveTrainBounceKind({ bounceKind: "CONFLICT" })).toBe("conflict");

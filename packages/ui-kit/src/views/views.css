@@ -472,6 +472,27 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    in the --cols templates in the ktable block below. This block is visual
    identity + the error/empty strips. */
 .train-panel { margin-bottom: 14px; }
+/* BR#5349: the blocked-lane resolution banner — pinned at the very top of the
+   trains panel, above the lane table, plain words, red tone. The hub serves
+   base_red_resolution only while a non-green base holds cars, so it vanishes
+   the moment main goes green. */
+.train-blocked-banner {
+  display: grid; gap: 3px; min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--red);
+  padding: 7px 10px; margin: 2px 0 8px;
+  font-size: 12px; line-height: 1.45;
+}
+.train-blocked-banner-amber {
+  border-color: color-mix(in srgb, var(--amber) 55%, var(--line));
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  color: var(--amber);
+}
+.train-blocked-banner a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.train-blocked-banner .train-banner-line { min-width: 0; }
+.train-blocked-banner .train-banner-dim { opacity: 0.75; }
 .train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
 .train-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
 .train-lane {

@@ -147,6 +147,84 @@ function nowAction(l: KbTrainLane, now: number): { text: string; title: string }
   };
 }
 
+/** Plain status words for a board status (BR#5349: no jargon on the banner). */
+function plainStatus(s: string | undefined): string {
+  return s === "in_progress" ? "in progress"
+    : s === "in_review" ? "in review"
+    : s === "todo" ? "not started"
+    : s === "blocked" ? "parked"
+    : s ?? "";
+}
+
+/** BR#5349 (Ray directive 2026-11-01: "THIS IS WHAT FIXES IT, HERE IS WHAT WE
+ *  NEED TO DO — loud and clear and direct with no jargon"): the blocked-lane
+ *  resolution banner, pinned to the TOP of the trains panel ABOVE the lane
+ *  table. Plain words only — no "gate", no "verdict", no "admission class":
+ *  what's broken (with the failing-run links), what fixes it (the open fix
+ *  card · a re-run of a flaky check · a bypass-merge), and what we need from
+ *  the human (answer the episode's alarm ask — one click). Red tone; the hub
+ *  serves `base_red_resolution` only while a non-green base holds cars, so
+ *  the banner disappears the moment main goes green. */
+function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: string) => void }) {
+  const r = lane.base_red_resolution!;
+  const repo = lane.lane.split("@")[0];
+  const red = r.verdict === "red";
+  const held = ` · ${r.held} PR${r.held === 1 ? "" : "s"} held`;
+  return (
+    <div className={`train-blocked-banner${red ? "" : " train-blocked-banner-amber"}`} role="alert">
+      <span className="train-banner-line">
+        {red
+          ? <>⛔ Merge train STOPPED — main's checks are failing on {repo}{held}</>
+          : r.verdict === "empty"
+            ? <>⛔ Merge train HELD — main has none of the checks this lane needs on {repo}{held}</>
+            : <>⛔ Merge train HELD — main's checks are still running on {repo}{held}</>}
+      </span>
+      {r.whats_broken.length > 0 && (
+        <span className="train-banner-line">
+          {"BROKEN: "}
+          {r.whats_broken.map((b, i) => (
+            <span key={b.name}>
+              {i > 0 ? " · " : ""}
+              {b.url
+                ? <a href={b.url} target="_blank" rel="noreferrer" title="open the failing run">{b.name}</a>
+                : b.name}
+            </span>
+          ))}
+        </span>
+      )}
+      <span className="train-banner-line">
+        {red ? "WHAT FIXES IT: " : "WHAT HAPPENS NEXT: "}
+        {r.fix_card ? (
+          <a
+            className="train-banner-card"
+            href={r.fix_card.url}
+            title={`${r.fix_card.id} — ${r.fix_card.title}`}
+            onClick={(e) => { if (openTask) { e.preventDefault(); openTask(r.fix_card!.id); } }}
+          >
+            {r.fix_card.id} — {plainStatus(r.fix_card.status)}
+          </a>
+        ) : (
+          <span className="train-banner-dim">no fix card open yet</span>
+        )}
+        {red ? " · or re-run a flaky check · or you bypass-merge a fix PR" : " · just wait — they finish on their own"}
+      </span>
+      {r.ask && (
+        <span className="train-banner-line">
+          {"WHAT WE NEED FROM YOU: "}
+          <a
+            className="train-banner-card"
+            href={r.ask.url}
+            title={r.ask.question}
+            onClick={(e) => { if (openTask) { e.preventDefault(); openTask(r.ask!.id); } }}
+          >
+            answer the ask (→ {r.ask.id}) — one click
+          </a>
+        </span>
+      )}
+    </div>
+  );
+}
+
 const REFRESH_MS = 30_000;
 
 /** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
@@ -192,6 +270,11 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
         <h2>merge trains</h2>
         <span className="muted-note">per-lane CAS lock + derived queue · 45s tick, 30s poll</span>
       </div>
+      {/* BR#5349: the blocked-lane resolution banners — pinned at the very top,
+          above the lane table (Ray: the resolution must not be buried). */}
+      {(lanes ?? []).filter((l) => l.base_red_resolution).map((l) => (
+        <BlockedBanner key={l.lane} lane={l} openTask={openTask} />
+      ))}
       {error && <div className="train-lane train-lane-err" title={error}>⚠ train status unavailable — {error.slice(0, 120)}</div>}
       {!error && lanes?.length === 0 && (
         <div className="train-lane train-lane-idle">no merge-train lanes configured — a lane appears when a card enters the train</div>

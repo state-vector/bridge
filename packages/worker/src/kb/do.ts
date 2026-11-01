@@ -107,6 +107,7 @@ import {
   trainRequeueSwap,
   trainStopAskTitle,
   trainBaseRedAskTitle,
+  trainBaseRedDefect,
   trainLandedCloseNote,
   trainLandedCloseEdge,
   trainCloseBounceBrief,
@@ -136,6 +137,8 @@ import {
 } from "./core.ts";
 import { aggregateThroughput, parseThroughputParams, type DoneEvent, type FallbackDone } from "./throughput.ts";
 import { parseProvenanceSha } from "./provenance.ts";
+import { emitOrigin } from "../permalink.ts";
+import { cardPath } from "@bridge/specs";
 import {
   accountingLine,
   normalizePr,
@@ -8235,9 +8238,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // queue only after a fresh verify. NO ask legs here either (BR#4960):
       // the repair leg re-enters review through the normal in_review
       // handoff, which auto-spawns the fresh verify duty.
-      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect });
+      // BR#5349: a gate bounce whose red is MAIN's (the circular deploy-health
+      // class, or a defect naming main red) renders the PLAIN base-red brief —
+      // the PR is mechanically clean, so impl is never told to rebase/re-sign/
+      // re-approve it (the BR#5193 circular-park waste). The lane's active
+      // fix-forward card rides the brief so impl knows where the cure lives.
+      const baseRedNames = bounceKind === "gate" ? trainBaseRedDefect(defect) : null;
+      const fixCard = baseRedNames
+        ? this.trainFixCard(String((this.one(`SELECT project FROM artefacts WHERE id = ?`, lane.id) as any)?.project ?? ""))
+        : null;
+      const brief = trainBounceBrief({ prNumber: pr, repo, headSha, conflictFiles, verdictId: this.trainChain(taskId).verdict_id, bounceKind, mergeStateStatus, defect, fixCard });
       const bounceNote =
-        bounceKind === "gate"
+        baseRedNames
+          ? `merge-train bounce (gate, base-red) — PR #${pr} is mechanically clean; MAIN is red (${baseRedNames.join(", ") || "required checks"}) — held until it clears; nothing to do on this PR`
+          : bounceKind === "gate"
           ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
           : bounceKind === "conflict"
             ? `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
@@ -8305,7 +8319,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect }, taskId);
       const laneNote =
-        bounceKind === "gate"
+        baseRedNames
+          ? `PR #${pr} bounced (gate, base-red) — MAIN is red; the PR is fine and held until it clears (the fix rides the base-red card/ask), then re-queue at the back`
+          : bounceKind === "gate"
           ? `PR #${pr} bounced (gate) — named defect; impl fixes it, then re-verify and re-queue at the back`
           : bounceKind === "conflict"
             ? `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`
@@ -9394,12 +9410,36 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
   }
 
+  /** BR#5349: the canonical card deep-link for payload surfaces that bypass
+   *  the MCP permalink stamp (the /api/kb/train snapshot the trains panel
+   *  polls) — emitOrigin picks the canonical origin (BR#4695), never the
+   *  workers.dev fallback. */
+  private cardUrl(id: string): string {
+    const path = cardPath(String(id));
+    return path ? emitOrigin(this.env?.CANONICAL_ORIGIN) + path : "";
+  }
+
+  /** BR#5349: the lane's active fix-forward card — an OPEN task tagged
+   *  hotfix+main-red in the LANE CARD's project (the lane card's project
+   *  column is the repo→project join; BR#5346 is the live superpositional
+   *  example). Newest-touched first. */
+  private trainFixCard(project: string): { id: string; url: string; title: string; status: string } | null {
+    const row = project ? this.one(
+      `SELECT id, title, status FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+         AND project = ? AND tags LIKE '%"hotfix"%' AND tags LIKE '%"main-red"%'
+       ORDER BY updated_ts DESC LIMIT 1`,
+      project,
+    ) as any : null;
+    return row ? { id: String(row.id), url: this.cardUrl(String(row.id)), title: String(row.title), status: String(row.status) } : null;
+  }
+
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
     const now0 = Date.now();
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
-      `SELECT id, title, status, meta, status_ts, updated_ts FROM artefacts
+      `SELECT id, title, status, meta, status_ts, updated_ts, project FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
        ORDER BY title`,
     ).toArray() as any[];
@@ -9521,6 +9561,55 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         })
         .sort((x, y) => y.age_ms - x.age_ms)
         .slice(0, 20);
+      // BR#5349 (Ray directive ~07:55Z: "THIS IS WHAT FIXES IT, HERE IS WHAT
+      // WE NEED TO DO — loud and clear and direct with no jargon"): when a
+      // non-green base HOLDS cars, serve the RESOLUTION beside the lane —
+      // what's broken (red names + run URLs, from the walk's base_state),
+      // how many cars are held, the episode's OPEN alarm ask (id/url/
+      // question/options verbatim — the ask the panel can link with one
+      // click), and the active fix-forward card (OPEN task tagged
+      // hotfix+main-red in the lane's project). Freshness-guarded like
+      // laneSyncReason's baseBlock (<15m — the executor refreshes every
+      // tick): a dead daemon's stale stamp never pins a banner, and the
+      // block disappears by itself the moment base_state goes green.
+      const brQf: any = meta.lane?.queue_facts ?? null;
+      const brBase: any = brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
+        && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0
+        ? brQf.base_state : null;
+      let base_red_resolution: any = null;
+      if (brBase) {
+        const reds = (Array.isArray(brBase.red) ? brBase.red : [])
+          .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+          .filter((r: any) => r.name);
+        // the OPEN alarm ask for this episode — filed per red episode under
+        // the deterministic trainBaseRedAskTitle prefix. Newest open questions
+        // first, prefix-matched in JS: parameterized LIKE+ESCAPE trips
+        // workerd's SQLite ("LIKE or GLOB pattern too complex"), and the
+        // episode ask is at most days old, so a recent-rows scan is a cheap,
+        // quirk-free join (the alarm sink is where these titles live).
+        const askPrefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base}`;
+        const askRow = ((this.state.storage.sql.exec(
+          `SELECT id, title, meta FROM artefacts
+           WHERE type = 'question' AND status = 'todo' AND created_ts > ?
+           ORDER BY created_ts DESC LIMIT 200`,
+          now0 - 7 * 86_400_000,
+        ).toArray() as any[]).find((r) => String(r.title ?? "").startsWith(askPrefix))) ?? null;
+        const askMeta = askRow ? JSON.parse(String(askRow.meta ?? "{}") || "{}") : null;
+        base_red_resolution = {
+          verdict: String(brBase.verdict ?? ""),
+          whats_broken: reds,
+          held: queue.length,
+          ask: askRow
+            ? {
+                id: String(askRow.id),
+                url: this.cardUrl(String(askRow.id)),
+                question: String(askRow.title),
+                options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
+              }
+            : null,
+          fix_card: this.trainFixCard(String((l as any).project ?? "")),
+        };
+      }
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
@@ -9540,6 +9629,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // BR#5114: per-entry executor gate verdicts in walk order (panel
         // blocks) — null until the first executor tick stamps them
         queue_facts: meta.lane?.queue_facts ?? null,
+        // BR#5349: the plain-words resolution block (whats_broken/held/ask/
+        // fix_card) while a non-green base holds cars — absent once green
+        ...(base_red_resolution ? { base_red_resolution } : {}),
         last_capable_lease_ts: meta.lane?.last_capable_lease_ts ?? null,
         capable,
         starved,

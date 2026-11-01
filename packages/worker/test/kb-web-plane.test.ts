@@ -209,6 +209,24 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(topViewSrc.indexOf("<TrainPanel")).toBeLessThan(topViewSrc.indexOf("<DashboardSummary"));
   });
 
+  it("renders the BR#5349 blocked-lane resolution banner PINNED ABOVE the lane table — plain words, zero jargon (Ray directive 2026-11-01: 'THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED TO DO')", () => {
+    // the banner keys off the hub-served resolution block and speaks Ray's
+    // plain words: what's broken, what fixes it, what we need from you
+    expect(trainPanelSrc).toContain("base_red_resolution");
+    expect(trainPanelSrc).toContain("Merge train STOPPED");
+    expect(trainPanelSrc).toContain("BROKEN:");
+    expect(trainPanelSrc).toContain("WHAT FIXES IT:");
+    expect(trainPanelSrc).toContain("or you bypass-merge a fix PR");
+    expect(trainPanelSrc).toContain("WHAT WE NEED FROM YOU:");
+    expect(trainPanelSrc).toContain("answer the ask");
+    // pinned at the very top: the banner renders BEFORE the lane table head
+    const banner = trainPanelSrc.indexOf("train-blocked-banner");
+    const tableHead = trainPanelSrc.indexOf("ktable-head train-head-cols");
+    expect(banner).toBeGreaterThan(-1);
+    expect(tableHead).toBeGreaterThan(-1);
+    expect(banner).toBeLessThan(tableHead);
+  });
+
   it("shows the CAS lock holder machine with a live heartbeat age per lane", () => {
     expect(trainPanelSrc).toMatch(/l\.lease\?\.holder/);
     expect(trainPanelSrc).toContain("lock ");
