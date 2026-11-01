@@ -347,10 +347,24 @@ export const RULES: Rule[] = [
       `task ${i.id} is claimed by ${i.owner} — only the owner, a human, or an unblock duty holding proof of the met exit condition can release it. If the work overlaps yours, coordinate via ask_agent instead.`,
   },
   {
+    // BR#5377 F1 (Ray directive 2026-11-01): a verify-verdict decision is a
+    // MACHINE verdict, not a consensus-seeking proposal — the verifier files
+    // receipts; the hub accepts it at create as `system:verifier` and the
+    // accept-side hook (do.ts) applies it to its target (bounce → in_progress,
+    // verify duty → done, impl → the merge-train queue per BR#3516). That
+    // narrow pair — actor system:verifier AND decision_class verify-verdict —
+    // is the ONLY exemption; every other decision class stays
+    // human-authoritative. An agent session proposing a verify-verdict still
+    // cannot accept it (the exemption is keyed on the machinery actor, so the
+    // verifier never self-ratifies beyond the hub's own create-time apply).
     name: "decision-acceptance-human",
-    when: (i) => i.type === "decision" && i.to === "accepted" && !HUMAN_ACTOR.test(i.actor),
+    when: (i) =>
+      i.type === "decision" &&
+      i.to === "accepted" &&
+      !HUMAN_ACTOR.test(i.actor) &&
+      !(String(i.actor) === "system:verifier" && metaOf(i.meta)?.decision_class === "verify-verdict"),
     guard: (i) =>
-      `decision ${i.id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel).`,
+      `decision ${i.id} acceptance is human-authoritative — agents propose, a human accepts in the webapp. Route it to a human for the final say (an ask, or the decisions panel). The one exception: verify-verdicts (decision_class verify-verdict) are machine verdicts — the hub applies them at create as system:verifier (BR#5377).`,
   },
   {
     // BR#3913 / BR#2508(a): blocked → superseded is a parked card's one drop

@@ -33,6 +33,7 @@ import {
   doWs,
   INITIAL_STATUS,
   verifyVerdictStatement,
+  canonicalVerdictTitle,
   LIMITS,
   SETTINGS_KEYS,
   ASK_ANSWERED,
@@ -195,6 +196,17 @@ import {
  *  sink the destination-green sweep used (BR#3124, infrastructure). Override
  *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
 const TRAIN_ALARM_SINK_ID = "BR#3124";
+/** BR#5377 F1: the human-actor test for the verdict-apply note (mirrors
+ *  machine.ts HUMAN_ACTOR — prose attribution, not legality: the gate itself
+ *  stays in machine.ts). Distinguishes "accepted by human" (a panel ratify of
+ *  a legacy proposed verdict) from "machine-applied" (the create-time
+ *  system:verifier apply). */
+const HUMAN_ACTOR_RX = /^web(:|$)|^human:/;
+/** BR#5377 F4: the adoption sweep only takes verdicts at least this old — a
+ *  fresh straggler (create-time auto-apply failed) shows proposed in the
+ *  panel first; the deploy-time backlog is older than any window and adopts
+ *  on the first ticks. The admin drill passes 0 (take everything now). */
+const VERDICT_ADOPTION_MIN_AGE_MS = 10 * 60_000;
 /** BR#4489: a queued lane with no merge-capable lease inside this window is STARVED — panel red + alarm. */
 const TRAIN_STARVE_MS = 10 * 60_000;
 /** Ray 2026-10-29: a merge-capable lease op inside this window means the train is
@@ -576,6 +588,17 @@ export class KnowledgeHub {
       await this.awaitingRequeueSweep(now0);
     } catch (e) {
       this.audit("system:watchdog", "awaiting_requeue_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+    // (A2) BR#5377 F4 — verify-verdict adoption: every still-proposed
+    // verify-verdict decision (legacy backlog at deploy time, or a straggler
+    // whose create-time auto-apply was refused) auto-accepts exactly like a
+    // fresh one — the machine-apply law, applied retroactively. The accept
+    // effect supersedes the decision's orphan Feedback round, so the
+    // duplicated cards collapse in the same tick. Idempotent, converges.
+    try {
+      await this.verifyVerdictAdoptionSweep();
+    } catch (e) {
+      this.audit("system:watchdog", "verdict_adoption_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
     // BR#4489: judge train-lane starvation on the alarm cadence too — a
     // queued lane with no merge-capable executor alarms even with zero
@@ -1004,6 +1027,61 @@ export class KnowledgeHub {
       }
     }
     return flipped;
+  }
+
+  /** (A2) BR#5377 F4 — the verify-verdict adoption pass: the retroactive
+   *  half of machine-apply. Every still-proposed verify-verdict decision —
+   *  the legacy backlog this fix deploys onto, or a straggler whose
+   *  create-time auto-apply failed — ACCEPTS exactly like a fresh one
+   *  (transition as system:verifier → the accept-side hook applies the
+   *  verdict to its target; the accept effect supersedes the decision's
+   *  orphan `Feedback:` round). Runs every alarm tick, idempotent: an
+   *  accepted verdict leaves the proposed set, so the sweep converges;
+   *  admin.verify_verdict_sweep drills it in isolation.
+   *  Age-gated (VERDICT_ADOPTION_MIN_AGE_MS): a fresh straggler shows
+   *  proposed in the panel first — a human ratify and the machine apply land
+   *  identically, and the tick takes it after the window; the deploy-time
+   *  backlog is older than any window and adopts on the first ticks. The
+   *  drill passes minAgeMs 0 and takes everything NOW (that is also how the
+   *  tests drive the migration deterministically, past the alarm cadence). */
+  private async verifyVerdictAdoptionSweep(minAgeMs: number = VERDICT_ADOPTION_MIN_AGE_MS): Promise<number> {
+    const cutoff = Date.now() - Math.max(0, minAgeMs);
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts
+       WHERE type = 'decision' AND status = 'proposed'
+         AND json_extract(meta, '$.decision_class') = 'verify-verdict'
+         AND created_ts < ?`,
+      cutoff,
+    ).toArray() as any[];
+    let applied = 0;
+    for (const r of rows) {
+      try {
+        // The verdict IS the acceptance evidence for its target: lay the
+        // supports link (decision → target) before the apply — legacy
+        // stragglers were filed as plain decisions (no link), and the
+        // accept-side hook's target close passes done-unreviewed only
+        // through this link (the same auto-link the F1 create block lays).
+        const rm = JSON.parse(r.meta ?? "{}");
+        const vTarget = String(rm.task ?? rm.verify_target ?? "").trim();
+        if (vTarget) {
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supports', ?, ?)`,
+            String(r.id), vTarget, Date.now(),
+          );
+        }
+        await this.transition(
+          { id: String(r.id), to: "accepted", note: "retroactive machine-apply (BR#5377 F4 sweep) — verify verdicts are machine verdicts, they apply on filing" },
+          "system:verifier",
+        );
+        applied++;
+        this.audit("system:verifier", "verdict_adopted", String(r.id), {});
+      } catch (e) {
+        // one refused verdict never blocks the sweep — the gate's refusal is
+        // observability; the card stays until the next tick
+        this.audit("system:verifier", "verdict_adopt_failed", String(r.id), { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
+    return applied;
   }
 
   private async stallSweep(nowIn: number) {
@@ -3273,6 +3351,7 @@ export class KnowledgeHub {
         case "admin.unblock_proxy_sweep":
         case "admin.stall_sweep":
         case "admin.awaiting_requeue_sweep":
+        case "admin.verify_verdict_sweep":
         case "admin.ask_escalation_sweep":
         case "admin.question_claim_sweep":
         case "admin.alarm_sweep":
@@ -3313,6 +3392,13 @@ export class KnowledgeHub {
             // the pass itself is clockless (verdict coverage, not age).
             const flipped = await this.awaitingRequeueSweep(Number(body.now ?? Date.now()));
             return this.json({ ok: true, flipped });
+          }
+          if (op === "admin.verify_verdict_sweep") {
+            // drill/liveness path for the BR#5377 F4 adoption pass: runs ONLY
+            // that migration (proposed verify-verdicts machine-apply) and
+            // bypasses the age window — the deploy-time migration leg.
+            const applied = await this.verifyVerdictAdoptionSweep(0);
+            return this.json({ ok: true, applied });
           }
           if (op === "admin.ask_escalation_sweep") {
             // drill/liveness path for the ask TTL escalation (BR#3942): the
@@ -3357,7 +3443,9 @@ export class KnowledgeHub {
   private async create(body: any, actor: string) {
     let type = body.type as ArtefactType;
     if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
-    const title = String(body.title ?? "");
+    // let: BR#5377 F3 mints the canonical verify-verdict title over the
+    // verifier's authored one (which rides into the body instead).
+    let title = String(body.title ?? "");
     let bodyMd = String(body.body_md ?? "");
     const limitErr = checkLimits(title, bodyMd, body.meta);
     if (limitErr) throw new Error(limitErr);
@@ -3365,7 +3453,9 @@ export class KnowledgeHub {
     const seq = (await this.nextSeq(type));
     const id = formatId(seq);
     const ts = Date.now();
-    const status = INITIAL_STATUS[type];
+    // let: BR#5377 F1 — a machine-applied verify-verdict flips the returned
+    // status to accepted after the create-time transition lands.
+    let status = INITIAL_STATUS[type];
     const tags = sanitizeTags(body.tags);
     // roles: the machine's dispatch/gating lanes — structural, NEVER tags
     // (tags are inert user labels; a tag can't change system behaviour)
@@ -3433,9 +3523,13 @@ export class KnowledgeHub {
           target, target,
         );
         // receipts fingerprint: any meta keys other than bookkeeping — identical
-        // when the verifier found the same world state
+        // when the verifier found the same world state. proposed_by is the
+        // create-time filer stamp (injected on every fresh decision, stripped
+        // when a legacy card's meta is updated) — it is bookkeeping, never
+        // receipts; keeping it in the fingerprint made identical repeats miss
+        // the dedup purely on filer provenance (BR#5377).
         const fp = (m: any) => JSON.stringify(Object.entries(m ?? {})
-          .filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round"].includes(k))
+          .filter(([k]) => !["decision_class", "task", "verify_target", "verdict", "session", "round", "proposed_by"].includes(k))
           .sort(([a], [b]) => a.localeCompare(b)));
         const same = prev && String((JSON.parse(prev.meta ?? "{}") as any).verdict ?? "").toLowerCase() === verdict
           && fp(createMeta) === fp(JSON.parse(prev.meta ?? "{}"));
@@ -3492,7 +3586,20 @@ export class KnowledgeHub {
     // plain-English ask (what accepting does, why a human must do it) so the
     // card is self-describing everywhere it renders: popover, notification
     // snippet, MCP reads. After the dedup gate above: only real cards.
+    // BR#5377 F3: the hub MINTS the canonical plain-language title
+    // ("Verify verdict — ACCEPT — PR owner/repo#N → card BR#X") from meta;
+    // the verifier's internals-dense authored title (head SHAs, bounce
+    // classes) rides at the top of the body instead — nothing is lost, and
+    // every surface (panel, notification, orient) renders the plain form.
+    // BR#5377 F4: the prepended statement states machine-application
+    // reality (machine-applied on filing, supersede is the human leg).
     if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      const canonical = canonicalVerdictTitle(createMeta);
+      if (canonical && title.trim() !== canonical) {
+        const authored = title.trim();
+        title = canonical;
+        if (authored) bodyMd = `> **Verifier's title:** ${authored}\n\n${bodyMd.trim()}`.trim();
+      }
       bodyMd = `${verifyVerdictStatement(createMeta)}\n\n${bodyMd.trim()}`.trim();
     }
     this.state.storage.sql.exec(
@@ -3527,8 +3634,13 @@ export class KnowledgeHub {
     // and the round never blocks the decision's acceptance. Recursion guard: the
     // round is a TASK, so its own create() never re-enters this branch; the
     // meta marker additionally lets internal paths mint decisions without a round.
+    // BR#5377 F2: machine verdicts are NOT consensus-seeking proposals — a
+    // verify-verdict decision skips the round entirely. Under the old rule one
+    // verdict rendered as TWO cards to the human (the decision + its identical
+    // "Feedback:" twin); machine verdicts never propose, so there is nothing to
+    // collect consensus on. Every other decision class keeps the round.
     let feedbackRoundId: string | undefined;
-    if (type === "decision" && createMeta.feedback_round !== true) {
+    if (type === "decision" && createMeta.feedback_round !== true && createMeta.decision_class !== "verify-verdict") {
       const round = await this.create(
         {
           type: "task",
@@ -3558,7 +3670,45 @@ export class KnowledgeHub {
       );
       this.audit(actor, "create", round.id, { type: "task", auto: "consensus", parent: id });
     }
-    return { id, type, status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}) };
+    // BR#5377 F1 — MACHINE VERDICTS APPLY ON FILING. A verify-verdict decision
+    // ACCEPTS at create (actor system:verifier — the narrow machine-gate
+    // exemption in machine.ts decision-acceptance-human); the accept-side hook
+    // (doTransition) then applies the verdict to its target: bounce →
+    // in_progress with the findings, verify duty → done, impl card → the
+    // merge-train queue (BR#3516 — the train owns delivery). No proposal
+    // phase, no For Me card, no per-merge human GO/NO-GO ask (the hub holds no
+    // VCS credentials and does no work; agents and the train merge — a
+    // verifier's verdict IS the acceptance). Failure degrades to the legacy
+    // behavior — the card stays proposed and a human accepts it in the panel;
+    // the F4 adoption sweep (alarmSweep) picks it up next tick either way.
+    let machineApplied = false;
+    if (type === "decision" && createMeta.decision_class === "verify-verdict") {
+      const vTarget = String(createMeta.task ?? createMeta.verify_target ?? "").trim();
+      try {
+        // The verdict IS the acceptance evidence for its target: link it
+        // (supports, decision → target) BEFORE the apply so the accept-side
+        // hook's target close passes the done-unreviewed gate — a machine
+        // apply has no separate "link the receipt" step, the link is part of
+        // the verdict (the human flow does this by hand after filing).
+        if (vTarget && type === "decision") {
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supports', ?, ?)`,
+            id, vTarget, ts,
+          );
+        }
+        await this.transition(
+          { id, to: "accepted", note: "verify verdict machine-applied on filing — no human GO/NO-GO leg (BR#5377 F1)" },
+          "system:verifier",
+        );
+        status = "accepted";
+        machineApplied = true;
+        this.audit("system:verifier", "verdict_machine_applied", id, { target: vTarget });
+      } catch (e) {
+        this.audit("system:verifier", "verdict_autoapply_failed", id, { target: vTarget, error: String((e as Error).message ?? e).slice(0, 300) });
+        this.version(id, "system:verifier", "note", `machine auto-apply failed — the verdict stays proposed for the panel: ${String((e as Error).message ?? e).slice(0, 200)}`, {});
+      }
+    }
+    return { id, type, status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}), ...(machineApplied ? { machine_applied: true } : {}) };
   }
 
   /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
@@ -4664,13 +4814,19 @@ export class KnowledgeHub {
             await this.trainQueueOnAccept(target, { note: String((meta?.body_md ?? this.one(`SELECT body_md FROM artefacts WHERE id = ?`, id)?.body_md) ?? "") }, actor);
             this.audit(actor, "verdict_applied", target, { decision: id, effect: "queued" });
           } else try {
+            // BR#5377 F1: the note names the real applier — a human click
+            // (legacy/panel ratify) or the machine apply on filing. The
+            // accept note carries a receipts token ("verify passed") so a
+            // verify-duty target's close passes verdict-done-needs-receipts
+            // (the receipts live on the decision card this verdict is).
+            const byHuman = HUMAN_ACTOR_RX.test(actor);
             await this.transition(
               {
                 id: target,
                 to: isBounce ? "in_progress" : "done",
                 note: isBounce
-                  ? `verdict ${id} rejected by human — bounce with the verifier's findings`
-                  : `verdict ${id} accepted by human — closed on a verified (non-void) verdict`,
+                  ? `verdict ${id} ${byHuman ? "rejected by human" : "machine-applied (system:verifier)"} — bounced with the verifier's findings`
+                  : `verdict ${id} ${byHuman ? "accepted by human" : "machine-applied (system:verifier)"} — verify passed, closed on a verified (non-void) verdict; receipts on verdict card ${id}`,
               },
               actor,
             );
@@ -4685,16 +4841,17 @@ export class KnowledgeHub {
         }
       }
     }
-    // BR#3457 act-time prong: the human acted on THIS verdict — any other
-    // still-proposed verdict for the same target must not survive to regrow
-    // the For Me card (legacy stacked rounds created before the create-time
-    // sweep, or create-race stragglers). The sweeper's own transitions don't
-    // cascade — the guard keeps the takeover verdict safe.
+    // BR#3457 act-time prong: the verdict was acted on (a human ratify/reject
+    // of a legacy proposed verdict, or the machine apply on filing — BR#5377
+    // F1) — any other still-proposed verdict for the same target must not
+    // survive to regrow the For Me card (legacy stacked rounds created before
+    // the create-time sweep, or create-race stragglers). The sweeper's own
+    // transitions don't cascade — the guard keeps the takeover verdict safe.
     if (row.type === "decision" && (verdict.status === "accepted" || verdict.status === "superseded") && actor !== "system:verdictsweep") {
       const dm = meta ?? {};
       if (dm.decision_class === "verify-verdict") {
         const target = String(dm.task ?? dm.verify_target ?? "").trim();
-        if (target) await this.supersedeStaleVerdicts(target, id, `superseded by human action on ${id} — one actionable verdict per target (BR#3457)`);
+        if (target) await this.supersedeStaleVerdicts(target, id, `superseded by ${HUMAN_ACTOR_RX.test(actor) ? "human action" : "machine apply"} on ${id} — one actionable verdict per target (BR#3457)`);
       }
     }
     // ---- execute the effects the executor decided (do.ts never decides) ----
@@ -5395,7 +5552,7 @@ export class KnowledgeHub {
     const round = this.one(
       `SELECT c.id AS id, c.title AS title, c.status AS status, c.updated_ts AS updated_ts
        FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type IN ('task','question')
          AND c.status IN ('todo','in_progress','blocked')
          AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
        ORDER BY c.updated_ts DESC LIMIT 1`, decisionId,
@@ -6350,7 +6507,7 @@ export class KnowledgeHub {
       `SELECT d.id, d.title, d.owner, d.created_ts, d.updated_ts
        FROM relations r
        JOIN artefacts d ON d.id = r.dst_id AND d.type = 'decision' AND d.status = 'proposed'
-       JOIN artefacts c ON c.id = r.src_id AND c.type = 'task' AND c.status IN ('todo','in_progress','blocked')
+       JOIN artefacts c ON c.id = r.src_id AND c.type IN ('task','question') AND c.status IN ('todo','in_progress','blocked')
        WHERE r.relation = 'child_of'
          AND (c.tags LIKE '%"question"%' OR json_extract(c.meta, '$.kind') = 'question')
        GROUP BY d.id ORDER BY d.updated_ts DESC LIMIT 10`,
