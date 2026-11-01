@@ -96,6 +96,8 @@ import {
   carryAppendLeg,
   trainQueueRemainingReason,
   trainParseNoteLegs,
+  trainRepoTokenValid,
+  trainStampRefresh,
   classifyRequiredRuns,
   decideTrainGate,
   trainBounceBrief,
@@ -4516,13 +4518,13 @@ export class KnowledgeHub {
               this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
               this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
             } else {
-              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), dutyBody: String(row.body_md ?? "") }, actor);
               this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
             }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
-            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), dutyBody: String(row.body_md ?? "") }, actor);
           }
         }
       } catch (e) {
@@ -9107,7 +9109,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  one unbound leg fail-closes the queue. Bounce guards (defect 2): a
    *  verify close on an in_progress (bounced) card or a card blocked on a
    *  non-train reason never re-queues it. */
-  private async trainQueueOnAccept(parentId: string, src: { note?: string }, actor: string): Promise<void> {
+  private async trainQueueOnAccept(parentId: string, src: { note?: string; dutyBody?: string }, actor: string): Promise<void> {
     const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
     const meta = JSON.parse(parent.meta ?? "{}");
@@ -9115,9 +9117,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const note = String(src.note ?? "");
     // the legs: the note's PR/Head pairs (one head after each PR — the multi-
     // PR convention), folded onto the existing stamp; without a note PR, the
-    // existing stamp re-queues as-is; with neither, the card body is the last
-    // resort (single-PR legacy path, unchanged)
-    const stampLegs = trainLegs(meta);
+    // existing stamp re-queues as-is; with neither, the closing duty's seeded
+    // brief (the verdict record — BR#5329) then the card body are the last
+    // resorts (single-PR legacy path, unchanged)
+    // BR#5329 defect 2 — validate the EXISTING stamp too: stamps written
+    // before the parser validated rows may carry ghost legs (repo '4365/BR'
+    // — a misread of 'BR#4365/…' card-reference prose, gh 404) that queue
+    // ghost merge lanes. Dropping them here cleans the stamp on the next
+    // accept, and the card stops riding the ghost lane (the derived queue
+    // is computed from the legs, so the ghost lane starves).
+    const stampLegsAll = trainLegs(meta);
+    const stampLegs = stampLegsAll.filter((l) => trainRepoTokenValid(l.repo));
+    const ghostLegs = stampLegsAll.filter((l) => !trainRepoTokenValid(l.repo));
+    if (ghostLegs.length) {
+      this.audit(actor, "queue_ghost_leg_dropped", parentId, { dropped: ghostLegs.map((l) => `${l.repo}#${l.number}`), reason: "stamped legs with non-repo repo tokens (BR#5329 ghost-row class) — dropped before the re-stamp" });
+    }
     const noteLegs = trainParseNoteLegs(note);
     let legs: { repo: string; number: number; head_sha_at_acceptance?: string; base?: string }[];
     if (noteLegs.length && Array.isArray(meta.prs)) {
@@ -9131,21 +9145,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       legs = noteLegs;
     } else if (stampLegs.length) {
       // no parseable PR reference in the note — the existing stamp re-queues
-      // as-is, EXCEPT (BR#4648): a note that still carries a `head <sha>`
-      // token speaks for the card's ONE open leg. A single-unlanded-leg
-      // stamp has nothing to cross-pair, so the lone head refreshes it — a
-      // verifier citing bare receipts (no URL, no `repo#N`) must not strand
-      // the stamp on an old head and spin the coverage bounce. Multi-leg
-      // stamps stay fail-closed (no guessing which leg a lone head names).
-      legs = stampLegs.map((l) => ({ ...l }));
-      const loneHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
-      const open = legs.filter((l) => !trainLegLanded(meta, l));
-      if (loneHead && open.length === 1 && open[0].head_sha_at_acceptance !== loneHead) {
-        open[0].head_sha_at_acceptance = loneHead;
-        this.audit(actor, "queue_stamp_refreshed", parentId, { leg: `${open[0].repo}#${open[0].number}`, head: loneHead.slice(0, 9), via: "lone head token — the close note cited no PR reference (BR#4648)" });
+      // as-is, EXCEPT: a note that still carries a `head <sha>` token speaks
+      // for a leg. A single-unlanded-leg stamp has nothing to cross-pair, so
+      // the lone head refreshes it (BR#4648 — a verifier citing bare
+      // receipts must not strand the stamp on an old head and spin the
+      // coverage bounce). On a multi-leg stamp the lone head refreshes a leg
+      // the note EXPLICITLY names — bare `PR #N` (BR#5329) — never by
+      // guessing. (Pure decision: trainStampRefresh.)
+      const r = trainStampRefresh({ legs: stampLegs.map((l) => ({ ...l })), meta, note });
+      legs = r.legs;
+      for (const m of r.refreshed) {
+        this.audit(actor, "queue_stamp_refreshed", parentId, { leg: `${m.repo}#${m.number}`, head: m.head.slice(0, 9), via: m.via });
       }
     } else {
-      legs = trainParseNoteLegs(String(parent.body_md ?? ""));
+      // BR#5329 (BR#5048 structural follow-up #2): the verify VERDICT RECORD
+      // — the closing duty's seeded brief — names the verified PR (/pull/
+      // URL, auto-seeded) even when the verifier's close-note prose does
+      // not; parse it before the legacy parent body. The note's lone head
+      // pairs with a single-PR brief (the documented verifier convention).
+      legs = trainParseNoteLegs(String(src.dutyBody ?? ""));
+      if (!legs.length) legs = trainParseNoteLegs(String(parent.body_md ?? ""));
       const loneHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
       if (legs.length && loneHead) legs = legs.map((l, i) => (i === 0 ? { ...l, head_sha_at_acceptance: loneHead } : l));
     }

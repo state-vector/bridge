@@ -672,6 +672,91 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(String(lastQueued.summary)).not.toContain("stamp refreshed");
   });
 
+  it("BR#5329 defect 1: a re-verify accept citing the PR ONLY as the typed machine-leg prose (repo=o/r n=N) still REFRESHES the stamp — prose-only accepts cannot strand (BR#5202 ×3 class)", async () => {
+    const repo = "state-vector/kv-prose";
+    const H1 = "1".repeat(40), H2 = "2".repeat(40);
+    // first accept cites the full URL; the stamp lands at H1
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: kv-prose drill", session: "" });
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: kv-prose ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `verified — PR https://github.com/${repo}/pull/3300 head ${H1}` });
+    let c = (await kbJson("/get", { id: implId })).body;
+    expect(c.meta?.pr?.head_sha_at_acceptance).toBe(H1);
+    // bounce → re-enter → the fresh verifier cites the PR the way the park
+    // note's own typed machine leg does (`repo=o/r n=N`) — no /pull/ URL, no
+    // owner/name#N shorthand. Pre-5329 the parser read no legs here, the
+    // stamp stayed at H1, and the train coverage-bounced the UNCHANGED live
+    // head every cycle (BR#5202: three consecutive accepts, ~50 min loop).
+    await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "merge-train bounce — resolved" });
+    await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: `re-entered review — PR https://github.com/${repo}/pull/3300` });
+    const verify2 = await kbJson("/create", { type: "task", title: `VERIFY: kv-prose 2 ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verify2Id = String(verify2.body.id);
+    await kbJson("/link", { src: verify2Id, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verify2Id, to: "in_progress", actor: "drill-verifier", note: "re-verifying at the new head" });
+    // production order: the verifier parks the parent BEFORE closing the duty
+    await kbJson("/transition", { id: implId, to: "blocked", actor: "drill-verifier", session: "", note: `merge-train: queued — verify verdict ACCEPT (drill), single typed leg, head ${H2}`, await_event: { event: "pr_merged", repo, n: 3300 } });
+    const closed2 = await kbJson("/transition", { id: verify2Id, to: "done", actor: "drill-verifier", note: `head ${H2} — VERIFY ACCEPT (re-verify at the new head); PR receipts checked live this session. Parent ${implId} parked with the ONE typed leg await_event pr_merged repo=${repo} n=3300 (conjunction as prose, BR#3986).` });
+    expect(closed2.status, `re-verify close failed: ${JSON.stringify(closed2.body)}`).toBeLessThan(400);
+    c = (await kbJson("/get", { id: implId })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.pr).toMatchObject({ repo, number: 3300, head_sha_at_acceptance: H2 });
+    expect(c.meta?.prs).toHaveLength(1);
+    expect(c.meta?.merge_train?.legs_total).toBe(1);
+  });
+
+  it("BR#5329 defect 2: a close note citing ONLY slash-joined card refs creates NO meta.prs rows and does NOT queue — the ghost-lane defect is dead", async () => {
+    const H = "3".repeat(40);
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: ghost-prose drill", session: "" });
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: ghost-prose ${implId}`, roles: ["review"], session: "bridge-task-BR-drill-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "wip" });
+    await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: "ready for review — PR https://github.com/state-vector/ghost-prose/pull/3500" });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    // the BR#5304/BR#5315 close-note shape: slash-joined card refs + a head
+    // token, no real PR citation anywhere — pre-5329 this WROTE ghost legs
+    // ({repo:'4365/BR',number:4875}, {repo:'4728/BR',number:5299}) that
+    // queued ghost merge lanes on the SP train
+    const closed = await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `head ${H} — VERIFY ACCEPT; PR unpushed since round 1. Parent BR#4365/BR#4875, base-owned BR#4728/BR#5299 class.` });
+    expect(closed.status, `close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    const c = (await kbJson("/get", { id: implId })).body;
+    expect(c.status).toBe("in_review"); // nothing queued
+    expect(c.meta?.prs).toBeUndefined();
+    expect(c.meta?.pr).toBeUndefined();
+    expect(c.meta?.merge_train?.pr ?? 0).toBe(0);
+  });
+
+  it("BR#5329 (BR#5048 follow-up #2): the closing duty's seeded brief names the PR — a prose-only first accept still stamps and queues", async () => {
+    const repo = "state-vector/duty-brief";
+    const H = "4".repeat(40);
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: duty-brief drill", session: "" });
+    const implId = String(impl.body.id);
+    // the seeded duty brief: the /pull/ URL rides the DUTY BODY (auto-seeded),
+    // while the verifier's close note carries receipts + head only and the
+    // impl card body carries no PR reference at all
+    const verify = await kbJson("/create", {
+      type: "task",
+      title: `VERIFY: duty-brief ${implId}`,
+      roles: ["review"],
+      session: "bridge-task-BR-drill-verify",
+      body_md: `Verification duty for ${implId}.\n\nThen double-check, don't reimplement: confirm the receipts (PR: https://github.com/${repo}/pull/3400, merge state, findings) and that the work matches the task.\n\nACCEPT: record the LIVE head and put the 40-hex sha in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).`,
+    });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: "ready for review" });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "verifying" });
+    const closed = await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", note: `head ${H} — VERIFY ACCEPT; all substantive checks passed first-hand, zero authored pushes since round 1.` });
+    expect(closed.status, `close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    const c = (await kbJson("/get", { id: implId })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.pr).toMatchObject({ repo, number: 3400, head_sha_at_acceptance: H });
+    expect(c.meta?.prs?.[0]).toMatchObject({ repo, number: 3400, head_sha_at_acceptance: H });
+  });
+
   it("BR#4129 zombie eviction: a renewal with a frozen progress note on a non-empty queue is denied and EXPIRES — the next gateway's acquire takes over within a tick; legacy `{}` renewals still pass", async () => {
     const repo = "state-vector/lane-zombie";
     // a verify-accepted card queues — the lane's derived queue is non-empty

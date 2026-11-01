@@ -2508,8 +2508,42 @@ export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Z
  *  (`repo#N`) still counts as a PR reference. A full /pull/ URL wins when
  *  both cite the same PR (dedupe keeps the earliest mention); plain `#N`
  *  without an owner/name prefix never matches, so card ids and "unrelated
- *  #2534 merge" prose stay inert. */
-export const TRAIN_PR_SHORT_RE = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
+ *  #2534 merge" prose stay inert. The lookbehind (BR#5329) keeps the match
+ *  from STARTING mid-token: slash-joined card-reference prose —
+ *  `BR#4365/BR#4875` — must not parse as repo `4365/BR` #4875 (the match
+ *  used to begin right after the `#`, gluing the two card ids into a fake
+ *  repo and a ghost meta.prs row). */
+export const TRAIN_PR_SHORT_RE = /(?<![A-Za-z0-9_#./-])([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
+
+/** A well-shaped GitHub repo token for a parsed PR leg: owner = GitHub's
+ *  username charset (alphanumerics/hyphens — never dots or underscores) and
+ *  NOT purely numeric (GitHub forbids all-numeric owners), name =
+ *  alphanumerics/dots/underscores/hyphens. BR#5329 defect 2: every parsed
+ *  row is validated before it can become a meta.prs leg — `4365/BR` (an
+ *  all-numeric owner, a misread of `BR#4365/…` card prose) gh-404s and
+ *  queues a ghost merge lane; it never leaves this parser. */
+export const TRAIN_REPO_SHAPE_RE = /^([A-Za-z0-9-]+)\/[A-Za-z0-9._-]+$/;
+export function trainRepoTokenValid(repo: string): boolean {
+  const m = TRAIN_REPO_SHAPE_RE.exec(String(repo ?? ""));
+  return !!m && !/^\d+$/.test(m[1]);
+}
+
+/** The typed machine-leg prose every verify park/close note carries —
+ *  `repo=owner/name n=2624` (and the seeded brief's JSON-ish
+ *  `repo:"owner/name", n:307`). BR#5329 defect 1: verifier close notes cite
+ *  the PR ONLY this way (plus a bare `head <sha>` token) — neither the
+ *  /pull/ URL nor the owner/name#N shorthand matched, so the accept stamp
+ *  stayed at the PRIOR verdict's head and every re-verify coverage-bounced
+ *  at an unchanged live head. The two halves must sit adjacent (one regex
+ *  match), so a `repo=` citation without its `n=` never invents a leg. */
+export const TRAIN_PR_KV_RE = /\brepo\s*[=:]\s*"?([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)"?\s*,?\s*n\s*[=:]\s*"?(\d+)"?/g;
+
+/** A bare, context-bound PR citation — `PR #2624` (BR#5329): `#N` alone is
+ *  inert (card refs), but `PR #N` is an explicit PR reference. It carries no
+ *  repo, so it never CREATES a leg — trainStampRefresh uses it to identify
+ *  which of the card's EXISTING open legs a lone `head <sha>` token names
+ *  (the stamp supplies the repo). */
+export const TRAIN_PR_BARE_RE = /\bPR\s*#(\d+)(?!\d)/g;
 
 export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
 
@@ -2528,21 +2562,29 @@ export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptanc
  *  "- PR n\n  head <sha>" list layout). Anything unpaired stays unbound —
  *  the queue arm fail-closes on it. Never a silent cross-pairing. A PR may
  *  be cited as the full /pull/ URL or the board's `owner/name#N` shorthand
- *  (BR#4648) — the URL form wins when both cite the same PR. */
+ *  (BR#4648), or the typed machine-leg prose `repo=owner/name n=N` (BR#5329)
+ *  — the URL form wins when several forms cite the same PR. Every parsed
+ *  row must pass trainRepoTokenValid (BR#5329 defect 2) before it can
+ *  become a leg. */
 export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const t = String(text ?? "");
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
   const seen = new Set<string>();
-  for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-    seen.add(`${m[1]}/${m[2]}#${m[3]}`);
-  }
-  for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
-    const key = `${m[1]}/${m[2]}#${m[3]}`;
-    if (seen.has(key)) continue; // the same PR already cited by its URL
+  // BR#5329: every parsed row passes trainRepoTokenValid BEFORE it can
+  // become a leg — a repo token that is not a real GitHub repo shape
+  // (all-numeric owner: a misread `BR#N/BR#M` card reference) never leaves
+  // this parser, so no ghost meta.prs row / ghost merge lane can be written.
+  const push = (repo: string, number: number, m: RegExpMatchArray) => {
+    if (!trainRepoTokenValid(repo)) return;
+    const key = `${repo}#${number}`;
+    if (seen.has(key)) return; // the same PR already cited by an earlier form
     seen.add(key);
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-  }
+    prs.push({ repo, number, index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  };
+  for (const m of t.matchAll(TRAIN_PR_URL_RE)) push(`${m[1]}/${m[2]}`, Number(m[3]), m);
+  // the typed machine-leg prose (`repo=owner/name n=N` / `repo:"owner/name", n:N`)
+  for (const m of t.matchAll(TRAIN_PR_KV_RE)) push(`${m[1]}/${m[2]}`, Number(m[3]), m);
+  for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) push(`${m[1]}/${m[2]}`, Number(m[3]), m);
   prs.sort((a, b) => a.index - b.index);
   if (!prs.length) return [];
   const heads: { sha: string; index: number; end: number; used: boolean }[] = [];
@@ -2611,4 +2653,41 @@ export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
     number: p.number,
     ...(paired[i] !== null ? { head_sha_at_acceptance: heads[paired[i] as number].sha } : {}),
   }));
+}
+
+/** BR#5329 defect 1 — the no-PR-citation stamp refresh (pure; the accept
+ *  hook applies it). The close note carried a `head <sha>` token but NO
+ *  parseable PR reference (the pre-5329 parser saw only /pull/ URLs and
+ *  owner/name#N — today's verifiers cite `PR #2624` bare or the typed
+ *  `repo=o/r n=N` machine leg), so the accept stamp stayed at the PRIOR
+ *  verdict's head and every re-verify coverage-bounced at an UNCHANGED live
+ *  head (BR#5202 ×3, BR#5304). The note still speaks for a leg when:
+ *  - it has a lone head and the stamp has exactly ONE open leg (BR#4648,
+ *    unchanged), or
+ *  - it has a lone head and EXPLICITLY names one open leg in prose —
+ *    bare `PR #N` (no repo, the stamp supplies it). Never by guessing: a
+ *    multi-open-leg stamp with no named leg stays fail-closed, and a named
+ *    leg only refreshes when the head actually moved (a no-op re-accept
+ *    stays a no-op).
+ *  Returns the (copied) legs and the legs that moved, each with the `via`
+ *  string for the hook's audit trail. */
+export function trainStampRefresh(input: { legs: TrainLeg[]; meta: any; note: string }): { legs: TrainLeg[]; refreshed: { number: number; repo: string; head: string; via: string }[] } {
+  const loneHead = TRAIN_HEAD_STAMP_RE.exec(String(input.note ?? ""))?.[1];
+  const refreshed: { number: number; repo: string; head: string; via: string }[] = [];
+  if (!loneHead) return { legs: input.legs, refreshed };
+  const legs = input.legs.map((l) => ({ ...l }));
+  const open = legs.filter((l) => !trainLegLanded(input.meta, l));
+  const bareRefs = new Set([...String(input.note ?? "").matchAll(TRAIN_PR_BARE_RE)].map((m) => Number(m[1])));
+  // BR#4648: a single-unlanded-leg stamp has nothing to cross-pair, so the
+  // lone head refreshes it — a verifier citing bare receipts must not
+  // strand the stamp on an old head. Multi-leg stamps stay fail-closed
+  // UNLESS the note itself names the leg (BR#5329).
+  const named = open.filter((l) => bareRefs.has(l.number));
+  const target = open.length === 1 ? open[0] : named.length === 1 ? named[0] : undefined;
+  const via = open.length === 1 ? "lone head token — the close note cited no PR reference (BR#4648)" : "bare `PR #N` citation + lone head token (BR#5329)";
+  if (target && target.head_sha_at_acceptance !== loneHead) {
+    target.head_sha_at_acceptance = loneHead;
+    refreshed.push({ number: target.number, repo: target.repo, head: loneHead, via });
+  }
+  return { legs, refreshed };
 }
