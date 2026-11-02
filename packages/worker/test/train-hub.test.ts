@@ -2111,7 +2111,11 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(brr.whats_broken).toEqual([{ name: "Test", url: "https://example.test/5349" }]);
     expect(brr.held).toBe(2);
     // the episode's OPEN alarm ask — verbatim id / canonical url / question / options
-    const ask = (await kbJson("/search", { q: "MERGE TRAIN BLOCKED", type: "question", limit: 50 })).body.artefacts
+    // the episode's OPEN alarm ask — verbatim id / canonical url / question / options
+    // (repo-unique token: the generic "MERGE TRAIN BLOCKED" query drowns past
+    // the 50-row FTS rank limit in a full-file run once the briefs carry the
+    // BR#5516 Read-of-the-red triage lines — same law as the brr-live test)
+    const ask = (await kbJson("/search", { q: "lane-brr", type: "question", limit: 50 })).body.artefacts
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
     expect(ask).toBeTruthy();
     expect(brr.ask.id).toBe(ask.id);
@@ -2261,6 +2265,68 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane3 = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane3.rerun_failed).toBeTruthy();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-disp" });
+  });
+
+  it("BR#5516: no root-fix card needed — a QUEUED fix-shaped cure PR renders bypass-first in the ask (the 2026-11-02 bridge episode: verified PR queued, ask said 'no fix PR'), the brief carries the Read-of-the-red triage lines, and a bypass answer dispatches the merge authority", async () => {
+    const repo = "state-vector/lane-brr-queue";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — brr-queue", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-brrq", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 55161, head: "e".repeat(40), title: "IMPL: brr-queue held feature" });
+    // the episode's cure: an ORDINARY card (no root_fix meta) queued on the
+    // lane, PR bound by the accept chain — the exact BR#5487/PR#357 shape
+    const cFix = await queueViaAccept({ repo, pr: 55162, head: "f".repeat(40), title: "fix(ci): main-green gate structurally self-failing — drill cure" });
+    const stampRed = () =>
+      kbJson("/train.queue_facts", {
+        repo, base: "main", actor: "gw-brrq",
+        entries: [ { id: cFix, pr: 55162, cls: "blocked" }, { id: c1, pr: 55161, cls: "blocked" } ],
+        base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "main-green gate", url: "https://example.test/queue" }], unsettled: [] },
+      });
+    expect((await stampRed()).body.error ?? "").toBe("");
+
+    const ask = (await kbJson("/search", { q: "lane-brr-queue", type: "question", limit: 50 })).body.artefacts
+      .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
+    expect(ask).toBeTruthy();
+    // the bypass option carries the QUEUED cure PR's number, first
+    const askMetaM = typeof ask.meta === "string" ? JSON.parse(ask.meta) : ask.meta ?? {};
+    expect(askMetaM.ask.options[0]).toContain("Bypass-merge fix PR #55162");
+    expect(String(ask.body_md)).toContain("https://github.com/" + repo + "/pull/55162");
+    // triage-before-menu: the brief carries the Read-of-the-red lines — the
+    // gate-self-failure shape says a re-run fails identically, in plain text
+    expect(String(ask.body_md)).toContain("Read of the red");
+    expect(String(ask.body_md)).toContain("re-run fails IDENTICALLY");
+    // fix_card rides the resolution with the cure PR (status-side join)
+    const lane = await laneSnap(repo);
+    expect(lane.base_red_resolution.fix_card.pr).toBe(55162);
+
+    // the bypass answer dispatches the merge authority on the lane card
+    const a = await kbJson("/ask.answer", { id: ask.id, answer: "(Recommended) Bypass-merge fix PR #55162 now", actor: "web:ray" });
+    expect(a.status).toBe(200);
+    const lane2 = await laneSnap(repo);
+    expect(lane2.bypass_merge).toBeTruthy();
+    expect(lane2.bypass_merge.pr).toBe(55162);
+    expect(lane2.bypass_merge.repo).toBe(repo);
+
+    // a NON-fix-shaped queued PR never becomes the cure — the bypass must
+    // not offer an arbitrary held PR (fresh lane, only the IMPL card queued)
+    const repo2 = "state-vector/lane-brr-plain";
+    await acquire(repo2, "gw-brrp", { merge_capable: true, required_workflows: ["Test"] });
+    const c2 = await queueViaAccept({ repo: repo2, pr: 55163, head: "g".repeat(40), title: "IMPL: brr-plain held feature" });
+    const r2 = await kbJson("/train.queue_facts", {
+      repo: repo2, base: "main", actor: "gw-brrp",
+      entries: [ { id: c2, pr: 55163, cls: "blocked" } ],
+      base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "Test", url: "https://example.test/plain" }], unsettled: [] },
+    });
+    expect(r2.body.error ?? "").toBe("");
+    const ask2 = (await kbJson("/search", { q: "lane-brr-plain", type: "question", limit: 50 })).body.artefacts
+      .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo2}@main`));
+    expect(ask2).toBeTruthy();
+    const ask2Meta = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
+    expect(ask2Meta.ask.options[0]).toContain("Hold the line");
+    expect(ask2Meta.ask.options.join(" ")).not.toContain("Bypass-merge");
+    expect(String(ask2.body_md)).toContain("diagnosis pending");
+    await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-brrp" });
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brrq" });
   });
 
   it("BR#5376: a stalled batch rides the walk stamp — the lane renders the loud STALLED reason (batch, duration, WHY), train.status serves stalled_resolution (batch/ticks/for_ms/last_error/ask/unblock), the ONE-per-episode ask dedupes the per-tick repeats, base-red suppresses the stall banner, and the next stamp WITHOUT the episode clears everything by itself", async () => {
