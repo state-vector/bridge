@@ -834,6 +834,10 @@ export interface AgentSignals {
   artefacts_created: number;
   /** role:review agents only: unclaimed verify tasks blocking a parent's owner */
   verify_duty_backlog: number;
+  /** BR#5517: stop-the-line episodes blamed on this agent's cards — the impl
+   *  and verify sessions that executed the culprit card each eat one
+   *  train_red incident per episode (dedupe by stop sha, capped in scoreAgent). */
+  train_red: number;
 }
 
 export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
@@ -871,6 +875,14 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   if (s.verify_duty_backlog > 0) {
     score -= Math.min(20, s.verify_duty_backlog * 10);
     hints.push(`${s.verify_duty_backlog} stalled verify task(s) are unclaimed and blocking their parent's owner — pick one up: check receipts, close or bounce the parent`);
+  }
+  // BR#5517 train-red blame: a stop-the-line episode whose culprit card this
+  // agent's sessions executed (impl or verify leg) costs each of those
+  // sessions a penalty — the signal is computed hub-side with the receipts
+  // already on the card, capped so one bad night cannot zero an agent.
+  if (s.train_red > 0) {
+    score -= Math.min(15, s.train_red * 5);
+    hints.push(`${s.train_red} stop-the-line episode(s) were blamed on a card your sessions executed (impl/verify) — a train_red ding: fix the culprit card and the train_red signal stays until the episode is exonerated`);
   }
 
   score = Math.max(0, Math.min(100, Math.round(score)));

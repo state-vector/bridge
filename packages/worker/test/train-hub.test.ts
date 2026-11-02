@@ -1615,6 +1615,53 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-inc" });
   });
 
+  it("BR#5517 bisect override: the walk's true culprit gets the ding, the wrongly stop-named card's episode is pardoned", async () => {
+    const repo = "state-vector/lane-ding-pardon";
+    await acquire(repo, "gw-pardon", { required_workflows: ["Test"], burst_max: 10 });
+    const H1 = "5".repeat(40), H2 = "6".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5401, head: H1, title: "IMPL: pardon drill — true culprit" });
+    const c2 = await queueViaAccept({ repo, pr: 5402, head: H2, title: "IMPL: pardon drill — stop-named final" });
+    // distinct impl legs on the two cards (version receipts = the blame source)
+    await kbJson("/progress.log", {
+      id: c1, actor: "impl-true-ding",
+      note: "true culprit session — bisect drill progress note",
+      completion_pct: 30, confidence_pct: 70, risk_pct: 20,
+    });
+    await kbJson("/progress.log", {
+      id: c2, actor: "impl-stop-ding",
+      note: "stop-named final session — bisect drill progress note",
+      completion_pct: 30, confidence_pct: 70, risk_pct: 20,
+    });
+    const M1 = "a".repeat(40), M2 = "b".repeat(40);
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pardon", pr: 5401, merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10 });
+    await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: "gw-pardon", pr: 5402, merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true });
+    // the settle comes back RED on the final sha → the stop blames the FINAL
+    // card's sessions (the stop flow's default culprit)
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-pardon", sha: M2, checks: [check(75, "Test", "failure")] });
+    expect(ci.body.decided).toBe("stopped");
+    const rowIn = (agents: any[], label: string) => agents.find((a: any) => a.label === label);
+    const afterStop = (await kbJson("/board")).body.agents as any[];
+    expect(rowIn(afterStop, "impl-stop-ding")?.train_red).toBe(1);
+    expect(rowIn(afterStop, "impl-true-ding")?.train_red).toBe(0);
+
+    // the walk probes M1 → RED → c1 is THE culprit: the final card's episode
+    // is pardoned (its ding leaves the board) and c1's sessions are dinged
+    const bisect = await kbJson("/train.bisect", {
+      repo, base: "main", actor: "gw-pardon",
+      step: { sha: M1, verdict: "red" }, culprit_task: c1, culprit_sha: M1,
+    });
+    expect(bisect.body.error ?? "", JSON.stringify(bisect.body)).toBe("");
+    expect(bisect.body.bounced).toBe(c1);
+    const afterWalk = (await kbJson("/board")).body.agents as any[];
+    const stopRow = rowIn(afterWalk, "impl-stop-ding");
+    expect(stopRow?.train_red).toBe(0);
+    expect(stopRow.hints.join(" ")).not.toMatch(/stop-the-line episode/);
+    const trueRow = rowIn(afterWalk, "impl-true-ding");
+    expect(trueRow?.train_red).toBe(1);
+    expect(trueRow.hints.join(" ")).toMatch(/stop-the-line episode/);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-pardon" });
+  });
+
   it("BR#4934 settle-window rebase: train.carry appends the verdict-carry chain (contiguity enforced, gaps fail loud)", async () => {
     const repo = "state-vector/lane-carry";
     await acquire(repo, "gw-carry", {});

@@ -208,7 +208,7 @@ import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from
 const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
   reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
-  artefacts_created: 0, verify_duty_backlog: 0,
+  artefacts_created: 0, verify_duty_backlog: 0, train_red: 0,
 };
 
 describe("role playbook resolution (settings.roles overrides)", () => {
@@ -265,6 +265,15 @@ describe("agent behaviour score", () => {
     const mixed = scoreAgent({ ...zero, result_lost: 2, abandoned: 1 });
     expect(mixed.score).toBe(40);
     expect(mixed.hints.join(" ")).toMatch(/watchdog-blocked/);
+  });
+
+  it("BR#5517: a train_red ding costs 5 per episode, capped at 15, with the exoneration hint", () => {
+    const one = scoreAgent({ ...zero, train_red: 1 });
+    expect(one.score).toBe(45);
+    expect(one.hints.join(" ")).toMatch(/stop-the-line episode/);
+    const many = scoreAgent({ ...zero, train_red: 5 });
+    expect(many.score).toBe(35); // min(15, 5×5) — capped, one bad night ≠ zero
+    expect(many.hints.join(" ")).toMatch(/5 stop-the-line episode/);
   });
 });
 
