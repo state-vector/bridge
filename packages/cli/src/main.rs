@@ -339,6 +339,12 @@ fn run(cfg: Option<DispatchConfig>) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
+                    sweep_repos: std::env::var("BRIDGE_SWEEP_REPOS")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
                     identity: None, // built-in worker class applies (BR#3185)
                 },
             });

@@ -57,6 +57,11 @@ export const BridgeConfigSchema = z.looseObject({
   // when BR#3204 landed, and the store parity test reds the build (found
   // completing the main-red base fix, BR#551 stop-the-line).
   worktree_exempt_repos: z.array(z.string()),
+  // Extra sweep roots for the worktree hygiene sweep (env BRIDGE_SWEEP_REPOS)
+  // — always written (serde serializes the Vec even empty); landed in the
+  // Rust struct + checked-in projection together but the zod shape was
+  // missed, and the drift alarm reds the build (BR#5484 main-red fix).
+  sweep_repos: z.array(z.string()),
   // legacy (accepted on load, folded into backends, never written once empty)
   models: z.record(z.string(), z.string()).optional(),
   agents: z.record(z.string(), z.string()).optional(),
