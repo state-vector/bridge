@@ -550,6 +550,9 @@ subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes i
 - **`options` — the decision.** 2–8 one-click answers (rejected with fewer): the recorded
   click is the answer, and it closes the question `done`. When the asker recommends an
   option it is **first** and prefixed `(Recommended)` — the first button is the recommendation.
+  The dispatch-verb match (below) reads the option and the answer after stripping that
+  recommendation marker (BR#5570), so a `(Recommended) SUPERSEDE — …` option dispatches
+  exactly like a verb-first one.
 
 Asks carry ordinary BR# ids, so refs linkify wherever BR# refs render (cards, task detail —
 the ref scanner in `packages/ui-kit/src/views/refs.ts`) and resolve via `get_artefact` like
@@ -562,7 +565,10 @@ that opens a text input: the typed text is recorded with the ask exactly like a 
 (BR#3912 — an option that promises a rewrite, like "RE-SCOPE — I'll rewrite the card
 myself", needs somewhere to write it). Typed answers follow the same dispatch law as
 clicks: an answer starting with a RE-SCOPE/KEEP option verb keeps the subject parked,
-RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resumes it.
+RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resumes it —
+the verb is matched after a leading `(Recommended)` marker is stripped (BR#5570), so a
+rule-6c recommended option dispatches like a verb-first one and a `(Recommended) KEEP`
+click stays a deliberate park instead of silently resuming.
 `urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.

@@ -368,6 +368,71 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     expect(after.body.status).toBe("superseded");
   });
 
+  it("a rule-6c '(Recommended) SUPERSEDE — …' option still dispatches when the click echoes the prefix (BR#5570 — specimen ask BR#5531 → lane BR#5497 unretired)", async () => {
+    // the exact live shape: recommended option FIRST with the "(Recommended)"
+    // prefix; the web button click echoes the full option text as the answer.
+    // Before BR#5570 the answer started with "(recommended)", startsWith
+    // failed, optHit was false, and the ask fell through to the generic
+    // rule-6 resume — the recorded GO never executed.
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#5570 rule-6c supersede dispatch target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Execute the recorded retire-GO: drop this card?",
+      options: ["(Recommended) SUPERSEDE — drop it now", "KEEP — stay parked", "RE-SCOPE — I'll rewrite it myself"],
+      reason: "BR#5570 regression fixture",
+      to: "human",
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
+    });
+    expect(ask.status).toBe(200);
+    const parked = await kbJson("/get", { id: t.id });
+    expect(parked.body.status).toBe("blocked");
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "(Recommended) SUPERSEDE — drop it now", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.error).toBeUndefined();
+    expect(ans.body.task_status).toBe("superseded");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("superseded");
+  });
+
+  it("a rule-6c '(Recommended) KEEP — …' click stays a deliberate park — no silent resume (BR#5570)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#5570 rule-6c keep-park target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Keep parked while the base is red?",
+      options: ["(Recommended) KEEP — stay parked", "RELEASE — back to the pool"],
+      reason: "BR#5570 regression fixture",
+      to: "human",
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
+    });
+    expect(ask.status).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "(Recommended) KEEP — stay parked", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    // optHit must be TRUE so the KEEP leg keeps the card parked; before the
+    // fix the prefix broke the match and the ask resumed the card instead.
+    expect(ans.body.task_status).toBe("blocked");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("blocked");
+  });
+
+  it("a plain non-dispatch '(Recommended) …' answer still falls through to the resume legs (BR#5570 — no over-broad dispatch)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#5570 non-dispatch resume target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Proceed with the ordinary plan?",
+      options: ["(Recommended) Yes — proceed", "No — rethink"],
+      reason: "BR#5570 regression fixture",
+      to: "human",
+      details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
+    });
+    expect(ask.status).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "(Recommended) Yes — proceed", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    // no dispatch verb anywhere → the generic rule-6 resume still runs
+    expect(ans.body.task_status).toBe("in_progress");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("in_progress");
+  });
+
   it("a bare agent session cannot supersede a parked card via transition (BR#3913 authority guard)", async () => {
     const { body: t } = await kbJson("/create", { type: "task", title: "BR#3913 agent-supersede refused" });
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
