@@ -1,13 +1,17 @@
 # Bridge repo — engineering rules for agent sessions
 
-## The shared checkout is MULTI-SESSION (read this before editing anything)
+## The working dir is the HUMAN'S — agent sessions work in registered worktrees (read this before editing anything)
 
-Multiple agent sessions work THIS SAME CHECKOUT concurrently. Incidents
-already caused by ignoring this: a committed feature reverted as "foreign
-WIP", a 22-file `add -A` sweep swallowing another session's in-flight work,
-mid-chain branch switches landing commits on the wrong branch, and a column
-added to a table with no matching track (broke the layout for three rounds
-while the owner probed their own stale approximation of the markup).
+Multiple agent sessions work THIS REPO concurrently — each in its own
+registered worktree (rule 6). The checked-out working dir is the human's
+local run space. Incidents already caused by ignoring this: a committed
+feature reverted as "foreign WIP", a 22-file `add -A` sweep swallowing
+another session's in-flight work, mid-chain branch switches landing commits
+on the wrong branch, a column added to a table with no matching track (broke
+the layout for three rounds while the owner probed their own stale
+approximation of the markup), and a merged branch left checked out and
+reused as a rolling base by three later tasks — the pile-up of foreign WIP
+made the human's own `git checkout main` fail (2026-11-02).
 
 Rules, in force:
 
@@ -32,24 +36,45 @@ Rules, in force:
    --show-current` before committing; if your commit landed on a foreign
    branch, cherry-pick it to main via a throwaway worktree instead of
    switching the shared checkout.
- 6. **Long edits want a worktree — register it, and the run owns its
-    cleanup.** `git worktree add` for anything beyond a few files — the
-    shared checkout is for short, surgical changes. **Register it at
-    creation** (this is the mechanical contract — the sweep enumerates
-    REGISTERED trees only, an unregistered tree is never swept):
+ 6. **All agent work happens in a registered worktree — never the shared
+    working dir.** The checkout itself is the HUMAN's local run space: the
+    human runs/reads code there (Ray directive 2026-11-02: "use worktrees
+    for work, never the normal working dir; clean up worktrees after;
+    leave working dir on main"). Agent sessions must not edit, build into,
+    commit in, or branch-switch the shared checkout — not even "just a
+    small change"; read-only probing (status/grep/gh) stays fine. Start
+    every session's work by cutting a worktree off origin/main:
+
+        git worktree add <abs sibling path> -b bridge/BR-<task> origin/main
+
+    **Register it at creation** (this is the mechanical contract — the
+    sweep enumerates REGISTERED trees only, an unregistered tree is never
+    swept):
 
         mkdir -p ~/.bridge && printf '%s\n' \
           '{"path":"<ABS worktree path>","repo":"<owner/name>","task":"<BR#N>","ts":<epoch-ms>}' \
           >> ~/.bridge/worktree-registry.jsonl
 
-    **Remove your worktree before the run ends** (`git worktree remove
-    <path>`; delete its branch if merged) — the registry line prunes
-    itself once the path is gone. Abandoned trees are the #1 disk leak on
-    this repo (185 strays / 471 GB observed on 2026-11-02). The gateway's
-    hygiene sweep is the backstop, not the owner — it enumerates the
-    registry plus the runner's own clones (preserving uncommitted WIP onto
+    **Clean up before the run ends**: `git worktree remove <path>`; delete
+    its branch if merged — the registry line prunes itself once the path
+    is gone. **Leave the shared checkout on main and clean.** If it is off
+    main or dirty when you arrive, do not work there and do not discard
+    what you found: park the residue on a `wip/<task>-<date>` branch
+    (BR#3204/BR#3633 law — never another session's discard), restore main,
+    work in your tree. Abandoned trees are the #1 disk leak on this repo
+    (185 strays / 471 GB observed on 2026-11-02; three stray trees plus a
+    stale merged branch found the same day). The gateway's hygiene sweep
+    is the backstop, not the owner — it enumerates the registry plus the
+    runner's own clones (preserving uncommitted WIP onto
     `wip/<task>-<date>` branches first, BR#3204/BR#3633 law), so a
     registered tree is swept by status/age rules even if its session died.
+ 7. **Land direct to main.** Commit in your worktree, push straight to
+    main — no PR round-trip, no merge-train wait (Ray directive
+    2026-11-02: "EVERYTHING DIRECT TO MAIN"). The PR/verify ceremony is
+    gone for this repo's day-to-day changes; main's mechanical gates still
+    apply (signed commits, CI on the push). If main is red, land the fix
+    first or hold — never stack work on a red main silently. Bigger or
+    riskier changes still get a second pair of eyes — ask, don't assume.
 
 The signature failure mode of this repo is not bugs in code — it is two
 sessions each holding a stale model of the tree. Every rule above exists
