@@ -57,6 +57,13 @@ export const BridgeConfigSchema = z.looseObject({
   // when BR#3204 landed, and the store parity test reds the build (found
   // completing the main-red base fix, BR#551 stop-the-line).
   worktree_exempt_repos: z.array(z.string()),
+  // 2026-11-02 (14d8c1ea3 follow-up): extra repo roots whose registered
+  // worktrees the hygiene sweep enumerates — the worktree registry is the
+  // primary mechanism; this is the explicit escape hatch. Always written
+  // (serde parity). The schema projection was hand-edited without this zod
+  // leg, reding the drift alarm on every push since — found completing the
+  // main-red base fix.
+  sweep_repos: z.array(z.string()),
   // legacy (accepted on load, folded into backends, never written once empty)
   models: z.record(z.string(), z.string()).optional(),
   agents: z.record(z.string(), z.string()).optional(),
