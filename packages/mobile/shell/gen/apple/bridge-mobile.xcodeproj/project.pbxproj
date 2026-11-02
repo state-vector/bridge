@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		039D8C6FBAC989B48234A1BA /* BridgeShellUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A595DFC3C3B78047996A89A0 /* BridgeShellUITests.swift */; };
+		111B0B435F39452DB5B8332C /* BridgeRealTapUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AC0E68A2DECE457833C0A17 /* BridgeRealTapUITests.swift */; };
 		163CEC4C83B2F8AF604D9143 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = C43948B4C14DFF44E6FEED01 /* libapp.a */; };
 		2372F2E91BD609B566CB42B9 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 63F443C0CF98FF8BB5C43DD2 /* QuartzCore.framework */; };
 		3ED58F9192D13D513B81170B /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 5617AECEB7A7475D4CCF5AFD /* main.mm */; };
@@ -37,6 +38,7 @@
 
 /* Begin PBXFileReference section */
 		02D366CADFD16DB35832EC8A /* ios_notify.rs */ = {isa = PBXFileReference; path = ios_notify.rs; sourceTree = "<group>"; };
+		0AC0E68A2DECE457833C0A17 /* BridgeRealTapUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeRealTapUITests.swift; sourceTree = "<group>"; };
 		11ABEBC831FBCCD2C04F5F73 /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = System/Library/Frameworks/AVFAudio.framework; sourceTree = SDKROOT; };
 		123047406EF321E03073F7C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		14AE49CFF73C1C631D797E38 /* console.rs */ = {isa = PBXFileReference; path = console.rs; sourceTree = "<group>"; };
@@ -91,6 +93,7 @@
 		0E47CDD977E2CEA0318FEDF4 /* UITests */ = {
 			isa = PBXGroup;
 			children = (
+				0AC0E68A2DECE457833C0A17 /* BridgeRealTapUITests.swift */,
 				A595DFC3C3B78047996A89A0 /* BridgeShellUITests.swift */,
 			);
 			path = UITests;
@@ -196,7 +199,7 @@
 			path = Sources;
 			sourceTree = "<group>";
 		};
-		"TEMP_FF7AA875-D160-4A6B-B83D-1027FDF862B9" /* arm64 */ = {
+		"TEMP_6938B376-5DEE-460B-A7F4-E61789DE0766" /* arm64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -258,6 +261,8 @@
 						ProvisioningStyle = Automatic;
 					};
 					8B7C251DE1569869ABD9B104 = {
+						DevelopmentTeam = A8G8PC6Q6K;
+						ProvisioningStyle = Automatic;
 						TestTargetID = 19D7220356E0056833BCF567;
 					};
 				};
@@ -332,6 +337,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				111B0B435F39452DB5B8332C /* BridgeRealTapUITests.swift in Sources */,
 				039D8C6FBAC989B48234A1BA /* BridgeShellUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -440,6 +446,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = A8G8PC6Q6K;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -458,6 +466,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = A8G8PC6Q6K;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

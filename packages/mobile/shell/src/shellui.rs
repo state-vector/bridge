@@ -6,8 +6,11 @@
 //!   same localStorage key the UI already writes (`bridge.url`).
 //! - the initialization script: a shell-owned ask-watch that polls hub
 //!   /api/state for open decisions and hands them to the Rust notification
-//!   core, plus a 401-triggered sign-in affordance. Nothing here changes the
-//!   @bridge/mobile-ui dist (PR bridge#40's fork-free contract).
+//!   core, plus a sign-in bridge with two shell-owned entry points: a 401-
+//!   triggered banner, and (BR#5449) the app's persistent Connect card which
+//!   dispatches a `bridge:sign-in` DOM event the init script listens for.
+//!   Nothing here changes the @bridge/mobile-ui dist (PR bridge#40's
+//!   fork-free contract).
 
 use tauri::Url;
 
@@ -112,7 +115,18 @@ pub const INIT_SCRIPT: &str = r##"(function () {
   };
 
   // ---- sign-in affordance (shell-owned; the mobile-ui dist stays untouched) ----
+  // Two entry points, one flow: (a) the 401-triggered banner below, and
+  // (b) BR#5449 — the app's persistent Connect card dispatches a
+  // `bridge:sign-in` DOM event (fork-free: the shell owns the navigation).
   var banner = null;
+  var startSignIn = function () {
+    var h = hub();
+    if (!h) { log("no hub url — enter it in Connect first"); return; }
+    invoke("shell_sign_in", { hub: h }).then(function () {
+      log("navigating to sign-in:", h + "/login?shell=1");
+      location.href = h + "/login?shell=1";
+    });
+  };
   var showBanner = function () {
     if (banner || !document.body) return;
     banner = document.createElement("button");
@@ -120,18 +134,12 @@ pub const INIT_SCRIPT: &str = r##"(function () {
     banner.style.cssText = "position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:2147483647;" +
       "padding:12px 22px;border-radius:999px;border:0;background:#4f46e5;color:#fff;" +
       "font:600 15px -apple-system,system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35)";
-    banner.onclick = function () {
-      var h = hub();
-      if (!h) { log("no hub url — enter it in Connect first"); return; }
-      invoke("shell_sign_in", { hub: h }).then(function () {
-        log("navigating to sign-in:", h + "/login?shell=1");
-        location.href = h + "/login?shell=1";
-      });
-    };
+    banner.onclick = startSignIn;
     document.body.appendChild(banner);
     log("auth needed — sign-in banner shown");
   };
   var hideBanner = function () { if (banner) { banner.remove(); banner = null; log("session ok — banner hidden"); } };
+  document.addEventListener("bridge:sign-in", startSignIn);
 
   // Wrap fetch to notice hub 401s (the app shows only generic "hub unreachable")
   // and to carry the shell session token on hub requests.

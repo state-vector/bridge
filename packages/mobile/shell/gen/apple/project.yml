@@ -177,3 +177,6 @@ targets:
         PRODUCT_NAME: bridge-mobile_UITests
         TEST_TARGET_NAME: bridge-mobile_iOS
         GENERATE_INFOPLIST_FILE: YES
+        # Device test runs sign the test bundle too (BR#5449 device lane).
+        DEVELOPMENT_TEAM: A8G8PC6Q6K
+        CODE_SIGN_STYLE: Automatic
