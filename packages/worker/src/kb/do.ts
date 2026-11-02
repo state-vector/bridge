@@ -6351,10 +6351,24 @@ export class KnowledgeHub {
           // not its first 12 chars — "RE-SCOPE: <new scope>" stays a
           // human-owned park exactly like "RE-SCOPE — I'll rewrite…", and a
           // typed "SUPERSEDE: x" drops instead of silently resuming
+          // BR#5570: rule-6c asks lead the recommended option with
+          // "(Recommended)" and a web button click echoes the FULL option
+          // text back as the answer — both the option's first token and
+          // the answer then start with "(recommended)", never the verb,
+          // so optHit was false and the ask fell through to the generic
+          // resume: the recorded GO never executed (ask BR#5531 → ghost
+          // lane BR#5497 unretired; the KEEP-park class silently RESUMED
+          // instead). Strip that leading marker (case-insensitive,
+          // optional trailing whitespace) from BOTH sides before the
+          // match; the verb-first style ("SUPERSEDE (Recommended) — …")
+          // still matches unchanged, and KEEP/RE-SCOPE keep their
+          // deliberate-park semantics.
+          const stripRecommended = (s: string): string =>
+            s.trim().replace(/^\(recommended\)\s*/i, "").trim();
           const optHit = (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
-            .map((o) => String(o ?? "").trim().split(/\s+/)[0] ?? "")
+            .map((o) => stripRecommended(String(o ?? "")).split(/\s+/)[0] ?? "")
             .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
-            .some((verb) => answer.trim().toLowerCase().startsWith(verb.toLowerCase()));
+            .some((verb) => stripRecommended(answer).toLowerCase().startsWith(verb.toLowerCase()));
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
