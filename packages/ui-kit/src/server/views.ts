@@ -125,7 +125,7 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
   time: { key: "time", title: "Awaiting a date", icon: "◷", note: "time-gated — flips when the clock passes." },
   main: { key: "main", title: "Awaiting green main", icon: "✖", note: "red-main / stop-the-line hold — resumes when the line is green." },
   other: { key: "other", title: "Blocked — other", icon: "▪", note: "no typed leg matched — open the card to resolve or re-scope." },
-  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); release early if you disagree." },
+  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); Release (or Release all) to put one back now — protected parks refuse and say why." },
 };
 
 /** Render order for the Backlog exit-class groups: human levers first, then
