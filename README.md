@@ -693,7 +693,22 @@ every tick. Two laws now hold:
   and its cure PR — and the executor refreshes the OPEN ask in place every red tick,
   so the bypass option CARRIES the cure PR's number the moment one binds (never
   again the old `Bypass-merge a cure PR (I'll reply with the number)` shape that
-  demanded a number a one-shot ask could never learn). Options mirror the triage
+  demanded a number a one-shot ask could never learn). The cure join covers the
+  whole queue (BR#5516): `trainOpenRootFix` prefers the root-fix card's own PR legs
+  and falls back to the lane's queue entries — any open queued card whose PR legs
+  match its queue entry and whose title names a fix of the base
+  (fix/gate/main-green/red/ci/stop-the-line/deploy-health shapes) renders as the
+  cure, so a verify-accepted fix PR parked on an ordinary lane card surfaces in the
+  ask the moment it queues (bypass-first) instead of a stale "No fix PR is open
+  yet" (the 2026-11-02 episode: the human answered RETRY on a structurally
+  self-failing gate run while fix PR #357 sat queued). The brief opens with a
+  **Read of the red (triage before you answer)** block that classifies each red
+  check by name shape: a gate/main-green check says IN PLAIN TEXT that a re-run
+  fails IDENTICALLY — fix forward or bypass-merge the cure, never answer RETRY
+  blind; a deploy/smoke/health check says the deployed state is failing, not the
+  merge diff — check the deploy logs first; anything else is diagnosis pending
+  until a session reads the failing job log (re-running a structural failure burns
+  a cycle and re-arms the ask). Options mirror the triage
   outcomes: hold-the-line · transient retry · bypass-merge the cure (number
   included) · manual/other · no-resolution-yet keep digging. The stamp is
   freshness-guarded (<15m, executor refreshes every tick) so a dead daemon's stale
