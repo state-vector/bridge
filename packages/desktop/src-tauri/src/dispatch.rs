@@ -1917,17 +1917,23 @@ fn preserve_wip(worktree_path: &Path, task_id: &str) -> Option<String> {
 /// fallback so pre-change worktrees re-attach on resume and repos whose
 /// clone predates the convention still isolate.
 /// On resume the branch already exists — attach to it.
+/// 2026-11-02: every provisioned tree is REGISTERED (the machine-local
+/// worktree registry) so the sweep knows it mechanically — see
+/// worktree_registry_append.
 fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<PathBuf> {
     let slug = slugify(task_id);
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
     let nested = repo_path.join(".worktrees").join(&slug);
-    let legacy = std::env::var("HOME").ok().map(|h| {
-        PathBuf::from(&h).join(".bridge").join("worktrees").join(&slug)
+    let legacy = home.as_ref().map(|h| {
+        h.join(".bridge").join("worktrees").join(&slug)
     });
     // reuse: nested first (the convention), legacy second (resume compat)
     if nested.exists() {
+        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
         return Some(nested);
     }
     if legacy.as_ref().map(|p| p.exists()).unwrap_or(false) {
+        worktree_registry_append(home.as_deref(), legacy.as_ref().unwrap(), &repo_path.to_string_lossy(), task_id);
         return legacy;
     }
     std::fs::create_dir_all(nested.parent()?).ok()?;
@@ -1953,6 +1959,7 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         cmd.output().map(|o| o.status.success()).unwrap_or(false)
     };
     if add_at(&nested) {
+        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
         return Some(nested);
     }
     // nested add refused (clone predates the .gitignore convention) — fall
@@ -1960,6 +1967,7 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
     let Some(path) = legacy else { return None };
     std::fs::create_dir_all(path.parent()?).ok()?;
     if add_at(&path) {
+        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
         return Some(path);
     }
     let mut cmd = Command::new("git");
@@ -1967,7 +1975,11 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         .args(["worktree", "add"])
         .arg(&path)
         .arg(&branch);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false).then_some(path)
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    if ok {
+        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
+    }
+    ok.then_some(path)
 }
 
 /// Run a command with a hard deadline: kill on expiry and report. The sign
@@ -2109,6 +2121,10 @@ fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Opti
     if !path.exists() {
         return None;
     }
+    // 2026-11-02: deregister FIRST — the teardown owns this tree, the
+    // registry must not outlive it (a stale line prunes on next read, but
+    // the contract is explicit).
+    worktree_registry_remove(std::env::var("HOME").ok().map(PathBuf::from).as_deref(), path);
     let preserved = preserve_wip(path, task_id);
     let slug = slugify(task_id);
     // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
@@ -2180,6 +2196,90 @@ struct WorktreeCandidate {
     slug: String,
     path: PathBuf,
     mtime: std::time::SystemTime,
+}
+
+// ---- worktree registry (2026-11-02, Ray: "you can both direct agents AND
+// know what worktrees were made — no guessing, mechanical and structural
+// assertions") ----
+// The machine-local record of every worktree the system directed a session
+// to create. Three mechanical facts close the leak loop:
+//   1. the runner REGISTERS on provision (ensure_worktree) and deregisters
+//      on teardown (cleanup_worktree_at) — its trees are never anonymous;
+//   2. directed agents register theirs at creation — the claim-locally
+//      prompt and AGENTS.md carry the exact append one-liner;
+//   3. the sweep enumerates REGISTERED paths as candidates (a registry×disk
+//      join), never a filesystem hunt or a hardcoded root list — dead lines
+//      are dropped on read so the file stays bounded.
+// Format: JSONL at ~/.bridge/worktree-registry.jsonl, one entry per line:
+// {"path":"/abs","repo":"owner/name or path","task":"BR#N or slug","ts":ms}.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct WorktreeRegEntry {
+    path: String,
+    repo: String,
+    task: String,
+    ts: u64,
+}
+
+fn worktree_registry_path(home: &Path) -> PathBuf {
+    home.join(".bridge").join("worktree-registry.jsonl")
+}
+
+fn worktree_registry_load(home: &Path) -> Vec<WorktreeRegEntry> {
+    let Ok(lines) = std::fs::read_to_string(worktree_registry_path(home)) else {
+        return vec![];
+    };
+    lines.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Best-effort registration — the path IS the record; a failed append never
+/// blocks provisioning (the sweep's dir scans still cover the runner's own
+/// trees). Home comes from the caller so tests inject a scratch root.
+fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: &str) {
+    use std::io::Write;
+    let Some(home) = home else { return };
+    let entry = WorktreeRegEntry {
+        path: path.to_string_lossy().into_owned(),
+        repo: repo.to_string(),
+        task: task.to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    let _ = std::fs::create_dir_all(home.join(".bridge"));
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(worktree_registry_path(home))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+}
+
+/// Deregistration: drop every line naming this path — the teardown owns the
+/// tree, the registry must not outlive it. Home comes from the caller so
+/// tests inject a scratch root.
+fn worktree_registry_remove(home: Option<&Path>, path: &Path) {
+    let Some(home) = home else {
+        return;
+    };
+    let reg = worktree_registry_path(&home);
+    let Ok(s) = std::fs::read_to_string(&reg) else {
+        return;
+    };
+    let p = path.to_string_lossy();
+    let kept: Vec<String> = s
+        .lines()
+        .filter_map(|l| serde_json::from_str::<WorktreeRegEntry>(l).ok())
+        .filter(|e| e.path != p)
+        .filter_map(|e| serde_json::to_string(&e).ok())
+        .collect();
+    let _ = std::fs::write(
+        &reg,
+        if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
+    );
 }
 
 /// Reverse slugify: BR-1003 → BR#1003. Anything else (TASK-010, session-named
@@ -2322,6 +2422,46 @@ fn collect_worktree_candidates(
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
             found.push(WorktreeCandidate { slug: name, path, mtime });
+        }
+    }
+    // registered (2026-11-02): the registry×disk join — every REGISTERED path
+    // is a candidate wherever it lives on disk (the agent chose the path;
+    // the sweep never hunts for it). Dead lines (path gone) are pruned on
+    // read so the file stays bounded; in-flight slugs stay protected by the
+    // `active` set above; the disposition rules then apply as usual.
+    if let Some(home) = home {
+        let entries = worktree_registry_load(home);
+        let mut dead = false;
+        for e in &entries {
+            let p = PathBuf::from(&e.path);
+            if !p.exists() {
+                dead = true;
+                continue;
+            }
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.is_empty() || active.contains(&name) {
+                continue;
+            }
+            if found.iter().any(|c| c.path == p) {
+                continue;
+            }
+            let mtime = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push(WorktreeCandidate { slug: name, path: p, mtime });
+        }
+        if dead {
+            let kept: Vec<String> = entries
+                .iter()
+                .filter(|e| PathBuf::from(&e.path).exists())
+                .filter_map(|e| serde_json::to_string(e).ok())
+                .collect();
+            let _ = std::fs::write(
+                worktree_registry_path(home),
+                if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
+            );
         }
     }
     found
@@ -4820,6 +4960,41 @@ mod tests {
         let slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
         assert!(slugs.contains(&"BR-9001".to_string()), "registered tree at an arbitrary path is enumerated via sweep_repos");
         assert!(!found.iter().any(|c| c.path == checkout), "the repo's own main worktree is never a candidate");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_registry_roundtrip_active_protected_dead_pruned() {
+        // 2026-11-02: the registry is the mechanical record of every worktree
+        // the system directed a session to create. Roundtrip: register →
+        // enumerate (live) → protect (active slug) → prune (dead line) →
+        // deregister (teardown).
+        let base = std::env::temp_dir().join(format!("bridge-wtreg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let live = base.join("trees").join("BR-7001");
+        std::fs::create_dir_all(&live).unwrap();
+        let dead = base.join("trees").join("BR-7002");
+
+        worktree_registry_append(Some(&home), &live, "state-vector/bridge", "BR-7001");
+        worktree_registry_append(Some(&home), &dead, "state-vector/bridge", "BR-7002");
+        assert_eq!(worktree_registry_load(&home).len(), 2);
+
+        // enumeration: the live registered path is a candidate wherever it
+        // lives; the dead line is not — and prunes on read
+        let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &HashSet::new(), &[]);
+        assert!(found.iter().any(|c| c.path == live), "registered live path enumerated");
+        assert_eq!(worktree_registry_load(&home).len(), 1, "dead line pruned on read");
+
+        // an in-flight slug is protected even though registered
+        let mut active = HashSet::new();
+        active.insert("BR-7001".to_string());
+        let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &active, &[]);
+        assert!(found.iter().all(|c| c.path != live), "active slug protected from the sweep");
+
+        // teardown deregisters: the registry must not outlive the tree
+        worktree_registry_remove(Some(&home), &live);
+        assert!(worktree_registry_load(&home).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 

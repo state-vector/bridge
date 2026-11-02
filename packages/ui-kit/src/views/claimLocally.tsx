@@ -24,7 +24,7 @@ const TAKEOVER_PROTOCOL = `TAKEOVER PROTOCOL (Superpositional bridge — follow 
 2. VERIFY STATE FIRST-HAND: this card may be partially done — check the artefact (get_artefact), any linked PR, and the live repo before claiming. Never trust this prompt's summary over live state.
 3. CLAIM: transition {id, to: "in_progress", session} before working.
 4. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. Declared silence (grace_minutes / subprocess block) before any long quiet op — undeclared silence = abandoned.
-5. SHARED-CHECKOUT DISCIPLINE: work in a git worktree off fresh origin/main (git worktree add .worktrees/<branch> -b <branch> origin/main); stage explicit paths only, never git add -A; never touch global git config.
+5. SHARED-CHECKOUT DISCIPLINE: work in a git worktree off fresh origin/main (git worktree add .worktrees/<branch> -b <branch> origin/main), REGISTER it (mkdir -p ~/.bridge && printf '%s\n' '{"path":"<ABS worktree path>","repo":"<owner/name>","task":"<this BR#N>","ts":<epoch-ms>}' >> ~/.bridge/worktree-registry.jsonl — the gateway's hygiene sweep enumerates REGISTERED trees only; an unregistered tree is never swept), stage explicit paths only, never git add -A, never touch global git config.
 6. SIGN AS DETACHED-CODY (BR#3181 ruling): every commit via
    git -c user.name=detached-cody -c user.email=297316395+detached-cody@users.noreply.github.com -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/sv-agents-signing.pub -c gpg.ssh.program=/usr/bin/ssh-keygen commit
    (unsigned commits are rejected by the 5c verify gate — do not bypass).

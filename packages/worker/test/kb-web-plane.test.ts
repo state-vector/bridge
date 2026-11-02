@@ -196,6 +196,21 @@ describe("GET /api/kb/train — the merge-train mirror (Top panel leg 1)", () =>
   });
 });
 
+describe("Claim-locally takeover prompt carries the worktree registry contract (2026-11-02)", () => {
+  // The sweep enumerates REGISTERED trees only — an unregistered tree is
+  // never swept. The prompt that directs a local session to create a
+  // worktree must therefore also direct it to REGISTER the worktree:
+  // without the registration one-liner the directed tree leaks by design.
+  const claimSrc = readFileSync(new URL("../../ui-kit/src/views/claimLocally.tsx", import.meta.url).pathname, "utf8");
+  it("SHARED-CHECKOUT DISCIPLINE carries the registry append one-liner + the removal duty", () => {
+    expect(claimSrc).toMatch(/SHARED-CHECKOUT DISCIPLINE/);
+    expect(claimSrc).toContain("worktree-registry.jsonl");
+    expect(claimSrc).toMatch(/"path":"<ABS worktree path>"/);
+    expect(claimSrc).toContain("REGISTER it");
+    expect(claimSrc).toContain("an unregistered tree is never swept");
+  });
+});
+
 describe("Top view renders the merge-train panel first (train panel legs 2+3)", () => {
   // Source assertions on the real views (no UI rig exists — repo convention):
   // the panel must sit at the very top of Top (before the dashboard strip) and
