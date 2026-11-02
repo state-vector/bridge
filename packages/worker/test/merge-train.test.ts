@@ -537,6 +537,41 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     expect(d.kind).not.toBe("merge");
   });
 
+  it("STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02): head red entirely the deploy-health class on a GREEN base → rerun_gate (re-run the failed gate jobs), never bounce, never a human leg — even BLOCKED (the failed required check's own state)", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "Deploy health (merge gate)"), green(2, "Test")],
+    }));
+    expect(d.kind).toBe("rerun_gate");
+    if (d.kind === "rerun_gate") {
+      expect(d.reason).toContain("deploy-health");
+      expect(d.reason).toContain("Deploy health (merge gate)");
+      expect(d.reason).toContain("GREEN");
+      expect(d.reason).toContain("stale");
+    }
+  });
+
+  it("SELF-HEAL control: a REAL red beside the gate red is not healed — the standing law owns the defect the PR carries", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "Deploy health (merge gate)"), fail(2, "Rust Tests")],
+    }));
+    expect(d.kind).not.toBe("rerun_gate");
+    // queued card → the standing note row
+    expect(d.kind).toBe("note");
+  });
+
+  it("SELF-HEAL control: a red base keeps the circular law — no premise has evaporated", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      baseVerdict: "red",
+      headChecks: [fail(1, "Deploy health (merge gate)")],
+    }));
+    expect(d.kind).not.toBe("rerun_gate");
+  });
+
   it("BR#4685: UNKNOWN × N polls → no bounce event — the compose waits on an unanswered state", () => {
     // the acceptance pin: poll the gate N times over UNKNOWN/null states and
     // no bounce ever fires; the mergeable field riding the same recomputation

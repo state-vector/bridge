@@ -834,6 +834,24 @@ Verify duty on a qualified root-fix card (tag + a stamped PR) names the fast
 lane in its body, so the reviewer knows the merge path is pre-cleared before
 they accept.
 
+### Stale deploy-health reds self-heal (2026-11-02)
+
+The `Deploy health (merge gate)` check on a PR judges MAIN's deploy state, not
+the PR's own code — so its verdict can go stale exactly when main recovers
+under it (observed 2026-11-02: the gate stamped red at 07:49 while the
+recovery deploy was still in flight; main settled green at 07:52 and the red
+sat in the queue with nothing to re-open it). The train now detects this
+itself, in the same gate that already runs every tick: a head red that is
+ENTIRELY the deploy-health class (`decideTrainGate`, TS + Rust mirrors) on a
+GREEN base is a stale verdict by construction — the gate returns
+`rerun_gate`, the executor re-runs the failed gate jobs
+(`gh api check-runs/<id>/rerequest`, worker-class identity-gated per BR#3181)
+and treats the entry as a clock (queue class `waiting`). The next tick reads
+the fresh run: green merges, honestly red falls to the standing law. Never a
+bounce (the PR carries no defect), never a human leg (main is green — no
+decision exists). A REAL red beside the gate red is not healed, and a red
+base keeps the circular BR#5189 law untouched.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in

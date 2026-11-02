@@ -1071,6 +1071,7 @@ export type MergeAction =
   | { kind: "close_superseded"; reason: string }
   | { kind: "bounce"; defect: string; bounceKind: TrainBounceKind }
   | { kind: "note"; reason: string }
+  | { kind: "rerun_gate"; reason: string }
   | { kind: "skip"; reason: string }
   | { kind: "human_leg"; reason: string };
 
@@ -2278,6 +2279,35 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   // an uncovered head bounced before this line, so behind reaching the
   // compose is always a §5-carryable head.
   const behind = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "behind";
+  // ---- STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive: "the
+  // train already runs — it should detect this itself; the system
+  // aggressively self-heals"): the deploy-health merge-gate check judges
+  // MAIN's deploy state, not the PR's own code. A head red of ENTIRELY that
+  // class with the base GREEN is a stale verdict by construction — the check
+  // stamped FAILURE against a deploy that has since settled (observed
+  // 2026-11-02: gate red at 07:49 judged the in-flight 06:40 deploy; main
+  // settled green at 07:52 and the red sat in the queue — nothing re-opens a
+  // terminal gate verdict when its premise evaporates). The train RE-RUNS the
+  // failed gate jobs (check-runs rerequest, worker-class identity-gated in
+  // the executor arm) and treats the entry as a clock: next tick reads the
+  // fresh run green → merge, or honestly red → the standing law's rows own
+  // it. NEVER a bounce, NEVER a human leg. This row sits ABOVE the blocked
+  // pre-clear: a failed required check reads BLOCKED, and the stale class
+  // must heal there too. MUST stay behaviour-identical to train_gate.rs
+  // decide_train_gate (the mirror). ----
+  if (i.baseVerdict === "green") {
+    const head = classifyHeadChecks(i.headChecks);
+    if (
+      head.verdict === "red" &&
+      head.red.every((r) => r.name.toLowerCase().includes(DEPLOY_HEALTH_PATTERN))
+    )
+      return {
+        kind: "rerun_gate",
+        reason: `PR #${i.prNumber} head red is entirely the deploy-health class (${head.red
+          .map((r) => r.name)
+          .join(", ")}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run`,
+      };
+  }
   // BR#3727: blocked with head checks merely PENDING is a clock, not a
   // defect — strict branch protection re-runs the required checks on the
   // head right after every machine-clean update-branch, so the tick after

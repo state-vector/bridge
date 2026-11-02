@@ -1663,6 +1663,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::RerunGate { reason } => ("rerun_gate", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
         qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
@@ -1673,6 +1674,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 _ => "blocked",
             },
             MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));
 
@@ -1696,6 +1698,43 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // once, on the final merge of the batch (phase C tail).
                 ctx.note(&format!("PR #{pr} ({head_id}) not ready — {reason}; continuing to the next queued PR"));
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
+                continue;
+            }
+            MergeAction::RerunGate { reason } => {
+                // STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive —
+                // "the train already runs; the system aggressively
+                // self-heals"): the red is entirely the deploy-health class on
+                // a GREEN base — a verdict stamped against a superseded main
+                // deploy. Dispatch the re-run (check-runs rerequest, the same
+                // write the bisect re-run leg uses) and treat the entry as a
+                // clock: the next tick reads the fresh run green → merge, or
+                // honestly red → the standing law owns it. Once the rerequest
+                // is accepted the check goes in-flight (conclusion null →
+                // unsettled → Skip), so this arm fires once, never a storm.
+                if !ctx.write_allowed() {
+                    log(Some(key), &format!("IDENTITY GATE: gate re-run dispatch for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); a worker gateway heals the stale red"));
+                } else {
+                    let stale: Vec<&crate::train_gate::MainCheckRun> = head_checks
+                        .iter()
+                        .filter(|r| {
+                            matches!(
+                                r.conclusion.as_deref(),
+                                Some("failure") | Some("timed_out") | Some("action_required") | Some("startup_failure")
+                            ) && r.name.to_lowercase().contains(crate::train_gate::DEPLOY_HEALTH_PATTERN)
+                        })
+                        .collect();
+                    let mut dispatched = 0usize;
+                    for r in &stale {
+                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok() {
+                            dispatched += 1;
+                        }
+                    }
+                    renew_lease(ctx, repo, base);
+                    ctx.note(&format!("self-heal: dispatched {dispatched} stale gate re-run(s) on PR #{pr} — {reason}"));
+                    log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick"));
+                }
+                // the entry is a clock (waiting), never a defect: advance —
+                // the queue is not held by a stale red
                 continue;
             }
             MergeAction::HumanLeg { reason } => {
