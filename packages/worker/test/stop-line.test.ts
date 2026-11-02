@@ -237,7 +237,17 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(String(ask.title)).toContain("Test");
     expect(String(ask.title).endsWith("?")).toBe(true);
     expect(String(ask.meta?.ask?.reason)).toContain("merges halt");
-    expect(String(ask.body_md ?? ask.meta?.ask?.details ?? "")).toContain("Culprit card");
+    // BR#5517 blame brief: the alarm names the guilty card on plain reading —
+    // a Guilty line with the culprit id + title + the PR that broke main + the
+    // failing checks, and a derived_from relation linking ask → culprit card.
+    const askBody = String(ask.body_md ?? ask.meta?.ask?.details ?? "");
+    expect(askBody).toContain("Guilty:");
+    expect(askBody).toContain(culprit);
+    expect(askBody).toContain("broke main");
+    expect(askBody).toContain("failing: Test");
+    const askRels = (await kbJson("/relations", { id: asks[0].id })).body.relations ?? [];
+    const blameLink = (askRels as any[]).find((r) => r.relation === "derived_from" && String(r.artefact_id) === culprit);
+    expect(blameLink, `expected a derived_from blame link ask → ${culprit}, got ${JSON.stringify(askRels)}`).toBeTruthy();
 
     // the culprit: bounced out of the queue with the failing runs in the brief
     const card = (await kbJson("/get", { id: culprit })).body;
@@ -257,6 +267,79 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect((await stopAsks("fffffffff")).length).toBe(1);
     const card2 = (await kbJson("/get", { id: culprit })).body;
     expect(String(card2.body_md).split("Merge-train STOP THE LINE").length - 1).toBe(1);
+  });
+
+  it("BR#5517: the stop dings the culprit card's impl/verify sessions — capped train_red on the score board, bystanders untouched, no refund on line_green", async () => {
+    const repo = "state-vector/ding-score";
+    // a culprit card whose version receipts name its impl + verify legs
+    const c = await kbJson("/create", { type: "task", title: "IMPL: ding drill — culprit", actor: "impl-ding-a" });
+    expect(c.status).toBe(200);
+    const culprit = String(c.body.id);
+    const b = await kbJson("/transition", {
+      id: culprit, to: "blocked", note: "merge-train: queued", merge_train: true,
+      unblock_condition: "the merge train advances this card — no agent action needed until it bounces (then fix per the brief)",
+      actor: "verify-ding-a",
+    });
+    expect(b.status, `park failed: ${JSON.stringify(b.body)}`).toBeLessThan(400);
+    // a bystander session: activity on an unrelated card, never on the culprit
+    const side = await kbJson("/create", { type: "task", title: "IMPL: ding drill — bystander card" });
+    expect(side.status).toBe(200);
+    // park the side card (the gate-free merge-train park) so the bystander's
+    // progress lands — progress on an unclaimed todo early-returns unclaimed
+    const parked = await kbJson("/transition", {
+      id: String(side.body.id), to: "blocked", note: "merge-train: queued", merge_train: true,
+      unblock_condition: "the merge train advances this card — bystander filler",
+      actor: "bystander-ding",
+    });
+    expect(parked.status, `park failed: ${JSON.stringify(parked.body)}`).toBeLessThan(400);
+    const prog = await kbJson("/progress.log", {
+      id: String(side.body.id), actor: "bystander-ding",
+      note: "unrelated bystander progress note, well past the thin-note bound",
+      completion_pct: 40, confidence_pct: 80, risk_pct: 10,
+    });
+    expect(prog.status, `progress failed: ${JSON.stringify(prog.body)}`).toBeLessThan(400);
+    expect(String(prog.body.note_postscript ?? ""), `progress must persist: ${JSON.stringify(prog.body)}`).not.toContain("PROGRESS LOGGED BUT TASK NOT CLAIMED");
+
+    await acquire(repo, "gw-ding", { required_workflows: ["Test"] });
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-ding",
+      pr: 5517, merge_sha: "9".repeat(40), head_sha: "8".repeat(40), task_id: culprit,
+    });
+    const red = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-ding", sha: "9".repeat(40),
+      checks: [check(9, "Test", "failure", "https://example/ci/ding-red")],
+    });
+    expect(red.body.decided).toBe("stopped");
+
+    // the board's agent rows show the ding: every leg the culprit's receipts
+    // name (impl + verify + the gateway that bounced it) eats ONE capped
+    // train_red
+    const agents = (await kbJson("/board")).body.agents as any[];
+    const row = (label: string) => agents.find((a: any) => a.label === label);
+    for (const label of ["impl-ding-a", "verify-ding-a", "gw-ding"]) {
+      const r = row(label);
+      expect(r?.train_red, `${label}: ${JSON.stringify(r)}`).toBe(1);
+      expect(r.hints.join(" ")).toMatch(/stop-the-line episode/);
+    }
+    // card legs own nothing: 50 − min(15, 1×5) = 45; the gateway also owns
+    // this lane card (+2 artefact bonus), so its ding lands on 47
+    expect(row("impl-ding-a").score).toBe(45);
+    expect(row("verify-ding-a").score).toBe(45);
+    expect(row("gw-ding").score).toBe(47);
+    // bystander sessions are untouched
+    const by = row("bystander-ding");
+    expect(by?.train_red, `bystander row: ${JSON.stringify(by)}`).toBe(0);
+    expect(by.hints.join(" ")).not.toMatch(/stop-the-line episode/);
+    expect(by.score).toBeGreaterThan(45);
+
+    // clearing the red (line_green release) does NOT refund the ding
+    const green = await kbJson("/train.lease", { repo, base: "main", action: "release", line_green: true, actor: "gw-ding" });
+    expect(green.body.error ?? "").toBe("");
+    const agents2 = (await kbJson("/board")).body.agents as any[];
+    const after = agents2.find((a: any) => a.label === "impl-ding-a");
+    expect(after?.train_red).toBe(1);
+    expect(after?.score).toBe(45);
+    expect(agents2.find((a: any) => a.label === "gw-ding")?.score).toBe(47);
   });
 
   it("only a line_green release re-opens a stopped lane (a plain release never clears the stop)", async () => {

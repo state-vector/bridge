@@ -2429,7 +2429,7 @@ export class KnowledgeHub {
     const sig = (label: string): AgentSignals => {
       let s = signals.get(label);
       if (!s) {
-        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 };
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
         signals.set(label, s);
       }
       return s;
@@ -2476,6 +2476,33 @@ export class KnowledgeHub {
       const d = JSON.parse(r.detail ?? "{}");
       sig(d.prev_owner || "unknown").reassigned++;
     }
+    // BR#5517 train-red blame: a stop-the-line episode's culprit card costs
+    // the agents that executed it. The stop flow stamps a durable
+    // train_red_ding on the culprit card (detail: sha + the agent labels of
+    // the impl/verify legs) — a later bisect exoneration writes the matching
+    // train_red_pardon, and a pardoned episode costs nothing. Once per
+    // episode (dedupe by stop sha in the stop flow itself).
+    const dingRows = this.state.storage.sql.exec(
+      `SELECT artefact_id, detail, ts FROM events WHERE op = 'train_red_ding' AND ts >= ?`, weekTs,
+    ).toArray() as any[];
+    const pardons = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT artefact_id, detail FROM events WHERE op = 'train_red_pardon' AND ts >= ?`, weekTs,
+    ).toArray() as any[]) {
+      let d: any = {};
+      try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+      if (d?.sha && d?.culprit) pardons.add(`${d.sha}:${d.culprit}`);
+    }
+    for (const r of dingRows) {
+      let d: any = {};
+      try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+      if (!d?.sha || !d?.culprit) continue;
+      if (pardons.has(`${d.sha}:${d.culprit}`)) continue; // bisect override exonerated this episode
+      if (String(d.culprit) !== String(r.artefact_id ?? "")) continue; // the ding belongs to its card
+      for (const label of Array.isArray(d.agents) ? d.agents.map(String) : []) {
+        if (label) sig(label).train_red++;
+      }
+    }
     for (const r of this.state.storage.sql.exec(
       `SELECT owner, COUNT(*) AS n FROM artefacts
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
@@ -2508,6 +2535,26 @@ export class KnowledgeHub {
       .filter(([label]) => !/^(system:|web$)/.test(label))
       .map(([label, s]) => ({ label, ...s, ...scoreAgent(s) }))
       .sort((a, b) => b.score - a.score);
+  }
+
+  /** BR#5517 blame resolution: the agent labels that executed a culprit
+   *  card's impl and verify legs — the distinct non-system actors on the
+   *  card's version receipts within the 7-day scoring window. Best-effort:
+   *  a resolution failure must never block the stop event itself. */
+  private blameAgents(culpritId: string, now: number): string[] {
+    if (!culpritId) return [];
+    const weekTs = now - 7 * 24 * 60 * 60_000;
+    try {
+      const rows = this.state.storage.sql.exec(
+        `SELECT DISTINCT actor FROM artefact_versions
+         WHERE artefact_id = ? AND ts >= ? AND actor != ''
+         AND actor NOT LIKE 'system:%' AND actor != 'web'`,
+        culpritId, weekTs,
+      ).toArray() as any[];
+      return rows.map((r) => String(r.actor)).filter(Boolean);
+    } catch {
+      return [];
+    }
   }
 
   private async getWithRelations(id: string) {
@@ -6762,7 +6809,7 @@ export class KnowledgeHub {
       ? `\n\nGAUGE DEBT — these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) — the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.`
       : "";
     const my_score = this.agentScores().find((a) => a.label === label)
-      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0 }) };
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 }) };
     // score optimisation is an explicit standing directive: the agent sees its
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.
@@ -8736,8 +8783,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // ONE ask per class: the sha+workflows make the title unique per red
       // episode; askCreate's identical-open-ask guard dedupes the rest.
       const askTitle = trainStopAskTitle({ repo, base }, sha, failing.map((f) => f.name).length ? failing.map((f) => f.name) : [why]);
+      // BR#5517 blame brief: the alarm carries a Guilty line — the culprit
+      // card id + title + the PR that broke main + the failing checks — so
+      // plain reading answers "what broke and who broke it" without a
+      // ledger dig (data is already in this stop event's detail).
+      const culpritRow = culprit ? this.one(`SELECT title FROM artefacts WHERE id = ?`, culprit) as any : null;
+      const guiltyLine = culprit
+        ? `Guilty: ${culprit}${culpritRow?.title ? ` — “${String(culpritRow.title).slice(0, 120)}”` : ""}${pr ? ` — PR ${repo}#${pr} broke main` : ""}${failing.length ? ` — failing: ${failing.map((f) => f.name).join(", ")}` : ""}`
+        : null;
+      let askId: string | null = null;
       try {
-        await this.askCreate(
+        const ask = await this.askCreate(
           {
             to: "human",
             question: askTitle,
@@ -8746,7 +8802,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               `Lane ${laneKey(repo, base)} stopped by gateway ${actor} at ${new Date(now).toISOString()}.`,
               `Commit: ${sha}`,
               failing.length ? `Failing required workflows:\n${failing.map((f) => `- ${f.name}${f.url ? ` — ${f.url}` : ""}`).join("\n")}` : `Reason: ${why}`,
-              culprit ? `Culprit card: ${culprit} (bounced with the failing runs).` : "No merge had landed — stopped at admission.",
+              culprit ? `${guiltyLine} (bounced with the failing runs).` : "No merge had landed — stopped at admission.",
               `Resume: main green again (the executor auto-resumes next tick) or a recorded authority decision.`,
             ].join("\n\n"),
             options: ["Ack — on it", "Revert the culprit", "Waive — resume the lane"],
@@ -8755,6 +8811,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           },
           actor,
         );
+        askId = (ask as any)?.id ?? null;
       } catch (e) {
         // an identical ask is already open for this episode — that IS one per class
         this.audit(actor, "train:stopped", lane.id, { ask_deduped: String((e as Error).message ?? e).slice(0, 160) });
@@ -8765,7 +8822,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // deploy-health class). Best-effort: a spawn failure must never eat the
       // stop event itself — the ledger entry below still fires.
       try {
-        await this.ensureRootFixCard({
+        const rootFixId = await this.ensureRootFixCard({
           repo,
           base,
           sha,
@@ -8777,8 +8834,41 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           culpritId: culprit,
           pr,
         });
+        // BR#5517 blame relationship: the alarm ask and the root-fix card link
+        // to the culprit card with a typed derived_from edge — the alarm's
+        // relations then show the guilty card (with its url) on plain
+        // reading. Best-effort like the spawn: a link failure must never eat
+        // the stop event itself (the ledger entry below still fires).
+        if (culprit) {
+          const blameSources = [...new Set([askId, rootFixId].filter((x): x is string => !!x && x !== culprit))];
+          for (const src of blameSources) {
+            try {
+              this.state.storage.sql.exec(
+                `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'derived_from', ?, ?)`,
+                src, culprit, now,
+              );
+              this.version(src, actor, "update", `blame link (BR#5517): derived_from ${culprit} — this ${src === rootFixId ? "root-fix card" : "alarm ask"} names the guilty card`, {});
+            } catch (e) {
+              this.audit(actor, "blame_link_error", src, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+            }
+          }
+        }
       } catch (e) {
         this.audit(actor, "root_fix_spawn_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+      // BR#5517 blame stamp: the culprit card's impl + verify sessions eat
+      // one train_red incident, durably in the audit ledger — clearing the
+      // red (fix merges green / re-verified) does NOT refund it; only a
+      // bisect exoneration (train_red_pardon) removes the episode. Capped
+      // and hinted in scoreAgent. Best-effort: a stamp failure must never
+      // eat the stop event itself.
+      if (culprit) {
+        try {
+          const agents = this.blameAgents(culprit, now);
+          if (agents.length) this.audit(actor, "train_red_ding", culprit, { sha, culprit, agents, reason: why.slice(0, 200) });
+        } catch (e) {
+          this.audit(actor, "train_red_ding_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
       }
       ev({ reason: why, failing, culprit }, culprit);
       this.version(lane.id, actor, `train:${kind}`, `line stopped — ${why}`, { stop: meta.stop, reason });
@@ -9312,6 +9402,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     let reparked: string | null = null;
     const culpritTask = body.culprit_task != null ? String(body.culprit_task).trim() : "";
     if (culpritTask) {
+      // BR#5517 bisect override: the walk names the TRUE culprit — when it
+      // differs from the stop-named card, the stop-named card is found NOT
+      // guilty and its train_red episode is pardoned (the penalty leaves),
+      // and the true culprit gets its own ding. Pardon/ding are best-effort
+      // audit stamps: a failure must never eat the walk itself.
+      const stopNamed = String(stop.culprit_task ?? "").trim();
+      if (stopNamed && stopNamed !== culpritTask) {
+        try {
+          this.audit(actor, "train_red_pardon", stopNamed, { sha: String(stop.sha ?? ""), culprit: stopNamed, agents: this.blameAgents(stopNamed, now), exonerated_by: "train.bisect" });
+          const trueAgents = this.blameAgents(culpritTask, now);
+          if (trueAgents.length) this.audit(actor, "train_red_ding", culpritTask, { sha: String(stop.sha ?? ""), culprit: culpritTask, agents: trueAgents, reason: "bisect override" });
+        } catch (e) {
+          this.audit(actor, "train_red_blame_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+      }
       const culpritSha = String(body.culprit_sha ?? "").toLowerCase() || null;
       stop.bisect.culprit_task = culpritTask;
       stop.bisect.culprit_sha = culpritSha;
