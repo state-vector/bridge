@@ -9482,7 +9482,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the moment one exists — and the four outcomes mirror the triage
       // task's own (transient/retry · fault-of-X fix PR → bypass · manual ·
       // no-resolution-yet keep digging). Plain words only (BR#5349).
-      const fix = this.trainOpenRootFix(repo);
+      const fix = this.trainOpenRootFix(repo, entries);
       const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
       const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
       // the episode's OPEN ask — the SAME join askCreate's identical-open-ask
@@ -9941,38 +9941,85 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  `meta.root_fix.pr` is the CULPRIT (the merged PR that broke main); the
    *  card's own PR stamp (meta.prs legs / meta.pr) is the CURE once a verify
    *  accept queues it. Absent card → the brief says so honestly. */
-  private trainOpenRootFix(repo: string): {
+  /** BR#5516: the episode's cure-PR join. Two sources, in order:
+   *  (1) the root-fix card's own PR legs (BR#5190 shape — the canonical fix
+   *      home the stopped flow spawns);
+   *  (2) FALLBACK — the lane's derived queue entries. The 2026-11-02 bridge
+   *      episode answered "No fix PR is open yet" while verify-accepted cure
+   *      PR #357 sat queued on an ORDINARY card (BR#5487) held by the base
+   *      red: the join never looked at the queue. Now any open queued card
+   *      whose PR legs match its queue entry AND whose title names a fix of
+   *      the base (fix/gate/main-green/red/ci/stop-the-line/deploy-health
+   *      shapes) renders as the cure — the bypass option surfaces the moment
+   *      a plausibly-curing PR is queued, not only when a root-fix card
+   *      binds. Walk order (the executor's queue_facts order, or the derived
+   *      queue's rank on the status side) decides precedence. */
+  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number }[]): {
     card: { id: string; title: string; status: string } | null;
     curePr: { repo: string; number: number } | null;
     culpritPr: number | null;
   } {
-    if (!repo) return { card: null, curePr: null, culpritPr: null };
-    const rows = this.state.storage.sql.exec(
-      `SELECT id, title, status, meta, tags FROM artefacts
-       WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-         AND json_extract(meta, '$.root_fix.repo') = ?
-       ORDER BY updated_ts DESC LIMIT 5`,
-      repo,
-    ).toArray() as any[];
-    for (const r of rows) {
-      const m = JSON.parse(r.meta ?? "{}");
-      if (!isRootFixCard({ tags: parseTags(r.tags), meta: m })) continue;
-      const legs = (Array.isArray(m.prs) ? m.prs : [])
-        .map((l: any) => ({ repo: String(l?.repo ?? repo), number: Number(l?.number) }))
-        .filter((l: { number: number }) => Number.isInteger(l.number) && l.number > 0);
-      const first = Number(m.pr?.number ?? 0) || 0;
-      const curePr = legs.length
-        ? legs[legs.length - 1]
-        : first > 0
-          ? { repo: String(m.pr?.repo ?? repo), number: first }
-          : null;
-      return {
-        card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? "") },
-        curePr,
-        culpritPr: Number(m.root_fix?.pr ?? 0) || null,
-      };
+    let root: {
+      card: { id: string; title: string; status: string } | null;
+      curePr: { repo: string; number: number } | null;
+      culpritPr: number | null;
+    } = { card: null, curePr: null, culpritPr: null };
+    if (repo) {
+      const rows = this.state.storage.sql.exec(
+        `SELECT id, title, status, meta, tags FROM artefacts
+         WHERE type = 'task' AND status NOT IN ('done', 'superseded')
+           AND json_extract(meta, '$.root_fix.repo') = ?
+         ORDER BY updated_ts DESC LIMIT 5`,
+        repo,
+      ).toArray() as any[];
+      for (const r of rows) {
+        const m = JSON.parse(r.meta ?? "{}");
+        if (!isRootFixCard({ tags: parseTags(r.tags), meta: m })) continue;
+        const legs = (Array.isArray(m.prs) ? m.prs : [])
+          .map((l: any) => ({ repo: String(l?.repo ?? repo), number: Number(l?.number) }))
+          .filter((l: { number: number }) => Number.isInteger(l.number) && l.number > 0);
+        const first = Number(m.pr?.number ?? 0) || 0;
+        const curePr = legs.length
+          ? legs[legs.length - 1]
+          : first > 0
+            ? { repo: String(m.pr?.repo ?? repo), number: first }
+            : null;
+        root = {
+          card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? "") },
+          curePr,
+          culpritPr: Number(m.root_fix?.pr ?? 0) || null,
+        };
+        break;
+      }
     }
-    return { card: null, curePr: null, culpritPr: null };
+    // (2) the queue-entry fallback — runs when the root-fix card is absent
+    // OR present without a bound cure PR (the root-fix card stays the fix
+    // card; the queued PR becomes the cure)
+    if (!root.curePr) {
+      for (const e of entries ?? []) {
+        const pr = Number(e?.pr);
+        const id = String(e?.id ?? "");
+        if (!id || !Number.isInteger(pr) || pr <= 0) continue;
+        const row = this.one(
+          `SELECT id, title, status, meta FROM artefacts WHERE id = ?`,
+          id,
+        ) as any;
+        if (!row) continue;
+        const m = JSON.parse(row.meta ?? "{}");
+        const legs = [...(Array.isArray(m.prs) ? m.prs : []), ...(m.pr ? [m.pr] : [])] as any[];
+        const legRepo = String(legs.find((l: any) => Number(l?.number) === pr)?.repo ?? repo);
+        if (!legs.some((l: any) => Number(l?.number) === pr)) continue;
+        // fix-of-the-base title shapes only — a bypass option that offered
+        // an arbitrary held PR would merge something that doesn't cure
+        if (!/\bfix\b|main[- ]green|\bgate\b|stop[- ]the[- ]line|\bred\b|\bci\b|deploy health/i.test(String(row.title ?? ""))) continue;
+        return {
+          card: root.card ?? { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? "") },
+          curePr: { repo: legRepo, number: pr },
+          culpritPr: root.culpritPr,
+        };
+      }
+    }
+    return root;
   }
 
   /** 2026-11-02: TRAIN ALARM ANSWER DISPATCH — the answer is the missing
@@ -10216,7 +10263,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // not just any hotfix+main-red task; the legacy tag join stays as
           // fallback. The cure PR rides the block so the banner links it.
           fix_card: (() => {
-            const rf = this.trainOpenRootFix(lane.repo);
+            const rf = this.trainOpenRootFix(lane.repo, queue);
             if (rf.card) {
               return {
                 id: rf.card.id,

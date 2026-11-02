@@ -2570,9 +2570,26 @@ export function trainBaseRedAskBrief(
   const broken = reds.length
     ? reds.map((r) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")
     : "- (the failing check names were not available this tick)";
+  // BR#5516: triage-before-menu — the ask carries a first-hand READ of each
+  // red check (name-shape classification; the hub has no logs, so this is
+  // honest about what is knowable hub-side) so the human never answers the
+  // template default blind. The 2026-11-02 episode: "Transient — re-run" was
+  // answered on a structurally self-failing gate run, burning a cycle and
+  // re-arming the ask.
+  const readOf = reds.map((r) => {
+    const n = r.name.toLowerCase();
+    if (/\bgate\b|main[- ]green/.test(n))
+      return `- ${r.name}: the gate itself is the failing check — almost always self-referential or destination-state, and a re-run fails IDENTICALLY. Read the gate log, then fix forward or bypass-merge the cure. Do not answer RETRY blind.`;
+    if (/deploy|smoke|health/.test(n))
+      return `- ${r.name}: a deploy-side check — the deployed state is failing, not the merge diff. Check the deploy logs before re-running anything.`;
+    return `- ${r.name}: diagnosis pending — a session must read the failing job log before RETRY is safe; re-running a structural failure burns a cycle and re-arms this ask.`;
+  });
   const details = [
     `Main on **${lane.repo}** is broken: these required checks are failing on its latest commit (${lane.base}):`,
     broken,
+    ``,
+    `**Read of the red (triage before you answer):**`,
+    ...(readOf.length ? readOf : ["- (no check names this tick — hold the line)"]),
     ``,
     `**${held} PR${held === 1 ? "" : "s"} held.** Nothing merges until main is green again — that is deliberate: no change lands on top of a broken main. The queue drains by itself the moment main recovers; nothing further is needed from you then.`,
     ``,
