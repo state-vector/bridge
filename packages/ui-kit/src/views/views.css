@@ -558,10 +558,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-block:hover { filter: brightness(1.2); }
 /* 2026-11-02: the block classes RESTORED — BR#5412's CSS half deleted them
    ("audit-trail classes removed") but the TSX half still emits every one
-   (tb-waiting/tb-conflict/tb-needs-review/tb-blocked/tb-unknown/tb-awaiting*/
-   + the gap divider), so every non-ready car rendered as .train-block's
-   transparent+transparent shell: INVISIBLE cars (Ray: "cars transparent/
-   empty"). Markup is the contract — style what it emits. */
+   (tb-waiting, tb-conflict, tb-needs-review, tb-blocked, tb-unknown,
+   tb-awaiting, plus the gap divider), so every non-ready car rendered as
+   .train-block's transparent+transparent shell: INVISIBLE cars (Ray:
+   "cars transparent/empty"). Markup is the contract — style what it
+   emits. */
 .tb-ready { background: var(--green, #3fb26a); }
 .tb-waiting { background: var(--amber, #d29a4b); }
 .tb-conflict { background: var(--red, #d9534f); }
