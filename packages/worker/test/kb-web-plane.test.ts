@@ -280,25 +280,23 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders the QUEUE column as plain counts + batch-only blocks — no awaiting band (BR#5412, Ray: 'if red is awaiting review, then they are not part of the release train. That just adds noise')", () => {
-    // Awaiting-review parks are not train cars: they render nowhere on the
-    // panel — the backlog cell shows a plain count (X in queue, Y waiting on
-    // review as a muted number with its own tooltip), and the block row is
-    // THE BATCH: only the cars the machine's walk stamped ready this pass,
-    // contiguous, no divider fence between groups that all land in one pass.
-    expect(trainPanelSrc).not.toMatch(/tb-awaiting/);
-    expect(trainPanelSrc).not.toMatch(/train-block-gap/);
-    expect(trainPanelSrc).not.toContain("grey blocks after the divider");
-    expect(trainPanelSrc).not.toContain("waiting on reviews outside the queue");
-    // the batch: only walk-stamped ready entries render
+  it("renders the QUEUE column as per-car verdict blocks + the Awaiting-review band after the divider (4eef434c4 restored; Ray 2026-11-02: the parks stay listed — 'if they are going to be there' — colour contract tracked in BR#5476)", () => {
+    // per-car classes from the machine's last walk: green merges this pass,
+    // amber waits on checks, red conflicts, grey needs review, pending cars
+    // read as a dashed placeholder (no verdict yet), never as broken
     expect(trainPanelSrc).toMatch(/cls === "ready"/);
     expect(trainPanelSrc).toMatch(/merges this pass/);
-    // plain counts: X in queue + muted Y waiting on review
-    expect(trainPanelSrc).toMatch(/train-queued-count/);
-    expect(trainPanelSrc).toMatch(/train-await-count/);
-    expect(trainPanelSrc).toContain("in queue");
-    expect(trainPanelSrc).toContain("waiting on review");
-    // the force-review affordance hint rides the muted count's tooltip
+    expect(trainPanelSrc).toMatch(/waiting on checks/);
+    expect(trainPanelSrc).toMatch(/conflicted — back to impl/);
+    expect(trainPanelSrc).toMatch(/needs a review/);
+    expect(trainPanelSrc).toMatch(/no machine verdict yet/);
+    // the Awaiting band: parks render AFTER the divider, oldest first, with
+    // the aging/lapsed modifiers and the force-review affordance hint
+    expect(trainPanelSrc).toMatch(/tb-awaiting/);
+    expect(trainPanelSrc).toMatch(/train-block-gap/);
+    expect(trainPanelSrc).toMatch(/tb-awaiting-lapsed/);
+    expect(trainPanelSrc).toMatch(/tb-awaiting-aging/);
+    expect(trainPanelSrc).toContain("grey blocks after the divider");
     expect(trainPanelSrc).toContain("force-review from the backlog");
     // a parked card keeps the lane's signal lit even with an empty queue
     expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
