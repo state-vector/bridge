@@ -617,6 +617,12 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   into the gate: a PR green on the *exact* checks main fails passes with a printed
   **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
   receipted, not a loophole.
+  Manual gate drills honour the same rule: a `workflow_dispatch` run MUST pass an
+  explicit `main_sha` (BR#5487) — a sha-less dispatch with `--ref main` attaches the
+  drill's own `main-green gate` check-run to main's HEAD, so the script finds itself
+  in flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
+  historic sha instead: the check-run still lands on HEAD, but the judged commit is
+  settled and independent.
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The same ruleset
