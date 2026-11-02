@@ -19,8 +19,13 @@ use crate::dispatch::DispatchConfig;
 use crate::mac_notify;
 use crate::opencode;
 
-const SEARCH_LIMIT: u32 = 8;
-const SNIPPET_CHARS: usize = 700;
+// The on-device model's context window is ~4k tokens (BR#4782 E2E receipts:
+// an 8×700-char context block plus instructions alone can blow it —
+// "Exceeded model context window size, code -5"). Budget the retrieval
+// tightly; the CLI fallback engine carries the deep reads.
+const SEARCH_LIMIT: u32 = 5;
+const SNIPPET_CHARS: usize = 400;
+const PROMPT_CHARS: usize = 3200;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 const WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -87,6 +92,39 @@ fn history_block(history: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Keep the on-device prompt inside the model's window: when over budget,
+/// drop the tail of the BOARD CONTEXT section first — the question and the
+/// conversation tail are what must survive.
+fn budget_prompt(prompt: &str) -> String {
+    if prompt.chars().count() <= PROMPT_CHARS {
+        return prompt.to_string();
+    }
+    let Some(ctx_start) = prompt.find("BOARD CONTEXT:\n") else {
+        return prompt.to_string();
+    };
+    let Some(conv_start) = prompt.find("\n\nCONVERSATION SO FAR:") else {
+        return prompt.to_string();
+    };
+    let head = &prompt[..ctx_start];
+    let tail = &prompt[conv_start..]; // conversation + question
+    let header_len = "BOARD CONTEXT:\n".chars().count();
+    let room = PROMPT_CHARS.saturating_sub(head.chars().count() + tail.chars().count() + header_len + 1);
+    if room == 0 {
+        return format!("{head}{tail}");
+    }
+    let ctx: String = prompt[ctx_start + "BOARD CONTEXT:\n".len()..conv_start]
+        .chars()
+        .take(room)
+        .collect();
+    format!("{head}BOARD CONTEXT:\n{ctx}{tail}")
+}
+
+/// True when the engine error is the on-device context window (the prompt,
+/// not the engine, is at fault — the caller should slim down or fall back).
+fn is_context_window_error(e: &str) -> bool {
+    e.contains("Exceeded model context window") || e.contains("context window")
 }
 
 /// Try the on-device Apple model. Ok(None) when unavailable (pre-26 OS,
@@ -167,9 +205,9 @@ pub fn chat_turn(question: &str, history: &[Value]) -> Result<Value, String> {
     let artefacts = retrieve(question)?;
     let context = context_block(&artefacts);
     let history = history_block(history);
-    let prompt = format!(
+    let prompt = budget_prompt(&format!(
         "BOARD CONTEXT:\n{context}\n\nCONVERSATION SO FAR:\n{history}\n\nQUESTION: {question}"
-    );
+    ));
 
     let sources: Vec<Value> = artefacts
         .iter()
@@ -182,8 +220,19 @@ pub fn chat_turn(question: &str, history: &[Value]) -> Result<Value, String> {
         })
         .collect();
 
-    if let Some(answer) = local_answer(&prompt)? {
-        return Ok(json!({ "answer": answer, "sources": sources, "engine": "apple-fm" }));
+    match local_answer(&prompt) {
+        Ok(Some(answer)) => {
+            return Ok(json!({ "answer": answer, "sources": sources, "engine": "apple-fm" }));
+        }
+        // The on-device window overflowed on this prompt: slim the prompt
+        // down and retry once before falling back to the CLI engine.
+        Err(e) if is_context_window_error(&e) => {
+            if let Some(answer) = local_answer(&budget_prompt(&prompt))? {
+                return Ok(json!({ "answer": answer, "sources": sources, "engine": "apple-fm" }));
+            }
+        }
+        Err(e) => return Err(e),
+        Ok(None) => {}
     }
     if let Some((answer, engine)) = cli_answer(question, &context, &history)? {
         return Ok(json!({ "answer": answer, "sources": sources, "engine": engine }));
@@ -203,8 +252,11 @@ pub fn propose_task(question: &str, answer: &str) -> Result<Option<Value>, Strin
     let prompt = format!(
         "{INSTRUCTIONS}\n\nThe human asked:\n{question}\n\nYou answered:\n{answer}\n\nIf that answer implies a NEW board task should exist (work, investigation, decision), output ONLY:\nTITLE: <one-line title>\nBODY: <2-4 sentence task body with context>\nIf no task is warranted, output ONLY: NO TASK"
     );
-    if let Some(raw) = local_answer(&prompt)? {
-        return Ok(parse_proposal(&raw));
+    match local_answer(&prompt) {
+        Ok(Some(raw)) => return Ok(parse_proposal(&raw)),
+        Err(e) if is_context_window_error(&e) => {} // fall through to the CLI engine
+        Err(e) => return Err(e),
+        Ok(None) => {}
     }
     let Some((raw, _)) = cli_answer("draft the task", "", &prompt)? else {
         return Ok(None);
@@ -313,8 +365,33 @@ fn decision_notify_body(id: &str, title: &str, meta: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decision_notify_body;
+    use super::{budget_prompt, decision_notify_body, is_context_window_error, PROMPT_CHARS};
     use serde_json::{json, Value};
+
+    #[test]
+    fn budget_prompt_trims_context_not_the_question() {
+        let ctx = "x".repeat(PROMPT_CHARS * 2);
+        let history = "y".repeat(300);
+        let p = format!("BOARD CONTEXT:\n{ctx}\n\nCONVERSATION SO FAR:\n{history}\n\nQUESTION: what is in review?");
+        let out = budget_prompt(&p);
+        assert!(out.chars().count() <= PROMPT_CHARS + 8, "len {}", out.chars().count());
+        assert!(out.ends_with("QUESTION: what is in review?"), "question must survive");
+        assert!(out.contains("CONVERSATION SO FAR:"));
+    }
+
+    #[test]
+    fn budget_prompt_leaves_small_prompts_alone() {
+        let p = "BOARD CONTEXT:\nsmall\n\nCONVERSATION SO FAR:\nh\n\nQUESTION: q?";
+        assert_eq!(budget_prompt(p), p);
+    }
+
+    #[test]
+    fn context_window_error_is_typed() {
+        assert!(is_context_window_error(
+            "apple-fm respond: Exceeded model context window size (code -5)"
+        ));
+        assert!(!is_context_window_error("apple-fm session: unavailable"));
+    }
 
     #[test]
     fn verify_verdict_notification_states_the_ask() {
