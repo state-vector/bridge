@@ -1126,6 +1126,158 @@ struct BatchCandidate {
 }
 
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
+    // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
+    // happens — it's broken"): the answered alarm ask IS the authority. The
+    // hub's askAnswer stamps `meta.lane.bypass_merge {pr}` (a BYPASS answer on
+    // the base-red alarm ask — the option carries the cure PR's number — or
+    // "Merge the cure now" on the root-fix fast-lane ask) and
+    // `meta.lane.rerun_failed` (a RETRY answer). Nothing consumed them before:
+    // the answer was recorded, the question closed, and the next red tick
+    // filed a fresh identical ask — the human answered B forever in a loop.
+    //
+    // bypass: merge the named PR OUT OF TURN, ahead of the queue, onto the
+    // red/stopped base. This is the circular cure's ONLY machine path: its own
+    // deploy-health check can never pass while the line it fixes is held, so
+    // the normal gate would refuse it forever. Runs BEFORE the stop arm for
+    // exactly that reason. The merged event carries `bypass: true` so
+    // provenance shows the lane was cured by an answered ask, and the ack
+    // (bypass_consumed) rides the queue_facts stamp.
+    //
+    // rerun: re-run the base tip's failing checks (`gh run rerun`) — a
+    // transient red (internet weather, flaky check) clears on the next run.
+    // Both stamps are consumed + acked through queue_facts, one per episode. ----
+    let bypass_pr = lane
+        .get("bypass_merge")
+        .and_then(|b| b.get("pr"))
+        .and_then(|v| v.as_i64())
+        .filter(|p| *p > 0);
+    let rerun_requested = lane.get("rerun_failed").map(|_| true).unwrap_or(false);
+    if let Some(bpr) = bypass_pr {
+        renew_lease(ctx, repo, base);
+        let facts = ctx.pr_facts(repo, bpr);
+        let ack = |ctx: &mut Ctx, outcome: &str| -> Result<(), String> {
+            ctx.mcp(
+                "train_queue_facts",
+                json!({ "repo": repo, "base": base, "entries": [], "bypass_consumed": outcome }),
+            )
+            .map(|_| ())
+        };
+        match facts.as_ref().map(|f| {
+            (
+                vstr(f, "state").unwrap_or("").to_string(),
+                f.pointer("/mergeCommit/oid").and_then(|v| v.as_str()).map(String::from),
+                vstr(f, "headRefOid").unwrap_or("").to_string(),
+            )
+        }) {
+            Ok((state, Some(_), _)) if state == "MERGED" => {
+                ack(ctx, "merged-elsewhere")?;
+                ctx.note(&format!("bypass: PR #{bpr} already MERGED — authorization consumed"));
+                log(Some(key), &format!("bypass: PR #{bpr} already merged — nothing to do, stamp consumed"));
+            }
+            Ok((state, _, _)) if state == "CLOSED" => {
+                ack(ctx, "closed")?;
+                log(Some(key), &format!("bypass: PR #{bpr} is CLOSED — authorization consumed (nothing to merge)"));
+            }
+            Ok((_, _, head_sha)) => {
+                // open: land it out of turn with the BR#5376 method fallback
+                // (squash → rebase → merge, remembered per repo) — a policy
+                // mismatch must ride the landing path, not loop.
+                let mut methods: Vec<String> = vec![
+                    ctx.method_sub.get(repo).cloned().unwrap_or_else(|| ctx.method.clone()),
+                ];
+                for alt in ["squash", "rebase", "merge"] {
+                    if !methods.iter().any(|m| m == alt) {
+                        methods.push(alt.to_string());
+                    }
+                }
+                let mut landed_sha: Option<String> = None;
+                let mut refusal: Option<String> = None;
+                ctx.tick_attempted = true;
+                for m in &methods {
+                    match ctx.sh("gh", &["pr", "merge", &bpr.to_string(), "--repo", repo, method_flag_for(m)]) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            if is_merge_method_refusal(&e) {
+                                refusal = Some(e);
+                                continue;
+                            }
+                            refusal = Some(e);
+                            break; // non-method refusal: branch protection et al — never loop
+                        }
+                    }
+                    // claimed ok — verify from live facts, never trust the exit code
+                    if let Ok(f2) = ctx.pr_facts(repo, bpr) {
+                        if let Some(oid) = f2.pointer("/mergeCommit/oid").and_then(|v| v.as_str()) {
+                            landed_sha = Some(oid.to_string());
+                        }
+                    }
+                    if landed_sha.is_some() {
+                        ctx.method_sub.insert(repo.to_string(), m.clone());
+                        break;
+                    }
+                }
+                match landed_sha {
+                    Some(merge_sha) => {
+                        ctx.tick_landed += 1;
+                        ctx.mcp(
+                            "train_event",
+                            json!({
+                                "repo": repo, "base": base, "kind": "merged", "pr": bpr,
+                                "merge_sha": merge_sha, "head_sha": head_sha,
+                                "signer": ctx.holder, "bypass": true,
+                                "reason": "bypass-merge — human-authorized out-of-turn merge (the answered alarm ask); the circular cure lands ahead of the queue",
+                            }),
+                        )?;
+                        ack(ctx, "merged")?;
+                        ctx.note(&format!("bypass: PR #{bpr} merged out of turn ({}) — authorization consumed", &merge_sha[..merge_sha.len().min(9)]));
+                        log(Some(key), &format!("bypass: PR #{bpr} MERGED out of turn as {} — the answered ask landed the cure", &merge_sha[..merge_sha.len().min(9)]));
+                    }
+                    None => {
+                        let why = refusal.unwrap_or_else(|| "gh pr merge reported ok but no mergeCommit — DO NOT trust this tick".into());
+                        ack(ctx, &format!("refused: {}", trunc(&why, 200)))?;
+                        log(Some(key), &format!("bypass: PR #{bpr} merge refused — authorization consumed, reason on the lane card: {}", trunc(&why, 200)));
+                    }
+                }
+            }
+            Err(e) => {
+                log(Some(key), &format!("bypass: PR #{bpr} facts unreadable — retrying next tick: {}", trunc(&e, 200)));
+            }
+        }
+    }
+    if rerun_requested {
+        renew_lease(ctx, repo, base);
+        let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+        // the red verdict carries urls (`…/actions/runs/<id>`) — rerun by id
+        let reds: Vec<(i64, &str)> = v
+            .red
+            .iter()
+            .filter_map(|r| {
+                let id = r
+                    .url
+                    .rsplit('/')
+                    .find(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                    .and_then(|p| p.parse::<i64>().ok())?;
+                Some((id, r.name.as_str()))
+            })
+            .collect();
+        if reds.is_empty() {
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": "nothing-red" }));
+            log(Some(key), "rerun: nothing red on the base tip — stamp consumed");
+        } else {
+            let mut rerun_ok = 0;
+            for (id, name) in &reds {
+                if ctx.sh("gh", &["run", "rerun", &id.to_string(), "--repo", repo]).is_ok() {
+                    rerun_ok += 1;
+                } else {
+                    log(Some(key), &format!("rerun: gh run rerun {id} ({name}) failed — partial"));
+                }
+            }
+            let outcome = if rerun_ok == reds.len() { "issued".to_string() } else { format!("partial: {rerun_ok}/{}", reds.len()) };
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": outcome }));
+            log(Some(key), &format!("rerun: re-ran {} failing check(s) on the base tip — stamp consumed ({outcome})", reds.len()));
+        }
+    }
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
         let stop = lane.get("stop").unwrap();

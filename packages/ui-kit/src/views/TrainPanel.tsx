@@ -220,7 +220,13 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
         ) : (
           <span className="train-banner-dim">no fix card open yet</span>
         )}
-        {red ? " · or re-run a flaky check · or you bypass-merge a fix PR" : " · just wait — they finish on their own"}
+        {r.fix_card && "pr" in r.fix_card && r.fix_card.pr ? (
+          <>
+            {" — fix PR "}
+            <a href={(r.fix_card as any).pr_url} target="_blank" rel="noreferrer" title="open the fix PR">#{r.fix_card.pr}</a>
+            {": answer the ask to bypass-merge it out of turn"}
+          </>
+        ) : red ? " · or re-run a flaky check · or you bypass-merge a fix PR" : " · just wait — they finish on their own"}
       </span>
       {r.ask && (
         <span className="train-banner-line">
@@ -353,7 +359,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
           <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
           <span title="PRs merged over the last hour / 24 hours">rate</span>
-          <span title="plain counts — X cards in the merge queue, Y parked waiting on review (not on the train); the blocks show the batch that merges this pass">backlog</span>
+          <span title="how many cards are waiting to merge, and how many of those waiting cards are blocked on a fresh review">backlog</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
@@ -380,15 +386,6 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             : l.activity?.last_event
               ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
               : null;
-        // QUEUE = THE BATCH (BR#5412, Ray: "the queue-block row = THE BATCH",
-        // "if red is awaiting review, then they are not part of the release
-        // train. That just adds noise"): only the cars the machine's walk
-        // stamped ready to merge this pass render — the mergeable set, not
-        // the audit trail. Awaiting-review parks are not train cars; they
-        // appear nowhere on the panel, only as a plain count below.
-        const batch = l.queue_facts
-          ? l.queue.filter((q) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls === "ready")
-          : [];
         return (
           <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
             <span className="trainc-dot">
@@ -413,28 +410,34 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
             <span className="trainc-backlog">
-              <span className="train-backlog-count">
-                <span className="train-queued-count" title={`${l.queue.length} card(s) in the merge queue`}>
-                  {l.queue.length} <span className="train-count-label">in queue</span>
-                </span>
-                {(l.awaiting ?? []).length > 0 && (
-                  <span className="train-await-count" title={`${(l.awaiting ?? []).length} parked Awaiting review — not on the release train (force-review from the backlog: approve re-queues, changes requested bounce impl)`}>
-                    · {(l.awaiting ?? []).length} <span className="train-count-label">waiting on review</span>
-                  </span>
-                )}
-              </span>
-              {batch.length > 0 && (
-                <span className="train-blocks" title={`${l.queue.length} in the merge queue — ${batch.length} will merge this pass (the batch)${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : ""}`}>
-                  {batch.map((q, i) => (
+              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), amber waits on checks, red conflicts, grey needs a review${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${(l.awaiting ?? []).length ? ` · grey blocks after the divider: ${(l.awaiting ?? []).length} waiting on a review (amber past the window, red past window + grace)` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}`}>
+                {l.queue.map((q, i) => {
+                  const fact = l.queue_facts?.entries.find((e) => e.id === q.id);
+                  const cls = fact?.cls ?? "unknown";
+                  const word = cls === "ready" ? "merges this pass" : cls === "waiting" ? "waiting on checks" : cls === "conflict" ? "conflicted — back to impl" : cls === "needs-review" ? "needs a review" : cls === "blocked" ? "blocked (protection)" : "no machine verdict yet";
+                  return (
                     <span
                       key={q.id}
-                      className={`train-block tb-ready${i === 0 ? " tb-head" : ""}`}
-                      title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — merges this pass (batch)${i === 0 ? " · head of the batch" : ""}`}
+                      className={`train-block tb-${cls}${i === 0 ? " tb-head" : ""}`}
+                      title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word}${i === 0 ? " · head of the queue" : ""}`}
                       onClick={() => openTask?.(q.id)}
                     />
-                  ))}
-                </span>
-              )}
+                  );
+                })}
+                {(l.awaiting ?? []).length > 0 && (
+                  <>
+                    <span className="train-block-gap" title={`${(l.awaiting ?? []).length} parked Awaiting review — after the queue, oldest first`} />
+                    {(l.awaiting ?? []).map((a) => (
+                      <span
+                        key={a.task}
+                        className={`train-block tb-awaiting${a.lapsed ? " tb-awaiting-lapsed" : a.aging ? " tb-awaiting-aging" : ""}`}
+                        title={`${a.task}${a.pr ? ` · PR #${a.pr}` : ""} — waiting on a review, parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? " · PAST the review window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? " · past the review window (amber)" : ""}${a.verdict ? `\nanchored verdict: ${a.verdict}` : ""}\nforce-review from the backlog: approve re-queues, changes requested bounce impl`}
+                        onClick={() => openTask?.(a.task)}
+                      />
+                    ))}
+                  </>
+                )}
+              </span>
             </span>
           </div>
         );

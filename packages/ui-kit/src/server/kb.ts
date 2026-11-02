@@ -200,6 +200,13 @@ export interface KbTrainLane {
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
   now_action?: { note: string; holder: string; at: number } | null;
+  /** 2026-11-02: the answer-derived authorization stamps — a BYPASS answer on
+   *  the base-red alarm ask / root-fix fast-lane ask stamps bypass_merge
+   *  (the executor merges that PR out of turn), a RETRY answer stamps
+   *  rerun_failed (the executor re-runs the failing checks). Consumed +
+   *  acked through the per-tick queue_facts stamp. */
+  bypass_merge?: { repo: string; base: string; pr: number; ask_id?: string; answer?: string; by?: string; at: number } | null;
+  rerun_failed?: { repo: string; base: string; ask_id?: string; answer?: string; by?: string; at: number } | null;
   /** BR#5114 round 2 (Ray: "remove jargon — make it clear"): the current
    *  attempt in plain words — which card the train is on and WHY it is or
    *  isn't moving. hold: "awaiting-review" = the PR branch changed after
@@ -258,7 +265,7 @@ export interface KbTrainLane {
     whats_broken: { name: string; url?: string }[];
     held: number;
     ask: { id: string; url: string; question: string; options: string[] } | null;
-    fix_card: { id: string; url: string; title: string; status: string } | null;
+    fix_card: { id: string; url: string; title: string; status: string; pr?: number; pr_url?: string } | null;
   };
   /** BR#5376: served while a fresh stall episode rides the stamp — the
    *  batch, how long nothing has landed (ticks + wall-clock), WHY (the

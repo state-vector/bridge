@@ -112,6 +112,8 @@ import {
   trainRequeueSwap,
   trainStopAskTitle,
   trainBaseRedAskTitle,
+  trainBaseRedAskBrief,
+  trainPlainStatus,
   trainStallAskTitle,
   trainBaseRedDefect,
   trainLandedCloseNote,
@@ -6248,7 +6250,7 @@ export class KnowledgeHub {
 
     // question-node asks (BR#): answer on the node, resume the subject
     if (/^BR#\d+$/.test(id)) {
-      const node = this.one(`SELECT id, status, meta, created_ts FROM artefacts WHERE id = ?`, id);
+      const node = this.one(`SELECT id, status, meta, created_ts, title FROM artefacts WHERE id = ?`, id);
       if (!node) throw new Error(`no such ask: ${id}`);
       const m = JSON.parse(node.meta ?? "{}");
       if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
@@ -6342,6 +6344,22 @@ export class KnowledgeHub {
         }
       }
       this.audit(actor, "answer", subject?.id ?? null, { ask_id: id, answer: answer.slice(0, 200) });
+      // 2026-11-02: TRAIN ALARM ANSWERS DISPATCH (Ray: "I keep answering B and
+      // nothing happens — it's broken"). The base-red alarm ask and the root-fix
+      // fast-lane ask were dead ends: the answer was recorded and the question
+      // closed, but NOTHING consumed it — no merge, no re-run, and the next red
+      // tick filed a fresh identical ask (the dedupe only guards OPEN asks), so
+      // the human answered B forever in a loop. Now the answer is an
+      // AUTHORIZATION STAMP on the lane card: BYPASS names the cure PR and the
+      // executor merges it out of turn on the next tick (the only way a
+      // circular cure lands — its own checks can never pass while the line it
+      // fixes is stopped); RETRY/rerun stamps the re-run request. The executor
+      // acks consumption through its per-tick queue_facts stamp.
+      try {
+        await this.trainAlarmAnswerDispatch(id, m, String(node.title ?? ""), answer, actor);
+      } catch (e) {
+        this.audit(actor, "train:alarm_answer_dispatch_error", id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
       return { id, status: "answered", artefact_id: subject?.id, task_status: taskStatus };
     }
 
@@ -9424,35 +9442,91 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // so the lane card reads BLOCKED/normal the moment the walk reports,
     // not on the next lease op.
     this.laneSyncReason(lane.id, meta, Date.now());
+    // 2026-11-02: the executor acks consumption of the answer-derived stamps —
+    // bypass_merge (the cure PR merged out of turn, or it was already
+    // closed/merged) and rerun_failed (the failed re-run was issued). One ack
+    // per tick, audited + versioned so the lane card tells the story.
+    const ackBypass = String(body.bypass_consumed ?? "").trim();
+    const ackRerun = String(body.rerun_consumed ?? "").trim();
+    if (ackBypass || ackRerun) {
+      const laneM = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+      let changed = false;
+      if (ackBypass && laneM.lane?.bypass_merge) {
+        delete laneM.lane.bypass_merge;
+        changed = true;
+        this.version(lane.id, actor, "update", `bypass-merge stamp consumed (${ackBypass}) — the authorized merge landed or the PR is closed; the authorization is spent`, {});
+        this.audit(actor, "train:bypass_merge_consumed", lane.id, { outcome: ackBypass });
+      }
+      if (ackRerun && laneM.lane?.rerun_failed) {
+        delete laneM.lane.rerun_failed;
+        changed = true;
+        this.version(lane.id, actor, "update", `re-run stamp consumed (${ackRerun}) — the failing checks were re-run`, {});
+        this.audit(actor, "train:rerun_consumed", lane.id, { outcome: ackRerun });
+      }
+      if (changed) this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneM), Date.now(), lane.id);
+    }
     if (baseState && String(baseState.verdict ?? "") === "red" && entries.length > 0) {
       const reds = (Array.isArray(baseState.red) ? baseState.red : [])
         .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
         .filter((r: { name: string }) => r.name);
       const held = entries.length;
       const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
-      try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: `base ${repo}@${base} RED — the standing order (BR#3009) holds every queued car until it clears`,
-            details: [
-              `Lane ${laneKey(repo, base)} base is RED — the train holds ${held} queued car(s): the standing order never merges onto a non-green destination.`,
-              reds.length
-                ? `Failing required workflow(s) on main's tip:\n${reds.map((r: { name: string; url: string }) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")}`
-                : "The base carries a failing required check (names unavailable this tick).",
-              `Fix forward (a base-fix card/PR), re-run a transient check, or bypass-merge a cure PR directly to main — any of the three unblocks the whole queue at once.`,
-              `Resume is automatic: the next walk classifies base green and merges the first ready car.`,
-            ].join("\n\n"),
-            options: ["Fixing forward — hold the line", "Bypass-merge a cure PR (I'll reply with the number)"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
-      } catch (e) {
-        // an identical ask is already open for this episode — that IS one per episode
-        this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+      // 2026-11-02 (Ray directive): the base-red ask is a LIVE TRIAGE VIEW,
+      // not a one-shot alarm. The old hard-coded pair offered "Bypass-merge
+      // a cure PR (I'll reply with the number)" — an option that demanded a
+      // number a one-shot ask could never learn (the ask fired BEFORE any
+      // triage, and dedupe kept it frozen there while the cure PR bound to
+      // the root-fix card off-ask). Now: the ask's brief/options render from
+      // the LIVE episode state (the root-fix card + its cure PR, refreshed
+      // every tick while the base is red), so option B CARRIES the number
+      // the moment one exists — and the four outcomes mirror the triage
+      // task's own (transient/retry · fault-of-X fix PR → bypass · manual ·
+      // no-resolution-yet keep digging). Plain words only (BR#5349).
+      const fix = this.trainOpenRootFix(repo);
+      const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
+      const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+      // the episode's OPEN ask — the SAME join askCreate's identical-open-ask
+      // guard uses (child_of sink + exact title), so create and refresh agree
+      // on one ask per episode
+      const existing = this.one(
+        `SELECT c.id AS id, c.body_md AS body_md, c.meta AS meta FROM relations r
+         JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+           AND c.type = 'question' AND c.title = ? LIMIT 1`,
+        sinkId, askTitle.slice(0, 200),
+      ) as any;
+      if (existing) {
+        // refresh IN PLACE when the live state moved (fix card opened · cure
+        // PR bound · status changed) — never a second ask, never a stale one
+        const em = JSON.parse(existing.meta ?? "{}");
+        const prevOptions = Array.isArray(em?.ask?.options) ? em.ask.options.map(String) : [];
+        if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(prevOptions) !== JSON.stringify(brief.options)) {
+          em.ask = { ...(em.ask ?? {}), to: String(em.ask?.to ?? "human"), options: brief.options };
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET body_md = ?, meta = ?, updated_ts = ? WHERE id = ?`,
+            brief.details, JSON.stringify(em), Date.now(), existing.id,
+          );
+          this.version(existing.id, actor, "update", `base-red ask refreshed — fix ${fix.card ? fix.card.id : "(no card)"}${fix.curePr ? `, cure PR #${fix.curePr.number}` : ", no cure PR yet"} (the ask is a live triage view while the base is red)`, {});
+          this.audit(actor, "train:base_red_ask_refreshed", lane.id, { ask: existing.id, fix_card: fix.card?.id ?? null, cure_pr: fix.curePr?.number ?? null });
+        }
+      } else {
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: askTitle,
+              reason: `base ${repo}@${base} RED — the standing order (BR#3009) holds every queued PR until it clears`,
+              details: brief.details,
+              options: brief.options,
+              artefact_id: sinkId,
+              urgency: "time-sensitive",
+            },
+            actor,
+          );
+        } catch (e) {
+          // an identical ask is already open for this episode — that IS one per episode
+          this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+        }
       }
     }
     // BR#5376: the STALLED alarm ask — one per episode, filed while the
@@ -9862,6 +9936,108 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return row ? { id: String(row.id), url: this.cardUrl(String(row.id)), title: String(row.title), status: String(row.status) } : null;
   }
 
+  /** 2026-11-02: the episode's OPEN root-fix card (BR#5190) for a repo, with
+   *  its LIVE fix-PR state — the join the base-red alarm ask's brief renders.
+   *  `meta.root_fix.pr` is the CULPRIT (the merged PR that broke main); the
+   *  card's own PR stamp (meta.prs legs / meta.pr) is the CURE once a verify
+   *  accept queues it. Absent card → the brief says so honestly. */
+  private trainOpenRootFix(repo: string): {
+    card: { id: string; title: string; status: string } | null;
+    curePr: { repo: string; number: number } | null;
+    culpritPr: number | null;
+  } {
+    if (!repo) return { card: null, curePr: null, culpritPr: null };
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, title, status, meta, tags FROM artefacts
+       WHERE type = 'task' AND status NOT IN ('done', 'superseded')
+         AND json_extract(meta, '$.root_fix.repo') = ?
+       ORDER BY updated_ts DESC LIMIT 5`,
+      repo,
+    ).toArray() as any[];
+    for (const r of rows) {
+      const m = JSON.parse(r.meta ?? "{}");
+      if (!isRootFixCard({ tags: parseTags(r.tags), meta: m })) continue;
+      const legs = (Array.isArray(m.prs) ? m.prs : [])
+        .map((l: any) => ({ repo: String(l?.repo ?? repo), number: Number(l?.number) }))
+        .filter((l: { number: number }) => Number.isInteger(l.number) && l.number > 0);
+      const first = Number(m.pr?.number ?? 0) || 0;
+      const curePr = legs.length
+        ? legs[legs.length - 1]
+        : first > 0
+          ? { repo: String(m.pr?.repo ?? repo), number: first }
+          : null;
+      return {
+        card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? "") },
+        curePr,
+        culpritPr: Number(m.root_fix?.pr ?? 0) || null,
+      };
+    }
+    return { card: null, curePr: null, culpritPr: null };
+  }
+
+  /** 2026-11-02: TRAIN ALARM ANSWER DISPATCH — the answer is the missing
+   *  merge authority. Two ask families:
+   *  (1) the base-red alarm ask — `MERGE TRAIN BLOCKED: base <repo>@<base> RED
+   *      (…)` — whose options carry the four triage outcomes; a BYPASS answer
+   *      names the cure PR (`Bypass-merge fix PR #N now`, or a typed `#N` /
+   *      `repo#N`), a RETRY answer asks for the failed re-run;
+   *  (2) the root-fix fast-lane ask — `Root-fix fast lane (BR#5189): merge
+   *      <repo> PR #N now? …` — whose "Merge the cure now" IS the bypass.
+   *  A BYPASS answer stamps `meta.lane.bypass_merge = {repo, base, pr, …}` on
+   *  the LANE card; a RETRY answer stamps `meta.lane.rerun_failed`. The
+   *  executor consumes both on its next tick (merge / gh run rerun) and acks
+   *  through the per-tick queue_facts stamp. Failures are audited, never
+   *  thrown — the answer itself is already safely recorded above. */
+  private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, answer: string, actor: string): Promise<void> {
+    const t = String(title ?? askMeta?.ask?.question ?? "");
+    const ans = answer.trim();
+    // (2) the root-fix fast-lane ask — the PR is IN the title
+    const fast = /^Root-fix fast lane \(BR#5189\): merge (\S+) PR #(\d+)/.exec(t);
+    // (1) the base-red alarm ask — repo@base in the title
+    const baseRed = /^MERGE TRAIN BLOCKED: base (\S+)@(\S+) RED/.exec(t);
+    const bypassPr = ((): number | null => {
+      if (fast && /\b(merge|bypass|yes|go)\b/i.test(ans)) return Number(fast[2]);
+      if (!baseRed) return null;
+      if (!/\bbypass\b|\bmerge\b/i.test(ans)) return null;
+      const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
+      return m ? Number(m[1]) : null;
+    })();
+    const rerun = !!baseRed && !bypassPr && /\bre-?run\b|\bretry\b|\btransient\b/i.test(ans);
+    if (!bypassPr && !rerun) return;
+    const repo = fast ? fast[1] : baseRed ? baseRed[1] : "";
+    const base = baseRed ? baseRed[2] : "main";
+    if (!repo) return;
+    const laneRow = this.one(
+      `SELECT id, meta FROM artefacts
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
+         AND status NOT IN ('done', 'superseded') LIMIT 1`,
+      laneKey(repo, base),
+    ) as any;
+    if (!laneRow) {
+      this.audit(actor, "train:alarm_answer_no_lane", askId, { repo, base, answer: ans.slice(0, 160) });
+      return;
+    }
+    const laneMeta = JSON.parse(laneRow.meta ?? "{}");
+    const now = Date.now();
+    if (bypassPr && Number.isInteger(bypassPr) && bypassPr > 0) {
+      laneMeta.lane = {
+        ...(laneMeta.lane ?? {}),
+        bypass_merge: { repo, base, pr: bypassPr, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.version(laneRow.id, actor, "update", `bypass-merge authorized by ask ${askId} — ${repo}#${bypassPr} merges out of turn on the next tick (answer: "${ans.slice(0, 120)}")`, {});
+      this.audit(actor, "train:bypass_merge_stamped", laneRow.id, { repo, base, pr: bypassPr, ask_id: askId });
+    } else {
+      laneMeta.lane = {
+        ...(laneMeta.lane ?? {}),
+        rerun_failed: { repo, base, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.version(laneRow.id, actor, "update", `failed-check re-run authorized by ask ${askId} (answer: "${ans.slice(0, 120)}") — the executor re-runs the failing checks on the next tick`, {});
+      this.audit(actor, "train:rerun_stamped", laneRow.id, { repo, base, ask_id: askId });
+    }
+  }
+
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
     const now0 = Date.now();
@@ -10035,7 +10211,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          fix_card: this.trainFixCard(String((l as any).project ?? "")),
+          // 2026-11-02: the fix card prefers the episode's ROOT-FIX card
+          // (BR#5190 — the auto-spawned work unit the triage outcomes ride),
+          // not just any hotfix+main-red task; the legacy tag join stays as
+          // fallback. The cure PR rides the block so the banner links it.
+          fix_card: (() => {
+            const rf = this.trainOpenRootFix(lane.repo);
+            if (rf.card) {
+              return {
+                id: rf.card.id,
+                url: this.cardUrl(rf.card.id),
+                title: rf.card.title,
+                status: rf.card.status,
+                ...(rf.curePr ? { pr: rf.curePr.number, pr_url: `https://github.com/${rf.curePr.repo}/pull/${rf.curePr.number}` } : {}),
+              };
+            }
+            return this.trainFixCard(String((l as any).project ?? ""));
+          })(),
         };
       }
       // BR#5376: the STALLED resolution beside the lane — the batch members,
@@ -10088,6 +10280,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // executor is doing right now, verbatim from its own tick log; the
         // panel renders it as the NOW line and ages it out at the lease TTL
         now_action: meta.lane?.now_action ?? null,
+        // 2026-11-02: the answer-derived authorization stamps (askAnswer
+        // writes them; the executor consumes + acks them)
+        bypass_merge: meta.lane?.bypass_merge ?? null,
+        rerun_failed: meta.lane?.rerun_failed ?? null,
         attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,
         queue_awaiting_review: awaitingReview,
         // BR#5114: per-entry executor gate verdicts in walk order (panel

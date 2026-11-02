@@ -2117,7 +2117,17 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(brr.ask.id).toBe(ask.id);
     expect(brr.ask.url).toBe(`https://hub.fleetbridge.run/card/${String(ask.id).replace("#", "-")}`);
     expect(brr.ask.question).toBe(ask.title);
-    expect(brr.ask.options).toEqual(["Fixing forward — hold the line", "Bypass-merge a cure PR (I'll reply with the number)"]);
+    // 2026-11-02: the ask is a LIVE TRIAGE VIEW — plain-words brief + the
+    // four triage outcomes (no cure PR yet: no bypass-merge number option,
+    // never the old "I'll reply with the number" shape)
+    expect(brr.ask.options).toEqual([
+      "Hold the line — the fix work continues",
+      "Transient — re-run the failing check",
+      "Other — manual steps (I'll reply)",
+      "No resolution yet — keep digging on the fix card",
+    ]);
+    expect(String(ask.body_md)).toContain("Where the fix work lives");
+    expect(String(ask.body_md)).toContain("No fix PR is open yet");
     // no fix card yet → null, never a lie
     expect(brr.fix_card).toBeNull();
 
@@ -2141,6 +2151,116 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane3 = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane3.base_red_resolution ?? null).toBeNull();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brr" });
+  });
+
+  it("2026-11-02: the base-red ask is a LIVE TRIAGE VIEW — a root-fix card + its cure PR surface IN the OPEN ask (refreshed in place, still ONE ask), fix_card prefers the root-fix card and carries the cure PR, and a bypass answer names the PR", async () => {
+    const repo = "state-vector/lane-brr-live";
+    // a reachable alarm sink for this episode (the setting overrides BR#3124)
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — brr-live", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-brrl", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 53495, head: "c".repeat(40), title: "IMPL: brr-live drill 1" });
+    const stampRed = () =>
+      kbJson("/train.queue_facts", {
+        repo, base: "main", actor: "gw-brrl",
+        entries: [{ id: c1, pr: 53495, cls: "waiting" }],
+        base_state: { verdict: "red", scoped_to_required: true, red: [{ name: "Test", url: "https://example.test/live" }], unsettled: [] },
+      });
+    expect((await stampRed()).body.error ?? "").toBe("");
+
+    // the ask lives under a repo-unique token — full-KB "MERGE TRAIN BLOCKED"
+    // searches drown it in lane-card noise past the limit in a full-file run
+    const askHits = async () => {
+      const all = (await kbJson("/search", { q: "lane-brr-live", type: "question", limit: 50 })).body.artefacts;
+      return all.filter((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
+    };
+    const findAsk = async () => (await askHits())[0] ?? null;
+    const ask1 = await findAsk();
+    expect(ask1).toBeTruthy();
+    expect(String(ask1.body_md)).toContain("No fix PR is open yet");
+
+    // the episode's root-fix card spawns (BR#5190 shape: tags + binding)…
+    const fix = await kbJson("/create", {
+      type: "task", title: "ROOT-FIX (BR#5189 p0): fix main — live drill", tags: ["root_blocker", "main-red", "p0"],
+      project: "superpositional", body_md: "root-fix drill card",
+      meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } },
+    });
+    expect(fix.status).toBe(200);
+
+    // …and a cure PR binds to it (the queued leg stamp meta.prs carries)
+    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() }, prs: [{ repo, number: 53499, head_sha_at_acceptance: "d".repeat(40) }] } });
+
+    // the NEXT red tick refreshes the OPEN ask IN PLACE — still ONE ask, now
+    // carrying the cure PR's number in the options (the old shape demanded a
+    // number it could never learn; the live view carries it)
+    expect((await stampRed()).body.error ?? "").toBe("");
+    const askCount = async () => (await askHits()).length;
+    expect(await askCount()).toBe(1);
+    const ask2 = await findAsk();
+    expect(ask2.id).toBe(ask1.id);
+    expect(String(ask2.body_md)).toContain("https://github.com/" + repo + "/pull/53499");
+    const askMetaM = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
+    expect(askMetaM.ask.options[0]).toContain("Bypass-merge fix PR #53499");
+
+    // fix_card prefers the root-fix card and carries the cure PR link
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    const fc = lane.base_red_resolution.fix_card;
+    expect(fc.id).toBe(fix.body.id);
+    expect(fc.pr).toBe(53499);
+    expect(fc.pr_url).toBe(`https://github.com/${repo}/pull/53499`);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brrl" });
+  });
+
+  it("2026-11-02: answering the base-red alarm ask DISPATCHES — a BYPASS answer stamps bypass_merge on the lane card (train.status serves it), the executor acks through queue_facts (bypass_consumed), and the stamp is spent; a RETRY answer stamps rerun_failed the same way", async () => {
+    const repo = "state-vector/lane-dispatch";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — dispatch", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-disp", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 53501, head: "c".repeat(40), title: "IMPL: dispatch drill 1" });
+    const r = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-disp",
+      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
+    });
+    expect(r.body.error ?? "").toBe("");
+    const ask = (await kbJson("/search", { q: "lane-dispatch", type: "question", limit: 50 })).body.artefacts
+      .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
+    expect(ask).toBeTruthy();
+
+    // the BYPASS answer (the option the live ask carries once a cure PR
+    // binds) — askAnswer records it AND stamps the merge authority on the LANE
+    const a = await kbJson("/ask.answer", { id: ask.id, answer: "(Recommended) Bypass-merge fix PR #53509 now", actor: "web:ray" });
+    expect(a.status).toBe(200);
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.bypass_merge).toBeTruthy();
+    expect(lane.bypass_merge.pr).toBe(53509);
+    expect(lane.bypass_merge.repo).toBe(repo);
+
+    // the executor's next tick consumes + acks through queue_facts — spent
+    const ack = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-disp",
+      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
+      bypass_consumed: "merged",
+    });
+    expect(ack.body.error ?? "").toBe("");
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane2.bypass_merge ?? null).toBeNull();
+
+    // a RETRY answer stamps rerun_failed — the executor re-runs the red checks
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-disp",
+      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
+    });
+    const ask2 = (await kbJson("/search", { q: "lane-dispatch", type: "question", limit: 50 })).body.artefacts
+      .filter((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`))
+      .find((x: any) => x.status === "todo");
+    expect(ask2).toBeTruthy();
+    await kbJson("/ask.answer", { id: ask2.id, answer: "Transient — re-run the failing check", actor: "web:ray" });
+    const lane3 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane3.rerun_failed).toBeTruthy();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-disp" });
   });
 
   it("BR#5376: a stalled batch rides the walk stamp — the lane renders the loud STALLED reason (batch, duration, WHY), train.status serves stalled_resolution (batch/ticks/for_ms/last_error/ask/unblock), the ONE-per-episode ask dedupes the per-tick repeats, base-red suppresses the stall banner, and the next stamp WITHOUT the episode clears everything by itself", async () => {

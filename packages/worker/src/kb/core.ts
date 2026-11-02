@@ -2526,6 +2526,74 @@ export function trainBaseRedAskTitle(lane: { repo: string; base: string }, reds:
   return prefix + names + suffix;
 }
 
+/** Plain status words for a human ask/banner (BR#5349: no jargon) — the
+ *  hub-side mirror of TrainPanel's plainStatus. */
+export function trainPlainStatus(s: string | undefined): string {
+  return s === "in_progress" ? "in progress"
+    : s === "in_review" ? "in review"
+    : s === "todo" ? "not started"
+    : s === "blocked" ? "parked"
+    : s ?? "";
+}
+
+/** The base-red alarm ask's LIVE brief (2026-11-02 Ray directive): the ask
+ *  is a triage view, not a one-shot alarm. What is broken (links), what is
+ *  held, where the fix work lives (the episode's root-fix card BR#5190 +
+ *  its cure PR once one binds), the PR that broke main, and the four ways
+ *  the red clears — transient/retry, bypass-merge the cure, manual steps,
+ *  no-resolution-yet (keep digging). Plain words only (BR#5349): no "car",
+ *  no "lane", no "verdict", no "episode". The options carry the cure PR's
+ *  NUMBER when one exists — never again "Bypass-merge a cure PR (I'll
+ *  reply with the number)", an option that demanded a number the one-shot
+ *  ask could never learn: the executor refreshes the open ask in place
+ *  every tick while the base is red, so the number surfaces the moment it
+ *  binds to the fix card. */
+export function trainBaseRedAskBrief(
+  lane: { repo: string; base: string },
+  reds: { name: string; url?: string }[],
+  held: number,
+  fix: {
+    card: { id: string; title?: string; status?: string } | null;
+    curePr: { repo: string; number: number } | null;
+    culpritPr: number | null;
+  },
+): { details: string; options: string[] } {
+  const broken = reds.length
+    ? reds.map((r) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")
+    : "- (the failing check names were not available this tick)";
+  const details = [
+    `Main on **${lane.repo}** is broken: these required checks are failing on its latest commit (${lane.base}):`,
+    broken,
+    ``,
+    `**${held} PR${held === 1 ? "" : "s"} held.** Nothing merges until main is green again — that is deliberate: no change lands on top of a broken main. The queue drains by itself the moment main recovers; nothing further is needed from you then.`,
+    ``,
+    `**Where the fix work lives:**`,
+    fix.card
+      ? `- Fix card ${fix.card.id}${fix.card.status ? ` (${trainPlainStatus(fix.card.status)})` : ""}${fix.card.title ? ` — ${fix.card.title}` : ""}`
+      : `- No fix card is open yet — the red has not been diagnosed; the next agent session picks it up from the queue.`,
+    fix.curePr
+      ? `- A fix PR is open: ${fix.curePr.repo}#${fix.curePr.number} — https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`
+      : `- No fix PR is open yet — it appears here automatically the moment one binds to the fix card.`,
+    fix.culpritPr ? `- The PR that broke main: #${fix.culpritPr}` : ``,
+    ``,
+    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): answer BYPASS and it merges out of turn, ahead of the queue — this is the only way a fix that cannot pass its own checks while the breakage it fixes is still live gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
+  ].filter((l) => l !== undefined).join("\n");
+  const options = fix.curePr
+    ? [
+        `(Recommended) Bypass-merge fix PR #${fix.curePr.number} now`,
+        `Hold the line — it merges automatically once green`,
+        `Transient — re-run the failing check`,
+        `Other — manual steps (I'll reply)`,
+      ]
+    : [
+        `Hold the line — the fix work continues${fix.card ? ` on ${fix.card.id}` : ""}`,
+        `Transient — re-run the failing check`,
+        `Other — manual steps (I'll reply)`,
+        `No resolution yet — keep digging on the fix card`,
+      ];
+  return { details, options };
+}
+
 /** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall
  *  episode. Unlike the base-red title it carries NO varying names (the
  *  episode's identity IS the lane): askCreate's identical-open-ask guard
