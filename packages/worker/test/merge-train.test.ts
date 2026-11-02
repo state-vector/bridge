@@ -1095,6 +1095,79 @@ describe("the remaining-legs queue reason + the multi-leg landed close note (BR#
   });
 });
 
+// ---------- BR#5556: stale deploy-health self-heal ----------
+
+describe("decideTrainGate BR#5556 — a stale deploy-health red on a green base re-runs the gate (no bounce, no human leg)", () => {
+  const HEAD = "b".repeat(40);
+  const dhRun = (id: number, conclusion: string | null): MainCheckRun =>
+    ({ id, name: "Deploy health (merge gate)", status: conclusion == null ? "in_progress" : "completed", conclusion, html_url: `https://example/${id}` });
+  const tRun = (id: number, conclusion: string | null): MainCheckRun =>
+    ({ id, name: "Test", status: conclusion == null ? "in_progress" : "completed", conclusion, html_url: `https://example/${id}` });
+  const gate = (over: Partial<Parameters<typeof decideTrainGate>[0]> = {}) =>
+    decideTrainGate({
+      prNumber: 5556,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 5556, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "in_review",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "clean",
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [dhRun(101, "failure")],
+      ...over,
+    });
+
+  it("the incident shape: deploy-health FAILURE stamped while main's recovery deploy was in flight, base settled GREEN — rerun_gate, not a bounce", () => {
+    const d = gate();
+    expect(d.kind).toBe("rerun_gate");
+    if (d.kind === "rerun_gate") {
+      expect(d.checkRunIds).toEqual([101]);
+      expect(d.reason).toContain("stale verdict by construction");
+      expect(d.reason).toContain("never a bounce, never a human leg");
+    }
+  });
+
+  it("the judge run is the newest non-cancelled — the re-request targets that id only", () => {
+    const d = gate({ headChecks: [dhRun(101, "failure"), dhRun(105, "failure"), dhRun(103, "cancelled"), tRun(104, "success")] });
+    expect(d.kind).toBe("rerun_gate");
+    if (d.kind === "rerun_gate") expect(d.checkRunIds).toEqual([105]);
+  });
+
+  it("queued card with mergeStateStatus=blocked (the required gate holds the entry) — self-heals the same way", () => {
+    const d = gate({ cardStatus: "blocked", mergeStateStatus: "blocked" });
+    expect(d.kind).toBe("rerun_gate");
+    if (d.kind === "rerun_gate") expect(d.checkRunIds).toEqual([101]);
+  });
+
+  it("a mixed head red (deploy-health + a real check) is NOT stale — the standing law owns it", () => {
+    const d = gate({ headChecks: [dhRun(101, "failure"), tRun(102, "failure")] });
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.defect).toContain("head check RED: Deploy health (merge gate), Test");
+  });
+
+  it("mergeability keeps its precedence: a CONFLICTING PR with a stale deploy-health red still bounces conflict", () => {
+    const d = gate({ mergeable: false, mergeStateStatus: "dirty" });
+    expect(d.kind).toBe("bounce");
+    if (d.kind === "bounce") expect(d.bounceKind).toBe("conflict");
+  });
+
+  it("unsigned commits keep their precedence: human_leg before any re-run", () => {
+    const d = gate({ commits: [{ sha: HEAD, verified: false }] });
+    expect(d.kind).toBe("human_leg");
+  });
+
+  it("a red BASE is not the self-heal's premise — the standing base-red skip stays", () => {
+    const d = gate({ baseVerdict: "red" });
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") expect(d.reason).toContain("base main RED");
+  });
+
+  it("a settled-green deploy-health run on the head merges — the self-heal never fires on green", () => {
+    const d = gate({ headChecks: [dhRun(101, "success")] });
+    expect(d.kind).toBe("merge");
+  });
+});
+
 // ---------- BR#3659: the gate is per-leg ----------
 
 describe("decideTrainGate legs (BR#3659 — the gate is per-leg)", () => {

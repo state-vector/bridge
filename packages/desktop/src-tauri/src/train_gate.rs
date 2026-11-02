@@ -420,6 +420,11 @@ pub enum MergeAction {
     Note { reason: String },
     Skip { reason: String },
     HumanLeg { reason: String },
+    /// BR#5556 self-heal: a stale deploy-health head red on a GREEN base —
+    /// the train executor re-requests the failed gate check run(s)
+    /// (worker-class write, identity-gated like the bisect re-run leg) and
+    /// treats the entry as a clock; never a bounce, never a human leg.
+    RerunGate { reason: String, check_run_ids: Vec<i64> },
 }
 
 #[derive(Clone)]
@@ -554,6 +559,63 @@ pub fn decide_merge_action(
     }
 }
 
+/// BR#5556 train self-heal — the stale deploy-health verdict (core.ts
+/// staleDeployHealthHeadRed mirror). The "Deploy health (merge gate)" check
+/// on a PR head exists to judge MAIN; it can only stamp red because main's
+/// decisive deploy was red at stamp time. If the base verdict is GREEN now,
+/// that red says nothing about this PR — a stale verdict by construction,
+/// and a terminal gate verdict whose premise (red main) evaporated must
+/// re-open itself (observed 2026-11-02: the check stamped FAILURE at 07:49
+/// while main's recovery deploy was still in flight; main settled green at
+/// 07:52 and the stale red held the entry — nothing re-opens it). Returns
+/// the judge check runs (newest non-cancelled per red name — the same rule
+/// classify_head_checks judges by, WITH ids) for the executor's rerequest
+/// dispatch, or None when the red is not entirely the deploy-health class
+/// or the base is not green (any other red, or a red base, stays the
+/// standing law's defect — the self-heal never invents a re-run for a red
+/// the PR or the line really owns).
+pub fn stale_deploy_health_head_red(
+    base_verdict: &MainVerdict,
+    head_checks: &[MainCheckRun],
+) -> Option<Vec<MainCheckRun>> {
+    if *base_verdict != MainVerdict::Green {
+        return None;
+    }
+    let head = classify_head_checks(head_checks);
+    if head.verdict != MainVerdict::Red || head.red.is_empty() {
+        return None;
+    }
+    if !head.red.iter().all(|r| r.name.to_lowercase().contains(DEPLOY_HEALTH_PATTERN)) {
+        return None;
+    }
+    let mut by_name: std::collections::HashMap<String, Vec<&MainCheckRun>> = std::collections::HashMap::new();
+    for r in head_checks {
+        if head.red.iter().any(|x| x.name == r.name) {
+            by_name.entry(r.name.clone()).or_default().push(r);
+        }
+    }
+    let mut judges: Vec<MainCheckRun> = Vec::new();
+    for (_, mut list) in by_name {
+        list.sort_by_key(|r| std::cmp::Reverse(r.id));
+        if let Some(judge) = list.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+            judges.push(judge.clone());
+        }
+    }
+    Some(judges)
+}
+
+/// The rerun_gate action for a stale deploy-health red (BR#5556) — byte-
+/// identical reason to core.ts rerunGateAction so the hub's ledger copy
+/// reads the same whichever mirror fired.
+fn rerun_gate_action(pr_number: i64, names: &str, judges: &[MainCheckRun]) -> MergeAction {
+    MergeAction::RerunGate {
+        reason: format!(
+            "PR #{pr_number} head check RED: {names} — entirely the deploy-health class while base main is GREEN: a stale verdict by construction (the gate judged main's red; the red evaporated under it) — re-requesting the gate check run(s) (BR#5556 self-heal), never a bounce, never a human leg"
+        ),
+        check_run_ids: judges.iter().map(|r| r.id).collect(),
+    }
+}
+
 /// core.ts decideTrainGate (1486): the executor's per-candidate gate, each
 /// leg fail-closed — verdict coverage (stamp or contiguous carry) first,
 /// then the standing gate.
@@ -628,11 +690,19 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             };
         }
         if head.verdict == MainVerdict::Red {
+            // BR#5556 self-heal FIRST: a red that is entirely the deploy-health
+            // class on a GREEN base is stale by construction — the gate judged
+            // main's red and the red evaporated under it. The executor re-requests
+            // the gate run(s) (identity-gated write) and holds the entry as a
+            // clock; the queued-note below stays for any other red class.
+            let names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
+            if let Some(judges) = stale_deploy_health_head_red(&i.base_verdict, i.head_checks) {
+                return rerun_gate_action(i.pr_number, &names, &judges);
+            }
             return MergeAction::Note {
                 reason: format!(
                     "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
                     n = i.pr_number,
-                    names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
                 ),
             };
         }
@@ -690,6 +760,27 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
         true,
         true,
     );
+    // BR#5556 (second shape): the compose stopped EXACTLY at its head-RED row
+    // — mergeable, answered clean/unstable state, signatures and base green
+    // all passed ahead of it (row order is the law's) — and that red is
+    // entirely the deploy-health class: the same stale verdict, the same
+    // self-heal. The prefix check is what proves the compose reached row (4);
+    // every earlier mechanical defect (conflict, unsigned, dirty, base red)
+    // keeps its precedence and still bounces/skips first.
+    let head_red_prefix = format!("PR #{} head check RED: ", i.pr_number);
+    let head_red_text: Option<&str> = match &gate {
+        MergeAction::Note { reason } => Some(reason),
+        MergeAction::Bounce { defect, .. } => Some(defect),
+        _ => None,
+    };
+    let stale = head_red_text
+        .filter(|t| t.starts_with(&head_red_prefix))
+        .and_then(|_| stale_deploy_health_head_red(&i.base_verdict, i.head_checks));
+    if let Some(judges) = stale {
+        let head = classify_head_checks(i.head_checks);
+        let names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
+        return rerun_gate_action(i.pr_number, &names, &judges);
+    }
     match gate {
         MergeAction::Merge { .. } => MergeAction::Merge {
             receipt: format!(
@@ -1366,6 +1457,57 @@ mod tests {
         // MERGES (the BR verify verdict is the approval of record). That posture is
         // pinned by `blocked_green_verdict_anchor_merges_br4633_l4_2` above; the old
         // Gate-bounce leg was removed with the superseded law.
+    }
+
+    // ---------- BR#5556: stale deploy-health self-heal (core.ts merge-train.test.ts mirror) ----------
+
+    #[test]
+    fn stale_deploy_health_rerun_gate_br5556() {
+        // gate_input's live head is 40×'a' — the stamp must cover it
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 5556, "head_sha_at_acceptance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } ] });
+        let dh = |id: i64, c: Option<&str>| run(id, "Deploy health (merge gate)", c);
+        // the incident shape: FAILURE stamped while main's recovery deploy was
+        // in flight; base settled green — rerun_gate with the judge id
+        let gate = decide_train_gate(gate_input(&meta, Some("clean"), &[dh(101, Some("failure"))]));
+        match gate {
+            MergeAction::RerunGate { reason, check_run_ids } => {
+                assert_eq!(check_run_ids, vec![101]);
+                assert!(reason.contains("stale verdict by construction"));
+                assert!(reason.contains("never a bounce, never a human leg"));
+            }
+            other => panic!("expected rerun_gate, got {other:?}"),
+        }
+        // the judge run is the newest non-cancelled — the re-request targets that id only
+        let gate = decide_train_gate(gate_input(&meta, Some("clean"), &[
+            dh(101, Some("failure")), dh(105, Some("failure")), dh(103, Some("cancelled")),
+        ]));
+        match gate {
+            MergeAction::RerunGate { check_run_ids, .. } => assert_eq!(check_run_ids, vec![105]),
+            other => panic!("expected rerun_gate, got {other:?}"),
+        }
+        // the observed hold: mergeStateStatus=blocked (the required gate keeps
+        // the entry) — the blocked red arm self-heals the same way
+        let gate = decide_train_gate(gate_input(&meta, Some("blocked"), &[dh(101, Some("failure"))]));
+        assert!(matches!(gate, MergeAction::RerunGate { .. }), "blocked hold must self-heal: {gate:?}");
+        // a mixed head red (deploy-health + a real check) is NOT stale — the
+        // standing law owns it (in_review → the compose's head-red bounce)
+        let gate = decide_train_gate(gate_input(&meta, Some("clean"), &[
+            dh(101, Some("failure")), run(102, "Test", Some("failure")),
+        ]));
+        assert!(matches!(gate, MergeAction::Bounce { bounce_kind: BounceKind::Gate, .. }), "mixed red must bounce as a gate defect: {gate:?}");
+        // mergeability keeps its precedence: CONFLICTING still bounces conflict
+        let conflict_checks = [dh(101, Some("failure"))];
+        let mut input = gate_input(&meta, Some("dirty"), &conflict_checks);
+        input.mergeable = Some(false);
+        assert!(matches!(decide_train_gate(input), MergeAction::Bounce { bounce_kind: BounceKind::Conflict, .. }));
+        // a red BASE is not the self-heal's premise — the standing skip stays
+        let red_base_checks = [dh(101, Some("failure"))];
+        let mut input = gate_input(&meta, Some("clean"), &red_base_checks);
+        input.base_verdict = MainVerdict::Red;
+        assert!(matches!(decide_train_gate(input), MergeAction::Skip { .. }));
+        // a settled-green deploy-health run on the head merges — never fires on green
+        let gate = decide_train_gate(gate_input(&meta, Some("clean"), &[dh(101, Some("success"))]));
+        assert!(matches!(gate, MergeAction::Merge { .. }));
     }
 
     // ---------- burst-drain law mirrors (BR#4934) ----------

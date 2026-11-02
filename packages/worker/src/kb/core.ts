@@ -1072,7 +1072,12 @@ export type MergeAction =
   | { kind: "bounce"; defect: string; bounceKind: TrainBounceKind }
   | { kind: "note"; reason: string }
   | { kind: "skip"; reason: string }
-  | { kind: "human_leg"; reason: string };
+  | { kind: "human_leg"; reason: string }
+  /** BR#5556 self-heal: a stale deploy-health head red on a GREEN base — the
+   *  train executor re-requests the failed gate check run(s) (worker-class
+   *  write, identity-gated like the bisect re-run leg) and treats the entry
+   *  as a clock; never a bounce, never a human leg. */
+  | { kind: "rerun_gate"; reason: string; checkRunIds: number[] };
 
 /** The 5c gate + verify lineage, as one decision table.
  *  Order matters: superseded first, then the mechanical gate (mergeable /
@@ -1134,6 +1139,19 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
   if (!i.verifyAcceptedOnHead)
     return { kind: "skip", reason: `no accepted verify verdict covering head ${short} — the verify pool owns the verdict; the sweep merges only verified PRs` };
   return { kind: "merge", receipt: `PR #${i.prNumber} merged by the standing merge sweep (BR#3033): head ${short} — 5c gate pass (mergeable, clean, ${i.commits.length} verified commits), base green, head checks green, verify accepted on head` };
+}
+
+/** The rerun_gate action for a stale deploy-health red (BR#5556): the
+ *  executor re-requests exactly the failed gate check run(s) — the judge
+ *  runs staleDeployHealthHeadRed derived — and treats the entry as a clock.
+ *  Never a bounce, never a human leg (Ray directive 2026-11-02: the train
+ *  should aggressively self-heal). */
+function rerunGateAction(prNumber: number, names: string, judges: MainCheckRun[]): MergeAction {
+  return {
+    kind: "rerun_gate",
+    reason: `PR #${prNumber} head check RED: ${names} — entirely the deploy-health class while base main is GREEN: a stale verdict by construction (the gate judged main's red; the red evaporated under it) — re-requesting the gate check run(s) (BR#5556 self-heal), never a bounce, never a human leg`,
+    checkRunIds: judges.map((r) => r.id),
+  };
 }
 
 /** Deterministic title for the human-leg class ask (rule 5c: ONE ask per
@@ -2234,6 +2252,41 @@ export function normalizeGhMergeState(v: unknown): string | null {
   return typeof v === "string" ? v.toLowerCase() : null;
 }
 
+/** BR#5556 train self-heal — the stale deploy-health verdict. The
+ *  "Deploy health (merge gate)" check on a PR head exists to judge MAIN; it
+ *  can only stamp red because main's decisive deploy was red at stamp time.
+ *  If the base verdict is GREEN now, that red says nothing about this PR —
+ *  it is a stale verdict by construction, and a terminal gate verdict whose
+ *  premise (red main) evaporated must re-open itself (observed 2026-11-02:
+ *  the check stamped FAILURE at 07:49 while main's recovery deploy was still
+ *  in flight; main settled green at 07:52 and the stale red held the entry —
+ *  nothing re-opens it). Returns the judge check runs (newest non-cancelled
+ *  per red name — the same rule classifyHeadChecks judges by, WITH ids) for
+ *  the executor's rerequest dispatch, or null when the red is not entirely
+ *  the deploy-health class or the base is not green (any other red, or a red
+ *  base, stays the standing law's defect — the self-heal never invents a
+ *  re-run for a red the PR or the line really owns). */
+export function staleDeployHealthHeadRed(baseVerdict: string, headChecks: MainCheckRun[]): MainCheckRun[] | null {
+  if (baseVerdict !== "green") return null;
+  const head = classifyHeadChecks(headChecks);
+  if (head.verdict !== "red" || !head.red.length) return null;
+  if (!head.red.every((r) => r.name.toLowerCase().includes(DEPLOY_HEALTH_PATTERN))) return null;
+  const redNames = new Set(head.red.map((r) => r.name));
+  const byName = new Map<string, MainCheckRun[]>();
+  for (const r of headChecks) {
+    if (!redNames.has(r.name ?? "")) continue;
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const judges: MainCheckRun[] = [];
+  for (const [, list] of byName) {
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (judge) judges.push(judge);
+  }
+  return judges;
+}
+
 /** The per-candidate gate the executor runs before merging (BR#3516 §2),
  *  each leg fail-closed: verdict coverage (stamp or contiguous carry) ·
  *  base-green · mergeable=MERGEABLE with bound-wait through null · every
@@ -2295,8 +2348,17 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     const head = classifyHeadChecks(i.headChecks);
     if (head.verdict === "unsettled")
       return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
-    if (head.verdict === "red")
+    if (head.verdict === "red") {
+      // BR#5556 self-heal FIRST: a red that is entirely the deploy-health
+      // class on a GREEN base is stale by construction — the gate judged
+      // main's red and the red evaporated under it. The executor re-requests
+      // the gate run(s) (identity-gated write) and holds the entry as a
+      // clock; the queued-note below stays for any other red class.
+      const stale = staleDeployHealthHeadRed(i.baseVerdict, i.headChecks);
+      if (stale)
+        return rerunGateAction(i.prNumber, head.red.map((r) => r.name).join(", "), stale);
       return { kind: "note", reason: `PR #${i.prNumber} head check RED: ${head.red.map((r) => r.name).join(", ")} — card queued (not in_review), no bounce; the linked session owns it` };
+    }
   }
   const gate = decideMergeAction({
     prNumber: i.prNumber,
@@ -2316,6 +2378,23 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
       kind: "merge",
       receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
     };
+  // BR#5556 (second shape): the compose stopped EXACTLY at its head-RED row —
+  // mergeable, answered clean/unstable state, signatures and base green all
+  // passed ahead of it (row order is the law's) — and that red is entirely
+  // the deploy-health class: the same stale verdict, the same self-heal. The
+  // prefix check is what proves the compose reached row (4); every earlier
+  // mechanical defect (conflict, unsigned, dirty, base red) keeps its
+  // precedence and still bounces/skips first.
+  if (gate.kind === "note" || gate.kind === "bounce") {
+    const text = gate.kind === "note" ? gate.reason : gate.defect;
+    if (text.startsWith(`PR #${i.prNumber} head check RED: `)) {
+      const stale = staleDeployHealthHeadRed(i.baseVerdict, i.headChecks);
+      if (stale) {
+        const head = classifyHeadChecks(i.headChecks);
+        return rerunGateAction(i.prNumber, head.red.map((r) => r.name).join(", "), stale);
+      }
+    }
+  }
   return gate;
 }
 

@@ -1663,6 +1663,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::RerunGate { reason, .. } => ("rerun_gate", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
         qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
@@ -1673,6 +1674,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 _ => "blocked",
             },
             MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));
 
@@ -1696,6 +1698,33 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // once, on the final merge of the batch (phase C tail).
                 ctx.note(&format!("PR #{pr} ({head_id}) not ready — {reason}; continuing to the next queued PR"));
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
+                continue;
+            }
+            MergeAction::RerunGate { reason, check_run_ids } => {
+                // BR#5556 train self-heal: the stale deploy-health red is
+                // machine-healable — re-request the failed gate check run(s)
+                // (a WRITE: worker-class only, BR#3181 — the same identity
+                // gate as the bisect re-run leg above) and treat the entry as
+                // a clock. NEVER a bounce, NEVER a human leg: the re-run is
+                // the re-open of a terminal verdict whose premise (red main)
+                // evaporated; the entry stays queued and re-gates next tick.
+                if !ctx.write_allowed() {
+                    ctx.note("identity gate: write leg withheld");
+                    log(Some(key), &format!("IDENTITY GATE: gate re-run dispatch for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); lease released for a worker gateway"));
+                    release_if_idle(ctx, key, repo, base)?;
+                    return Ok(());
+                }
+                renew_lease(ctx, repo, base);
+                let mut rerun_ok = 0usize;
+                for id in &check_run_ids {
+                    if ctx.sh("gh", &["api", &format!("repos/{}/check-runs/{}/rerequest", repo, id), "-X", "POST"]).is_ok() {
+                        rerun_ok += 1;
+                    } else {
+                        log(Some(key), &format!("self-heal: rerequest for check run {id} failed — next tick re-arms"));
+                    }
+                }
+                ctx.note(&format!("PR #{pr} head red is stale (deploy-health class on a GREEN base) — re-requested {rerun_ok}/{} gate check run(s); holding as a clock", check_run_ids.len()));
+                log(Some(key), &format!("self-heal (BR#5556): PR #{pr} stale deploy-health red re-requested ({rerun_ok}/{}) — entry stays queued, never a bounce, never a human leg — {reason}", check_run_ids.len()));
                 continue;
             }
             MergeAction::HumanLeg { reason } => {

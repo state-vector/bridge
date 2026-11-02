@@ -1246,6 +1246,19 @@ machine-clean carry chain:
   closed). Bounce only on definitive DIRTY/CONFLICTING. Receipt: the 2026-10-28 ledger,
   where PRs #279/#281 bounced 28× with `merge_state_status:null` — every "CONFLICTING"
   row of that loop trial-merged CLEAN (a stale read, not a conflict).
+- **A stale deploy-health red re-runs itself (BR#5556)**: the "Deploy health (merge
+  gate)" check on a PR head judges MAIN — it can only stamp red because main's
+  decisive deploy was red at stamp time. When the base verdict is GREEN and the head
+  red is ENTIRELY that class, the red is stale by construction: a terminal verdict
+  whose premise (red main) evaporated must re-open itself (observed 2026-11-02: a
+  check stamped FAILURE at 07:49 while main's recovery deploy was still in flight;
+  main settled green at 07:52 and the stale red held the entry). The gate returns the
+  new `rerun_gate` action and the executor re-requests exactly the failed gate check
+  run(s) (`gh api check-runs/{id}/rerequest` — a worker-class, identity-gated write,
+  same as the bisect re-run leg) and holds the entry as a clock — never a bounce,
+  never a human leg. Any other red (mixed classes, a red base), and every earlier
+  mechanical defect (conflict, unsigned, dirty state), keeps its precedence — the
+  self-heal only ever re-arms a red nothing else owns.
 - **Mechanical defects bounce with the exact defect named** — conflicts, red base, red
   head, unsigned commits, a head the verdict no longer covers — the same law the verify
   round enforces (rule 5c), now executed by the train. Human-leg defects
