@@ -131,6 +131,12 @@
         "type": "string"
       }
     },
+    "sweep_repos": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "models": {
       "type": "object",
       "propertyNames": {
@@ -169,7 +175,8 @@
     "report_minutes",
     "isolate",
     "backends",
-    "worktree_exempt_repos"
+    "worktree_exempt_repos",
+    "sweep_repos"
   ],
   "additionalProperties": {}
 }

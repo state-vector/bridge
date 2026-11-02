@@ -80,6 +80,18 @@ pub struct DispatchConfig {
     /// case-insensitively against the tail of the repo URL.
     #[serde(default)]
     pub worktree_exempt_repos: Vec<String>,
+    /// 2026-11-02 (Ray: "worktrees are still not being cleaned up — massive
+    /// disk space leakage"): extra git repo ROOTS whose REGISTERED worktrees
+    /// the stale sweep enumerates via `git worktree list` — e.g. the shared
+    /// checkout, where interactive agent sessions create trees per AGENTS.md
+    /// rule 6 with no other lifecycle owner. The dir scans only cover the
+    /// runner's own roots (<workdir>/repos/<repo>/.worktrees, the legacy
+    /// ~/.bridge/worktrees, <workdir>/worktrees); everything else — the
+    /// 30+ GB class observed on the checkout: .worktrees/*, ~/Projects/wt-*,
+    /// /tmp trees — is registered in a repo the sweep never consulted.
+    /// Env BRIDGE_SWEEP_REPOS (comma-separated paths).
+    #[serde(default)]
+    pub sweep_repos: Vec<String>,
     /// Enabled backends, keyed by provider name. Each section carries that
     /// provider's own config — model, agent profile, CLI binary override.
     /// A dict, not an array: providers differ (opencode has its own default
@@ -327,6 +339,12 @@ impl DispatchConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            sweep_repos: std::env::var("BRIDGE_SWEEP_REPOS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             backends: std::env::var("BRIDGE_BACKENDS")
                 .ok()
                 .map(|v| {
@@ -560,6 +578,7 @@ pub fn default_config() -> DispatchConfig {
         report_minutes: None,
         isolate: default_isolate(),
         worktree_exempt_repos: Vec::new(),
+        sweep_repos: Vec::new(),
         backends: Default::default(),
         models: None,
         agents: None,
@@ -2205,13 +2224,22 @@ fn sweep_disposition(age_secs: u64, status: Option<&str>) -> (bool, bool, String
 /// Collect worktree candidates from both roots. `home` is a parameter (not
 /// read from the env here) so tests can inject a scratch root. A missing root
 /// contributes nothing — a scoped skip, never an abort.
+/// 2026-11-02: also collects (a) the runner's own `<workdir>/worktrees/<slug>`
+/// root (observed leak: br4994-corpus sat there while the sweep passed it by),
+/// and (b) every REGISTERED worktree of the clones under `<workdir>/repos` and
+/// the configured `sweep_repos` roots (`git worktree list --porcelain`) — the
+/// dir scans can only see their own roots, but registered trees live wherever
+/// their session put them (the checkout's .worktrees/, ~/Projects/wt-*,
+/// /tmp/...). Enumeration skips each repo's main worktree (the root itself).
 fn collect_worktree_candidates(
     workdir: &Path,
     home: Option<&Path>,
     active: &HashSet<String>,
+    sweep_repos: &[String],
 ) -> Vec<WorktreeCandidate> {
     let mut found: Vec<WorktreeCandidate> = Vec::new();
-    let mut push = |e: std::fs::DirEntry, found: &mut Vec<WorktreeCandidate>| {
+    let push_entry =
+        |e: std::fs::DirEntry, found: &mut Vec<WorktreeCandidate>| {
         let name = e.file_name().to_string_lossy().to_string();
         if name.is_empty() || active.contains(&name) {
             return;
@@ -2231,17 +2259,69 @@ fn collect_worktree_candidates(
         for repo in repos.flatten() {
             if let Ok(entries) = std::fs::read_dir(repo.path().join(".worktrees")) {
                 for e in entries.flatten() {
-                    push(e, &mut found);
+                    push_entry(e, &mut found);
                 }
             }
+        }
+    }
+    // 2026-11-02: the runner's own trees root — <workdir>/worktrees/<slug>
+    if let Ok(entries) = std::fs::read_dir(workdir.join("worktrees")) {
+        for e in entries.flatten() {
+            push_entry(e, &mut found);
         }
     }
     // legacy: ~/.bridge/worktrees/<slug>
     if let Some(home) = home {
         if let Ok(entries) = std::fs::read_dir(home.join(".bridge").join("worktrees")) {
             for e in entries.flatten() {
-                push(e, &mut found);
+                push_entry(e, &mut found);
             }
+        }
+    }
+    // registered enumeration: every clone under <workdir>/repos plus the
+    // configured sweep_repos roots (e.g. the shared checkout). A repo root
+    // that is not a git repo contributes nothing — scoped skip.
+    let mut repo_roots: Vec<PathBuf> = std::fs::read_dir(workdir.join("repos"))
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    repo_roots.extend(
+        sweep_repos
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.join(".git").exists()),
+    );
+    for root in repo_roots {
+        let Ok(out) = Command::new("git")
+            .current_dir(&root)
+            .args(["worktree", "list", "--porcelain"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(p) = line.strip_prefix("worktree ") else {
+                continue;
+            };
+            let path = PathBuf::from(p);
+            if path == root {
+                continue; // the repo's own main worktree is not a candidate
+            }
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.is_empty() || active.contains(&name) {
+                continue;
+            }
+            // dedup by path against what the dir scans already collected
+            if found.iter().any(|c| c.path == path) {
+                continue;
+            }
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push(WorktreeCandidate { slug: name, path, mtime });
         }
     }
     found
@@ -2257,6 +2337,7 @@ fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlig
         Path::new(&cfg.workdir),
         std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
         &active,
+        &cfg.sweep_repos,
     );
     // dedup by slug (same name in both roots → nested wins), then drain
     // oldest-first: the cap must always bite the worst offenders
@@ -2299,14 +2380,21 @@ fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlig
         // prune the clones that actually own the registrations. cfg.workdir is
         // scratch space, NOT a repo — the old prune against it was a silent
         // no-op that left ghost registrations in the owning clones (BR#2421).
-        if let Ok(repos) = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos")) {
-            for repo in repos.flatten() {
-                let _ = Command::new("git")
-                    .current_dir(repo.path())
-                    .arg("worktree")
-                    .arg("prune")
-                    .output();
-            }
+        let mut prune_roots: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos"))
+            .map(|it| it.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        prune_roots.extend(
+            cfg.sweep_repos
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| p.join(".git").exists()),
+        );
+        for repo in prune_roots {
+            let _ = Command::new("git")
+                .current_dir(repo)
+                .arg("worktree")
+                .arg("prune")
+                .output();
         }
     }
 }
@@ -4699,16 +4787,39 @@ mod tests {
         std::fs::create_dir_all(home.join(".bridge").join("worktrees").join("hotfix-ext")).unwrap();
         let mut active = HashSet::new();
         active.insert("BR-2".to_string()); // in-flight on this host — excluded from BOTH roots
-        let found = collect_worktree_candidates(&workdir, Some(&home), &active);
+        // 2026-11-02: the runner's own trees root <workdir>/worktrees/<slug>
+        std::fs::create_dir_all(workdir.join("worktrees").join("BR-4")).unwrap();
+        let found = collect_worktree_candidates(&workdir, Some(&home), &active, &[]);
         let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
         slugs.sort();
-        assert_eq!(slugs, vec!["BR-1", "BR-3", "hotfix-ext"], "active excluded from both roots, the rest collected");
+        assert_eq!(slugs, vec!["BR-1", "BR-3", "BR-4", "hotfix-ext"], "active excluded from every root, the rest collected (incl. <workdir>/worktrees)");
         // the BR#3633 regression: a missing legacy root used to early-return
         // and discard the nested candidates — now it is a scoped skip
-        let found = collect_worktree_candidates(&workdir, Some(&base.join("no-such-home")), &HashSet::new());
+        let found = collect_worktree_candidates(&workdir, Some(&base.join("no-such-home")), &HashSet::new(), &[]);
         let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
         slugs.sort();
-        assert_eq!(slugs, vec!["BR-1", "BR-2"], "nested candidates survive a missing legacy root");
+        assert_eq!(slugs, vec!["BR-1", "BR-2", "BR-4"], "nested candidates survive a missing legacy root");
+
+        // 2026-11-02: REGISTERED enumeration — a real git repo root (the shared
+        // checkout class) with worktrees registered at arbitrary paths via
+        // `git worktree add` is enumerated by `git worktree list`, its own
+        // main worktree skipped. The dir scans alone never saw these — this
+        // is the 30+ GB checkout leak class.
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git").args(args).current_dir(cwd).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success()
+        };
+        assert!(git(&["init", "-q", "."], &checkout));
+        git(&["config", "user.email", "t@t"], &checkout);
+        git(&["config", "user.name", "t"], &checkout);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"], &checkout);
+        let leaked = base.join("elsewhere").join("BR-9001");
+        assert!(git(&["worktree", "add", "-q", leaked.to_str().unwrap()], &checkout), "register a worktree at an arbitrary path");
+        let found = collect_worktree_candidates(&workdir, Some(&home), &HashSet::new(), &[checkout.to_string_lossy().to_string()]);
+        let slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
+        assert!(slugs.contains(&"BR-9001".to_string()), "registered tree at an arbitrary path is enumerated via sweep_repos");
+        assert!(!found.iter().any(|c| c.path == checkout), "the repo's own main worktree is never a candidate");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4849,6 +4960,7 @@ mod tests {
             report_minutes: None,
             isolate: true,
             worktree_exempt_repos: vec![],
+            sweep_repos: vec![],
             backends: std::collections::BTreeMap::from([
                 ("opencode".to_string(), Default::default()),
             ]),

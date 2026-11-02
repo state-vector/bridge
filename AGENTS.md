@@ -32,8 +32,16 @@ Rules, in force:
    --show-current` before committing; if your commit landed on a foreign
    branch, cherry-pick it to main via a throwaway worktree instead of
    switching the shared checkout.
-6. **Long edits want a worktree.** `git worktree add` for anything beyond
-   a few files — the shared checkout is for short, surgical changes.
+6. **Long edits want a worktree — and the run owns its cleanup.** `git
+   worktree add` for anything beyond a few files — the shared checkout is
+   for short, surgical changes. **Remove your worktree before the run
+   ends** (`git worktree remove <path>`; delete its branch if merged):
+   abandoned trees are the #1 disk leak on this repo (~50 registered
+   strays, 30+ GB observed). The gateway's hygiene sweep is the backstop,
+   not the owner — it sweeps only trees registered to the runner's clones
+   and the configured `sweep_repos` roots (env `BRIDGE_SWEEP_REPOS`,
+   e.g. this checkout), preserving uncommitted WIP onto
+   `wip/<task>-<date>` branches first (BR#3204/BR#3633 law).
 
 The signature failure mode of this repo is not bugs in code — it is two
 sessions each holding a stale model of the tree. Every rule above exists
