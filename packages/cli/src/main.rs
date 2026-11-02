@@ -339,6 +339,15 @@ fn run(cfg: Option<DispatchConfig>) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
+                    // 2026-11-02: extra repo roots whose registered worktrees
+                    // the hygiene sweep enumerates (the worktree registry is
+                    // the primary mechanism; this is the explicit escape hatch)
+                    sweep_repos: std::env::var("BRIDGE_SWEEP_REPOS")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
                     identity: None, // built-in worker class applies (BR#3185)
                 },
             });
