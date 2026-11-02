@@ -556,8 +556,28 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; max-width: 100%; overflow: hidden; }
 .train-block { width: 11px; height: 16px; border-radius: 3px; cursor: pointer; flex: none; border: 1px solid transparent; }
 .train-block:hover { filter: brightness(1.2); }
+/* 2026-11-02: the block classes RESTORED — BR#5412's CSS half deleted them
+   ("audit-trail classes removed") but the TSX half still emits every one
+   (tb-waiting/tb-conflict/tb-needs-review/tb-blocked/tb-unknown/tb-awaiting*/
+   + the gap divider), so every non-ready car rendered as .train-block's
+   transparent+transparent shell: INVISIBLE cars (Ray: "cars transparent/
+   empty"). Markup is the contract — style what it emits. */
 .tb-ready { background: var(--green, #3fb26a); }
-.tb-head { box-shadow: 0 0 0 2px var(--accent, #6ea8fe); }
+.tb-waiting { background: var(--amber, #d29a4b); }
+.tb-conflict { background: var(--red, #d9534f); }
+.tb-needs-review { background: var(--text-faint, #8b94a7); }
+.tb-blocked { background: repeating-linear-gradient(45deg, var(--text-faint, #8b94a7), var(--text-faint, #8b94a7) 3px, transparent 3px, transparent 6px); }
+/* unknown = no machine verdict yet — a faint DASHED placeholder reads as
+   "pending", never as a broken/empty box (Ray, 2026-11-02) */
+.tb-unknown { background: repeating-linear-gradient(45deg, transparent, transparent 3px, color-mix(in srgb, var(--text-faint, #8b94a7) 18%, transparent) 3px, color-mix(in srgb, var(--text-faint, #8b94a7) 18%, transparent) 6px); border: 1px dashed var(--text-faint, #8b94a7); }
+/* head of the queue — an INSIDE accent border on the block itself, never
+   the 2px box-shadow ring that bled onto the right/bottom neighbours and
+   read as a rendering glitch (Ray, 2026-11-02) */
+.tb-head { border: 1.5px solid var(--accent, #6ea8fe); }
+.tb-awaiting { background: var(--text-faint, #8b94a7); opacity: 0.55; }
+.tb-awaiting-aging { background: var(--amber, #d29a4b); opacity: 0.8; }
+.tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
+.train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
@@ -1024,15 +1044,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* per-table column templates — layout lives ONLY here, as --cols */
 .top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
-/* BR#5412 (Ray): status pill column shrunk — the NOW msg line is the most
-   valuable cell and the backlog counts/batch blocks need room; line stays
-   readable, prog + rate keep their tracks. */
-.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) minmax(150px, 0.7fr) 120px minmax(280px, 1.6fr) 86px minmax(210px, 1.2fr); }
+/* 2026-11-02 rebalance (Ray: "column width still disproportionate") — the
+   BR#5412 swing overshot: status crushed to 0.7fr/150px while its chips
+   ("⛔ blocked — base is red (…)") are the longest strings on the row, and
+   msg bloated to 1.6fr/280px for content that is often just "—". Closer
+   ratios, floors matched to real content, backlog flexible for the queue. */
+.train-head-cols, .train-row { --cols: 26px minmax(150px, 0.9fr) minmax(210px, 1.1fr) 112px minmax(220px, 1.3fr) 86px minmax(190px, 1fr); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
   .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
   /* narrow: PROGRESS and RATE fold away; STATUS/CURRENT/MSG/BACKLOG stay */
-  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(130px, 0.7fr) minmax(220px, 1.6fr) minmax(170px, 1.2fr); }
+  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(190px, 1fr) minmax(200px, 1.2fr) minmax(160px, 0.9fr); }
   .trainc-prog, .trainc-rate { display: none; }
 }
 
