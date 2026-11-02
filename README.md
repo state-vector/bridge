@@ -3098,6 +3098,15 @@ webapp overrides the palette in its `:root`; mobile sets
 chip, card or field styles: the drift those per-surface copies caused is
 the bug this kit removes.
 
+The kit also ships the **knowledge-plane views** — `TopView`, `TrainPanel`,
+`AskBand` / `AskEntries` / `useHumanAsks`, `DashboardSummary`, `ForMeView`,
+`BacklogView`, `TaskDetail`, `StatusLights` — the same rendering path for
+web, desktop and mobile. `packages/mobile/ui` consumes them directly
+(Overview / Asks / Trains / Top / Voice tabs): its layer is layout,
+navigation and narrow-screen overrides only, and where a kit view doesn't
+fit a phone it adapts the DATA (same endpoints, same shapes) rather than
+re-implementing the view.
+
 **Docs are part of the change.** README.md and `packages/site/content.md`
 describe shipped behaviour — a change that alters user-visible behaviour
 (UI, config, protocol, gates) updates both in the same commit. Agents get
@@ -3115,7 +3124,7 @@ contract.
 | `packages/ui-kit` | `@bridge/ui-kit` — shared design tokens + Btn/Chip/Card/Field/ConnDot/RelTime; one look for webapp, gateway UI and mobile |
 | `packages/desktop` | gateway desktop app: minimal gateway UI (`ui/`) + Rust dispatch core (`src-tauri/`) |
 | `packages/desktop/ui` | the gateway UI (auth, dispatch log stream, agent config, open-in-web) |
-| `packages/mobile/ui` | mobile UI (Fleet + For You + Voice console) — native iOS shell (`packages/mobile/shell`, Tauri 2) |
+| `packages/mobile/ui` | mobile UI — Overview / Asks / Trains / Top / Voice tabs on the shared ui-kit views (iOS shell: `packages/mobile/shell`, Tauri 2) |
 | `packages/cli` | headless `bridge` runner binary (reuses the desktop dispatch core) |
 | `packages/site` | public landing page (static) |
 | `packages/adapters` | anything → `/ingest` shippers |
