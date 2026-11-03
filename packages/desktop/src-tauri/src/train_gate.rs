@@ -175,36 +175,47 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
     classify_main_check_runs(&scoped)
 }
 
-/// core.ts classifyHeadChecks (846): same rule, but exempt-external failures
-/// are pulled OUT of red into `external` (human-leg class ask, never gating).
+/// core.ts classifyHeadChecks (846): same rule as classify_main_check_runs
+/// (newest non-cancelled run per check name wins, by highest id — so a
+/// re-run that succeeded supersedes an earlier failure of the same check),
+/// with exempt-external failures pulled OUT of red into `external`
+/// (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
     let mut red = Vec::new();
     let mut unsettled = Vec::new();
     let mut external = Vec::new();
     let mut green = 0usize;
-    for r in runs {
-        let name = r.name.clone();
-        match r.conclusion.as_deref() {
+    for (name, list) in parse_runs(runs) {
+        let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        let judge = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled"));
+        match judge {
             None => {
-                if is_exempt_check_name(&name) {
-                    continue; // exempt externals in flight say nothing
-                }
-                unsettled.push(name);
-            }
-            Some(c) if is_exempt_check_name(&name) => {
-                if is_red_conclusion(c) {
-                    external.push(MainRedCheck { name, conclusion: c.to_string(), url: r.html_url.clone().unwrap_or_default() });
-                } else if settled_green(c) {
-                    green += 1;
+                if !is_exempt_check_name(&name) {
+                    unsettled.push(format!("{} (only cancelled runs)", name));
                 }
             }
-            Some(c) if is_red_conclusion(c) => red.push(MainRedCheck {
-                name,
-                conclusion: c.to_string(),
-                url: r.html_url.clone().unwrap_or_default(),
-            }),
-            Some(c) if settled_green(c) => green += 1,
-            Some(c) => unsettled.push(format!("{} (unknown conclusion: {})", name, c)),
+            Some(r) => match r.conclusion.as_deref() {
+                None => {
+                    if !is_exempt_check_name(&name) {
+                        unsettled.push(name);
+                    }
+                }
+                Some(c) if is_exempt_check_name(&name) => {
+                    if is_red_conclusion(c) {
+                        external.push(MainRedCheck { name, conclusion: c.to_string(), url: r.html_url.clone().unwrap_or_default() });
+                    } else if settled_green(c) {
+                        green += 1;
+                    }
+                }
+                Some(c) if is_red_conclusion(c) => red.push(MainRedCheck {
+                    name,
+                    conclusion: c.to_string(),
+                    url: r.html_url.clone().unwrap_or_default(),
+                }),
+                Some(c) if settled_green(c) => green += 1,
+                Some(c) => unsettled.push(format!("{} (unknown conclusion: {})", name, c)),
+            },
         }
     }
     finish_verdict(red, unsettled, external, green)
@@ -1823,5 +1834,36 @@ mod tests {
             base_red_names: &["Deploy health (merge gate)".to_string()],
         });
         assert!(!matches!(gate, MergeAction::RerunGate { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn head_checks_newest_non_cancelled_run_per_name_supersedes_stale_failure() {
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "o/r", "number": 2707, "head_sha_at_acceptance": head } ] });
+        let checks = [
+            run(100, "Deploy health (merge gate)", Some("failure")),
+            run(101, "Deploy health (merge gate)", Some("failure")),
+            run(200, "Deploy health (merge gate)", Some("success")),
+            run(201, "ci", Some("success")),
+        ];
+        let v = classify_head_checks(&checks);
+        assert_eq!(v.verdict, MainVerdict::Green);
+        assert!(v.red.is_empty());
+        assert_eq!(v.green, 2);
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 2707,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("behind".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &checks,
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
+        });
+        assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
     }
 }

@@ -14,6 +14,7 @@ import {
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
+  classifyHeadChecks,
   decideMergeAction,
   decideTrainGate,
   leaseDecide,
@@ -23,6 +24,9 @@ import {
   progressVerdict,
   renewProgressDecide,
   selectBatch,
+  partitionMergeBatches,
+  isValidGitHubRepo,
+  parseDirectCommitReceipt,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -266,6 +270,30 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.map((x) => x.id)).toEqual(["A"]);
   });
 
+  // BR#5750 — a watchdog silence-release hold-park of a QUEUED car must keep
+  // its queue slot even when the park note predates the merge-train: prefix
+  // (the BR#4995 silent drop). awaiting is NOT a queue slot — it re-enters
+  // through the board.
+  it("BR#5750: a legacy unprefixed watchdog hold-park of a queued car still queues; awaiting parks never do", () => {
+    const legacy = {
+      id: "H1",
+      status_ts: 7,
+      meta: {
+        merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" },
+        blocked: { reason: "silence-release held (watchdog): no update for >10m, but the card carries merge-train queued on PR state-vector/bridge#259 — parked on the typed proxy, not released (BR#4067)" },
+      },
+    };
+    const awaiting = {
+      ...legacy,
+      id: "H2",
+      status_ts: 8,
+      meta: { ...legacy.meta, merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge" } },
+    };
+    const q = mergeTrainQueue([card("B", 2, "needs review"), legacy, awaiting]);
+    expect(q.map((x) => x.id)).toEqual(["H1"]);
+    expect(q[0].priority).toBe("normal");
+  });
+
   it("BOOSTED (meta.boosted) first among mortals, FIFO within class by blocked-since (BR#5190 renamed the old CRITICAL label)", () => {
     const q = mergeTrainQueue([
       card("N1", 10, "merge-train: queued"),
@@ -310,14 +338,24 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.every((x) => x.priority !== "root_fix")).toBe(true);
   });
 
-  it("baseRed (a stopped lane) parks EVERYTHING except the root-fix card — the base-red law, BR#4365 precedent", () => {
-    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)], { baseRed: true });
-    expect(q.map((x) => x.id)).toEqual(["R1"]);
+  // ---- BR#5753: the hub queue NEVER hides held cars ----
+  // The pre-5753 baseRed option (a STOPPED lane offering only tier 0) was
+  // dead in production — its one caller looked the lane's stop facts up with
+  // `WHERE id = laneKey(repo, base)`, and a lane key is never an
+  // artefacts.id — and it must stay gone: base_red_resolution.held, the
+  // alarm ask's cure-PR fallback and trainOpenRootFix all read the derived
+  // queue and would go blind mid-episode if non-root_fix cars were filtered
+  // out. The stop fast-lane is the WALK's law (train.rs gate), not a
+  // hub-side queue filter.
+
+  it("BR#5753: no baseRed filter — a stopped lane's queue keeps EVERY held car visible, root_fix still at rank 0", () => {
+    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)]);
+    expect(q.map((x) => x.id)).toEqual(["R1", "B1", "N1"]);
     expect(q[0].priority).toBe("root_fix");
   });
 
-  it("baseRed with NO root-fix card → an empty queue: every head stays parked until the fix is bound or the line greens", () => {
-    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")], { baseRed: true })).toEqual([]);
+  it("BR#5753: with NO root-fix card the queue still lists the held cars (root_fix absent, tiers intact)", () => {
+    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")]).map((x) => x.id)).toEqual(["B1", "N1"]);
   });
 
   it("empty input → empty queue (vacuity)", () => {
@@ -997,6 +1035,53 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
     // `#N` without an owner/name prefix is inert — BR#NNNN card refs and
     // "the unrelated #2534 merge" prose never become legs
     expect(trainParseNoteLegs(`rebased over the unrelated #2534 merge; BR#4648 spins no more; head ${h}`)).toEqual([]);
+  });
+  it("BR#5658 / BR#5324 / BR#5805: rejects /BR#N cross-references, CSS tokens, and numeric-owner fragments (never mints ghost lanes like tb-pulse/BR or 5563/BR)", () => {
+    const h = "a".repeat(40);
+    expect(isValidGitHubRepo("state-vector/bridge")).toBe(true);
+    expect(isValidGitHubRepo("o/r")).toBe(true);
+    expect(isValidGitHubRepo("tb-pulse/BR")).toBe(false);
+    expect(isValidGitHubRepo("5563/BR")).toBe(false);
+    expect(isValidGitHubRepo("1768/BR")).toBe(false);
+    expect(isValidGitHubRepo("5022/BR")).toBe(false);
+    expect(isValidGitHubRepo("foo/GH")).toBe(false);
+    expect(trainParseNoteLegs(`added @keyframes tb-pulse/BR#5658 and BR#5563/BR#5635; (#1768/BR#4993) head ${h}`)).toEqual([]);
+    expect(parseDirectCommitReceipt(`Landed direct to main — https://github.com/state-vector/bridge/commit/${h}`)).toEqual({
+      repo: "state-vector/bridge",
+      sha: h,
+    });
+    expect(parseDirectCommitReceipt(`PR https://github.com/state-vector/bridge/pull/350 head ${h}`)).toBeNull();
+  });
+  it("BR#5658: partitionMergeBatches partitions verifying + ready PRs into sequential non-conflicting merge passes", () => {
+    const cars = [
+      { id: "BR#1", pr: 101, state: "ready" as const },
+      { id: "BR#2", pr: 102, state: "verifying" as const },
+      { id: "BR#3", pr: 103, state: "waiting" as const },
+      { id: "BR#4", pr: 104, state: "ready" as const },
+    ];
+    // PR 101 and PR 104 conflict → Batch 1 takes [101, 102, 103], Batch 2 takes [104]
+    const batches = partitionMergeBatches(cars, [[101, 104]], 10);
+    expect(batches.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 102, 103],
+      [104],
+    ]);
+    // burst_max cap = 2 with no conflicts → [101, 102] then [103, 104]
+    const capped = partitionMergeBatches(cars, [], 2);
+    expect(capped.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 102],
+      [103, 104],
+    ]);
+  });
+  it("BR#5897: classifyHeadChecks deduplicates by check name (newest non-cancelled run wins over stale failure)", () => {
+    const v = classifyHeadChecks([
+      { id: 100, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old1" },
+      { id: 101, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old2" },
+      { id: 200, name: "Deploy health (merge gate)", conclusion: "success", html_url: "https://example/new" },
+      { id: 201, name: "Rust Tests", conclusion: "success", html_url: "https://example/rust" },
+    ]);
+    expect(v.verdict).toBe("green");
+    expect(v.red).toEqual([]);
+    expect(v.green).toBe(2);
   });
 });
 

@@ -795,12 +795,11 @@ fn doctor() -> bool {
             _ => ok("hub reachable", "hub unreachable or /__version broken", &mut bad, true),
         }
         if !cfg.token.is_empty() {
-            // Probe with `stats`, NOT orient: orient registers the session name
-            // on the gateway token's session registry, and a throwaway probe
-            // name then resolved as executor attribution via the hub's
-            // last-session fallback (the 2026-11-03 "doctor" misattribution).
-            // stats verifies the same MCP + auth path and writes nothing.
-            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#;
+            // Probe `/mcp` with JSON-RPC `ping` (mcp.ts:197): authenticates the
+            // bearer token via `resolveTokenWs` + `auth.identify` and returns
+            // `{}` without dispatching any DO tool or touching the session
+            // registry.
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
             match client
                 .post(format!("{}/mcp", cfg.url.trim_end_matches('/')))
                 .header("content-type", "application/json")

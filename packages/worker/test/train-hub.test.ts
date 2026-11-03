@@ -686,11 +686,17 @@ describe("merge train DO drill (real bundled worker)", () => {
     let c = (await kbJson("/get", { id: implId })).body;
     expect(c.status).toBe("blocked");
     expect(c.meta?.pr?.head_sha_at_acceptance).toBe(H2);
-    // the re-queue note is honest: this cycle moved a stamp, so it says so
+    // the re-queue note is honest: this cycle moved a stamp, so it says so.
+    // BR#5751: the DIRECT PARK is itself a queue event now — its note carried
+    // the live head, so the park moved the stamp and claims the refresh; the
+    // duty close re-queues idempotently on the already-covered head and must
+    // NOT claim a refresh.
     const hist = await kbJson(`/history?id=${encodeURIComponent(implId)}&limit=20`);
     const queuedNotes = (hist.body.versions as any[]).filter((v) => v.action === "train_queued").map((v) => String(v.summary));
-    expect(queuedNotes.length).toBe(2);
-    expect(queuedNotes[0]).toContain("(re-queued, stamp refreshed)");
+    expect(queuedNotes.length).toBe(3);
+    expect(queuedNotes[1]).toContain("(re-queued, stamp refreshed)");
+    expect(queuedNotes[0]).toContain("(re-queued)");
+    expect(queuedNotes[0]).not.toContain("stamp refreshed");
     // and a no-op re-accept at the SAME head must not claim a refresh
     await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "gate bounce — nothing to fix" });
     await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: `re-entered review — PR https://github.com/${repo}/pull/3200` });
@@ -2947,5 +2953,163 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(snapCleared.starved.ask_id).toBeTruthy();
     expect(snapCleared.starved.duty_id).toBeTruthy();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p4a" });
+  });
+
+  it("BR#5658 v2: trainStatus serves 3-bucket pr_stats (in_progress, verifying, ready) across all card states + sequential batches, direct-to-main Verify ACCEPT auto-closes parent done, and unbound handoff asks mint a tracked task on answer", async () => {
+    const repo = "state-vector/nextgen-lane";
+    await kbJson("/train.lane", { repo, base: "main", actor: "gw-ng" });
+
+    // 1. Direct-to-main card: in_review with commit URL receipt -> Verify closes done -> parent auto-closes done (never queued on a ghost lane)
+    const directCard = (await kbJson("/create", {
+      type: "task",
+      title: "IMPL: direct-to-main feature with tb-pulse/BR#5658 prose",
+      body_md: "Added @keyframes tb-pulse/BR#5658.",
+      qualified: true,
+      session: "sess-direct-impl",
+      actor: "impl-agent",
+    })).body;
+    await kbJson("/transition", { id: directCard.id, to: "in_progress", session: "sess-direct-impl", actor: "impl-agent" });
+    const rev = (await kbJson("/transition", {
+      id: directCard.id,
+      to: "in_review",
+      session: "sess-direct-impl",
+      note: "Landed direct to main — https://github.com/state-vector/bridge/commit/68ef20ed1e2797072411ac99bdfa832a39866b54",
+      actor: "impl-agent",
+    })).body;
+    expect(rev.verify_task).toBeTruthy();
+    await kbJson("/transition", { id: rev.verify_task, to: "in_progress", session: "sess-direct-verify", actor: "verifier-agent" });
+    await kbJson("/transition", {
+      id: rev.verify_task,
+      to: "done",
+      session: "sess-direct-verify",
+      note: "VERIFY ACCEPT — commit 68ef20ed1e2797072411ac99bdfa832a39866b54 passed all checks on main",
+      actor: "verifier-agent",
+    });
+    const directAfter = (await kbJson("/get", { id: directCard.id })).body;
+    expect(directAfter.status).toBe("done");
+
+    // 2. Unbound handoff ask (BR#5476 class) -> answering "apply ... WIP" auto-mints a qualified task card
+    const handoffAsk = (await kbJson("/ask.create", {
+      to: "macbook-pro-local-opencode",
+      question: "Ray's colour spec hits your TrainPanel WIP: apply it in your WIP, or hand me the slice?",
+      reason: "Live directive modifies your in-flight files",
+      details: "Apply green ready, orange pulsing verifying, orange solid waiting.",
+      options: [
+        "(Recommended) I apply Ray's colour spec to my WIP now",
+        "Stand down — opencode-ray takes the slice",
+      ],
+      actor: "opencode-ray",
+    })).body;
+    const ansRes = (await kbJson("/ask.answer", {
+      id: handoffAsk.id,
+      answer: "(Recommended) I apply Ray's colour spec to my WIP now",
+      actor: "web:rayh",
+    })).body;
+    expect(ansRes.spawned_task).toMatch(/^BR#\d+$/);
+    const spawnedTask = (await kbJson("/get", { id: ansRes.spawned_task })).body;
+    expect(spawnedTask.status).toBe("todo");
+    expect(spawnedTask.meta?.handoff_from_ask).toBe(handoffAsk.id);
+    expect(spawnedTask.meta?.handoff_to).toBe("macbook-pro-local-opencode");
+
+    // 3. Lane PR stats & sequential merge batches across in_progress, in_review (waiting + active), and queued (ready)
+    const ipCard = (await kbJson("/create", {
+      type: "task",
+      title: "IMPL: in-progress PR",
+      body_md: `Working on https://github.com/${repo}/pull/501`,
+      qualified: true,
+      session: "sess-ip",
+      actor: "impl-1",
+    })).body;
+    await kbJson("/transition", { id: ipCard.id, to: "in_progress", session: "sess-ip", actor: "impl-1" });
+
+    const revWaitingCard = (await kbJson("/create", {
+      type: "task",
+      title: "IMPL: waiting-for-verify PR",
+      body_md: "Impl",
+      qualified: true,
+      session: "sess-rw",
+      actor: "impl-2",
+    })).body;
+    await kbJson("/transition", { id: revWaitingCard.id, to: "in_progress", session: "sess-rw", actor: "impl-2" });
+    await kbJson("/transition", {
+      id: revWaitingCard.id,
+      to: "in_review",
+      session: "sess-rw",
+      note: `PR https://github.com/${repo}/pull/502`,
+      actor: "impl-2",
+    });
+
+    const revActiveCard = (await kbJson("/create", {
+      type: "task",
+      title: "IMPL: actively-verifying PR",
+      body_md: "Impl",
+      qualified: true,
+      session: "sess-ra",
+      actor: "impl-3",
+    })).body;
+    await kbJson("/transition", { id: revActiveCard.id, to: "in_progress", session: "sess-ra", actor: "impl-3" });
+    const raRev = (await kbJson("/transition", {
+      id: revActiveCard.id,
+      to: "in_review",
+      session: "sess-ra",
+      note: `PR https://github.com/${repo}/pull/503`,
+      actor: "impl-3",
+    })).body;
+    await kbJson("/transition", { id: raRev.verify_task, to: "in_progress", session: "sess-ra-v", actor: "verifier-3" });
+
+    const readyCard = (await kbJson("/create", {
+      type: "task",
+      title: "IMPL: ready PR",
+      body_md: "Impl",
+      qualified: true,
+      session: "sess-rdy",
+      actor: "impl-4",
+    })).body;
+    await kbJson("/transition", { id: readyCard.id, to: "in_progress", session: "sess-rdy", actor: "impl-4" });
+    const rdyRev = (await kbJson("/transition", {
+      id: readyCard.id,
+      to: "in_review",
+      session: "sess-rdy",
+      note: `PR https://github.com/${repo}/pull/504`,
+      actor: "impl-4",
+    })).body;
+    await kbJson("/transition", { id: rdyRev.verify_task, to: "in_progress", session: "sess-rdy-v", actor: "verifier-4" });
+    await kbJson("/transition", {
+      id: rdyRev.verify_task,
+      to: "done",
+      session: "sess-rdy-v",
+      note: `VERIFY ACCEPT — PR https://github.com/${repo}/pull/504 head ${"d".repeat(40)}`,
+      actor: "verifier-4",
+    });
+
+    // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2
+    // Even if queue_facts stamps cls:"waiting" on the already verify-accepted PR 504 (e.g. waiting on base settle), it stays ready (green)
+    await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-ng", merge_capable: true });
+    await kbJson("/train.queue_facts", {
+      repo,
+      base: "main",
+      entries: [{ id: readyCard.id, pr: 504, cls: "waiting" }],
+      conflict_pairs: [[504, 503]],
+      actor: "gw-ng",
+    });
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ng" });
+
+    const st = (await kbJson("/train.status", { repo })).body;
+    const laneSnap = st.lanes.find((l: any) => l.lane === `${repo}@main`);
+    expect(laneSnap).toBeTruthy();
+    expect(laneSnap.pr_stats).toEqual({
+      in_progress: 1, // PR 501
+      verifying: 2,   // PR 502 (waiting) + PR 503 (actively verifying)
+      ready: 1,       // PR 504 (ready)
+    });
+    // Batch 1 contains [504 (ready), 502 (waiting)], Batch 2 contains [503 (verifying — conflicted with 504)]
+    expect(laneSnap.batches.length).toBe(2);
+    expect(laneSnap.batches[0].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 504, state: "ready" },
+      { pr: 502, state: "waiting" },
+    ]);
+    expect(laneSnap.batches[1].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 503, state: "verifying" },
+    ]);
   });
 });

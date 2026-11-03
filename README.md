@@ -494,19 +494,34 @@ executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the 
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
 conflated again.
-The lane's PR column shows ALL of the lane's PRs by verification state (BR#5658,
-Ray 2026-11-03: "each lane needs to show PR stats — in-progress, verifying and
-ready… colours should denote verification — green if ready, orange pulsing if
-being verified, orange solid if waiting to be"): a count line first (`N in
-progress · M verifying · K ready`, waiting appended when non-zero) — in-progress
-counts the OPEN impl cards with a PR bound to the lane's repo, verifying the
-walk's `waiting` verdicts (checks running), ready the walk's `ready` verdicts —
-then one coloured block per PR, grouped the way the pass merges them: green =
-ready (the batch that merges this pass), orange **pulsing** = being verified,
-orange solid = waiting to be verified (the `needs-review` verdicts plus the
-Awaiting parks after the divider), red = conflicted, hatched = branch-protection
-blocked, dashed grey = no machine verdict yet. The hub serves the buckets as
-`pr_stats` on each `train.status` lane.
+The lane's PR column shows ALL of the lane's PRs by verification state and merge
+batch (BR#5658 v2, Ray 2026-11-03: "each lane needs to show PR stats —
+in-progress, verifying and ready… the backlog train just shows the batches of
+verifying/ready PRs based on how they can be merged in batches… colours should
+denote verification — green if ready, orange pulsing if being verified, orange
+solid if waiting to be"):
+1. **3-bucket lane PR stats (`N in progress · M verifying · K ready`)**:
+   `in_progress` counts open PRs on the lane in active implementation (or bounced
+   back to `in_progress` / conflicted); `verifying` counts all PRs in the
+   verification stage across `in_review` (both `Verify:` todo and `Verify:` in
+   progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
+   counts verified (`ACCEPT`) PRs ready to merge.
+2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
+   runs `selectBatch` iteratively over the lane's verifying + ready PRs (using
+   the executor's `conflict_pairs` and `lane.burst_max`), separating batches with
+   `.train-block-gap` dividers.
+3. **Verification colour law**: inside each batch, **green solid (`.tb-ready`)** =
+   ready (verified), **orange pulsing (`.tb-verifying`)** = actively being
+   verified right now (`Verify:` child `in_progress` / live heartbeat <10m /
+   walk checks running), **orange solid (`.tb-wait`)** = waiting to be verified
+   (`Verify:` child `todo` or idle `awaiting` park; never red on awaiting,
+   never diagonal stripes, per BR#5476).
+And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
+`owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
+never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings
+(`commit/<sha>`) auto-close the `in_review` parent `done` when `Verify:` accepts;
+and answering an unbound implementation handoff ask (`BR#5476` class) auto-mints a
+qualified `task` card linked `derived_from` the ask.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -1011,6 +1026,23 @@ the fix); the executor re-probes the cheap ones every start. It merges as whatev
 identity that `gh` is authed as — the identity gate refuses the write legs unless that
 is the worker-class credential per BR#3181, never a personal one.
 
+**Token rot is loud, never blind (BR#4754)**: a hub token rotation invalidates a
+long-running train executor's stored credential. Both forms of the executor — the
+standalone `bridge train` loop and the in-process daemon leg — classify an
+auth-rejected tick (the hub answers `unknown auth token`; there is no HTTP status in
+the JSON-RPC error) and run the same paced self-heal ladder the gateway dispatch loop
+uses (BR#4113): reload the credential store, then re-vend by principal
+(`/api/token/repair` — the principal is the credential, so this works even while the
+bearer is fully dead). Backoff between ladder runs is 5s → 300s (the hub rate-limits
+repairs at 6/hour per row). The standalone daemon **exits non-zero after 5 failed
+ladder runs** with a `TOKEN-BLIND` line naming the cause — a supervisor restart then
+starts fresh — instead of the old behavior: ticking blindly forever, one silent
+`tick failed` per interval (the 2026-10-29 incident: ~1,684 unnoticed failures on one
+lane). Once healed, the executor posts **one note per episode** to the lane card
+naming the blind window and the remedy, so the board holds the cause — a token-blind
+process cannot post mid-episode (every board write needs the bearer the hub just
+rejected), which is exactly why the note fires on recovery.
+
 **Dedicated merge node (`role: train`, BR#4489)**: a normal gateway in a named mode —
 set `"role": "train"` in the config (`~/.bridge/config.json`) or `BRIDGE_ROLE=train` in
 the environment, and the daemon skips task dispatch entirely while the connection and
@@ -1021,9 +1053,15 @@ capable gateways (or one dedicated train node) — merges never move server-side
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
 lands, stops or pends) → else the derived queue is **walked in order** (BR#3935): a
-permanently unlandable entry — a CLOSED PR, a leg with no PR stamp, no unlanded leg on
-this lane — is logged and the walk advances to the next entry **in the same tick** (the
-card stays queued for the humans; the lane never starves behind it), while a transient
+permanently unlandable entry must not starve the lane — a leg with **no PR stamp** is
+**bounced off the hub** (the audited impl bounce, gate class: the card leaves the
+derived queue that tick, impl re-stamps the PR binding, re-verifies, re-queues —
+BR#5753; the hub kept matching the stamp-less leg on repo+base, so the old
+log-and-advance left the entry in `lane.queue` forever), while a **CLOSED PR** or an
+entry with **no unlanded leg on this lane** ("on this lane" is repo AND base, the
+hub's own queue scoping, BR#4977) is logged and the walk advances to the next entry
+**in the same tick** (the card stays queued for the humans; the lane never starves
+behind it), while a transient
 no-op — mergeability still computing, unsettled checks, no verdict — still blocks; the
 first drivable entry's **first unlanded leg on this lane**
 (BR#3659: a multi-PR card rides leg by leg) → `decideTrainGate` → act: merge (`gh`) →
@@ -1259,6 +1297,20 @@ machine-clean carry chain:
   only be superseded by the next bounce, with the re-park after it flood-guarded on
   the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
   BR#4135).
+- **Direct parent train parks queue for real (BR#5751)**: the train's own bounce
+  and coverage paths run `trainQueueOnAccept`, but a plain `blocked` transition
+  whose note opens with the canonical `merge-train: queued` reason used to bypass
+  the hook entirely — the card sat dual-state (a derived queue slot plus a leftover
+  `merge_train.awaiting` chip) with a stale `head_sha_at_acceptance` (live on
+  BR#4711/4678/3623/3999/4995/4999). The blocked branch now runs the hook itself
+  when its note opens with that reason (the `merge_train` body flag guards
+  recursion; `alreadyQueued` makes it a meta-only refresh), and the converse
+  demotion holds: a blocked park whose note is neither a `merge-train:` note nor an
+  `Awaiting review (verdict …)` reason clears any leftover `merge_train.awaiting`
+  and demotes its `awaiting` state to `bounced` — a card that has stopped waiting
+  on a human leg shows exactly that. The Awaiting-park census and the `pr_stats`
+  buckets are base-scoped (`lane.base`), so a second lane on the same repo never
+  inherits another base's parks.
 - **Bounced cards cannot starve (BR#4068)** — a bounced card is the most valuable work
   on the board: verified once, one leg from landed. So the bounce itself **auto-boosts
   the card to priority 0** — the same `boosted` stamp the human ▲ boost writes, read by
@@ -1665,7 +1717,7 @@ double-binding single spawn) and `test/machine.test.ts` (the refusal names child
 - Create work: `bridge create_artefact` via MCP, or ask an agent to — tasks land in `todo` and the runner picks them up
 - **Boost**: the Backlog tab ranks work by pickup order; `▲ boost` takes a task and all its open children to priority 0, ahead of unblock duty. Boost cascades server-side and is audited; `▼ unboost` removes it.
 - **Progress gauges persist until updated**: a `log_progress` post that omits gauge fields (`completion_pct`, `confidence_pct`, `risk_pct`, `context_pct`) preserves the previous gauges on the card — gauge-less posts (heartbeats, relay lines, auto-notes) never clobber them, and the freshest gauge-bearing call wins.
-- **The watchdog keeps states moving**: silent agents are released back to the pool, an `in_review` park past `review_stale_minutes` (default 360) with no verifier running bounces and releases too, and gate-rejection blocks are reaped after 24h. Unblock tasks close directly with their verdict — they are never reviewed. A silent task whose trail proves landed side effects (GitHub PR/commit receipts, or the runner's own `completed_result_lost` marker) is released as `completed_result_lost`, not abandoned: the run happened and the report was lost between worker and hub. The class never penalizes the agent's behaviour score — the delivery channel is flagged instead (BR#3352). **The one behaviour cost a PR can bring you is the train-red ding** (BR#5517): when a stop-the-line episode bounces a culprit card, the agent labels on the card's version receipts (its impl and verify sessions) each eat a capped `train_red` penalty — −5 per episode, at most −15 — visible on the board's agent rows with the episode hint; it survives clearing the red and leaves only when a bisect exoneration names a different true culprit. **Silence never destroys a machine wait** (BR#4067): a card whose meta carries a live wait — a merge-train queue slot (`queued` / `awaiting-ci` / `bounced` on a live PR leg), a typed `await_event`, or a bound ask — is **parked `blocked`, never released to todo**, by every release path (stall sweep, review-stall sweep, lapsed subprocess, reaper reassign, and the machine-actor backstop in the transition gate). The park names the silence in its reason and preserves the wait meta intact — the typed proxy (e.g. `pr_merged`) still owns the exit, so the proxy watch flips the card when the wait resolves. A hold parks with result class `proxy_wait_hold`, which is exempt from abandonment scoring — holding a wait is neither a lost run nor a dump. A dispatched run also gets grace: the claiming session's freshest hub ping counts as a liveness signal, so a run that is plausibly still in flight is not swept while quiet. **The bounce re-entry is the one release carve-out** (BR#4494): a train bounce re-opens its card `in_progress` with the prior executor session — usually dead — and `in_progress` is not claimable, so a bounced card whose re-entry sits silent past the stale window is **demoted to a claimable todo** (bounce brief + boost intact, result class `bounce_reentry_demote`, exempt from abandonment scoring) instead of re-parked; the carve-out is scoped to `bounced` + `in_progress` — `queued`/`awaiting-ci` and parked-blocked cards keep the full hold. Rework-loop escalation is unchanged: a held card's attempt counter keeps counting, so a card that cycles still reaches the human-ask park at 5 attempts. Rework-loop escalation is unchanged: a held card's attempt counter keeps counting, so a card that cycles still trips the churn redirect at 5 attempts — and that park is now typed, not prose: a 24h `time` cooldown is the machine exit (the sweep reads the atom; on fire the duty re-checks and a proven release resets the counter; BR#4248).
+- **The watchdog keeps states moving**: silent agents are released back to the pool, an `in_review` park past `review_stale_minutes` (default 360) with no verifier running bounces and releases too, and gate-rejection blocks are reaped after 24h. Unblock tasks close directly with their verdict — they are never reviewed. A silent task whose trail proves landed side effects (GitHub PR/commit receipts, or the runner's own `completed_result_lost` marker) is released as `completed_result_lost`, not abandoned: the run happened and the report was lost between worker and hub. The class never penalizes the agent's behaviour score — the delivery channel is flagged instead (BR#3352). **The one behaviour cost a PR can bring you is the train-red ding** (BR#5517): when a stop-the-line episode bounces a culprit card, the agent labels on the card's version receipts (its impl and verify sessions) each eat a capped `train_red` penalty — −5 per episode, at most −15 — visible on the board's agent rows with the episode hint; it survives clearing the red and leaves only when a bisect exoneration names a different true culprit. **Silence never destroys a machine wait** (BR#4067): a card whose meta carries a live wait — a merge-train queue slot (`queued` / `awaiting-ci` / `bounced` on a live PR leg), a typed `await_event`, or a bound ask — is **parked `blocked`, never released to todo**, by every release path (stall sweep, review-stall sweep, lapsed subprocess, reaper reassign, and the machine-actor backstop in the transition gate). The park names the silence in its reason and preserves the wait meta intact — the typed proxy (e.g. `pr_merged`) still owns the exit, so the proxy watch flips the card when the wait resolves. A hold parks with result class `proxy_wait_hold`, which is exempt from abandonment scoring — holding a wait is neither a lost run nor a dump. A dispatched run also gets grace: the claiming session's freshest hub ping counts as a liveness signal, so a run that is plausibly still in flight is not swept while quiet. **The bounce re-entry is the one release carve-out** (BR#4494): a train bounce re-opens its card `in_progress` with the prior executor session — usually dead — and `in_progress` is not claimable, so a bounced card whose re-entry sits silent past the stale window is **demoted to a claimable todo** (bounce brief + boost intact, result class `bounce_reentry_demote`, exempt from abandonment scoring) instead of re-parked; the carve-out covers the live re-entries — `bounced`, `awaiting`, or `stopped` train state on an `in_progress` card (an `in_progress` card is never a live awaiting park: a verifier bounce that re-opens impl ENDS the Awaiting park, flipping `merge_train.state` to `bounced` and dropping the awaiting stamp — BR#5750) — while `queued`/`awaiting-ci` and parked-blocked cards keep the full hold. A hold-park of a queued/awaiting-ci car also keeps the car VISIBLE to the train: the park reason carries the state-named `merge-train:` prefix, and legacy unprefixed hold-parks are admitted by their hold fingerprint, so the silence never silently drops a live queue slot (BR#4995/BR#5750). Rework-loop escalation is unchanged: a held card's attempt counter keeps counting, so a card that cycles still reaches the human-ask park at 5 attempts. Rework-loop escalation is unchanged: a held card's attempt counter keeps counting, so a card that cycles still trips the churn redirect at 5 attempts — and that park is now typed, not prose: a 24h `time` cooldown is the machine exit (the sweep reads the atom; on fire the duty re-checks and a proven release resets the counter; BR#4248).
 - **Blocker rollup**: when ≥3 blocked cards share one machine-detectable root cause, the watchdog sweep auto-creates ONE boosted `ROOT BLOCKER` task — *investigate → fix → one approval* — and every queued card points at it (`meta.root_blocker` + a `child_of` link, so the board shows the tree and the boost cascades to all of them). Today's machine-detectable roots: a `github.com/.../pull/N` URL in the card's unblock condition (the one unmerged PR everything queues behind) and red/broken/failing-`main` language (the never-merge-onto-red-main class). Idempotent: cards already pointing at an open root are left alone, re-runs create no duplicates. A root closes only by an agent or human with receipts that the root cause is gone — the sweep never auto-closes it, and a later cluster of the same root opens a NEW root rather than reusing a done one.
 - **Blocked parks get a clock too** (BR#2893): churn-guard parks (retry instructions stamped as blocks) and parks whose unblock condition references only closed asks drain back to the pool automatically; an honest park with no external gate ages out past `blocked_stale_hours` (a setting, default 48). True external gates — dated checkpoints, GitHub issue/PR lanes, red-main — are exempt, and so is any park on a live machine wait (BR#4067): a typed `await_event`, a merge-train queue slot, or a bound ask owns its own exit, and the drain never attempts one (attempting it only re-bred a refused release — and a breach card — every sweep tick). A card whose owner has had no live session for `owner_stale_hours` (default 4) loses the claim regardless of status. And a parent that has burned `UNBLOCK_SPAWN_CAP` (3) unblock rounds stops spawning them and escalates to a human once. On the board, Top is the actionable fleet only; every parked card files in Backlog under its EXIT CONDITION — one group per typed await class (awaiting you · PR verification · PR merge (train) · CI · deploy · another task · GitHub issue · a date · green main · other), with churn parks under Timeout — each row has a **Release** button and the section head a **Release all** (human early-exit; protected parks — typed awaits, train-queue slots — refuse server-side and are listed, never routed around) — and a live unblock duty shown as a chip on the row.
 - Anything needing a human lands in **For Me** (genuine decisions only — a merge-train coverage bounce parks the card Awaiting only for genuine human legs (BR#5226): a machine-verdict-covered head re-queues itself, a plain lapse re-verifies, BR#4960)

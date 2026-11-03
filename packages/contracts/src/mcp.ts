@@ -111,6 +111,7 @@ export const TOOL_ARG_SCHEMAS = {
     class: z.enum(["subprocess"]).optional(),
     budget_minutes: z.number().int().max(1440).optional(),
     replacement_id: z.string().optional(),
+    session: z.string().optional(),
   }),
   link_artefacts: z.looseObject({
     src: z.string(),
@@ -123,7 +124,10 @@ export const TOOL_ARG_SCHEMAS = {
     id: z.string(),
     limit: z.number().int().max(50).optional(),
   }),
-  session_alive: z.looseObject({ id: z.string() }),
+  session_alive: z.looseObject({
+    id: z.string(),
+    session: z.string().optional(),
+  }),
   log_progress: z.looseObject({
     id: z.string(),
     note: z.string(),
@@ -136,6 +140,7 @@ export const TOOL_ARG_SCHEMAS = {
     confidence_pct: z.number().int().min(0).max(100).optional(),
     risk_pct: z.number().int().min(0).max(100).optional(),
     context_pct: z.number().int().min(0).max(100).optional(),
+    session: z.string().optional(),
   }),
   get_history: z.looseObject({
     id: z.string(),
@@ -152,6 +157,7 @@ export const TOOL_ARG_SCHEMAS = {
     // 2–8 one-click answers; recommended option FIRST, prefixed "(Recommended)"
     options: z.array(z.string()).min(2).max(8),
     artefact_id: z.string().optional(),
+    session: z.string().optional(),
   }),
   asks: z.looseObject({}),
   answer_ask: z.looseObject({ id: z.string(), answer: z.string() }),

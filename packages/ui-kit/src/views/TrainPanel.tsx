@@ -333,7 +333,18 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   }, []);
 
   const now = Date.now();
-  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently || (l.awaiting?.length ?? 0) > 0 || (l.pr_stats?.in_progress ?? 0) > 0;
+  const hasSignal = (l: KbTrainLane) =>
+    Boolean(
+      l.lease ||
+      l.queue.length > 0 ||
+      l.stop ||
+      l.currently ||
+      (l.awaiting?.length ?? 0) > 0 ||
+      (l.batches?.length ?? 0) > 0 ||
+      (l.pr_stats?.in_progress ?? 0) > 0 ||
+      (l.pr_stats?.verifying ?? 0) > 0 ||
+      (l.pr_stats?.ready ?? 0) > 0,
+    );
 
   return (
     <div className="train-panel">
@@ -363,7 +374,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
           <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
           <span title="PRs merged over the last hour / 24 hours">rate</span>
-          <span title="all PRs on this lane by verification state — the count line (in progress · verifying · ready) then one coloured block per PR: green = verified and mergeable (the batch that merges this pass), orange pulsing = being verified (checks running), orange solid = waiting to be verified, red = conflicted, hatched = branch-protection blocked, grey = no machine verdict yet">PRs</span>
+          <span title="PR stats on this lane (in progress · verifying · ready) + the backlog train of verifying/ready PRs grouped into sequential merge batches (Batch 1 | Batch 2 | …). Block colour denotes verification: green = ready, orange pulsing = being verified, orange solid = waiting to be verified">PRs</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
@@ -414,95 +425,118 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
             <span className="trainc-backlog">
-              {/* BR#5658 (Ray 2026-11-03): the lane PR stat line — in progress ·
-                  verifying · ready — then EVERY PR on the lane as a coloured
-                  block. Colour = verification state: green = ready (the batch
-                  that merges this pass), orange pulsing = being verified,
-                  orange solid = waiting to be verified. Conflicts (red),
-                  protection blocks (hatched) and unknowns (grey) stay visible
-                  so the lane shows ALL its PRs, not just the mergeable set. */}
+              {/* BR#5658 (Ray 2026-11-03, v2):
+                  1. Each lane shows PR stats: in progress · verifying · ready
+                     (strictly 3 buckets covering ALL open PRs on the lane).
+                  2. The backlog train shows ONLY the batches of verifying/ready
+                     PRs grouped by how they can be merged in batches (Batch 1 |
+                     Batch 2 | … via iterative selectBatch over conflict_pairs +
+                     burst_max).
+                  3. Block colour denotes verification state:
+                     - green solid (.tb-ready): ready (verified, mergeable)
+                     - orange pulsing (.tb-verifying): being verified right now
+                     - orange solid (.tb-wait): waiting to be verified */}
               {(() => {
-                const ps = l.pr_stats ?? { in_progress: 0, verifying: 0, waiting: 0, ready: 0 };
+                const clsOf = (q: { id: string }) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls ?? "ready";
+                const fallbackBatches = () => {
+                  type Car = { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string };
+                  const cars: Car[] = [];
+                  let ip = 0, ver = 0, rdy = 0;
+                  for (const q of l.queue) {
+                    const cls = clsOf(q);
+                    if (cls === "conflict" || cls === "blocked") {
+                      ip++;
+                    } else if (cls === "needs-review") {
+                      ver++;
+                      cars.push({ id: q.id, pr: q.pr, state: "waiting", detail: "waiting to be verified — needs a fresh review" });
+                    } else if (cls === "ready" || cls === "waiting" || cls !== "") {
+                      rdy++;
+                      cars.push({
+                        id: q.id,
+                        pr: q.pr,
+                        state: "ready",
+                        detail: cls === "waiting" ? "verified — ready to merge (waiting on lane/CI)" : "verified — merges this pass (batch)",
+                      });
+                    }
+                  }
+                  for (const a of l.awaiting ?? []) {
+                    if (cars.some((c) => c.id === a.task || (a.pr && c.pr === a.pr))) continue;
+                    ver++;
+                    cars.push({
+                      id: a.task,
+                      pr: a.pr,
+                      state: a.in_flight ? "verifying" : "waiting",
+                      detail: a.in_flight
+                        ? "being verified — review in progress"
+                        : `waiting to be verified, parked ${age(now - a.age_ms, now)} ago — force-review from the backlog: approve re-queues, changes requested bounce impl`,
+                    });
+                  }
+                  const cap = typeof l.burst_max === "number" && l.burst_max >= 0 ? l.burst_max : 10;
+                  const pairs = l.queue_facts?.conflict_pairs ?? [];
+                  const rem = cars.map((_, i) => i);
+                  const outBatches: Car[][] = [];
+                  while (rem.length > 0) {
+                    const chosen: number[] = [];
+                    for (let i = 0; i < rem.length; i++) {
+                      if (cap > 0 && chosen.length >= cap) break;
+                      const pa = cars[rem[i]].pr ?? 0;
+                      const clashing = chosen.some((s) => {
+                        const pb = cars[rem[s]].pr ?? 0;
+                        return pa > 0 && pb > 0 && pairs.some(([x, y]) => (x === pa && y === pb) || (x === pb && y === pa));
+                      });
+                      if (!clashing) chosen.push(i);
+                    }
+                    const pick = chosen.length ? chosen : [0];
+                    outBatches.push(pick.map((si) => cars[rem[si]]));
+                    const pickSet = new Set(pick);
+                    const next = rem.filter((_, idx) => !pickSet.has(idx));
+                    rem.length = 0;
+                    rem.push(...next);
+                  }
+                  return { stats: { in_progress: ip, verifying: ver, ready: rdy }, batches: outBatches };
+                };
+                const fb = fallbackBatches();
+                const ps = l.pr_stats ?? fb.stats;
+                const batches = l.batches ?? fb.batches;
+                const totalBatchCars = batches.reduce((acc, b) => acc + b.length, 0);
                 const stat = (n: number, cls: string, word: string) => (
                   <span className={`train-stat ${cls}`} title={`${n} ${word}`}>{n} {word}</span>
                 );
+                const wordFor = (q: { state: "ready" | "verifying" | "waiting"; detail?: string }) =>
+                  q.detail ?? (
+                    q.state === "ready" ? "verified — merges this pass (batch)" :
+                    q.state === "verifying" ? "being verified — checks/mergeability running" :
+                    "waiting to be verified — needs a fresh review"
+                  );
+                const toneFor = (state: "ready" | "verifying" | "waiting") =>
+                  state === "ready" ? "tb-ready" : state === "verifying" ? "tb-verifying" : "tb-wait";
                 return (
-                  <span className="train-stats" title="PRs on this lane: in progress (impl, PR open) · verifying (checks running) · ready (verified — merges this pass)">
-                    {stat(ps.in_progress, "ts-ip", "in progress")}
-                    <span className="train-stat-sep">·</span>
-                    {stat(ps.verifying, "ts-verifying", "verifying")}
-                    <span className="train-stat-sep">·</span>
-                    {stat(ps.ready, "ts-ready", "ready")}
-                    {ps.waiting > 0 && (
-                      <>
-                        <span className="train-stat-sep">·</span>
-                        {stat(ps.waiting, "ts-waiting", "waiting")}
-                      </>
-                    )}
-                  </span>
-                );
-              })()}
-              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), orange pulsing is being verified, orange solid waits to be verified, red conflicts, hatched branch-protection, grey no verdict yet${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}`}>
-                {/* BR#5658: blocks grouped by verification state — the ready
-                    set first (THE batch that merges this pass, green), then
-                    verifying (orange pulsing), waiting-to-be-verified (orange
-                    solid), then the not-mergeable tail (conflict red,
-                    protection hatched, unknown grey). Awaiting parks ride
-                    after the divider. */}
-                {(() => {
-                  const clsOf = (q: { id: string }) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls ?? "unknown";
-                  const groups: { cls: string; items: typeof l.queue }[] = [
-                    { cls: "ready", items: [] },
-                    { cls: "waiting", items: [] },
-                    { cls: "needs-review", items: [] },
-                    { cls: "conflict", items: [] },
-                    { cls: "other", items: [] },
-                  ];
-                  for (const q of l.queue) {
-                    const cls = clsOf(q);
-                    const g = groups.find((x) => x.cls === cls) ?? groups[4];
-                    g.items.push(q);
-                  }
-                  const word = (cls: string) =>
-                    cls === "ready" ? "verified — merges this pass (batch)" :
-                    cls === "waiting" ? "being verified — checks/mergeability running" :
-                    cls === "needs-review" ? "waiting to be verified — needs a fresh review" :
-                    cls === "conflict" ? "conflicted — back to impl" :
-                    cls === "blocked" ? "blocked (branch protection)" : "no machine verdict yet";
-                  const tone = (cls: string) =>
-                    cls === "ready" ? "tb-ready" :
-                    cls === "waiting" ? "tb-verifying" :
-                    cls === "needs-review" ? "tb-wait" :
-                    cls === "conflict" ? "tb-conflict" :
-                    cls === "blocked" ? "tb-blocked" : "tb-unknown";
-                  return groups.filter((g) => g.items.length > 0).map((g, gi) => (
-                    <span key={g.cls} className="train-block-group">
-                      {gi > 0 && <span className="train-block-gap" title="verification groups — the green batch merges first" />}
-                      {g.items.map((q) => (
-                        <span
-                          key={q.id}
-                          className={`train-block ${tone(g.cls)}`}
-                          title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word(g.cls)}`}
-                          onClick={() => openTask?.(q.id)}
-                        />
+                  <>
+                    <span className="train-stats" title="PR stats on this lane: in progress (active impl / conflict repair) · verifying (being verified or waiting to be verified) · ready (verified — ready to merge)">
+                      {stat(ps.in_progress, "ts-ip", "in progress")}
+                      <span className="train-stat-sep">·</span>
+                      {stat(ps.verifying, "ts-verifying", "verifying")}
+                      <span className="train-stat-sep">·</span>
+                      {stat(ps.ready, "ts-ready", "ready")}
+                    </span>
+                    <span className="train-blocks" title={`${totalBatchCars} verifying/ready PR${totalBatchCars === 1 ? "" : "s"} in ${batches.length} merge batch${batches.length === 1 ? "" : "es"} — green = ready (verified), orange pulsing = being verified, orange solid = waiting to be verified${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : ""}`}>
+                      {batches.map((batch, bi) => (
+                        <span key={bi} className="train-block-group">
+                          {bi > 0 && <span className="train-block-gap" title={`Batch ${bi + 1} (${batch.length} PR${batch.length === 1 ? "" : "s"}) — merges after Batch ${bi} settles`} />}
+                          {batch.map((q, qi) => (
+                            <span
+                              key={`${q.id}-${q.pr ?? qi}`}
+                              className={`train-block ${toneFor(q.state)}${bi === 0 && qi === 0 ? " tb-head" : ""}`}
+                              title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${wordFor(q)}`}
+                              onClick={() => openTask?.(q.id)}
+                            />
+                          ))}
+                        </span>
                       ))}
                     </span>
-                  ));
-                })()}
-                {(l.awaiting ?? []).length > 0 && (
-                  <>
-                    <span className="train-block-gap" title={`${(l.awaiting ?? []).length} parked Awaiting review — after the queue, oldest first`} />
-                    {(l.awaiting ?? []).map((a) => (
-                      <span
-                        key={a.task}
-                        className={`train-block tb-wait${a.lapsed ? " tb-awaiting-lapsed" : ""}`}
-                        title={`${a.task}${a.pr ? ` · PR #${a.pr}` : ""} — waiting to be verified, parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? " · PAST the review window + grace (red)" : ""}${a.verdict ? `\nanchored verdict: ${a.verdict}` : ""}\nforce-review from the backlog: approve re-queues, changes requested bounce impl`}
-                        onClick={() => openTask?.(a.task)}
-                      />
-                    ))}
                   </>
-                )}
-              </span>
+                );
+              })()}
             </span>
           </div>
         );

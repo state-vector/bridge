@@ -800,6 +800,69 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
     expect(bAfter.status, "a parked blocked bounced card stays parked — the carve-out is in_progress-only").toBe("blocked");
   });
 });
+
+describe("BR#5750 — awaiting re-park loop + hold-park queue prefix (real DO)", () => {
+  it("the livelock chain is dead end-to-end: a verifier bounce of an Awaiting park flips it to bounced (leaving the park ends it), and the stalled re-entry DEMOTES to claimable todo — never re-parked blocked (the BR#3853/3937/5139 loop)", async () => {
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br5750 awaiting unpark drill", qualified: true, session: "drill-exec-br5750" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    // The specimen shape, exactly what train:bounce_awaiting_park writes: an
+    // Awaiting human-leg park — blocked on the typed pr_merged proxy,
+    // merge_train.state = awaiting on the live leg.
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5750", session: "drill-exec-br5750",
+      note: "coverage bounce needs a human leg",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2404 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2404 },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    // /update meta REPLACES wholesale — spread the live meta so the park's
+    // blocked record (the typed pr_merged await) survives the stamp, exactly
+    // what train:bounce_awaiting_park writes in place.
+    const stamp = await kbJson("/update", {
+      id, actor: "drill-exec-br5750",
+      meta: {
+        ...((await taskById(id)).meta ?? {}),
+        merge_train: { state: "awaiting", bounce_kind: "coverage", pr: 2404, repo: "state-vector/superpositional", awaiting: { at: t0 + 1000 } },
+      },
+    });
+    expect(stamp.status, `stamp failed: ${JSON.stringify(stamp.body)}`).toBe(200);
+    // The verifier bounce — the exact edge that used to leave `awaiting`
+    // live on an in_progress card (the loop's first half).
+    const bounce = await kbJson("/transition", { id, to: "in_progress", actor: "drill-verify-br5750", session: "drill-verify-br5750", note: "PR CONFLICTING/DIRTY — fix forward" });
+    expect(bounce.status, `bounce failed: ${JSON.stringify(bounce.body)}`).toBe(200);
+    const afterBounce = await taskById(id);
+    expect(afterBounce.status).toBe("in_progress");
+    expect(afterBounce.meta?.merge_train?.state, "leaving the Awaiting park ENDS it — awaiting flips to bounced (BR#5750)").toBe("bounced");
+    expect(afterBounce.meta?.merge_train?.awaiting).toBeUndefined();
+    // The executor then dies — the stalled re-entry must DEMOTE (the loop's
+    // second half), never hold-park straight back into blocked.
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 11 * 60_000 });
+    expect(sweep.status, `stall sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "the stalled awaiting re-entry demotes to claimable todo (BR#4494/BR#5750), not blocked").toBe("todo");
+    expect(after.meta?.blocked).toBeUndefined();
+    expect(after.meta?.merge_train?.state).toBe("bounced");
+    expect(String(after.meta?.attempt?.last_reason ?? "")).toContain("BR#5750");
+  });
+
+  it("a watchdog hold-park of a queued car keeps its queue slot: the blocked reason carries the merge-train prefix, so mergeTrainQueue still sees the car (the BR#4995 drop)", async () => {
+    const q = await kbJson("/create", { type: "task", title: "IMPL: br5750 queued hold-park prefix drill", qualified: true, session: "drill-exec-br5750q" });
+    expect(q.status).toBe(200);
+    const qid = String(q.body.id);
+    const claim = await kbJson("/transition", { id: qid, to: "in_progress", actor: "drill-exec-br5750q", session: "drill-exec-br5750q" });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBe(200);
+    await kbJson("/update", { id: qid, actor: "drill-exec-br5750q", meta: { merge_train: { state: "queued", pr: 2405, repo: "state-vector/superpositional" } } });
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 12 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const qAfter = await taskById(qid);
+    expect(qAfter.status, "queued keeps parks-not-releases (BR#4067 — live queue slot)").toBe("blocked");
+    const reason = String(qAfter.meta?.blocked?.reason ?? "");
+    expect(reason.startsWith("merge-train: queued — "), `the hold-park must keep the queue prefix, got: ${reason}`).toBe(true);
+    expect(reason).toContain("silence-release held (watchdog)");
+  });
+});
 // ---------- BR#3620: the stale-ledger flips ----------
 // The BR#3423/BR#3415 class: cards sat blocked for days with legs holding —
 // (a) "BR#N answered" had NO atom kind (whole condition stamped unparseable),

@@ -30,14 +30,15 @@
 //! Loop (one tick): preflight → train_status → per lane: CAS-lease →
 //! reconcile from live GitHub → awaiting-CI poll → else WALK the derived
 //! queue in order and drive the first entry that can act (BR#3935: a
-//! permanently unlandable entry — CLOSED PR, stamp-less leg, no unlanded leg
-//! on this lane — is logged and the walk advances in the SAME tick; a
-//! transient no-op still blocks) → decideTrainGate → act: merge →
-//! train:merged → next tick polls CI on the merge commit. Carry law
-//! (BR#3516 §5): machine-clean carries, human-resolved invalidates. Local
-//! git plumbing is three-valued (BR#3935): a git FAILURE is never folded
-//! into a conflict/behind verdict — the PR head is fetched explicitly
-//! before any local op names it.
+//! permanently unlandable entry must not starve the lane — a stamp-less leg
+//! is BOUNCED off the hub so lane.queue self-heals (BR#5753), a CLOSED PR or
+//! an entry with no unlanded leg on this lane is logged and the walk
+//! advances in the SAME tick; a transient no-op still blocks) →
+//! decideTrainGate → act: merge → train:merged → next tick polls CI on the
+//! merge commit. Carry law (BR#3516 §5): machine-clean carries,
+//! human-resolved invalidates. Local git plumbing is three-valued (BR#3935):
+//! a git FAILURE is never folded into a conflict/behind verdict — the PR
+//! head is fetched explicitly before any local op names it.
 
 use crate::train_gate::{
     classify_base_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
@@ -52,7 +53,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::logging::{emit, now_ms, prefer_stdout};
+use crate::logging::{emit, iso, now_ms, prefer_stdout};
 
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -231,6 +232,10 @@ struct Ctx {
     /// the executor automatically triggers one `gh run rerun` per `(key, sha)`
     /// so marginal races (e.g. Post-Deploy Smoke deadline race) self-heal.
     auto_rerun_shas: std::collections::HashSet<String>,
+    // ---- token-rot visibility (BR#4754) ----
+    /// The lane card id train_status last reported (the one-per-episode
+    /// token-rot note lands there after a self-healed blind episode).
+    last_lane_card: Option<String>,
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -316,6 +321,7 @@ impl Ctx {
             tick_landed: 0,
             tick_error: None,
             auto_rerun_shas: std::collections::HashSet::new(),
+            last_lane_card: None,
         })
     }
 
@@ -1691,9 +1697,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // per-member merge leg law is unchanged — and the pass runs exactly
     // ONE settle wait, on the FINAL merge commit. The pass state is the
     // HUB's (currently.phase/​burst_*), never executor-local — crash-safe.
-    // A PERMANENTLY unlandable entry — PR CLOSED, a leg with no PR stamp,
-    // no unlanded leg on this lane — must NOT starve the lane (BR#3935):
-    // it is logged and classification advances to the next entry. A red
+    // A PERMANENTLY unlandable entry must NOT starve the lane (BR#3935): a
+    // leg with no PR stamp is BOUNCED off the hub — the card leaves the
+    // derived queue that tick (BR#5753, the self-heal); a CLOSED PR or an
+    // entry with no unlanded leg on this lane is logged and classification
+    // advances to the next entry. A red
     // pass sha (tip classify, re-checked before EACH member) stops the
     // line IMMEDIATELY (GH#2261) — it never waits for the settle; earlier
     // pass-sha reds surface at the settle (and its bisect, if the settle
@@ -1803,10 +1811,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // is PARKED on this pass (its merge is in; the settle owns it) and
         // must never re-gate as if unmerged.
         let legs = train_legs(&card_meta);
+        // "On this lane" is repo AND base — a leg without a base stamp
+        // defaults to "main" (the card-stamp convention), the exact scoping
+        // the hub's derived queue uses (core.ts trainLegsRemaining,
+        // BR#4977). Without the base half, a second base's leg on this repo
+        // could be classified (and driven) by the wrong lane's walk; with it,
+        // an entry whose legs all target other bases is honestly "no unlanded
+        // leg on this lane" below. (BR#5753 walk half.)
         let lane_legs: Vec<usize> = legs
             .iter()
             .enumerate()
-            .filter(|(_, leg)| leg.repo == repo && !train_leg_landed(&card_meta, leg))
+            .filter(|(_, leg)| {
+                leg.repo == repo
+                    && leg.base.as_deref().unwrap_or("main") == base
+                    && !train_leg_landed(&card_meta, leg)
+            })
             .map(|(i, _)| i)
             .collect();
         if lane_legs.is_empty() {
@@ -1831,6 +1850,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             // BR#3935: this entry can never drive on this lane — advance.
+            // BR#5753: this stays an ADVANCE, not a bounce — post-BR#4977 the
+            // hub's derived queue only lists cards with an unlanded leg on
+            // THIS repo+base, so a static no-lane-leg entry cannot persist in
+            // lane.queue (the snapshot re-derives within one tick). A firing
+            // here is mid-tick drift, and the card may legitimately ride a
+            // SIBLING lane via its other unlanded legs — a hub bounce here
+            // would yank it off that lane's queue.
             log(Some(key), &format!("queue[{qi}] {head_id} has no unlanded leg on this lane ({} leg(s) cited) — advancing to the next queue entry", legs.len()));
             continue;
         }
@@ -1849,9 +1875,43 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let leg_number = leg_idx + 1;
         let pr = leg.number;
         if pr == 0 || leg.repo.is_empty() {
-            // BR#3935: a stamp-less leg can never drive — advance (the hub
-            // audit owns the convention violation; the card stays queued).
-            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
+            // BR#5753: a stamp-less leg can NEVER drive — and the old
+            // advance-only path left the card in the hub's derived queue
+            // FOREVER: the hub keeps matching the leg on repo+base+unlanded
+            // regardless of its missing number, so the entry re-derived into
+            // lane.queue every tick, a silent zombie inflating queue.length.
+            // Un-queue it on the hub: the audited impl bounce (train:bounced,
+            // gate class) stamps merge_train.state = "bounced" and flips the
+            // card blocked → in_progress with the fix-up brief — impl
+            // re-stamps the PR binding, re-verifies, re-queues. The bounce
+            // needs pr > 0: the card's own merge_train stamp supplies it
+            // (the hub's laneQueue SQL only queues cards with
+            // merge_train.pr > 0, falling back to any stamped leg). When
+            // even that is missing the entry is not hub-queueable anymore —
+            // snapshot drift: advance and let the snapshot re-derive.
+            let bounce_pr = card_meta
+                .pointer("/merge_train/pr")
+                .and_then(|v| v.as_i64())
+                .filter(|&n| n > 0)
+                .or_else(|| legs.iter().map(|l| l.number).find(|&n| n > 0))
+                .unwrap_or(0);
+            if bounce_pr > 0 {
+                renew_lease(ctx, repo, base);
+                let defect = format!(
+                    "queue entry leg {leg_number} on this lane carries no PR stamp (number 0 / empty repo) — the entry can never drive or land (BR#5753); re-stamp the card's PR binding (meta.prs leg), re-verify, re-queue"
+                );
+                ctx.mcp("train_event", json!({
+                    "repo": repo, "base": base, "kind": "bounced", "pr": bounce_pr, "task_id": head_id,
+                    "reason": defect, "bounce_kind": "gate",
+                }))?;
+                ctx.note(&format!("bounced {head_id} (gate, stamp-less) — leg {leg_number} carries no PR stamp; lane.queue self-heals this tick"));
+                log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — bounced off the hub (impl re-stamps the binding, re-verifies, re-queues; BR#5753)"));
+                release_if_idle(ctx, key, repo, base)?;
+                return Ok(());
+            }
+            // BR#3935 (fail-open residue): no bounceable pr stamp at all —
+            // advance (the hub audit owns the convention violation).
+            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp and no bounceable train stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
             continue;
         }
         let mut facts = ctx.pr_facts(repo, pr)?;
@@ -1884,9 +1944,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             return Ok(());
         }
         if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935: a CLOSED PR can never merge — the old drop-and-return
-            // starved the whole lane behind its card. Log it, leave the card
-            // for the humans, and drive the NEXT entry this same tick.
+            // BR#3935 + BR#5897: a CLOSED PR can never merge — stamp cls:"blocked"
+            // in qfacts so the hub never counts an unmerged closed PR as ready/green,
+            // and advance to the next entry this same tick.
+            qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
             log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
@@ -2001,7 +2062,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         .collect();
                     let mut dispatched = 0usize;
                     for r in &stale {
-                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok() {
+                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok()
+                            || ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"]).is_ok()
+                        {
                             dispatched += 1;
                         }
                     }
@@ -2132,6 +2195,63 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // the truth of this pass: which entries are ready (the next batch) and
     // which wait/leave. One write per tick; failures never break the tick.
     // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
+    // ---- PHASE B (BR#4996 + BR#5658): select the batch — the maximal set of
+    // MUTUALLY non-conflicting candidates, queue order = landing order.
+    // Conflict pairs come from the candidates' changed-file sets (merge-base
+    // diff), then each intersecting pair is CONFIRMED head-vs-head with
+    // merge-tree (BR#3935 fail-closed: a probe that cannot run counts as
+    // conflicting, and a candidate whose file set cannot be computed is
+    // excluded as not-known-clean — select_batch's clean[i] == false law).
+    // Computed before the queue_facts stamp so conflict_pairs ([pr_a, pr_b])
+    // ride the stamp and the hub can partition the backlog into sequential
+    // merge batches (Batch 1 | Batch 2 | …).
+    let mut batch: Vec<usize> = Vec::new();
+    let mut conflict_pairs_prs: Vec<[i64; 2]> = Vec::new();
+    let mut batch_deferred_log: Option<String> = None;
+    let mut batch_selected_log: Option<(usize, String)> = None;
+    if !candidates.is_empty() {
+        let mut clean: Vec<bool> = vec![true; candidates.len()];
+        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
+                Ok(set) => file_sets.push(set),
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
+                    clean[i] = false;
+                    file_sets.push(crate::train_gate::FileSet::new());
+                }
+            }
+        }
+        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
+        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
+            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
+                Ok(true) => {
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+            }
+        }
+        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
+        if batch.len() < candidates.len() {
+            let dropped: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !batch.contains(i))
+                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
+                .collect();
+            batch_deferred_log = Some(format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
+        }
+        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
+        batch_selected_log = Some((batch.len(), batch_ids.join(", ")));
+    }
+
+    // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
     // the walk produced verdicts — entries can short-circuit pre-gate) and
     // carries base_state (Fix A): the hub renders the lane BLOCKED with
     // the base red names + files the one-per-episode human alarm ask.
@@ -2141,6 +2261,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // base_state); the next stamp after a landing omits it, which clears
         // the state by itself.
         let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state });
+        if !conflict_pairs_prs.is_empty() {
+            qf.as_object_mut().unwrap().insert("conflict_pairs".into(), json!(conflict_pairs_prs));
+        }
         if let Some(st) = ctx.stall.get(key) {
             qf.as_object_mut().unwrap().insert(
                 "stalled".into(),
@@ -2163,52 +2286,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
     }
 
-
-    // ---- PHASE B (BR#4996): select the batch — the maximal set of MUTUALLY
-    // non-conflicting candidates, queue order = landing order. Conflict
-    // pairs come from the candidates' changed-file sets (merge-base diff),
-    // then each intersecting pair is CONFIRMED head-vs-head with merge-tree
-    // (BR#3935 fail-closed: a probe that cannot run counts as conflicting,
-    // and a candidate whose file set cannot be computed is excluded as
-    // not-known-clean — select_batch's clean[i] == false law).
-    let mut batch: Vec<usize> = Vec::new();
-    if !candidates.is_empty() {
-        let mut clean: Vec<bool> = vec![true; candidates.len()];
-        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
-        for (i, c) in candidates.iter().enumerate() {
-            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
-                Ok(set) => file_sets.push(set),
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
-                    clean[i] = false;
-                    file_sets.push(crate::train_gate::FileSet::new());
-                }
-            }
-        }
-        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
-        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
-            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
-                Ok(true) => conflict_pairs.push((i, j)),
-                Ok(false) => {}
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
-                    conflict_pairs.push((i, j));
-                }
-            }
-        }
-        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
-        if batch.len() < candidates.len() {
-            let dropped: Vec<String> = candidates
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !batch.contains(i))
-                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
-                .collect();
-            log(Some(key), &format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
-        }
-        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
-        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", batch.len()));
-        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", batch.len(), batch_ids.join(", ")));
+    if let Some(msg) = batch_deferred_log {
+        log(Some(key), &msg);
+    }
+    if let Some((n_sel, ids_str)) = batch_selected_log {
+        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", n_sel));
+        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", n_sel, ids_str));
     }
 
     // identity gate at the write boundary (BR#3181): the batch's merge legs
@@ -2775,6 +2858,11 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
             log(Some(&key), "lane retired (lane card closed) — skipping (BR#4977)");
             continue;
         }
+        // BR#4754: remember the lane card — the one-per-episode token-rot
+        // note lands there when a blind episode self-heals.
+        if let Some(c) = lane.get("card").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            ctx.last_lane_card = Some(c.to_string());
+        }
         // Daemon mode resolves the workdir per lane from the managed clone
         // cache (or the MERGE_TRAIN_WORKDIR override) before driving it.
         if ctx.in_process {
@@ -2817,19 +2905,212 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
     if ctx.once {
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
-            return 1;
-        }
-        return 0;
+        return once_run(&mut ctx);
     }
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     loop {
         let started = now_ms();
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+        match tick(&mut ctx) {
+            Ok(()) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — report it once so the
+                // board learns WHY the lane went quiet (the token-rot class),
+                // not just that it did.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
+            Err(e) => {
+                log(None, &format!("tick failed: {}", trunc(&e, 300)));
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // BR#4754: fail LOUDLY and exit non-zero — a supervisor
+                        // (systemd/launchd/nohup loop) restarts a fresh process
+                        // that re-resolves the store and re-runs the ladder with
+                        // a clean slate; the pre-fix loop instead ticked blindly
+                        // forever (1,684 silent failures on the super lane).
+                        let (since, ticks) = match blind.as_ref() {
+                            Some(b) => (b.since_ms, b.ticks),
+                            None => (now_ms(), 0),
+                        };
+                        log(
+                            None,
+                            &format!(
+                                "TOKEN-BLIND — EXITING (exit 1): the hub rejected this executor's credential for {} tick(s) since {} and the auth ladder (store reload + principal re-vend) failed {} consecutive runs. A supervisor restart picks up fresh credentials; if the principal itself is dead, the operator must re-pair (`bridge pair <hub-url>`).",
+                                ticks,
+                                iso(since),
+                                heal.streak,
+                            ),
+                        );
+                        return 1;
+                    }
+                }
+            }
         }
         let spent = now_ms() - started;
         std::thread::sleep(Duration::from_millis(ctx.interval_ms.saturating_sub(spent).max(1000)));
+    }
+}
+
+/// `--once`: one tick, one ladder attempt on an auth-class failure (cron
+/// re-runs pick up the healed pairing). Exit 0 on a clean tick, else 1.
+fn once_run(ctx: &mut Ctx) -> i32 {
+    match tick(ctx) {
+        Ok(()) => 0,
+        Err(e) => {
+            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+            if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                log(None, "auth-class failure — one ladder attempt before giving up");
+                if try_auth_ladder(ctx, &mut crate::dispatch::AuthHeal::new()) {
+                    return match tick(ctx) {
+                        Ok(()) => 0,
+                        Err(e2) => {
+                            log(None, &format!("tick failed after re-vend: {}", trunc(&e2, 300)));
+                            1
+                        }
+                    };
+                }
+            }
+            1
+        }
+    }
+}
+
+/// BR#4754 — a token-rot episode: consecutive auth-class tick failures since
+/// `since_ms`. Cleared by the first successful tick (which also fires the
+/// one-per-episode board note once the episode is worth naming).
+struct BlindStreak {
+    since_ms: u64,
+    ticks: u32,
+}
+
+/// A blind episode shorter than this is a hiccup (a single rotated mid-flight
+/// tick), not an outage — it does not earn a board note.
+const BLIND_NOTE_MIN_TICKS: u32 = 3;
+
+/// What the daemon loop should do after an auth-classified tick failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthOutcome {
+    /// stay in the loop (ladder attempted or paced out)
+    Continue,
+    /// the ladder is exhausted — exit loudly (standalone daemon only)
+    Park,
+}
+
+/// Shared auth failure path for BOTH daemon loops: the caller has already
+/// classified the error auth-class and streaked it; this paces (the hub
+/// rate-limits /api/token/repair at 6/h per row — an unpaced ladder in a 45s
+/// loop would burn the mint budget in minutes) and attempts the ladder when
+/// due. Returns Park when AUTH_PARK_ATTEMPTS consecutive ladder runs failed.
+fn on_tick_auth_failure(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal, e: &str) -> AuthOutcome {
+    if crate::dispatch::classify_hub_error(e) != crate::dispatch::HubErrClass::Auth {
+        return AuthOutcome::Continue;
+    }
+    match heal.on_auth_failure(std::time::Instant::now()) {
+        crate::dispatch::HealStep::Wait => AuthOutcome::Continue,
+        crate::dispatch::HealStep::Attempt => {
+            if try_auth_ladder(ctx, heal) {
+                AuthOutcome::Continue
+            } else if heal.streak >= crate::dispatch::AUTH_PARK_ATTEMPTS {
+                AuthOutcome::Park
+            } else {
+                AuthOutcome::Continue
+            }
+        }
+    }
+}
+
+/// One run of the BR#4754 auth ladder when a hub call comes back
+/// auth-rejected. True = the ctx now carries a fresh pairing.
+/// `Ok`/`Err` reasons are logged by the caller — never swallowed (the 2026-10-27
+/// incidents: "repair failed" with zero why).
+fn try_auth_ladder(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal) -> bool {
+    match auth_ladder_with(&ctx.hub, &ctx.token, &|| crate::dispatch::DispatchConfig::resolve()) {
+        Ok((hub, token)) => {
+            ctx.hub = hub;
+            ctx.token = token;
+            heal.on_repair_success();
+            log(None, "hub rejected the stored token — the auth ladder re-vended the pairing; re-ticking");
+            true
+        }
+        Err(why) => {
+            log(
+                None,
+                &format!(
+                    "auth ladder failed (attempt {}/{}): {}",
+                    heal.streak,
+                    crate::dispatch::AUTH_PARK_ATTEMPTS,
+                    trunc(&why.join("; "), 240)
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// BR#4754 — the train executor's auth self-heal ladder (the BR#4113
+/// ladder's train-leg twin). A token-blind daemon cannot ask the hub for
+/// ANYTHING under the dead bearer — but the repair route authenticates by
+/// PRINCIPAL (the durable device credential, BR#2711 §2), so self-heal is
+/// possible while fully blind: (1) reload the store — another process on
+/// this device (the runner's dispatch loop) may have re-vended the token;
+/// (2) agent-plane re-vend by principal (`repair_by_principal` —
+/// headless-safe, and it PERSISTS the fresh secret to the store so a
+/// supervisor-restarted process resolves it directly). The human-plane leg
+/// is desktop-only by design. Returns the fresh (hub, token) to adopt.
+/// The store leg is injected (see `auth_ladder_with`) so unit tests stay
+/// machine-independent.
+fn auth_ladder_with(
+    prev_url: &str,
+    prev_token: &str,
+    store: &dyn Fn() -> Option<crate::dispatch::DispatchConfig>,
+) -> Result<(String, String), Vec<String>> {
+    let mut failures: Vec<String> = Vec::new();
+    match store() {
+        Some(fresh) if !fresh.token.is_empty() && fresh.token != prev_token => {
+            return Ok((fresh.url, fresh.token));
+        }
+        Some(_) => failures.push("store token unchanged".into()),
+        None => failures.push("no resolvable config in the store".into()),
+    }
+    let client = match reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            failures.push(format!("repair client build failed: {e}"));
+            return Err(failures);
+        }
+    };
+    match crate::dispatch::repair_by_principal(&client, prev_url) {
+        Ok(cfg) => Ok((cfg.url, cfg.token)),
+        Err(e) => {
+            failures.push(format!("principal repair: {e}"));
+            Err(failures)
+        }
+    }
+}
+
+/// BR#4754 — the board-visible half of the token-rot fix. A token-blind
+/// daemon is board-MUTE by construction (every hub write needs the bearer
+/// the hub just rejected), so the alarm cannot fire mid-blind; what CAN
+/// reach the board is the retroactive note once the ladder heals: one
+/// log_progress per episode on the lane card naming the class, the window,
+/// and the remedy — so the board holds the CAUSE, not just a lease-less lane.
+fn board_note_token_rot(ctx: &mut Ctx, streak: &BlindStreak) {
+    let Some(card) = ctx.last_lane_card.clone() else {
+        return;
+    };
+    let did = format!(
+        "token-rot episode: {} tick(s) failed 'unknown auth token' since {} — the executor self-healed via the auth ladder (store reload / principal re-vend, BR#4754) and the lane tick resumed",
+        streak.ticks,
+        iso(streak.since_ms)
+    );
+    if let Err(e) = ctx.mcp("log_progress", json!({ "id": card, "did": did, "will": "none — the executor is ticking again", "sentiment": "neutral" })) {
+        log(None, &format!("token-rot board note failed (non-fatal): {}", trunc(&e, 160)));
     }
 }
 
@@ -3185,6 +3466,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         tick_landed: 0,
         tick_error: None,
         auto_rerun_shas: std::collections::HashSet::new(),
+        last_lane_card: None,
     })
 }
 
@@ -3211,6 +3493,11 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     let mut preflighted = false;
     let mut failures: u32 = 0;
     let mut ticks: u64 = 0;
+    // BR#4754: the same paced auth ladder the standalone daemon runs —
+    // role:"train" nodes have NO dispatch loop, so this leg is the only
+    // thing that can re-vend a rotated pairing on those hosts.
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     let mut last_reconcile: Option<std::time::Instant> = None;
     loop {
         // sleep in small slices so stop is responsive (same law as run_loop)
@@ -3264,15 +3551,32 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
         // loudly, continue — the lease TTL reconciles any half-state.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(&mut ctx)));
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — name it on the lane
+                // card (once per episode) so the board holds the CAUSE.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 failures += 1;
-                if e.contains("401") {
-                    // the pairing rotated under us — rebuild from the
-                    // keychain/config and let the next tick retry
-                    if let Ok(fresh) = ctx_for_daemon(&cfg) {
-                        ctx = fresh;
-                        log(None, "gateway token rotated — train leg re-vended its pairing");
+                // BR#4754: the old sniff (`e.contains("401")`) missed the
+                // JSON-RPC shape the hub actually returns for a dead token
+                // ("unknown auth token" — no HTTP status in the string), so a
+                // rotated pairing stayed broken here too on role:"train"
+                // nodes (no dispatch loop to refresh the store). Classified
+                // + paced ladder now; the leg NEVER exits its host.
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // the leg itself survives — it just stops hammering
+                        // the ladder; the capped cadence keeps retrying (the
+                        // dispatch loop's park path owns the loud surface)
+                        log(None, "auth ladder exhausted — the train leg keeps ticking on the capped cadence (host loop owns the park/alarm surface)");
                     }
                 }
                 log(None, &format!("tick failed: {}", trunc(&e, 300)));
@@ -3354,10 +3658,19 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
         // Read-only by construction: `gh pr list` is the ONLY GitHub call
         // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
         // board authority and the hub holds no VCS credentials).
-        let rows = ctx.gh_json(&[
+        let rows = match ctx.gh_json(&[
             "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
             "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
-        ])?;
+        ]) {
+            Ok(r) => r,
+            Err(e) if e.contains("502") || e.contains("504") || e.contains("Bad Gateway") || e.contains("timeout") => {
+                ctx.gh_json(&[
+                    "pr", "list", "--repo", &repo, "--state", "open", "--limit", "100",
+                    "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
+                ])?
+            }
+            Err(e) => return Err(e),
+        };
         let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3917,6 +4230,87 @@ mod tests {
         assert!(nolabel.holder.starts_with("merge-train@"));
     }
 
+    // ---- BR#4754: token rot is auth-class, heals through the ladder, and
+    // ---- parks LOUDLY when the ladder is exhausted ----
+
+    #[test]
+    fn token_rot_jsonrpc_errors_classify_auth() {
+        // The incident shape (1,684 consecutive super-lane failures): mcp()
+        // wraps the hub's error TEXT and a rotted token carries no HTTP
+        // status — the old `contains("401")` sniff and the status-prefix
+        // classifier patterns both missed it.
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_status): unknown auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_lease): invalid auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+    }
+
+    #[test]
+    fn lane_lease_contention_stays_transient() {
+        // NOT auth: the token is fine, another executor holds the lane.
+        assert_eq!(
+            crate::dispatch::classify_hub_error(
+                "hub rpc error (train_lease): lane lease held live by merge-train@other — stand down this tick"
+            ),
+            crate::dispatch::HubErrClass::Transient
+        );
+    }
+
+    #[test]
+    fn auth_ladder_failure_names_every_failed_leg() {
+        // Store leg injected to None (dev machines hold a REAL pairing — an
+        // un-injected store leg makes this test machine-dependent), repair
+        // leg aimed at a dead port: BOTH legs must be NAMED in the reasons —
+        // never a bare "repair failed" (the 2026-10-27 class).
+        let errs = auth_ladder_with("http://127.0.0.1:9", "sentinel-store-token", &||
+            None::<crate::dispatch::DispatchConfig>)
+            .expect_err("unreachable hub must fail the ladder");
+        let joined = errs.join("; ");
+        assert!(joined.contains("no resolvable config in the store"), "names the store leg: {joined}");
+        assert!(joined.contains("principal repair:"), "names the principal-repair leg: {joined}");
+    }
+
+    #[test]
+    fn auth_ladder_adopts_a_changed_store_token() {
+        // Leg 1: another process (the runner's dispatch loop) re-vended the
+        // store token — the ladder adopts it WITHOUT hitting the repair route.
+        let fresh = crate::dispatch::DispatchConfig {
+            url: "https://hub.example".into(),
+            token: "fresh-from-store".into(),
+            ..crate::dispatch::default_config()
+        };
+        let (hub, token) = auth_ladder_with("https://hub.example", "stale-snapshot", &move || {
+            Some(fresh.clone())
+        })
+        .expect("a changed store token is a completed ladder");
+        assert_eq!(token, "fresh-from-store");
+        assert_eq!(hub, "https://hub.example");
+    }
+
+    #[test]
+    fn both_daemon_loops_wire_the_ladder_and_park_loudly() {
+        // Source-scan pin (the dispatch.rs convention): the standalone run()
+        // loop AND the in-process daemon loop must classify auth errors,
+        // run the injected ladder, pace it, and the standalone must exit
+        // non-zero when the ladder is exhausted — a regression to the silent
+        // tick-forever loop is the exact Oct-29 incident.
+        let src = include_str!("train.rs");
+        for needle in [
+            "fn auth_ladder_with",
+            "fn on_tick_auth_failure",
+            "AuthOutcome::Park",
+            "TOKEN-BLIND — EXITING (exit 1)",
+            "fn board_note_token_rot",
+            "BLIND_NOTE_MIN_TICKS",
+        ] {
+            assert!(src.contains(needle), "BR#4754 machinery missing: {needle}");
+        }
+    }
+
     // ---- the gate law, restated: writes flow only through worker creds ----
 
     #[test]
@@ -4037,6 +4431,7 @@ mod tests {
             tick_landed: 0,
             tick_error: None,
             auto_rerun_shas: std::collections::HashSet::new(),
+            last_lane_card: None,
         }
     }
 
@@ -4130,6 +4525,76 @@ mod tests {
         let recorded = calls.lock().unwrap();
         assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
         assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_bounces_off_the_hub_br5753() {
+        // BR#5753: a queued card whose lane leg carries no PR stamp used to be
+        // logged and advanced — the hub keeps matching that leg on
+        // repo+base+unlanded, so the entry re-derived into lane.queue on every
+        // tick, a silent zombie inflating queue.length forever. The walk now
+        // bounces it off the hub (the audited impl bounce: train:bounced, gate
+        // class) with the card's own merge_train.pr stamp, and the tick ends —
+        // lane.queue self-heals within one tick.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+                "merge_train": { "pr": 7, "state": "queued" },
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // renew_lease (bounce arm)
+            ok(json!({ "ok": true })),                                // train_event bounced
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_lease", "train_event", "train_status", "train_lease"],
+            "the stamp-less arm must bounce (renew → train_event) and end the tick, got {:?}",
+            names
+        );
+        let ev = call_args(&recorded[3]);
+        assert_eq!(call_name(&recorded[3]), "train_event");
+        assert_eq!(ev.get("kind"), Some(&json!("bounced")));
+        assert_eq!(ev.get("pr"), Some(&json!(7)), "the bounce rides the card's own merge_train.pr stamp");
+        assert_eq!(ev.get("task_id"), Some(&json!("BR#1")));
+        assert_eq!(ev.get("bounce_kind"), Some(&json!("gate")));
+        assert!(
+            String::from(ev.get("reason").and_then(|v| v.as_str()).unwrap_or("")).contains("no PR stamp"),
+            "the defect must name the stamp-less leg, got: {:?}",
+            ev.get("reason")
+        );
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_without_train_stamp_advances_br5753() {
+        // Fail-open residue: a stamp-less leg on a card with NO bounceable
+        // merge_train.pr / stamped leg anywhere cannot call train:bounced (the
+        // hub requires pr > 0) — the walk advances instead of erroring the
+        // tick (the entry is not hub-queueable anymore; snapshot drift).
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // train_queue_facts (walk end)
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"],
+            "no bounceable stamp → advance (no train_event), got {:?}",
+            names
+        );
     }
 
     #[test]
@@ -4362,6 +4827,7 @@ mod tests {
                 tick_landed: 0,
                 tick_error: None,
                 auto_rerun_shas: std::collections::HashSet::new(),
+                last_lane_card: None,
             }
         }
     }

@@ -1031,28 +1031,42 @@ export type HeadCheckVerdict = {
 };
 
 /** The HEAD side of the 5c mechanical gate: same decision rule as
- *  classifyMainCheckRuns, but exempt-external failures (BR#2267) are pulled
- *  OUT of red and recorded as `external` — they are collected into the class
- *  ask, never bounce a PR. */
+ *  classifyMainCheckRuns (newest non-cancelled run per check name wins, by
+ *  highest id — so a re-run that succeeded supersedes an earlier failure of
+ *  the same check), with exempt-external failures (BR#2267) pulled OUT of red
+ *  and recorded as `external` — they are collected into the class ask, never
+ *  bounce a PR. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
+  const byName = new Map<string, MainCheckRun[]>();
+  for (const r of runs) {
+    const name = r.name ?? "";
+    const list = byName.get(name) ?? [];
+    list.push(r);
+    byName.set(name, list);
+  }
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
-  for (const r of runs) {
-    if (r.conclusion == null) {
-      if (isExemptCheckName(r.name ?? "")) continue; // exempt externals in flight say nothing
-      unsettled.push(r.name ?? "");
+  for (const [name, list] of byName) {
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge) {
+      if (!isExemptCheckName(name)) unsettled.push(`${name} (only cancelled runs)`);
       continue;
     }
-    if (isExemptCheckName(r.name ?? "")) {
-      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    if (judge.conclusion == null) {
+      if (isExemptCheckName(name)) continue; // exempt externals in flight say nothing
+      unsettled.push(name);
       continue;
     }
-    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
-    else unsettled.push(r.name ?? "");
+    if (isExemptCheckName(name)) {
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) external.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+    else unsettled.push(name);
   }
   if (red.length) return { verdict: "red", red, unsettled, external, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
@@ -1743,6 +1757,64 @@ export function selectBatch(clean: boolean[], conflictPairs: [number, number][],
   return selected;
 }
 
+/** BR#5658 (Ray 2026-11-03): one verifying or ready PR car in a merge batch.
+ *  `state` drives the verification colour law:
+ *  - "ready"     → green solid (.tb-ready): verified & ready to merge
+ *  - "verifying" → orange pulsing (.tb-verifying): actively being verified now
+ *  - "waiting"   → orange solid (.tb-wait): waiting to be verified */
+export interface TrainBatchCar {
+  id: string;
+  pr?: number;
+  state: "ready" | "verifying" | "waiting";
+  detail?: string;
+}
+
+/** BR#5658 (Ray 2026-11-03): partition all verifying + ready PRs on a lane into
+ *  sequential merge batches (`Batch 1 | Batch 2 | …`) by running `selectBatch`
+ *  iteratively until every car is assigned to a pass.
+ *  `conflictPairsByPr` are pairs of PR numbers `[prA, prB]` whose changed-file
+ *  sets conflict (executor-stamped on `queue_facts.conflict_pairs`); `cap` is
+ *  `lane.burst_max` (0 = unlimited). Cars that conflict with an earlier member
+ *  in Batch k or exceed `cap` defer to Batch k+1 while non-conflicting later
+ *  cars still join Batch k (the greedy A↔B↔C → [A, C] then [B] law). */
+export function partitionMergeBatches<T extends { id: string; pr?: number }>(
+  cars: T[],
+  conflictPairsByPr: [number, number][] = [],
+  cap: number = DEFAULT_BURST_MAX,
+): T[][] {
+  if (!cars.length) return [];
+  const remaining: number[] = cars.map((_, i) => i);
+  const batches: T[][] = [];
+  const prConflict = (i: number, j: number): boolean => {
+    const pa = Number(cars[i]?.pr ?? 0);
+    const pb = Number(cars[j]?.pr ?? 0);
+    if (!pa || !pb) return false;
+    if (pa === pb && cars[i].id !== cars[j].id) return true;
+    return conflictPairsByPr.some(([a, b]) => (a === pa && b === pb) || (a === pb && b === pa));
+  };
+  while (remaining.length > 0) {
+    const clean = remaining.map(() => true);
+    const subPairs: [number, number][] = [];
+    for (let a = 0; a < remaining.length; a++) {
+      for (let b = a + 1; b < remaining.length; b++) {
+        if (prConflict(remaining[a], remaining[b])) subPairs.push([a, b]);
+      }
+    }
+    const chosenSub = selectBatch(clean, subPairs, cap);
+    if (!chosenSub.length) {
+      // safety fallback (clean is all-true so selectBatch always picks >=1)
+      batches.push([cars[remaining.shift()!]]);
+      continue;
+    }
+    batches.push(chosenSub.map((si) => cars[remaining[si]]));
+    const chosenSet = new Set(chosenSub);
+    const nextRemaining = remaining.filter((_, idx) => !chosenSet.has(idx));
+    remaining.length = 0;
+    remaining.push(...nextRemaining);
+  }
+  return batches;
+}
+
 /** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
  *  the caller fails loud, a guessed lane config would gate the wrong CI. */
 export function laneOfMeta(meta: any): LaneSpec | null {
@@ -1865,19 +1937,28 @@ export function rootFixCardBody(repo: string, sha: string, failing: { name: stri
  *  tier 2 "critical" — cards explicitly marked critical (meta.priority ===
  *      "critical"), the manual rung;
  *  tier 3 "normal" — everything else.
- *  FIFO within tier by blocked-since (status_ts ascending). opts.baseRed
- *  (a STOPPED lane — the lane card's stop facts are the hub-visible proxy
- *  for base red) offers ONLY tier 0: every other head stays parked on the
- *  base-red law (BR#4365 precedent) until the fix merges or the line goes
- *  green. */
-export function mergeTrainQueue(cards: TrainCandidate[], opts?: { baseRed?: boolean }): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
+ *  FIFO within tier by blocked-since (status_ts ascending). NO stop/base-red
+ *  filter (BR#5753): the hub's derived queue keeps EVERY held car visible —
+ *  root_fix still sorts to rank 0 unconditionally — because the stop-arm
+ *  consumers (base_red_resolution.held, the alarm ask's cure-PR fallback,
+ *  trainOpenRootFix) read this list and would go blind mid-episode if
+ *  non-root_fix cars were filtered out. The stopped-lane fast lane (only the
+ *  bound root-fix card merges; BR#5190) is the WALK's law — train.rs
+ *  is_root_fix_card + the merge gate — enforced where merges happen, not a
+ *  hub-side queue filter. (The pre-5753 opts.baseRed option was dead in
+ *  production: its one caller looked the stop facts up with
+ *  `WHERE id = laneKey(repo, base)`, and a lane key is never an
+ *  artefacts.id, so the filter never fired once.) */
+export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
   const queued = cards.filter((c) =>
-    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX)),
+    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX))
+    // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
+    // the silence-release parked unprefixed must not stay invisible to the
+    // train (the BR#4995 silent drop)
+    || isWatchdogTrainHoldPark(c.meta),
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
-  const baseRed = opts?.baseRed === true;
   return [...queued]
-    .filter((c) => !baseRed || rank(c) === 0)
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
     .map((c) => {
       const r = rank(c);
@@ -1923,7 +2004,7 @@ export function trainProxyEvent(meta: any): AwaitEvent | null {
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
   const n = trainPrLeg(meta);
-  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+  return isValidGitHubRepo(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
 }
 
 /** BR#4282 — the card's OWN merge-train stamp proving its pr_merged leg has
@@ -1984,6 +2065,43 @@ export function releaseHold(meta: any): string | null {
   if (m.awaiting_ask)
     return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
   return null;
+}
+
+/** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE
+ *  mergeTrainQueue. The queue derives candidates from the `merge-train:`
+ *  reason prefix alone, so a watchdog hold-park whose note lacks the prefix
+ *  silently drops a live queued/awaiting-ci car out of the train queue
+ *  forever — the BR#4995 class, root-caused from the BR#5674 Mission 2
+ *  audit. The two live-slot states ride the state-named prefix; every other
+ *  hold (bounced/awaiting/typed waits) is NOT a queue slot and must stay
+ *  unprefixed — those legs re-enter through the board, never the queue. */
+export function mergeTrainHoldPrefix(meta: any): string | null {
+  const mt = ((meta ?? {}).merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued") return `${MERGE_TRAIN_REASON_PREFIX} queued — `;
+  if (st === "awaiting-ci") return `${MERGE_TRAIN_REASON_PREFIX} awaiting-ci — `;
+  return null;
+}
+
+/** The park-note fingerprints a watchdog releaseHold hold-park writes (the
+ *  holdParkBody silence note and the lapsed-subprocess hold note, BR#4067). */
+export const WATCHDOG_HOLD_PARK_REASON_RE =
+  /silence-release held \(watchdog\)|release held \(BR#4067\)/i;
+
+/** BR#5750 — a blocked card that a watchdog releaseHold hold-park created
+ *  BEFORE the merge-train prefix existed (the already-dropped BR#4995 cars
+ *  still sitting unprefixed on the board). Read from the park's own facts:
+ *  the reason matches the hold-park fingerprint AND the card still carries a
+ *  live `queued` slot. `queued` only — awaiting-ci parks advance via train
+ *  events (train:merged → awaiting-ci), not queue admission, and
+ *  bounced/awaiting re-enter through the board, never the queue. */
+export function isWatchdogTrainHoldPark(meta: any): boolean {
+  const m = meta ?? {};
+  const mt = ((m.merge_train ?? {}) as Record<string, unknown>);
+  if (String(mt.state ?? "") !== "queued") return false;
+  return [m.blocked?.reason, m.blocked_reason].some(
+    (r: unknown) => typeof r === "string" && WATCHDOG_HOLD_PARK_REASON_RE.test(r),
+  );
 }
 
 // ---- carry-record law (BR#3516 §5) ----
@@ -2930,6 +3048,47 @@ export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Z
  *  #2534 merge" prose stay inert. */
 export const TRAIN_PR_SHORT_RE = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
 
+/** BR#5658 / BR#5324 / BR#5805: validate that `owner/name` is a plausible
+ *  GitHub repository rather than a Bridge/tracker cross-reference token or
+ *  numeric fragment. Prose notes like `BR#5563/BR#5635`, `#1768/BR#4993`, or
+ *  CSS/identifier tokens adjacent to a card ref (`tb-pulse/BR#5658`) previously
+ *  matched `TRAIN_PR_SHORT_RE` with `m[2] === "BR"`, minting ghost merge lanes
+ *  (`4365/BR`, `4728/BR`, `5022/BR`, `5299/BR`, `5563/BR`, `1768/BR`,
+ *  `tb-pulse/BR`) and poisoning cards' `pr_merged` proxies.
+ *  - `owner` must not be all-digits (`5563`, `1768`) and must follow GitHub's
+ *    username/org syntax (`[A-Za-z0-9]` endpoints, `[A-Za-z0-9-]` interior).
+ *  - `name` must not be a reserved tracker/card prefix (`BR`, `GH`, `PR`,
+ *    `TASK`, `ASK`, `ISSUE`, `PULL`, `ISSUES`, `PULLS`). */
+export function isValidGitHubRepo(repo: string): boolean {
+  const parts = String(repo ?? "").trim().split("/");
+  if (parts.length !== 2) return false;
+  const [owner, name] = parts;
+  if (!owner || !name) return false;
+  if (/^\d+$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name === "." || name === "..") return false;
+  if (/^(?:br|gh|pr|issue|issues|pull|pulls|task|ask)$/i.test(name)) return false;
+  return true;
+}
+
+/** BR#5658 / AGENTS.md Rule 7: extract a direct-to-main landing commit receipt
+ *  from a review/verify note when no PR exists (`https://github.com/o/r/commit/<sha>`
+ *  or `commit <sha>` / `landed on main as <sha>`). Returns null when the text
+ *  cites any PR leg (PR legs ride the merge train, never direct-close). */
+export function parseDirectCommitReceipt(text: string): { repo?: string; sha: string } | null {
+  const t = String(text ?? "");
+  if (trainParseNoteLegs(t).length > 0) return null;
+  const urlMatch = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/commit\/([0-9a-f]{7,40})\b/i.exec(t);
+  if (urlMatch && isValidGitHubRepo(urlMatch[1])) {
+    return { repo: urlMatch[1], sha: urlMatch[2].toLowerCase() };
+  }
+  const tokenMatch = /(?:^|[\s(—–-])(?:commit|landed(?:\s+direct(?:ly)?\s+to\s+main)?(?:\s+on\s+main)?(?:\s+as)?|main\s+commit)[\s#:@=/]+([0-9a-f]{7,40})(?=[\s;.,)]|$)/i.exec(t);
+  if (tokenMatch) {
+    return { sha: tokenMatch[1].toLowerCase() };
+  }
+  return null;
+}
+
 export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
 
 /** Parse a verify close note into PR legs. Single-PR notes keep the
@@ -2953,14 +3112,22 @@ export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
   const seen = new Set<string>();
   for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-    seen.add(`${m[1]}/${m[2]}#${m[3]}`);
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    prs.push({ repo, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    seen.add(`${repo}#${m[3]}`);
   }
   for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
-    const key = `${m[1]}/${m[2]}#${m[3]}`;
+    const idx = m.index ?? 0;
+    const before = idx > 0 ? t[idx - 1] : "";
+    // Reject if preceded by `#` or `/` (e.g. `BR#5563/BR#5635` or URL path tails)
+    if (before === "#" || before === "/") continue;
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    const key = `${repo}#${m[3]}`;
     if (seen.has(key)) continue; // the same PR already cited by its URL
     seen.add(key);
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    prs.push({ repo, number: Number(m[3]), index: idx, end: idx + m[0].length });
   }
   prs.sort((a, b) => a.index - b.index);
   if (!prs.length) return [];
