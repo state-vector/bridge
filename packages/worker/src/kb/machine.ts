@@ -195,6 +195,59 @@ export function prFromNote(note: string): string | null {
   return null;
 }
 
+/** The GitHub PR(s) a card covers — BR#5874: the verify-round supersede has to
+ *  tell the parent's OWN verify duty from a disposition duty covering a
+ *  DIFFERENT PR, and auto-spawned verify duties carry NO meta.pr stamp (the
+ *  binding lives on the parent; the duty's PR surfaces in its body URL and
+ *  title). Resolution order per card:
+ *  1. meta.pr / meta.prs legs (repo+number — the authoritative binding),
+ *  2. canonical github.com owner/repo/pull/N URLs in the body,
+ *  3. "…slug PR #N" (or bare "PR #N") mentions in the title.
+ *  Empty array = no PR signal anywhere on the card. */
+export function prTargetsOf(row: { meta?: unknown; body_md?: unknown; title?: unknown } | null | undefined): { repo?: string; number: number }[] {
+  if (!row) return [];
+  const out: { repo?: string; number: number }[] = [];
+  const push = (t: { repo?: string; number: number }) => {
+    if (!Number.isInteger(t.number) || t.number <= 0) return;
+    if (out.some((x) => x.number === t.number && (x.repo ?? undefined) === (t.repo ?? undefined))) return;
+    out.push(t);
+  };
+  let m: any = {};
+  try { m = typeof row.meta === "string" ? JSON.parse(row.meta) : (row.meta ?? {}); } catch { m = {}; }
+  const bound = (leg: any) => {
+    const repo = String(leg?.repo ?? "");
+    return repo.includes("/") && Number.isInteger(Number(leg?.number)) ? { repo, number: Number(leg.number) } : null;
+  };
+  const direct = bound(m?.pr);
+  if (direct) push(direct);
+  if (Array.isArray(m?.prs)) for (const leg of m.prs) { const t = bound(leg); if (t) push(t); }
+  if (out.length) return out; // a meta binding wins — body/title only for unbound duties
+  const body = String(row.body_md ?? "");
+  for (const u of body.matchAll(/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/g)) push({ repo: `${u[1]}/${u[2]}`, number: Number(u[3]) });
+  if (out.length) return out;
+  const title = String(row.title ?? "");
+  for (const t of title.matchAll(/([\w.-]+)[/ ]PR #(\d+)/gi)) push({ repo: t[1], number: Number(t[2]) });
+  if (!out.length) {
+    const bare = title.match(/\bPR #(\d+)\b/i);
+    if (bare) push({ number: Number(bare[1]) });
+  }
+  return out;
+}
+
+/** Do two PR targets denote the same pull request? Numbers must be equal;
+ *  slugs compare case-insensitively, equal on the full slug OR the repo's
+ *  local segment (a title may carry the bare slug — "superpositional PR
+ *  #2329" vs the binding's "state-vector/superpositional"). A target with no
+ *  slug (bare "PR #N" in a title) matches on the number alone — PR numbers
+ *  are per-repo sequences, but a duty that names only a number under a parent
+ *  whose world is one repo is best read as naming that repo's PR. */
+export function prTargetMatch(a: { repo?: string; number: number } | null | undefined, b: { repo?: string; number: number } | null | undefined): boolean {
+  if (!a || !b || a.number !== b.number) return false;
+  if (!a.repo || !b.repo) return true;
+  const la = a.repo.toLowerCase(), lb = b.repo.toLowerCase();
+  return la === lb || la.split("/").pop() === lb.split("/").pop();
+}
+
 export type Effect =
   | { kind: "spawn_verify"; parent: string; pr: string | null }
   | { kind: "reuse_verify"; parent: string; verify: string }
