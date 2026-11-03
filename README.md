@@ -717,11 +717,15 @@ and the skip was SILENT — no ledger event, no bounce, no ask, the lane reading
 fake-busy `working on <head> — checking review, signatures and CI before merging`
 every tick. Two laws now hold:
 
-- **Scoped base classification (the gate)**: the base verdict classifies ONLY the
+- **Scoped base classification + empty-is-loud (the gate, BR#5265 + BR#5674 P1)**: the base verdict classifies ONLY the
   lane's `required_workflows` when the lane configures them (`classifyBaseCheckRuns`,
   `train_gate.rs` — newest non-cancelled run per name, red beats unsettled beats
   green; an un-configured lane keeps the legacy whole-tip read). A nightly, battery
-  or canary red stops its own pipeline and its own cards — never the train.
+  or canary red stops its own pipeline and its own cards — never the train. When
+  `required_workflows` are configured and the scoped filter yields zero matches on a
+  tip that HAS runs, `base_state` carries `alarm: "<N> runs read, none matched required set — check names/pagination"`;
+  a tip with zero total runs carries the sibling `alarm: "tip carries no check runs at all"`,
+  and the hub's `empty` blocked reason renders the alarm verbatim instead of a silent `config?`.
 - **Loud BLOCKED (the lane)**: every walk stamps its base verdict into the lane
   (`train.queue_facts` carries `base_state: {verdict, scoped_to_required, red[],
   unsettled[]}`, served whole by `train.status`), and a non-green base holding
@@ -1076,16 +1080,16 @@ included) as "unmergeable — CONFLICTING".
   releases the lease, and an **empty queue always renews** (idle holding is harmless).
   Legacy executors that send `{}` renewals carry no proof — treated as UNKNOWN
   (allowed + a loud audit line) while the deprecation window runs.
-- **Starvation alarm (BR#4489)**: a lane whose queue is non-empty with **no
-  merge-capable lease for >10 minutes** cannot advance — the executor outage class
-  where gateways tick (bounces flow) but merges stand down. The hub stamps the episode
-  (`meta.lane.starved_since`), broadcasts `lane.starved` on the WS push channel, marks
+- **Starvation alarm + diagnostic duty (BR#4489 + BR#5674 P4)**: two starvation legs share one loop (`laneStarvationTick` / `sweepLaneStarvation`).
+  (1) **Merge starvation (BR#5674 P4)**: when a lane holds cars (non-empty derived `queue` OR non-empty `awaiting` set) with `now - last_merge_ts > 1h` and no stop-the-line episode is active, the hub stamps `meta.lane.starvation = {since, fired_at, ask_id, duty_id}`, broadcasts `lane.starved`, fires **one time-sensitive human ask per episode** (`MERGE TRAIN STARVED: <repo>@<base> — >1h with zero merges while holding cars. Diagnose or bypass?`) carrying full diagnosis details (base verdict + names + P1 alarm, blocked reason, queue + awaiting counts, last merge timestamp), and **auto-spawns one agent-executable diagnostic duty per episode** (task card, tags `merge-train` + `diagnostic`, ranked at top priority in `orient` alongside `root_fix` cards, with a checklist covering `per_page`/naming of `required_workflows`, base check-runs count, verify pool depth, and park exits); cleared automatically on any merge.
+  (2) **Capability starvation (BR#4489)**: a lane whose queue is non-empty with **no
+  merge-capable lease for >10 minutes** stamps `meta.lane.starved_since`, broadcasts `lane.starved` on the WS push channel, marks
   the lane `starved: {since, mins}` in `train_status` (the trains panel renders it red),
   and files **one time-sensitive ask per episode** to the alarm sink — restart a
   capable gateway, merge the head by hand, or waive. Judged both on `train.status`
   reads and proactively on the hub's alarm sweep, so a dead train is loud even with
   zero panel readers. Recovery is automatic: the first capable lease (or the queue
-  draining) clears the starved state.
+  draining) clears the capability-starved state.
 - **Lane lifecycle: a retired lane is never ticked again (BR#4977)**: a lane card
   that is closed (`done`/`superseded`) — a base branch deleted after a drill, or a
   lane deliberately retired — is frozen. Every lane-touching hub op refuses it
