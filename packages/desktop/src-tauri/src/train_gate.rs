@@ -537,12 +537,6 @@ pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize)
 /// pass — the one-click human merge ask is the fast lane (BR#5189 §5, SP #2617
 /// precedent). MUST stay byte-identical to core.ts DEPLOY_HEALTH_PATTERN.
 pub const DEPLOY_HEALTH_PATTERN: &str = "deploy health";
-pub const MAIN_GREEN_GATE_PATTERN: &str = "main-green gate";
-
-pub fn is_base_health_gate_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains(DEPLOY_HEALTH_PATTERN) || lower.contains(MAIN_GREEN_GATE_PATTERN)
-}
 
 /// The destination-green gate check (BR#3008/BR#3009) — matched as a
 /// lowercase substring against the check NAME ("main-green gate" matches).
@@ -555,6 +549,11 @@ pub fn is_base_health_gate_name(name: &str) -> bool {
 /// nothing re-opened the terminal verdict). MUST stay byte-identical to
 /// core.ts MAIN_GREEN_GATE_PATTERN.
 pub const MAIN_GREEN_GATE_PATTERN: &str = "main-green gate";
+
+pub fn is_base_health_gate_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains(DEPLOY_HEALTH_PATTERN) || lower.contains(MAIN_GREEN_GATE_PATTERN)
+}
 
 /// The deterministic one-click human merge ask title for the circular
 /// deploy-health class. BYTE-IDENTICAL to core.ts rootFixFastLaneTitle: the

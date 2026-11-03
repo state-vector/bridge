@@ -2133,6 +2133,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     leg_number: Some(leg_number),
                     root_fix,
                     base_red_names: &[],
+                    // simulated green base ⇒ the qualifier-free green tip the
+                    // BR#5883 field encodes (RerunGate ≠ Merge, so the
+                    // ready_on_own_head predicate reads identically either way)
+                    base_gate_green: true,
                 }),
                 MergeAction::Merge { .. }
             )

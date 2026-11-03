@@ -1914,12 +1914,6 @@ export const MAIN_RED_TAG = "main-red";
  *  can pass — the one-click human merge ask is the fast lane (BR#5189 §5,
  *  SP #2617 precedent). MUST stay byte-identical to train_gate.rs. */
 export const DEPLOY_HEALTH_PATTERN = "deploy health";
-export const MAIN_GREEN_GATE_PATTERN = "main-green gate";
-
-export function isBaseHealthGateName(name: string): boolean {
-  const lower = String(name ?? "").toLowerCase();
-  return lower.includes(DEPLOY_HEALTH_PATTERN) || lower.includes(MAIN_GREEN_GATE_PATTERN);
-}
 
 /** BR#5883: the destination-green gate check (BR#3008/BR#3009) — matched as a
  *  lowercase substring against the check NAME ("main-green gate" matches). A
@@ -1928,6 +1922,11 @@ export function isBaseHealthGateName(name: string): boolean {
  *  conviction is stale by construction and the self-heal re-runs it. MUST
  *  stay byte-identical to train_gate.rs MAIN_GREEN_GATE_PATTERN. */
 export const MAIN_GREEN_GATE_PATTERN = "main-green gate";
+
+export function isBaseHealthGateName(name: string): boolean {
+  const lower = String(name ?? "").toLowerCase();
+  return lower.includes(DEPLOY_HEALTH_PATTERN) || lower.includes(MAIN_GREEN_GATE_PATTERN);
+}
 
 /** The failing-main binding a root-fix card must carry: the repo + the exact
  *  failing main-HEAD run sha it cures. */
