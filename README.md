@@ -1247,6 +1247,20 @@ machine-clean carry chain:
   only be superseded by the next bounce, with the re-park after it flood-guarded on
   the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
   BR#4135).
+- **Direct parent train parks queue for real (BR#5751)**: the train's own bounce
+  and coverage paths run `trainQueueOnAccept`, but a plain `blocked` transition
+  whose note opens with the canonical `merge-train: queued` reason used to bypass
+  the hook entirely — the card sat dual-state (a derived queue slot plus a leftover
+  `merge_train.awaiting` chip) with a stale `head_sha_at_acceptance` (live on
+  BR#4711/4678/3623/3999/4995/4999). The blocked branch now runs the hook itself
+  when its note opens with that reason (the `merge_train` body flag guards
+  recursion; `alreadyQueued` makes it a meta-only refresh), and the converse
+  demotion holds: a blocked park whose note is neither a `merge-train:` note nor an
+  `Awaiting review (verdict …)` reason clears any leftover `merge_train.awaiting`
+  and demotes its `awaiting` state to `bounced` — a card that has stopped waiting
+  on a human leg shows exactly that. The Awaiting-park census and the `pr_stats`
+  buckets are base-scoped (`lane.base`), so a second lane on the same repo never
+  inherits another base's parks.
 - **Bounced cards cannot starve (BR#4068)** — a bounced card is the most valuable work
   on the board: verified once, one leg from landed. So the bounce itself **auto-boosts
   the card to priority 0** — the same `boosted` stamp the human ▲ boost writes, read by

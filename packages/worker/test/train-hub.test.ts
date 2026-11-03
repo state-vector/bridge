@@ -686,11 +686,17 @@ describe("merge train DO drill (real bundled worker)", () => {
     let c = (await kbJson("/get", { id: implId })).body;
     expect(c.status).toBe("blocked");
     expect(c.meta?.pr?.head_sha_at_acceptance).toBe(H2);
-    // the re-queue note is honest: this cycle moved a stamp, so it says so
+    // the re-queue note is honest: this cycle moved a stamp, so it says so.
+    // BR#5751: the DIRECT PARK is itself a queue event now — its note carried
+    // the live head, so the park moved the stamp and claims the refresh; the
+    // duty close re-queues idempotently on the already-covered head and must
+    // NOT claim a refresh.
     const hist = await kbJson(`/history?id=${encodeURIComponent(implId)}&limit=20`);
     const queuedNotes = (hist.body.versions as any[]).filter((v) => v.action === "train_queued").map((v) => String(v.summary));
-    expect(queuedNotes.length).toBe(2);
-    expect(queuedNotes[0]).toContain("(re-queued, stamp refreshed)");
+    expect(queuedNotes.length).toBe(3);
+    expect(queuedNotes[1]).toContain("(re-queued, stamp refreshed)");
+    expect(queuedNotes[0]).toContain("(re-queued)");
+    expect(queuedNotes[0]).not.toContain("stamp refreshed");
     // and a no-op re-accept at the SAME head must not claim a refresh
     await kbJson("/transition", { id: implId, to: "in_progress", actor: "drill", session: "", note: "gate bounce — nothing to fix" });
     await kbJson("/transition", { id: implId, to: "in_review", actor: "drill", session: "", note: `re-entered review — PR https://github.com/${repo}/pull/3200` });
