@@ -976,3 +976,149 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
     expect(JSON.stringify(after.body)).toContain(ask.body.id);
   });
 });
+
+describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clobber class)", () => {
+  const laneConfig = {
+    lane: {
+      repo: "state-vector/bridge", base: "main",
+      required_workflows: ["Test", "CLI build (packages/cli)"],
+      ci_typical_minutes: 10, key: "state-vector/bridge@main", starved_since: null,
+    },
+    lease: { holder: "gw-1", heartbeat_ts: 1, expires_ts: 2 },
+    currently: { pr: 371, phase: "awaiting-ci" },
+    stop: null,
+    session: "lane-tick-session",
+  };
+  const seedLaneCard = async (title: string) => {
+    const { body: t } = await kbJson("/create", { type: "task", title });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    await kbJson("/update", { id: t.id, meta: laneConfig, actor: "gw-1" });
+    return t.id;
+  };
+
+  it("THE regression: a single-key meta edit on a lane card preserves lane/lease/stop/currently (BR#5733 — the edit that clobbered tb-pulse/BR@main)", async () => {
+    const id = await seedLaneCard("BR#5807 lane-clobber regression lane");
+    // the exact near-miss shape: the executor passes ONLY {blocked, await_event}
+    const r = await kbJson("/update", {
+      id, actor: "bridge-task-BR-5733",
+      meta: { blocked: { reason: "merge-train: awaiting an available gateway", ts: 3 }, await_event: { event: "time", until_ts: 4 } },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body.error).toBeUndefined();
+    const after = await kbJson("/get", { id });
+    const m = after.body.meta;
+    // lane config intact — every infrastructure key the old replace semantics amputated
+    expect(m.lane).toEqual(laneConfig.lane);
+    expect(m.lane.key).toBe("state-vector/bridge@main");
+    expect(m.lane.required_workflows).toEqual(laneConfig.lane.required_workflows);
+    expect(m.lease).toEqual(laneConfig.lease);
+    expect(m.currently).toEqual(laneConfig.currently);
+    expect(m.stop).toBeNull();
+    expect(m.session).toBe("lane-tick-session");
+    // and the key the caller DID pass landed
+    expect(m.blocked.reason).toBe("merge-train: awaiting an available gateway");
+    expect(m.await_event).toEqual({ event: "time", until_ts: 4 });
+  });
+
+  it("a present top-level key replaces WHOLESALE — nested objects are never Frankenstein-merged", async () => {
+    const id = await seedLaneCard("BR#5807 wholesale-replace regression lane");
+    const newLane = { repo: "state-vector/bridge", base: "main", key: "state-vector/bridge@main", ci_typical_minutes: 12 };
+    const r = await kbJson("/update", { id, actor: "gw-1", meta: { lane: newLane } });
+    expect(r.status).toBe(200);
+    const m = (await kbJson("/get", { id })).body.meta;
+    // the new object is the whole lane value — the old nested keys (required_workflows,
+    // starved_since) do NOT survive as stale residue beside the partial replacement
+    expect(m.lane).toEqual(newLane);
+    expect(m.lane.required_workflows).toBeUndefined();
+    expect(m.lane.ci_typical_minutes).toBe(12);
+    // untouched sibling keys still preserved
+    expect(m.lease).toEqual(laneConfig.lease);
+  });
+
+  it("a null VALUE stores as null — only meta_delete removes keys", async () => {
+    const id = await seedLaneCard("BR#5807 null-value regression lane");
+    const r = await kbJson("/update", { id, actor: "gw-1", meta: { stop: null, lease: null } });
+    expect(r.status).toBe(200);
+    const m = (await kbJson("/get", { id })).body.meta;
+    expect("stop" in m).toBe(true);
+    expect(m.stop).toBeNull();
+    expect("lease" in m).toBe(true);
+    expect(m.lease).toBeNull();
+    expect(m.lane).toEqual(laneConfig.lane);
+  });
+
+  it("meta_delete removes a non-infrastructure key explicitly", async () => {
+    const id = await seedLaneCard("BR#5807 meta-delete regression lane");
+    const r = await kbJson("/update", { id, actor: "some-agent", meta_delete: ["session"] });
+    expect(r.status).toBe(200);
+    const m = (await kbJson("/get", { id })).body.meta;
+    expect("session" in m).toBe(false);
+    expect(m.lane).toEqual(laneConfig.lane);
+  });
+
+  it("meta_delete on lane-config keys is refused for agent sessions, allowed for machinery (BR#5807 fail-closed guard)", async () => {
+    const id = await seedLaneCard("BR#5807 lane-guard regression lane");
+    const refused = await kbJson("/update", { id, actor: "rogue-session", meta_delete: ["lane", "lease"] });
+    expect(refused.status).toBe(400);
+    expect(String(refused.body.error)).toContain("BR#5807");
+    expect(String(refused.body.error)).toContain("lane, lease");
+    // the card is untouched by the refused edit
+    const m1 = (await kbJson("/get", { id })).body.meta;
+    expect(m1.lane).toEqual(laneConfig.lane);
+    expect(m1.lease).toEqual(laneConfig.lease);
+    // machinery authority passes (the close-protection OWNER_RELEASE_EXEMPT class)
+    const allowed = await kbJson("/update", { id, actor: "system:watchdog", meta_delete: ["lease", "currently"] });
+    expect(allowed.status).toBe(200);
+    const m2 = (await kbJson("/get", { id })).body.meta;
+    expect("lease" in m2).toBe(false);
+    expect("currently" in m2).toBe(false);
+    expect(m2.lane).toEqual(laneConfig.lane);
+  });
+
+  it("meta_delete of a parked card's blocked (carrying a typed await) is refused for agent sessions — the watchdog-leg-drop class", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#5807 await-guard regression" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    await kbJson("/transition", {
+      id: t.id, to: "blocked", actor: "some-agent",
+      note: "merge-train: awaiting gateway",
+      await_event: { event: "time", until_ts: Date.now() + 60_000 },
+    });
+    const refused = await kbJson("/update", { id: t.id, actor: "rogue-session", meta_delete: ["blocked"] });
+    expect(refused.status).toBe(400);
+    expect(String(refused.body.error)).toContain("BR#5807");
+    // parked reason + typed await intact
+    const m = (await kbJson("/get", { id: t.id })).body.meta;
+    expect(m.blocked.await_event).toBeTruthy();
+  });
+
+  it("an update on an abandoned-blocked card re-claims AND does not resurrect the cleared parked reason (stale-snapshot guard)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#5807 reclaim regression" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    await kbJson("/transition", {
+      id: t.id, to: "blocked", actor: "system:watchdog",
+      note: "abandoned — silence >10m; released to the pool by watchdog",
+      await_event: { event: "time", until_ts: Date.now() + 60_000 },
+    });
+    const r = await kbJson("/update", { id: t.id, actor: "resuming-agent", meta: { fresh: "edit" } });
+    expect(r.status).toBe(200);
+    const after = await kbJson("/get", { id: t.id });
+    // the update heartbeat re-claimed the abandoned card...
+    expect(after.body.status).toBe("in_progress");
+    const m = after.body.meta;
+    // ...the dead-end blocked record did not resurrect (the transition cleared it
+    // post-snapshot; the merge base is the POST-transition row)...
+    expect(m.blocked).toBeUndefined();
+    // ...and the new payload key survived the merge.
+    expect(m.fresh).toBe("edit");
+  });
+
+  it("the history line names meta set/deleted keys — a meta shrink is never silent (BR#5807 audit leg)", async () => {
+    const id = await seedLaneCard("BR#5807 audit-line regression lane");
+    await kbJson("/update", { id, actor: "auditor-agent", meta: { blocked: { reason: "x" } }, meta_delete: ["session"] });
+    const h = await kbJson("/get_history", { id });
+    const line = (h.body.versions ?? []).find((v: any) => v.action === "update" && /meta/.test(v.summary ?? ""));
+    expect(line).toBeTruthy();
+    expect(line.summary).toContain("set: blocked");
+    expect(line.summary).toContain("deleted: session");
+  });
+});

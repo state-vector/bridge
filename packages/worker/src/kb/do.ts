@@ -178,6 +178,7 @@ import {
   churnRelease,
   blockedParkVerdict,
   UNBLOCK_SPAWN_CAP,
+  OWNER_RELEASE_EXEMPT,
   RuleCtx,
 } from "./machine.ts";
 import {
@@ -4016,8 +4017,42 @@ export class KnowledgeHub {
     }
     const title = body.title !== undefined ? String(body.title) : row.title;
     const bodyMd = body.body_md !== undefined ? String(body.body_md) : row.body_md;
-    // row.meta predates the re-claim transition — strip the stale blocked record so we don't resurrect it
-    const metaObj = body.meta !== undefined ? JSON.parse(JSON.stringify(body.meta)) : JSON.parse(row.meta ?? "{}");
+    // BR#5807: meta is INFRASTRUCTURE — lane cards carry lane/lease/currently/stop,
+    // parked cards carry blocked.await_event, the hub stamps last_progress/attempt.
+    // This path used to REPLACE the whole object, so a single-key edit ("just touch
+    // blocked") silently amputated every key the caller omitted — the BR#5733
+    // near-miss dropped a lane card's entire config mid-session; a session death
+    // between the edit and the restore would have left a ghost lane with no lane
+    // identity. Per-key merge is the honest reading of "edit meta": each top-level
+    // key present in the payload replaces WHOLESALE (nested objects are never
+    // Frankenstein-merged — a partial lane object would be worse than a dropped
+    // one); keys you omit are preserved. Deliberate key removal is explicit:
+    // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
+    // delete (lane stop/currently rest at null).
+    const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    // the re-claim transition above rewrote meta in DB (cleared the dead-end
+    // blocked record) — merge against the POST-transition row, never the stale
+    // pre-claim snapshot, or the parked reason resurrects
+    const postRow = reclaimed ? this.one(`SELECT meta FROM artefacts WHERE id = ?`, id) : null;
+    const metaObj: any = { ...(postRow ? JSON.parse(postRow.meta ?? "{}") : preMeta) };
+    if (body.meta !== undefined) Object.assign(metaObj, JSON.parse(JSON.stringify(body.meta)));
+    // BR#5807 fail-closed guard: meta_delete is the only remaining way to drop
+    // keys, so it carries the authority check the close-protection law uses
+    // (machine.ts) — lane-config keys on a lane card, and a typed await on a
+    // parked card, are machinery/human-owned state; an agent session deleting
+    // them is the watchdog-leg-drop / lease-desync class this card exists for.
+    const infraDel = metaDel.filter((k) =>
+      (metaObj.lane && ["lane", "lease", "currently", "stop"].includes(k)) ||
+      (row.status === "blocked" && metaObj.blocked?.await_event && k === "blocked"),
+    );
+    if (infraDel.length && !OWNER_RELEASE_EXEMPT.test(actor)) {
+      throw new Error(
+        `BR#5807 lane/park meta-integrity guard: meta_delete would drop infrastructure key(s) ${infraDel.join(", ")}` +
+        ` — lane config and typed awaits are machinery/human-owned state. Route the change through an answered ask` +
+        ` or the web (system:/web:/human: actors pass).`,
+      );
+    }
+    for (const k of metaDel) delete metaObj[k];
     if (reclaimed) delete metaObj.blocked;
     const meta = JSON.stringify(metaObj);
     if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
@@ -4036,13 +4071,23 @@ export class KnowledgeHub {
       `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
       title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
     );
-    this.audit(actor, "update", id, {});
+    // BR#5807: meta key changes ride the audit trail — a meta SHRINK (deleted
+    // keys) is exactly the silent-amputation class, so the history line names
+    // what was set and what was removed instead of a bare "updated meta".
+    const metaSet = body.meta !== undefined ? Object.keys(JSON.parse(JSON.stringify(body.meta))) : [];
+    this.audit(actor, "update", id, {
+      ...(metaSet.length ? { meta_set: metaSet } : {}),
+      ...(metaDel.length ? { meta_deleted: metaDel } : {}),
+    });
     const changed = [
       body.title !== undefined && "title", body.body_md !== undefined && "body",
       body.meta !== undefined && "meta", body.tags !== undefined && "tags",
       body.roles !== undefined && "roles",
     ].filter(Boolean);
-    this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}`, { title, body_md: bodyMd });
+    const metaDetail = body.meta !== undefined || metaDel.length
+      ? ` (meta set: ${metaSet.join(", ") || "—"}; deleted: ${metaDel.join(", ") || "—"})`
+      : "";
+    this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}${metaDetail}`, { title, body_md: bodyMd });
     await this.embedArtefact(id, title, bodyMd);
     return { id };
   }

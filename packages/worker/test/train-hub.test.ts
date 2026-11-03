@@ -2422,7 +2422,9 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // (2) warrant LAPSE: the cure PR unbinds (closed unmerged, nothing
     // re-bound) — the open ask no longer names a human act; the next red
     // tick closes it done, honestly, and it re-files if a cure re-binds
-    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } } });
+    // (BR#5807: update meta merges per key now — the unbind is an explicit
+    // meta_delete, not an omitted-key replace)
+    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } }, meta_delete: ["prs"] });
     expect((await stampRed()).body.error ?? "").toBe("");
     const closedAsk = (await askHits()).find((x: any) => x.id === ask2.id);
     expect(closedAsk?.status).toBe("done");
