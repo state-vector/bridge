@@ -1865,19 +1865,28 @@ export function rootFixCardBody(repo: string, sha: string, failing: { name: stri
  *  tier 2 "critical" — cards explicitly marked critical (meta.priority ===
  *      "critical"), the manual rung;
  *  tier 3 "normal" — everything else.
- *  FIFO within tier by blocked-since (status_ts ascending). opts.baseRed
- *  (a STOPPED lane — the lane card's stop facts are the hub-visible proxy
- *  for base red) offers ONLY tier 0: every other head stays parked on the
- *  base-red law (BR#4365 precedent) until the fix merges or the line goes
- *  green. */
-export function mergeTrainQueue(cards: TrainCandidate[], opts?: { baseRed?: boolean }): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
+ *  FIFO within tier by blocked-since (status_ts ascending). NO stop/base-red
+ *  filter (BR#5753): the hub's derived queue keeps EVERY held car visible —
+ *  root_fix still sorts to rank 0 unconditionally — because the stop-arm
+ *  consumers (base_red_resolution.held, the alarm ask's cure-PR fallback,
+ *  trainOpenRootFix) read this list and would go blind mid-episode if
+ *  non-root_fix cars were filtered out. The stopped-lane fast lane (only the
+ *  bound root-fix card merges; BR#5190) is the WALK's law — train.rs
+ *  is_root_fix_card + the merge gate — enforced where merges happen, not a
+ *  hub-side queue filter. (The pre-5753 opts.baseRed option was dead in
+ *  production: its one caller looked the stop facts up with
+ *  `WHERE id = laneKey(repo, base)`, and a lane key is never an
+ *  artefacts.id, so the filter never fired once.) */
+export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
   const queued = cards.filter((c) =>
-    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX)),
+    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX))
+    // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
+    // the silence-release parked unprefixed must not stay invisible to the
+    // train (the BR#4995 silent drop)
+    || isWatchdogTrainHoldPark(c.meta),
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
-  const baseRed = opts?.baseRed === true;
   return [...queued]
-    .filter((c) => !baseRed || rank(c) === 0)
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
     .map((c) => {
       const r = rank(c);
@@ -1984,6 +1993,43 @@ export function releaseHold(meta: any): string | null {
   if (m.awaiting_ask)
     return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
   return null;
+}
+
+/** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE
+ *  mergeTrainQueue. The queue derives candidates from the `merge-train:`
+ *  reason prefix alone, so a watchdog hold-park whose note lacks the prefix
+ *  silently drops a live queued/awaiting-ci car out of the train queue
+ *  forever — the BR#4995 class, root-caused from the BR#5674 Mission 2
+ *  audit. The two live-slot states ride the state-named prefix; every other
+ *  hold (bounced/awaiting/typed waits) is NOT a queue slot and must stay
+ *  unprefixed — those legs re-enter through the board, never the queue. */
+export function mergeTrainHoldPrefix(meta: any): string | null {
+  const mt = ((meta ?? {}).merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued") return `${MERGE_TRAIN_REASON_PREFIX} queued — `;
+  if (st === "awaiting-ci") return `${MERGE_TRAIN_REASON_PREFIX} awaiting-ci — `;
+  return null;
+}
+
+/** The park-note fingerprints a watchdog releaseHold hold-park writes (the
+ *  holdParkBody silence note and the lapsed-subprocess hold note, BR#4067). */
+export const WATCHDOG_HOLD_PARK_REASON_RE =
+  /silence-release held \(watchdog\)|release held \(BR#4067\)/i;
+
+/** BR#5750 — a blocked card that a watchdog releaseHold hold-park created
+ *  BEFORE the merge-train prefix existed (the already-dropped BR#4995 cars
+ *  still sitting unprefixed on the board). Read from the park's own facts:
+ *  the reason matches the hold-park fingerprint AND the card still carries a
+ *  live `queued` slot. `queued` only — awaiting-ci parks advance via train
+ *  events (train:merged → awaiting-ci), not queue admission, and
+ *  bounced/awaiting re-enter through the board, never the queue. */
+export function isWatchdogTrainHoldPark(meta: any): boolean {
+  const m = meta ?? {};
+  const mt = ((m.merge_train ?? {}) as Record<string, unknown>);
+  if (String(mt.state ?? "") !== "queued") return false;
+  return [m.blocked?.reason, m.blocked_reason].some(
+    (r: unknown) => typeof r === "string" && WATCHDOG_HOLD_PARK_REASON_RE.test(r),
+  );
 }
 
 // ---- carry-record law (BR#3516 §5) ----

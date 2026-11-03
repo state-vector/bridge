@@ -643,11 +643,16 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     // the demote to a claimable todo destroys no queue slot; the train meta
     // rides along and the fresh accept re-queues. Keyed on the explicit body
     // flag the sweep sets + in_progress (a live re-entry, never a park) +
-    // state bounced — queued/awaiting-ci/awaiting stay protected even with a
-    // forged
+    // state bounced — queued/awaiting-ci stay protected even with a forged
     // flag, and so does a bounced card parked BLOCKED.
+    // BR#5750 — the carve-out widens to awaiting + stopped: an in_progress
+    // card is NEVER a live awaiting park (the human-leg park lives on
+    // blocked) nor a live stop-park; only the blocked parks stay protected,
+    // flag or no flag.
     const demoteReentry =
-      st === "bounced" && i.status === "in_progress" && i.body?.demote_bounced_reentry === true;
+      (st === "bounced" || st === "awaiting" || st === "stopped") &&
+      i.status === "in_progress" &&
+      i.body?.demote_bounced_reentry === true;
     if ((st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") && pr && !demoteReentry) {
       const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
       return {

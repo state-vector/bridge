@@ -87,6 +87,7 @@ import {
   midWalkReceiptDecide,
   type LeaseLossTransition,
   mergeTrainQueue,
+  mergeTrainHoldPrefix,
   // BR#5190 root-fix fast lane: the board half of the main-breakage law
   ROOT_FIX_TAG,
   MAIN_RED_TAG,
@@ -706,7 +707,10 @@ export class KnowledgeHub {
       if (hold) {
         meta.blocked = {
           ...(meta.blocked ?? {}),
-          reason: `declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed, but the card carries ${hold} — release held (BR#4067)`,
+          // BR#5750 — same merge-train prefix law as holdParkBody: an
+          // unprefixed lapsed-subprocess hold drops the queued car from
+          // mergeTrainQueue (the BR#4995 silent drop)
+          reason: `${mergeTrainHoldPrefix(meta) ?? ""}declared subprocess window (${b.budget_minutes ?? "?"}m) lapsed, but the card carries ${hold} — release held (BR#4067)`,
         };
         this.state.storage.sql.exec(
           `UPDATE artefacts SET meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -1191,13 +1195,26 @@ export class KnowledgeHub {
         // queued/awaiting-ci flavors KEEP the hold — those are live queue
         // slots (the PR #257 class this park exists to protect). The machine
         // backstop admits exactly this shape (demote_bounced_reentry).
+        // BR#5750 — the demote widens to awaiting + stopped: an in_progress
+        // card is never a live awaiting park (the Awaiting human-leg park
+        // lives on blocked, and a verifier bounce that re-opens impl ENDS it
+        // — doTransition flips awaiting → bounced) nor a live stop-park. A
+        // stalled re-entry carrying those states is the same
+        // silent-unclaimable shape; hold-parking it back to blocked is the
+        // BR#3853/3937/5139 re-park loop.
         const mtState = String(((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "");
-        if (mtState === "bounced") {
+        if (mtState === "bounced" || mtState === "awaiting" || mtState === "stopped") {
+          const reentryBrief =
+            mtState === "bounced"
+              ? "the train bounce re-opened this card in_progress with no live executor and its demanded leg had no machine starter"
+              : mtState === "awaiting"
+                ? "a verifier bounce superseded the Awaiting human-leg park — the re-opened in_progress card is not a live awaiting park and its demanded leg has no machine starter"
+                : "a stop-park rode an in_progress re-entry with no live executor — the stop owns the lane, not this card's next leg";
           await this.transition(
             {
               id: r.id,
               to: "todo",
-              note: `bounce re-entry demoted (watchdog, BR#4494): the train bounce re-opened this card in_progress with no live executor and its demanded leg had no machine starter — released claimable with the bounce brief intact; a fresh verify accept re-queues the train`,
+              note: `bounce re-entry demoted (watchdog, BR#4494/BR#5750): ${reentryBrief} — released claimable with the bounce brief intact; a fresh verify accept re-queues the train`,
               demote_bounced_reentry: true,
               result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
             },
@@ -4624,6 +4641,22 @@ export class KnowledgeHub {
       delete meta.subprocess; // a real block supersedes a declared subprocess window
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
+      // BR#5750 — leaving the Awaiting park ENDS the park. A verifier bounce
+      // (blocked → in_progress) of an awaiting card used to leave
+      // merge_train.state = "awaiting" live on an in_progress card; the
+      // stall sweep then hold-parked it straight back into blocked — the
+      // BR#3853/3937/5139 re-park loop. The bounce supersedes the human-leg
+      // park: flip to bounced (the leg is back on the board — a fresh verify
+      // accept re-queues) and drop the awaiting stamp.
+      if (
+        row.type === "task" && row.status === "blocked" && verdict.status === "in_progress" &&
+        String((((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "")) === "awaiting"
+      ) {
+        meta.merge_train = { ...(meta.merge_train ?? {}), state: "bounced" };
+        delete meta.merge_train.awaiting;
+        this.audit(actor, "train:awaiting_unparked", id, { from: "awaiting", to: "bounced", via: "blocked→in_progress" });
+        this.version(id, actor, "update", "awaiting park ended — the bounce re-opens impl; merge_train.state awaiting → bounced (BR#5750)", {});
+      }
     }
     // BR#3911: a question leaving todo (answered done, ADR supersede) cancels
     // any live human-claim hold — the hold was waiting for exactly this.
@@ -6953,7 +6986,10 @@ export class KnowledgeHub {
     return {
       id,
       to: "blocked",
-      note: `silence-release held (watchdog): ${staleDesc}, but the card carries ${hold} — parked on the typed proxy, not released (BR#4067)`,
+      // BR#5750 — a queued/awaiting-ci hold-park MUST keep the merge-train
+      // reason prefix: mergeTrainQueue admits cars by that prefix alone, and
+      // an unprefixed park silently drops the live queue slot (BR#4995).
+      note: `${mergeTrainHoldPrefix(meta) ?? ""}silence-release held (watchdog): ${staleDesc}, but the card carries ${hold} — parked on the typed proxy, not released (BR#4067)`,
       unblock_condition: aw ? describeAwaitEvent(aw) : hold,
       ...(aw ? { await_event: aw } : { merge_train: true }),
       result_class: PROXY_WAIT_HOLD_RESULT_CLASS,
@@ -10059,21 +10095,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  queue is scoped to the lane's BASE — a card matches only when one of
    *  its unlanded legs targets this repo AND this base (a leg without a
    *  base stamp defaults to "main"), so a lane never inherits another
-   *  base's queue on the same repo. */
+   *  base's queue on the same repo.
+   *  BR#5753: NO stop/base-red filter here. The old lookup ran
+   *  `SELECT meta FROM artefacts WHERE id = laneKey(repo, base)` — dead by
+   *  construction, since a lane key ("owner/repo@base") is never an
+   *  artefacts.id (the live card resolves via laneRow() on
+   *  json_extract(meta, '$.lane.key')) — so the baseRed tier filter never
+   *  fired once, and it must STAY gone: the stop-arm consumers all read
+   *  this list (train.status counts `held: queue.length` in
+   *  base_red_resolution, the alarm ask's cure-PR fallback and
+   *  trainOpenRootFix discover queued fixes here) and filtering
+   *  non-root_fix cars out during a stop would hide held cars from every
+   *  one of them. root_fix sorts to rank 0 unconditionally; the stopped
+   *  lane's fast lane (BR#5190) is enforced walk-side at the merge gate. */
   private laneQueue(repo: string, base: string) {
     const cards = this.state.storage.sql.exec(
       `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
-    // BR#5190: a STOPPED lane offers ONLY tier 0 — the lane card's stop facts
-    // are the hub-visible proxy for base red (the hub holds no VCS
-    // credentials), and every other head stays parked on the base-red law
-    // (BR#4365 precedent) until the bound fix merges or the line goes green.
-    const laneRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneKey(repo, base)) as any;
-    const baseRed = !!JSON.parse(String(laneRow?.meta ?? "{}") || "{}")?.stop?.sha;
     return mergeTrainQueue(
       cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}"), tags: parseTags(c.tags) })),
-      { baseRed },
     ).filter((c) => {
       const cm = cards.find((x) => x.id === c.id);
       // a card rides exactly the lanes that own one of its UNLANDED legs
