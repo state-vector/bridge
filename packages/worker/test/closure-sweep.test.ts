@@ -562,18 +562,24 @@ describe("askInbox addressee routing (real DO)", () => {
 
 describe("BR#4062 — ask/time prose parks type at the door and sweep first-class (real DO)", () => {
   it("a timer prose park (the takeover repro) types at the door and the sweep WAITS, honest", async () => {
+    // BR#5623: until_ts must be derived from t0, never a hardcoded wall-clock
+    // instant. The frozen 1793673600000 (= 2026-11-03T02:40Z) made the sweep's
+    // synthetic clock (t0 + 400min) overtake the timer for every run after
+    // 2026-11-02T20:00Z — a calendar time-bomb that turned this test red on
+    // the first CI run to cross it, blocking an unrelated PR.
+    const untilTs = t0 + 800 * 60_000;
     const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 time-prose drill", qualified: true, session: "drill-4062-time" });
     const pid = String(r.body.id);
     await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-time", session: "drill-4062-time" });
     // THE regression: this exact park shape REJECTED from MCP on 2026-10-28
     const blk = await block(pid, "drill-4062-time",
-      "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer → then a FRESH session closes it done.",
+      `Machine proxy (typed await_event time until_ts=${untilTs}): the card re-enters at the timer → then a FRESH session closes it done.`,
       "parked on a typed timer (BR#4062 repro)");
     expect(blk.status, JSON.stringify(blk.body)).toBe(200);
     const parked = await taskById(pid);
     expect(parked.status).toBe("blocked");
     // the typed event self-stamped at the door (not just text)
-    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: 1793673600000 });
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: untilTs });
 
     const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 400 * 60_000 });
     expect(s.body.error).toBeUndefined();
