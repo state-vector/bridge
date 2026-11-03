@@ -921,6 +921,19 @@ bounce (the PR carries no defect), never a human leg (main is green — no
 decision exists). A REAL red beside the gate red is not healed, and a red
 base keeps the circular BR#5189 law untouched.
 
+The re-run targets are the verdict's, not the archive's (BR#5911): the
+dispatch selection re-derives the same latest-wins classification the gate
+decision used (`self_heal_dispatch_targets`) and re-requests, per red check
+name, only the run the verdict itself judged — never a superseded run id.
+The BR#5880 incident spent hours re-requesting Nov-2 red ids on a head whose
+latest gate run was already SUCCESS. And a tick that classifies a healable
+red but dispatches zero re-runs is a contradiction that renders loudly: an
+error-level log names every dispatch failure, and a `self_heal_stalled`
+payload rides the lane's `queue_facts` stamp (freshness-guarded like the
+batch-stall stamp) so the hub shows the stall instead of a healthy-looking
+lane. A worker-identity withhold (BR#3181) stays a deliberate non-event —
+the stall stamp fires only on real dispatch attempts that all failed.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in
@@ -1057,7 +1070,10 @@ permanently unlandable entry must not starve the lane — a leg with **no PR sta
 **bounced off the hub** (the audited impl bounce, gate class: the card leaves the
 derived queue that tick, impl re-stamps the PR binding, re-verifies, re-queues —
 BR#5753; the hub kept matching the stamp-less leg on repo+base, so the old
-log-and-advance left the entry in `lane.queue` forever), while a **CLOSED PR** or an
+log-and-advance left the entry in `lane.queue` forever), while a PR whose
+**live state is not OPEN** — CLOSED, or MERGED with no merge commit to
+reconcile, or an unparseable read (BR#5911; the ghost ready-car BR#5639
+bound a CLOSED PR and reached batch `ready`) — or an
 entry with **no unlanded leg on this lane** ("on this lane" is repo AND base, the
 hub's own queue scoping, BR#4977) is logged and the walk advances to the next entry
 **in the same tick** (the card stays queued for the humans; the lane never starves
@@ -1227,8 +1243,11 @@ included) as "unmergeable — CONFLICTING".
   behind one skipped head); bounces, human legs and superseded closes still
   fire on sight. The per-member merge leg law is unchanged: the pass's
   FIRST landing still gates on the real base verdict (BR#3009), the burst
-  cap and the mid-drain tip RED check re-run before EACH member (GH#2261),
-  the mergeability recompute after a machine update-branch is polled
+  cap, the mid-drain tip RED check (GH#2261) and the member's LIVE PR state
+  re-run before EACH member — a leg whose live state is not OPEN (closed or
+  merged between classification and landing, the BR#5639 ghost class) is
+  never a merge candidate: it is logged and the batch advances to the next
+  member (BR#5911), the mergeability recompute after a machine update-branch is polled
   in-tick (lease-bounded ladder) instead of deferred, and every merged
   event carries `batch_members` — the batch composition in landing order,
   sanitized into the provenance ledger (positive ints, deduped, order
