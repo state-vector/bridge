@@ -199,6 +199,12 @@ export interface KbTrainLane {
    *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
+  /** BR#5911 follow-on: the capability-starvation episode the hub serves in
+   *  the lane payload (do.ts laneStarvationTick) — null when the lane is not
+   *  starved. since = when the starve window opened (epoch ms); mins =
+   *  minutes starved; the fired alarm ask/duty ids ride for panel
+   *  cross-reference. */
+  starved?: { since: number; mins: number; fired_at?: number; ask_id?: string | null; duty_id?: string | null; kind?: "merge_starved" } | null;
   now_action?: { note: string; holder: string; at: number } | null;
   /** 2026-11-02: the answer-derived authorization stamps — a BYPASS answer on
    *  the base-red alarm ask / root-fix fast-lane ask stamps bypass_merge
