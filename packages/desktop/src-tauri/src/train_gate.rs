@@ -2236,6 +2236,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
     }
