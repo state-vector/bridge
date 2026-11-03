@@ -1952,13 +1952,22 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             continue;
         }
         let mut facts = ctx.pr_facts(repo, pr)?;
+        if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
+            // reconcile: merged on GitHub, no train event (crash between merge and
+            // event) — stamp it and continue walking the remaining queue entries.
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
+            ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
+            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
+            continue;
+        }
         // L1.1 (BR#4685): poll, don't bounce. An unanswered mergeStateStatus
         // (null/UNKNOWN — GitHub computing, typical right after a base merge)
         // is backoff-polled inside this tick — bounded by the lease heartbeat
         // (renewed around every wait) — until GitHub answers. The gate below
         // bounces ONLY on definitive DIRTY/CONFLICTING; a merge/closure that
         // lands mid-poll reconciles through the arms below instead of gating.
-        if !mergeability_definitive(&facts) {
+        if vstr(&facts, "state") == Some("OPEN") && !mergeability_definitive(&facts) {
             log(Some(key), &format!("queue[{qi}] PR #{pr} mergeStateStatus not yet computed — backoff-polling before the gate (BR#4685, lease-bounded)"));
             for wait in mergeability_poll_secs() {
                 renew_lease(ctx, repo, base);
@@ -1972,13 +1981,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
         }
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
-            // reconcile: merged on GitHub, no train event (crash between merge and
-            // event) — stamp it and let the CI poll take over next tick.
             renew_lease(ctx, repo, base);
             ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
-            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, awaiting CI"));
-            return Ok(());
+            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
+            continue;
         }
         // BR#5639 ghost car + BR#3935/BR#5897 lineage, fail-closed
         // (BR#5911 F3): a leg whose live PR state is not OPEN can NEVER be
@@ -2520,8 +2527,20 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 match merge_refusal_fallback(zero_behind, clean, &tm_files) {
                     RefusalFallback::UpdateBranch => {
                         ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
-                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, continuing batch"));
+                        if let Ok(updated) = ctx.pr_facts(repo, pr) {
+                            let to_head = vstr(&updated, "headRefOid").unwrap_or("");
+                            if !to_head.is_empty() && !to_head.eq_ignore_ascii_case(head_sha) {
+                                let _ = ctx.mcp("train_carry", json!({
+                                    "repo": repo,
+                                    "base": base,
+                                    "pr": pr,
+                                    "from_head": head_sha,
+                                    "to_head": to_head,
+                                }));
+                            }
+                        }
+                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carried); merging next tick"));
+                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch + train_carry recorded, continuing batch"));
                         continue;
                     }
                     RefusalFallback::ConflictBounce => {

@@ -11062,18 +11062,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         for (const q of queue) {
           seenCards.add(q.id);
           if (q.pr) seenPrs.add(Number(q.pr));
-          // Already merged and currently settling on main — not waiting in the backlog
+          const qCardRow = this.one(`SELECT status_ts, meta FROM artefacts WHERE id = ?`, q.id) as any;
+          const qCardMeta = qCardRow ? JSON.parse(qCardRow.meta ?? "{}") : {};
+          const qLegState = q.pr ? String(qCardMeta?.merge_train?.legs?.[String(q.pr)]?.state ?? "") : "";
+          // Already merged in the current batch and settling on main — not waiting in the backlog
           if (
             (meta.currently?.task_id && q.id === String(meta.currently.task_id)) ||
-            (q.pr && Number(meta.currently?.pr) === Number(q.pr))
+            (q.pr && Number(meta.currently?.pr) === Number(q.pr)) ||
+            String(qCardMeta?.merge_train?.state ?? "") === "awaiting-ci" ||
+            qLegState === "awaiting-ci" ||
+            String(qCardMeta?.blocked?.reason ?? "").startsWith("merge-train: awaiting-ci")
           ) {
             continue;
           }
           const cls = factFor(q.id);
-          const qRow = walkCompletedWithoutBounce && cls === "" && qfAt > 0
-            ? (this.one(`SELECT status_ts FROM artefacts WHERE id = ?`, q.id) as any)
-            : null;
-          const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qRow || Number(qRow.status_ts ?? 0) <= qfAt);
+          const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
           if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {

@@ -31,8 +31,10 @@ export function isArtefactType(t: unknown): t is ArtefactType {
  *  parseTags before handing them here. */
 export function isStandingCard(meta: unknown, tags: unknown): boolean {
   const m = (meta ?? {}) as Record<string, unknown>;
+  if (m.lane) return true;
+  if (m.pr || (Array.isArray(m.prs) && m.prs.length > 0) || m.merge_train) return false;
   const t = Array.isArray(tags) ? tags.map(String) : [];
-  return !!m.lane || t.includes("infrastructure");
+  return t.includes("infrastructure");
 }
 
 /** Task kinds — one task type, distinguished by TYPE + ROLES (phase-3

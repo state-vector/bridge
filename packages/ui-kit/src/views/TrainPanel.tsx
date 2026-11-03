@@ -86,6 +86,13 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   const bs = l.queue_facts?.base_state;
   if (bs && bs.verdict !== "green" && l.queue.length > 0 && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
     const reds = (bs.red ?? []).map((r) => r.name).join(", ");
+    if (bs.verdict === "unsettled") {
+      return {
+        tone: "warn", card: curCard, pr: curPr,
+        label: "⏳ awaiting deploy",
+        title: `Main's checks (${(bs.unsettled ?? []).join(", ") || "CI"}) are finishing — ${l.queue.length} queued PR(s) merge as soon as main is green.`,
+      };
+    }
     return {
       tone: "err", card: curCard, pr: curPr,
       label: `⛔ blocked — base is red${reds ? ` (${reds})` : ""}`,
@@ -102,7 +109,7 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
     const mins = Math.max(1, Math.round((stall.for_ms ?? 0) / 60_000));
     return {
       tone: "warn", card: curCard, pr: curPr,
-      label: `⚠ stalled — 0 landed in ${mins}m`,
+      label: `⚠ stalled (${mins}m)`,
       title: `${(stall.batch ?? []).map((p) => "#" + p).join(", ") || "the batch"} was selected to merge and merges were attempted, but nothing landed for ${stall.ticks} consecutive tick(s)${stall.last_error ? ` — last error: ${stall.last_error}` : ""}. Likely executor breakage, not a PR defect — restart the gateway/executor onto the current build.`,
     };
   }
@@ -113,7 +120,7 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
       card: settling ? undefined : l.currently.task_id,
       pr: settling ? undefined : l.currently.pr,
       label: l.currently.phase === "bursting"
-        ? `merging batch${l.currently.pr ? ` — at PR #${l.currently.pr}` : ""}`
+        ? "merging batch"
         : "awaiting deploy",
       title: settling
         ? `Batch merged (last: PR #${l.currently.pr ?? "?"}); the train is awaiting main's build + deploy to finish green before the next batch. Next: ${l.attempt?.card ?? "—"}.`
@@ -125,23 +132,23 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   if (l.starved && rdyCount === 0) {
     return {
       tone: "warn", card: curCard, pr: curPr,
-      label: `⚠ starved (${age(l.starved.since, now)}) — 0 ready (${verCount} verifying)`,
+      label: `⚠ starved (${age(l.starved.since, now)})`,
       title: `No merges for ${age(l.starved.since, now)} while holding queued PRs — 0 PRs are ready to merge right now (${verCount} verifying).`,
     };
   }
   if (l.attempt) {
     if (l.attempt.hold === "awaiting-review")
-      return { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` };
+      return { tone: "warn", card: l.attempt.card, pr: curPr, label: "waiting on review", title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` };
     if (l.attempt.hold === "held-checks" && rdyCount === 0)
-      return { tone: "warn", card: l.attempt.card, pr: curPr, label: `⚠ held — 0 ready (${l.attempt.card}${curPr ? ` PR #${curPr}` : ""} checks failing)`, title: `${l.attempt.note} — 0 PRs are ready to merge; queued PR has failing head checks or conflicts.` };
+      return { tone: "warn", card: l.attempt.card, pr: curPr, label: "⚠ held on checks", title: `${l.attempt.note} — 0 PRs are ready to merge; queued PR has failing head checks or conflicts.` };
     if (l.attempt.hold === "waiting-checks" && rdyCount === 0)
-      return { tone: "muted", card: l.attempt.card, pr: curPr, label: `idle — 0 ready (${verCount} verifying, waiting on PR checks)`, title: `${l.attempt.note} — line is idle because no PRs are ready to merge yet.` };
-    return { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
+      return { tone: "muted", card: undefined, pr: undefined, label: "verifying", title: `${l.attempt.note} — line is idle because no PRs are ready to merge yet (${verCount} verifying).` };
+    return { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
   }
   if (rdyCount === 0 && verCount > 0) {
     return {
       tone: "muted",
-      label: `idle — 0 ready (${verCount} verifying)`,
+      label: "verifying",
       title: `Line is idle because no PRs are ready to merge yet (${verCount} verifying). Merges start automatically as soon as verification/checks pass.`,
     };
   }
@@ -149,7 +156,7 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
     const t = lockTone(l, now);
     return {
       tone: t === "ok" ? "scope" : t === "warn" || t === "err" ? "warn" : "muted",
-      label: "idle — nothing to merge",
+      label: "idle",
       title: `a machine (${l.lease.holder}) is on this lane — heartbeat ${age(l.lease.heartbeat_ts, now)} ago; it takes work the moment a PR is ready`,
     };
   }
@@ -175,7 +182,7 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
  *  history, not now, and rendering it would be the same lie as before. */
 function nowAction(l: KbTrainLane, now: number): { text: string; title: string } | null {
   const na = l.now_action;
-  if (!na?.note) return null;
+  if (!na?.note || na.note.startsWith("ticking ")) return null;
   const ageSec = (now - na.at) / 1000;
   if (ageSec > 300) return null; // older than the lease TTL — not "now"
   return {
