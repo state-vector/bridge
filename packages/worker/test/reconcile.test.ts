@@ -216,11 +216,13 @@ describe("reconcileJoin — forward", () => {
     expect(r.accounting.accounted).toBe(1);
   });
 
-  // BR#5677 (census BR#5634): branch protection dismisses the bot's approval
-  // on every rebase, so every train-owned PR reads reviewDecision="" — the
-  // binding check must run BEFORE the review gate or the whole bound/duty
-  // accounting is unreachable for exactly the PRs the train owns ("0 bound /
-  // 54 unreviewed" against a 37-car train, reading green vacuously).
+  // BR#5677 (census BR#5634): train-owned PRs read reviewDecision="" (bot
+  // approvals are dismissed on every rebase — and the field has been
+  // observed empty repo-wide even beside a live approval, the BR#5640
+  // trace; the accounting must not depend on the cause) — the binding check
+  // must run BEFORE the review gate or the whole bound/duty accounting is
+  // unreachable for exactly the PRs the train owns ("0 bound / 54
+  // unreviewed" against a 37-car train, reading green vacuously).
   it("BR#5677: a bound train-owned PR with NO review decision accounts bound — the dismissed-bot class", () => {
     const r = join({
       prs: [pr(1, { reviewDecision: null })],

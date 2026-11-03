@@ -11,11 +11,13 @@
  *
  *  BR#5677: BINDING outranks the review gate. A PR whose card exists is
  *  accounted as bound even with NO review decision — train-owned PRs read
- *  reviewDecision="" (branch protection dismisses the bot's approval on
- *  every rebase), and gating the binding lookup on a review decision made
+ *  reviewDecision="" (bot approvals are dismissed on every rebase, and the
+ *  field has been observed empty repo-wide even beside a live approval —
+ *  the BR#5640 trace refinement; whatever the cause, the accounting must
+ *  not depend on it). Gating the binding lookup on a review decision made
  *  the whole accounting read green vacuously ("0 bound / 54 unreviewed")
- *  while the train held 37 cars. `unreviewed` counts only genuinely-unbound
- *  PRs.
+ *  while the train held 37 cars. `unreviewed` counts only
+ *  genuinely-unbound PRs.
  *
  *  Division of labour (accepted BR#3507/BR#3499: the hub holds NO VCS
  *  credentials): a gateway daemon runs the read-only `gh pr list` and feeds
@@ -277,14 +279,16 @@ export function reconcileJoin(args: {
     //    never spawned and the PR is verify-eligible past the grace, spawn
     //    the standard duty on the EXISTING card — never a second card).
     //    BR#5677: the binding check runs BEFORE the reviewDecision gate.
-    //    Every train-owned PR reads reviewDecision="" (branch protection
-    //    dismisses the bot's approval on every rebase), so gating the
-    //    binding lookup on a review decision made the entire bound/duty
-    //    accounting unreachable for exactly the PRs the train owns — 56 of
-    //    them read "unreviewed" while their cards sat in the bindings map
-    //    (the census: "0 bound / 54 unreviewed" against a 37-car train).
-    //    A bound card accounts the PR regardless of reviewDecision; with
-    //    no decision, approved/verifyEligible are false by construction, so
+    //    Train-owned PRs read reviewDecision="" (bot approvals are
+    //    dismissed on every rebase — and the field has been observed empty
+    //    repo-wide even beside a live approval, the BR#5640 trace; the
+    //    accounting must not depend on the cause), so gating the binding
+    //    lookup on a review decision made the entire bound/duty accounting
+    //    unreachable for exactly the PRs the train owns — 56 of them read
+    //    "unreviewed" while their cards sat in the bindings map (the
+    //    census: "0 bound / 54 unreviewed" against a 37-car train). A
+    //    bound card accounts the PR regardless of reviewDecision; with no
+    //    decision, approved/verifyEligible are false by construction, so
     //    an unreviewed bound card can never spawn a verify duty — it
     //    accounts as bound (queued/lane/in-flight per its stamps).
     const b = bindings.get(p.number);
