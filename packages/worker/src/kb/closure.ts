@@ -584,7 +584,18 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
   if (typeof v !== "object" || v === null) return null;
   const e = v as Record<string, unknown>;
   const kind = String(e.event ?? "");
-  const repo = typeof e.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(e.repo) ? e.repo : null;
+  const isValidRepo = (r: unknown): r is string => {
+    if (typeof r !== "string") return false;
+    const parts = r.trim().split("/");
+    if (parts.length !== 2) return false;
+    const [owner, name] = parts;
+    if (!owner || !name || /^\d+$/.test(owner)) return false;
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return false;
+    if (!/^[A-Za-z0-9._-]+$/.test(name) || name === "." || name === "..") return false;
+    if (/^(?:br|gh|pr|issue|issues|pull|pulls|task|ask)$/i.test(name)) return false;
+    return true;
+  };
+  const repo = isValidRepo(e.repo) ? e.repo : null;
   const num = (x: unknown) => typeof x === "number" && Number.isInteger(x) && x > 0;
   const id = (x: unknown) => typeof x === "string" && /^BR#\d+$/.test(x) ? x : null;
   switch (kind) {

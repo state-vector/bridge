@@ -280,29 +280,32 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders the PRs column as verification-coloured groups + the Awaiting parks after the divider (BR#5658, Ray 2026-11-03: colour = verification state — green ready, orange pulsing being verified, orange solid waiting to be; supersets 4eef434c4/BR#5476 — the parks stay listed)", () => {
-    // the lane stat line first: in progress · verifying · ready (+ waiting)
+  it("renders the PRs column as 3-bucket PR stats (in progress · verifying · ready) + sequential merge batches coloured strictly by verification state (BR#5658 v2, Ray 2026-11-03)", () => {
+    // 1. strictly 3-bucket lane PR stats: in progress · verifying · ready (no 4th waiting stat)
     expect(trainPanelSrc).toMatch(/train-stats/);
+    expect(trainPanelSrc).toMatch(/ts-ip/);
     expect(trainPanelSrc).toMatch(/ts-verifying/);
     expect(trainPanelSrc).toMatch(/ts-ready/);
-    // per-car groups from the machine's last walk: green merges this pass,
-    // orange PULSING is being verified, orange SOLID waits to be verified,
-    // red conflicts, hatched protection, dashed grey = no verdict yet
+    expect(trainPanelSrc).not.toMatch(/ts-waiting/);
+    // 2. sequential merge batches (Batch 1 | Batch 2 | …) separated by .train-block-gap
+    expect(trainPanelSrc).toMatch(/train-block-group/);
+    expect(trainPanelSrc).toMatch(/train-block-gap/);
+    expect(trainPanelSrc).toMatch(/Batch \$\{bi \+ 1\}/);
+    // 3. verification colour law: green = ready (.tb-ready), orange pulsing =
+    // being verified (.tb-verifying), orange solid = waiting to be verified (.tb-wait);
+    // no red on awaiting parks (BR#5476)
     expect(trainPanelSrc).toMatch(/cls === "ready"/);
     expect(trainPanelSrc).toMatch(/merges this pass/);
+    expect(trainPanelSrc).toMatch(/tb-ready/);
     expect(trainPanelSrc).toMatch(/tb-verifying/);
     expect(trainPanelSrc).toMatch(/being verified — checks\/mergeability running/);
     expect(trainPanelSrc).toMatch(/tb-wait/);
     expect(trainPanelSrc).toMatch(/waiting to be verified — needs a fresh review/);
-    expect(trainPanelSrc).toMatch(/conflicted — back to impl/);
-    expect(trainPanelSrc).toMatch(/no machine verdict yet/);
-    // the Awaiting parks: render AFTER the divider, orange solid (red past
-    // window + grace), oldest first, with the force-review affordance hint
-    expect(trainPanelSrc).toMatch(/train-block-gap/);
-    expect(trainPanelSrc).toMatch(/tb-awaiting-lapsed/);
+    expect(trainPanelSrc).not.toMatch(/tb-awaiting-lapsed/);
     expect(trainPanelSrc).toContain("force-review from the backlog");
-    // a parked card keeps the lane's signal lit even with an empty queue
+    // a parked card or non-zero PR stat keeps the lane's signal lit
     expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
+    expect(trainPanelSrc).toMatch(/l\.pr_stats\?\.verifying/);
   });
 
   it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {

@@ -226,13 +226,20 @@ export interface KbTrainLane {
    *  (aging) at the awaiting TTL, red (lapsed) past TTL + grace; a lapsed
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
-  awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
-  /** BR#5658 (Ray 2026-11-03): per-lane PR stats — the verification buckets
-   *  the lane stat line shows. in-progress = impl cards with open PRs on
-   *  this lane's repo; verifying = walk verdict "waiting" (checks running);
-   *  waiting = walk verdict "needs-review" + Awaiting parks (waiting to be
-   *  verified); ready = walk verdict "ready" (the mergeable batch). */
-  pr_stats?: { in_progress: number; verifying: number; waiting: number; ready: number };
+  awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean; in_flight?: boolean }[];
+  burst_max?: number;
+  /** BR#5658 (Ray 2026-11-03, v2): true 3-bucket per-lane PR stats covering
+   *  ALL open PRs on the lane:
+   *  - in_progress: active implementation or bounced back to in_progress
+   *  - verifying: in verification (being verified + waiting to be verified)
+   *  - ready: verified (ACCEPT) and ready to merge */
+  pr_stats?: { in_progress: number; verifying: number; ready: number };
+  /** BR#5658 (Ray 2026-11-03, v2): all verifying + ready PRs on the lane
+   *  partitioned into sequential merge batches (Batch 1 | Batch 2 | …) via
+   *  iterative selectBatch (conflict_pairs + burst_max). Inside each batch,
+   *  state drives the block colour: "ready" (green solid), "verifying"
+   *  (orange pulsing), "waiting" (orange solid). */
+  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string }[][];
   /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
    *  (rank) order — the queue block row. cls: ready (merges this pass) |
    *  waiting (checks/mergeability pending) | conflict | needs-review |
@@ -243,6 +250,7 @@ export interface KbTrainLane {
   queue_facts?: {
     at: number;
     entries: { id: string; pr?: number; cls: string }[];
+    conflict_pairs?: [number, number][];
     base_state?: {
       verdict: "green" | "red" | "unsettled" | "empty";
       scoped_to_required?: boolean;

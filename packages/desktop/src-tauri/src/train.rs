@@ -2187,6 +2187,63 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // the truth of this pass: which entries are ready (the next batch) and
     // which wait/leave. One write per tick; failures never break the tick.
     // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
+    // ---- PHASE B (BR#4996 + BR#5658): select the batch — the maximal set of
+    // MUTUALLY non-conflicting candidates, queue order = landing order.
+    // Conflict pairs come from the candidates' changed-file sets (merge-base
+    // diff), then each intersecting pair is CONFIRMED head-vs-head with
+    // merge-tree (BR#3935 fail-closed: a probe that cannot run counts as
+    // conflicting, and a candidate whose file set cannot be computed is
+    // excluded as not-known-clean — select_batch's clean[i] == false law).
+    // Computed before the queue_facts stamp so conflict_pairs ([pr_a, pr_b])
+    // ride the stamp and the hub can partition the backlog into sequential
+    // merge batches (Batch 1 | Batch 2 | …).
+    let mut batch: Vec<usize> = Vec::new();
+    let mut conflict_pairs_prs: Vec<[i64; 2]> = Vec::new();
+    let mut batch_deferred_log: Option<String> = None;
+    let mut batch_selected_log: Option<(usize, String)> = None;
+    if !candidates.is_empty() {
+        let mut clean: Vec<bool> = vec![true; candidates.len()];
+        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
+                Ok(set) => file_sets.push(set),
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
+                    clean[i] = false;
+                    file_sets.push(crate::train_gate::FileSet::new());
+                }
+            }
+        }
+        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
+        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
+            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
+                Ok(true) => {
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+            }
+        }
+        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
+        if batch.len() < candidates.len() {
+            let dropped: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !batch.contains(i))
+                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
+                .collect();
+            batch_deferred_log = Some(format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
+        }
+        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
+        batch_selected_log = Some((batch.len(), batch_ids.join(", ")));
+    }
+
+    // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
     // the walk produced verdicts — entries can short-circuit pre-gate) and
     // carries base_state (Fix A): the hub renders the lane BLOCKED with
     // the base red names + files the one-per-episode human alarm ask.
@@ -2196,6 +2253,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // base_state); the next stamp after a landing omits it, which clears
         // the state by itself.
         let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state });
+        if !conflict_pairs_prs.is_empty() {
+            qf.as_object_mut().unwrap().insert("conflict_pairs".into(), json!(conflict_pairs_prs));
+        }
         if let Some(st) = ctx.stall.get(key) {
             qf.as_object_mut().unwrap().insert(
                 "stalled".into(),
@@ -2218,52 +2278,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
     }
 
-
-    // ---- PHASE B (BR#4996): select the batch — the maximal set of MUTUALLY
-    // non-conflicting candidates, queue order = landing order. Conflict
-    // pairs come from the candidates' changed-file sets (merge-base diff),
-    // then each intersecting pair is CONFIRMED head-vs-head with merge-tree
-    // (BR#3935 fail-closed: a probe that cannot run counts as conflicting,
-    // and a candidate whose file set cannot be computed is excluded as
-    // not-known-clean — select_batch's clean[i] == false law).
-    let mut batch: Vec<usize> = Vec::new();
-    if !candidates.is_empty() {
-        let mut clean: Vec<bool> = vec![true; candidates.len()];
-        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
-        for (i, c) in candidates.iter().enumerate() {
-            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
-                Ok(set) => file_sets.push(set),
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
-                    clean[i] = false;
-                    file_sets.push(crate::train_gate::FileSet::new());
-                }
-            }
-        }
-        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
-        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
-            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
-                Ok(true) => conflict_pairs.push((i, j)),
-                Ok(false) => {}
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
-                    conflict_pairs.push((i, j));
-                }
-            }
-        }
-        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
-        if batch.len() < candidates.len() {
-            let dropped: Vec<String> = candidates
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !batch.contains(i))
-                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
-                .collect();
-            log(Some(key), &format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
-        }
-        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
-        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", batch.len()));
-        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", batch.len(), batch_ids.join(", ")));
+    if let Some(msg) = batch_deferred_log {
+        log(Some(key), &msg);
+    }
+    if let Some((n_sel, ids_str)) = batch_selected_log {
+        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", n_sel));
+        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", n_sel, ids_str));
     }
 
     // identity gate at the write boundary (BR#3181): the batch's merge legs

@@ -1743,6 +1743,64 @@ export function selectBatch(clean: boolean[], conflictPairs: [number, number][],
   return selected;
 }
 
+/** BR#5658 (Ray 2026-11-03): one verifying or ready PR car in a merge batch.
+ *  `state` drives the verification colour law:
+ *  - "ready"     → green solid (.tb-ready): verified & ready to merge
+ *  - "verifying" → orange pulsing (.tb-verifying): actively being verified now
+ *  - "waiting"   → orange solid (.tb-wait): waiting to be verified */
+export interface TrainBatchCar {
+  id: string;
+  pr?: number;
+  state: "ready" | "verifying" | "waiting";
+  detail?: string;
+}
+
+/** BR#5658 (Ray 2026-11-03): partition all verifying + ready PRs on a lane into
+ *  sequential merge batches (`Batch 1 | Batch 2 | …`) by running `selectBatch`
+ *  iteratively until every car is assigned to a pass.
+ *  `conflictPairsByPr` are pairs of PR numbers `[prA, prB]` whose changed-file
+ *  sets conflict (executor-stamped on `queue_facts.conflict_pairs`); `cap` is
+ *  `lane.burst_max` (0 = unlimited). Cars that conflict with an earlier member
+ *  in Batch k or exceed `cap` defer to Batch k+1 while non-conflicting later
+ *  cars still join Batch k (the greedy A↔B↔C → [A, C] then [B] law). */
+export function partitionMergeBatches<T extends { id: string; pr?: number }>(
+  cars: T[],
+  conflictPairsByPr: [number, number][] = [],
+  cap: number = DEFAULT_BURST_MAX,
+): T[][] {
+  if (!cars.length) return [];
+  const remaining: number[] = cars.map((_, i) => i);
+  const batches: T[][] = [];
+  const prConflict = (i: number, j: number): boolean => {
+    const pa = Number(cars[i]?.pr ?? 0);
+    const pb = Number(cars[j]?.pr ?? 0);
+    if (!pa || !pb) return false;
+    if (pa === pb && cars[i].id !== cars[j].id) return true;
+    return conflictPairsByPr.some(([a, b]) => (a === pa && b === pb) || (a === pb && b === pa));
+  };
+  while (remaining.length > 0) {
+    const clean = remaining.map(() => true);
+    const subPairs: [number, number][] = [];
+    for (let a = 0; a < remaining.length; a++) {
+      for (let b = a + 1; b < remaining.length; b++) {
+        if (prConflict(remaining[a], remaining[b])) subPairs.push([a, b]);
+      }
+    }
+    const chosenSub = selectBatch(clean, subPairs, cap);
+    if (!chosenSub.length) {
+      // safety fallback (clean is all-true so selectBatch always picks >=1)
+      batches.push([cars[remaining.shift()!]]);
+      continue;
+    }
+    batches.push(chosenSub.map((si) => cars[remaining[si]]));
+    const chosenSet = new Set(chosenSub);
+    const nextRemaining = remaining.filter((_, idx) => !chosenSet.has(idx));
+    remaining.length = 0;
+    remaining.push(...nextRemaining);
+  }
+  return batches;
+}
+
 /** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
  *  the caller fails loud, a guessed lane config would gate the wrong CI. */
 export function laneOfMeta(meta: any): LaneSpec | null {
@@ -1932,7 +1990,7 @@ export function trainProxyEvent(meta: any): AwaitEvent | null {
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
   const n = trainPrLeg(meta);
-  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+  return isValidGitHubRepo(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
 }
 
 /** BR#4282 — the card's OWN merge-train stamp proving its pr_merged leg has
@@ -2976,6 +3034,47 @@ export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Z
  *  #2534 merge" prose stay inert. */
 export const TRAIN_PR_SHORT_RE = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
 
+/** BR#5658 / BR#5324 / BR#5805: validate that `owner/name` is a plausible
+ *  GitHub repository rather than a Bridge/tracker cross-reference token or
+ *  numeric fragment. Prose notes like `BR#5563/BR#5635`, `#1768/BR#4993`, or
+ *  CSS/identifier tokens adjacent to a card ref (`tb-pulse/BR#5658`) previously
+ *  matched `TRAIN_PR_SHORT_RE` with `m[2] === "BR"`, minting ghost merge lanes
+ *  (`4365/BR`, `4728/BR`, `5022/BR`, `5299/BR`, `5563/BR`, `1768/BR`,
+ *  `tb-pulse/BR`) and poisoning cards' `pr_merged` proxies.
+ *  - `owner` must not be all-digits (`5563`, `1768`) and must follow GitHub's
+ *    username/org syntax (`[A-Za-z0-9]` endpoints, `[A-Za-z0-9-]` interior).
+ *  - `name` must not be a reserved tracker/card prefix (`BR`, `GH`, `PR`,
+ *    `TASK`, `ASK`, `ISSUE`, `PULL`, `ISSUES`, `PULLS`). */
+export function isValidGitHubRepo(repo: string): boolean {
+  const parts = String(repo ?? "").trim().split("/");
+  if (parts.length !== 2) return false;
+  const [owner, name] = parts;
+  if (!owner || !name) return false;
+  if (/^\d+$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name === "." || name === "..") return false;
+  if (/^(?:br|gh|pr|issue|issues|pull|pulls|task|ask)$/i.test(name)) return false;
+  return true;
+}
+
+/** BR#5658 / AGENTS.md Rule 7: extract a direct-to-main landing commit receipt
+ *  from a review/verify note when no PR exists (`https://github.com/o/r/commit/<sha>`
+ *  or `commit <sha>` / `landed on main as <sha>`). Returns null when the text
+ *  cites any PR leg (PR legs ride the merge train, never direct-close). */
+export function parseDirectCommitReceipt(text: string): { repo?: string; sha: string } | null {
+  const t = String(text ?? "");
+  if (trainParseNoteLegs(t).length > 0) return null;
+  const urlMatch = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/commit\/([0-9a-f]{7,40})\b/i.exec(t);
+  if (urlMatch && isValidGitHubRepo(urlMatch[1])) {
+    return { repo: urlMatch[1], sha: urlMatch[2].toLowerCase() };
+  }
+  const tokenMatch = /(?:^|[\s(—–-])(?:commit|landed(?:\s+direct(?:ly)?\s+to\s+main)?(?:\s+on\s+main)?(?:\s+as)?|main\s+commit)[\s#:@=/]+([0-9a-f]{7,40})(?=[\s;.,)]|$)/i.exec(t);
+  if (tokenMatch) {
+    return { sha: tokenMatch[1].toLowerCase() };
+  }
+  return null;
+}
+
 export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
 
 /** Parse a verify close note into PR legs. Single-PR notes keep the
@@ -2999,14 +3098,22 @@ export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
   const seen = new Set<string>();
   for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-    seen.add(`${m[1]}/${m[2]}#${m[3]}`);
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    prs.push({ repo, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    seen.add(`${repo}#${m[3]}`);
   }
   for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
-    const key = `${m[1]}/${m[2]}#${m[3]}`;
+    const idx = m.index ?? 0;
+    const before = idx > 0 ? t[idx - 1] : "";
+    // Reject if preceded by `#` or `/` (e.g. `BR#5563/BR#5635` or URL path tails)
+    if (before === "#" || before === "/") continue;
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    const key = `${repo}#${m[3]}`;
     if (seen.has(key)) continue; // the same PR already cited by its URL
     seen.add(key);
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    prs.push({ repo, number: Number(m[3]), index: idx, end: idx + m[0].length });
   }
   prs.sort((a, b) => a.index - b.index);
   if (!prs.length) return [];
