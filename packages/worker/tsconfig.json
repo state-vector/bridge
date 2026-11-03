@@ -34,6 +34,9 @@
     "test/br3819-self-edge.test.ts",
     // BR#3942: same rig as do.test.ts (miniflare + workerd fetch types)
     "test/ask-escalation.test.ts",
-    "test/ws-members.test.ts"
+    "test/ws-members.test.ts",
+    // doctor-probe attribution incident (2026-11-03): same rig as do.test.ts
+    // (miniflare + workerd fetch types)
+    "test/doctor-attribution.test.ts"
   ]
 }

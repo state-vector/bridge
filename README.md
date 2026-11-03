@@ -482,6 +482,19 @@ executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the 
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
 conflated again.
+The lane's PR column shows ALL of the lane's PRs by verification state (BR#5658,
+Ray 2026-11-03: "each lane needs to show PR stats — in-progress, verifying and
+ready… colours should denote verification — green if ready, orange pulsing if
+being verified, orange solid if waiting to be"): a count line first (`N in
+progress · M verifying · K ready`, waiting appended when non-zero) — in-progress
+counts the OPEN impl cards with a PR bound to the lane's repo, verifying the
+walk's `waiting` verdicts (checks running), ready the walk's `ready` verdicts —
+then one coloured block per PR, grouped the way the pass merges them: green =
+ready (the batch that merges this pass), orange **pulsing** = being verified,
+orange solid = waiting to be verified (the `needs-review` verdicts plus the
+Awaiting parks after the divider), red = conflicted, hatched = branch-protection
+blocked, dashed grey = no machine verdict yet. The hub serves the buckets as
+`pr_stats` on each `train.status` lane.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>
@@ -755,13 +768,16 @@ every tick. Two laws now hold:
   freshness-guarded (<15m, executor refreshes every tick) so a dead daemon's stale
   stamp can never pin a false BLOCKED; a stale or green stamp falls back to the
   normal lane vocabulary.
-- **The resolution rides the lane, not the weeds (BR#5349, Ray directive 2026-11-01
+- **The resolution rides the lane, not the weeds (BR#5349 + BR#5679, Ray directive 2026-11-01
   ~07:55Z — "THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED TO DO — loud and clear and
-  direct with no jargon")**: while a non-green base holds cars, `train.status` serves
+  direct with no jargon")**: while a non-green base holds cars or `meta.stop` is active, `train.status` serves
   a `base_red_resolution` block per lane — `whats_broken` (the red checks + run URLs,
-  from the walk's base_state), `held` (queue depth), `ask` (the episode's OPEN alarm
-  ask verbatim: id, canonical url, question, options) and `fix_card` (the OPEN task
-  tagged hotfix+main-red in the lane card's project — the active fix-forward card).
+  from the walk's `base_state` or `stop.failing`), `held` (queue depth), `ask` (the episode's OPEN alarm
+  ask verbatim: id, canonical url, question, options) and `fix_card` (the episode's root-fix card, OPEN task
+  tagged hotfix+main-red in the lane card's project, or the stop's culprit card — the active fix-forward card).
+  Every executor lane arm (stop-recovery, rerun, mid-drain tip check, and bisect) classifies base/tip check runs
+  scoped to `lane.required_workflows` (`classify_base_check_runs`), and feeding green required-workflow check runs
+  to `train.ci` on a stopped lane clears `meta.stop` (`decided: "line_green"`) even when non-required nightly checks fail.
   The trains panel renders it as a red banner PINNED to the very top of the panel,
   above the lane table, in plain words only — `⛔ Merge train STOPPED — main's checks
   are failing on <repo> · N PRs held`, `BROKEN: <checks with run links>`,

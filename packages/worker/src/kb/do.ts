@@ -4672,9 +4672,15 @@ export class KnowledgeHub {
     if (attributedAgent && attributedAgent !== actor && this.isGatewayActor(actor)) {
       this.gatewayTouch(actor, attributedAgent);
     }
-    // session attribution: stamp which session claimed/acted, first-wins, resolved
-    // explicit → the token's most recent session (agents pass session on orient only)
-    if (row.type === "task" && !meta.session) {
+    // session attribution: stamp which session claimed/acted, resolved
+    // explicit → the token's most recent session (agents pass session on
+    // orient only). A FRESH claim (todo → in_progress) RE-stamps: a released
+    // claim must not inherit the previous holder's session (2026-11-03
+    // incident: the token's last-session fallback resolved a throwaway
+    // doctor-probe session as executor and first-wins froze the mislabel for
+    // the card's whole life — re-stamping on fresh pickup heals such cards).
+    const freshClaim = to === "in_progress" && row.status === "todo";
+    if (row.type === "task" && (freshClaim || !meta.session)) {
       const sess = await this.resolveSession(body, String(body.token_id ?? ""));
       if (sess) meta.session = String(sess).slice(0, 120);
     }
@@ -5915,6 +5921,17 @@ export class KnowledgeHub {
       await this.sessionTouch({ token_id: tokenId, session: named, worktree: body.worktree }).catch(() => {});
       return named;
     }
+    // gateway-tagged tokens are infrastructure (the gateway daemon, its train
+    // executor, its CLI probes): a session-less write from one stays
+    // ANONYMOUS — the token's last-session fallback would forge executor
+    // attribution out of whatever session last orient'ed on this gateway
+    // (2026-11-03 incident: `bridge doctor`'s throwaway probe session was
+    // resolved as the executor of live impl cards). Explicit sessions are
+    // still honored above; infrastructure never inherits one.
+    const tok = tokenId
+      ? (this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, tokenId) as any)
+      : null;
+    if (tok && tagsSayGateway(tok.tags)) return undefined;
     const row = this.one(
       `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`, tokenId,
     ) as any;
@@ -9263,6 +9280,33 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
+    const sha = String(body.sha ?? "");
+    // BR#5679: when the lane is STOPPED (meta.stop != null) and check-run
+    // facts are fed for the stopped sha, evaluate classifyRequiredRuns
+    // against the lane's required_workflows. If all required workflows are
+    // now GREEN (e.g. a transient post-deploy smoke rerun passed while a
+    // non-required nightly check stayed red), the hub clears meta.stop
+    // directly — hub-decided from facts, even if another gateway holds the
+    // lease while stuck in its stop arm.
+    if (meta.stop && (!sha || String(meta.stop.sha ?? "").toLowerCase() === sha.toLowerCase())) {
+      const stopChecks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
+      const stopSpec = laneOfMeta(meta)!;
+      const stopV: RequiredRunsVerdict = classifyRequiredRuns(stopChecks, stopSpec.required_workflows, {
+        merged_at: Number(meta.currently?.merged_at ?? meta.stop?.at ?? now),
+        now,
+        typical_ms: (stopSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000,
+      });
+      if (stopV.verdict === "green" && stopChecks.length > 0) {
+        const clearedSha = String(meta.stop.sha ?? sha);
+        meta.stop = null;
+        if (meta.currently?.phase === "stopped") meta.currently = null;
+        const reason = this.laneSyncReason(lane.id, meta, now);
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+        this.audit(actor, "train:line_green_ci", lane.id, { lane: laneKey(repo, base), sha: clearedSha.slice(0, 9), reason });
+        this.version(lane.id, actor, "train:line_green", `line green again — required workflows settled green on ${clearedSha.slice(0, 9)}; stop cleared`, { stop: null, reason });
+        return { ok: true, decided: "line_green", lane: laneKey(repo, base), sha: clearedSha, stop: null, reason };
+      }
+    }
     const lease: TrainLease | null = meta.lease ?? null;
     if (!lease || lease.holder !== actor) throw new Error(`train.ci requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
     if (!meta.currently) {
@@ -9270,7 +9314,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.audit(actor, "train:ci_idle", lane.id, { lane: laneKey(repo, base), sha: String(body.sha ?? "").slice(0, 9) });
       return { ok: true, decided: "idle", lane: laneKey(repo, base) };
     }
-    const sha = String(body.sha ?? "");
     if (sha && String(meta.currently.merge_sha).toLowerCase() !== sha.toLowerCase())
       throw new Error(`stale CI report — the lane's in-flight merge is ${String(meta.currently.merge_sha).slice(0, 9)}, not ${sha.slice(0, 9)}`);
     // BR#4934: the FIRST settle feed on a bursting lane flips phase →
@@ -9528,12 +9571,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async trainQueueFacts(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
-    // BR#5633: an ABSENT entries field preserves the stored per-entry
-    // verdicts — the awaiting sweep stamps through this same op at the TOP
-    // of the tick (before the arms that never reach the walk's own stamp),
-    // and must not clobber the walk's queue blocks. An explicit [] still
-    // clears (the bypass/rerun acks rely on that).
-    const entries = Array.isArray(body.entries)
+    // BR#5633 + BR#5679: an ABSENT entries field — or a pure bypass/rerun
+    // consumption ack that passed `entries: []` with no base_state/stalled —
+    // preserves the stored per-entry verdicts and base_state so top-of-tick
+    // stamps never clobber the walk's queue blocks or resolution banner.
+    const ackOnly =
+      (Boolean(body.bypass_consumed) || Boolean(body.rerun_consumed)) &&
+      Array.isArray(body.entries) &&
+      body.entries.length === 0 &&
+      !body.base_state &&
+      !body.stalled;
+    const entries = Array.isArray(body.entries) && !ackOnly
       ? body.entries
       : null;
     const lane = await this.laneEnsure(repo, base, actor);
@@ -10431,15 +10479,56 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // laneSyncReason's baseBlock (<15m — the executor refreshes every
       // tick): a dead daemon's stale stamp never pins a banner, and the
       // block disappears by itself the moment base_state goes green.
+      // BR#5658 (Ray 2026-11-03): per-lane PR stats — in-progress / verifying
+      // / ready, the three verification buckets the lane stat line shows.
+      // in-progress = OPEN impl cards with a PR bound to this lane's repo,
+      // excluding the ones already parked on the train's review legs (those
+      // count as waiting). verifying = executor walk verdict "waiting"
+      // (checks/mergeability being checked right now). ready = walk verdict
+      // "ready" (merges this pass — the batch). waiting (the orange-solid
+      // bucket) = walk verdict "needs-review" + the Awaiting parks.
+      const prStats = (() => {
+        const facts = meta.lane?.queue_facts?.entries ?? [];
+        const factFor = (id: string) => String(facts.find((e: any) => e.id === id)?.cls ?? "");
+        let ready = 0, verifying = 0, waiting = 0;
+        for (const q of queue) {
+          const cls = factFor(q.id);
+          if (cls === "ready") ready++;
+          else if (cls === "waiting") verifying++;
+          else if (cls === "needs-review") waiting++;
+        }
+        waiting += awaitingRows.length;
+        let inProgress = 0;
+        for (const r of this.state.storage.sql.exec(
+          `SELECT meta FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
+        ).toArray() as any[]) {
+          const m = JSON.parse(r.meta ?? "{}");
+          if (!trainCardMatchesLane(m, lane.repo)) continue;
+          const mtState = String(m?.merge_train?.state ?? "");
+          if (mtState === "bounced" || mtState === "awaiting") waiting++; // parked on a review leg — not impl
+          else inProgress++;
+        }
+        return { in_progress: inProgress, verifying, waiting, ready };
+      })();
       const brQf: any = meta.lane?.queue_facts ?? null;
       const brBase: any = brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
         && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0
         ? brQf.base_state : null;
+      const stopActive: any = meta.stop ?? null;
       let base_red_resolution: any = null;
-      if (brBase) {
-        const reds = (Array.isArray(brBase.red) ? brBase.red : [])
-          .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
-          .filter((r: any) => r.name);
+      if (brBase || stopActive) {
+        const reds = brBase
+          ? (Array.isArray(brBase.red) ? brBase.red : [])
+              .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+              .filter((r: any) => r.name)
+          : (() => {
+              const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : [])
+                .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? r?.html_url ?? "") }))
+                .filter((r: any) => r.name);
+              if (fromStop.length) return fromStop;
+              const why = String(stopActive?.reason ?? "").trim();
+              return why ? [{ name: why, url: "" }] : [];
+            })();
         // the OPEN alarm ask for this episode — filed per red episode under
         // the deterministic trainBaseRedAskTitle prefix. Newest open questions
         // first, prefix-matched in JS: parameterized LIKE+ESCAPE trips
@@ -10447,15 +10536,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // episode ask is at most days old, so a recent-rows scan is a cheap,
         // quirk-free join (the alarm sink is where these titles live).
         const askPrefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base}`;
+        const stopAskPrefix = `MERGE TRAIN STOPPED: ${lane.repo}@${lane.base}`;
         const askRow = ((this.state.storage.sql.exec(
           `SELECT id, title, meta FROM artefacts
            WHERE type = 'question' AND status = 'todo' AND created_ts > ?
            ORDER BY created_ts DESC LIMIT 200`,
           now0 - 7 * 86_400_000,
-        ).toArray() as any[]).find((r) => String(r.title ?? "").startsWith(askPrefix))) ?? null;
+        ).toArray() as any[]).find((r) => {
+          const t = String(r.title ?? "");
+          return t.startsWith(askPrefix) || t.startsWith(stopAskPrefix);
+        })) ?? null;
         const askMeta = askRow ? JSON.parse(String(askRow.meta ?? "{}") || "{}") : null;
         base_red_resolution = {
-          verdict: String(brBase.verdict ?? ""),
+          verdict: brBase ? String(brBase.verdict ?? "red") : "red",
           whats_broken: reds,
           held: queue.length,
           ask: askRow
@@ -10466,10 +10559,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          // 2026-11-02: the fix card prefers the episode's ROOT-FIX card
-          // (BR#5190 — the auto-spawned work unit the triage outcomes ride),
-          // not just any hotfix+main-red task; the legacy tag join stays as
-          // fallback. The cure PR rides the block so the banner links it.
+          // 2026-11-02 + BR#5679: the fix card prefers the episode's ROOT-FIX
+          // card (BR#5190 — the auto-spawned work unit the triage outcomes
+          // ride), then the project's open hotfix+main-red task, and on a
+          // stopped lane falls back to the named culprit card so the banner
+          // never says "no fix card" when a stop culprit is known.
           fix_card: (() => {
             const rf = this.trainOpenRootFix(lane.repo, queue);
             if (rf.card) {
@@ -10481,7 +10575,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 ...(rf.curePr ? { pr: rf.curePr.number, pr_url: `https://github.com/${rf.curePr.repo}/pull/${rf.curePr.number}` } : {}),
               };
             }
-            return this.trainFixCard(String((l as any).project ?? ""));
+            const projFix = this.trainFixCard(String((l as any).project ?? ""));
+            if (projFix) return projFix;
+            const culpritId = String(stopActive?.culprit_task ?? "").trim();
+            if (culpritId) {
+              const cr = this.one(`SELECT id, title, status FROM artefacts WHERE id = ?`, culpritId) as any;
+              if (cr) {
+                const stopPr = Number(stopActive?.pr ?? 0) || 0;
+                return {
+                  id: String(cr.id),
+                  url: this.cardUrl(String(cr.id)),
+                  title: String(cr.title ?? ""),
+                  status: String(cr.status ?? ""),
+                  ...(stopPr > 0 ? { pr: stopPr, pr_url: `https://github.com/${lane.repo}/pull/${stopPr}` } : {}),
+                };
+              }
+            }
+            return null;
           })(),
         };
       }
@@ -10535,10 +10645,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // executor is doing right now, verbatim from its own tick log; the
         // panel renders it as the NOW line and ages it out at the lease TTL
         now_action: meta.lane?.now_action ?? null,
-        // 2026-11-02: the answer-derived authorization stamps (askAnswer
-        // writes them; the executor consumes + acks them)
-        bypass_merge: meta.lane?.bypass_merge ?? null,
-        rerun_failed: meta.lane?.rerun_failed ?? null,
+        // 2026-11-02 + BR#5679: the answer-derived authorization stamps (askAnswer
+        // writes them; the executor consumes + acks them). Omit when unset so
+        // pre-BR#5679 Rust executors (`lane.get("rerun_failed").map(|_| true)`)
+        // never misread a JSON `null` as an active rerun request.
+        ...(meta.lane?.bypass_merge ? { bypass_merge: meta.lane.bypass_merge } : {}),
+        ...(meta.lane?.rerun_failed ? { rerun_failed: meta.lane.rerun_failed } : {}),
         attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,
         queue_awaiting_review: awaitingReview,
         // BR#5114: per-entry executor gate verdicts in walk order (panel
@@ -10560,6 +10672,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         starved,
         queue,
         awaiting: awaitingRows,
+        pr_stats: prStats,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
           merged_24h: Number(tp.h24 ?? 0),

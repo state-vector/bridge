@@ -523,4 +523,65 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(rel.body.error ?? "").toBe("");
     expect(rel.body.lease).toBeNull();
   });
+
+  it("BR#5679: a stopped lane serves base_red_resolution (BROKEN + WHAT FIXES IT), preserves queue_facts across rerun_consumed acks, and clears stop via train.ci when required workflows recover green despite a non-required nightly failure", async () => {
+    const repo = "state-vector/lane-br5679";
+    const card = await parkQueued("IMPL: br5679 culprit");
+    const heldCard = await parkQueued("IMPL: br5679 queued behind stop");
+    await acquire(repo, "gw-5679", { required_workflows: ["post-deploy / Post-Deploy Smoke"] });
+    const M = "7".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-5679",
+      pr: 2743, merge_sha: M, head_sha: "5".repeat(40), task_id: card,
+    });
+
+    // Required workflow fails -> stop-the-line
+    const stopped = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-5679", sha: M,
+      checks: [check(10, "post-deploy / Post-Deploy Smoke", "failure", "https://example/runs/41576347395/job/125726311965")],
+    });
+    expect(stopped.body.decided).toBe("stopped");
+
+    // Stamp queue_facts, then send an ack-only rerun_consumed with entries:[] —
+    // stored entries must NOT be clobbered, and rerun_failed is omitted when null.
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-5679",
+      entries: [{ id: heldCard, pr: 2750, cls: "waiting" }],
+    });
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-5679",
+      entries: [],
+      rerun_consumed: "nothing-red",
+    });
+
+    const snapStopped = await laneSnap(repo);
+    expect("rerun_failed" in snapStopped).toBe(false);
+    expect(snapStopped.queue_facts?.entries?.length).toBe(1);
+    // Stop-mode resolution banner is populated even without queue_facts.base_state
+    expect(snapStopped.base_red_resolution).toBeTruthy();
+    expect(snapStopped.base_red_resolution.verdict).toBe("red");
+    expect(snapStopped.base_red_resolution.whats_broken).toEqual([
+      { name: "post-deploy / Post-Deploy Smoke", url: "https://example/runs/41576347395/job/125726311965" },
+    ]);
+    expect(snapStopped.base_red_resolution.fix_card).toBeTruthy();
+
+    // Post-Deploy Smoke rerun succeeds while a non-required nightly check fails;
+    // train.ci clears the stop even when called by a second actor while gw-5679 holds the lease.
+    const recovered = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-reconcile", sha: M,
+      checks: [
+        check(10, "post-deploy / Post-Deploy Smoke", "failure", "https://example/runs/41576347395/job/125726311965"),
+        check(20, "post-deploy / Post-Deploy Smoke", "success", "https://example/runs/41576347395/job/125733260105"),
+        check(21, "Guard fixtures (3 draws, boundary-classified)", "failure", "https://example/runs/41579155833/job/125729626874"),
+      ],
+    });
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.decided).toBe("line_green");
+    expect(recovered.body.stop).toBeNull();
+
+    const snapGreen = await laneSnap(repo);
+    expect(snapGreen.stop).toBeNull();
+    expect(snapGreen.currently).toBeNull();
+    expect(snapGreen.base_red_resolution ?? null).toBeNull();
+  });
 });

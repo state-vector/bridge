@@ -280,23 +280,26 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders the QUEUE column as per-car verdict blocks + the Awaiting-review band after the divider (4eef434c4 restored; Ray 2026-11-02: the parks stay listed — 'if they are going to be there' — colour contract tracked in BR#5476)", () => {
-    // per-car classes from the machine's last walk: green merges this pass,
-    // amber waits on checks, red conflicts, grey needs review, pending cars
-    // read as a dashed placeholder (no verdict yet), never as broken
+  it("renders the PRs column as verification-coloured groups + the Awaiting parks after the divider (BR#5658, Ray 2026-11-03: colour = verification state — green ready, orange pulsing being verified, orange solid waiting to be; supersets 4eef434c4/BR#5476 — the parks stay listed)", () => {
+    // the lane stat line first: in progress · verifying · ready (+ waiting)
+    expect(trainPanelSrc).toMatch(/train-stats/);
+    expect(trainPanelSrc).toMatch(/ts-verifying/);
+    expect(trainPanelSrc).toMatch(/ts-ready/);
+    // per-car groups from the machine's last walk: green merges this pass,
+    // orange PULSING is being verified, orange SOLID waits to be verified,
+    // red conflicts, hatched protection, dashed grey = no verdict yet
     expect(trainPanelSrc).toMatch(/cls === "ready"/);
     expect(trainPanelSrc).toMatch(/merges this pass/);
-    expect(trainPanelSrc).toMatch(/waiting on checks/);
+    expect(trainPanelSrc).toMatch(/tb-verifying/);
+    expect(trainPanelSrc).toMatch(/being verified — checks\/mergeability running/);
+    expect(trainPanelSrc).toMatch(/tb-wait/);
+    expect(trainPanelSrc).toMatch(/waiting to be verified — needs a fresh review/);
     expect(trainPanelSrc).toMatch(/conflicted — back to impl/);
-    expect(trainPanelSrc).toMatch(/needs a review/);
     expect(trainPanelSrc).toMatch(/no machine verdict yet/);
-    // the Awaiting band: parks render AFTER the divider, oldest first, with
-    // the aging/lapsed modifiers and the force-review affordance hint
-    expect(trainPanelSrc).toMatch(/tb-awaiting/);
+    // the Awaiting parks: render AFTER the divider, orange solid (red past
+    // window + grace), oldest first, with the force-review affordance hint
     expect(trainPanelSrc).toMatch(/train-block-gap/);
     expect(trainPanelSrc).toMatch(/tb-awaiting-lapsed/);
-    expect(trainPanelSrc).toMatch(/tb-awaiting-aging/);
-    expect(trainPanelSrc).toContain("grey blocks after the divider");
     expect(trainPanelSrc).toContain("force-review from the backlog");
     // a parked card keeps the lane's signal lit even with an empty queue
     expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);

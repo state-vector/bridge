@@ -795,7 +795,12 @@ fn doctor() -> bool {
             _ => ok("hub reachable", "hub unreachable or /__version broken", &mut bad, true),
         }
         if !cfg.token.is_empty() {
-            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"orient","arguments":{"session":"doctor"}}}"#;
+            // Probe with `stats`, NOT orient: orient registers the session name
+            // on the gateway token's session registry, and a throwaway probe
+            // name then resolved as executor attribution via the hub's
+            // last-session fallback (the 2026-11-03 "doctor" misattribution).
+            // stats verifies the same MCP + auth path and writes nothing.
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#;
             match client
                 .post(format!("{}/mcp", cfg.url.trim_end_matches('/')))
                 .header("content-type", "application/json")
@@ -803,7 +808,7 @@ fn doctor() -> bool {
                 .body(body)
                 .send()
             {
-                Ok(r) if r.status().is_success() => ok("token valid (orient 200)", "", &mut bad, false),
+                Ok(r) if r.status().is_success() => ok("token valid (mcp 200)", "", &mut bad, false),
                 Ok(r) => ok("token valid", &format!("hub rejected it ({}) — re-pair to repair", r.status()), &mut bad, true),
                 Err(e) => ok("token valid", &format!("probe failed: {e}"), &mut bad, false),
             }
