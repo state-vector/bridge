@@ -110,9 +110,9 @@ import {
   trainAwaitingReason,
   trainAwaitingHumanLeg,
   trainRequeueSwap,
-  trainStopAskTitle,
   trainBaseRedAskTitle,
   trainBaseRedAskBrief,
+  trainBaseRedAskWarranted,
   trainPlainStatus,
   trainStallAskTitle,
   trainBaseRedDefect,
@@ -8814,42 +8814,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
       meta.currently = meta.currently ? { ...meta.currently, phase: "stopped" } : null;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      // ONE ask per class: the sha+workflows make the title unique per red
-      // episode; askCreate's identical-open-ask guard dedupes the rest.
-      const askTitle = trainStopAskTitle({ repo, base }, sha, failing.map((f) => f.name).length ? failing.map((f) => f.name) : [why]);
-      // BR#5517 blame brief: the alarm carries a Guilty line — the culprit
-      // card id + title + the PR that broke main + the failing checks — so
-      // plain reading answers "what broke and who broke it" without a
-      // ledger dig (data is already in this stop event's detail).
-      const culpritRow = culprit ? this.one(`SELECT title FROM artefacts WHERE id = ?`, culprit) as any : null;
-      const guiltyLine = culprit
-        ? `Guilty: ${culprit}${culpritRow?.title ? ` — “${String(culpritRow.title).slice(0, 120)}”` : ""}${pr ? ` — PR ${repo}#${pr} broke main` : ""}${failing.length ? ` — failing: ${failing.map((f) => f.name).join(", ")}` : ""}`
-        : null;
-      let askId: string | null = null;
-      try {
-        const ask = await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: `the merge train stopped the ${repo}@${base} line — merges halt until green (BR#3516 §6)`,
-            details: [
-              `Lane ${laneKey(repo, base)} stopped by gateway ${actor} at ${new Date(now).toISOString()}.`,
-              `Commit: ${sha}`,
-              failing.length ? `Failing required workflows:\n${failing.map((f) => `- ${f.name}${f.url ? ` — ${f.url}` : ""}`).join("\n")}` : `Reason: ${why}`,
-              culprit ? `${guiltyLine} (bounced with the failing runs).` : "No merge had landed — stopped at admission.",
-              `Resume: main green again (the executor auto-resumes next tick) or a recorded authority decision.`,
-            ].join("\n\n"),
-            options: ["Ack — on it", "Revert the culprit", "Waive — resume the lane"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
-        askId = (ask as any)?.id ?? null;
-      } catch (e) {
-        // an identical ask is already open for this episode — that IS one per class
-        this.audit(actor, "train:stopped", lane.id, { ask_deduped: String((e as Error).message ?? e).slice(0, 160) });
-      }
+      // 2026-11-03 Ray ruling (BR#5631, from the BR#5626 escalation): NO
+      // unconditional "Acknowledge?" ask at stop time. The stop is machine
+      // state, not a human decision: the culprit bounces with the failing
+      // runs (above), the root-fix card spawns at absolute p0 (BR#5190,
+      // below), the lane card + banner carry what's broken, and the line
+      // auto-resumes the moment main is green (BR#4692). The old
+      // Ack/Revert/Waive ask had no dispatch side and demanded a pointless
+      // click — noise that trains the human to ignore the band where real
+      // bypass/manual decisions land. The human-actionable decisions surface
+      // LATER, warranted, through the base-red ask (queue_facts keeps
+      // stamping while red: a bound cure PR files the BYPASS ask) and the
+      // root-fix fast lane (BR#5189 §5). BR#5517's Guilty line survives on
+      // the root-fix card's blame edge and the lane's ledger row.
+      const askId: string | null = null;
       // BR#5190: auto-spawn (or re-bind) THE root-fix card at absolute p0 —
       // it jumps every queue tier, and the stopped executor's walk fast-tracks
       // its PR (or opens the human fast-lane ask for the circular
@@ -9658,19 +9636,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const held = entriesArr.length;
       const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
       // 2026-11-02 (Ray directive): the base-red ask is a LIVE TRIAGE VIEW,
-      // not a one-shot alarm. The old hard-coded pair offered "Bypass-merge
-      // a cure PR (I'll reply with the number)" — an option that demanded a
-      // number a one-shot ask could never learn (the ask fired BEFORE any
-      // triage, and dedupe kept it frozen there while the cure PR bound to
-      // the root-fix card off-ask). Now: the ask's brief/options render from
-      // the LIVE episode state (the root-fix card + its cure PR, refreshed
-      // every tick while the base is red), so option B CARRIES the number
-      // the moment one exists — and the four outcomes mirror the triage
-      // task's own (transient/retry · fault-of-X fix PR → bypass · manual ·
-      // no-resolution-yet keep digging). Plain words only (BR#5349).
+      // not a one-shot alarm — the ask's brief/options render from the LIVE
+      // episode state (the root-fix card + its cure PR, refreshed every tick
+      // while the base is red), so the bypass option CARRIES the number the
+      // moment one exists. Plain words only (BR#5349).
       const fix = this.trainOpenRootFix(repo, entriesArr);
-      const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
       const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+      // 2026-11-03 Ray ruling (BR#5631, from the BR#5626 escalation): ask the
+      // human ONLY when the episode has a human-actionable act on the table —
+      // a cure PR bound to the fix work (the out-of-turn bypass merge is
+      // human authority, BR#4122) or the fix path EXHAUSTED (manual steps are
+      // the only lever left). While the red is agent-workable the machinery
+      // carries it — root-fix card at absolute p0 (BR#5190), lane BLOCKED
+      // reason + banner, held queue, auto-resume on green (BR#4692) — and an
+      // ask would only demand a pointless "keep going" click.
+      const warranted = trainBaseRedAskWarranted(fix);
       // the episode's OPEN ask — the SAME join askCreate's identical-open-ask
       // guard uses (child_of sink + exact title), so create and refresh agree
       // on one ask per episode
@@ -9681,6 +9661,31 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
            AND c.type = 'question' AND c.title = ? LIMIT 1`,
         sinkId, askTitle.slice(0, 200),
       ) as any;
+      if (!warranted) {
+        if (existing) {
+          // the warrant LAPSED (e.g. the cure PR closed unmerged and nothing
+          // re-bound): the open ask no longer names a human act — close it.
+          // It re-files automatically the moment a bypass decision re-arises.
+          try {
+            await this.transition(
+              {
+                id: String(existing.id),
+                to: "done",
+                session: "", // anonymous — hub-side machine action (BR#5631)
+                note: `auto-closed (BR#5631, 2026-11-03 ruling): no human-actionable act remains on this red episode — no cure PR bound and the fix path is not exhausted. The fix work lives on ${fix.card ? fix.card.id : "the root-fix card (auto-spawned)"} and the queue drains itself the moment main is green. The ask re-files automatically if a bypass decision (a bound cure PR) or an exhausted fix path re-arises.`,
+              },
+              actor,
+            );
+            this.audit(actor, "train:base_red_ask_closed_unwarranted", lane.id, { ask: String(existing.id) });
+          } catch (e) {
+            this.audit(actor, "train:base_red_ask_close_error", lane.id, { ask: String(existing.id), error: String((e as Error).message ?? e).slice(0, 160) });
+          }
+        } else {
+          // the default: agent-workable red — machinery carries it, no ask
+          this.audit(actor, "train:base_red_ask_suppressed", lane.id, { fix_card: fix.card?.id ?? null, cure_pr: fix.curePr?.number ?? null, exhausted: fix.card?.exhausted ?? false });
+        }
+      } else {
+      const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
       if (existing) {
         // refresh IN PLACE when the live state moved (fix card opened · cure
         // PR bound · status changed) — never a second ask, never a stale one
@@ -9701,7 +9706,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             {
               to: "human",
               question: askTitle,
-              reason: `base ${repo}@${base} RED — the standing order (BR#3009) holds every queued PR until it clears`,
+              reason: `base ${repo}@${base} RED — a human-actionable act is on the table: ${fix.curePr ? `bypass-merge cure PR ${fix.curePr.repo}#${fix.curePr.number} (out-of-turn merge is human authority, BR#4122)` : "the fix path is exhausted — manual steps are the only lever left"}`,
               details: brief.details,
               options: brief.options,
               artefact_id: sinkId,
@@ -9713,6 +9718,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // an identical ask is already open for this episode — that IS one per episode
           this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
         }
+      }
       }
     }
     // BR#5376: the STALLED alarm ask — one per episode, filed while the
@@ -10140,13 +10146,24 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *      a plausibly-curing PR is queued, not only when a root-fix card
    *      binds. Walk order (the executor's queue_facts order, or the derived
    *      queue's rank on the status side) decides precedence. */
+  /** 2026-11-03 (BR#5631): the machine proxy for "the agent fix path is
+   *  EXHAUSTED" — the fix card churned out of watchdog attempts (>= 3, the
+   *  unblock spawner's own cap class) or carries an escalation stamp. Only
+   *  then does a red episode become human-actionable without a cure PR. */
+  private rootFixExhausted(m: any): boolean {
+    if (!m || typeof m !== "object") return false;
+    if (m.escalate || m.unblock_escalated) return true;
+    const attempts = Number(m?.attempt?.attempts ?? 0);
+    return Number.isFinite(attempts) && attempts >= 3;
+  }
+
   private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number }[]): {
-    card: { id: string; title: string; status: string } | null;
+    card: { id: string; title: string; status: string; exhausted?: boolean } | null;
     curePr: { repo: string; number: number } | null;
     culpritPr: number | null;
   } {
     let root: {
-      card: { id: string; title: string; status: string } | null;
+      card: { id: string; title: string; status: string; exhausted?: boolean } | null;
       curePr: { repo: string; number: number } | null;
       culpritPr: number | null;
     } = { card: null, curePr: null, culpritPr: null };
@@ -10171,7 +10188,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             ? { repo: String(m.pr?.repo ?? repo), number: first }
             : null;
         root = {
-          card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? "") },
+          card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr,
           culpritPr: Number(m.root_fix?.pr ?? 0) || null,
         };
@@ -10199,7 +10216,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // an arbitrary held PR would merge something that doesn't cure
         if (!/\bfix\b|main[- ]green|\bgate\b|stop[- ]the[- ]line|\bred\b|\bci\b|deploy health/i.test(String(row.title ?? ""))) continue;
         return {
-          card: root.card ?? { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? "") },
+          card: root.card ?? { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr: { repo: legRepo, number: pr },
           culpritPr: root.culpritPr,
         };

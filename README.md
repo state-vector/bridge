@@ -648,15 +648,19 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   (`classifyRequiredRuns` — red, or unknown past 3× the lane's typical CI time,
   fail-closed), and any non-green verdict **stops the line**: the lane card reads
   `merge-train: STOPPED — … (resume when the line is green)`, the just-merged **culprit
-  card is bounced** to `in_progress` with the failing runs appended (red after merge), and
-  ONE time-sensitive ask is filed per red episode to the `ALARM SINK` card
-  (`train_alarm_sink_id` setting, default BR#3124) — deduped per sha by the
-  identical-open-ask guard, so ten red runs are one ask, not ten. Options ride the ask:
-  `Ack — on it` / `Revert the culprit` / `Waive — resume the lane`. Green again → the
+  card is bounced** to `in_progress` with the failing runs appended (red after merge),
+  and the root-fix card auto-spawns at absolute p0 (BR#5190). Green again → the
   executor's next CI poll feeds a green classification (`train:landed`) and the hub
   releases the stop automatically. v1 stops the line; there is no auto-revert — fix
   forward or revert is the culprit card's job. Work on branches (worktrees) continues —
-  only the line stops. Two BR#5061 refinements keep the stop honest instead of stormy:
+  only the line stops. **No stop-time human ask** (BR#5631, Ray ruling 2026-11-03 from
+  the BR#5626 escalation: "you should only be giving me the solution if it needs me —
+  bypass merge, manual steps"): the stop is machine state, not a human decision; the
+  old `Ack — on it` / `Revert the culprit` / `Waive — resume the lane` ask had no
+  dispatch side and demanded a pointless click. The human-actionable decisions surface
+  LATER, warranted, through the base-red ask (below) once a cure PR binds, and the
+  root-fix fast lane (BR#5189 §5). Two BR#5061 refinements keep the stop honest
+  instead of stormy:
   **one ledger episode per stop** (the same sha + reason re-reported by a tick loop —
   the stop arm clearing on green main while the awaiting-CI arm re-fires it — is a
   `train:stopped_deduped` no-op, never a new ledger row every 20 seconds), and the
@@ -673,11 +677,11 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
 
 ### The stop names the guilty card — and dings its sessions (BR#5517)
 
-A stop-the-line episode carries blame end to end. The alarm ask's brief names the
-guilty card on plain reading — a `Guilty:` line with the culprit card id + title,
-the PR that broke main, and the failing checks — and both the alarm ask and the
-auto-spawned root-fix card (BR#5190) link to the culprit card with a typed
-`derived_from` edge, so the card's relations show who it answers to. Blame also
+A stop-the-line episode carries blame end to end. The auto-spawned root-fix card
+(BR#5190) links to the culprit card with a typed `derived_from` edge — the card's
+relations show who it answers to, and the culprit's own bounce brief names the merge
+sha and failing runs on plain reading (the stop-time alarm ask that used to carry the
+`Guilty:` line is gone per BR#5631 — the card is the blame surface). Blame also
 sticks to the people: the hub stamps a durable `train_red_ding` on the culprit
 card naming the agent labels on its version receipts (the impl and verify
 sessions that executed it, within the 7-day scoring window), and every one of
@@ -711,9 +715,21 @@ every tick. Two laws now hold:
   queued cars renders the lane `merge-train: BLOCKED — base main RED: <names> — N
   car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks
   the whole queue` (lane card reason + trains panel status pill, red) — never a
-  fake-busy checking line — with ONE time-sensitive alarm ask per red episode to the
-  alarm sink (`trainBaseRedAskTitle`, deduped by the identical-open-ask guard). The
-  ask is a LIVE TRIAGE VIEW (2026-11-02, Ray directive), not a one-shot alarm: its
+  fake-busy checking line. The human alarm ask is **warrant-gated** (BR#5631, Ray
+  ruling 2026-11-03 from the BR#5626 escalation: "you should only be giving me the
+  solution if it needs me — bypass merge, manual steps"): it files ONLY when the
+  episode has a human-actionable act on the table — a cure PR bound to the fix work
+  (the out-of-turn bypass merge is human authority, BR#4122) or the fix path
+  exhausted (`trainBaseRedAskWarranted` — the root-fix card churned out of attempts
+  or escalated, so manual steps are the only lever left). While the red is
+  agent-workable there is NO ask at all: the root-fix card (BR#5190) carries the
+  work, the banner carries the information, the queue self-drains the moment main
+  is green — an ask there would only demand a pointless "keep going" click, and
+  noise trains the human to ignore the band where real bypass/manual decisions
+  land. A lapsed warrant (the cure PR closed unmerged, nothing re-bound) closes
+  the open ask on the next red tick; the ask re-files automatically if a bypass
+  decision re-arises. When warranted, the ask is a LIVE TRIAGE VIEW (2026-11-02,
+  Ray directive), not a one-shot alarm: its
   brief/options render from the LIVE episode state — the root-fix card (BR#5190)
   and its cure PR — and the executor refreshes the OPEN ask in place every red tick,
   so the bypass option CARRIES the cure PR's number the moment one binds (never

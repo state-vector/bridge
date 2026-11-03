@@ -2595,7 +2595,7 @@ export function trainBaseRedAskBrief(
   reds: { name: string; url?: string }[],
   held: number,
   fix: {
-    card: { id: string; title?: string; status?: string } | null;
+    card: { id: string; title?: string; status?: string; exhausted?: boolean } | null;
     curePr: { repo: string; number: number } | null;
     culpritPr: number | null;
   },
@@ -2637,6 +2637,11 @@ export function trainBaseRedAskBrief(
     ``,
     `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): answer BYPASS and it merges out of turn, ahead of the queue — this is the only way a fix that cannot pass its own checks while the breakage it fixes is still live gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
   ].filter((l) => l !== undefined).join("\n");
+  // 2026-11-03 Ray ruling (BR#5631): an ask whose honest answers are all
+  // "keep doing what you're already doing" is noise — see
+  // trainBaseRedAskWarranted. These options only render when the warrant
+  // gate let the ask through, so the exhausted shape leads with the human
+  // levers (manual steps / a fresh direction), never a default "keep digging".
   const options = fix.curePr
     ? [
         `(Recommended) Bypass-merge fix PR #${fix.curePr.number} now`,
@@ -2644,13 +2649,40 @@ export function trainBaseRedAskBrief(
         `Transient — re-run the failing check`,
         `Other — manual steps (I'll reply)`,
       ]
-    : [
-        `Hold the line — the fix work continues${fix.card ? ` on ${fix.card.id}` : ""}`,
-        `Transient — re-run the failing check`,
-        `Other — manual steps (I'll reply)`,
-        `No resolution yet — keep digging on the fix card`,
-      ];
+    : fix.card?.exhausted
+      ? [
+          `Other — manual steps (I'll reply)`,
+          `Re-arm — re-issue the fix card with fresh direction`,
+          `Hold the line — the queue drains itself once main is green`,
+        ]
+      : [
+          `Hold the line — the fix work continues${fix.card ? ` on ${fix.card.id}` : ""}`,
+          `Transient — re-run the failing check`,
+          `Other — manual steps (I'll reply)`,
+          `No resolution yet — keep digging on the fix card`,
+        ];
   return { details, options };
+}
+
+/** 2026-11-03 Ray ruling (BR#5631, from the BR#5626 escalation): the
+ *  base-red alarm asks the human ONLY when the episode has a
+ *  human-actionable act on the table —
+ *  - a cure PR is bound to the fix work (the out-of-turn bypass merge is
+ *    human authority, BR#4122: "Give me the PR url and ask to bypass"), or
+ *  - the fix path is EXHAUSTED (the fix card churned out of attempts or is
+ *    escalated — manual steps / a fresh human direction are the only
+ *    levers left).
+ *  Everything else is agent-workable and fully automatic: root-fix card at
+ *  absolute p0 (BR#5190), lane BLOCKED reason + banner (what's broken, PRs
+ *  held, fix card link — informational, ask:null), queue self-drains the
+ *  moment main is green (BR#4692). An ask there would only demand a
+ *  pointless "keep going" click. */
+export function trainBaseRedAskWarranted(fix: {
+  card?: { exhausted?: boolean } | null;
+  curePr?: unknown;
+}): boolean {
+  if (fix && fix.curePr != null) return true;
+  return !!(fix && fix.card && fix.card.exhausted);
 }
 
 /** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall
