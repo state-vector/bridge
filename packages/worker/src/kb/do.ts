@@ -3546,7 +3546,14 @@ export class KnowledgeHub {
     const rolesIn = parseRolesInput(body.roles);
     if (rolesIn.ok === false) throw new Error(rolesIn.error);
     const roles = rolesIn.roles;
-    const session = await this.resolveSession(body, String(body.token_id ?? ""));
+    // Tasks enter `todo` unclaimed — filing a task is not executing it. Only
+    // stamp meta.session at task creation when the caller explicitly passed a
+    // session (e.g. test fixtures pre-seeding a card); omitted session on a
+    // new todo task stays undefined so the filer's session (or a probe on the
+    // filer's token) never pre-stamps executor attribution before claim time.
+    const session = type === "task" && body.session === undefined
+      ? undefined
+      : await this.resolveSession(body, String(body.token_id ?? ""));
     // project: explicit override or the deployment's project; tasks enter UNCLAIMED (owner = pool)
     const project = String(body.project ?? "").trim() || this.settingsMap().project_name || "superpositional";
     // owner = claimant, on tasks only (phase 4). Other types record their human
@@ -4736,15 +4743,19 @@ export class KnowledgeHub {
     }
     // session attribution: stamp which session claimed/acted, resolved
     // explicit → the token's most recent session (agents pass session on
-    // orient only). A FRESH claim (todo → in_progress) RE-stamps: a released
-    // claim must not inherit the previous holder's session (2026-11-03
-    // incident: the token's last-session fallback resolved a throwaway
-    // doctor-probe session as executor and first-wins froze the mislabel for
-    // the card's whole life — re-stamping on fresh pickup heals such cards).
-    const freshClaim = to === "in_progress" && row.status === "todo";
-    if (row.type === "task" && (freshClaim || !meta.session)) {
-      const sess = await this.resolveSession(body, String(body.token_id ?? ""));
-      if (sess) meta.session = String(sess).slice(0, 120);
+    // orient only). Releasing a task to `todo` clears meta.session alongside
+    // owner_clear so a released card carries no stale executor lease; a fresh
+    // claim (todo → in_progress) re-stamps from the claiming session.
+    if (row.type === "task") {
+      if (verdict.status === "todo") {
+        delete meta.session;
+      } else {
+        const freshClaim = to === "in_progress" && row.status === "todo";
+        if (freshClaim || !meta.session) {
+          const sess = await this.resolveSession(body, String(body.token_id ?? ""));
+          if (sess) meta.session = String(sess).slice(0, 120);
+        }
+      }
     }
     // (release ownership, churn escalate/redirect and the attempt stamp are
     // executor decisions now — machine.ts RULES + effects, BR#2420 F4)
@@ -5474,7 +5485,7 @@ export class KnowledgeHub {
       ? String(body.agent).trim().slice(0, 60)
       : undefined;
     if (row.status === "blocked" && ((meta.blocked?.reason ?? "").startsWith("abandoned") || isSubprocessBlock)) {
-      await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed — subprocess resolved" : "re-claimed — agent resumed (heartbeat)", gateway: body.gateway, agent: body.agent }, actor);
+      await this.transition({ id, to: "in_progress", note: isSubprocessBlock ? "re-claimed — subprocess resolved" : "re-claimed — agent resumed (heartbeat)", gateway: body.gateway, agent: body.agent, session: body.session, token_id: body.token_id }, actor);
       delete meta.blocked; // transition cleared it in DB — don't resurrect it here
     } else if (row.status === "todo") {
       // progress on an unclaimed task = intent to work it. Claim if allowed;
@@ -5496,7 +5507,7 @@ export class KnowledgeHub {
             note_postscript: `PROGRESS LOGGED BUT TASK NOT CLAIMED — ${id} is unclaimed todo and not qualified for you (label ${actor}). transition {to: "in_progress"} will be rejected until it is qualified: complete an analysis child task, link an accepted decision, or pick qualified work. Analysis/review-role agents may claim unqualified work.`,
           };
         }
-        await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent }, actor);
+        await this.transition({ id, to: "in_progress", note: "started — progress logged", gateway: body.gateway, agent: body.agent, session: body.session, token_id: body.token_id }, actor);
       }
     }
     // (A) declared grace: a silence window for a long op, made while still
@@ -5532,7 +5543,7 @@ export class KnowledgeHub {
       risk_pct:        risk_pct        ?? prev.risk_pct,
       context_pct:     context_pct     ?? prev.context_pct,
     };
-    if (session && !meta.session) meta.session = session;
+    if (session && !questionContribution && (!meta.session || row.status === "todo")) meta.session = session;
     this.state.storage.sql.exec(
       `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
       JSON.stringify(meta), Date.now(), id,
@@ -6018,6 +6029,9 @@ export class KnowledgeHub {
       await this.sessionTouch({ token_id: tokenId, session: named, worktree: body.worktree }).catch(() => {});
       return named;
     }
+    // Token-less internal/admin DO calls have no token to resolve a session
+    // from — never read the shared `token_id = ''` bucket.
+    if (!tokenId) return undefined;
     // gateway-tagged tokens are infrastructure (the gateway daemon, its train
     // executor, its CLI probes): a session-less write from one stays
     // ANONYMOUS — the token's last-session fallback would forge executor
@@ -6025,9 +6039,7 @@ export class KnowledgeHub {
     // (2026-11-03 incident: `bridge doctor`'s throwaway probe session was
     // resolved as the executor of live impl cards). Explicit sessions are
     // still honored above; infrastructure never inherits one.
-    const tok = tokenId
-      ? (this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, tokenId) as any)
-      : null;
+    const tok = this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, tokenId) as any;
     if (tok && tagsSayGateway(tok.tags)) return undefined;
     const row = this.one(
       `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`, tokenId,
