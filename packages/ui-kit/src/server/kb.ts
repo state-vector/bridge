@@ -216,6 +216,11 @@ export interface KbTrainLane {
   /** how many queued cards are waiting on a fresh review (the honest
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
+  /** P4 starvation episode (BR#5674): no merges while holding queued cars —
+   *  since/mins name the episode window, fired_at the one-per-episode alarm,
+   *  ask_id/duty_id the fired ask + spawned diagnostic duty. Cleared on any
+   *  merge. Served by train.status; the panel renders the ⚠ starved chip. */
+  starved?: { since: number; mins: number; fired_at?: number; ask_id?: string; duty_id?: string; kind?: string } | null;
   /** BR#5190 four-tier ladder: root_fix (the bound main-breakage fix, tier 0)
    *  > boosted (the human/starvation boost stamp) > critical (manual
    *  meta.priority rung) > normal; under a stopped lane only root_fix rides. */
