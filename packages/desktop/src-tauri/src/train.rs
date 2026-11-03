@@ -1695,12 +1695,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             if left > 0 {
                 log(Some(key), &format!("fail-closed bound in ~{}m", (left / 60_000).max(1)));
             }
+            let cur_merged = cur.get("burst_merged").and_then(|v| v.as_u64()).unwrap_or(1).min(u32::MAX as u64) as u32;
+            let cur_task = vstr(cur, "task_id").unwrap_or("");
+            let has_other_queued = lane
+                .get("queue")
+                .and_then(|q| q.as_array())
+                .map(|q| q.iter().any(|item| vstr(item, "id").unwrap_or("") != cur_task && item.get("pr").and_then(|v| v.as_i64()) != Some(cur_pr)))
+                .unwrap_or(false);
+            if (burst_cap == 0 || cur_merged < burst_cap) && has_other_queued {
+                log(Some(key), &format!("awaiting-ci with batch slot open ({cur_merged}/{}) — checking remaining queued PRs to merge into this batch before settling CI", if burst_cap == 0 { "∞".to_string() } else { burst_cap.to_string() }));
+            } else {
+                settle_window_rebase(ctx, key, repo, base, lane)?;
+                return Ok(());
+            }
+        } else {
+            // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
+            // update-branch per tick on the first behind+covered queued head, so
+            // conflicts surface during the wait, not at the drain.
+            settle_window_rebase(ctx, key, repo, base, lane)?;
+            return Ok(());
         }
-        // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
-        // update-branch per tick on the first behind+covered queued head, so
-        // conflicts surface during the wait, not at the drain.
-        settle_window_rebase(ctx, key, repo, base, lane)?;
-        return Ok(());
     }
 
     // ---- drain arm (idle, or mid-pass "bursting"): THREE phases (BR#4996,
@@ -1729,12 +1743,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // settles, the refused member waits for the next pass (a fresh pass —
     // pass_merged == 0 — keeps the loud tick error).
     let cur = lane.get("currently").filter(|c| !c.is_null());
-    let bursting = lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("bursting");
+    let cur_phase = lane.pointer("/currently/phase").and_then(|p| p.as_str());
+    let from_awaiting_ci = cur_phase == Some("awaiting-ci");
+    let bursting = cur_phase == Some("bursting") || from_awaiting_ci;
     let mut pass_merged: u32 = if bursting {
-        cur.and_then(|c| c.get("burst_merged")).and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32
+        cur.and_then(|c| c.get("burst_merged")).and_then(|v| v.as_u64()).unwrap_or(if from_awaiting_ci { 1 } else { 0 }).min(u32::MAX as u64) as u32
     } else {
         0
     };
+    let initial_pass_merged = pass_merged;
     let mut tip_sha: String = if bursting {
         cur.and_then(|c| c.get("merge_sha")).and_then(|v| v.as_str()).unwrap_or("").to_string()
     } else {
@@ -2462,7 +2479,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             None => method_flag_for(&ctx.method),
         };
         ctx.tick_attempted = true;
-        if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
+        let mut merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+        if pass_merged > 0 {
+            for wait_secs in [3u64, 5, 8] {
+                let is_transient_post_merge = match &merge_res {
+                    Err(e) => {
+                        let l = e.to_lowercase();
+                        l.contains("base branch was modified")
+                            || l.contains("try the merge again")
+                            || l.contains("pull request is not mergeable")
+                    }
+                    Ok(_) => false,
+                };
+                if !is_transient_post_merge {
+                    break;
+                }
+                renew_lease(ctx, repo, base);
+                std::thread::sleep(Duration::from_secs(wait_secs));
+                renew_lease(ctx, repo, base);
+                merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+            }
+        }
+        if let Err(err) = merge_res {
             let low = err.to_lowercase();
             if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
                 // strict protection wants the branch current — the one case
@@ -2483,8 +2521,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     RefusalFallback::UpdateBranch => {
                         ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
                         ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
-                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
-                        break; // BR#4996: the batch tail below settles the landed prefix honestly
+                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, continuing batch"));
+                        continue;
                     }
                     RefusalFallback::ConflictBounce => {
                         // BR#4066: the event kind is REFINED from the
@@ -2504,16 +2542,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         ctx.mcp("train_event", ev)?;
                         ctx.note(&format!("bounced PR #{pr} [{event_kind}] — {}", trunc(&conflict_reason, 120)));
                         let files_note = format!("conflicts in {} file(s): {}{}", tm_files.len(), tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" });
-                        log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
-                        // BR#4996: mid-batch the landed prefix still owes its
-                        // settle; a fresh pass releases honestly (the bounce
-                        // already ended the batch walk).
-                        if pass_merged > 0 {
-                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                        } else {
-                            release_if_idle(ctx, key, repo, base)?;
-                        }
-                        return Ok(());
+                        log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}; continuing batch"));
+                        continue;
                     }
                     RefusalFallback::StaleOrInfra => {
                         // BR#5252 (b): a file-less not-clean read (real text
@@ -2530,16 +2560,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                             if zero_behind { "; head is 0 behind (base tip ∈ ancestry)" } else { "" },
                             trunc(&err, 200)
                         ));
-                        log(Some(key), &format!("PR #{pr}: phantom merge refusal (BR#5252) — no bounce, retrying next tick"));
-                        // Same batch courtesy as a soft-break: the landed
-                        // prefix settles, the phantom-refused member waits
-                        // for the next pass (BR#4996).
-                        if pass_merged > 0 {
-                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                        } else {
-                            release_if_idle(ctx, key, repo, base)?;
-                        }
-                        return Ok(());
+                        log(Some(key), &format!("PR #{pr}: phantom merge refusal (BR#5252) — no bounce, continuing batch"));
+                        continue;
                     }
                 }
             }
@@ -2566,12 +2588,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
             } else {
                 // BR#4996 soft-break: a refused merge mid-batch must not fail the
-                // whole tick — the landed prefix settles, the refused member
-                // waits for the next pass. A fresh pass keeps the loud error.
-                if pass_merged > 0 {
-                    log(Some(key), &format!("batch soft-break: gh pr merge refused PR #{pr} mid-batch ({}) — settling the landed prefix of {} merge(s)", trunc(&err, 200), pass_merged));
-                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                    return Ok(());
+                // whole tick — continue to the remaining batch members and settle
+                // at the end of the batch.
+                if pass_merged > 0 || bi + 1 < batch.len() {
+                    log(Some(key), &format!("batch soft-skip: gh pr merge refused PR #{pr} ({}) — continuing to remaining batch members", trunc(&err, 200)));
+                    continue;
                 }
                 return Err(err);
             }
@@ -2625,6 +2646,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // per drain pass, on the FINAL merge commit (BR#4934, unchanged).
     // Otherwise the lane is honestly idle.
     if pass_merged > 0 && !tip_sha.is_empty() {
+        if from_awaiting_ci && pass_merged == initial_pass_merged {
+            settle_window_rebase(ctx, key, repo, base, lane)?;
+            return Ok(());
+        }
         burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
         return Ok(());
     }
