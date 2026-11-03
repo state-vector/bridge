@@ -9,6 +9,14 @@
  *  #2466 class: a session died post-open and the PR sat APPROVED+MERGEABLE
  *  34h, invisible to every stamp-gated mechanism).
  *
+ *  BR#5677: BINDING outranks the review gate. A PR whose card exists is
+ *  accounted as bound even with NO review decision — train-owned PRs read
+ *  reviewDecision="" (branch protection dismisses the bot's approval on
+ *  every rebase), and gating the binding lookup on a review decision made
+ *  the whole accounting read green vacuously ("0 bound / 54 unreviewed")
+ *  while the train held 37 cars. `unreviewed` counts only genuinely-unbound
+ *  PRs.
+ *
  *  Division of labour (accepted BR#3507/BR#3499: the hub holds NO VCS
  *  credentials): a gateway daemon runs the read-only `gh pr list` and feeds
  *  observations via reconcile.report; the HUB owns this join, the decisions,
@@ -213,8 +221,11 @@ export function accountingLine(a: ReconcileAccounting): string {
 
 /** Join one repo's observed open PRs against the board projection and emit
  *  one judgement per PR plus the accounting report. The order of checks IS
- *  the precedence: binding > ignore > duty(in-flight) > duty(dead, alarm) >
- *  spawn/grace. See the module docstring for the invariants. */
+ *  the precedence: binding > review-gate (BR#5677: a bound card accounts the
+ *  PR even with NO review decision — train-owned PRs read reviewDecision=""
+ *  because branch protection dismisses the bot approval on every rebase) >
+ *  ignore > duty(in-flight) > duty(dead, alarm) > spawn/grace. See the
+ *  module docstring for the invariants. */
 export function reconcileJoin(args: {
   repo: string;
   prs: ReconcilePr[];
@@ -252,12 +263,6 @@ export function reconcileJoin(args: {
   const drafts = prs.filter((p) => p.isDraft);
   const reviewed = prs.filter((p) => !p.isDraft);
   for (const p of reviewed) {
-    if (!p.reviewDecision) {
-      acc.unreviewed++;
-      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: "no review decision yet — owner active, out of the invariant's scope" });
-      continue;
-    }
-    acc.open_reviewed++;
     const age = prAgeMs(p.updatedAt, cfg.now);
     const approved = p.reviewDecision === "APPROVED";
     // verify-eligible = the PR could pass the 5c gate TODAY: mergeable AND a
@@ -271,6 +276,17 @@ export function reconcileJoin(args: {
     //    exists but was never queued still accounts the PR; if its verify
     //    never spawned and the PR is verify-eligible past the grace, spawn
     //    the standard duty on the EXISTING card — never a second card).
+    //    BR#5677: the binding check runs BEFORE the reviewDecision gate.
+    //    Every train-owned PR reads reviewDecision="" (branch protection
+    //    dismisses the bot's approval on every rebase), so gating the
+    //    binding lookup on a review decision made the entire bound/duty
+    //    accounting unreachable for exactly the PRs the train owns — 56 of
+    //    them read "unreviewed" while their cards sat in the bindings map
+    //    (the census: "0 bound / 54 unreviewed" against a 37-car train).
+    //    A bound card accounts the PR regardless of reviewDecision; with
+    //    no decision, approved/verifyEligible are false by construction, so
+    //    an unreviewed bound card can never spawn a verify duty — it
+    //    accounts as bound (queued/lane/in-flight per its stamps).
     const b = bindings.get(p.number);
     if (b) {
       if (b.lane) {
@@ -300,6 +316,14 @@ export function reconcileJoin(args: {
       }
       continue;
     }
+    // BR#5677: only GENUINELY-unbound PRs reach the unreviewed bucket — a
+    // bound PR above is accounted whatever GitHub says about its reviews.
+    if (!p.reviewDecision) {
+      acc.unreviewed++;
+      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: "no review decision yet — owner active, out of the invariant's scope" });
+      continue;
+    }
+    acc.open_reviewed++;
     // 2. ignored-with-reason — an explicit human/agent ruling.
     if (ignores.has(p.number)) {
       acc.ignored++;

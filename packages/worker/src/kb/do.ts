@@ -10378,8 +10378,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // a full queue: the train bounces each head, the head leaves for a
       // review, the next head bounces… count them so the panel can tell
       // that story.
+      // BR#5677: LIVE cards only. The merge_train stamp is never cleaned on
+      // close, so every done/superseded card on a merged PR keeps its stale
+      // `bounced`/`awaiting` state forever — counting them inflated the
+      // awaiting-review figure with zombies (the census decode: 24 "awaiting
+      // review" against a handful of live parks).
       const awaitingReview = (this.state.storage.sql.exec(
-        `SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
+        `SELECT id, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked') AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
       ).toArray() as any[]).filter((c) => {
         const m = JSON.parse(c.meta ?? "{}");
         return trainCardMatchesLane(m, lane.repo, lane.base);
@@ -10820,12 +10825,32 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const bindings: ReconcileBinding[] = [];
     for (const row of openCards) {
       const meta = JSON.parse(row.meta ?? "{}");
+      const legSet = new Set<string>();
       const legs = [
         { number: Number((meta.pr ?? {}).number), repo: String((meta.pr ?? {}).repo ?? "") },
         ...(Array.isArray(meta.prs) ? meta.prs : []).map((l: any) => ({ number: Number(l?.number), repo: String(l?.repo ?? "") })),
+        // BR#5677: a meta.merge_train stamp is binding evidence too. The
+        // train's parked/queued stamps (awaiting, bounced, queued) carry
+        // (pr, repo) ON the stamp — a card whose meta.pr/meta.prs legs were
+        // never written (or drifted off the stamp's PR) still binds the PR
+        // the stamp names. Repo must match EXPLICITLY: PR numbers are
+        // per-repo namespaces, and a bare stamp pr without a repo (the
+        // "unbound" queue-refusal stamp) names no repo we can trust, so it
+        // binds nothing — a guessed repo would false-bind another repo's PR
+        // number and read a cardless PR as accounted.
+        ...(() => {
+          const mt = (meta.merge_train ?? {}) as Record<string, any>;
+          const mtPr = Number(mt.pr ?? 0);
+          return String(mt.repo ?? "") === repo && Number.isInteger(mtPr) && mtPr > 0
+            ? [{ number: mtPr, repo: String(mt.repo ?? "") }]
+            : [];
+        })(),
       ];
       for (const leg of legs) {
         if (leg.repo !== repo || !Number.isInteger(leg.number) || leg.number <= 0) continue;
+        const legKey = `${leg.repo}#${leg.number}`;
+        if (legSet.has(legKey)) continue; // one binding per (card, pr) — BR#5370
+        legSet.add(legKey);
         const seen = this.one(`SELECT missing FROM reconcile_seen WHERE repo = ? AND pr = ?`, repo, leg.number) as any;
         const prov = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, repo, leg.number) as any;
         bindings.push({
