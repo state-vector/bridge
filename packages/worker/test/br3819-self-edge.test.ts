@@ -24,6 +24,12 @@ import { RELATIONS } from "../src/kb/core.ts";
  *      (no live signal within the stale window, ask older than it) is
  *      released to the pool for fresh dispatch — never resumed onto a
  *      finished runner.
+ *   E. (BR#5902) the dead-holder release leg is hold-clean — a park still
+ *      held by a typed wait (a time await, a train queue slot, an
+ *      unanswered sibling ask) skips + audits instead of feeding the
+ *      BR#4067 release backstop a refused blocked→todo — and the standing
+ *      alarm sink (train_alarm_sink_id) is exempt from ask-answer
+ *      dispatch entirely.
  */
 
 let mf: Miniflare;
@@ -228,4 +234,69 @@ describe("BR#3819 D — ask answers resume live holders and release dead ones", 
       await kbJson("/admin.settings_set", { settings: { stale_minutes: 10 } });
     }
   }, 130_000);
+});
+
+describe("BR#5902 — ask answers never move held parks or the alarm sink", () => {
+  it("a HELD park is skipped by the dead-holder release leg — never a refused blocked→todo (the breach class)", async () => {
+    const { task, ask } = await parkedOnAsk(`held-park-${Date.now()}`);
+    // Resume, then re-park on a typed TIME await: the time hold survives the
+    // answer's ask-wait cleanup into the dead-holder leg — exactly the sink's
+    // breach shape (blocked on {event:"time"} with an open bound ask, holder
+    // long dead). Without the releaseHold pre-check this answer attempted a
+    // machine blocked→todo, the release backstop refused it
+    // (release-holds-typed-await), and the audited refusals folded breach
+    // card BR#5902 (3 events from one human answer batch on BR#3124).
+    await kbJson("/transition", { id: task, to: "in_progress", note: "resume for re-park" });
+    await kbJson("/transition", {
+      id: task, to: "blocked", note: "drill: parked on a live time hold",
+      await_event: { event: "time", until_ts: Date.now() + 600_000 },
+    });
+    const parked = await get(task);
+    expect(parked.status).toBe("blocked");
+    expect(parked.meta?.blocked?.await_event?.event).toBe("time");
+    // shrink the stale window to its 1-minute floor and let the holder go
+    // quiet past it, so the answer hits the DEAD-holder leg with the hold live
+    await kbJson("/admin.settings_set", { settings: { stale_minutes: 1 } });
+    try {
+      await sleep(61_000);
+      const { body } = await kbJson("/ask.answer", { id: ask, answer: "GO" });
+      expect(body.error).toBeUndefined();
+      expect(body.task_status).toBeUndefined(); // the dispatch skipped — moved nothing
+      const card = await get(task);
+      expect(card.status).toBe("blocked"); // the hold owns the exit
+      expect(card.meta?.blocked?.await_event?.event).toBe("time");
+      const notes = (await history(task)).map((v) => `${String(v.summary ?? "")} ${String(v.data?.note ?? "")}`);
+      expect(notes.some((n) => n.includes("released to the pool"))).toBe(false);
+    } finally {
+      await kbJson("/admin.settings_set", { settings: { stale_minutes: 10 } });
+    }
+  }, 130_000);
+
+  it("the standing alarm sink is exempt from ask-answer dispatch entirely — even a live holder moves nothing", async () => {
+    const { task, ask } = await parkedOnAsk(`alarm-sink-${Date.now()}`);
+    // sink-shaped: resumed, re-parked on a time hold, and named the alarm
+    // sink via the setting. No sleep: the holder stays LIVE, which makes the
+    // assertion stronger — without the exemption the resume leg would fire
+    // (blocked→in_progress is not hold-gated), so "still blocked" proves the
+    // exemption, not the hold.
+    await kbJson("/transition", { id: task, to: "in_progress", note: "resume for re-park" });
+    await kbJson("/transition", {
+      id: task, to: "blocked", note: "drill: sink-shaped park",
+      await_event: { event: "time", until_ts: Date.now() + 600_000 },
+    });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: task } });
+    try {
+      const { body } = await kbJson("/ask.answer", { id: ask, answer: "GO" });
+      expect(body.error).toBeUndefined();
+      expect(body.task_status).toBeUndefined();
+      const card = await get(task);
+      expect(card.status).toBe("blocked");
+      expect(card.meta?.blocked?.await_event?.event).toBe("time");
+      const notes = (await history(task)).map((v) => `${String(v.summary ?? "")} ${String(v.data?.note ?? "")}`);
+      expect(notes.some((n) => n.includes("released to the pool"))).toBe(false);
+      expect(notes.some((n) => n.includes("answered — resumed"))).toBe(false);
+    } finally {
+      await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: "BR#3124" } });
+    }
+  });
 });
