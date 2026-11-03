@@ -88,7 +88,14 @@ export const TOOL_ARG_SCHEMAS = {
     id: z.string(),
     title: z.string().optional(),
     body_md: z.string().optional(),
+    /** BR#5807: per-key MERGE against the stored meta (omitted keys preserved,
+     *  present top-level keys replace wholesale) — not a whole-object replace. */
     meta: z.record(z.string(), z.unknown()).optional(),
+    /** Explicit key removal (the only way to drop a meta key now). Lane-card
+     *  infrastructure keys (lane/lease/currently/stop) and a parked card's
+     *  blocked (when it carries a typed await) refuse meta_delete from agent
+     *  sessions — machinery/human authority only, BR#5807. */
+    meta_delete: z.array(z.string()).optional(),
     tags: z.array(z.string()).optional(),
     roles: z.array(z.string()).optional(),
   }),

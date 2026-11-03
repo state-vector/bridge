@@ -165,7 +165,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("create", { ...args, session: args.session, token_id: ctx.identity.token_id }))),
   },
   update_artefact: {
-    description: "Edit title/body/meta/tags/roles. Does not change status — use transition.",
+    description: "Edit title/body/meta/tags/roles. meta MERGES per top-level key: keys you pass replace wholesale (nested objects must be complete), keys you omit are PRESERVED — meta is infrastructure on lane cards (lane/lease/currently/stop) and parked cards (blocked.await_event); never re-send a partial meta expecting replace (BR#5807). Remove keys explicitly with meta_delete: [\"key\"] — null values store as null, not deletes; lane/park infrastructure keys refuse meta_delete from agent sessions (route through an answered ask or the web). Does not change status — use transition.",
     schema: TOOL_ARG_SCHEMAS.update_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("update", args))),
   },

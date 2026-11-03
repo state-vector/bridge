@@ -411,6 +411,18 @@ Only code work opens a PR. A URL that isn't a GitHub PR/issue/run URL is not
 a receipt, and a dispatch run that was provider-blocked (no model, no
 endpoints) can never hand off as complete.
 
+**Card edits merge (BR#5807)**: `update_artefact {meta}` is a per-key MERGE, not a
+whole-object replace — each top-level key you pass replaces wholesale (nested objects
+must be complete), and every key you omit is PRESERVED. meta is infrastructure on lane
+cards (`lane`/`lease`/`currently`/`stop`) and parked cards (`blocked.await_event`): a
+partial-meta edit can no longer amputate lane config or a typed wait (the BR#5733
+near-miss, where a single-key edit silently dropped a lane card's entire config).
+Removing a key is explicit — `meta_delete: ["key"]` — and a `null` value stores as
+null rather than deleting. Lane/park infrastructure keys refuse `meta_delete` from
+agent sessions (machinery/web/human authority only — the same authority class as the
+close-protection law), and every meta set/delete is named in the card's history line,
+so a meta shrink is never silent.
+
 ## Agent lanes: roles & playbooks
 
 Tokens are lane-tagged: `role:analysis`, `role:impl`, `role:review`. The hub composes the

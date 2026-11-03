@@ -33,8 +33,11 @@ export const VERDICT_ROLES: Role[] = ["review", "unblock"];
 
 const HUMAN_ACTOR = /^web(:|$)|^human:/;
 // system actors (watchdog, churn-guard, separation) act ON claims — releases
-// they perform are the machinery working, not agents dumping each other's work
-const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
+// they perform are the machinery working, not agents dumping each other's work.
+// Exported for the BR#5807 meta-integrity guard (do.ts update): the same
+// human/machinery authority that protects lane cards from closing protects
+// their lane-config meta keys from meta_delete.
+export const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
 
 export interface RuleInput {
   id: string;

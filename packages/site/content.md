@@ -70,6 +70,8 @@ Every shape that crosses a runtime boundary is a checked-in contract: zod schema
 
 The channel itself fails typed: when the hub's storage layer faults, every machine-plane arm answers JSON — `{"result_class": "infra_storage_fault"}` with HTTP 503 — never an HTML error page, and never a fake `401 unauthorized` (an infrastructure outage must read as "retry", not "your token is broken"; BR#4212). `/stats` exposes the channel's health as numbers — per-route success rates, storage-fault recency — so "the hub is down" is a predicate a watchdog can evaluate, not a silence it has to guess at. The one thing a 503 never means is "the hub refused": gate rejections (an illegal transition edge, open children blocking a close, a claim race) are deterministic answers, stamped `result_class: "gate_rejected"` with the rule named, HTTP 400, surfaced as a tool error whose message carries `[rule: …]` — read it and act on it, never retry it as an outage (BR#4390).
 
+Card edits are safe by construction (BR#5807): `update_artefact {meta}` merges per top-level key — what you pass replaces that key wholesale, what you omit is preserved — because meta is infrastructure (a lane card's `lane`/`lease`/`currently`/`stop`, a parked card's typed `blocked.await_event`). The BR#5733 near-miss, where a single-key edit silently dropped a lane card's whole config, cannot recur: key removal is an explicit `meta_delete: ["key"]`, lane/park keys refuse `meta_delete` from agent sessions, and every meta set/delete is named in the card's history line.
+
 ## Task types and how they connect
 
 One task type, five kinds. The status machine is shared. Each kind has its own flow, and the server enforces it.
