@@ -8237,7 +8237,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // BR#4981: the derived queue head (what the train is attempting) and the
     // lane's last ledger action (the bounce feed) are both hub-derivable.
     const queue = lane ? this.laneQueue(lane.repo, lane.base) : [];
-    const head = queue[0]?.id ? String(queue[0].id) : null;
+    const qfEntries: any[] = Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : [];
+    const qfCls = (id: string) => String(qfEntries.find((e: any) => e.id === id)?.cls ?? "");
+    const activeQueue = queue.filter((q) => !currently?.task_id || q.id !== String(currently.task_id));
+    const readyQueueItem = activeQueue.find((q) => qfCls(q.id) === "ready");
+    const head = String((readyQueueItem ?? activeQueue[0] ?? queue[0])?.id ?? "") || null;
     const lastAct: any = lane ? (this.state.storage.sql.exec(
       `SELECT ts, kind, pr, task_id FROM train_events WHERE repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
       lane.repo, lane.base,
@@ -8271,9 +8275,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ? (() => {
           const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
           const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-          return st === "bounced"
-            ? { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` }
-            : { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
+          const cls = qfCls(head);
+          if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
+            return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
+          }
+          if (cls === "blocked" || cls === "conflict") {
+            return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
+          }
+          if (cls === "waiting" && String(bsQf?.base_state?.verdict ?? "") === "green") {
+            return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
+          }
+          return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
         })()
       : null;
     let reason: string;
@@ -10937,14 +10949,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the raw "0/h" rate never told). BR#4962 (per BR#4960): coverage
       // bounces now PARK `awaiting` instead of stamping `bounced` — same
       // plain-words story, so both classes read as awaiting a fresh review.
-      const head = queue[0]?.id ? String(queue[0].id) : null;
+      const qfEntries: any[] = Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : [];
+      const qfCls = (id: string) => String(qfEntries.find((e: any) => e.id === id)?.cls ?? "");
+      const activeQueue = queue.filter((q) => !meta.currently?.task_id || q.id !== String(meta.currently.task_id));
+      const readyQueueItem = activeQueue.find((q) => qfCls(q.id) === "ready");
+      const head = String((readyQueueItem ?? activeQueue[0] ?? queue[0])?.id ?? "") || null;
       const headHold = head
         ? (() => {
             const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
             const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-            return st === "bounced" || st === "awaiting"
-              ? { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` }
-              : { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
+            const cls = qfCls(head);
+            if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
+              return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
+            }
+            if (cls === "blocked" || cls === "conflict") {
+              return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
+            }
+            if (cls === "waiting" && String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green") {
+              return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
+            }
+            return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
           })()
         : null;
       // cards bounced off this lane and not yet re-accepted — gate/conflict
@@ -11027,17 +11051,30 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
         // 1. Queued cars (already verify-accepted onto the merge train).
         // When the executor walk completed without terminating early on a bounce
-        // (every walked entry is "ready" or "waiting"), any queued card that has
-        // NO entry in `facts` was skipped by the walk because its PR is CLOSED
-        // on GitHub (e.g. SP #2659 on BR#5639) — never count it as ready.
+        // (every walked entry is "ready" or "waiting"), any queued card that was
+        // already queued BEFORE the walk (`status_ts <= qfAt`) and has NO entry in
+        // `facts` was skipped by the walk because its PR is CLOSED on GitHub.
+        const qfAt = Number(meta.lane?.queue_facts?.at ?? 0);
+        const baseGreenInWalk = String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green";
         const walkCompletedWithoutBounce =
           facts.length > 0 &&
           facts.every((e: any) => e.cls === "ready" || e.cls === "waiting");
         for (const q of queue) {
           seenCards.add(q.id);
           if (q.pr) seenPrs.add(Number(q.pr));
+          // Already merged and currently settling on main — not waiting in the backlog
+          if (
+            (meta.currently?.task_id && q.id === String(meta.currently.task_id)) ||
+            (q.pr && Number(meta.currently?.pr) === Number(q.pr))
+          ) {
+            continue;
+          }
           const cls = factFor(q.id);
-          if (cls === "conflict" || cls === "blocked" || (walkCompletedWithoutBounce && cls === "")) {
+          const qRow = walkCompletedWithoutBounce && cls === "" && qfAt > 0
+            ? (this.one(`SELECT status_ts FROM artefacts WHERE id = ?`, q.id) as any)
+            : null;
+          const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qRow || Number(qRow.status_ts ?? 0) <= qfAt);
+          if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {
             verifying++;
@@ -11047,9 +11084,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               state: "waiting",
               detail: "waiting to be verified — needs a fresh review",
             });
+          } else if (cls === "waiting" && baseGreenInWalk) {
+            // Base was green in the walk, so this car was skipped because its
+            // own head checks / mergeability / gate-rerun are still running
+            verifying++;
+            batchCandidates.push({
+              id: q.id,
+              ...(q.pr ? { pr: q.pr } : {}),
+              state: "verifying",
+              detail: "being verified — checks/mergeability running",
+            });
           } else {
-            // cls === "ready", cls === "waiting" (already verify-accepted; waiting
-            // on base settle or CI), or not walked yet ("") → verified & ready (green)
+            // cls === "ready", or cls === "waiting" while base is settling, or
+            // newly verify-accepted after the last walk → verified & ready (green)
             ready++;
             batchCandidates.push({
               id: q.id,
@@ -11146,7 +11193,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           }
         }
 
-        // 5. Reconcile-seen open PRs on this repo not yet covered above ("So we can see all PRs")
+        // 5. Reconcile-seen open PRs on this repo not yet covered above
         if (lane.base === "main") {
           for (const rs of this.state.storage.sql.exec(
             `SELECT pr, card FROM reconcile_seen WHERE repo = ? AND missing = 0 ORDER BY pr ASC`,
@@ -11156,29 +11203,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             if (!prNum || seenPrs.has(prNum) || mergedPrs.has(prNum) || ignoredPrs.has(prNum)) continue;
             seenPrs.add(prNum);
             const boundCardId = String(rs.card ?? "").trim();
-            const boundCard = boundCardId
-              ? (this.one(`SELECT id, status, meta, updated_ts FROM artefacts WHERE id = ?`, boundCardId) as any)
-              : null;
-            const bm = boundCard ? JSON.parse(boundCard.meta ?? "{}") : {};
-            if (boundCard && String(boundCard.status) === "in_progress" && String(bm?.merge_train?.state ?? "") !== "awaiting") {
-              inProgress++;
-              continue;
-            }
-            const isVerifiedReady =
-              boundCard &&
-              String(boundCard.status) === "blocked" &&
-              (String(bm?.merge_train?.state ?? "") === "queued" ||
-                /VERIFY ACCEPT/i.test(String(bm?.blocked?.reason ?? "")));
-            if (isVerifiedReady) {
-              ready++;
-              batchCandidates.push({
-                id: boundCardId,
-                pr: prNum,
-                state: "ready",
-                detail: "verified — ready to merge",
-              });
-              continue;
-            }
             const vDuty = this.one(
               `SELECT d.duty_id AS duty_id, a.status AS status, a.meta AS meta, a.updated_ts AS updated_ts
                FROM reconcile_duties d JOIN artefacts a ON a.id = d.duty_id
@@ -11189,14 +11213,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               ? (this.one(
                   `SELECT a.id AS duty_id, a.status AS status, a.meta AS meta, a.updated_ts AS updated_ts
                    FROM relations rel JOIN artefacts a ON a.id = rel.src_id
-                   WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task' AND a.status IN ('todo','in_progress')
+                   WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task'
+                     AND a.status IN ('todo','in_progress') AND a.title LIKE 'Verify:%'
                    ORDER BY a.created_ts DESC LIMIT 1`,
                   boundCardId,
                 ) as any)
               : null;
             const activeDuty = vDuty ?? childVerify;
-            verifying++;
             if (activeDuty) {
+              verifying++;
               const dm = JSON.parse(activeDuty.meta ?? "{}");
               const sig = Math.max(Number(dm.session_alive_ts ?? 0), Number(dm.last_progress?.ts ?? 0), Number(activeDuty.updated_ts ?? 0));
               const live = String(activeDuty.status) === "in_progress" && now0 - sig < 10 * 60_000;
@@ -11208,12 +11233,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 detail: live ? `being verified (${activeDuty.duty_id} in progress)` : `waiting to be verified (${activeDuty.duty_id} queued)`,
               });
             } else {
-              batchCandidates.push({
-                id: boundCardId || `PR#${prNum}`,
-                pr: prNum,
-                state: "waiting",
-                detail: "waiting to be verified",
-              });
+              inProgress++;
             }
           }
         }

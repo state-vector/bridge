@@ -61,7 +61,8 @@ function lockDot(l: KbTrainLane, now: number): { sd: "live" | "lapse" | "dead" |
  *  (the walk continues to the next ready PR). */
 function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string; card?: string; pr?: number } {
   const reason = l.reason ?? "";
-  const curPr = l.currently?.pr ?? l.queue[0]?.pr ?? undefined;
+  const attemptPr = l.attempt ? l.queue.find((q) => q.id === l.attempt?.card)?.pr : undefined;
+  const curPr = l.currently?.pr ?? attemptPr ?? l.queue[0]?.pr ?? undefined;
   const curCard = l.currently?.task_id ?? l.attempt?.card ?? undefined;
   if (l.stop)
     return {
@@ -117,10 +118,30 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
         : `a batch is landing back-to-back; main settles when the batch finishes`,
     };
   }
+  const rdyCount = l.pr_stats?.ready ?? 0;
+  const verCount = l.pr_stats?.verifying ?? 0;
+  if (l.starved && rdyCount === 0) {
+    return {
+      tone: "warn", card: curCard, pr: curPr,
+      label: `⚠ starved (${age(l.starved.since, now)}) — 0 ready (${verCount} verifying)`,
+      title: `No merges for ${age(l.starved.since, now)} while holding queued PRs — 0 PRs are ready to merge right now (${verCount} verifying).`,
+    };
+  }
   if (l.attempt) {
-    return l.attempt.hold === "awaiting-review"
-      ? { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` }
-      : { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
+    if (l.attempt.hold === "awaiting-review")
+      return { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` };
+    if (l.attempt.hold === "held-checks" && rdyCount === 0)
+      return { tone: "warn", card: l.attempt.card, pr: curPr, label: `⚠ held — 0 ready (${l.attempt.card}${curPr ? ` PR #${curPr}` : ""} checks failing)`, title: `${l.attempt.note} — 0 PRs are ready to merge; queued PR has failing head checks or conflicts.` };
+    if (l.attempt.hold === "waiting-checks" && rdyCount === 0)
+      return { tone: "muted", card: l.attempt.card, pr: curPr, label: `idle — 0 ready (${verCount} verifying, waiting on PR checks)`, title: `${l.attempt.note} — line is idle because no PRs are ready to merge yet.` };
+    return { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
+  }
+  if (rdyCount === 0 && verCount > 0) {
+    return {
+      tone: "muted",
+      label: `idle — 0 ready (${verCount} verifying)`,
+      title: `Line is idle because no PRs are ready to merge yet (${verCount} verifying). Merges start automatically as soon as verification/checks pass.`,
+    };
   }
   if (l.lease?.holder) {
     const t = lockTone(l, now);
@@ -438,17 +459,22 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                      - orange solid (.tb-wait): waiting to be verified */}
               {(() => {
                 const clsOf = (q: { id: string }) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls ?? "ready";
+                const baseGreen = l.queue_facts?.base_state?.verdict === "green";
                 const fallbackBatches = () => {
                   type Car = { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string };
                   const cars: Car[] = [];
                   let ip = 0, ver = 0, rdy = 0;
                   for (const q of l.queue) {
+                    if ((l.currently?.task_id && q.id === l.currently.task_id) || (q.pr && l.currently?.pr === q.pr)) continue;
                     const cls = clsOf(q);
                     if (cls === "conflict" || cls === "blocked") {
                       ip++;
                     } else if (cls === "needs-review") {
                       ver++;
                       cars.push({ id: q.id, pr: q.pr, state: "waiting", detail: "waiting to be verified — needs a fresh review" });
+                    } else if (cls === "waiting" && baseGreen) {
+                      ver++;
+                      cars.push({ id: q.id, pr: q.pr, state: "verifying", detail: "being verified — checks/mergeability running" });
                     } else if (cls === "ready" || cls === "waiting" || cls !== "") {
                       rdy++;
                       cars.push({
@@ -471,6 +497,8 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                         : `waiting to be verified, parked ${age(now - a.age_ms, now)} ago — force-review from the backlog: approve re-queues, changes requested bounce impl`,
                     });
                   }
+                  const stateRank = (s: Car["state"]) => (s === "ready" ? 0 : s === "verifying" ? 1 : 2);
+                  cars.sort((a, b) => stateRank(a.state) - stateRank(b.state));
                   const cap = typeof l.burst_max === "number" && l.burst_max >= 0 ? l.burst_max : 10;
                   const pairs = l.queue_facts?.conflict_pairs ?? [];
                   const rem = cars.map((_, i) => i);

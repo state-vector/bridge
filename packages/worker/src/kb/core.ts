@@ -1777,19 +1777,24 @@ export interface TrainBatchCar {
  *  `lane.burst_max` (0 = unlimited). Cars that conflict with an earlier member
  *  in Batch k or exceed `cap` defer to Batch k+1 while non-conflicting later
  *  cars still join Batch k (the greedy A↔B↔C → [A, C] then [B] law). */
-export function partitionMergeBatches<T extends { id: string; pr?: number }>(
+export function partitionMergeBatches<T extends { id: string; pr?: number; state?: string }>(
   cars: T[],
   conflictPairsByPr: [number, number][] = [],
   cap: number = DEFAULT_BURST_MAX,
 ): T[][] {
   if (!cars.length) return [];
-  const remaining: number[] = cars.map((_, i) => i);
+  const stateRank = (s: string | undefined): number => (s === "ready" ? 0 : s === "verifying" ? 1 : 2);
+  const ordered = cars
+    .map((c, idx) => ({ c, idx }))
+    .sort((a, b) => stateRank(a.c.state) - stateRank(b.c.state) || a.idx - b.idx)
+    .map((x) => x.c);
+  const remaining: number[] = ordered.map((_, i) => i);
   const batches: T[][] = [];
   const prConflict = (i: number, j: number): boolean => {
-    const pa = Number(cars[i]?.pr ?? 0);
-    const pb = Number(cars[j]?.pr ?? 0);
+    const pa = Number(ordered[i]?.pr ?? 0);
+    const pb = Number(ordered[j]?.pr ?? 0);
     if (!pa || !pb) return false;
-    if (pa === pb && cars[i].id !== cars[j].id) return true;
+    if (pa === pb && ordered[i].id !== ordered[j].id) return true;
     return conflictPairsByPr.some(([a, b]) => (a === pa && b === pb) || (a === pb && b === pa));
   };
   while (remaining.length > 0) {
@@ -1803,10 +1808,10 @@ export function partitionMergeBatches<T extends { id: string; pr?: number }>(
     const chosenSub = selectBatch(clean, subPairs, cap);
     if (!chosenSub.length) {
       // safety fallback (clean is all-true so selectBatch always picks >=1)
-      batches.push([cars[remaining.shift()!]]);
+      batches.push([ordered[remaining.shift()!]]);
       continue;
     }
-    batches.push(chosenSub.map((si) => cars[remaining[si]]));
+    batches.push(chosenSub.map((si) => ordered[remaining[si]]));
     const chosenSet = new Set(chosenSub);
     const nextRemaining = remaining.filter((_, idx) => !chosenSet.has(idx));
     remaining.length = 0;
@@ -1869,6 +1874,12 @@ export const MAIN_RED_TAG = "main-red";
  *  can pass — the one-click human merge ask is the fast lane (BR#5189 §5,
  *  SP #2617 precedent). MUST stay byte-identical to train_gate.rs. */
 export const DEPLOY_HEALTH_PATTERN = "deploy health";
+export const MAIN_GREEN_GATE_PATTERN = "main-green gate";
+
+export function isBaseHealthGateName(name: string): boolean {
+  const lower = String(name ?? "").toLowerCase();
+  return lower.includes(DEPLOY_HEALTH_PATTERN) || lower.includes(MAIN_GREEN_GATE_PATTERN);
+}
 
 /** The failing-main binding a root-fix card must carry: the repo + the exact
  *  failing main-HEAD run sha it cures. */
@@ -2441,7 +2452,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     const head = classifyHeadChecks(i.headChecks);
     if (
       head.verdict === "red" &&
-      head.red.every((r) => r.name.toLowerCase().includes(DEPLOY_HEALTH_PATTERN))
+      head.red.every((r) => isBaseHealthGateName(r.name))
     )
       return {
         kind: "rerun_gate",

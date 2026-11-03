@@ -1065,11 +1065,11 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
       [101, 102, 103],
       [104],
     ]);
-    // burst_max cap = 2 with no conflicts → [101, 102] then [103, 104]
+    // burst_max cap = 2 with no conflicts → ready cars [101, 104] first in Batch 1, then [102, 103] in Batch 2
     const capped = partitionMergeBatches(cars, [], 2);
     expect(capped.map((b) => b.map((c) => c.pr))).toEqual([
-      [101, 102],
-      [103, 104],
+      [101, 104],
+      [102, 103],
     ]);
   });
   it("BR#5897: classifyHeadChecks deduplicates by check name (newest non-cancelled run wins over stale failure)", () => {
@@ -1646,5 +1646,46 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(dutyBody).toContain("required_workflows");
     expect(dutyBody).toContain("Verify pool depth");
     expect(dutyBody).toContain("Park exits");
+  });
+
+  it("partitionMergeBatches orders ready cars ahead of verifying and waiting cars (non-FIFO readiness priority)", () => {
+    const cars = [
+      { id: "BR#1", pr: 101, state: "verifying" as const },
+      { id: "BR#2", pr: 102, state: "waiting" as const },
+      { id: "BR#3", pr: 103, state: "ready" as const },
+      { id: "BR#4", pr: 104, state: "verifying" as const },
+      { id: "BR#5", pr: 105, state: "ready" as const },
+    ];
+    const batches = partitionMergeBatches(cars, [[103, 101]], 3);
+    // Batch 1 gets both ready cars (103, 105) first, plus non-conflicting verifying car (104)
+    expect(batches[0].map((c) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 103, state: "ready" },
+      { pr: 105, state: "ready" },
+      { pr: 104, state: "verifying" },
+    ]);
+    // Batch 2 gets verifying car 101 (conflicted with 103) and waiting car 102
+    expect(batches[1].map((c) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 101, state: "verifying" },
+      { pr: 102, state: "waiting" },
+    ]);
+  });
+
+  it("decideTrainGate self-heals stale main-green gate reds on a green base via rerun_gate", () => {
+    const head = "d".repeat(40);
+    const gate = decideTrainGate({
+      prNumber: 377,
+      headSha: head,
+      cardMeta: { prs: [{ repo: "state-vector/bridge", number: 377, head_sha_at_acceptance: head }] },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "behind",
+      commits: [{ sha: head, verified: true }],
+      headChecks: [
+        { id: 10, name: "main-green gate", status: "completed", conclusion: "failure" },
+        { id: 11, name: "Test", status: "completed", conclusion: "success" },
+      ],
+    });
+    expect(gate.kind).toBe("rerun_gate");
   });
 });

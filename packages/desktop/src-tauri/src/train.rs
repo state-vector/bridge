@@ -1143,6 +1143,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     ctx.tick_attempted = false;
     ctx.tick_landed = 0;
     ctx.tick_error = None;
+    ctx.note(&format!("ticking {key}"));
     let result = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap);
     // BR#5376: the tick's landing truth feeds the stall tracker BEFORE the
     // error path releases the lease. Pure state here; the EVENT fires on the
@@ -2039,6 +2040,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::RerunGate { reason } => ("rerun_gate", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
+        let ready_on_own_head = if gate_base != MainVerdict::Green && matches!(&gate, MergeAction::Skip { reason } if reason.starts_with("base main ")) {
+            matches!(
+                decide_train_gate(crate::train_gate::TrainGateInput {
+                    pr_number: pr,
+                    head_sha: &head_sha,
+                    card_meta: &card_meta,
+                    card_status: card_status.as_deref(),
+                    base_verdict: MainVerdict::Green,
+                    mergeable: facts.get("mergeable").and_then(|v| v.as_bool()),
+                    merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
+                    commits: &commits,
+                    head_checks: &head_checks,
+                    leg_number: Some(leg_number),
+                    root_fix,
+                    base_red_names: &[],
+                }),
+                MergeAction::Merge { .. }
+            )
+        } else {
+            false
+        };
         qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
             MergeAction::Merge { .. } => "ready",
             MergeAction::Bounce { bounce_kind, .. } => match bounce_kind {
@@ -2046,7 +2068,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 crate::train_gate::BounceKind::Coverage => "needs-review",
                 _ => "blocked",
             },
-            MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            MergeAction::Skip { reason } => if reason.contains("no accepted verify") {
+                "needs-review"
+            } else if ready_on_own_head {
+                "ready"
+            } else {
+                "waiting"
+            },
             MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));

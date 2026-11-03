@@ -212,7 +212,7 @@ export interface KbTrainLane {
    *  isn't moving. hold: "awaiting-review" = the PR branch changed after
    *  its last review (a fresh review unblocks it); "merge-checks" = review,
    *  signatures and CI being checked before the merge. */
-  attempt?: { card: string; hold: "awaiting-review" | "merge-checks"; note: string } | null;
+  attempt?: { card: string; hold: "awaiting-review" | "merge-checks" | "waiting-checks" | "held-checks"; note: string } | null;
   /** how many queued cards are waiting on a fresh review (the honest
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;

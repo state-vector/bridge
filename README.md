@@ -507,15 +507,21 @@ solid if waiting to be"):
    progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
    counts verified (`ACCEPT`) PRs ready to merge.
 2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
-   runs `selectBatch` iteratively over the lane's verifying + ready PRs (using
-   the executor's `conflict_pairs` and `lane.burst_max`), separating batches with
-   `.train-block-gap` dividers.
-3. **Verification colour law**: inside each batch, **green solid (`.tb-ready`)** =
+   orders candidates by readiness state first (`ready` → `verifying` → `waiting` —
+   the train is NOT FIFO: ready PRs merge immediately in Batch 1 without waiting on
+   verifying PRs) and runs `selectBatch` iteratively over the lane's verifying + ready
+   PRs (using the executor's `conflict_pairs` and `lane.burst_max`), separating batches
+   with `.train-block-gap` dividers.
+3. **Verification colour law & lane idle/held clarity**: inside each batch, **green solid (`.tb-ready`)** =
    ready (verified), **orange pulsing (`.tb-verifying`)** = actively being
    verified right now (`Verify:` child `in_progress` / live heartbeat <10m /
    walk checks running), **orange solid (`.tb-wait`)** = waiting to be verified
    (`Verify:` child `todo` or idle `awaiting` park; never red on awaiting,
-   never diagonal stripes, per BR#5476).
+   never diagonal stripes, per BR#5476). When `ready === 0`, the lane status pill
+   shows whether the line is idle waiting on verification/PR checks (`idle — 0 ready`)
+   or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
+   the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
+   (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings

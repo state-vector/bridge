@@ -253,7 +253,7 @@ pub fn latest_red_deploy_health_runs(runs: &[MainCheckRun]) -> Vec<MainCheckRun>
         let judge = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled"));
         if let Some(r) = judge {
             if r.conclusion.as_deref().is_some_and(is_red_conclusion)
-                && name.to_lowercase().contains(DEPLOY_HEALTH_PATTERN)
+                && is_base_health_gate_name(&name)
             {
                 out.push((*r).clone());
             }
@@ -463,6 +463,12 @@ pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize)
 /// pass — the one-click human merge ask is the fast lane (BR#5189 §5, SP #2617
 /// precedent). MUST stay byte-identical to core.ts DEPLOY_HEALTH_PATTERN.
 pub const DEPLOY_HEALTH_PATTERN: &str = "deploy health";
+pub const MAIN_GREEN_GATE_PATTERN: &str = "main-green gate";
+
+pub fn is_base_health_gate_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains(DEPLOY_HEALTH_PATTERN) || lower.contains(MAIN_GREEN_GATE_PATTERN)
+}
 
 /// The deterministic one-click human merge ask title for the circular
 /// deploy-health class. BYTE-IDENTICAL to core.ts rootFixFastLaneTitle: the
@@ -716,7 +722,7 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             && head
                 .red
                 .iter()
-                .all(|r| r.name.to_lowercase().contains(DEPLOY_HEALTH_PATTERN))
+                .all(|r| is_base_health_gate_name(&r.name))
         {
             return MergeAction::RerunGate {
                 reason: format!(
@@ -1973,5 +1979,30 @@ mod tests {
             base_red_names: &[],
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
+    }
+
+    #[test]
+    fn stale_main_green_gate_on_green_base_triggers_rerun_gate() {
+        let head = "dddddddddddddddddddddddddddddddddddddddd";
+        let meta = serde_json::json!({ "prs": [ { "repo": "state-vector/bridge", "number": 377, "head_sha_at_acceptance": head } ] });
+        let checks = [
+            run(10, "main-green gate", Some("failure")),
+            run(11, "Test", Some("success")),
+        ];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 377,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("behind".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &checks,
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
+        });
+        assert!(matches!(gate, MergeAction::RerunGate { .. }), "expected RerunGate on stale main-green gate, got {gate:?}");
     }
 }
