@@ -1737,6 +1737,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         return Ok(());
     }
     let mut candidates: Vec<BatchCandidate> = Vec::new();
+    // BR#5911 F2: a "classified fixable, dispatched 0" self-heal tick is a
+    // loud contradiction (the BR#5880 class ran as a silent no-op for 5h).
+    // The RerunGate arm raises it here; it rides the queue_facts stamp below
+    // so the hub renders the stall instead of a healthy-looking lane.
+    let mut self_heal_stall: Option<Value> = None;
     // BR#5265 Fix B + Fix A: ONE base read per walk, hoisted before the
     // loop (the old lazy base_cache re-fetched per gate-reaching entry —
     // same values, wasted calls) — classified SCOPED to the lane's
@@ -2086,6 +2091,32 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         let msg = "error: self-heal contradiction — gate classified a healable deploy-health red but the target derivation found 0 dispatchable run(s); advancing as waiting";
                         ctx.note(msg);
                         log(Some(key), msg);
+                    } else if dispatched == 0 {
+                        // BR#5911 F2: ≥1 healable red classified but 0 re-runs
+                        // dispatched — the no-op loop the BR#5880 incident ran
+                        // for 5h. LOUD: error-level log naming every dispatch
+                        // failure + `self_heal_stalled` rides the queue_facts
+                        // stamp so the hub renders the stall. The entry still
+                        // advances as a clock (waiting), never a bounce.
+                        let last_error = if failures.is_empty() {
+                            "unknown dispatch failure (no gh error captured)".to_string()
+                        } else {
+                            failures.join(" | ")
+                        };
+                        let msg = format!(
+                            "error: self-heal STALLED on PR #{pr}: {} healable deploy-health red(s) classified but 0 re-run(s) dispatched — {last_error}",
+                            targets.len()
+                        );
+                        ctx.note(&format!("self-heal stalled on PR #{pr}: 0/{} re-runs dispatched — {}", targets.len(), trunc(&last_error, 160)));
+                        log(Some(key), &msg);
+                        self_heal_stall = Some(json!({
+                            "pr": pr,
+                            "task_id": head_id,
+                            "classified": targets.iter().map(|r| json!({ "name": r.name, "run_id": r.id })).collect::<Vec<_>>(),
+                            "dispatched": 0,
+                            "since": now_ms(),
+                            "last_error": trunc(&last_error, 300),
+                        }));
                     } else {
                         ctx.note(&format!("self-heal: dispatched {dispatched}/{} stale gate re-run(s) on PR #{pr} — {reason}", targets.len()));
                         log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched}/{} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick", targets.len()));
@@ -2294,6 +2325,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     "last_error": st.last_error,
                 }),
             );
+        }
+        // BR#5911 F2: a self-heal tick that classified ≥1 healable red but
+        // dispatched 0 re-runs stamps the contradiction LOUD — the hub
+        // renders it; a healthy-looking lane must never mask a stalled heal.
+        if let Some(stall) = self_heal_stall.as_ref() {
+            qf.as_object_mut().unwrap().insert("self_heal_stalled".into(), stall.clone());
         }
         let _ = ctx.mcp("train_queue_facts", qf);
         // BR#5376: the ONE-per-episode stall alarm — fired under the walk's
