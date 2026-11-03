@@ -232,6 +232,36 @@ fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<
     CheckVerdict { verdict, red, unsettled, external, green, alarm: None }
 }
 
+/// BR#5880 (live incident, tick 2026-11-03T21:23:47Z on PR #2707): the
+/// self-heal's RE-RUN DISPATCH set is derived with the SAME newest-wins
+/// law as the verdict that fired it (classify_head_checks: newest
+/// non-cancelled run per check name, by highest id) — never the raw
+/// historical check-run list. At the incident the walk cited Nov-2 red
+/// runs (ids 125041293759/125040321562) while the LATEST run on that
+/// exact head sha was SUCCESS (id 126074493096, 17:07Z) — a superseded
+/// red read as live. Re-requesting a superseded red is worse than noise:
+/// it re-opens a check whose latest run already settled, flipping a
+/// healed head back to unsettled on the next tick. The dispatch set is
+/// therefore: per check name, the judge run (highest id, skipping
+/// cancelled) — kept only when THAT run is red-concluded and the check
+/// name matches the deploy-health gate class.
+pub fn latest_red_deploy_health_runs(runs: &[MainCheckRun]) -> Vec<MainCheckRun> {
+    let mut out = Vec::new();
+    for (name, list) in parse_runs(runs) {
+        let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        let judge = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled"));
+        if let Some(r) = judge {
+            if r.conclusion.as_deref().is_some_and(is_red_conclusion)
+                && name.to_lowercase().contains(DEPLOY_HEALTH_PATTERN)
+            {
+                out.push((*r).clone());
+            }
+        }
+    }
+    out
+}
+
 // ---------- legs (core.ts 1285-1338) ----------
 
 #[derive(Clone, Debug)]
@@ -923,6 +953,59 @@ fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_red_deploy_health_ignores_superseded_red_when_latest_green_br5880() {
+        // The exact BR#5880 incident shape on PR #2707's head sha: Nov-2
+        // deploy-health reds (ids 125040321562, 125041293759) still attached
+        // to the sha, while the LATEST run of the same check name was
+        // SUCCESS (id 126074493096, 2026-11-03 17:07Z). The dispatch set
+        // must be EMPTY — re-requesting the superseded reds would re-open a
+        // healed check and flip the head back to unsettled next tick.
+        // (The live fetch itself — ctx.check_runs, a paginated gh read — is
+        // not unit-testable here; this newest-wins law over the fetched set
+        // is the testable half of the invariant.)
+        let runs = vec![
+            run(125_040_321_562, "Deploy health (merge gate)", Some("failure")),
+            run(125_041_293_759, "Deploy health (merge gate)", Some("failure")),
+            run(126_074_493_096, "Deploy health (merge gate)", Some("success")),
+        ];
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
+
+    #[test]
+    fn latest_red_deploy_health_dispatches_the_latest_red_only_br5880() {
+        // A REAL red (the judge run — highest id, non-cancelled — is red):
+        // exactly that run is dispatchable, never the superseded older red.
+        let runs = vec![
+            run(100, "Deploy health (merge gate)", Some("failure")),
+            run(200, "Deploy health (merge gate)", Some("timed_out")),
+        ];
+        let got = latest_red_deploy_health_runs(&runs);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 200, "the judge (newest non-cancelled) run only");
+    }
+
+    #[test]
+    fn latest_red_deploy_health_skips_cancelled_judge_br5880() {
+        // Same judge law as classify_head_checks: a CANCELLED newest run is
+        // not the judge — the next non-cancelled run down decides.
+        let runs = vec![
+            run(300, "Deploy health (merge gate)", Some("cancelled")),
+            run(200, "Deploy health (merge gate)", Some("failure")),
+        ];
+        let got = latest_red_deploy_health_runs(&runs);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 200);
+    }
+
+    #[test]
+    fn latest_red_deploy_health_ignores_other_check_names_br5880() {
+        // Non-deploy-health reds are NOT self-heal dispatchable (the arm
+        // heals only the stale main-deploy-judging gate class).
+        let runs = vec![run(400, "Rust Tests", Some("failure"))];
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
 
     #[test]
     fn classify_main_empty_red_unsettled_green() {

@@ -42,7 +42,7 @@
 
 use crate::train_gate::{
     classify_base_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
-    merge_sweep_human_leg_title, normalize_gh_mergeable,
+    latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     CheckVerdict, DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
@@ -1977,6 +1977,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
         // on the card row, the binding under meta.root_fix).
         let root_fix = is_root_fix_card(&card);
+        // BR#5880 (live incident, tick 2026-11-03T21:23:47Z): every gate
+        // DECISION reads the LIVE check-runs for THIS head sha — the
+        // paginated ctx.check_runs() fetch above, this tick — never a
+        // cached, panel, or prior-tick value. The incident shape: the
+        // self-heal cited Nov-2 red runs on PR #2707's head while that
+        // head's latest run was SUCCESS (id 126074493096, 17:07Z) — the
+        // classification newest-wins law (aeae01cd2) plus this live-read
+        // rule make the cited-verdict-must-be-the-live-verdict invariant:
+        // a cache may speed renders, it must never feed a merge or
+        // self-heal decision.
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
@@ -2051,15 +2061,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if !ctx.write_allowed() {
                     log(Some(key), &format!("IDENTITY GATE: gate re-run dispatch for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); a worker gateway heals the stale red"));
                 } else {
-                    let stale: Vec<&crate::train_gate::MainCheckRun> = head_checks
-                        .iter()
-                        .filter(|r| {
-                            matches!(
-                                r.conclusion.as_deref(),
-                                Some("failure") | Some("timed_out") | Some("action_required") | Some("startup_failure")
-                            ) && r.name.to_lowercase().contains(crate::train_gate::DEPLOY_HEALTH_PATTERN)
-                        })
-                        .collect();
+                    // BR#5880: the dispatch set uses the SAME newest-wins law
+                    // as the verdict that fired this arm (latest judge run per
+                    // check name) — re-requesting a SUPERSEDED red (an older
+                    // run of a name whose latest is green) would re-open a
+                    // healed check and flip the head back to unsettled next
+                    // tick. Never the raw historical list.
+                    let stale = latest_red_deploy_health_runs(&head_checks);
                     let mut dispatched = 0usize;
                     for r in &stale {
                         if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok()
