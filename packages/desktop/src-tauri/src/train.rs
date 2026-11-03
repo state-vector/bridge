@@ -1948,12 +1948,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, awaiting CI"));
             return Ok(());
         }
-        if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935 + BR#5897: a CLOSED PR can never merge — stamp cls:"blocked"
-            // in qfacts so the hub never counts an unmerged closed PR as ready/green,
+        if !crate::train_gate::batch_eligible_state(&vstr(&facts, "state").unwrap_or("").to_string()) {
+            // BR#5911 F3 (extends BR#3935 + BR#5897): the exclusion is ≠OPEN,
+            // not just CLOSED — a MERGED leg whose mergeCommit oid never
+            // reconciled, or any unparseable live state, is equally never a
+            // batch candidate (the BR#5639 ghost ready-car class). Stamp
+            // cls:"blocked" in qfacts so the hub never counts it ready/green,
             // and advance to the next entry this same tick.
+            let live_state = vstr(&facts, "state").unwrap_or("");
+            let shown = if live_state.is_empty() { "unreadable" } else { live_state };
             qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
-            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
+            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} live state is {shown} on GitHub, not OPEN — never a merge candidate; advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
@@ -2399,6 +2404,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 log(Some(key), &format!("batch drain: pass tip {} went RED — stop-the-line fed, batch aborted", &tip_sha[..tip_sha.len().min(9)]));
                 return Ok(());
             }
+        }
+        // BR#5911 F3: the batch landing boundary re-reads the member's LIVE
+        // PR state — the gate verdict rides walk-time facts, and a member can
+        // close or merge between classification and landing (BR#5639 reached
+        // batch `ready` bound to CLOSED PR #2659 while its real leg was
+        // #2759; BR#3935's closed-PR exclusion missed the batch path). Live
+        // state ≠ OPEN is never a merge candidate: log + advance to the next
+        // batch member; the next walk re-derives the entry from the stamp.
+        let live = ctx.pr_facts(repo, pr)?;
+        let live_state = vstr(&live, "state").unwrap_or("").to_string();
+        if !crate::train_gate::batch_eligible_state(&live_state) {
+            let shown = if live_state.is_empty() { "unreadable".to_string() } else { live_state };
+            ctx.note(&format!("batch member PR #{pr} live state is {shown} on GitHub, not OPEN — never a merge candidate; advancing (BR#5911 F3)"));
+            log(Some(key), &format!("batch[{}/{}] PR #{pr} live state {shown} ≠ OPEN — skipped, advancing to the next batch member", bi + 1, batch.len()));
+            continue;
         }
         // ---- the merge leg (Ray, 2026-10-30: "if it's still mergeable, go
         // (squash merges). We only need a rebase if there are conflicts") ----

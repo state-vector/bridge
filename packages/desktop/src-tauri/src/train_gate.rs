@@ -455,6 +455,17 @@ pub fn self_heal_dispatch_targets(runs: &[MainCheckRun]) -> Vec<MainCheckRun> {
     targets
 }
 
+/// BR#5911 F3 — the PR live states a train leg may drive on. GitHub's PR
+/// state is OPEN | CLOSED | MERGED; anything else (a merged leg with no
+/// mergeCommit oid reconciled out above, an unparseable empty read) is never
+/// a batch candidate: log + advance. BR#5639 reached batch `ready` bound to a
+/// CLOSED PR (the real leg was another number) — the closed-PR exclusion
+/// (BR#3935/BR#5897) missed the batch path. Matched case-insensitively: the
+/// GraphQL enum is uppercase, REST lowercase — both name the same live state.
+pub fn batch_eligible_state(state: &str) -> bool {
+    state.eq_ignore_ascii_case("OPEN")
+}
+
 /// The deterministic one-click human merge ask title for the circular
 /// deploy-health class. BYTE-IDENTICAL to core.ts rootFixFastLaneTitle: the
 /// executor files this ask and the hub re-classifies executor-fed reports, so
@@ -1957,5 +1968,17 @@ mod tests {
         let targets = self_heal_dispatch_targets(&checks);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, 200);
+    }
+
+    // ---- BR#5911 F3: ≠OPEN is never a batch candidate ----
+
+    #[test]
+    fn batch_eligible_state_is_open_only() {
+        assert!(batch_eligible_state("OPEN")); // GraphQL enum
+        assert!(batch_eligible_state("open")); // REST lowercase — same state
+        assert!(!batch_eligible_state("CLOSED")); // BR#5639: closed ghost car
+        assert!(!batch_eligible_state("closed"));
+        assert!(!batch_eligible_state("MERGED")); // merged-without-mergeCommit residue
+        assert!(!batch_eligible_state("")); // unparseable read — fail closed
     }
 }
