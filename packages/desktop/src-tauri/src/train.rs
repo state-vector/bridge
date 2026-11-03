@@ -2051,26 +2051,45 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if !ctx.write_allowed() {
                     log(Some(key), &format!("IDENTITY GATE: gate re-run dispatch for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); a worker gateway heals the stale red"));
                 } else {
-                    let stale: Vec<&crate::train_gate::MainCheckRun> = head_checks
-                        .iter()
-                        .filter(|r| {
-                            matches!(
-                                r.conclusion.as_deref(),
-                                Some("failure") | Some("timed_out") | Some("action_required") | Some("startup_failure")
-                            ) && r.name.to_lowercase().contains(crate::train_gate::DEPLOY_HEALTH_PATTERN)
-                        })
-                        .collect();
+                    // BR#5911 F1: the dispatch targets are THE SAME latest-wins
+                    // verdict the gate just rendered (self_heal_dispatch_targets
+                    // re-derives classify_head_checks on this tick's live read) —
+                    // the run the verdict judged per red name, never a superseded
+                    // run id. The BR#5880 live incident re-requested Nov-2 red ids
+                    // on a head whose latest gate run (126074493096) was already
+                    // SUCCESS — hours of "dispatched 0" no-ops.
+                    let targets = crate::train_gate::self_heal_dispatch_targets(&head_checks);
                     let mut dispatched = 0usize;
-                    for r in &stale {
-                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok()
-                            || ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"]).is_ok()
-                        {
+                    let mut failures: Vec<String> = Vec::new();
+                    for r in &targets {
+                        let mut errs: Vec<String> = Vec::new();
+                        let ok = ctx
+                            .sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"])
+                            .map_err(|e| errs.push(format!("rerequest: {}", trunc(&e, 160))))
+                            .is_ok()
+                            || ctx
+                                .sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"])
+                                .map_err(|e| errs.push(format!("jobs/rerun: {}", trunc(&e, 160))))
+                                .is_ok();
+                        if ok {
                             dispatched += 1;
+                        } else {
+                            failures.push(format!("{} (run {}): {}", r.name, r.id, errs.join("; ")));
                         }
                     }
                     renew_lease(ctx, repo, base);
-                    ctx.note(&format!("self-heal: dispatched {dispatched} stale gate re-run(s) on PR #{pr} — {reason}"));
-                    log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick"));
+                    if targets.is_empty() {
+                        // Unreachable while the gate arm above classified a
+                        // healable red from the same read — if it ever fires, the
+                        // premise drifted between classification and dispatch:
+                        // say so loudly, never silently advance (BR#5911 F2 law).
+                        let msg = "error: self-heal contradiction — gate classified a healable deploy-health red but the target derivation found 0 dispatchable run(s); advancing as waiting";
+                        ctx.note(msg);
+                        log(Some(key), msg);
+                    } else {
+                        ctx.note(&format!("self-heal: dispatched {dispatched}/{} stale gate re-run(s) on PR #{pr} — {reason}", targets.len()));
+                        log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched}/{} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick", targets.len()));
+                    }
                 }
                 // the entry is a clock (waiting), never a defect: advance —
                 // the queue is not held by a stale red

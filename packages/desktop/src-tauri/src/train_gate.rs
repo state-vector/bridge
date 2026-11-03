@@ -422,6 +422,39 @@ pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize)
 /// precedent). MUST stay byte-identical to core.ts DEPLOY_HEALTH_PATTERN.
 pub const DEPLOY_HEALTH_PATTERN: &str = "deploy health";
 
+/// BR#5911 F1 — single source of truth for the self-heal's dispatch targets.
+/// The targets are re-derived from THE SAME latest-wins verdict the gate
+/// decision rendered (`classify_head_checks` on the live check-run read) —
+/// never from an independent scan of the raw run list. The BR#5880 incident
+/// (live tick 1793741027674, 2026-11-03): the dispatch filter matched
+/// SUPERSEDED red run ids (Nov-2 125041293759 / 125040321562) on a head whose
+/// latest gate run (126074493096) was already SUCCESS — the walk spent hours
+/// "healing" a red that no longer existed. For each deploy-health-class red
+/// NAME in the verdict, the target is the run the verdict itself judged: the
+/// highest-id non-cancelled run of that name in the live read (the same judge
+/// law classify_head_checks applies).
+pub fn self_heal_dispatch_targets(runs: &[MainCheckRun]) -> Vec<MainCheckRun> {
+    let verdict = classify_head_checks(runs);
+    let healable: Vec<&str> = verdict
+        .red
+        .iter()
+        .map(|r| r.name.as_str())
+        .filter(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN))
+        .collect();
+    let mut targets = Vec::new();
+    for (name, list) in parse_runs(runs) {
+        if !healable.iter().any(|h| *h == name.as_str()) {
+            continue;
+        }
+        let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        if let Some(judge) = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+            targets.push((*judge).clone());
+        }
+    }
+    targets
+}
+
 /// The deterministic one-click human merge ask title for the circular
 /// deploy-health class. BYTE-IDENTICAL to core.ts rootFixFastLaneTitle: the
 /// executor files this ask and the hub re-classifies executor-fed reports, so
@@ -1865,5 +1898,64 @@ mod tests {
             base_red_names: &[],
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
+    }
+
+    // ---- BR#5911 F1: self-heal dispatch targets are latest-wins, verdict-derived ----
+
+    const GATE_NAME: &str = "Deploy health (merge gate)";
+
+    #[test]
+    fn self_heal_targets_never_pick_superseded_run_ids() {
+        // The BR#5880 shape: superseded Nov-2 reds (100/101) under a SUCCESS
+        // latest (200) — the old raw-list filter re-requested 100/101; the
+        // verdict-derived derivation must find NOTHING to dispatch.
+        let checks = [
+            run(100, GATE_NAME, Some("failure")),
+            run(101, GATE_NAME, Some("failure")),
+            run(200, GATE_NAME, Some("success")),
+            run(201, "ci", Some("success")),
+        ];
+        assert!(self_heal_dispatch_targets(&checks).is_empty());
+    }
+
+    #[test]
+    fn self_heal_targets_dispatch_exactly_the_judged_run() {
+        // Latest gate run is RED: the target is THAT run (the one the
+        // verdict judged), not the older failures of the same name.
+        let checks = [
+            run(100, GATE_NAME, Some("failure")),
+            run(200, GATE_NAME, Some("failure")),
+            run(201, "ci", Some("success")),
+        ];
+        let targets = self_heal_dispatch_targets(&checks);
+        assert_eq!(targets.len(), 1, "one healable red name = one target");
+        assert_eq!(targets[0].id, 200);
+        assert_eq!(targets[0].name, GATE_NAME);
+    }
+
+    #[test]
+    fn self_heal_targets_only_the_deploy_health_class() {
+        // A red of another class is a real defect — never a self-heal target;
+        // mixed reds keep only the healable name.
+        let only_other = [run(1, "ci/unit", Some("failure")), run(2, "lint", Some("timed_out"))];
+        assert!(self_heal_dispatch_targets(&only_other).is_empty());
+        let mixed = [run(1, "ci/unit", Some("failure")), run(2, GATE_NAME, Some("failure"))];
+        let targets = self_heal_dispatch_targets(&mixed);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, GATE_NAME);
+    }
+
+    #[test]
+    fn self_heal_targets_judge_skips_cancelled_and_green_names() {
+        // Cancelled-above-red judges the red beneath (same law as the gate);
+        // a name whose judge is green contributes nothing.
+        let checks = [
+            run(300, GATE_NAME, Some("cancelled")),
+            run(200, GATE_NAME, Some("failure")),
+            run(400, "Deploy health (record)", Some("success")),
+        ];
+        let targets = self_heal_dispatch_targets(&checks);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, 200);
     }
 }
