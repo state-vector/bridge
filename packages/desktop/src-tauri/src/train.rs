@@ -547,21 +547,40 @@ impl Ctx {
         Ok(raw)
     }
 
+    /// BR#5623: PAGINATED — GitHub defaults to per_page=30 and returns runs
+    /// newest-first. The 2026-11-02 lane death (10.6h BLOCKED, 54-PR pileup):
+    /// the tip froze after the last merge while scheduled workflows kept
+    /// attaching check-runs to it; once the newest-30 were all newer than the
+    /// deploy runs, the four lane-required runs fell onto page 2 and the
+    /// base-green gate read a false "empty" verdict every tick — fail-closed
+    /// on a green base, self-sustaining (no merge → frozen tip → still more
+    /// runs → worse each hour). Read per_page=100 pages until a short page;
+    /// any gh/parse failure still yields an EMPTY vec (→ Empty verdict →
+    /// lane blocked → fail-closed), never a partial read.
     fn check_runs(&self, repo: &str, sha: &str) -> Vec<MainCheckRun> {
-        let out = self.gh_json(&["api", &format!("repos/{repo}/commits/{sha}/check-runs"), "--jq", "[.check_runs[] | {id, name, status, conclusion, html_url}]"]);
-        let arr = match out {
-            Ok(Value::Array(a)) => a,
-            _ => return vec![],
-        };
-        arr.iter()
-            .map(|r| MainCheckRun {
-                id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                status: r.get("status").and_then(|v| v.as_str()).map(String::from),
-                conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
-                html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
-            })
-            .collect()
+        let mut pages: Vec<Option<Vec<Value>>> = Vec::new();
+        for page in 1..=10 {
+            let out = self.gh_json(&[
+                "api",
+                &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"),
+                "--jq",
+                "[.check_runs[] | {id, name, status, conclusion, html_url}]",
+            ]);
+            match out {
+                Ok(Value::Array(a)) => {
+                    let short = a.len() < 100;
+                    pages.push(Some(a));
+                    if short {
+                        break;
+                    }
+                }
+                _ => {
+                    pages.push(None);
+                    break;
+                }
+            }
+        }
+        check_runs_from_pages(&pages)
     }
 
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
@@ -710,6 +729,29 @@ impl Ctx {
             )),
         }
     }
+}
+
+/// BR#5623: fold paginated check-run pages into MainCheckRuns. A `None`
+/// page (gh/parse failure) fails CLOSED — empty vec, never a partial read:
+/// downstream classifies empty as an "empty" verdict and blocks the lane,
+/// which is the safe direction (a partial page-1-only read is exactly the
+/// bug that killed the lane for 10.6h).
+fn check_runs_from_pages(pages: &[Option<Vec<Value>>]) -> Vec<MainCheckRun> {
+    let mut runs = Vec::new();
+    for page in pages {
+        let arr = match page {
+            None => return vec![],
+            Some(a) => a,
+        };
+        runs.extend(arr.iter().map(|r| MainCheckRun {
+            id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        }));
+    }
+    runs
 }
 
 fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -3401,6 +3443,66 @@ mod tests {
         assert_eq!(method_flag_for("squash"), "--squash");
         assert_eq!(method_flag_for("rebase"), "--rebase");
         assert_eq!(method_flag_for("merge"), "--merge");
+    }
+
+    // ---- BR#5623: paginated check-run read — the base-green gate must see
+    // past GitHub's default 30-entry page 1 ----
+
+    fn filler_run(i: usize) -> Value {
+        json!({
+            "id": 1_000_000 + i as i64,
+            "name": format!("Product surface canary (dev) #{i}"),
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": format!("https://github.example/run/{i}"),
+        })
+    }
+
+    fn required_run(name: &str, id: i64) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": format!("https://github.example/run/{id}"),
+        })
+    }
+
+    const LANE_REQUIRED: [&str; 4] = [
+        "deploy / Deploy to dev",
+        "post-deploy / Post-Deploy Smoke",
+        "post-deploy / DNS chain (front doors)",
+        "post-deploy / Lodestar Storage Health",
+    ];
+
+    #[test]
+    fn check_runs_pagination_finds_required_runs_past_page_one_br5623() {
+        // The 2026-11-02 lane-death shape: a frozen tip with 100 scheduled
+        // runs newer than the four lane-required deploy runs — page 1 (even
+        // at per_page=100) holds only filler, the required runs live on
+        // page 2. The old single-page read classified this exact shape as
+        // verdict "empty" and blocked the lane for 10.6h.
+        let page1: Vec<Value> = (0..100).map(filler_run).collect();
+        let page2: Vec<Value> = LANE_REQUIRED
+            .iter()
+            .enumerate()
+            .map(|(i, name)| required_run(name, 2_000_000 + i as i64))
+            .collect();
+        let runs = check_runs_from_pages(&[Some(page1), Some(page2)]);
+        assert_eq!(runs.len(), 104, "both pages accumulated");
+        let required: Vec<String> = LANE_REQUIRED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(classify_base_check_runs(&runs, &required).verdict, MainVerdict::Green);
+    }
+
+    #[test]
+    fn check_runs_fail_closed_on_a_failed_page_br5623() {
+        // A None page (gh/parse failure) yields an EMPTY vec — never a
+        // partial read. Downstream classifies empty as an "empty" verdict
+        // and blocks the lane: the fail-closed direction is unchanged.
+        let page1: Vec<Value> = (0..100).map(filler_run).collect();
+        assert!(check_runs_from_pages(&[Some(page1), None]).is_empty());
+        assert!(check_runs_from_pages(&[None]).is_empty());
+        assert!(check_runs_from_pages(&[]).is_empty());
     }
 
     // ---- pure helpers: the identity law and its plumbing (BR#4104) ----
