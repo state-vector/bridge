@@ -758,6 +758,33 @@ fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+/// The lane's configured required workflows (BR#5265 Fix B). ONE extraction
+/// shared by the walk's base gate and the stop-release arm — two inline
+/// copies of this would drift, and the resume bar and the merge bar must
+/// read the same list.
+fn lane_required_workflows(lane: &Value) -> Vec<String> {
+    lane.get("required_workflows")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// BR#5717: the verdict that decides whether a stopped line may release.
+///
+/// INVARIANT: the bar to resume the line must never be higher than the bar
+/// to merge onto it. The stop was TRIGGERED by required reds, so the release
+/// bar is the SAME scoped classification the merge gate uses
+/// (`classify_base_check_runs` over the lane's required_workflows, BR#5265
+/// Fix B — "nightly/battery reds never park the train"). The unscoped
+/// whole-tip read latches a stale stop forever on chronic non-required
+/// nightly reds (Guard Fixture Gate, Nightly Release, Meta-review) while
+/// every required workflow sits green on the tip — the 2026-11-03 16-car
+/// stale stop. Un-configured lanes (empty required) keep the legacy
+/// whole-tip read: `classify_base_check_runs` falls back itself.
+fn stop_release_verdict(lane: &Value, tip_runs: &[MainCheckRun]) -> CheckVerdict {
+    classify_base_check_runs(tip_runs, &lane_required_workflows(lane))
+}
+
 /// Lease renewal carries proof-of-progress (BR#4104): the last ledger action
 /// this holder took and its age. The hub ignores the payload today — consuming
 /// it (deny renewal on stale progress while the queue is non-empty) is the
@@ -1059,11 +1086,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
         log(Some(&key), "malformed lane key (want repo@base) — skipping");
         return;
     }
-    let required: Vec<String> = lane
-        .get("required_workflows")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let required: Vec<String> = lane_required_workflows(lane);
     let typical_ms = lane.get("ci_typical_minutes").and_then(|v| v.as_u64()).unwrap_or(TRAIN_CI_TYPICAL_MINUTES) * 60_000;
     // BR#4934 lane config: the burst-drain cap per settle pass (0 = unlimited).
     let burst_cap = parse_burst_max(lane.get("burst_max").unwrap_or(&Value::Null));
@@ -1488,7 +1511,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let stop_sha = vstr(stop, "sha").unwrap_or("");
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+        let v = stop_release_verdict(lane, &ctx.check_runs(repo, &base_sha));
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
@@ -1658,11 +1681,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // never park the train), and stamped whole into the queue_facts
     // payload (Fix A) so the hub renders a loud BLOCKED lane + files the
     // ONE-per-episode human alarm ask while cars are held.
-    let required: Vec<String> = lane
-        .get("required_workflows")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let required: Vec<String> = lane_required_workflows(lane);
     let base_class = if !ctx.base_probe {
         // BR#5265 fix-up (verify bounce, CI run 41261611797 — the PR's own
         // drills failed in CI): the hoisted read is HERMETIC — the drills
@@ -3750,6 +3769,81 @@ mod tests {
         assert!(check_runs_from_pages(&[Some(page1), None]).is_empty());
         assert!(check_runs_from_pages(&[None]).is_empty());
         assert!(check_runs_from_pages(&[]).is_empty());
+    }
+
+    // ---- BR#5717: the stop-release bar is the merge bar, scoped to the
+    // lane's required workflows — call site: the stop-the-line arm in
+    // drive_lane_inner (stop_release_verdict). ----
+
+    #[test]
+    fn stop_release_uses_the_scoped_bar_not_the_whole_tip_br5717() {
+        // The exact 2026-11-03 production shape (16 cars held on a stale
+        // stop): all FOUR lane-required workflows SUCCESS on the stop tip,
+        // an unrelated chronic nightly ("Guard Fixture Gate") FAILURE.
+        // The unscoped whole-tip read latched the stop Red forever; the
+        // release bar is the SAME scoped classification the merge gate
+        // uses (BR#5265 Fix B).
+        let mut pages: Vec<Value> = LANE_REQUIRED
+            .iter()
+            .enumerate()
+            .map(|(i, name)| required_run(name, 3_000_000 + i as i64))
+            .collect();
+        pages.push(json!({
+            "id": 3_000_100,
+            "name": "Guard Fixture Gate",
+            "status": "completed",
+            "conclusion": "failure",
+            "html_url": "https://github.example/run/3000100",
+        }));
+        let runs = check_runs_from_pages(&[Some(pages)]);
+        let lane = json!({ "required_workflows": LANE_REQUIRED });
+
+        // INVARIANT: the bar to resume the line must never be higher than
+        // the bar to merge onto it. Scoped verdict Green releases…
+        let v = stop_release_verdict(&lane, &runs);
+        assert!(
+            matches!(v.verdict, MainVerdict::Green),
+            "required green + unrelated nightly red must RELEASE the stop: got {:?}",
+            v.verdict
+        );
+        // …and the legacy whole-tip read of the SAME tip is Red — the
+        // stale-stop shape the old stop arm classified with.
+        assert!(
+            matches!(classify_main_check_runs(&runs).verdict, MainVerdict::Red),
+            "sanity: the unscoped read of the same tip is Red — this is the stale-stop shape"
+        );
+
+        // A REQUIRED red still holds the line — scoping narrows the judge
+        // set, it never blinds the arm to the workflows that stopped it.
+        let mut red_tip: Vec<Value> = LANE_REQUIRED
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut r = required_run(name, 3_100_000 + i as i64);
+                if i == 1 {
+                    r["conclusion"] = json!("failure"); // Post-Deploy Smoke red
+                }
+                r
+            })
+            .collect();
+        red_tip.push(json!({
+            "id": 3_100_100,
+            "name": "Guard Fixture Gate",
+            "status": "completed",
+            "conclusion": "success",
+        }));
+        let held = stop_release_verdict(&lane, &check_runs_from_pages(&[Some(red_tip)]));
+        assert!(matches!(held.verdict, MainVerdict::Red), "a required red must HOLD the stop");
+        assert_eq!(held.red.len(), 1);
+        assert_eq!(held.red[0].name, "post-deploy / Post-Deploy Smoke");
+
+        // Un-configured lane (no required_workflows): the legacy whole-tip
+        // read is preserved — classify_base_check_runs falls back itself.
+        let unconfigured = stop_release_verdict(&json!({}), &runs);
+        assert!(
+            matches!(unconfigured.verdict, MainVerdict::Red),
+            "un-configured lanes keep the whole-tip read"
+        );
     }
 
     // ---- pure helpers: the identity law and its plumbing (BR#4104) ----
