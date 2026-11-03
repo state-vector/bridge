@@ -2081,11 +2081,15 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-qf" });
   });
 
-  it("BR#5265 Fix A+B: base_state rides the walk stamp — a RED base holding cars renders the lane BLOCKED (loud, red names) and files the ONE-per-episode human alarm ask (per-tick repeats dedupe); a GREEN base restores the normal vocabulary and never asks", async () => {
+  it("BR#5265 Fix A+B (+ BR#5631 warrant gate): base_state rides the walk stamp — a RED base holding cars renders the lane BLOCKED (loud, red names) and files NO human ask while the episode is agent-workable (no cure PR, not exhausted); a GREEN base restores the normal vocabulary", async () => {
     const repo = "state-vector/lane-base-red";
     await acquire(repo, "gw-br", { merge_capable: true, required_workflows: ["Test"] });
-    const c1 = await queueViaAccept({ repo, pr: 52651, head: "a".repeat(40), title: "IMPL: base-red drill 1" });
-    const c2 = await queueViaAccept({ repo, pr: 52652, head: "b".repeat(40), title: "IMPL: base-red drill 2" });
+    // NOTE (BR#5631 drill hygiene): the held cards' titles must stay OUT of
+    // the fix-shape family (\bfix\b|main-green|gate|stop-the-line|\bred\b|ci|
+    // deploy health) or the queue-entry fallback binds them as the cure and
+    // the warrant gate (correctly) files the ask — "held drill" wording.
+    const c1 = await queueViaAccept({ repo, pr: 52651, head: "a".repeat(40), title: "IMPL: held drill alpha" });
+    const c2 = await queueViaAccept({ repo, pr: 52652, head: "b".repeat(40), title: "IMPL: held drill beta" });
 
     // RED base (scoped to the lane's required workflows, Fix B) holding 2
     // cars: stamped whole-of-row, the lane renders the loud BLOCKED line
@@ -2104,22 +2108,24 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(lane.reason).toContain("merge-train: BLOCKED — base main RED: Test");
     expect(lane.reason).toContain("2 car(s) held");
 
-    // ONE ask per red episode — the executor repeats this stamp every tick;
-    // askCreate's identical-open-ask guard must dedupe them to one
+    // 2026-11-03 (BR#5631): NO ask on an agent-workable red — no cure PR is
+    // bound and the fix path is not exhausted. The machinery carries the
+    // episode (lane BLOCKED reason + banner); the human is not asked to
+    // click "keep going". Per-tick repeats stay ask-free identically.
     const askCount = async () =>
       (await kbJson("/search?q=MERGE+TRAIN+BLOCKED&type=question&limit=50")).body.artefacts.filter(
         (x: any) => x.type === "question" && String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`),
       ).length;
-    expect(await askCount()).toBe(1);
+    expect(await askCount()).toBe(0);
     await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-br",
       entries: [{ id: c1, pr: 52651, cls: "waiting" }],
       base_state: { verdict: "red", red: [{ name: "Test" }] },
     });
-    expect(await askCount()).toBe(1);
+    expect(await askCount()).toBe(0);
 
     // GREEN base: the normal lane vocabulary returns (no false BLOCKED) and
-    // no further ask exists
+    // still no ask exists
     await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-br",
       entries: [
@@ -2131,11 +2137,11 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane2.queue_facts.base_state.verdict).toBe("green");
     expect(lane2.reason).not.toContain("BLOCKED — base main RED");
-    expect(await askCount()).toBe(1);
+    expect(await askCount()).toBe(0);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-br" });
   });
 
-  it("BR#5349: a non-green base holding cars serves base_red_resolution on train.status — whats_broken + held + the episode's OPEN alarm ask (id/url/question/options verbatim) + the lane's OPEN hotfix+main-red fix card; green drops the block (the banner's own off-switch)", async () => {
+  it("BR#5349 (+ BR#5631): a non-green base holding cars serves base_red_resolution on train.status — whats_broken + held + ask:null while agent-workable (no action demanded of the human) + the lane's OPEN hotfix+main-red fix card; green drops the block (the banner's own off-switch)", async () => {
     const repo = "state-vector/lane-brr";
     await acquire(repo, "gw-brr", { merge_capable: true, required_workflows: ["Test"] });
     const c1 = await queueViaAccept({ repo, pr: 53491, head: "c".repeat(40), title: "IMPL: brr drill 1" });
@@ -2153,32 +2159,19 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // the RESOLUTION rides the lane snapshot, plain and complete
     const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
     const brr = lane.base_red_resolution;
+    // 2026-11-03 (BR#5631): the episode is agent-workable (no cure PR, not
+    // exhausted) → NO ask exists at all; the banner carries the information
+    // (what's broken, PRs held, fix card) with ask:null — nothing demanded
+    // of the human. The bypass ask files later, warranted, once a cure PR
+    // binds (next drill).
     expect(brr).toBeTruthy();
     expect(brr.verdict).toBe("red");
     expect(brr.whats_broken).toEqual([{ name: "Test", url: "https://example.test/5349" }]);
     expect(brr.held).toBe(2);
-    // the episode's OPEN alarm ask — verbatim id / canonical url / question / options
-    // the episode's OPEN alarm ask — verbatim id / canonical url / question / options
-    // (repo-unique token: the generic "MERGE TRAIN BLOCKED" query drowns past
-    // the 50-row FTS rank limit in a full-file run once the briefs carry the
-    // BR#5516 Read-of-the-red triage lines — same law as the brr-live test)
-    const ask = (await kbJson("/search", { q: "lane-brr", type: "question", limit: 50 })).body.artefacts
-      .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
-    expect(ask).toBeTruthy();
-    expect(brr.ask.id).toBe(ask.id);
-    expect(brr.ask.url).toBe(`https://hub.fleetbridge.run/card/${String(ask.id).replace("#", "-")}`);
-    expect(brr.ask.question).toBe(ask.title);
-    // 2026-11-02: the ask is a LIVE TRIAGE VIEW — plain-words brief + the
-    // four triage outcomes (no cure PR yet: no bypass-merge number option,
-    // never the old "I'll reply with the number" shape)
-    expect(brr.ask.options).toEqual([
-      "Hold the line — the fix work continues",
-      "Transient — re-run the failing check",
-      "Other — manual steps (I'll reply)",
-      "No resolution yet — keep digging on the fix card",
-    ]);
-    expect(String(ask.body_md)).toContain("Where the fix work lives");
-    expect(String(ask.body_md)).toContain("No fix PR is open yet");
+    expect(brr.ask).toBeNull();
+    const asks5349 = (await kbJson("/search", { q: "lane-brr", type: "question", limit: 50 })).body.artefacts
+      .filter((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
+    expect(asks5349.length).toBe(0);
     // no fix card yet → null, never a lie
     expect(brr.fix_card).toBeNull();
 
@@ -2204,7 +2197,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brr" });
   });
 
-  it("2026-11-02: the base-red ask is a LIVE TRIAGE VIEW — a root-fix card + its cure PR surface IN the OPEN ask (refreshed in place, still ONE ask), fix_card prefers the root-fix card and carries the cure PR, and a bypass answer names the PR", async () => {
+  it("2026-11-03 (BR#5631) + 2026-11-02: the base-red ask is WARRANT-GATED then a LIVE TRIAGE VIEW — no ask while the red is agent-workable; a bound cure PR files it (bypass-first, live-refreshed, still ONE); a lapsed warrant closes it; an EXHAUSTED fix path warrants it without a cure", async () => {
     const repo = "state-vector/lane-brr-live";
     // a reachable alarm sink for this episode (the setting overrides BR#3124)
     const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — brr-live", session: "" });
@@ -2225,10 +2218,11 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       const all = (await kbJson("/search", { q: "lane-brr-live", type: "question", limit: 50 })).body.artefacts;
       return all.filter((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`));
     };
-    const findAsk = async () => (await askHits())[0] ?? null;
-    const ask1 = await findAsk();
-    expect(ask1).toBeTruthy();
-    expect(String(ask1.body_md)).toContain("No fix PR is open yet");
+    const findAsk = async () => (await askHits()).find((x: any) => x.status === "todo") ?? null;
+
+    // (1) BR#5631 warrant gate: agent-workable red (no fix card, no cure) —
+    // NO ask. The machinery carries it; the human is not asked to "keep going"
+    expect(await findAsk()).toBeNull();
 
     // the episode's root-fix card spawns (BR#5190 shape: tags + binding)…
     const fix = await kbJson("/create", {
@@ -2237,21 +2231,23 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } },
     });
     expect(fix.status).toBe(200);
+    // fix card alone (not exhausted, no cure PR) STILL warrants no ask
+    expect((await stampRed()).body.error ?? "").toBe("");
+    expect(await findAsk()).toBeNull();
 
-    // …and a cure PR binds to it (the queued leg stamp meta.prs carries)
+    // …and a cure PR binds to it (the queued leg stamp meta.prs carries) —
+    // NOW the episode has a human-actionable act (the out-of-turn bypass
+    // merge is human authority, BR#4122) and the ask FILES on the next tick
     await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() }, prs: [{ repo, number: 53499, head_sha_at_acceptance: "d".repeat(40) }] } });
-
-    // the NEXT red tick refreshes the OPEN ask IN PLACE — still ONE ask, now
-    // carrying the cure PR's number in the options (the old shape demanded a
-    // number it could never learn; the live view carries it)
     expect((await stampRed()).body.error ?? "").toBe("");
     const askCount = async () => (await askHits()).length;
     expect(await askCount()).toBe(1);
     const ask2 = await findAsk();
-    expect(ask2.id).toBe(ask1.id);
+    expect(ask2).toBeTruthy();
     expect(String(ask2.body_md)).toContain("https://github.com/" + repo + "/pull/53499");
     const askMetaM = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
     expect(askMetaM.ask.options[0]).toContain("Bypass-merge fix PR #53499");
+    expect(String(askMetaM.ask.reason ?? "")).toContain("human-actionable");
 
     // fix_card prefers the root-fix card and carries the cure PR link
     const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
@@ -2259,6 +2255,27 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(fc.id).toBe(fix.body.id);
     expect(fc.pr).toBe(53499);
     expect(fc.pr_url).toBe(`https://github.com/${repo}/pull/53499`);
+
+    // (2) warrant LAPSE: the cure PR unbinds (closed unmerged, nothing
+    // re-bound) — the open ask no longer names a human act; the next red
+    // tick closes it done, honestly, and it re-files if a cure re-binds
+    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } } });
+    expect((await stampRed()).body.error ?? "").toBe("");
+    const closedAsk = (await askHits()).find((x: any) => x.id === ask2.id);
+    expect(closedAsk?.status).toBe("done");
+    expect(await findAsk()).toBeNull();
+    expect(await askCount()).toBe(1); // still exactly one artefact — closed, not duplicated
+
+    // (3) EXHAUSTION warrant: no cure PR, but the fix card churned out of
+    // attempts (attempt.attempts >= 3) — manual steps are the only lever
+    // left, so the ask files WITHOUT a cure, manual-first options
+    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() }, attempt: { by: "system:watchdog", at: Date.now(), attempts: 3, last_reason: "stalled" } } });
+    expect((await stampRed()).body.error ?? "").toBe("");
+    const ask3 = await findAsk();
+    expect(ask3).toBeTruthy();
+    const ask3Meta = typeof ask3.meta === "string" ? JSON.parse(ask3.meta) : ask3.meta ?? {};
+    expect(ask3Meta.ask.options[0]).toContain("manual steps");
+    expect(ask3Meta.ask.options.join(" ")).not.toContain("Bypass-merge");
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brrl" });
   });
 
@@ -2268,9 +2285,12 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
     await acquire(repo, "gw-disp", { merge_capable: true, required_workflows: ["Test"] });
     const c1 = await queueViaAccept({ repo, pr: 53501, head: "c".repeat(40), title: "IMPL: dispatch drill 1" });
+    // BR#5631: the ask needs a WARRANT — a fix-shaped cure queued on the lane
+    // (the queue-entry fallback binds it, cure PR #53509)
+    const cCure = await queueViaAccept({ repo, pr: 53509, head: "9".repeat(40), title: "fix(ci): dispatch drill cure — main red" });
     const r = await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-disp",
-      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      entries: [ { id: cCure, pr: 53509, cls: "blocked" }, { id: c1, pr: 53501, cls: "waiting" } ],
       base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
     });
     expect(r.body.error ?? "").toBe("");
@@ -2290,7 +2310,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // the executor's next tick consumes + acks through queue_facts — spent
     const ack = await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-disp",
-      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      entries: [ { id: cCure, pr: 53509, cls: "blocked" }, { id: c1, pr: 53501, cls: "waiting" } ],
       base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
       bypass_consumed: "merged",
     });
@@ -2301,7 +2321,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // a RETRY answer stamps rerun_failed — the executor re-runs the red checks
     await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-disp",
-      entries: [{ id: c1, pr: 53501, cls: "waiting" }],
+      entries: [ { id: cCure, pr: 53509, cls: "blocked" }, { id: c1, pr: 53501, cls: "waiting" } ],
       base_state: { verdict: "red", scoped_to: true, red: [{ name: "Test", url: "https://example.test/dispatch" }], unsettled: [] },
     });
     const ask2 = (await kbJson("/search", { q: "lane-dispatch", type: "question", limit: 50 })).body.artefacts
@@ -2354,8 +2374,10 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(lane2.bypass_merge.pr).toBe(55162);
     expect(lane2.bypass_merge.repo).toBe(repo);
 
-    // a NON-fix-shaped queued PR never becomes the cure — the bypass must
-    // not offer an arbitrary held PR (fresh lane, only the IMPL card queued)
+    // a NON-fix-shaped queued PR never becomes the cure — no cure, not
+    // exhausted → NO ask at all under the BR#5631 warrant gate (fresh lane,
+    // only the IMPL card queued; the bypass must never offer an arbitrary
+    // held PR, and an agent-workable red never asks the human)
     const repo2 = "state-vector/lane-brr-plain";
     await acquire(repo2, "gw-brrp", { merge_capable: true, required_workflows: ["Test"] });
     const c2 = await queueViaAccept({ repo: repo2, pr: 55163, head: "g".repeat(40), title: "IMPL: brr-plain held feature" });
@@ -2367,11 +2389,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(r2.body.error ?? "").toBe("");
     const ask2 = (await kbJson("/search", { q: "lane-brr-plain", type: "question", limit: 50 })).body.artefacts
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo2}@main`));
-    expect(ask2).toBeTruthy();
-    const ask2Meta = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
-    expect(ask2Meta.ask.options[0]).toContain("Hold the line");
-    expect(ask2Meta.ask.options.join(" ")).not.toContain("Bypass-merge");
-    expect(String(ask2.body_md)).toContain("diagnosis pending");
+    expect(ask2 ?? null).toBeNull();
     await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-brrp" });
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-brrq" });
   });

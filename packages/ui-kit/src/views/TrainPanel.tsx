@@ -226,7 +226,11 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
             <a href={(r.fix_card as any).pr_url} target="_blank" rel="noreferrer" title="open the fix PR">#{r.fix_card.pr}</a>
             {": answer the ask to bypass-merge it out of turn"}
           </>
-        ) : red ? " · or re-run a flaky check · or you bypass-merge a fix PR" : " · just wait — they finish on their own"}
+        ) : red
+          ? r.ask
+            ? " · or re-run a flaky check · or you bypass-merge a fix PR"
+            : " — the fix work runs on its own; you'll be asked only if a fix PR needs an out-of-turn merge or manual steps (BR#5631)"
+          : " · just wait — they finish on their own"}
       </span>
       {r.ask && (
         <span className="train-banner-line">
