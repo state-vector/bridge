@@ -982,6 +982,134 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-mg" });
   });
 
+  it("BR#5633 awaiting sweep, LAPSED park: the executor's re-assert (coverage bounce carrying the sweep marker + live head) hands the card to the verify pool — machine re-queue only when the verdict covers, never a strand", async () => {
+    const repo = "state-vector/lane-sweep-lapse";
+    const H1 = "4".repeat(40), H2 = "5".repeat(40);
+    // the blackhole shape (bridge#364): queued at H1, parked Awaiting at H2
+    // with a done verdict that does NOT cover H2 — the hub's own parked-head
+    // sweep leaves it (correctly, BR#5226), so only the executor's live
+    // re-assert can give it an exit
+    const { implId: card, verifyId } = await queueViaAcceptBoth({ repo, pr: 3601, head: H1, title: "IMPL: sweep-lapse drill" });
+    await acquire(repo, "gw-sw", { required_workflows: ["Test"] });
+    const c0 = (await kbJson("/get", { id: card })).body;
+    await kbJson("/update", {
+      id: card,
+      meta: {
+        ...c0.meta,
+        merge_train: {
+          ...(c0.meta.merge_train ?? {}),
+          state: "awaiting",
+          bounce_kind: "coverage",
+          defect: `PR #3601 live head ${H2} is not covered by the accepted verdict (leg 1 stamped ${H1.slice(0, 9)}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+          awaiting: { at: Date.now(), head_sha: H2, verdict_id: verifyId },
+          pr: 3601,
+          repo,
+        },
+        blocked: { ...(c0.meta.blocked ?? {}), reason: `Awaiting review (verdict ${verifyId}, anchored at head ${H2.slice(0, 9)})` },
+      },
+    });
+    // the sweep fires: the executor re-asserts through the audited bounce
+    // path with the LIVE head and a marker reason (NO conflict files, NO
+    // human-leg vocabulary — exactly what train.rs emits)
+    const reasserted = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-sw", pr: 3601, task_id: card,
+      head_sha: H2, bounce_kind: "coverage",
+      reason: "awaiting sweep: re-assert parked card with live facts (BR#5633)",
+    });
+    expect(reasserted.body.error ?? "", `sweep re-assert failed: ${JSON.stringify(reasserted.body)}`).toBe("");
+    // the verdict does not cover the live head and there is no human leg —
+    // the plain machine-lapse fall-through: impl bounce, NO park, NO requeue
+    expect(reasserted.body.machine_requeue).toBeUndefined();
+    expect(reasserted.body.awaiting_park).toBeUndefined();
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("in_progress");
+    expect(c.meta?.merge_train?.state).toBe("bounced");
+    expect(c.meta?.merge_train?.awaiting).toBeUndefined();
+    // the STORED defect survives on the bounce record — the marker never
+    // overwrites the card's own history
+    expect(String(c.meta?.merge_train?.defect ?? "")).toContain("no contiguous carry chain");
+    expect(String(c.meta?.merge_train?.defect ?? "")).not.toContain("awaiting sweep");
+    expect(String(c.body_md ?? "")).toContain("Merge-train bounce (coverage)");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-sw" });
+  });
+
+  it("BR#5633 awaiting sweep, HUMAN-LEG park: the re-assert classifies on the card's STORED park facts — the marker reason alone must not demote a genuine human leg to a machine lapse", async () => {
+    const repo = "state-vector/lane-sweep-human";
+    const H1 = "6".repeat(40), H2 = "7".repeat(40);
+    // a REAL human-leg park (conflict files ride the first bounce)
+    const card = await queueViaAccept({ repo, pr: 3602, head: H1, title: "IMPL: sweep-human drill" });
+    await acquire(repo, "gw-sh", { required_workflows: ["Test"] });
+    const parked = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-sh", pr: 3602, task_id: card,
+      head_sha: H2, bounce_kind: "coverage", merge_state_status: "dirty",
+      reason: "PR #3602 head moved past the accepted verdict — human-resolved conflict",
+      conflict_files: ["src/train/park.ts"],
+    });
+    expect(parked.body.error ?? "").toBe("");
+    expect(parked.body.awaiting_park).toBe(true);
+    // the sweep re-asserts at the SAME head with a clean marker reason and
+    // NO conflict_files — the handler must still see the human leg
+    const reasserted = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-sh", pr: 3602, task_id: card,
+      head_sha: H2, bounce_kind: "coverage",
+      reason: "awaiting sweep: re-assert parked card with live facts (BR#5633)",
+    });
+    expect(reasserted.body.error ?? "", `sweep re-assert failed: ${JSON.stringify(reasserted.body)}`).toBe("");
+    expect(reasserted.body.awaiting_park).toBe(true);
+    expect(reasserted.body.machine_requeue).toBeUndefined();
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    expect(c.meta?.merge_train?.state).toBe("awaiting");
+    expect(c.meta?.merge_train?.awaiting?.head_sha).toBe(H2);
+    // the park's OWN record survived the refresh: original defect text +
+    // conflict files, never the marker
+    expect(String(c.meta?.merge_train?.defect ?? "")).toContain("human-resolved conflict");
+    expect(c.meta?.merge_train?.conflict_files).toEqual(["src/train/park.ts"]);
+    expect(String(c.meta?.merge_train?.defect ?? "")).not.toContain("awaiting sweep");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-sh" });
+  });
+
+  it("BR#5633 awaiting-sweep rate-limit stamp: train.queue_facts merges {task: {head, outcome, at}} without clobbering the walk's stored entries — absent entries PRESERVE, explicit [] still clears, train.status serves the stamps", async () => {
+    const repo = "state-vector/lane-sweep-stamp";
+    await queueViaAccept({ repo, pr: 3603, head: "8".repeat(40), title: "IMPL: sweep-stamp drill" });
+    await acquire(repo, "gw-st", { required_workflows: ["Test"] });
+    // the walk's own stamp: per-entry verdicts
+    const walk = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-st",
+      entries: [{ id: "BR#W1", pr: 3603, cls: "ready" }],
+      base_state: { verdict: "green", scoped_to_required: true, red: [], unsettled: [] },
+    });
+    expect(walk.body.error ?? "").toBe("");
+    // the sweep's stamp: NO entries field — must preserve the walk's blocks
+    const sweep = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-st",
+      awaiting_sweep: { "BR#W1": { head: "9".repeat(40), outcome: "impl_bounce", at: Date.now() } },
+    });
+    expect(sweep.body.error ?? "").toBe("");
+    let lane = await laneSnap(repo);
+    expect(lane.queue_facts.entries).toEqual([{ id: "BR#W1", pr: 3603, cls: "ready" }]);
+    expect(lane.queue_facts.base_state?.verdict).toBe("green");
+    expect(lane.awaiting_sweep?.["BR#W1"]?.outcome).toBe("impl_bounce");
+    expect(lane.awaiting_sweep?.["BR#W1"]?.head).toBe("9".repeat(40));
+    // a walk re-stamp (entries present) refreshes the blocks and leaves the
+    // sweep ledger alone
+    const walk2 = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-st",
+      entries: [{ id: "BR#W1", pr: 3603, cls: "waiting" }],
+    });
+    expect(walk2.body.error ?? "").toBe("");
+    lane = await laneSnap(repo);
+    expect(lane.queue_facts.entries).toEqual([{ id: "BR#W1", pr: 3603, cls: "waiting" }]);
+    expect(lane.awaiting_sweep?.["BR#W1"]?.outcome).toBe("impl_bounce");
+    // an EXPLICIT empty entries still clears (the bypass/rerun acks rely on it)
+    const clear = await kbJson("/train.queue_facts", { repo, base: "main", actor: "gw-st", entries: [] });
+    expect(clear.body.error ?? "").toBe("");
+    lane = await laneSnap(repo);
+    expect(lane.queue_facts.entries).toEqual([]);
+    expect(lane.awaiting_sweep?.["BR#W1"]?.outcome).toBe("impl_bounce");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-st" });
+  });
+
   it("BR#4962: a second coverage bounce refreshes the SAME park (one row, newest anchor) and force-review approve re-anchors the verdict at the parked head — carry leg via force-review, queued in place, zero asks", async () => {
     const repo = "state-vector/lane-force";
     const H1 = "1".repeat(40), H2 = "2".repeat(40), H3 = "3".repeat(40);
