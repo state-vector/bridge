@@ -441,7 +441,14 @@ checks are green. There is no separate human merge gate for a verified PR. The c
 impl works → rebases → pushes a mergeable PR → `in_review`; verify reviews substance
 (mergeability confirmed first — rule 5c); findings → bounce back to impl
 (`in_review → in_progress`, one round, N bounces — the same verify round re-enters, it
-never stacks); loop until the train merges and closes. Impl owns mergeability
+never stacks); loop until the train merges and closes. The one-round rule is
+**target-scoped** (BR#5874): a second verify duty linked under the same parent supersedes
+an older open round only when both cover the SAME PR — resolved from the card's `meta.pr`/
+`meta.prs` binding, its body's GitHub pull URL, or its title ("slug PR #N"). A disposition
+verify duty covering a DIFFERENT PR (an impl session's done-when leg) coexists — it never
+counts as the parent's round, and a bounce keeps the newest same-PR round even when a
+cross-PR duty is newer. Duties with no PR signal anywhere (child, sibling, parent) keep
+the legacy newest-wins supersede. Impl owns mergeability
 *preparation* (rebase before every in_review — a conflicting PR is the impl's defect, not
 the reviewer's); the train owns mergeability *enforcement* (a conflicting, red or unsigned
 PR is bounced with the exact defect — never merged silently).

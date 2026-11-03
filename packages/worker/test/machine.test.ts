@@ -17,6 +17,8 @@ import {
   SILENT_REDIRECT_CYCLES,
   blockedParkVerdict,
   UNBLOCK_SPAWN_CAP,
+  prTargetsOf,
+  prTargetMatch,
   type RuleCtx,
   type RuleInput,
   type Applied,
@@ -2096,5 +2098,64 @@ describe("blockedParkVerdict (BR#2893)", () => {
   it("the spawner cap is a real, exported constant", () => {
     expect(UNBLOCK_SPAWN_CAP).toBeGreaterThanOrEqual(2);
     expect(Number.isInteger(UNBLOCK_SPAWN_CAP)).toBe(true);
+  });
+});
+
+// ---- BR#5874: PR-target resolution + same-round matching -----------------
+// The verify-round supersede must tell the parent's OWN duty (round for the
+// deliverable PR) from a disposition duty covering a DIFFERENT PR. Duties
+// carry no meta.pr — their PR surfaces in the body URL or the title.
+describe("prTargetsOf / prTargetMatch (BR#5874)", () => {
+  it("meta.pr / meta.prs bindings win over body and title", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ pr: { repo: "state-vector/superpositional", number: 2573 }, prs: [{ repo: "state-vector/superpositional", number: 2573 }, { repo: "state-vector/bridge", number: 300 }] }),
+      body_md: "see https://github.com/other/repo/pull/999",
+      title: "Verify: something PR #1",
+    });
+    expect(t).toEqual([
+      { repo: "state-vector/superpositional", number: 2573 },
+      { repo: "state-vector/bridge", number: 300 },
+    ]);
+  });
+
+  it("an unbound duty resolves from the body's canonical pull URL (the auto-spawn prLink)", () => {
+    // BR#5735 shape: no meta.pr; the spawn template wrote the parent's PR URL into the body
+    const t = prTargetsOf({
+      meta: JSON.stringify({ superseded_reason: "x" }),
+      body_md: "Receipts: https://github.com/state-vector/superpositional/pull/2573, merge state...",
+      title: "Verify: Backlog disposition",
+    });
+    expect(t).toEqual([{ repo: "state-vector/superpositional", number: 2573 }]);
+  });
+
+  it("an unbound duty with no body URL resolves from the title's 'slug PR #N' (BR#5746 shape)", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ session: "dispatch-BR-5746" }),
+      body_md: "no urls here",
+      title: "Verify: superpositional PR #2329 — canary: judge chat CONVERSATION answer shape",
+    });
+    expect(t).toEqual([{ repo: "superpositional", number: 2329 }]);
+  });
+
+  it("a bare 'PR #N' title yields a repo-less target; no signal anywhere yields []", () => {
+    expect(prTargetsOf({ title: "Verify: fix the widget (PR #12)" })).toEqual([{ number: 12 }]);
+    expect(prTargetsOf({ meta: "{}", body_md: "nothing", title: "Verify: docs pass" })).toEqual([]);
+    expect(prTargetsOf(null)).toEqual([]);
+  });
+
+  it("garbage meta does not throw", () => {
+    expect(prTargetsOf({ meta: "{not json", title: "PR #7" })).toEqual([{ number: 7 }]);
+  });
+
+  it("prTargetMatch: number decides; slugs compare full or local segment; missing slug matches on number", () => {
+    const full = { repo: "state-vector/superpositional", number: 2573 };
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2573 })).toBe(true);
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2573 })).toBe(true); // bare slug vs full
+    expect(prTargetMatch(full, { repo: "state-vector/bridge", number: 2573 })).toBe(false); // same number, other repo
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2329 })).toBe(false);
+    expect(prTargetMatch(full, { number: 2573 })).toBe(true); // repo-less title target
+    expect(prTargetMatch(full, null)).toBe(false);
+    // the incident pair must NOT match: round for #2573 vs disposition for #2329
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2329 })).toBe(false);
   });
 });

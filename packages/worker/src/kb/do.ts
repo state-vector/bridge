@@ -180,6 +180,8 @@ import {
   UNBLOCK_FLOOD_MS,
   isClonableRepoRef,
   prFromNote,
+  prTargetsOf,
+  prTargetMatch,
   RECEIPTS_DOC,
   churnRelease,
   blockedParkVerdict,
@@ -5180,13 +5182,31 @@ export class KnowledgeHub {
           // closes. keep_newest keeps the newest verify child alive across a
           // bounce — the bounce re-enters the SAME round (the churn that
           // drowned the pool was 3-6 cards per parent).
+          // BR#5874: the kept child must be THE ROUND — a duty for the
+          // parent's own deliverable. A disposition verify child covering a
+          // DIFFERENT PR (spawned after the handoff) is neither kept as the
+          // round nor superseded: it verifies its own PR and coexists.
+          // Target-blind keep_newest handed the round to whichever child
+          // happened to be newest; a cross-PR child won the keep and the
+          // parent's round died (BR#4678: ~6h with no verifier on a boosted
+          // card). Parent targets resolve from meta.pr / body / title; a
+          // duty with no PR signal counts as a (legacy) round; with no
+          // parent binding at all the legacy newest-wins keep applies.
+          const parentRow = fx.keep_newest ? this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id) : null;
+          const parentTargets = fx.keep_newest ? prTargetsOf(parentRow) : [];
           const kids = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
             id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
-          kids.forEach((v, i) => {
-            if (fx.keep_newest && i === 0) return;
+          let keptNewestRound = false;
+          kids.forEach((v) => {
+            if (fx.keep_newest) {
+              const t = prTargetsOf(v);
+              const isRound = t.length === 0 || parentTargets.length === 0 || t.some((x) => parentTargets.some((p) => prTargetMatch(x, p)));
+              if (!isRound) return; // cross-PR disposition duty — untouched, it is not the round
+              if (!keptNewestRound) { keptNewestRound = true; return; } // newest round survives for re-entry
+            }
             const vm = JSON.parse(v.meta ?? "{}");
             vm.superseded_reason = fx.cause;
             this.state.storage.sql.exec(
@@ -5282,22 +5302,43 @@ export class KnowledgeHub {
       // open verify child under the same parent supersedes the older one
       // (keep-newest) instead of stacking. The spawn path already reuses; this
       // is the structural backstop for every other path that creates+links.
+      // BR#5874: "the parent's verify round" is a duty for the parent's OWN
+      // deliverable. A disposition verify child covering a DIFFERENT PR (an
+      // impl session's done-when leg, e.g. BR#5746 for PR #2329 next to the
+      // round for PR #2573) must NEVER supersede the round — target-blind
+      // superseding killed BR#5735 and left BR#4678 ownerless for ~6h
+      // (watchdog "no verifier picked up the verification round"). Supersede
+      // only provably same-round duties: same repo+number resolved from
+      // meta.pr / body pull URL / title. Fully signal-less duties (no PR
+      // anywhere on child, sibling, or parent) keep the legacy keep-newest —
+      // with zero signal there is nothing to distinguish, only duplicate
+      // rounds to collapse. Everything else COEXISTS.
       if (childRoles.includes("review") && !["done", "superseded"].includes(String((src as any).status))) {
+        const srcRow = this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, srcId);
+        const parentRow = this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, dstId);
+        const srcTargets = prTargetsOf(srcRow);
+        const parentTargets = prTargetsOf(parentRow);
         const openSiblings = this.state.storage.sql.exec(
-          `SELECT c.id AS id, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+          `SELECT c.id AS id, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.id != ?
              AND c.roles LIKE '%"review"%' AND c.status IN ('todo','in_progress','blocked')
            ORDER BY c.updated_ts ASC`,
           dstId, srcId,
         ).toArray() as any[];
         for (const sib of openSiblings) {
+          const sibTargets = prTargetsOf(sib);
+          const sameRound =
+            (srcTargets.length > 0 && sibTargets.length > 0 && srcTargets.some((t) => sibTargets.some((s) => prTargetMatch(t, s)))) ||
+            (srcTargets.length === 0 && sibTargets.length === 0 && parentTargets.length === 0);
+          if (!sameRound) continue;
           const vm = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, sib.id)?.meta ?? "{}");
-          vm.superseded_reason = `${srcId} linked as the parent's verify round — older open verify child superseded (one round, N bounces)`;
+          const tgt = srcTargets[0];
+          vm.superseded_reason = `${srcId} covers the same deliverable (${tgt ? `${tgt.repo ?? "repo"}#${tgt.number}` : "no PR binding anywhere"}) — older open verify duty superseded (one round per target, keep-newest; BR#5874)`;
           this.state.storage.sql.exec(
             `UPDATE artefacts SET status = 'superseded', meta = ?, updated_ts = ? WHERE id = ?`,
             JSON.stringify(vm), Date.now(), sib.id,
           );
-          this.audit("system:invariant", "verify_superseded", sib.id, { parent: dstId, newer: srcId, reason: "one-open-verify-child" });
+          this.audit("system:invariant", "verify_superseded", sib.id, { parent: dstId, newer: srcId, reason: "one-open-verify-child", target: tgt ?? null });
         }
       }
     }

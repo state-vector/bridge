@@ -1122,3 +1122,112 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
     expect(line.summary).toContain("deleted: session");
   });
 });
+
+// ---- BR#5874: the verify-round supersede must kill only same-PR duties ----
+// Production incident (BR#4678): the parent's verify round BR#5735 (PR #2573)
+// was superseded by the LINK of BR#5746 — a disposition duty for a DIFFERENT
+// PR (#2329). The round went ownerless; the watchdog stalled the boosted card
+// ~6h ("no verifier picked up the verification round").
+describe("BR#5874 — verify-round supersede is target-aware", () => {
+  it("a cross-PR disposition child does NOT supersede the parent's own round; a same-PR round does (keep-newest)", async () => {
+    // the BR#4678 shape: parent bound to its deliverable PR via meta.pr; the
+    // round carries the PR only in its body URL (auto-spawn duties have no
+    // meta.pr); the disposition duty carries its PR only in the title.
+    const parent = await kbJson("/create", {
+      type: "task",
+      title: "Backlog disposition: 44 open PRs vs board",
+      meta: { pr: { repo: "state-vector/superpositional", number: 2573 } },
+    });
+    expect(parent.status).toBe(200);
+    const round = await kbJson("/create", {
+      type: "task",
+      title: "Verify: Backlog disposition: 44 open PRs vs board",
+      roles: ["review"],
+      body_md: "Verification duty for the deliverable.\nPR: https://github.com/state-vector/superpositional/pull/2573",
+    });
+    expect(round.status).toBe(200);
+    const linked = await kbJson("/link", { src: round.body.id, relation: "child_of", dst: parent.body.id });
+    expect(linked.status).toBe(200);
+
+    const disposition = await kbJson("/create", {
+      type: "task",
+      title: "Verify: superpositional PR #2329 — canary: judge chat CONVERSATION answer shape",
+      roles: ["review"],
+      body_md: "Verify duty for the done-when disposition leg — different PR, no body URL.",
+    });
+    expect(disposition.status).toBe(200);
+    const linkedDisp = await kbJson("/link", { src: disposition.body.id, relation: "child_of", dst: parent.body.id });
+    expect(linkedDisp.status).toBe(200);
+
+    // THE INCIDENT: the disposition link must leave the round open.
+    const roundAfter = await kbJson("/get", { id: round.body.id });
+    expect(roundAfter.body.status).not.toBe("superseded");
+    const dispAfter = await kbJson("/get", { id: disposition.body.id });
+    expect(dispAfter.body.status).not.toBe("superseded");
+
+    // a NEW round for the SAME deliverable supersedes the older same-PR round
+    // (the invariant's original purpose) and STILL leaves the disposition alone.
+    const round2 = await kbJson("/create", {
+      type: "task",
+      title: "Verify: Backlog disposition: 44 open PRs vs board (fresh handoff)",
+      roles: ["review"],
+      body_md: "Re-anchor receipt duty.\nPR: https://github.com/state-vector/superpositional/pull/2573",
+    });
+    expect(round2.status).toBe(200);
+    const linked2 = await kbJson("/link", { src: round2.body.id, relation: "child_of", dst: parent.body.id });
+    expect(linked2.status).toBe(200);
+    const round1Final = await kbJson("/get", { id: round.body.id });
+    expect(round1Final.body.status).toBe("superseded");
+    expect(String(round1Final.body.meta?.superseded_reason)).toContain("same deliverable");
+    const round2Final = await kbJson("/get", { id: round2.body.id });
+    expect(round2Final.body.status).not.toBe("superseded");
+    const dispFinal = await kbJson("/get", { id: disposition.body.id });
+    expect(dispFinal.body.status).not.toBe("superseded");
+  });
+
+  it("legacy keep-newest survives in the no-signal world (parent, rounds — nothing PR-bound)", async () => {
+    const parent = await kbJson("/create", { type: "task", title: "Docs pass — no deliverable PR bound" });
+    const u1 = await kbJson("/create", { type: "task", title: "Verify: Docs pass", roles: ["review"], body_md: "no PR signal anywhere" });
+    await kbJson("/link", { src: u1.body.id, relation: "child_of", dst: parent.body.id });
+    const u2 = await kbJson("/create", { type: "task", title: "Verify: Docs pass (re-round)", roles: ["review"], body_md: "also no signal" });
+    await kbJson("/link", { src: u2.body.id, relation: "child_of", dst: parent.body.id });
+    const u1Final = await kbJson("/get", { id: u1.body.id });
+    expect(u1Final.body.status).toBe("superseded"); // legacy keep-newest preserved
+    const u2Final = await kbJson("/get", { id: u2.body.id });
+    expect(u2Final.body.status).not.toBe("superseded");
+  });
+
+  it("a bounce keeps the ROUND child even when a cross-PR disposition child is newer (supersede_children keep_newest)", async () => {
+    const parent = await kbJson("/create", {
+      type: "task",
+      title: "Impl card with deliverable PR #777",
+      meta: { pr: { repo: "state-vector/superpositional", number: 777 } },
+    });
+    const round = await kbJson("/create", {
+      type: "task",
+      title: "Verify: Impl card with deliverable PR #777",
+      roles: ["review"],
+      body_md: "Duty body.\nPR: https://github.com/state-vector/superpositional/pull/777",
+    });
+    await kbJson("/link", { src: round.body.id, relation: "child_of", dst: parent.body.id });
+    await kbJson("/transition", { id: parent.body.id, to: "in_progress", note: "claim" });
+    // handoff: in_review reuses the open round (no fresh spawn)
+    const rev = await kbJson("/transition", { id: parent.body.id, to: "in_review", note: "PR https://github.com/state-vector/superpositional/pull/777" });
+    expect(rev.status).toBe(200);
+    // the impl session then spawns a disposition duty for ANOTHER PR (newer child)
+    const disp = await kbJson("/create", {
+      type: "task",
+      title: "Verify: superpositional PR #2329 — disposition leg",
+      roles: ["review"],
+      body_md: "Different PR, title carries the number.",
+    });
+    await kbJson("/link", { src: disp.body.id, relation: "child_of", dst: parent.body.id });
+    // bounce: the round must survive (old code kept the NEWEST child — the disposition — and killed the round)
+    const bounce = await kbJson("/transition", { id: parent.body.id, to: "in_progress", note: "bounce — findings on the round" });
+    expect(bounce.status).toBe(200);
+    const roundAfter = await kbJson("/get", { id: round.body.id });
+    expect(roundAfter.body.status).not.toBe("superseded");
+    const dispAfter = await kbJson("/get", { id: disp.body.id });
+    expect(dispAfter.body.status).not.toBe("superseded"); // cross-PR duty coexists untouched
+  });
+});
