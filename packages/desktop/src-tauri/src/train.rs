@@ -2412,7 +2412,22 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // #2759; BR#3935's closed-PR exclusion missed the batch path). Live
         // state ≠ OPEN is never a merge candidate: log + advance to the next
         // batch member; the next walk re-derives the entry from the stamp.
-        let live = ctx.pr_facts(repo, pr)?;
+        let live = match ctx.pr_facts(repo, pr) {
+            Ok(f) => f,
+            Err(e) => {
+                // BR#3935 fail-closed: a cannot-read never merges blind — but a
+                // landed prefix still owes its settle (the BR#4996 soft-break
+                // courtesy, same shape as the phantom-refusal arm): settle the
+                // prefix honestly and end the tick; a clean pass retries next
+                // tick with the loud error.
+                if pass_merged > 0 {
+                    log(Some(key), &format!("batch soft-break: live state re-read failed for PR #{pr} ({}) — settling the landed prefix of {} merge(s)", trunc(&e, 160), pass_merged));
+                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
         let live_state = vstr(&live, "state").unwrap_or("").to_string();
         if !crate::train_gate::batch_eligible_state(&live_state) {
             let shown = if live_state.is_empty() { "unreadable".to_string() } else { live_state };
