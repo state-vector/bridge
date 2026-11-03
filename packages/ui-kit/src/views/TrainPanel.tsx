@@ -109,12 +109,14 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   if (l.currently) {
     const settling = l.currently.phase !== "bursting";
     return {
-      tone: l.currently.phase === "stopped" ? "err" : "live", card: l.currently.task_id, pr: l.currently.pr,
+      tone: l.currently.phase === "stopped" ? "err" : "live",
+      card: settling ? undefined : l.currently.task_id,
+      pr: settling ? undefined : l.currently.pr,
       label: l.currently.phase === "bursting"
-        ? `merging several in a row${l.currently.pr ? ` — at PR #${l.currently.pr}` : ""}`
-        : `merged PR #${l.currently.pr ?? "?"} — waiting on CI`,
+        ? `merging batch${l.currently.pr ? ` — at PR #${l.currently.pr}` : ""}`
+        : "awaiting deploy",
       title: settling
-        ? `PR #${l.currently.pr ?? "?"} is merged; the train waits for main's build+deploy to finish green before the next merge — this is the settle that keeps main deployable. Next: ${l.attempt?.card ?? "—"}.`
+        ? `Batch merged (last: PR #${l.currently.pr ?? "?"}); the train is awaiting main's build + deploy to finish green before the next batch. Next: ${l.attempt?.card ?? "—"}.`
         : `a batch is landing back-to-back; main settles when the batch finishes`,
     };
   }
@@ -409,19 +411,32 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           l.currently?.phase === "bursting"
             ? `${Number(l.currently.burst_merged ?? 0)} of ${l.currently.burst_cap === 0 ? "∞" : Number(l.currently.burst_cap ?? 0)} merged this batch`
             : l.currently
-              ? "1 of 1 merged — settling"
+              ? Number(l.currently.burst_merged ?? 1) > 1
+                ? `${Number(l.currently.burst_merged)} of ${Number(l.currently.burst_merged)} merged — settling`
+                : "1 of 1 merged — settling"
               : l.queue.length > 0
                 ? "0 of 1 — batch not started"
                 : "—";
         // MSG: the freshest true message — the machine's live note first,
         // else the current attempt sentence, else the last ledger action
+        const settlingPrPrefix =
+          l.currently && l.currently.phase !== "bursting" && l.currently.pr
+            ? `merged PR #${l.currently.pr}`
+            : null;
         const msg = na
-          ? { text: na.text, title: na.title }
-          : l.attempt
-            ? { text: l.attempt.note, title: l.attempt.note }
-            : l.activity?.last_event
-              ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
-              : null;
+          ? {
+              text: settlingPrPrefix && !na.text.includes(`#${l.currently?.pr}`)
+                ? `${settlingPrPrefix} · ${na.text}`
+                : na.text,
+              title: na.title,
+            }
+          : settlingPrPrefix
+            ? { text: `${settlingPrPrefix} — confirming deploy on main`, title: `${settlingPrPrefix} — confirming build and deploy on main` }
+            : l.attempt
+              ? { text: l.attempt.note, title: l.attempt.note }
+              : l.activity?.last_event
+                ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
+                : null;
         return (
           <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
             <span className="trainc-dot">
