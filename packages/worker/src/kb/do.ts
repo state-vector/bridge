@@ -10443,6 +10443,37 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // laneSyncReason's baseBlock (<15m — the executor refreshes every
       // tick): a dead daemon's stale stamp never pins a banner, and the
       // block disappears by itself the moment base_state goes green.
+      // BR#5658 (Ray 2026-11-03): per-lane PR stats — in-progress / verifying
+      // / ready, the three verification buckets the lane stat line shows.
+      // in-progress = OPEN impl cards with a PR bound to this lane's repo,
+      // excluding the ones already parked on the train's review legs (those
+      // count as waiting). verifying = executor walk verdict "waiting"
+      // (checks/mergeability being checked right now). ready = walk verdict
+      // "ready" (merges this pass — the batch). waiting (the orange-solid
+      // bucket) = walk verdict "needs-review" + the Awaiting parks.
+      const prStats = (() => {
+        const facts = meta.lane?.queue_facts?.entries ?? [];
+        const factFor = (id: string) => String(facts.find((e: any) => e.id === id)?.cls ?? "");
+        let ready = 0, verifying = 0, waiting = 0;
+        for (const q of queue) {
+          const cls = factFor(q.id);
+          if (cls === "ready") ready++;
+          else if (cls === "waiting") verifying++;
+          else if (cls === "needs-review") waiting++;
+        }
+        waiting += awaitingRows.length;
+        let inProgress = 0;
+        for (const r of this.state.storage.sql.exec(
+          `SELECT meta FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
+        ).toArray() as any[]) {
+          const m = JSON.parse(r.meta ?? "{}");
+          if (!trainCardMatchesLane(m, lane.repo)) continue;
+          const mtState = String(m?.merge_train?.state ?? "");
+          if (mtState === "bounced" || mtState === "awaiting") waiting++; // parked on a review leg — not impl
+          else inProgress++;
+        }
+        return { in_progress: inProgress, verifying, waiting, ready };
+      })();
       const brQf: any = meta.lane?.queue_facts ?? null;
       const brBase: any = brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
         && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0
@@ -10572,6 +10603,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         starved,
         queue,
         awaiting: awaitingRows,
+        pr_stats: prStats,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
           merged_24h: Number(tp.h24 ?? 0),

@@ -333,7 +333,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   }, []);
 
   const now = Date.now();
-  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently || (l.awaiting?.length ?? 0) > 0;
+  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently || (l.awaiting?.length ?? 0) > 0 || (l.pr_stats?.in_progress ?? 0) > 0;
 
   return (
     <div className="train-panel">
@@ -363,7 +363,7 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
           <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
           <span title="PRs merged over the last hour / 24 hours">rate</span>
-          <span title="how many cards are waiting to merge, and how many of those waiting cards are blocked on a fresh review">backlog</span>
+          <span title="all PRs on this lane by verification state — the count line (in progress · verifying · ready) then one coloured block per PR: green = verified and mergeable (the batch that merges this pass), orange pulsing = being verified (checks running), orange solid = waiting to be verified, red = conflicted, hatched = branch-protection blocked, grey = no machine verdict yet">PRs</span>
         </div>
       )}
       {(lanes ?? []).map((l) => {
@@ -414,28 +414,89 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
             </span>
             <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
             <span className="trainc-backlog">
-              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), amber waits on checks, red conflicts, grey needs a review${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${(l.awaiting ?? []).length ? ` · grey blocks after the divider: ${(l.awaiting ?? []).length} waiting on a review (amber past the window, red past window + grace)` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}`}>
-                {l.queue.map((q, i) => {
-                  const fact = l.queue_facts?.entries.find((e) => e.id === q.id);
-                  const cls = fact?.cls ?? "unknown";
-                  const word = cls === "ready" ? "merges this pass" : cls === "waiting" ? "waiting on checks" : cls === "conflict" ? "conflicted — back to impl" : cls === "needs-review" ? "needs a review" : cls === "blocked" ? "blocked (protection)" : "no machine verdict yet";
-                  return (
-                    <span
-                      key={q.id}
-                      className={`train-block tb-${cls}${i === 0 ? " tb-head" : ""}`}
-                      title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word}${i === 0 ? " · head of the queue" : ""}`}
-                      onClick={() => openTask?.(q.id)}
-                    />
-                  );
-                })}
+              {/* BR#5658 (Ray 2026-11-03): the lane PR stat line — in progress ·
+                  verifying · ready — then EVERY PR on the lane as a coloured
+                  block. Colour = verification state: green = ready (the batch
+                  that merges this pass), orange pulsing = being verified,
+                  orange solid = waiting to be verified. Conflicts (red),
+                  protection blocks (hatched) and unknowns (grey) stay visible
+                  so the lane shows ALL its PRs, not just the mergeable set. */}
+              {(() => {
+                const ps = l.pr_stats ?? { in_progress: 0, verifying: 0, waiting: 0, ready: 0 };
+                const stat = (n: number, cls: string, word: string) => (
+                  <span className={`train-stat ${cls}`} title={`${n} ${word}`}>{n} {word}</span>
+                );
+                return (
+                  <span className="train-stats" title="PRs on this lane: in progress (impl, PR open) · verifying (checks running) · ready (verified — merges this pass)">
+                    {stat(ps.in_progress, "ts-ip", "in progress")}
+                    <span className="train-stat-sep">·</span>
+                    {stat(ps.verifying, "ts-verifying", "verifying")}
+                    <span className="train-stat-sep">·</span>
+                    {stat(ps.ready, "ts-ready", "ready")}
+                    {ps.waiting > 0 && (
+                      <>
+                        <span className="train-stat-sep">·</span>
+                        {stat(ps.waiting, "ts-waiting", "waiting")}
+                      </>
+                    )}
+                  </span>
+                );
+              })()}
+              <span className="train-blocks" title={`${l.queue.length} in the merge queue, in order — green merges this pass (batch), orange pulsing is being verified, orange solid waits to be verified, red conflicts, hatched branch-protection, grey no verdict yet${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} more waiting on reviews outside the queue` : ""}${l.queue_facts ? `\nverdicts from the machine's last walk, ${age(l.queue_facts.at, now)} ago` : "\n(machine verdicts arrive on its next tick)"}`}>
+                {/* BR#5658: blocks grouped by verification state — the ready
+                    set first (THE batch that merges this pass, green), then
+                    verifying (orange pulsing), waiting-to-be-verified (orange
+                    solid), then the not-mergeable tail (conflict red,
+                    protection hatched, unknown grey). Awaiting parks ride
+                    after the divider. */}
+                {(() => {
+                  const clsOf = (q: { id: string }) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls ?? "unknown";
+                  const groups: { cls: string; items: typeof l.queue }[] = [
+                    { cls: "ready", items: [] },
+                    { cls: "waiting", items: [] },
+                    { cls: "needs-review", items: [] },
+                    { cls: "conflict", items: [] },
+                    { cls: "other", items: [] },
+                  ];
+                  for (const q of l.queue) {
+                    const cls = clsOf(q);
+                    const g = groups.find((x) => x.cls === cls) ?? groups[4];
+                    g.items.push(q);
+                  }
+                  const word = (cls: string) =>
+                    cls === "ready" ? "verified — merges this pass (batch)" :
+                    cls === "waiting" ? "being verified — checks/mergeability running" :
+                    cls === "needs-review" ? "waiting to be verified — needs a fresh review" :
+                    cls === "conflict" ? "conflicted — back to impl" :
+                    cls === "blocked" ? "blocked (branch protection)" : "no machine verdict yet";
+                  const tone = (cls: string) =>
+                    cls === "ready" ? "tb-ready" :
+                    cls === "waiting" ? "tb-verifying" :
+                    cls === "needs-review" ? "tb-wait" :
+                    cls === "conflict" ? "tb-conflict" :
+                    cls === "blocked" ? "tb-blocked" : "tb-unknown";
+                  return groups.filter((g) => g.items.length > 0).map((g, gi) => (
+                    <span key={g.cls} className="train-block-group">
+                      {gi > 0 && <span className="train-block-gap" title="verification groups — the green batch merges first" />}
+                      {g.items.map((q) => (
+                        <span
+                          key={q.id}
+                          className={`train-block ${tone(g.cls)}`}
+                          title={`${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${word(g.cls)}`}
+                          onClick={() => openTask?.(q.id)}
+                        />
+                      ))}
+                    </span>
+                  ));
+                })()}
                 {(l.awaiting ?? []).length > 0 && (
                   <>
                     <span className="train-block-gap" title={`${(l.awaiting ?? []).length} parked Awaiting review — after the queue, oldest first`} />
                     {(l.awaiting ?? []).map((a) => (
                       <span
                         key={a.task}
-                        className={`train-block tb-awaiting${a.lapsed ? " tb-awaiting-lapsed" : a.aging ? " tb-awaiting-aging" : ""}`}
-                        title={`${a.task}${a.pr ? ` · PR #${a.pr}` : ""} — waiting on a review, parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? " · PAST the review window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? " · past the review window (amber)" : ""}${a.verdict ? `\nanchored verdict: ${a.verdict}` : ""}\nforce-review from the backlog: approve re-queues, changes requested bounce impl`}
+                        className={`train-block tb-wait${a.lapsed ? " tb-awaiting-lapsed" : ""}`}
+                        title={`${a.task}${a.pr ? ` · PR #${a.pr}` : ""} — waiting to be verified, parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? " · PAST the review window + grace (red)" : ""}${a.verdict ? `\nanchored verdict: ${a.verdict}` : ""}\nforce-review from the backlog: approve re-queues, changes requested bounce impl`}
                         onClick={() => openTask?.(a.task)}
                       />
                     ))}

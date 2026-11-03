@@ -482,6 +482,19 @@ executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the 
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
 conflated again.
+The lane's PR column shows ALL of the lane's PRs by verification state (BR#5658,
+Ray 2026-11-03: "each lane needs to show PR stats — in-progress, verifying and
+ready… colours should denote verification — green if ready, orange pulsing if
+being verified, orange solid if waiting to be"): a count line first (`N in
+progress · M verifying · K ready`, waiting appended when non-zero) — in-progress
+counts the OPEN impl cards with a PR bound to the lane's repo, verifying the
+walk's `waiting` verdicts (checks running), ready the walk's `ready` verdicts —
+then one coloured block per PR, grouped the way the pass merges them: green =
+ready (the batch that merges this pass), orange **pulsing** = being verified,
+orange solid = waiting to be verified (the `needs-review` verdicts plus the
+Awaiting parks after the divider), red = conflicted, hatched = branch-protection
+blocked, dashed grey = no machine verdict yet. The hub serves the buckets as
+`pr_stats` on each `train.status` lane.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>

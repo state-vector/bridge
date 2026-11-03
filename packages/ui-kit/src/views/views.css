@@ -580,6 +580,24 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
 .train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
+/* ---------- BR#5658 (Ray 2026-11-03): the verification colour law ----------
+   Colour = verification state on every PR block, and the lane stat line:
+   green = ready (verified, the batch that merges this pass) · orange
+   PULSING = being verified (checks running) · orange SOLID = waiting to be
+   verified (needs a fresh review, incl. the Awaiting parks) · red =
+   conflicted · hatched = protection-blocked · dashed grey = no verdict. */
+.train-block-group { display: inline-flex; align-items: center; gap: 3px; }
+.tb-verifying { background: var(--amber, #d29a4b); animation: tb-pulse 1.6s ease-in-out infinite; }
+.tb-wait { background: var(--amber, #d29a4b); }
+@keyframes tb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.train-stats { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; max-width: 100%; overflow: hidden; font-size: 11.5px; }
+.train-stat { font-weight: 600; }
+.train-stat.ts-ip { color: var(--text-faint, #8b94a7); }
+.train-stat.ts-verifying { color: var(--amber, #d29a4b); }
+.train-stat.ts-ready { color: var(--green, #3fb26a); }
+.train-stat.ts-waiting { color: var(--amber, #d29a4b); opacity: 0.85; }
+.train-stat-sep { color: var(--text-faint, #8b94a7); opacity: 0.7; }
+
 /* ---------- dashboard ---------- */
 .dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
 .dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }

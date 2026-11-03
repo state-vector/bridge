@@ -227,6 +227,12 @@ export interface KbTrainLane {
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
   awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
+  /** BR#5658 (Ray 2026-11-03): per-lane PR stats — the verification buckets
+   *  the lane stat line shows. in-progress = impl cards with open PRs on
+   *  this lane's repo; verifying = walk verdict "waiting" (checks running);
+   *  waiting = walk verdict "needs-review" + Awaiting parks (waiting to be
+   *  verified); ready = walk verdict "ready" (the mergeable batch). */
+  pr_stats?: { in_progress: number; verifying: number; waiting: number; ready: number };
   /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
    *  (rank) order — the queue block row. cls: ready (merges this pass) |
    *  waiting (checks/mergeability pending) | conflict | needs-review |
