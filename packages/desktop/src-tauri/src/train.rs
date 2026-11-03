@@ -770,6 +770,25 @@ fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+/// BR#5911 (F2): the self-heal's stall fact, stamped onto the entry's
+/// queue_facts payload. PRECONDITION: only called from the RerunGate arm —
+/// the gate firing already proves the classification found ≥1 healable
+/// deploy-health red, so `dispatched == 0` (every gh rerun attempt failed,
+/// or the dispatch set resolved no run ids) is a loud contradiction: a
+/// remediation reporting success while doing nothing (proactive-support:
+/// a no-op loop ran 5h on PR #2707 logging "dispatched 0" every tick).
+/// The hub panel and the starvation duty read the stamp off train.status;
+/// the next walk's entries rebuild drops it (self-clearing on success).
+fn self_heal_stall_fact(reds: usize, dispatched: usize, last_error: Option<&str>) -> Option<Value> {
+    (dispatched == 0).then(|| {
+        json!({
+            "reds": reds,
+            "dispatched": dispatched,
+            "error": last_error.unwrap_or("(no run resolved — dispatch set was empty against a red verdict)"),
+        })
+    })
+}
+
 /// Lease renewal carries proof-of-progress (BR#4104): the last ledger action
 /// this holder took and its age. The hub ignores the payload today — consuming
 /// it (deny renewal on stale progress while the queue is non-empty) is the
@@ -2069,16 +2088,53 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     // tick. Never the raw historical list.
                     let stale = latest_red_deploy_health_runs(&head_checks);
                     let mut dispatched = 0usize;
+                    let mut last_err: Option<String> = None;
                     for r in &stale {
-                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok()
-                            || ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"]).is_ok()
-                        {
-                            dispatched += 1;
+                        // BR#5911 (F2): "classified fixable, dispatched 0" is a
+                        // loud contradiction, never a quiet no-op — the 5h
+                        // silent self-heal loop on PR #2707 dispatched 0 re-runs
+                        // every tick while logging success-shaped lines. The
+                        // failure is CAPTURED per attempt and, when nothing
+                        // dispatched, escalated: error-level log + a
+                        // self_heal_stalled stamp on this entry's queue_facts
+                        // (the hub panel and the starvation duty read it).
+                        let attempt = ctx
+                            .sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"])
+                            .or_else(|check_err| {
+                                ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"])
+                                    .map_err(|job_err| format!("check-runs rerequest: {check_err}; actions rerun: {job_err}"))
+                            });
+                        match attempt {
+                            Ok(_) => dispatched += 1,
+                            Err(e) => last_err = Some(trunc(&e, 240)),
                         }
                     }
                     renew_lease(ctx, repo, base);
-                    ctx.note(&format!("self-heal: dispatched {dispatched} stale gate re-run(s) on PR #{pr} — {reason}"));
-                    log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick"));
+                    // BR#5911 (F2): RerunGate firing already proves the
+                    // classification found ≥1 healable red — dispatched == 0
+                    // (gh rerun failed, or the dispatch set resolved no run
+                    // ids) is therefore always a loud contradiction, never a
+                    // quiet no-op. The 5h silent loop on PR #2707 logged
+                    // success-shaped "dispatched 0" lines every tick.
+                    if let Some(fact) = self_heal_stall_fact(stale.len(), dispatched, last_err.as_deref()) {
+                        // the stall stamp rides THIS tick's entry — the next
+                        // walk rebuilds the entries, so a tick that dispatches
+                        // cleanly drops it (self-clearing, same law as the
+                        // whole-row stalled field).
+                        if let Some(entry) = qfacts.last_mut() {
+                            entry.as_object_mut().map(|o| o.insert("self_heal_stalled".into(), fact.clone()));
+                        }
+                        let err_note = last_err.as_deref().unwrap_or("(no run resolved — dispatch set was empty against a red verdict)");
+                        ctx.note(&format!("SELF-HEAL STALLED on PR #{pr}: classified healable red(s), dispatched 0 — {err_note}"));
+                        log(Some(key), &format!("ERROR — queue[{qi}] PR #{pr} self-heal STALLED: dispatch set resolved {reds} run(s), 0 re-run(s) dispatched ({err_note}); stamped self_heal_stalled into queue_facts (BR#5911)", reds = stale.len()));
+                    } else {
+                        let err_suffix = match last_err.as_deref() {
+                            Some(e) => format!(" (partial: {e})"),
+                            None => String::new(),
+                        };
+                        ctx.note(&format!("self-heal: dispatched {dispatched} stale gate re-run(s) on PR #{pr} — {reason}"));
+                        log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick{err_suffix}"));
+                    }
                 }
                 // the entry is a clock (waiting), never a defect: advance —
                 // the queue is not held by a stale red
@@ -4144,6 +4200,42 @@ mod tests {
         assert!(check_runs_from_pages(&[Some(page1), None]).is_empty());
         assert!(check_runs_from_pages(&[None]).is_empty());
         assert!(check_runs_from_pages(&[]).is_empty());
+    }
+
+    // ---- BR#5911 (F2): the self-heal stall fact — "classified fixable,
+    // dispatched 0" is a loud contradiction, never a quiet no-op ----
+
+    #[test]
+    fn self_heal_stall_fact_fires_when_dispatched_zero_with_failures_br5911() {
+        // gh rerun failed on every resolved run: the 5h no-op loop shape on
+        // PR #2707 — classified healable, dispatched nothing, logged
+        // success-shaped lines. The fact names the failure verbatim.
+        let f = self_heal_stall_fact(2, 0, Some("gh: HttpError 403 — resource not accessible"));
+        let f = f.expect("stalled: reds>=1, dispatched 0");
+        assert_eq!(f["reds"], json!(2));
+        assert_eq!(f["dispatched"], json!(0));
+        assert_eq!(f["error"], json!("gh: HttpError 403 — resource not accessible"));
+    }
+
+    #[test]
+    fn self_heal_stall_fact_fires_when_no_run_ids_resolved_br5911() {
+        // The "resolves no run ids" cause: dispatch set empty against a red
+        // verdict — still dispatched 0, still a contradiction, fact fires
+        // with the no-ids error.
+        let f = self_heal_stall_fact(0, 0, None).expect("stalled: no ids resolved, dispatched 0");
+        assert_eq!(f["reds"], json!(0));
+        assert_eq!(f["error"], json!("(no run resolved — dispatch set was empty against a red verdict)"));
+    }
+
+    #[test]
+    fn self_heal_stall_fact_absent_when_dispatch_succeeded_br5911() {
+        // Healthy and partial dispatches never stamp — partial failures ride
+        // the normal log line's error suffix, and post-F1 the dispatch set
+        // holds at most one run per check name, so a partial dispatch still
+        // settles every name it re-requested; the missed name re-fires
+        // RerunGate next tick (retry, not silence).
+        assert!(self_heal_stall_fact(2, 2, None).is_none());
+        assert!(self_heal_stall_fact(2, 1, Some("one job rerun failed")).is_none());
     }
 
     // ---- pure helpers: the identity law and its plumbing (BR#4104) ----
