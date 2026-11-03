@@ -1962,12 +1962,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, awaiting CI"));
             return Ok(());
         }
-        if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935 + BR#5897: a CLOSED PR can never merge — stamp cls:"blocked"
-            // in qfacts so the hub never counts an unmerged closed PR as ready/green,
-            // and advance to the next entry this same tick.
+        // BR#5639 ghost car + BR#3935/BR#5897 lineage, fail-closed
+        // (BR#5911 F3): a leg whose live PR state is not OPEN can NEVER be
+        // a batch candidate — the 2026-11-03 incident reached batch `ready`
+        // while binding CLOSED PR #2659 (real leg #2759). The old
+        // `== CLOSED` shape let non-CLOSED fall-throughs (MERGED without a
+        // mergeCommit, an unreadable state) sail into the gate. Only a live
+        // OPEN read passes; everything else stamps cls:"blocked" so the
+        // hub never counts an unlandable PR as ready/green, and advances —
+        // the card stays for the humans, the queue is not held.
+        if !crate::train_gate::pr_state_is_batch_candidate(vstr(&facts, "state")) {
+            let st = vstr(&facts, "state").unwrap_or("(unreadable)");
             qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
-            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
+            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} live state is {st} (not OPEN) — unlandable, never a batch candidate, advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();

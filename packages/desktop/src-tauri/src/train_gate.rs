@@ -262,6 +262,18 @@ pub fn latest_red_deploy_health_runs(runs: &[MainCheckRun]) -> Vec<MainCheckRun>
     out
 }
 
+/// BR#5639 (ghost car, 2026-11-03): a batch reached `ready` while binding
+/// CLOSED PR #2659 (its live leg was #2759) — BR#3935's `== CLOSED`
+/// exclusion shape missed the batch path and any non-CLOSED fall-through
+/// (MERGED without a mergeCommit, an unreadable state). Fail-closed law:
+/// ONLY a live read that says OPEN can ever make a leg a batch candidate;
+/// every other state — CLOSED, MERGED, missing, empty — is excluded (log +
+/// advance, the BR#3935 shape: the card stays for the humans, the queue
+/// is not held).
+pub fn pr_state_is_batch_candidate(state: Option<&str>) -> bool {
+    state == Some("OPEN")
+}
+
 // ---------- legs (core.ts 1285-1338) ----------
 
 #[derive(Clone, Debug)]
@@ -1005,6 +1017,19 @@ mod tests {
         // heals only the stale main-deploy-judging gate class).
         let runs = vec![run(400, "Rust Tests", Some("failure"))];
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
+
+    #[test]
+    fn only_live_open_prs_are_batch_candidates_br5639() {
+        // BR#5639 ghost car: the batch reached `ready` while binding CLOSED
+        // PR #2659. Fail-closed: ONLY an OPEN live read can be a batch
+        // candidate — CLOSED, MERGED (incl. without a mergeCommit), a
+        // missing state (gh partial read), or an empty string all exclude.
+        assert!(pr_state_is_batch_candidate(Some("OPEN")));
+        assert!(!pr_state_is_batch_candidate(Some("CLOSED")), "the ghost-car state itself");
+        assert!(!pr_state_is_batch_candidate(Some("MERGED")), "MERGED without mergeCommit fell through the old ==CLOSED shape");
+        assert!(!pr_state_is_batch_candidate(None), "unreadable state is never a candidate (fail-closed)");
+        assert!(!pr_state_is_batch_candidate(Some("")), "empty state is never a candidate");
     }
 
     #[test]
