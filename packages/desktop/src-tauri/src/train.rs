@@ -30,14 +30,15 @@
 //! Loop (one tick): preflight → train_status → per lane: CAS-lease →
 //! reconcile from live GitHub → awaiting-CI poll → else WALK the derived
 //! queue in order and drive the first entry that can act (BR#3935: a
-//! permanently unlandable entry — CLOSED PR, stamp-less leg, no unlanded leg
-//! on this lane — is logged and the walk advances in the SAME tick; a
-//! transient no-op still blocks) → decideTrainGate → act: merge →
-//! train:merged → next tick polls CI on the merge commit. Carry law
-//! (BR#3516 §5): machine-clean carries, human-resolved invalidates. Local
-//! git plumbing is three-valued (BR#3935): a git FAILURE is never folded
-//! into a conflict/behind verdict — the PR head is fetched explicitly
-//! before any local op names it.
+//! permanently unlandable entry must not starve the lane — a stamp-less leg
+//! is BOUNCED off the hub so lane.queue self-heals (BR#5753), a CLOSED PR or
+//! an entry with no unlanded leg on this lane is logged and the walk
+//! advances in the SAME tick; a transient no-op still blocks) →
+//! decideTrainGate → act: merge → train:merged → next tick polls CI on the
+//! merge commit. Carry law (BR#3516 §5): machine-clean carries,
+//! human-resolved invalidates. Local git plumbing is three-valued (BR#3935):
+//! a git FAILURE is never folded into a conflict/behind verdict — the PR
+//! head is fetched explicitly before any local op names it.
 
 use crate::train_gate::{
     classify_base_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
@@ -1691,9 +1692,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // per-member merge leg law is unchanged — and the pass runs exactly
     // ONE settle wait, on the FINAL merge commit. The pass state is the
     // HUB's (currently.phase/​burst_*), never executor-local — crash-safe.
-    // A PERMANENTLY unlandable entry — PR CLOSED, a leg with no PR stamp,
-    // no unlanded leg on this lane — must NOT starve the lane (BR#3935):
-    // it is logged and classification advances to the next entry. A red
+    // A PERMANENTLY unlandable entry must NOT starve the lane (BR#3935): a
+    // leg with no PR stamp is BOUNCED off the hub — the card leaves the
+    // derived queue that tick (BR#5753, the self-heal); a CLOSED PR or an
+    // entry with no unlanded leg on this lane is logged and classification
+    // advances to the next entry. A red
     // pass sha (tip classify, re-checked before EACH member) stops the
     // line IMMEDIATELY (GH#2261) — it never waits for the settle; earlier
     // pass-sha reds surface at the settle (and its bisect, if the settle
@@ -1803,10 +1806,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // is PARKED on this pass (its merge is in; the settle owns it) and
         // must never re-gate as if unmerged.
         let legs = train_legs(&card_meta);
+        // "On this lane" is repo AND base — a leg without a base stamp
+        // defaults to "main" (the card-stamp convention), the exact scoping
+        // the hub's derived queue uses (core.ts trainLegsRemaining,
+        // BR#4977). Without the base half, a second base's leg on this repo
+        // could be classified (and driven) by the wrong lane's walk; with it,
+        // an entry whose legs all target other bases is honestly "no unlanded
+        // leg on this lane" below. (BR#5753 walk half.)
         let lane_legs: Vec<usize> = legs
             .iter()
             .enumerate()
-            .filter(|(_, leg)| leg.repo == repo && !train_leg_landed(&card_meta, leg))
+            .filter(|(_, leg)| {
+                leg.repo == repo
+                    && leg.base.as_deref().unwrap_or("main") == base
+                    && !train_leg_landed(&card_meta, leg)
+            })
             .map(|(i, _)| i)
             .collect();
         if lane_legs.is_empty() {
@@ -1831,6 +1845,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             // BR#3935: this entry can never drive on this lane — advance.
+            // BR#5753: this stays an ADVANCE, not a bounce — post-BR#4977 the
+            // hub's derived queue only lists cards with an unlanded leg on
+            // THIS repo+base, so a static no-lane-leg entry cannot persist in
+            // lane.queue (the snapshot re-derives within one tick). A firing
+            // here is mid-tick drift, and the card may legitimately ride a
+            // SIBLING lane via its other unlanded legs — a hub bounce here
+            // would yank it off that lane's queue.
             log(Some(key), &format!("queue[{qi}] {head_id} has no unlanded leg on this lane ({} leg(s) cited) — advancing to the next queue entry", legs.len()));
             continue;
         }
@@ -1849,9 +1870,43 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let leg_number = leg_idx + 1;
         let pr = leg.number;
         if pr == 0 || leg.repo.is_empty() {
-            // BR#3935: a stamp-less leg can never drive — advance (the hub
-            // audit owns the convention violation; the card stays queued).
-            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
+            // BR#5753: a stamp-less leg can NEVER drive — and the old
+            // advance-only path left the card in the hub's derived queue
+            // FOREVER: the hub keeps matching the leg on repo+base+unlanded
+            // regardless of its missing number, so the entry re-derived into
+            // lane.queue every tick, a silent zombie inflating queue.length.
+            // Un-queue it on the hub: the audited impl bounce (train:bounced,
+            // gate class) stamps merge_train.state = "bounced" and flips the
+            // card blocked → in_progress with the fix-up brief — impl
+            // re-stamps the PR binding, re-verifies, re-queues. The bounce
+            // needs pr > 0: the card's own merge_train stamp supplies it
+            // (the hub's laneQueue SQL only queues cards with
+            // merge_train.pr > 0, falling back to any stamped leg). When
+            // even that is missing the entry is not hub-queueable anymore —
+            // snapshot drift: advance and let the snapshot re-derive.
+            let bounce_pr = card_meta
+                .pointer("/merge_train/pr")
+                .and_then(|v| v.as_i64())
+                .filter(|&n| n > 0)
+                .or_else(|| legs.iter().map(|l| l.number).find(|&n| n > 0))
+                .unwrap_or(0);
+            if bounce_pr > 0 {
+                renew_lease(ctx, repo, base);
+                let defect = format!(
+                    "queue entry leg {leg_number} on this lane carries no PR stamp (number 0 / empty repo) — the entry can never drive or land (BR#5753); re-stamp the card's PR binding (meta.prs leg), re-verify, re-queue"
+                );
+                ctx.mcp("train_event", json!({
+                    "repo": repo, "base": base, "kind": "bounced", "pr": bounce_pr, "task_id": head_id,
+                    "reason": defect, "bounce_kind": "gate",
+                }))?;
+                ctx.note(&format!("bounced {head_id} (gate, stamp-less) — leg {leg_number} carries no PR stamp; lane.queue self-heals this tick"));
+                log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — bounced off the hub (impl re-stamps the binding, re-verifies, re-queues; BR#5753)"));
+                release_if_idle(ctx, key, repo, base)?;
+                return Ok(());
+            }
+            // BR#3935 (fail-open residue): no bounceable pr stamp at all —
+            // advance (the hub audit owns the convention violation).
+            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp and no bounceable train stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
             continue;
         }
         let mut facts = ctx.pr_facts(repo, pr)?;
@@ -4130,6 +4185,76 @@ mod tests {
         let recorded = calls.lock().unwrap();
         assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
         assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_bounces_off_the_hub_br5753() {
+        // BR#5753: a queued card whose lane leg carries no PR stamp used to be
+        // logged and advanced — the hub keeps matching that leg on
+        // repo+base+unlanded, so the entry re-derived into lane.queue on every
+        // tick, a silent zombie inflating queue.length forever. The walk now
+        // bounces it off the hub (the audited impl bounce: train:bounced, gate
+        // class) with the card's own merge_train.pr stamp, and the tick ends —
+        // lane.queue self-heals within one tick.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+                "merge_train": { "pr": 7, "state": "queued" },
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // renew_lease (bounce arm)
+            ok(json!({ "ok": true })),                                // train_event bounced
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_lease", "train_event", "train_status", "train_lease"],
+            "the stamp-less arm must bounce (renew → train_event) and end the tick, got {:?}",
+            names
+        );
+        let ev = call_args(&recorded[3]);
+        assert_eq!(call_name(&recorded[3]), "train_event");
+        assert_eq!(ev.get("kind"), Some(&json!("bounced")));
+        assert_eq!(ev.get("pr"), Some(&json!(7)), "the bounce rides the card's own merge_train.pr stamp");
+        assert_eq!(ev.get("task_id"), Some(&json!("BR#1")));
+        assert_eq!(ev.get("bounce_kind"), Some(&json!("gate")));
+        assert!(
+            String::from(ev.get("reason").and_then(|v| v.as_str()).unwrap_or("")).contains("no PR stamp"),
+            "the defect must name the stamp-less leg, got: {:?}",
+            ev.get("reason")
+        );
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_without_train_stamp_advances_br5753() {
+        // Fail-open residue: a stamp-less leg on a card with NO bounceable
+        // merge_train.pr / stamped leg anywhere cannot call train:bounced (the
+        // hub requires pr > 0) — the walk advances instead of erroring the
+        // tick (the entry is not hub-queueable anymore; snapshot drift).
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // train_queue_facts (walk end)
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"],
+            "no bounceable stamp → advance (no train_event), got {:?}",
+            names
+        );
     }
 
     #[test]

@@ -334,14 +334,24 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.every((x) => x.priority !== "root_fix")).toBe(true);
   });
 
-  it("baseRed (a stopped lane) parks EVERYTHING except the root-fix card — the base-red law, BR#4365 precedent", () => {
-    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)], { baseRed: true });
-    expect(q.map((x) => x.id)).toEqual(["R1"]);
+  // ---- BR#5753: the hub queue NEVER hides held cars ----
+  // The pre-5753 baseRed option (a STOPPED lane offering only tier 0) was
+  // dead in production — its one caller looked the lane's stop facts up with
+  // `WHERE id = laneKey(repo, base)`, and a lane key is never an
+  // artefacts.id — and it must stay gone: base_red_resolution.held, the
+  // alarm ask's cure-PR fallback and trainOpenRootFix all read the derived
+  // queue and would go blind mid-episode if non-root_fix cars were filtered
+  // out. The stop fast-lane is the WALK's law (train.rs gate), not a
+  // hub-side queue filter.
+
+  it("BR#5753: no baseRed filter — a stopped lane's queue keeps EVERY held car visible, root_fix still at rank 0", () => {
+    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)]);
+    expect(q.map((x) => x.id)).toEqual(["R1", "B1", "N1"]);
     expect(q[0].priority).toBe("root_fix");
   });
 
-  it("baseRed with NO root-fix card → an empty queue: every head stays parked until the fix is bound or the line greens", () => {
-    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")], { baseRed: true })).toEqual([]);
+  it("BR#5753: with NO root-fix card the queue still lists the held cars (root_fix absent, tiers intact)", () => {
+    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")]).map((x) => x.id)).toEqual(["B1", "N1"]);
   });
 
   it("empty input → empty queue (vacuity)", () => {

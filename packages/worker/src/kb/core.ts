@@ -1865,12 +1865,19 @@ export function rootFixCardBody(repo: string, sha: string, failing: { name: stri
  *  tier 2 "critical" — cards explicitly marked critical (meta.priority ===
  *      "critical"), the manual rung;
  *  tier 3 "normal" — everything else.
- *  FIFO within tier by blocked-since (status_ts ascending). opts.baseRed
- *  (a STOPPED lane — the lane card's stop facts are the hub-visible proxy
- *  for base red) offers ONLY tier 0: every other head stays parked on the
- *  base-red law (BR#4365 precedent) until the fix merges or the line goes
- *  green. */
-export function mergeTrainQueue(cards: TrainCandidate[], opts?: { baseRed?: boolean }): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
+ *  FIFO within tier by blocked-since (status_ts ascending). NO stop/base-red
+ *  filter (BR#5753): the hub's derived queue keeps EVERY held car visible —
+ *  root_fix still sorts to rank 0 unconditionally — because the stop-arm
+ *  consumers (base_red_resolution.held, the alarm ask's cure-PR fallback,
+ *  trainOpenRootFix) read this list and would go blind mid-episode if
+ *  non-root_fix cars were filtered out. The stopped-lane fast lane (only the
+ *  bound root-fix card merges; BR#5190) is the WALK's law — train.rs
+ *  is_root_fix_card + the merge gate — enforced where merges happen, not a
+ *  hub-side queue filter. (The pre-5753 opts.baseRed option was dead in
+ *  production: its one caller looked the stop facts up with
+ *  `WHERE id = laneKey(repo, base)`, and a lane key is never an
+ *  artefacts.id, so the filter never fired once.) */
+export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
   const queued = cards.filter((c) =>
     [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX))
     // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
@@ -1879,9 +1886,7 @@ export function mergeTrainQueue(cards: TrainCandidate[], opts?: { baseRed?: bool
     || isWatchdogTrainHoldPark(c.meta),
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
-  const baseRed = opts?.baseRed === true;
   return [...queued]
-    .filter((c) => !baseRed || rank(c) === 0)
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
     .map((c) => {
       const r = rank(c);

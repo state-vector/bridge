@@ -10053,21 +10053,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  queue is scoped to the lane's BASE — a card matches only when one of
    *  its unlanded legs targets this repo AND this base (a leg without a
    *  base stamp defaults to "main"), so a lane never inherits another
-   *  base's queue on the same repo. */
+   *  base's queue on the same repo.
+   *  BR#5753: NO stop/base-red filter here. The old lookup ran
+   *  `SELECT meta FROM artefacts WHERE id = laneKey(repo, base)` — dead by
+   *  construction, since a lane key ("owner/repo@base") is never an
+   *  artefacts.id (the live card resolves via laneRow() on
+   *  json_extract(meta, '$.lane.key')) — so the baseRed tier filter never
+   *  fired once, and it must STAY gone: the stop-arm consumers all read
+   *  this list (train.status counts `held: queue.length` in
+   *  base_red_resolution, the alarm ask's cure-PR fallback and
+   *  trainOpenRootFix discover queued fixes here) and filtering
+   *  non-root_fix cars out during a stop would hide held cars from every
+   *  one of them. root_fix sorts to rank 0 unconditionally; the stopped
+   *  lane's fast lane (BR#5190) is enforced walk-side at the merge gate. */
   private laneQueue(repo: string, base: string) {
     const cards = this.state.storage.sql.exec(
       `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
-    // BR#5190: a STOPPED lane offers ONLY tier 0 — the lane card's stop facts
-    // are the hub-visible proxy for base red (the hub holds no VCS
-    // credentials), and every other head stays parked on the base-red law
-    // (BR#4365 precedent) until the bound fix merges or the line goes green.
-    const laneRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneKey(repo, base)) as any;
-    const baseRed = !!JSON.parse(String(laneRow?.meta ?? "{}") || "{}")?.stop?.sha;
     return mergeTrainQueue(
       cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}"), tags: parseTags(c.tags) })),
-      { baseRed },
     ).filter((c) => {
       const cm = cards.find((x) => x.id === c.id);
       // a card rides exactly the lanes that own one of its UNLANDED legs

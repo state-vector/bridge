@@ -1009,9 +1009,15 @@ capable gateways (or one dedicated train node) — merges never move server-side
 One tick: preflight → `train_status` → per lane: CAS-lease → **reconcile from live
 GitHub** (never trust a prior holder's picture) → awaiting-CI poll (`train.ci`; the hub
 lands, stops or pends) → else the derived queue is **walked in order** (BR#3935): a
-permanently unlandable entry — a CLOSED PR, a leg with no PR stamp, no unlanded leg on
-this lane — is logged and the walk advances to the next entry **in the same tick** (the
-card stays queued for the humans; the lane never starves behind it), while a transient
+permanently unlandable entry must not starve the lane — a leg with **no PR stamp** is
+**bounced off the hub** (the audited impl bounce, gate class: the card leaves the
+derived queue that tick, impl re-stamps the PR binding, re-verifies, re-queues —
+BR#5753; the hub kept matching the stamp-less leg on repo+base, so the old
+log-and-advance left the entry in `lane.queue` forever), while a **CLOSED PR** or an
+entry with **no unlanded leg on this lane** ("on this lane" is repo AND base, the
+hub's own queue scoping, BR#4977) is logged and the walk advances to the next entry
+**in the same tick** (the card stays queued for the humans; the lane never starves
+behind it), while a transient
 no-op — mergeability still computing, unsettled checks, no verdict — still blocks; the
 first drivable entry's **first unlanded leg on this lane**
 (BR#3659: a multi-PR card rides leg by leg) → `decideTrainGate` → act: merge (`gh`) →
