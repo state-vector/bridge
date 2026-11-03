@@ -65,6 +65,10 @@ pub struct CheckVerdict {
     pub unsettled: Vec<String>,
     pub external: Vec<MainRedCheck>,
     pub green: usize,
+    /// BR#5674 P1 (empty-is-loud): when verdict == Empty, explains WHY:
+    /// - zero total runs on the tip → "tip carries no check runs at all"
+    /// - N runs read but 0 matched required_workflows → "{N} runs read, none matched required set — check names/pagination"
+    pub alarm: Option<String>,
 }
 
 fn is_red_conclusion(c: &str) -> bool {
@@ -95,7 +99,14 @@ fn parse_runs(runs: &[MainCheckRun]) -> Vec<(String, Vec<&MainCheckRun>)> {
 /// judges; red beats unsettled beats green; no runs at all = "empty".
 pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
     if runs.is_empty() {
-        return CheckVerdict { verdict: MainVerdict::Empty, red: vec![], unsettled: vec![], external: vec![], green: 0 };
+        return CheckVerdict {
+            verdict: MainVerdict::Empty,
+            red: vec![],
+            unsettled: vec![],
+            external: vec![],
+            green: 0,
+            alarm: Some("tip carries no check runs at all".to_string()),
+        };
     }
     let mut red = Vec::new();
     let mut unsettled = Vec::new();
@@ -121,15 +132,25 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
     finish_verdict(red, unsettled, vec![], green)
 }
 
-/// BR#5265 Fix B: the base-green gate classifies ONLY the lane's required
-/// workflows when the lane configures them (newest non-cancelled run per
-/// name, red beats unsettled beats green — the same law
+/// BR#5265 Fix B + BR#5674 P1 (empty-is-loud): the base-green gate classifies
+/// ONLY the lane's required workflows when the lane configures them (newest
+/// non-cancelled run per name, red beats unsettled beats green — the same law
 /// classify_main_check_runs applies to its set). Un-configured lanes keep
-/// the legacy whole-tip read. A nightly/battery/canary red stops its own
-/// pipeline and its own cards — never the train: the observed 2026-10-31
-/// outage was three non-required nightly reds parking a 10-car queue ~30h
-/// while the four deploy-required workflows sat green on the same tip.
+/// the legacy whole-tip read. When required workflows are configured and the
+/// scoped filter yields zero on a tip that HAS runs, `alarm` names the exact
+/// count ("{N} runs read, none matched required set — check names/pagination");
+/// zero-total-runs gets the sibling alarm ("tip carries no check runs at all").
 pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> CheckVerdict {
+    if runs.is_empty() {
+        return CheckVerdict {
+            verdict: MainVerdict::Empty,
+            red: vec![],
+            unsettled: vec![],
+            external: vec![],
+            green: 0,
+            alarm: Some("tip carries no check runs at all".to_string()),
+        };
+    }
     if required.is_empty() {
         return classify_main_check_runs(runs);
     }
@@ -138,6 +159,19 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
         .filter(|r| required.iter().any(|n| n == &r.name))
         .cloned()
         .collect();
+    if scoped.is_empty() {
+        return CheckVerdict {
+            verdict: MainVerdict::Empty,
+            red: vec![],
+            unsettled: vec![],
+            external: vec![],
+            green: 0,
+            alarm: Some(format!(
+                "{} runs read, none matched required set — check names/pagination",
+                runs.len()
+            )),
+        };
+    }
     classify_main_check_runs(&scoped)
 }
 
@@ -184,7 +218,7 @@ fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<
     } else {
         MainVerdict::Green
     };
-    CheckVerdict { verdict, red, unsettled, external, green }
+    CheckVerdict { verdict, red, unsettled, external, green, alarm: None }
 }
 
 // ---------- legs (core.ts 1285-1338) ----------
@@ -948,11 +982,30 @@ mod tests {
         assert!(matches!(healed.verdict, MainVerdict::Green));
         // required set matching NOTHING on the tip → Empty (a lane-config
         // defect, rendered loud by the Fix A BLOCKED line — never green)
+        // BR#5674 P1 (empty-is-loud): distinguishes some-runs-none-matched vs zero-total-runs
         let phantom = classify_base_check_runs(&tip, &["ci / Never Runs".to_string()]);
         assert!(matches!(phantom.verdict, MainVerdict::Empty));
-        // un-configured lane keeps the legacy whole-tip read
+        assert_eq!(
+            phantom.alarm.as_deref(),
+            Some("5 runs read, none matched required set — check names/pagination")
+        );
+        let zero_runs = classify_base_check_runs(&[], &required);
+        assert!(matches!(zero_runs.verdict, MainVerdict::Empty));
+        assert_eq!(
+            zero_runs.alarm.as_deref(),
+            Some("tip carries no check runs at all")
+        );
+        let zero_unconfigured = classify_base_check_runs(&[], &[]);
+        assert!(matches!(zero_unconfigured.verdict, MainVerdict::Empty));
+        assert_eq!(
+            zero_unconfigured.alarm.as_deref(),
+            Some("tip carries no check runs at all")
+        );
+        // un-configured lane keeps the legacy whole-tip read (and no empty alarm)
         let legacy = classify_base_check_runs(&tip, &[]);
         assert!(matches!(legacy.verdict, MainVerdict::Red));
+        assert!(legacy.alarm.is_none());
+        assert!(scoped.alarm.is_none());
     }
 
     #[test]

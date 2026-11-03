@@ -37,6 +37,12 @@ import {
   trainParseNoteLegs,
   trainQueueRemainingReason,
   trainStopAskTitle,
+  trainStarvationAskTitle,
+  trainStarvationAskDetails,
+  trainStarvationDutyTitle,
+  trainStarvationDutyBody,
+  TRAIN_MERGE_STARVE_MS,
+  classifyBaseCheckRuns,
   trainAwaitingReason,
   trainAwaitingHumanLeg,
   trainRequeueSwap,
@@ -1490,5 +1496,70 @@ describe("batch-merge law (BR#4996)", () => {
     expect(body).toContain("MUTUALLY non-conflicting");
     expect(body).toContain("BR#4996");
     expect(body).toContain("waits for the next pass");
+  });
+});
+
+// ---------- BR#5674 P1 + P4: empty-is-loud + starvation ask/duty copy ----------
+
+describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/duty builders", () => {
+  const run = (id: number, name: string, conclusion: string | null = "success"): MainCheckRun => ({
+    id,
+    name,
+    status: conclusion ? "completed" : "in_progress",
+    conclusion,
+  });
+
+  it("P1 classifyBaseCheckRuns: distinguishes N runs with 0 required matches from 0 total runs", () => {
+    const tip = [run(1, "Product surface canary (dev)"), run(2, "Nightly Release")];
+    const unmatched = classifyBaseCheckRuns(tip, ["deploy / Deploy to dev"]);
+    expect(unmatched.verdict).toBe("empty");
+    expect(unmatched.alarm).toBe("2 runs read, none matched required set — check names/pagination");
+
+    const zero = classifyBaseCheckRuns([], ["deploy / Deploy to dev"]);
+    expect(zero.verdict).toBe("empty");
+    expect(zero.alarm).toBe("tip carries no check runs at all");
+
+    const matched = classifyBaseCheckRuns([...tip, run(3, "deploy / Deploy to dev", "success")], ["deploy / Deploy to dev"]);
+    expect(matched.verdict).toBe("green");
+    expect(matched.alarm).toBeUndefined();
+  });
+
+  it("P4 trainStarvationAskTitle + details + duty builders hold the ask contract and carry full diagnosis", () => {
+    expect(TRAIN_MERGE_STARVE_MS).toBe(60 * MIN);
+    const lane = { repo: "state-vector/superpositional", base: "main" };
+    const title = trainStarvationAskTitle(lane);
+    expect(title.length).toBeLessThanOrEqual(240);
+    expect(title.endsWith("?")).toBe(true);
+    expect(title).toBe(trainStarvationAskTitle(lane));
+
+    const diag = {
+      lane,
+      laneId: "BR#3637",
+      blockedReason: "merge-train: BLOCKED — base main carries none of the lane's required workflow runs (30 runs read, none matched required set — check names/pagination) — 3 car(s) held",
+      baseVerdict: "empty",
+      requiredWorkflows: ["deploy / Deploy to dev", "post-deploy / Post-Deploy Smoke"],
+      redNames: [],
+      unsettledNames: [],
+      baseAlarm: "30 runs read, none matched required set — check names/pagination",
+      queue: [{ id: "BR#5422", pr: 2692 }, { id: "BR#5421", pr: 2693 }],
+      awaiting: [{ task: "BR#4711", pr: 2518 }],
+      lastMergeTs: 1793627633028,
+      mins: 636,
+      dutyId: "BR#5999",
+    };
+    const details = trainStarvationAskDetails(diag);
+    expect(details).toContain("30 runs read, none matched required set — check names/pagination");
+    expect(details).toContain("2 queued");
+    expect(details).toContain("1 awaiting");
+    expect(details).toContain("1793627633028");
+    expect(details).toContain("BR#5999");
+
+    const dutyTitle = trainStarvationDutyTitle(lane, 2, 1);
+    expect(dutyTitle.length).toBeLessThanOrEqual(240);
+    const dutyBody = trainStarvationDutyBody(diag);
+    expect(dutyBody).toContain("per_page");
+    expect(dutyBody).toContain("required_workflows");
+    expect(dutyBody).toContain("Verify pool depth");
+    expect(dutyBody).toContain("Park exits");
   });
 });
