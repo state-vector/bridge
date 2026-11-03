@@ -266,6 +266,30 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.map((x) => x.id)).toEqual(["A"]);
   });
 
+  // BR#5750 — a watchdog silence-release hold-park of a QUEUED car must keep
+  // its queue slot even when the park note predates the merge-train: prefix
+  // (the BR#4995 silent drop). awaiting is NOT a queue slot — it re-enters
+  // through the board.
+  it("BR#5750: a legacy unprefixed watchdog hold-park of a queued car still queues; awaiting parks never do", () => {
+    const legacy = {
+      id: "H1",
+      status_ts: 7,
+      meta: {
+        merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" },
+        blocked: { reason: "silence-release held (watchdog): no update for >10m, but the card carries merge-train queued on PR state-vector/bridge#259 — parked on the typed proxy, not released (BR#4067)" },
+      },
+    };
+    const awaiting = {
+      ...legacy,
+      id: "H2",
+      status_ts: 8,
+      meta: { ...legacy.meta, merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge" } },
+    };
+    const q = mergeTrainQueue([card("B", 2, "needs review"), legacy, awaiting]);
+    expect(q.map((x) => x.id)).toEqual(["H1"]);
+    expect(q[0].priority).toBe("normal");
+  });
+
   it("BOOSTED (meta.boosted) first among mortals, FIFO within class by blocked-since (BR#5190 renamed the old CRITICAL label)", () => {
     const q = mergeTrainQueue([
       card("N1", 10, "merge-train: queued"),
