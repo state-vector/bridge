@@ -8548,11 +8548,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (kind === "bounced") {
       if (!pr) throw new Error("train:bounced needs pr");
       const taskId = String(body.task_id ?? "") || (meta.currently?.task_id ?? null);
-      const conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
+      let conflictFiles: string[] = Array.isArray(body.conflict_files) ? body.conflict_files.map(String).filter(Boolean) : [];
       const bounceKindRaw = body.bounce_kind != null ? String(body.bounce_kind).trim().toLowerCase() : "";
       if (bounceKindRaw && !["coverage", "conflict", "gate"].includes(bounceKindRaw))
         throw new Error(`train:bounced bounce_kind must be coverage | conflict | gate (got "${bounceKindRaw}")`);
-      const defect = body.reason != null ? String(body.reason) : null;
+      let defect = body.reason != null ? String(body.reason) : null;
       const mergeStateStatus = body.merge_state_status != null ? String(body.merge_state_status) : null;
       const bounceKind = resolveTrainBounceKind({ bounceKind: bounceKindRaw || null, conflictFiles, defect });
       // FAIL LOUD (BR#4066): a conflict bounce without the enumerated file
@@ -8562,6 +8562,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
+      // BR#5633 awaiting sweep: a re-assert of a card ALREADY parked
+      // Awaiting classifies (and re-stamps) on the card's STORED park facts
+      // — the executor's sweep reason is a trigger marker, not the defect.
+      // Without this restore, a genuine human-leg park (human-resolved
+      // conflict files / dismissed review / signing environment) would
+      // misread as a machine-clean lapse and bounce to impl, overriding the
+      // BR#4960 park policy; the park's own defect record would also be
+      // overwritten by the marker string.
+      if (String(cm.merge_train?.state ?? "") === "awaiting" && /awaiting sweep/i.test(defect ?? "")) {
+        if (cm.merge_train?.defect) defect = String(cm.merge_train.defect);
+        if (Array.isArray(cm.merge_train?.conflict_files)) conflictFiles = cm.merge_train.conflict_files.map(String).filter(Boolean);
+      }
       // BR#4962 (per accepted BR#4960), AMENDED BR#5226: a coverage bounce
       // is judged by what the card's ACCEPTED verdict actually covers. The
       // machine verdict IS the review: a bounce whose accepted stamp (or
@@ -8617,6 +8629,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             state: "awaiting",
             bounce_kind: "coverage",
             defect: (defect ?? "").slice(0, 300) || undefined,
+            // BR#5633: the enumerated conflict files ARE the human-leg
+            // evidence — persist them on the park so a sweep re-assert (or
+            // any later read) classifies the park on its own facts.
+            conflict_files: conflictFiles,
             awaiting: { at: now, ...(headSha ? { head_sha: headSha } : {}), ...(verdictId ? { verdict_id: verdictId } : {}) },
             pr,
             repo,
@@ -8693,6 +8709,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           repo,
         },
       };
+      // BR#5633: a card that left the Awaiting park (the sweep re-assert's
+      // impl-bounce exit) must not carry its stale awaiting anchor forward —
+      // the park is over; the bounce record is the truth now.
+      delete nextMeta.merge_train.awaiting;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
       // blocked→in_progress with the fix-up brief; resolution invalidates the
       // verdict — the card re-enters the queue only after a fresh verify.
@@ -9530,11 +9550,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async trainQueueFacts(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
-    const entries = Array.isArray(body.entries) ? body.entries : [];
+    // BR#5633: an ABSENT entries field preserves the stored per-entry
+    // verdicts — the awaiting sweep stamps through this same op at the TOP
+    // of the tick (before the arms that never reach the walk's own stamp),
+    // and must not clobber the walk's queue blocks. An explicit [] still
+    // clears (the bypass/rerun acks rely on that).
+    const entries = Array.isArray(body.entries)
+      ? body.entries
+      : null;
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const lease: TrainLease | null = meta.lease ?? null;
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    // BR#5633: the entries THIS stamp persists — provided, else the stored
+    // ones (the absent-entries preservation above).
+    const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
     // BR#5265 Fix A: the executor stamps the walk's base verdict
     // (scoped to the lane's required workflows, Fix B) alongside the
     // entries — whole-of-row, served verbatim by train.status. The lane
@@ -9549,12 +9579,49 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // itself). The lane renders a loud STALLED reason/banner off it and the
     // ONE-per-episode alarm ask files below — same dedupe law as base-red.
     const stalled = body.stalled && typeof body.stalled === "object" ? body.stalled : null;
+    // BR#5633: the awaiting sweep's rate-limit stamp — {task: {head, outcome,
+    // at}} for every card it re-asserted this tick. Kept SMALL: pruned to
+    // entries fresher than 14d and at most 50 keys, and merged (not
+    // replaced) so the walk's own stamps never touch it.
+    const sweepStamp =
+      body.awaiting_sweep && typeof body.awaiting_sweep === "object" && !Array.isArray(body.awaiting_sweep) ? body.awaiting_sweep : null;
+    const prevSweep = (meta.lane?.awaiting_sweep ?? {}) as Record<string, any>;
+    const nextSweep: Record<string, any> = {};
+    if (sweepStamp) {
+      const cutoff = Date.now() - 14 * 24 * 3_600_000;
+      const mergedSweep: Record<string, any> = { ...prevSweep, ...sweepStamp };
+      for (const [k, v] of Object.entries(mergedSweep)) {
+        if (!v || typeof v !== "object") continue;
+        if (Number(v.at ?? 0) < cutoff) continue;
+        nextSweep[String(k)] = v;
+      }
+      // newest 50 only — the stamp is a rate-limit ledger, not history
+      const keys = Object.keys(nextSweep);
+      if (keys.length > 50) {
+        keys.sort((a, b) => Number(nextSweep[b]?.at ?? 0) - Number(nextSweep[a]?.at ?? 0));
+        for (const k of keys.slice(50)) delete nextSweep[k];
+      }
+    }
+    const sweepChanged = sweepStamp && JSON.stringify(prevSweep) !== JSON.stringify(nextSweep);
+    // BR#5633: with ABSENT entries (the sweep-stamp shape) the stored
+    // base_state/stalled ride on too — the sweep must not wipe the walk's
+    // fresh banner facts for the fraction of a tick before the walk
+    // re-stamps. A stamp that PROVIDES entries (every walk stamp always
+    // carries base_state; the acks clear deliberately) keeps today's
+    // whole-of-row semantics.
+    const preservedQf: any = entries ? {} : (meta.lane?.queue_facts ?? {});
     meta.lane = {
       ...(meta.lane ?? {}),
-      queue_facts: { at: Date.now(), entries, ...(baseState ? { base_state: baseState } : {}), ...(stalled ? { stalled } : {}) },
+      queue_facts: {
+        at: Date.now(),
+        entries: entriesArr,
+        ...(baseState ? { base_state: baseState } : preservedQf.base_state ? { base_state: preservedQf.base_state } : {}),
+        ...(stalled ? { stalled } : preservedQf.stalled ? { stalled: preservedQf.stalled } : {}),
+      },
+      ...(sweepChanged ? { awaiting_sweep: nextSweep } : {}),
     };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
-    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entries.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null });
+    this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entriesArr.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null, ...(sweepStamp ? { awaiting_sweep: Object.keys(sweepStamp).length } : {}) });
     // BR#5265 Fix A: train.status serves meta.blocked.reason — the STORED
     // string, re-written only when laneSyncReason runs. The stamp changed
     // the lane's truth (base verdict + entries); re-render the reason NOW
@@ -9584,11 +9651,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
       if (changed) this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneM), Date.now(), lane.id);
     }
-    if (baseState && String(baseState.verdict ?? "") === "red" && entries.length > 0) {
+    if (baseState && String(baseState.verdict ?? "") === "red" && entriesArr.length > 0) {
       const reds = (Array.isArray(baseState.red) ? baseState.red : [])
         .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
         .filter((r: { name: string }) => r.name);
-      const held = entries.length;
+      const held = entriesArr.length;
       const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
       // 2026-11-02 (Ray directive): the base-red ask is a LIVE TRIAGE VIEW,
       // not a one-shot alarm. The old hard-coded pair offered "Bypass-merge
@@ -9601,7 +9668,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the moment one exists — and the four outcomes mirror the triage
       // task's own (transient/retry · fault-of-X fix PR → bypass · manual ·
       // no-resolution-yet keep digging). Plain words only (BR#5349).
-      const fix = this.trainOpenRootFix(repo, entries);
+      const fix = this.trainOpenRootFix(repo, entriesArr);
       const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
       const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
       // the episode's OPEN ask — the SAME join askCreate's identical-open-ask
@@ -9652,7 +9719,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // fresh stamp carries the episode (the per-tick repeats collapse in
     // askCreate's identical-open-ask guard on the numberless title; the
     // train_event "stalled" leg files the same title as belt-and-braces).
-    if (stalled && entries.length > 0 && !baseState) {
+    if (stalled && entriesArr.length > 0 && !baseState) {
       const members: number[] = (Array.isArray(stalled.batch) ? stalled.batch : []).map(Number).filter((n: number) => Number.isInteger(n) && n > 0);
       const ticks = Math.max(0, Math.floor(Number(stalled.ticks ?? 0) || 0));
       const sinceMs = Math.max(0, Math.floor(Number(stalled.since ?? 0) || 0));
@@ -9683,7 +9750,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit(actor, "train:stalled_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
       }
     }
-    return { ok: true, lane: laneKey(repo, base), n: entries.length, stalled: !!stalled };
+    return { ok: true, lane: laneKey(repo, base), n: entriesArr.length, stalled: !!stalled };
   }
 
   private async trainCarry(body: any, actor: string): Promise<any> {
@@ -10455,6 +10522,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // BR#5114: per-entry executor gate verdicts in walk order (panel
         // blocks) — null until the first executor tick stamps them
         queue_facts: meta.lane?.queue_facts ?? null,
+        // BR#5633: the awaiting sweep's per-task rate-limit stamps — the
+        // executor reads these to skip re-asserting a settled human-leg
+        // park at an unchanged head
+        awaiting_sweep: meta.lane?.awaiting_sweep ?? null,
         // BR#5349: the plain-words resolution block (whats_broken/held/ask/
         // fix_card) while a non-green base holds cars — absent once green
         ...(base_red_resolution ? { base_red_resolution } : {}),

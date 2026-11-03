@@ -1167,6 +1167,161 @@ struct BatchCandidate {
     root_fix: bool,
 }
 
+// ---- BR#5633: the Awaiting-park sweep ---------------------------------
+//
+// The Awaiting park had NO machine exit: a card parked by a coverage
+// bounce (hub train:bounced → awaiting_park) was never re-evaluated —
+// the machine re-queue existed only at bounce-event time, so cars whose
+// verdicts lapsed while the lane was blocked sat parked forever
+// (bridge#364: 10 cars dead since Oct 30; the panel's aging/lapsed chips
+// are render-only). The sweep re-asserts every parked card through the
+// EXISTING audited bounce path with LIVE facts; the hub handler branches
+// correctly for all three cases:
+//   (a) accepted verdict covers the live head → machine re-queue (BR#5226)
+//   (b) machine-clean lapse / head moved → impl bounce — the verify pool
+//       re-verifies at the new head
+//   (c) human-leg class (conflict files / dismissed review / signing env)
+//       → stays parked (the hub classifies a re-asserted park on its
+//       STORED defect/conflict files — the sweep reason is only a trigger
+//       marker, deliberately free of the human-leg vocabulary)
+// Verdict validity becomes head-anchored, not clock-anchored. Runs every
+// tick BEFORE the stop arm: verdicts lapse exactly while the lane is
+// stopped / settling — the states the walk never reaches.
+
+/// One Awaiting-park entry as the hub's train.status serves it on the lane.
+struct AwaitingPark {
+    task: String,
+    pr: i64,
+}
+
+/// The per-card sweep decision (pure — table-tested below).
+#[derive(Debug, PartialEq)]
+enum SweepAction {
+    /// Re-assert the bounce through the audited hub path with live facts.
+    Reassert {
+        task: String,
+        pr: i64,
+        head_sha: String,
+    },
+    /// Leave the card this tick; the reason names whose path owns it.
+    Skip {
+        task: String,
+        why: &'static str,
+    },
+}
+
+fn awaiting_sweep_action(task: &str, pr: i64, facts: Result<&Value, &str>, last_sweep: Option<&Value>) -> SweepAction {
+    let facts = match facts {
+        Ok(f) => f,
+        Err(_) => {
+            // transient gh read — no stamp, the next tick retries
+            return SweepAction::Skip { task: task.to_string(), why: "live facts unreadable — retry next tick" };
+        }
+    };
+    if vstr(facts, "state").unwrap_or("") != "OPEN" {
+        // MERGED/CLOSED — the landed/close path owns the card
+        return SweepAction::Skip { task: task.to_string(), why: "PR not OPEN — the landed/close path owns it" };
+    }
+    let head = vstr(facts, "headRefOid").unwrap_or("").to_string();
+    if head.is_empty() {
+        return SweepAction::Skip { task: task.to_string(), why: "OPEN PR with no live head — fail closed, retry next tick" };
+    }
+    if let Some(last) = last_sweep {
+        let same_head = last.get("head").and_then(|v| v.as_str()) == Some(head.as_str());
+        let settled = last.get("outcome").and_then(|v| v.as_str()) == Some("awaiting_park");
+        if same_head && settled {
+            // a human-leg park re-asserted at an unchanged head re-parked
+            // identically — one event per (card, head), never per tick
+            return SweepAction::Skip { task: task.to_string(), why: "settled human-leg park at an unchanged head — rate-limited" };
+        }
+    }
+    SweepAction::Reassert { task: task.to_string(), pr, head_sha: head }
+}
+
+/// The train_event payload a sweep re-assert emits — mirrors the executor's
+/// real coverage-bounce shape (kind bounced + bounce_kind coverage + the
+/// live head + the task). The reason is a trigger marker: it must carry NO
+/// human-leg vocabulary (conflict files ride `conflict_files`, never prose;
+/// "dismiss…review" / "signing environment" / "key unavailable" /
+/// "NO_USER" would misclassify a re-asserted park).
+fn awaiting_sweep_bounce_event(repo: &str, base: &str, task: &str, pr: i64, head_sha: &str) -> Value {
+    json!({
+        "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": task,
+        "head_sha": head_sha, "bounce_kind": "coverage",
+        "reason": "awaiting sweep: re-assert parked card with live facts (BR#5633)",
+    })
+}
+
+/// Per-tick awaiting sweep (BR#5633) — see the block comment above.
+/// Never fails the tick: per-card errors are logged and retried next tick.
+fn awaiting_sweep(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) {
+    let parks: Vec<AwaitingPark> = lane
+        .get("awaiting")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| {
+            let task = e.get("task").and_then(|v| v.as_str())?.to_string();
+            let pr = e.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+            Some(AwaitingPark { task, pr })
+        })
+        .filter(|p| p.pr > 0)
+        .collect();
+    if parks.is_empty() {
+        return;
+    }
+    log(Some(key), &format!("awaiting sweep: {} parked card(s) (BR#5633)", parks.len()));
+    let stamps = lane.get("awaiting_sweep").cloned().unwrap_or(json!({}));
+    let mut asserted: Vec<(String, Value)> = Vec::new();
+    for park in parks {
+        let facts = ctx.pr_facts(repo, park.pr);
+        let action = match &facts {
+            Ok(f) => awaiting_sweep_action(&park.task, park.pr, Ok(f), stamps.get(park.task.as_str())),
+            Err(e) => awaiting_sweep_action(&park.task, park.pr, Err(e.as_str()), stamps.get(park.task.as_str())),
+        };
+        let (task, pr, head) = match action {
+            SweepAction::Reassert { task, pr, head_sha } => (task, pr, head_sha),
+            SweepAction::Skip { task, why } => {
+                log(Some(key), &format!("awaiting sweep: {task} PR #{} — {why}", park.pr));
+                continue;
+            }
+        };
+        renew_lease(ctx, repo, base);
+        match ctx.mcp("train_event", awaiting_sweep_bounce_event(repo, base, &task, pr, &head)) {
+            Ok(resp) => {
+                let outcome = if resp.get("machine_requeue").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "machine_requeue"
+                } else if resp.get("awaiting_park").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "awaiting_park"
+                } else {
+                    "impl_bounce"
+                };
+                log(Some(key), &format!("awaiting sweep: {task} PR #{pr} re-asserted at {} → {outcome}", &head[..head.len().min(9)]));
+                ctx.note(&format!("awaiting sweep: {task} PR #{pr} → {outcome} (BR#5633)"));
+                asserted.push((task, json!({ "head": head, "outcome": outcome, "at": now_ms() })));
+            }
+            Err(e) => {
+                // no stamp — the refusal is loud here and the next tick retries
+                log(Some(key), &format!("awaiting sweep: {task} re-assert refused — {} (retry next tick)", trunc(&e, 200)));
+            }
+        }
+    }
+    if asserted.is_empty() {
+        return;
+    }
+    // one stamp op for the whole tick (the rate-limit ledger lives hub-side
+    // — the executor is stateless across ticks by design). ABSENT entries
+    // preserve the walk's stored queue blocks (the hub merges, BR#5633).
+    let mut map = serde_json::Map::new();
+    for (task, v) in asserted {
+        map.insert(task, v);
+    }
+    if let Err(e) = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "awaiting_sweep": Value::Object(map) })) {
+        log(Some(key), &format!("awaiting sweep: rate-limit stamp failed — settled parks may re-assert next tick: {}", trunc(&e, 200)));
+    }
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
     // happens — it's broken"): the answered alarm ask IS the authority. The
@@ -1320,6 +1475,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("rerun: re-ran {} failing check(s) on the base tip — stamp consumed ({outcome})", reds.len()));
         }
     }
+    // ---- BR#5633 awaiting-park sweep: every parked card gets its machine
+    // exit EVERY tick, before any arm that can return early — verdicts
+    // lapse exactly while the lane is stopped / mid-settle, the states the
+    // walk never reaches (bridge#364: 10 cars parked dead since Oct 30).
+    // See the block comment at awaiting_sweep for the three hub outcomes. ----
+    awaiting_sweep(ctx, key, repo, base, lane);
+
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
         let stop = lane.get("stop").unwrap();
@@ -3401,6 +3563,91 @@ mod tests {
         let (s2, f2) = stall_next(Some(&s1), &batch, attempted, 2, "e", T0 + 45_000, th);
         assert_eq!(s2, None, "a landed prefix settles the episode");
         assert!(!f2);
+    }
+
+    // ---- BR#5633: the awaiting-park sweep decision (bridge#364) ----
+
+    fn open_pr_at(head: &str) -> Value {
+        json!({ "state": "OPEN", "headRefOid": head, "mergeable": true, "mergeStateStatus": "CLEAN" })
+    }
+
+    const SWEEP_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The covered-head case: an OPEN parked card with no prior sweep stamp
+    /// (or a stamp from a DIFFERENT head) is re-asserted through the audited
+    /// bounce path — the hub then re-queues it (verdict covers the live
+    /// head) or bounces it to impl for a fresh verify. Either way the park
+    /// has its machine exit.
+    #[test]
+    fn awaiting_sweep_reasserts_an_open_card_br5633() {
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), None);
+        assert_eq!(a, SweepAction::Reassert { task: "BR#1".into(), pr: 2518, head_sha: SWEEP_HEAD.into() });
+        // a stamp at a DIFFERENT head never rate-limits — live facts moved
+        let stamp = json!({ "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "outcome": "awaiting_park", "at": T0 });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+        assert!(matches!(a, SweepAction::Reassert { .. }));
+    }
+
+    /// The pr-closed case: MERGED/CLOSED PRs are skipped entirely — the
+    /// landed/close path owns those cards; the sweep never speaks for them.
+    #[test]
+    fn awaiting_sweep_skips_non_open_prs_br5633() {
+        for state in ["MERGED", "CLOSED"] {
+            let facts = json!({ "state": state, "headRefOid": SWEEP_HEAD });
+            let a = awaiting_sweep_action("BR#1", 2518, Ok(&facts), None);
+            assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("landed/close")), "{state} must skip to the landed/close path");
+        }
+    }
+
+    /// The unchanged-human-leg case: a card the hub re-parked (awaiting_park
+    /// outcome) at the SAME head is rate-limited — one event per
+    /// (card, head), never one per tick. Any other outcome at the same head
+    /// re-asserts (the card should have LEFT the awaiting set; if it did
+    /// not, it must not strand).
+    #[test]
+    fn awaiting_sweep_rate_limits_the_settled_human_leg_park_br5633() {
+        let stamp = json!({ "head": SWEEP_HEAD, "outcome": "awaiting_park", "at": T0 });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("rate-limited")));
+        for outcome in ["machine_requeue", "impl_bounce"] {
+            let stamp = json!({ "head": SWEEP_HEAD, "outcome": outcome, "at": T0 });
+            let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+            assert!(matches!(a, SweepAction::Reassert { .. }), "{outcome} at an unchanged head must re-assert, not strand");
+        }
+    }
+
+    /// Unreadable live facts and headless OPEN PRs fail closed: skip with no
+    /// stamp, retry next tick — the sweep never asserts a head it did not
+    /// read.
+    #[test]
+    fn awaiting_sweep_fails_closed_on_unreadable_facts_br5633() {
+        let a = awaiting_sweep_action("BR#1", 2518, Err("gh: connection reset"), None);
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("retry next tick")));
+        let headless = json!({ "state": "OPEN", "headRefOid": "" });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&headless), None);
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("fail closed")));
+    }
+
+    /// The wire contract: the sweep's bounce event mirrors the executor's
+    /// real coverage-bounce shape, and its reason carries NONE of the
+    /// human-leg vocabulary (the hub classifies a re-asserted park on the
+    /// card's STORED defect/conflict files — a marker that named a human leg
+    /// would strand every machine-lapsed park back into the park).
+    #[test]
+    fn awaiting_sweep_bounce_event_mirrors_the_real_coverage_bounce_br5633() {
+        let ev = awaiting_sweep_bounce_event("state-vector/superpositional", "main", "BR#4711", 2518, SWEEP_HEAD);
+        assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("bounced"));
+        assert_eq!(ev.get("bounce_kind").and_then(|v| v.as_str()), Some("coverage"));
+        assert_eq!(ev.get("task_id").and_then(|v| v.as_str()), Some("BR#4711"));
+        assert_eq!(ev.get("pr").and_then(|v| v.as_i64()), Some(2518));
+        assert_eq!(ev.get("head_sha").and_then(|v| v.as_str()), Some(SWEEP_HEAD));
+        assert_eq!(ev.get("repo").and_then(|v| v.as_str()), Some("state-vector/superpositional"));
+        assert_eq!(ev.get("base").and_then(|v| v.as_str()), Some("main"));
+        let reason = ev.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(reason.to_lowercase().contains("awaiting sweep"), "the reason must carry the sweep marker the hub restores on");
+        for banned in ["dismiss", "review", "approval", "signing environment", "key unavailable", "NO_USER", "conflict"] {
+            assert!(!reason.to_lowercase().contains(&banned.to_lowercase()), "reason must not carry human-leg vocabulary: {banned}");
+        }
     }
 
     #[test]
