@@ -10941,6 +10941,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // - "ready"     → green solid (.tb-ready): verified & ready to merge
       // - "verifying" → orange pulsing (.tb-verifying): actively being verified now
       // - "waiting"   → orange solid (.tb-wait): waiting to be verified
+      // BR#5897: queued cars NEVER render "verifying" — a queued car has
+      // already passed VERIFY ACCEPT, so cls "waiting" (the executor's
+      // base-settle / check-poll clock) still renders ready; only
+      // "needs-review" demotes to orange solid and "conflict"/"blocked"
+      // to in_progress.
       const { prStats, batches } = (() => {
         const facts = meta.lane?.queue_facts?.entries ?? [];
         const factFor = (id: string) => String(facts.find((e: any) => e.id === id)?.cls ?? "");
@@ -10980,21 +10985,22 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           return [];
         };
 
-        // 1. Queued cars (already verify-accepted onto the merge train)
+        // 1. Queued cars (already verify-accepted onto the merge train).
+        // BR#5897 (Ray colour law correction): a queued car has ALREADY
+        // passed verification (VERIFY ACCEPT) — `cls === "waiting"` is only
+        // the executor's base-settle / check-poll clock on an accepted car,
+        // NOT a verify in progress, so it renders READY (green solid). The
+        // orange buckets are strictly: "needs-review" (head moved, re-verify
+        // → orange solid waiting) and "conflict"/"blocked" (impl/unblock
+        // repair → in_progress). "verifying" (orange pulsing) is never a
+        // queued-car state — it belongs to in_review cards with an active
+        // Verify child, in-flight awaiting parks, and live reconcile duties.
         for (const q of queue) {
           seenCards.add(q.id);
           if (q.pr) seenPrs.add(Number(q.pr));
           const cls = factFor(q.id);
           if (cls === "conflict" || cls === "blocked") {
             inProgress++;
-          } else if (cls === "waiting") {
-            verifying++;
-            batchCandidates.push({
-              id: q.id,
-              ...(q.pr ? { pr: q.pr } : {}),
-              state: "verifying",
-              detail: "being verified — checks/mergeability running",
-            });
           } else if (cls === "needs-review") {
             verifying++;
             batchCandidates.push({
@@ -11004,6 +11010,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               detail: "waiting to be verified — needs a fresh review",
             });
           } else {
+            // ready, waiting (executor settle/poll clock), or no facts yet —
+            // verify-accepted cars are green
             ready++;
             batchCandidates.push({
               id: q.id,

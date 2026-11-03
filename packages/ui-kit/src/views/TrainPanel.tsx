@@ -435,7 +435,11 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   3. Block colour denotes verification state:
                      - green solid (.tb-ready): ready (verified, mergeable)
                      - orange pulsing (.tb-verifying): being verified right now
-                     - orange solid (.tb-wait): waiting to be verified */}
+                     - orange solid (.tb-wait): waiting to be verified
+                     BR#5897: queued cars never render verifying — a queued car
+                     has already passed VERIFY ACCEPT; cls "waiting" (executor
+                     settle/poll clock) still renders ready, only needs-review
+                     waits and conflict/blocked count as in_progress */}
               {(() => {
                 const clsOf = (q: { id: string }) => l.queue_facts?.entries.find((e) => e.id === q.id)?.cls ?? "ready";
                 const fallbackBatches = () => {
@@ -444,15 +448,21 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                   let ip = 0, ver = 0, rdy = 0;
                   for (const q of l.queue) {
                     const cls = clsOf(q);
+                    // BR#5897 (Ray colour law correction): a queued car has
+                    // ALREADY passed verification — cls "waiting" is only the
+                    // executor's base-settle / check-poll clock on an accepted
+                    // car, so it renders READY (green solid). Orange is
+                    // strictly needs-review (waiting) and conflict/blocked
+                    // (in_progress); "verifying" (pulsing) is never a
+                    // queued-car state.
                     if (cls === "conflict" || cls === "blocked") {
                       ip++;
-                    } else if (cls === "waiting") {
-                      ver++;
-                      cars.push({ id: q.id, pr: q.pr, state: "verifying", detail: "being verified — checks/mergeability running" });
                     } else if (cls === "needs-review") {
                       ver++;
                       cars.push({ id: q.id, pr: q.pr, state: "waiting", detail: "waiting to be verified — needs a fresh review" });
-                    } else if (cls === "ready" || cls !== "") {
+                    } else {
+                      // ready, waiting (executor settle/poll clock), or no
+                      // facts yet — verify-accepted cars are green
                       rdy++;
                       cars.push({ id: q.id, pr: q.pr, state: "ready", detail: "verified — merges this pass (batch)" });
                     }

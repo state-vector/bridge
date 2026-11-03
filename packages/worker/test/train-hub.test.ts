@@ -3080,12 +3080,16 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       actor: "verifier-4",
     });
 
-    // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2
+    // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2.
+    // BR#5897: the queued car is stamped cls "waiting" ON PURPOSE — a queued
+    // car has already passed VERIFY ACCEPT, and cls "waiting" is only the
+    // executor's base-settle / check-poll clock, so it must still render
+    // READY (green solid): the assertions below pin the correction.
     await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-ng", merge_capable: true });
     await kbJson("/train.queue_facts", {
       repo,
       base: "main",
-      entries: [{ id: readyCard.id, pr: 504, cls: "ready" }],
+      entries: [{ id: readyCard.id, pr: 504, cls: "waiting" }],
       conflict_pairs: [[504, 503]],
       actor: "gw-ng",
     });

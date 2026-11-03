@@ -1033,26 +1033,49 @@ export type HeadCheckVerdict = {
 /** The HEAD side of the 5c mechanical gate: same decision rule as
  *  classifyMainCheckRuns, but exempt-external failures (BR#2267) are pulled
  *  OUT of red and recorded as `external` — they are collected into the class
- *  ask, never bounce a PR. */
+ *  ask, never bounce a PR.
+ *  BR#5897: the runs are DEDUPLICATED BY NAME first — the newest
+ *  non-cancelled run per name (highest id) judges, the classifyMainCheckRuns
+ *  law. The old flat scan let a superseded historical run poison the verdict
+ *  (SP #2692/#2693/#2624/#2555/#2707/#2689: a Nov-1 `Deploy health (merge
+ *  gate)` failure beside Nov-3 successes gated a 4.4h RerunGate loop).
+ *  Groups whose entries ALL carry id == 0 (synthetic unit-test runs) have no
+ *  ordering signal — distinct entries there are preserved as-is. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
+  const byName = new Map<string, MainCheckRun[]>();
   for (const r of runs) {
+    const list = byName.get(r.name ?? "") ?? [];
+    list.push(r);
+    byName.set(r.name ?? "", list);
+  }
+  const judgeOne = (name: string, r: MainCheckRun) => {
     if (r.conclusion == null) {
-      if (isExemptCheckName(r.name ?? "")) continue; // exempt externals in flight say nothing
-      unsettled.push(r.name ?? "");
-      continue;
+      if (isExemptCheckName(name)) return; // exempt externals in flight say nothing
+      unsettled.push(name);
+      return;
     }
-    if (isExemptCheckName(r.name ?? "")) {
-      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    if (isExemptCheckName(name)) {
+      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name, conclusion: r.conclusion, url: r.html_url ?? "" });
       else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
-      continue;
+      return;
     }
-    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
+    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name, conclusion: r.conclusion, url: r.html_url ?? "" });
     else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
-    else unsettled.push(r.name ?? "");
+    else unsettled.push(name);
+  };
+  for (const [name, list] of byName) {
+    if (list.some((r) => (r.id ?? 0) > 0)) {
+      // dedup: the newest non-cancelled run on this name judges
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (judge) judgeOne(name, judge);
+      else unsettled.push(`${name} (only cancelled runs)`);
+    } else {
+      for (const r of list) judgeOne(name, r); // id == 0: preserve distinct entries
+    }
   }
   if (red.length) return { verdict: "red", red, unsettled, external, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };

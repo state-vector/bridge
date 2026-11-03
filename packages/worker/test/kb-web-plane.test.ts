@@ -271,7 +271,10 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // cars the machine's walk stamped ready this pass render — the
     // mergeable set, not the audit trail; head ringed; click opens the card
     expect(trainPanelSrc).toMatch(/train-blocks/);
-    expect(trainPanelSrc).toMatch(/cls === "ready"/);
+    // BR#5897: queued cars never branch on cls "ready" — verify-accepted cars
+    // ARE the ready else-branch; the cls conditionals left are the demotions
+    expect(trainPanelSrc).toMatch(/cls === "needs-review"/);
+    expect(trainPanelSrc).toMatch(/BR#5897/);
     expect(trainPanelSrc).toMatch(/l\.queue_facts\?\.entries\.find/);
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
     expect(trainPanelSrc).toContain("merges this pass");
@@ -293,8 +296,13 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/Batch \$\{bi \+ 1\}/);
     // 3. verification colour law: green = ready (.tb-ready), orange pulsing =
     // being verified (.tb-verifying), orange solid = waiting to be verified (.tb-wait);
-    // no red on awaiting parks (BR#5476)
-    expect(trainPanelSrc).toMatch(/cls === "ready"/);
+    // no red on awaiting parks (BR#5476).
+    // BR#5897: a queued car never renders verifying — it has already passed
+    // VERIFY ACCEPT; the cls branches left in the panel are the demotions
+    // (needs-review → waiting solid, conflict/blocked → in progress) and the
+    // ready else-branch is the verify-accepted default.
+    expect(trainPanelSrc).toMatch(/cls === "needs-review"/);
+    expect(trainPanelSrc).toMatch(/BR#5897/);
     expect(trainPanelSrc).toMatch(/merges this pass/);
     expect(trainPanelSrc).toMatch(/tb-ready/);
     expect(trainPanelSrc).toMatch(/tb-verifying/);

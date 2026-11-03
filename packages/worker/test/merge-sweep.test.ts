@@ -101,6 +101,45 @@ describe("classifyHeadChecks (the head half of the 5c gate)", () => {
     expect(v.verdict).toBe("unsettled");
     expect(v.unsettled).toEqual(["Test"]);
   });
+
+  it("BR#5897: deduplicates by name — the newest non-cancelled run judges (a superseded failure never poisons)", () => {
+    // the live incident shape: SP PRs carried a Nov-1 `Deploy health (merge
+    // gate)` failure beside Nov-3 successes — the stale red gated a 4.4h
+    // RerunGate loop ("dispatched 0 stale gate re-run(s)")
+    const v = classifyHeadChecks([
+      run(1260740000000, "Deploy health (merge gate)", "failure"),
+      run(1260744930960, "Deploy health (merge gate)", "success"),
+    ]);
+    expect(v.verdict).toBe("green");
+    expect(v.green).toBe(1);
+    expect(v.red).toEqual([]);
+    // inverse order — the newest run judges regardless of list order
+    const v2 = classifyHeadChecks([
+      run(1260744930960, "Deploy health (merge gate)", "success"),
+      run(1260740000000, "Deploy health (merge gate)", "failure"),
+    ]);
+    expect(v2.verdict).toBe("green");
+  });
+
+  it("BR#5897: a newer cancelled run does not hide the older failure — newest NON-CANCELLED judges", () => {
+    const v = classifyHeadChecks([run(1, "Test", "failure"), run(2, "Test", "cancelled")]);
+    expect(v.verdict).toBe("red");
+  });
+
+  it("BR#5897: a newer in-flight run is unsettled (checks re-running — the gate waits), never green off the older success", () => {
+    const v = classifyHeadChecks([run(1, "Test", "success"), run(2, "Test", null)]);
+    expect(v.verdict).toBe("unsettled");
+  });
+
+  it("BR#5897: id == 0 (synthetic) groups carry no ordering signal — distinct entries are preserved", () => {
+    const v = classifyHeadChecks([run(0, "Test", "failure"), run(0, "Test", "success")]);
+    expect(v.verdict).toBe("red");
+    expect(v.green).toBe(1);
+    // exempt externals inside an id == 0 group still carve out
+    const v2 = classifyHeadChecks([run(0, "ci", "success"), run(0, "Workers Builds: bridge", "failure")]);
+    expect(v2.verdict).toBe("green");
+    expect(v2.external).toEqual([{ name: "Workers Builds: bridge", conclusion: "failure", url: "https://example.com/run/0" }]);
+  });
 });
 
 // ---------- tier 1b: decideMergeAction (the standing order's decision table) ----------

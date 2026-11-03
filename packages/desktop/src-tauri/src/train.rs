@@ -1364,6 +1364,38 @@ fn extract_actions_run_id(url: &str) -> Option<i64> {
         .and_then(|p| p.parse::<i64>().ok())
 }
 
+/// Extract the GitHub Actions JOB id from a check-run `html_url`
+/// (`https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>`) —
+/// the sibling of extract_actions_run_id, for the `actions/jobs/{id}/rerun`
+/// fallback (BR#5897). Job URLs may carry an `/attempts/<n>` suffix; the
+/// `/job/<digits>` pair still matches first.
+fn extract_actions_job_id(url: &str) -> Option<i64> {
+    let segs: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    for w in segs.windows(2) {
+        if w[0] == "job" && w[1].chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(id) = w[1].parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// BR#5897: re-run one failed check run. `check-runs/{id}/rerequest` is the
+/// canonical write, but GitHub REFUSES it for check runs created by GitHub
+/// Actions workflows; for those the documented path is
+/// `actions/jobs/{job_id}/rerun` with the Actions JOB id parsed from the
+/// check run's html_url. True only when a re-run was actually accepted.
+fn rerun_check_run(ctx: &Ctx, repo: &str, r: &crate::train_gate::MainCheckRun) -> bool {
+    if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok() {
+        return true;
+    }
+    match extract_actions_job_id(r.html_url.as_deref().unwrap_or("")) {
+        Some(job) => ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{job}/rerun"), "-X", "POST"]).is_ok(),
+        None => false,
+    }
+}
+
 fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged: u32) -> Value {
     let mut base_state = json!({
         // mid-drain (pass_merged > 0): destination-green is owned by the
@@ -1944,11 +1976,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             return Ok(());
         }
         if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935: a CLOSED PR can never merge — the old drop-and-return
-            // starved the whole lane behind its card. Log it, leave the card
-            // for the humans, and drive the NEXT entry this same tick.
-            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
-            continue;
+            // BR#5897: a CLOSED, unmerged PR can never merge. The old
+            // log-and-advance left the card sitting in lane.queue with NO
+            // queue_facts entry — the hub's derived stats fell through to the
+            // ready bucket and rendered the dead PR as a green ready block
+            // forever (SP #2659 / BR#5639 sat queued for days). Bounce it off
+            // the hub (gate class — impl re-plans the leg: reopen, re-target
+            // or supersede the card) and stamp cls: "blocked" so a closed PR
+            // never renders as a green ready block.
+            qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
+            renew_lease(ctx, repo, base);
+            let defect = format!(
+                "queue entry PR #{pr} is CLOSED (unmerged) on GitHub — unlandable, bounced off lane.queue (BR#5897); reopen/re-target the PR or supersede the card, then re-verify to re-queue"
+            );
+            ctx.mcp("train_event", json!({
+                "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id,
+                "reason": defect, "bounce_kind": "gate",
+            }))?;
+            ctx.note(&format!("bounced {head_id} (gate, CLOSED PR) — PR #{pr} is closed and unmerged; lane.queue self-heals this tick"));
+            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — bounced off the hub (gate); card returns to impl to re-plan"));
+            release_if_idle(ctx, key, repo, base)?;
+            return Ok(());
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
         // BR#4996: the lane's base sha + verdict are read ONCE per
@@ -2061,7 +2109,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         .collect();
                     let mut dispatched = 0usize;
                     for r in &stale {
-                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok() {
+                        // BR#5897: rerequest first, actions/jobs/{id}/rerun
+                        // fallback when GitHub refuses the check-run write
+                        if rerun_check_run(ctx, repo, r) {
                             dispatched += 1;
                         }
                     }
@@ -2801,7 +2851,9 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, r
                         if !seen.insert(r.name.clone()) {
                             continue; // newest run per name only
                         }
-                        let ok = ctx.sh("gh", &["api", &format!("repos/{}/check-runs/{}/rerequest", repo, r.id), "-X", "POST"]).is_ok();
+                        // BR#5897: rerequest first, actions/jobs/{id}/rerun
+                        // fallback when GitHub refuses the check-run write
+                        let ok = rerun_check_run(ctx, repo, r);
                         if ok {
                             dispatched += 1;
                         }
@@ -3655,16 +3707,52 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
         // Read-only by construction: `gh pr list` is the ONLY GitHub call
         // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
         // board authority and the hub holds no VCS credentials).
-        let rows = ctx.gh_json(&[
-            "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
-            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
-        ])?;
+        // BR#5897: a transient GitHub 502/timeout (typical on the --limit
+        // 200 page) used to `?`-abort the WHOLE pass — every repo after the
+        // flaky one went unreported for the cycle. The list now retries ONCE
+        // at --limit 100 when the failure reads transient (smaller page,
+        // cheaper read), and a repo that still fails is ISOLATED: its
+        // accounting line names the failure and the pass walks on to the
+        // remaining repos.
+        let list_json = "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft";
+        let list_args = |limit: &str| {
+            vec![
+                "pr", "list", "--repo", repo.as_str(), "--state", "open", "--limit", limit, "--json", list_json,
+            ]
+        };
+        let rows = match ctx.gh_json(&list_args("200")) {
+            Ok(r) => r,
+            Err(e) => {
+                if !is_transient_gh_list_error(&e) {
+                    lines.push(format!("[reconcile] {repo}: pr list failed — {} (repo isolated, remaining repos still reported)", trunc(&e, 200)));
+                    continue;
+                }
+                log(None, &format!("[reconcile] {repo}: pr list failed transiently ({}) — retrying once at --limit 100", trunc(&e, 160)));
+                match ctx.gh_json(&list_args("100")) {
+                    Ok(r) => r,
+                    Err(e2) => {
+                        lines.push(format!("[reconcile] {repo}: pr list failed after the --limit-100 retry — {} (repo isolated, remaining repos still reported)", trunc(&e2, 200)));
+                        continue;
+                    }
+                }
+            }
+        };
         let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         lines.push(format!("[reconcile] {repo}: {line}{}", if ok { String::new() } else { " — ALARM routed to the sink".to_string() }));
     }
     Ok(lines)
+}
+
+/// BR#5897: the retryable class for the reconcile `gh pr list` — GitHub 5xx
+/// gateway flakiness and client-side timeouts. Everything else (auth, rate
+/// limit, unknown repo) is terminal for the attempt: isolate the repo, walk on.
+fn is_transient_gh_list_error(e: &str) -> bool {
+    let l = e.to_lowercase();
+    ["502", "503", "504", "bad gateway", "service unavailable", "timed out", "timeout", "internal server error"]
+        .iter()
+        .any(|s| l.contains(s))
 }
 
 /// Pass the `gh pr list` rows through to the hub unchanged (the hub
@@ -5126,6 +5214,31 @@ mod tests {
         );
         assert_eq!(extract_actions_run_id("https://github.example/run/999"), Some(999));
         assert_eq!(extract_actions_run_id("https://github.example/no-digits"), None);
+    }
+
+    /// BR#5897: the actions/jobs/{id}/rerun fallback parses the JOB id from a
+    /// check-run html_url (with and without the /attempts suffix), and the
+    /// reconcile gh-list retry class matches the GitHub 5xx/timeout family
+    /// only — auth and rate-limit failures isolate the repo without a retry.
+    #[test]
+    fn job_id_extraction_and_transient_gh_list_class_br5897() {
+        assert_eq!(
+            extract_actions_job_id("https://github.com/state-vector/superpositional/actions/runs/41576347395/job/125726311965"),
+            Some(125726311965)
+        );
+        assert_eq!(
+            extract_actions_job_id("https://github.com/state-vector/superpositional/actions/runs/41576347395/job/125726311965/attempts/2"),
+            Some(125726311965)
+        );
+        assert_eq!(extract_actions_job_id("https://github.com/state-vector/superpositional/actions/runs/41576347395"), None);
+        assert_eq!(extract_actions_job_id(""), None);
+        assert!(is_transient_gh_list_error("gh pr list failed (exit status 1): gh: Bad gateway (HTTP 502)"));
+        assert!(is_transient_gh_list_error("gh pr list failed (exit status 1): HTTP 504 Gateway Time-out"));
+        assert!(is_transient_gh_list_error("gh: request timed out"));
+        assert!(is_transient_gh_list_error("503 Service Unavailable"));
+        assert!(!is_transient_gh_list_error("gh: Forbidden (HTTP 403) — rate limit exceeded"));
+        assert!(!is_transient_gh_list_error("gh: Not found (HTTP 404)"));
+        assert!(!is_transient_gh_list_error("authentication required"));
     }
 
     #[test]

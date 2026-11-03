@@ -493,7 +493,14 @@ solid if waiting to be"):
    back to `in_progress` / conflicted); `verifying` counts all PRs in the
    verification stage across `in_review` (both `Verify:` todo and `Verify:` in
    progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
-   counts verified (`ACCEPT`) PRs ready to merge.
+   counts verified (`ACCEPT`) PRs ready to merge. BR#5897 correction (Ray colour
+   law, 2026-11-03): a car already sitting in `lane.queue` has **passed
+   verification** — it renders `ready` green even while the executor's
+   base-settle / check-poll clock reads `cls: "waiting"`; `verifying` (orange
+   pulsing) is strictly PRs being verified right now (an active `Verify:` child,
+   an in-flight `awaiting` park, a live reconcile verify duty), `waiting`
+   (orange solid) is strictly PRs waiting to be verified (`Verify:` todo, idle
+   park, `cls: "needs-review"`), and `conflict`/`blocked` count as in progress.
 2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
    runs `selectBatch` iteratively over the lane's verifying + ready PRs (using
    the executor's `conflict_pairs` and `lane.burst_max`), separating batches with
@@ -902,7 +909,10 @@ itself, in the same gate that already runs every tick: a head red that is
 ENTIRELY the deploy-health class (`decideTrainGate`, TS + Rust mirrors) on a
 GREEN base is a stale verdict by construction — the gate returns
 `rerun_gate`, the executor re-runs the failed gate jobs
-(`gh api check-runs/<id>/rerequest`, worker-class identity-gated per BR#3181)
+(`gh api check-runs/<id>/rerequest`, worker-class identity-gated per BR#3181,
+falling back to `gh api actions/jobs/<job_id>/rerun` when GitHub refuses the
+check-run write for an Actions-created check run — the job id parsed from the
+check run's html_url, BR#5897)
 and treats the entry as a clock (queue class `waiting`). The next tick reads
 the fresh run: green merges, honestly red falls to the standing law. Never a
 bounce (the PR carries no defect), never a human leg (main is green — no
@@ -1248,7 +1258,12 @@ included) as "unmergeable — CONFLICTING".
 `decideTrainGate` composes the standing `decideMergeAction` 5c gate (`mergeable`, clean,
 every commit GitHub-verified, base green, head checks green) plus **verdict coverage**:
 the accepted verify verdict must stamp the exact head, or arrive by a contiguous
-machine-clean carry chain:
+machine-clean carry chain. Head checks deduplicate **by name** (BR#5897): the newest
+non-cancelled run per name judges (highest `id`, the same law the tip classifier
+applies; `id == 0` synthetic groups keep their distinct entries), so a superseded
+historical failure sitting beside a newer success can never re-gate the tick into a
+`RerunGate` loop (the Nov-1 `Deploy health (merge gate)` failure beside Nov-3
+successes gated a 4.4h loop on six queued SP PRs):
 
 - **A git failure is never a verdict (BR#3935)**: the executor fetches the PR head
   explicitly (`refs/pull/<n>/head`) before any local `merge-base`/`merge-tree` names
@@ -1509,7 +1524,10 @@ session died post-open and an APPROVED+MERGEABLE PR sat invisible for 34 hours, 
 every stamp-gated mechanism).
 
 Division of labour is the credential split (BR#3499/BR#3507): the gateway daemon runs the
-read-only `gh pr list` leg and feeds raw observations via `reconcile_report`; the **hub**
+read-only `gh pr list` leg and feeds raw observations via `reconcile_report` — the list
+retries ONCE at `--limit 100` on a transient GitHub 502/timeout, and a repo that still
+fails is isolated into its own accounting line so one repo's flake never silences the
+remaining repos for the cycle (BR#5897); the **hub**
 runs the join (`reconcile.ts`, pure), decides, and performs every board mutation. The
 daemon never writes the board; the hub never touches GitHub. A report per repo per cycle:
 

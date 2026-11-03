@@ -177,37 +177,71 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
 
 /// core.ts classifyHeadChecks (846): same rule, but exempt-external failures
 /// are pulled OUT of red into `external` (human-leg class ask, never gating).
+/// BR#5897: the runs are DEDUPLICATED BY NAME first — the newest
+/// non-cancelled run per name (highest id) judges, the same law
+/// classify_main_check_runs applies to the tip. The old flat scan let a
+/// superseded historical run poison the verdict: SP #2692/#2693/#2624/
+/// #2555/#2707/#2689 carried a Nov-1 `Deploy health (merge gate)` failure
+/// beside Nov-3 successes, and the stale red drove a 4.4h RerunGate loop
+/// ("dispatched 0 stale gate re-run(s)"). Groups whose entries ALL carry
+/// id == 0 (synthetic unit-test runs) have no ordering signal — distinct
+/// entries there are preserved as-is (each classifies on its own).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
     let mut red = Vec::new();
     let mut unsettled = Vec::new();
     let mut external = Vec::new();
     let mut green = 0usize;
-    for r in runs {
-        let name = r.name.clone();
-        match r.conclusion.as_deref() {
-            None => {
-                if is_exempt_check_name(&name) {
-                    continue; // exempt externals in flight say nothing
-                }
-                unsettled.push(name);
+    for (name, list) in parse_runs(runs) {
+        if list.iter().any(|r| r.id > 0) {
+            // dedup: the newest non-cancelled run on this name judges
+            let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+            sorted.sort_by(|a, b| b.id.cmp(&a.id));
+            match sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+                Some(judge) => classify_one_head_run(&name, judge, &mut red, &mut unsettled, &mut external, &mut green),
+                None => unsettled.push(format!("{name} (only cancelled runs)")),
             }
-            Some(c) if is_exempt_check_name(&name) => {
-                if is_red_conclusion(c) {
-                    external.push(MainRedCheck { name, conclusion: c.to_string(), url: r.html_url.clone().unwrap_or_default() });
-                } else if settled_green(c) {
-                    green += 1;
-                }
+        } else {
+            // id == 0: no ordering signal — preserve the distinct entries
+            for r in &list {
+                classify_one_head_run(&name, r, &mut red, &mut unsettled, &mut external, &mut green);
             }
-            Some(c) if is_red_conclusion(c) => red.push(MainRedCheck {
-                name,
-                conclusion: c.to_string(),
-                url: r.html_url.clone().unwrap_or_default(),
-            }),
-            Some(c) if settled_green(c) => green += 1,
-            Some(c) => unsettled.push(format!("{} (unknown conclusion: {})", name, c)),
         }
     }
     finish_verdict(red, unsettled, external, green)
+}
+
+/// One judged head run through the exempt-external carve-out (BR#2267).
+fn classify_one_head_run(
+    name: &str,
+    r: &MainCheckRun,
+    red: &mut Vec<MainRedCheck>,
+    unsettled: &mut Vec<String>,
+    external: &mut Vec<MainRedCheck>,
+    green: &mut usize,
+) {
+    let name = name.to_string();
+    match r.conclusion.as_deref() {
+        None => {
+            if is_exempt_check_name(&name) {
+                return; // exempt externals in flight say nothing
+            }
+            unsettled.push(name);
+        }
+        Some(c) if is_exempt_check_name(&name) => {
+            if is_red_conclusion(c) {
+                external.push(MainRedCheck { name, conclusion: c.to_string(), url: r.html_url.clone().unwrap_or_default() });
+            } else if settled_green(c) {
+                *green += 1;
+            }
+        }
+        Some(c) if is_red_conclusion(c) => red.push(MainRedCheck {
+            name,
+            conclusion: c.to_string(),
+            url: r.html_url.clone().unwrap_or_default(),
+        }),
+        Some(c) if settled_green(c) => *green += 1,
+        Some(c) => unsettled.push(format!("{} (unknown conclusion: {})", name, c)),
+    }
 }
 
 fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<MainRedCheck>, green: usize) -> CheckVerdict {
@@ -943,6 +977,47 @@ mod tests {
         assert!(matches!(v.verdict, MainVerdict::Green)); // exempt in-flight says nothing
         let v = classify_head_checks(&[run(1, "ci", None)]);
         assert!(matches!(v.verdict, MainVerdict::Unsettled));
+    }
+
+    /// BR#5897: head checks deduplicate BY NAME — the newest non-cancelled
+    /// run per name (highest id) judges. The live shape that forced this:
+    /// SP PRs carried a Nov-1 `Deploy health (merge gate)` failure beside
+    /// Nov-3 successes; the stale red re-gated every tick into a 4.4h
+    /// RerunGate loop.
+    #[test]
+    fn head_checks_dedup_newest_non_cancelled_run_per_name_br5897() {
+        // a superseded historical failure must not poison the verdict
+        let v = classify_head_checks(&[
+            run(1_260_740_000_000, "Deploy health (merge gate)", Some("failure")),
+            run(1_260_744_930_960, "Deploy health (merge gate)", Some("success")),
+        ]);
+        assert!(matches!(v.verdict, MainVerdict::Green), "newest run per name judges — success wins");
+        assert_eq!(v.green, 1);
+        // and the inverse order (success first, failure newest) still reads red
+        let v = classify_head_checks(&[
+            run(1_260_744_930_960, "Deploy health (merge gate)", Some("success")),
+            run(1_260_740_000_000, "Deploy health (merge gate)", Some("failure")),
+        ]);
+        assert!(matches!(v.verdict, MainVerdict::Green));
+        // a newer CANCELLED run does not hide the older failure — the newest
+        // non-cancelled run judges
+        let v = classify_head_checks(&[run(1, "ci", Some("failure")), run(2, "ci", Some("cancelled"))]);
+        assert!(matches!(v.verdict, MainVerdict::Red));
+        // a superseded in-flight (conclusion null) run is the newest — checks
+        // are re-running: the tip reads unsettled and the gate waits (the
+        // same law classify_main_check_runs applies to the tip), never green
+        // off the older success
+        let v = classify_head_checks(&[run(1, "ci", Some("success")), run(2, "ci", None)]);
+        assert!(matches!(v.verdict, MainVerdict::Unsettled));
+        // synthetic id == 0 groups carry no ordering signal — distinct
+        // entries are preserved (each classifies on its own)
+        let v = classify_head_checks(&[run(0, "ci", Some("failure")), run(0, "ci", Some("success"))]);
+        assert!(matches!(v.verdict, MainVerdict::Red));
+        assert_eq!(v.green, 1);
+        // all-cancelled group says so, unsettled (fail-closed, never green)
+        let v = classify_head_checks(&[run(3, "ci", Some("cancelled"))]);
+        assert!(matches!(v.verdict, MainVerdict::Unsettled));
+        assert!(v.unsettled.iter().any(|u| u.contains("only cancelled runs")));
     }
 
     #[test]
