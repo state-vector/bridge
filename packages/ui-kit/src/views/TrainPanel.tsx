@@ -107,6 +107,21 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
       title: `main is RED${reds ? `: ${reds}` : ` (${bs.verdict})`} — the standing order (never merge onto a non-green destination) holds all ${l.queue.length} queued car(s) until it clears. Fix forward, re-run a transient check, or bypass-merge a cure — the queue then drains automatically.`,
     };
   }
+  // BR#5883: GATE-BLOCKED is LOUD — the scoped verdict reads green (no
+  // base-red pill above) while the repo's own merge gate judges the tip
+  // non-green, so every car's `main-green gate` run fails while the lane
+  // looks available. This vocabulary is what the 2026-11-03 3.5h starve
+  // hid behind. Freshness-guarded like base-red.
+  if (bs && bs.verdict === "green" && bs.gate_blocked === true && l.queue.length > 0 && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
+    const gateReds = (bs.gate_red ?? []).map((r) => r.name).join(", ");
+    const gateUnsettled = (bs.gate_unsettled ?? []).join(", ");
+    const blocking = [gateReds ? `red: ${gateReds}` : "", gateUnsettled ? `unsettled: ${gateUnsettled}` : ""].filter(Boolean).join(" · ");
+    return {
+      tone: "err", card: curCard, pr: curPr,
+      label: `⛔ gate-blocked — the repo merge gate judges main${blocking ? ` (${blocking})` : ""}`,
+      title: `The lane's required workflows are all green, but the repo's own merge gate check (main-green gate — it judges the WHOLE tip of main) is failing${blocking ? ` on: ${blocking}` : ""}. Every queued PR's gate run re-judges main and fails, so all ${l.queue.length} queued car(s) are held while the lane looks idle-green. Fix or re-run the named checks — a stale gate red on a queued PR re-runs automatically once main's tip judges fully green (BR#5883 self-heal).`,
+    };
+  }
   // BR#5376: a STALLED batch is LOUD — members were selected, merges were
   // attempted, and NOTHING landed for K consecutive ticks. Never the
   // fake-busy "checking" vocabulary that hid the 2026-10-30 refusal loop

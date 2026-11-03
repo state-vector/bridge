@@ -596,6 +596,31 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     }
   });
 
+  it("STALE MAIN-GREEN-GATE SELF-HEAL (BR#5883): head red entirely the main-green gate class while the tip judges fully green under the gate's own predicate (baseGateGreen) → rerun_gate — the 2026-11-03 pinned-head-car shape; an HONEST gate conviction (baseGateGreen false — a real tip red) is NOT healed", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    // stale conviction: the gate judged a transiently-unsettled tip that has
+    // since settled — re-run it
+    const healed = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "main-green gate"), green(2, "Test")],
+      baseGateGreen: true,
+    }));
+    expect(healed.kind).toBe("rerun_gate");
+    if (healed.kind === "rerun_gate") {
+      expect(healed.reason).toContain("main-green gate class");
+      expect(healed.reason).toContain("BR#5883");
+      expect(healed.reason).toContain("stale conviction");
+    }
+    // honest conviction: a real tip red exists — re-running would just
+    // re-convict; the standing rows own the entry (blocked+red → note)
+    const honest = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "main-green gate"), green(2, "Test")],
+      baseGateGreen: false,
+    }));
+    expect(honest.kind).not.toBe("rerun_gate");
+  });
+
   it("SELF-HEAL control: a REAL red beside the gate red is not healed — the standing law owns the defect the PR carries", () => {
     const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
     const d = decideTrainGate(clean({
@@ -1607,6 +1632,34 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     const matched = classifyBaseCheckRuns([...tip, run(3, "deploy / Deploy to dev", "success")], ["deploy / Deploy to dev"]);
     expect(matched.verdict).toBe("green");
     expect(matched.alarm).toBeUndefined();
+  });
+
+  it("BR#5883 classifyBaseCheckRuns: a scoped GREEN on a tip the repo gate judges non-green carries the gate qualifier — verdict stays green, the qualifier names what main-green-gate.sh would report", () => {
+    // the 2026-11-03 starve shape: merge-commit tip, required `main-green
+    // gate` vacuous (BR#5847), non-required `Deploy drift alarm` FAILED
+    const tip = [
+      run(1, "Test"),
+      run(2, "CLI build (packages/cli)"),
+      run(3, "Deploy drift alarm", "failure"),
+    ];
+    const required = ["Test", "CLI build (packages/cli)", "main-green gate"];
+    const v = classifyBaseCheckRuns(tip, required);
+    expect(v.verdict).toBe("green");
+    expect(v.gate).toBeTruthy();
+    expect(v.gate?.verdict).toBe("red");
+    expect(v.gate?.red.map((r) => r.name)).toEqual(["Deploy drift alarm"]);
+    // in-flight non-required check → the gate refuses unsettled too
+    const unsettled = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy health (merge gate)", null)], ["Test", "main-green gate"]);
+    expect(unsettled.verdict).toBe("green");
+    expect(unsettled.gate?.verdict).toBe("unsettled");
+    // fully green tip → no qualifier
+    const allGreen = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy drift alarm")], ["Test", "main-green gate"]);
+    expect(allGreen.verdict).toBe("green");
+    expect(allGreen.gate).toBeUndefined();
+    // scoped red → the verdict itself speaks; no qualifier
+    const scopedRed = classifyBaseCheckRuns([run(1, "Test", "failure")], ["Test", "main-green gate"]);
+    expect(scopedRed.verdict).toBe("red");
+    expect(scopedRed.gate).toBeUndefined();
   });
 
   it("P4 trainStarvationAskTitle + details + duty builders hold the ask contract and carry full diagnosis", () => {

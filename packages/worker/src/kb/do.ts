@@ -119,6 +119,8 @@ import {
   trainBaseRedAskTitle,
   trainBaseRedAskBrief,
   trainBaseRedAskWarranted,
+  trainGateBlockedAskTitle,
+  trainGateBlockedAskBrief,
   trainPlainStatus,
   trainStallAskTitle,
   TRAIN_MERGE_STARVE_MS,
@@ -8299,6 +8301,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const baseBlock: any = bsQf?.base_state && String(bsQf.base_state?.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
       ? bsQf.base_state
       : null;
+    // BR#5883: the gate-blocked qualifier — the scoped verdict IS green (the
+    // base-red row above reads none) but the repo's own merge gate judges
+    // main's tip non-green, so every car's `main-green gate` run fails. Fresh
+    // (<15m) like baseBlock; a dead daemon's stale stamp never pins a false
+    // GATE-BLOCKED.
+    const gateBlocked: any = bsQf?.base_state
+      && String(bsQf.base_state?.verdict ?? "") === "green"
+      && bsQf.base_state?.gate_blocked === true
+      && now - Number(bsQf.at ?? 0) < 15 * 60_000
+      ? bsQf.base_state
+      : null;
     // BR#5376: the walk's batch-stall episode stamp (executor-fed via
     // train.queue_facts) — truthy only when fresh (<15m; the executor
     // refreshes every tick and OMITS it the moment a landing clears the
@@ -8372,6 +8385,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       reason = String(bs.verdict) === "red" && redNames.length
         ? `merge-train: BLOCKED — base main RED: ${redNames.join(", ")} — ${queue.length} car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks the whole queue`
         : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? `carries none of the lane's required workflow runs (${emptyAlarm || "config?"})` : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
+    }
+    // BR#5883: gate-blocked is LOUD — the required-scoped verdict reads green
+    // so nothing above fires, yet the repo's own merge gate judges the tip
+    // and fails every car. Name the gate-blocking checks; this vocabulary
+    // (not the fake-busy "checking" line) is what the 2026-11-03 starve hid
+    // behind for 3.5h+.
+    else if (queue.length > 0 && gateBlocked) {
+      const gb: any = gateBlocked;
+      const gateRedNames = (Array.isArray(gb.gate_red) ? gb.gate_red : []).map((r: any) => String(r?.name ?? "")).filter(Boolean);
+      const gateUnsettled = (Array.isArray(gb.gate_unsettled) ? gb.gate_unsettled : []).map(String).filter(Boolean);
+      const blocking = [
+        ...(gateRedNames.length ? [`RED: ${gateRedNames.join(", ")}`] : []),
+        ...(gateUnsettled.length ? [`unsettled: ${gateUnsettled.join(", ")}`] : []),
+      ].join(" · ") || "the gate's view of the tip is not green";
+      reason = `merge-train: GATE-BLOCKED — base main passes the required workflows but the repo merge gate judges it ${blocking} — ${queue.length} car(s) held (every car's main-green gate run fails on these); fix or re-run the named checks to unblock`;
     }
     // BR#5376: a STALLED batch is LOUD. Members were selected, merges were
     // attempted, and NOTHING landed for K consecutive ticks — the receipt
@@ -10000,6 +10028,53 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         .filter((r: { name: string }) => r.name);
       await this.syncBaseRedAlarmAsk(lane, repo, base, entriesArr, reds, actor);
     }
+    // BR#5883: the GATE-BLOCKED escalation at P1 — the scoped verdict reads
+    // green (the base-red row above reads none) while the repo's own merge
+    // gate judges the tip non-green, so every car's `main-green gate` run
+    // fails and NOTHING can merge while the lane looks available. The
+    // 2026-11-03 episode stayed silent for 3.5h+ because the only signal was
+    // the P4 starve clock (>1h). A fresh stamp carrying the qualifier fires
+    // the alarm machinery IMMEDIATELY: one diagnostic duty + one human ask
+    // per episode. A fresh stamp without the qualifier (or a non-green
+    // verdict — a louder truth owns the lane) closes the episode.
+    const gateBlockedStamp = !!baseState
+      && String(baseState.verdict ?? "") === "green"
+      && baseState.gate_blocked === true
+      && entriesArr.length > 0;
+    if (gateBlockedStamp) {
+      const gateReds = (Array.isArray(baseState.gate_red) ? baseState.gate_red : [])
+        .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+        .filter((r: { name: string }) => r.name);
+      const gateUnsettled = (Array.isArray(baseState.gate_unsettled) ? baseState.gate_unsettled : []).map(String).filter(Boolean);
+      await this.syncGateBlockedAlarm(lane, repo, base, entriesArr, gateReds, gateUnsettled, actor);
+    } else if (baseState && meta.lane?.gate_blocked) {
+      const ep = meta.lane.gate_blocked;
+      delete meta.lane.gate_blocked;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+      this.audit(actor, "train:gate_blocked_cleared", lane.id, {
+        lane: laneKey(repo, base),
+        since: ep.since ?? null,
+        ask_id: ep.ask_id ?? null,
+        duty_id: ep.duty_id ?? null,
+        because: String(baseState.verdict ?? "") !== "green" ? "verdict no longer green (a louder alarm owns the lane)" : "the repo gate no longer judges the tip non-green",
+      });
+      if (ep.ask_id) {
+        try {
+          await this.transition(
+            {
+              id: String(ep.ask_id),
+              to: "done",
+              session: "",
+              note: `auto-closed (BR#5883): the ${repo}@${base} lane's fresh base stamp no longer carries the gate-blocked qualifier — the repo merge gate now judges the tip green (or a louder red verdict owns the lane). The queue drains itself; the ask re-files automatically if the qualifier re-appears.`,
+            },
+            actor,
+          );
+          this.audit(actor, "train:gate_blocked_ask_closed", lane.id, { ask: String(ep.ask_id) });
+        } catch (e) {
+          this.audit(actor, "train:gate_blocked_ask_close_error", lane.id, { ask: String(ep.ask_id), error: String((e as Error).message ?? e).slice(0, 160) });
+        }
+      }
+    }
     // BR#5376: the STALLED alarm ask — one per episode, filed while the
     // fresh stamp carries the episode (the per-tick repeats collapse in
     // askCreate's identical-open-ask guard on the numberless title; the
@@ -10434,6 +10509,132 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
   }
 
+  /** BR#5883 gate-blocked alarm synchronizer: fires at P1 (immediately on a
+   *  fresh gate-blocked stamp with held cars — the 2026-11-03 starve had only
+   *  the P4 >1h clock). ONE human ask + ONE diagnostic duty per episode;
+   *  per-tick repeats collapse in askCreate's identical-open-ask guard and the
+   *  open-duty lookup. The episode clears in the queue_facts handler when a
+   *  fresh stamp drops the qualifier (or a non-green verdict arrives). */
+  private async syncGateBlockedAlarm(
+    lane: { id: string },
+    repo: string,
+    base: string,
+    entriesArr: { id?: string; pr?: number }[],
+    gateReds: { name: string; url?: string }[],
+    gateUnsettled: string[],
+    actor: string,
+  ): Promise<void> {
+    const held = entriesArr.length;
+    const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+    const askTitle = trainGateBlockedAskTitle({ repo, base }, gateReds.map((r: { name: string }) => r.name));
+    const brief = trainGateBlockedAskBrief({ repo, base }, gateReds, gateUnsettled, held);
+    let meta: any = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    let ep = meta.lane?.gate_blocked ?? null;
+    if (!ep) {
+      ep = { since: Date.now(), ask_id: null as string | null, duty_id: null as string | null };
+      meta.lane = { ...(meta.lane ?? {}), gate_blocked: ep };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+      this.audit(actor, "train:gate_blocked_episode", lane.id, {
+        lane: `${repo}@${base}`,
+        held,
+        gate_reds: gateReds.map((r: { name: string }) => r.name),
+        gate_unsettled: gateUnsettled,
+        reason: "scoped-green tip fails the repo merge gate — escalating at P1 (BR#5883), not the P4 starve clock",
+      });
+    }
+    // (1) ONE diagnostic duty per episode — the P4 starvation machinery
+    // matches open `diagnostic` children too, so the alarms share one duty.
+    if (!ep.duty_id) {
+      try {
+        const openDuty = this.one(
+          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+             AND c.status NOT IN ('done', 'superseded') AND c.tags LIKE '%"diagnostic"%' LIMIT 1`,
+          lane.id,
+        ) as any;
+        if (openDuty?.id) {
+          ep.duty_id = String(openDuty.id);
+        } else {
+          const names = [...gateReds.map((r: { name: string }) => r.name), ...gateUnsettled].join(", ") || "unknown checks";
+          const createdDuty = await this.create(
+            {
+              type: "task",
+              title: `FIX (bridge train): GATE-BLOCKED on ${repo}@${base} — scoped-green tip fails the repo merge gate (${names}) — ${held} car(s) held`,
+              body_md: [
+                `# Gate-blocked merge train — ${repo}@${base}`,
+                ``,
+                `Auto-spawned at **P1** by the BR#5883 gate-blocked alarm: the lane's required workflows are ALL green (the scoped base verdict reads \`green\`, the P1 base alarm reads none) but the repo's own merge gate check (\`main-green gate\` — it judges the WHOLE tip of ${base}) fails on:`,
+                ``,
+                gateReds.length ? gateReds.map((r: { name: string; url?: string }) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n") : "- (no settled failures — the gate is refusing unsettled checks)",
+                ...(gateUnsettled.length ? [``, `Unsettled (the gate refuses these too):`, ...gateUnsettled.map((n) => `- ${n}`)] : []),
+                ``,
+                `Every queued PR's \`main-green gate\` run re-judges the tip and fails while these are non-green, so ${held} queued change(s) cannot merge. This exact shape starved the 2026-11-03 queue for 3.5h+ with zero alarms (BR#5822/BR#5861).`,
+                ``,
+                `## What to check`,
+                `1. Read the named failing check runs first-hand (\`gh run view\` / the URLs above) — real red vs stale/transient.`,
+                `2. Real red → fix forward (bind the cure PR) or hand to the root-fix path; transient with a settled premise → re-run it (\`gh run rerun\`).`,
+                `3. If the tip is a merge commit and the failing check NEVER ran on it, check whether the check consumes only PR-head runs (the BR#5847 vacuous-entry question) — the alarm may be judgeable from the latest PR-head gate run's log instead.`,
+                `4. Confirm the episode cleared: a fresh queue_facts stamp without \`gate_blocked\` closes the ask automatically.`,
+              ].join("\n"),
+              tags: ["merge-train", "diagnostic", "p0", "gate-blocked"],
+              roles: ["analysis"],
+              qualified: true,
+              project: String((lane as any).project ?? "bridge"),
+              session: "",
+              meta: {
+                boosted: Date.now(),
+                machine_duty: { by: "system:train", kind: "diagnostic", subject: lane.id, lane: `${repo}@${base}` },
+                gate_blocked_episode: { lane: `${repo}@${base}`, since: ep.since },
+              },
+            },
+            "system:train",
+          );
+          ep.duty_id = String(createdDuty.id);
+          this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, ep.duty_id, lane.id, Date.now());
+          this.audit("system:train", "train:gate_blocked_duty_spawned", ep.duty_id, {
+            lane: `${repo}@${base}`,
+            lane_card: lane.id,
+            since: ep.since,
+            held,
+          });
+        }
+      } catch (de) {
+        this.audit("system:train", "gate_blocked_duty_error", lane.id, { note: String((de as Error).message ?? de).slice(0, 160) });
+      }
+    }
+    // (2) ONE human ask per episode (deduped via askCreate's identical-open-ask guard)
+    try {
+      await this.askCreate(
+        {
+          to: "human",
+          question: askTitle,
+          reason: `${repo}@${base} passes its required workflows but the repo merge gate judges main's tip non-green — ${held} queued change(s) cannot merge and the lane reads green-idle (BR#5883 class: the 2026-11-03 3.5h silent starve)`,
+          details: brief.details,
+          options: brief.options,
+          artefact_id: sinkId,
+          urgency: "time-sensitive",
+        },
+        actor,
+      );
+    } catch (e) {
+      this.audit(actor, "train:gate_blocked_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+    }
+    // persist the episode's ask/duty ids (re-read meta first — the ask/duty
+    // writes above may have bumped the row)
+    meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    if (meta.lane?.gate_blocked && (meta.lane.gate_blocked.ask_id !== ep.ask_id || meta.lane.gate_blocked.duty_id !== ep.duty_id)) {
+      // ask/duty ids change only when re-derived; write once when they differ
+      const freshAsk = this.one(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
+        sinkId, askTitle.slice(0, 200),
+      ) as any;
+      meta.lane.gate_blocked.ask_id = freshAsk?.id ? String(freshAsk.id) : meta.lane.gate_blocked.ask_id ?? null;
+      meta.lane.gate_blocked.duty_id = ep.duty_id ?? meta.lane.gate_blocked.duty_id ?? null;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+    }
+  }
+
   private laneAwaitingRows(repo: string, now0: number, ttlMs?: number, base?: string) {
     const resolvedTtlMs = ttlMs ?? clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     return (this.state.storage.sql.exec(
@@ -10527,6 +10728,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const redNames = (Array.isArray(baseState?.red) ? baseState.red : []).map((r: any) => String(r?.name ?? "")).filter(Boolean);
         const unsettledNames = (Array.isArray(baseState?.unsettled) ? baseState.unsettled : []).map(String).filter(Boolean);
         const baseAlarm = typeof baseState?.alarm === "string" && baseState.alarm.trim() ? baseState.alarm.trim() : null;
+        const gateRedNames = (Array.isArray(baseState?.gate_red) ? baseState.gate_red : []).map((r: any) => String(r?.name ?? "")).filter(Boolean);
+        const gateUnsettledNames = (Array.isArray(baseState?.gate_unsettled) ? baseState.gate_unsettled : []).map(String).filter(Boolean);
         const blockedReason = String(meta.blocked?.reason ?? "");
         const diagInput: TrainStarvationDiagnosisInput = {
           lane,
@@ -10537,6 +10740,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           redNames,
           unsettledNames,
           baseAlarm,
+          gateRedNames,
+          gateUnsettledNames,
           queue,
           awaiting,
           lastMergeTs,

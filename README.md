@@ -848,6 +848,46 @@ every tick. Two laws now hold:
   never the mechanical rebase/re-sign/re-approve loop that made verify sessions
   re-prove clean PRs while main stayed red (the BR#5193 circular-park class).
 
+### Scoped green never certifies an unfit tip — the gate-block qualifier (BR#5883)
+
+Scoped classification fixed the nightly-red park — and opened a new silence: the lane's
+base verdict reads ONLY the required set, so a scoped Green can coexist with the repo's
+own destination gate — `main-green gate`, which judges main's WHOLE tip, no exemptions,
+unsettled fails — red on that same tip. The lane then looks idle-green while every queued
+car's own gate run fails, and a car whose head red is entirely gate-class stands convicted
+forever because nothing ever re-runs the stale gate red on it. The 2026-11-03 receipt
+(BR#5822/BR#5861 diagnosis): the lane starved 3.5h+ with cars held while a `Deploy drift
+alarm` red — correctly outside the scoped set — kept the repo's gate red, the lane reading
+green the whole time; the sibling settle exit had already been fixed (BR#5829), and
+BR#5847 established the gate itself is vacuous on merge commits, so the qualifier below is
+COMPUTED from the tip's runs, never read from the required set. Two laws close the class:
+
+- **The qualifier rides the verdict — computed, never read**: when the scoped base verdict
+  is Green but the gate predicate — `classify_main_check_runs`, byte-equivalent to
+  `scripts/main-green-gate.sh` (newest non-cancelled run per name, no exemptions,
+  unsettled fails) — judges the tip non-green, `classify_base_check_runs` attaches a
+  `GateBlock` qualifier. The verdict itself STAYS Green (BR#5265 law intact: non-required
+  reds never park the train). The walk's `base_state` stamps `gate_blocked: true` with
+  `gate_verdict` / `gate_red[]` / `gate_unsettled[]` (omitted while clean or mid-burst),
+  the lane vocabulary goes loud — `merge-train: GATE-BLOCKED — base main passes the
+  required workflows but the repo merge gate judges it red/unsettled — N car(s) held
+  (every car's main-green gate run fails on these); fix or re-run the named checks to
+  unblock` — and the trains panel renders the red `⛔ gate-blocked` pill
+  (freshness-guarded <15m like base-red). The hub escalates a fresh gate-blocked stamp at
+  P1: ONE diagnostic duty (child of the lane card) and ONE deduped human ask per episode,
+  stamped `meta.lane.gate_blocked = {since, ask_id, duty_id}`; the episode auto-clears and
+  the ask auto-closes the moment a fresh stamp drops the qualifier or the verdict goes
+  non-green (the ordinary base-red path takes over with its warrant-gated escalation).
+- **A stale gate conviction self-heals**: the merge gate's rerun ladder gains a
+  `RerunGate` row — a car whose head red is ENTIRELY `main-green gate`-class reruns
+  instead of standing convicted when the fresh tip evidence says the gate would now pass
+  (`base_gate_green` — the tip fully green under the gate's own predicate); any honest
+  conviction (a non-gate red on the head, or a tip still non-green) stands untouched, so
+  the row can never spring a genuinely red PR. The action reason names the class on plain
+  reading ("head red is entirely the main-green gate class … a stale conviction …
+  (BR#5883)"), mirrored byte-parallel in the TS classifier (`core.ts`) per the
+  dual-implementation disclosure law.
+
 ### Stalled is loud + the merge-method fallback (BR#5376)
 
 The base-red gate above guards the base. BR#5376 closes the OTHER silent-failure
