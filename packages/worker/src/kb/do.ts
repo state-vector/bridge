@@ -4672,9 +4672,15 @@ export class KnowledgeHub {
     if (attributedAgent && attributedAgent !== actor && this.isGatewayActor(actor)) {
       this.gatewayTouch(actor, attributedAgent);
     }
-    // session attribution: stamp which session claimed/acted, first-wins, resolved
-    // explicit → the token's most recent session (agents pass session on orient only)
-    if (row.type === "task" && !meta.session) {
+    // session attribution: stamp which session claimed/acted, resolved
+    // explicit → the token's most recent session (agents pass session on
+    // orient only). A FRESH claim (todo → in_progress) RE-stamps: a released
+    // claim must not inherit the previous holder's session (2026-11-03
+    // incident: the token's last-session fallback resolved a throwaway
+    // doctor-probe session as executor and first-wins froze the mislabel for
+    // the card's whole life — re-stamping on fresh pickup heals such cards).
+    const freshClaim = to === "in_progress" && row.status === "todo";
+    if (row.type === "task" && (freshClaim || !meta.session)) {
       const sess = await this.resolveSession(body, String(body.token_id ?? ""));
       if (sess) meta.session = String(sess).slice(0, 120);
     }
@@ -5915,6 +5921,17 @@ export class KnowledgeHub {
       await this.sessionTouch({ token_id: tokenId, session: named, worktree: body.worktree }).catch(() => {});
       return named;
     }
+    // gateway-tagged tokens are infrastructure (the gateway daemon, its train
+    // executor, its CLI probes): a session-less write from one stays
+    // ANONYMOUS — the token's last-session fallback would forge executor
+    // attribution out of whatever session last orient'ed on this gateway
+    // (2026-11-03 incident: `bridge doctor`'s throwaway probe session was
+    // resolved as the executor of live impl cards). Explicit sessions are
+    // still honored above; infrastructure never inherits one.
+    const tok = tokenId
+      ? (this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, tokenId) as any)
+      : null;
+    if (tok && tagsSayGateway(tok.tags)) return undefined;
     const row = this.one(
       `SELECT name FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`, tokenId,
     ) as any;
