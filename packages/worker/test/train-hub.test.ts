@@ -2186,6 +2186,41 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-plain" });
   });
 
+  // BR#5677 (census BR#5634): the merge_train stamp is never cleaned on
+  // close, so a done/superseded card on a merged PR keeps its stale
+  // `bounced`/`awaiting` state forever — counting every stamp holder
+  // inflated queue_awaiting_review with zombies (the census decode: 24
+  // "awaiting review" against a handful of live parks).
+  it("queue_awaiting_review counts LIVE cards only — a closed card's stale bounce stamp stays out of the count", async () => {
+    const repo = "state-vector/lane-stale-stamp";
+    const acq = await acquire(repo, "gw-stale", { merge_capable: true, required_workflows: ["Test"] });
+    expect(acq.body.error ?? "", `acquire failed: ${JSON.stringify(acq.body)}`).toBe("");
+    const card = await queueViaAccept({ repo, pr: 51147, head: "9".repeat(40), title: "IMPL: zombie-stamp drill" });
+
+    // the head bounces (coverage lapse at an uncovered head) — the card
+    // leaves the queue for its review (in_progress) and counts as awaiting
+    const bounced = await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-stale", pr: 51147, task_id: card,
+      head_sha: "8".repeat(40), bounce_kind: "coverage",
+      reason: "PR #51147 live head is not covered by the accepted verdict — re-verify at the new head",
+    });
+    expect(bounced.body.error ?? "", `bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
+    let lane = await laneSnap(repo);
+    expect(lane.queue_awaiting_review).toBe(1);
+
+    // the card finishes and closes done — the bounce stamp survives the
+    // close (stamps are records, not liveness), but the zombie must not
+    // keep counting
+    const closed = await kbJson("/transition", { id: card, to: "done", actor: "drill", note: "drill: landed out-of-band — closing (BR#5677 zombie drill)" });
+    expect(closed.status, `zombie close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    const after = (await kbJson("/get", { id: card })).body;
+    expect(after.status).toBe("done");
+    expect(after.meta?.merge_train?.state).toBe("bounced"); // the stale stamp is still there
+    lane = await laneSnap(repo);
+    expect(lane.queue_awaiting_review).toBe(0); // …but it no longer counts
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-stale" });
+  });
+
   it("train.queue_facts stamps the executor's per-entry walk verdicts — train.status serves them in walk order (the queue block row)", async () => {
     const repo = "state-vector/lane-qf";
     await acquire(repo, "gw-qf", { merge_capable: true, required_workflows: ["Test"] });

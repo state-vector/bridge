@@ -216,6 +216,59 @@ describe("reconcileJoin — forward", () => {
     expect(r.accounting.accounted).toBe(1);
   });
 
+  // BR#5677 (census BR#5634): train-owned PRs read reviewDecision="" (bot
+  // approvals are dismissed on every rebase — and the field has been
+  // observed empty repo-wide even beside a live approval, the BR#5640
+  // trace; the accounting must not depend on the cause) — the binding check
+  // must run BEFORE the review gate or the whole bound/duty accounting is
+  // unreachable for exactly the PRs the train owns ("0 bound / 54
+  // unreviewed" against a 37-car train, reading green vacuously).
+  it("BR#5677: a bound train-owned PR with NO review decision accounts bound — the dismissed-bot class", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: null })],
+      bindings: [binding(1, { queued: true, status: "blocked" })],
+    });
+    expect(one(r, 1).decision).toEqual({ action: "bound", card: "BR#9001" });
+    expect(one(r, 1).reason).toContain("the train owns it");
+    expect(r.accounting.bound).toBe(1);
+    expect(r.accounting.accounted).toBe(1);
+    expect(r.accounting.unreviewed).toBe(0);
+    expect(r.accounting.open_reviewed).toBe(0); // accounted bound, not reviewed
+    expect(r.accounting.ok).toBe(true);
+  });
+
+  it("BR#5677: a bound unreviewed PR (not queued, no verify children) still accounts bound — and NEVER spawns a verify duty: approval is the evidence verify needs", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: null, updatedAt: iso(30) })], // past every age gate
+      bindings: [binding(1)],
+    });
+    expect(one(r, 1).decision.action).toBe("bound");
+    expect(one(r, 1).reason).toContain("bound to a card");
+    expect(r.accounting.spawned).toBe(0);
+    expect(r.accounting.unreviewed).toBe(0);
+    expect(r.accounting.bound).toBe(1);
+  });
+
+  it("BR#5677: a lane binding on an unreviewed PR is lane_exempt — the review gate never hid the lane cards either", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: null })],
+      bindings: [binding(1, { lane: true, status: "blocked" })],
+    });
+    expect(one(r, 1).decision).toEqual({ action: "lane_exempt", card: "BR#9001" });
+    expect(r.accounting.unreviewed).toBe(0);
+  });
+
+  it("BR#5677: unreviewed counts only GENUINELY-unbound PRs", () => {
+    const r = join({
+      prs: [pr(1, { reviewDecision: null }), pr(2, { reviewDecision: null })],
+      bindings: [binding(1, { queued: true, status: "blocked" })],
+    });
+    expect(r.accounting.bound).toBe(1);
+    expect(r.accounting.unreviewed).toBe(1); // PR 2 only
+    expect(one(r, 2).decision.action).toBe("grace");
+    expect(r.accounting.ok).toBe(true);
+  });
+
   it("a binding with an open verify child is in-flight via the normal flow", () => {
     const r = join({ prs: [pr(1)], bindings: [binding(1, { open_verify_children: 1 })] });
     expect(one(r, 1).decision).toEqual({ action: "inflight", duty_id: "BR#9001", via: "verify-children" });
