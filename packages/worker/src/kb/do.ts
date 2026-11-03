@@ -70,6 +70,7 @@ import {
   // serialized merge train (BR#3516)
   MERGE_TRAIN_QUEUED_REASON,
   MERGE_TRAIN_REASON_PREFIX,
+  TRAIN_AWAITING_REASON_PREFIX,
   TRAIN_LEASE_TTL_MS,
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_CI_BOUND_MULTIPLIER,
@@ -4622,6 +4623,21 @@ export class KnowledgeHub {
           ...(aw ? { await_event: aw } : {}),
         };
       }
+      // BR#5751: a NON-train park ends any live Awaiting park. The card's
+      // primary state is this park now (BR#4999: re-parked on an ask while
+      // merge_train.state stayed `awaiting` — the ghost row sat in
+      // lane.awaiting forever, listing a card whose PR was closed and whose
+      // park was on a question). Demote to `bounced` and drop the awaiting
+      // stamp so non-train parks never pollute the awaiting lane; the
+      // silence hold treats `bounced` identically (core.ts releaseHold), so
+      // the park's watchdog protection is unchanged. Train-owned reasons —
+      // the `merge-train:*` family and the BR#4960 Awaiting park reason —
+      // keep the park intact.
+      const parkNote = String(body.note ?? body.reason ?? "").trim();
+      if (!parkNote.startsWith(MERGE_TRAIN_REASON_PREFIX) && !parkNote.startsWith(TRAIN_AWAITING_REASON_PREFIX)) {
+        if (meta.merge_train?.awaiting) delete meta.merge_train.awaiting;
+        if (meta.merge_train?.state === "awaiting") meta.merge_train.state = "bounced";
+      }
       delete meta.subprocess; // a real block supersedes a declared subprocess window
     } else if (meta.blocked) {
       delete meta.blocked; // unblocking clears the dead-end record
@@ -4875,6 +4891,32 @@ export class KnowledgeHub {
             await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
           }
         }
+      } catch (e) {
+        this.audit("system:merge-train", "queue_hook_error", id, { error: String((e as Error).message ?? e).slice(0, 200) });
+      }
+    }
+    // BR#5751: a DIRECT parent re-queue — a verifier transitioning the impl
+    // card itself to blocked with the canonical `merge-train: queued` note —
+    // is the same ACCEPT event the child-close hook above serves, but it
+    // bypassed trainQueueOnAccept entirely: head_sha_at_acceptance rode at
+    // the old pre-sync SHA (a guaranteed false coverage bounce on the first
+    // drain walk — BR#4711/4995 receipts), and merge_train stayed `awaiting`
+    // with its awaiting stamp, so the card sat in lane.queue AND
+    // lane.awaiting at once. Route the park through the same hook: the
+    // note's legs/head refresh the stamp (BR#3659/BR#4648 parsers), state
+    // flips to `queued`, the awaiting residue clears, the boost decays.
+    // `body.merge_train` — the machine-managed park flag the typed-await
+    // gate already exempts on (machine.ts) — is the recursion guard: the
+    // hook's own re-park passes it, so this fires only on agent-driven
+    // parks; alreadyQueued keeps the hook's re-park a meta-only stamp.
+    if (
+      row.type === "task" &&
+      verdict.status === "blocked" &&
+      !body.merge_train &&
+      String(body.note ?? body.reason ?? "").startsWith(MERGE_TRAIN_QUEUED_REASON)
+    ) {
+      try {
+        await this.trainQueueOnAccept(id, { note: String(body.note ?? body.reason ?? "") }, actor);
       } catch (e) {
         this.audit("system:merge-train", "queue_hook_error", id, { error: String((e as Error).message ?? e).slice(0, 200) });
       }
@@ -10175,14 +10217,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
   }
 
-  private laneAwaitingRows(repo: string, now0: number, ttlMs?: number) {
+  private laneAwaitingRows(repo: string, now0: number, ttlMs?: number, base?: string) {
     const resolvedTtlMs = ttlMs ?? clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     return (this.state.storage.sql.exec(
       `SELECT id, status_ts, meta FROM artefacts
        WHERE type = 'task' AND status = 'blocked'
          AND json_extract(meta, '$.merge_train.state') = 'awaiting'`,
     ).toArray() as any[])
-      .filter((r) => trainCardMatchesLane(JSON.parse(r.meta ?? "{}"), repo))
+      .filter((r) => trainCardMatchesLane(JSON.parse(r.meta ?? "{}"), repo, base))
       .map((r) => {
         const tm = JSON.parse(r.meta ?? "{}");
         const aw = tm.merge_train?.awaiting ?? {};
@@ -10236,7 +10278,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     awaitingArg?: any[],
     tpLastMergeTs?: unknown,
   ): Promise<{ since: number; mins: number; fired_at?: number; ask_id?: string | null; duty_id?: string | null; kind?: string } | null> {
-    const awaiting = awaitingArg ?? this.laneAwaitingRows(lane.repo, now0);
+    const awaiting = awaitingArg ?? this.laneAwaitingRows(lane.repo, now0, undefined, lane.base);
     const hasCars = queue.length > 0 || awaiting.length > 0;
     const stopActive = !!meta.stop;
     const lastMergeTs = this.laneLastMergeTs(lane.repo, lane.base, meta, tpLastMergeTs);
@@ -10462,7 +10504,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // asks; its queue (post base-filter) is not this lane's problem.
         if (l.status === "done" || l.status === "superseded") continue;
         const queue = this.laneQueue(lane.repo, lane.base);
-        const awaiting = this.laneAwaitingRows(lane.repo, now0);
+        const awaiting = this.laneAwaitingRows(lane.repo, now0, undefined, lane.base);
         await this.laneStarvationTick(l, meta, lane, queue, now0, awaiting);
       } catch (e) {
         this.audit("system:train", "starve_sweep_error", l.id, { error: String((e as Error).message ?? e).slice(0, 160) });
@@ -10716,7 +10758,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
          WHERE repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
         lane.repo, lane.base,
       ).toArray()[0] ?? null;
-      const awaitingRows = this.laneAwaitingRows(lane.repo, now0, ttlMs);
+      const awaitingRows = this.laneAwaitingRows(lane.repo, now0, ttlMs, lane.base);
       const starved = await this.laneStarvationTick(l, meta, lane, queue, now0, awaitingRows, tp.last_merge_ts ?? null);
       const capableAt = Number(meta.lane?.last_capable_lease_ts ?? 0);
       const capable = capableAt
@@ -10791,7 +10833,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           `SELECT meta FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
         ).toArray() as any[]) {
           const m = JSON.parse(r.meta ?? "{}");
-          if (!trainCardMatchesLane(m, lane.repo)) continue;
+          if (!trainCardMatchesLane(m, lane.repo, lane.base)) continue;
           const mtState = String(m?.merge_train?.state ?? "");
           if (mtState === "bounced" || mtState === "awaiting") waiting++; // parked on a review leg — not impl
           else inProgress++;
