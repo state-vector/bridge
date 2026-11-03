@@ -2703,3 +2703,212 @@ describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-lane" });
   });
 });
+
+// ---------- BR#5674 P1 + P4: empty-is-loud + 1h merge-starvation alarm & diagnostic duty ----------
+
+describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm & diagnostic duty (real DO)", () => {
+  it("P1 empty-is-loud: base_state.alarm surfaces in the lane's blocked reason for both some-runs-none-matched and zero-total-runs (and falls back to config? when absent)", async () => {
+    const repo = "state-vector/lane-p1-empty";
+    await acquire(repo, "gw-p1", { merge_capable: true, required_workflows: ["deploy / Deploy to dev"] });
+    const c1 = await queueViaAccept({ repo, pr: 56741, head: "a".repeat(40), title: "IMPL: p1 empty-is-loud drill" });
+
+    // (1) N runs read, none matched required set
+    const r1 = await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-p1",
+      entries: [{ id: c1, pr: 56741, cls: "waiting" }],
+      base_state: {
+        verdict: "empty",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+        alarm: "49 runs read, none matched required set — check names/pagination",
+      },
+    });
+    expect(r1.body.error ?? "").toBe("");
+    const lane1 = await laneSnap(repo);
+    expect(lane1.reason).toContain("merge-train: BLOCKED — base main carries none of the lane's required workflow runs (49 runs read, none matched required set — check names/pagination)");
+    expect(lane1.reason).toContain("1 car(s) held");
+
+    // (2) zero total runs on tip
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-p1",
+      entries: [{ id: c1, pr: 56741, cls: "waiting" }],
+      base_state: {
+        verdict: "empty",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+        alarm: "tip carries no check runs at all",
+      },
+    });
+    const lane2 = await laneSnap(repo);
+    expect(lane2.reason).toContain("merge-train: BLOCKED — base main carries none of the lane's required workflow runs (tip carries no check runs at all)");
+
+    // (3) legacy executor (no alarm field) keeps the fallback "(config?)"
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-p1",
+      entries: [{ id: c1, pr: 56741, cls: "waiting" }],
+      base_state: {
+        verdict: "empty",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+      },
+    });
+    const lane3 = await laneSnap(repo);
+    expect(lane3.reason).toContain("carries none of the lane's required workflow runs (config?)");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p1" });
+  });
+
+  it("P4 merge-starvation alarm: non-empty queue (or awaiting) + now-last_merge_ts > 1h + no stop-the-line fires ONE ask with full diagnosis (incl. P1 alarm) + spawns ONE diagnostic duty (tags merge-train/diagnostic, ranked #1 in orient), stamps starvation={since,fired_at,ask_id,duty_id}, and clears on any merge", async () => {
+    const repo = "state-vector/lane-p4-starve";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — p4-starve", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-p4", { merge_capable: true, required_workflows: ["deploy / Deploy to dev", "post-deploy / Post-Deploy Smoke"] });
+
+    // Land a prior merge > 2 hours ago so last_merge_ts is > 1h in the past
+    const priorCard = await queueViaAccept({ repo, pr: 56742, head: "1".repeat(40), title: "IMPL: p4 prior landed car" });
+    const twoHoursAgo = Date.now() - 2 * 3_600_000;
+    const M0 = "2".repeat(40);
+    expect((await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-p4",
+      pr: 56742, merge_sha: M0, head_sha: "1".repeat(40), task_id: priorCard,
+      merged_at: twoHoursAgo,
+    })).body.error ?? "").toBe("");
+    expect((await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-p4", sha: M0,
+      checks: [
+        check(101, "deploy / Deploy to dev", "success"),
+        check(102, "post-deploy / Post-Deploy Smoke", "success"),
+      ],
+    })).body.decided).toBe("landed");
+
+    // Now queue a car and park a second car in Awaiting, while the gateway is
+    // actively leasing (merge_capable: true) and base_state is P1 empty-with-alarm!
+    const qCard = await queueViaAccept({ repo, pr: 56743, head: "3".repeat(40), title: "IMPL: p4 held queued car" });
+    const awCard = await queueViaAccept({ repo, pr: 56744, head: "4".repeat(40), title: "IMPL: p4 held awaiting car" });
+    expect((await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-p4", pr: 56744, task_id: awCard,
+      head_sha: "5".repeat(40), bounce_kind: "coverage", conflict_files: ["src/conflict.ts"],
+    })).body.awaiting_park).toBe(true);
+
+    expect((await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-p4",
+      entries: [{ id: qCard, pr: 56743, cls: "waiting" }],
+      base_state: {
+        verdict: "empty",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+        alarm: "49 runs read, none matched required set — check names/pagination",
+      },
+    })).body.error ?? "").toBe("");
+
+    // First read after >1h without a merge: fires starvation!
+    const snap1 = await laneSnap(repo);
+    expect(snap1.starved).toBeTruthy();
+    expect(snap1.starved.mins).toBeGreaterThanOrEqual(60);
+    expect(snap1.starved.ask_id).toBeTruthy();
+    expect(snap1.starved.duty_id).toBeTruthy();
+
+    const laneCardObj = (await kbJson("/get", { id: snap1.card })).body;
+    const starv = laneCardObj.meta?.lane?.starvation ?? laneCardObj.meta?.starvation;
+    expect(starv).toBeTruthy();
+    expect(starv.since).toBe(twoHoursAgo);
+    expect(starv.fired_at).toBeGreaterThan(0);
+    expect(starv.ask_id).toBe(snap1.starved.ask_id);
+    expect(starv.duty_id).toBe(snap1.starved.duty_id);
+
+    // Check the starvation ask details carry full diagnosis + P1 alarm
+    const askArt = (await kbJson("/get", { id: starv.ask_id })).body;
+    expect(askArt.type).toBe("question");
+    expect(askArt.status).toBe("todo");
+    expect(String(askArt.title)).toContain(`MERGE TRAIN STARVED: ${repo}@main`);
+    expect(String(askArt.body_md)).toContain("49 runs read, none matched required set — check names/pagination");
+    expect(String(askArt.body_md)).toContain("1 queued");
+    expect(String(askArt.body_md)).toContain("1 awaiting");
+    expect(String(askArt.body_md)).toContain(String(twoHoursAgo));
+    expect(String(askArt.body_md)).toContain(starv.duty_id);
+
+    // Check the diagnostic duty card (tags merge-train + diagnostic, checklist items)
+    const dutyArt = (await kbJson("/get", { id: starv.duty_id })).body;
+    expect(dutyArt.type).toBe("task");
+    expect(dutyArt.status).toBe("todo");
+    expect(dutyArt.tags).toEqual(expect.arrayContaining(["merge-train", "diagnostic"]));
+    expect(String(dutyArt.body_md)).toContain("per_page");
+    expect(String(dutyArt.body_md)).toContain("required_workflows");
+    expect(String(dutyArt.body_md)).toContain("Verify pool depth");
+    expect(String(dutyArt.body_md)).toContain("Park exits");
+
+    // Train-health priority: the diagnostic duty ranks at the top of orient's unclaimed_work
+    const oriented = (await kbJson("/orient", { session: "p4-diag-probe" })).body;
+    expect((oriented.unclaimed_work ?? []).map((w: any) => w.id)).toContain(starv.duty_id);
+
+    // Second read + merge_capable lease renewal: does NOT duplicate the ask or duty, and does NOT clear starvation before a merge
+    await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-p4", merge_capable: true });
+    const snap2 = await laneSnap(repo);
+    expect(snap2.starved?.ask_id).toBe(starv.ask_id);
+    expect(snap2.starved?.duty_id).toBe(starv.duty_id);
+    const allStarveAsks = (await kbJson("/search", { q: "lane-p4-starve", type: "question", limit: 50 })).body.artefacts
+      .filter((x: any) => x.type === "question" && String(x.title).startsWith(`MERGE TRAIN STARVED: ${repo}@main`));
+    expect(allStarveAsks.length).toBe(1);
+
+    // ANY merge on the lane clears starvation (meta.lane.starvation = null, lane.starved = null)
+    const M1 = "6".repeat(40);
+    expect((await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-p4",
+      pr: 56743, merge_sha: M1, head_sha: "3".repeat(40), task_id: qCard,
+    })).body.error ?? "").toBe("");
+    const laneCardAfterMerge = (await kbJson("/get", { id: snap1.card })).body;
+    expect(laneCardAfterMerge.meta?.lane?.starvation ?? null).toBeNull();
+    expect(laneCardAfterMerge.meta?.starvation ?? null).toBeNull();
+    const snap3 = await laneSnap(repo);
+    expect(snap3.starved).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p4" });
+  });
+
+  it("P4 awaiting-only starvation + stop-the-line suppression: an empty derived queue with an awaiting car >1h since last merge fires starvation; an active stop-the-line episode suppresses it", async () => {
+    const repo = "state-vector/lane-p4-awaiting";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — p4-awaiting", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-p4a", { merge_capable: true, required_workflows: ["Test"] });
+
+    // Prior merge > 2h ago
+    const prior = await queueViaAccept({ repo, pr: 56745, head: "7".repeat(40), title: "IMPL: p4a prior" });
+    const M0 = "8".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-p4a",
+      pr: 56745, merge_sha: M0, head_sha: "7".repeat(40), task_id: prior,
+      merged_at: Date.now() - 2 * 3_600_000,
+    });
+    await kbJson("/train.ci", { repo, base: "main", actor: "gw-p4a", sha: M0, checks: [check(201, "Test", "success")] });
+
+    // Park a card in Awaiting — derived queue is now EMPTY, awaiting has 1 car
+    const awOnly = await queueViaAccept({ repo, pr: 56746, head: "9".repeat(40), title: "IMPL: p4a awaiting-only" });
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "bounced", actor: "gw-p4a", pr: 56746, task_id: awOnly,
+      head_sha: "a".repeat(40), bounce_kind: "coverage", conflict_files: ["src/a.ts"],
+    });
+
+    // While a stop-the-line episode is active, P4 starvation does NOT fire
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "stopped", actor: "gw-p4a",
+      merge_sha: "b".repeat(40), failing: [{ name: "Test", conclusion: "failure", url: "https://example/red" }],
+    });
+    const snapStopped = await laneSnap(repo);
+    expect(snapStopped.queue.length).toBe(0);
+    expect(snapStopped.awaiting.length).toBe(1);
+    expect(snapStopped.starved).toBeNull();
+
+    // Clear the stop → next status check fires starvation on the non-empty awaiting set!
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p4a", line_green: true });
+    await acquire(repo, "gw-p4a", { merge_capable: true, required_workflows: ["Test"] });
+    const snapCleared = await laneSnap(repo);
+    expect(snapCleared.queue.length).toBe(0);
+    expect(snapCleared.awaiting.length).toBe(1);
+    expect(snapCleared.starved).toBeTruthy();
+    expect(snapCleared.starved.ask_id).toBeTruthy();
+    expect(snapCleared.starved.duty_id).toBeTruthy();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p4a" });
+  });
+});

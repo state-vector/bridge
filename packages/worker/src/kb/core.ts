@@ -916,6 +916,8 @@ export type MainCheckVerdict = {
   unsettled: string[];
   /** settled-green check count (receipt line) */
   green: number;
+  /** BR#5674 P1 (empty-is-loud): explains why verdict === "empty" */
+  alarm?: string;
 };
 
 /** Conclusions that mean the line is stopped. `cancelled` and null are NOT
@@ -929,7 +931,7 @@ export const MAIN_RED_CONCLUSIONS = new Set([
 ]);
 
 export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
-  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0 };
+  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
   const byName = new Map<string, MainCheckRun[]>();
   for (const r of runs) {
     const list = byName.get(r.name ?? "") ?? [];
@@ -957,6 +959,28 @@ export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
   if (red.length) return { verdict: "red", red, unsettled, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
   return { verdict: "green", red, unsettled, green };
+}
+
+/** BR#5265 Fix B + BR#5674 P1 (empty-is-loud): TypeScript mirror of
+ *  train_gate.rs classify_base_check_runs. */
+export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]): MainCheckVerdict {
+  if (!runs.length) {
+    return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
+  }
+  if (!required.length) {
+    return classifyMainCheckRuns(runs);
+  }
+  const scoped = runs.filter((r) => required.includes(r.name ?? ""));
+  if (!scoped.length) {
+    return {
+      verdict: "empty",
+      red: [],
+      unsettled: [],
+      green: 0,
+      alarm: `${runs.length} runs read, none matched required set — check names/pagination`,
+    };
+  }
+  return classifyMainCheckRuns(scoped);
 }
 
 /** Deterministic ask title for one red episode — the sha makes the title
@@ -2693,6 +2717,103 @@ export function trainBaseRedAskWarranted(fix: {
  *  the ask contract. */
 export function trainStallAskTitle(lane: { repo: string; base: string }): string {
   return `MERGE TRAIN STALLED: ${lane.repo}@${lane.base} — PRs selected to merge are not landing. Restart the executor?`;
+}
+
+/** BR#5674 P4: merge-starvation threshold — when a lane holds cars (derived
+ *  queue OR awaiting set) with zero merges for >1h and no stop-the-line
+ *  episode is active, the hub fires ONE human ask + spawns ONE diagnostic
+ *  duty per episode. */
+export const TRAIN_MERGE_STARVE_MS = 60 * 60_000;
+
+/** Deterministic merge-starvation ask title (BR#5674 P4 — ONE per starvation
+ *  episode; askCreate's identical-open-ask guard dedupes on exact title, so
+ *  the title carries no changing minute/car counts). ≤240 chars, ends "?". */
+export function trainStarvationAskTitle(lane: { repo: string; base: string }): string {
+  const prefix = `MERGE TRAIN STARVED: ${lane.repo}@${lane.base} — `;
+  const suffix = `>1h with zero merges while holding cars. Diagnose or bypass?`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "?" : suffix);
+}
+
+export type TrainStarvationDiagnosisInput = {
+  lane: { repo: string; base: string };
+  laneId: string;
+  blockedReason: string;
+  baseVerdict: string;
+  requiredWorkflows: string[];
+  redNames: string[];
+  unsettledNames: string[];
+  baseAlarm: string | null;
+  queue: { id: string; pr?: number }[];
+  awaiting: { task: string; pr?: number }[];
+  lastMergeTs: number | null;
+  mins: number;
+  dutyId?: string | null;
+};
+
+export function trainStarvationAskDetails(i: TrainStarvationDiagnosisInput): string {
+  const qList = i.queue.length
+    ? i.queue.map((q) => `${q.id}${q.pr ? ` (PR #${q.pr} on ${i.lane.repo})` : ""}`).join(", ")
+    : "none";
+  const aList = i.awaiting.length
+    ? i.awaiting.map((a) => `${a.task}${a.pr ? ` (PR #${a.pr} on ${i.lane.repo})` : ""}`).join(", ")
+    : "none";
+  const lastMergeLine = i.lastMergeTs
+    ? `${new Date(i.lastMergeTs).toISOString()} (epoch ${i.lastMergeTs} — ${i.mins}m ago)`
+    : `none recorded (${i.mins}m without a merge)`;
+  const namesLine = i.redNames.length
+    ? `red: ${i.redNames.join(", ")}`
+    : i.unsettledNames.length
+      ? `unsettled: ${i.unsettledNames.join(", ")}`
+      : i.requiredWorkflows.length
+        ? `required: ${i.requiredWorkflows.join(", ")}`
+        : "none";
+  return [
+    `Merge lane **${i.lane.repo}@${i.lane.base}** (standing lane card ${i.laneId}) has held cars for **${i.mins}m (>1h)** with **zero merges** and no active stop-the-line episode.`,
+    ``,
+    `**Full diagnosis snapshot:**`,
+    `- **Blocked reason:** ${i.blockedReason || "(none)"}`,
+    `- **Base verdict:** \`${i.baseVerdict}\` (${namesLine})`,
+    ...(i.baseAlarm ? [`- **Base alarm (P1 empty-is-loud):** ${i.baseAlarm}`] : []),
+    `- **Queue + awaiting counts:** ${i.queue.length} queued (${qList}) · ${i.awaiting.length} awaiting (${aList})`,
+    `- **Last merge timestamp:** ${lastMergeLine}`,
+    ...(i.dutyId ? [`- **Auto-spawned diagnostic duty:** ${i.dutyId} (agent-executable task card, tags \`merge-train\`, \`diagnostic\`)`] : []),
+    ``,
+    `**Why this needs attention:** the lane is holding cars without merging and without a stop-the-line halt (the 2026-11-02/03 10.6h silent-outage class). An agent diagnostic duty has been spawned automatically at top priority to inspect pagination/naming of required workflows, base check-run counts, verify pool depth, and parked card exits. Any merge on this lane clears the episode automatically.`,
+  ].join("\n");
+}
+
+export function trainStarvationDutyTitle(lane: { repo: string; base: string }, queueCount: number, awaitingCount: number): string {
+  const prefix = `Diagnose starved merge train: ${lane.repo}@${lane.base} — `;
+  const suffix = `>1h with 0 merges (${queueCount} queued, ${awaitingCount} awaiting)`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "…" : suffix);
+}
+
+export function trainStarvationDutyBody(i: TrainStarvationDiagnosisInput): string {
+  return [
+    `# Merge-train starvation diagnostic duty — ${i.lane.repo}@${i.lane.base}`,
+    ``,
+    `Auto-spawned by the P4 starvation alarm (decision BR#5674) because lane **${i.lane.repo}@${i.lane.base}** (card ${i.laneId}) has held cars with **0 merges for ${i.mins}m (>1h)** while no stop-the-line episode is active.`,
+    ``,
+    `## Diagnosis snapshot at alarm time`,
+    `- **Lane:** \`${i.lane.repo}@${i.lane.base}\` (${i.laneId})`,
+    `- **Blocked reason:** ${i.blockedReason || "(none)"}`,
+    `- **Base verdict:** \`${i.baseVerdict}\``,
+    `- **Required workflows:** ${i.requiredWorkflows.length ? i.requiredWorkflows.map((w) => `\`${w}\``).join(", ") : "(unconfigured — whole tip)"}`,
+    `- **Failing base checks:** ${i.redNames.length ? i.redNames.join(", ") : "none"}`,
+    `- **Unsettled base checks:** ${i.unsettledNames.length ? i.unsettledNames.join(", ") : "none"}`,
+    `- **Base alarm (P1):** ${i.baseAlarm ?? "none"}`,
+    `- **Queue count:** ${i.queue.length} (${i.queue.map((q) => `${q.id}${q.pr ? `#${q.pr}` : ""}`).join(", ") || "none"})`,
+    `- **Awaiting count:** ${i.awaiting.length} (${i.awaiting.map((a) => `${a.task}${a.pr ? `#${a.pr}` : ""}`).join(", ") || "none"})`,
+    `- **Last merge ts:** ${i.lastMergeTs ? `${new Date(i.lastMergeTs).toISOString()} (${i.lastMergeTs}, ${i.mins}m ago)` : `none (${i.mins}m starved)`}`,
+    ``,
+    `## What to check (agent checklist)`,
+    `1. **\`per_page\` / pagination and naming of \`required_workflows\`**: run \`gh api "repos/${i.lane.repo}/commits/${i.lane.base}/check-runs?per_page=100"\` and compare actual check-run names against \`required_workflows\`. Did required runs fall past page 1 or change workflow/job names?`,
+    `2. **Base runs count on tip**: verify total check-runs count on \`${i.lane.base}\` tip vs matched required runs (\`base_state.alarm\`). If a required check failed transiently, re-run it (\`gh run rerun\`) or open/bind the root-fix cure PR.`,
+    `3. **Verify pool depth**: check \`queue_awaiting_review\` and open \`Verify:\` tasks — are verify duties backed up or bouncing in a coverage loop?`,
+    `4. **Park exits (\`awaiting\` / \`blocked\` cards)**: inspect every card in \`awaiting\` and \`queue\` — confirm each has a valid \`head_sha_at_acceptance\` covering its live PR head and a live machine exit (\`awaiting_sweep\` / \`pr_merged\` proxy).`,
+  ].join("\n");
 }
 
 /** The machine-proxy close note for train:landed — cites the merge commit

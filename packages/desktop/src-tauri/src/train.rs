@@ -226,6 +226,11 @@ struct Ctx {
     tick_attempted: bool,
     tick_landed: u32,
     tick_error: Option<String>,
+    /// Per-(lane, sha) auto-rerun guard for rapid red-train self-healing:
+    /// when a lane stops on a failing required workflow (no burst bisect),
+    /// the executor automatically triggers one `gh run rerun` per `(key, sha)`
+    /// so marginal races (e.g. Post-Deploy Smoke deadline race) self-heal.
+    auto_rerun_shas: std::collections::HashSet<String>,
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -310,6 +315,7 @@ impl Ctx {
             tick_attempted: false,
             tick_landed: 0,
             tick_error: None,
+            auto_rerun_shas: std::collections::HashSet::new(),
         })
     }
 
@@ -1352,6 +1358,28 @@ fn extract_actions_run_id(url: &str) -> Option<i64> {
         .and_then(|p| p.parse::<i64>().ok())
 }
 
+fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged: u32) -> Value {
+    let mut base_state = json!({
+        // mid-drain (pass_merged > 0): destination-green is owned by the
+        // pass settle (BR#4934) — the gate composes with base FORCED green;
+        // the stamp mirrors the gate so the panel never shows a false red
+        // mid-burst.
+        "verdict": if pass_merged > 0 { "green" } else { base_class.verdict.as_str() },
+        "scoped_to_required": !required.is_empty(),
+        "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
+        "unsettled": base_class.unsettled,
+    });
+    // BR#5674 P1 (empty-is-loud): annotate base_state with the alarm string
+    // when the base verdict is empty (either N runs read with 0 matching
+    // required_workflows, or 0 total runs on the tip).
+    if pass_merged == 0 {
+        if let Some(ref alarm) = base_class.alarm {
+            base_state.as_object_mut().unwrap().insert("alarm".into(), json!(alarm));
+        }
+    }
+    base_state
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     let required = lane_required_workflows(lane);
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
@@ -1542,6 +1570,25 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 Ok(()) => {}
                 Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
             }
+            // Rapid self-heal on a non-bisect red stop: auto-rerun failing
+            // required workflow runs ONCE per (lane, base_sha) so transient/race
+            // failures (e.g. Post-Deploy Smoke 300s race) heal automatically.
+            let has_bisect = stop.get("bisect").filter(|b| !b.is_null()).is_some();
+            let auto_key = format!("{key}:{base_sha}");
+            if v.verdict == MainVerdict::Red && !has_bisect && !rerun_requested && !base_sha.is_empty() && !ctx.auto_rerun_shas.contains(&auto_key) {
+                ctx.auto_rerun_shas.insert(auto_key);
+                let mut auto_rerun_ok = 0usize;
+                for r in &v.red {
+                    if let Some(run_id) = extract_actions_run_id(&r.url) {
+                        if ctx.sh("gh", &["run", "rerun", &run_id.to_string(), "--repo", repo]).is_ok() {
+                            auto_rerun_ok += 1;
+                        }
+                    }
+                }
+                if auto_rerun_ok > 0 {
+                    log(Some(key), &format!("self-heal: auto-dispatched rerun for {auto_rerun_ok} failing required workflow(s) on stopped tip {}", &base_sha[..base_sha.len().min(9)]));
+                }
+            }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             let hold_msg = format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") });
             ctx.note(&hold_msg);
@@ -1705,7 +1752,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // walks on — the gate still refuses to merge onto a non-green
         // destination (leg 3), so the fail-closed law holds; the lane just
         // says WHY it holds.
-        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0 }
+        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None }
     } else {
         match ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])
             .map(|base_sha| {
@@ -1714,19 +1761,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             })
         {
             Ok((_, runs)) => classify_base_check_runs(&runs, &required),
-            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0 },
+            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None },
         }
     };
-    let base_state = json!({
-        // mid-drain (pass_merged > 0): destination-green is owned by the
-        // pass settle (BR#4934) — the gate composes with base FORCED green;
-        // the stamp mirrors the gate so the panel never shows a false red
-        // mid-burst.
-        "verdict": if pass_merged > 0 { "green" } else { base_class.verdict.as_str() },
-        "scoped_to_required": !required.is_empty(),
-        "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
-        "unsettled": base_class.unsettled,
-    });
+    if let Some(ref alarm) = base_class.alarm {
+        log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
+    }
+    let base_state = build_base_state(&base_class, &required, pass_merged);
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -3143,6 +3184,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         tick_attempted: false,
         tick_landed: 0,
         tick_error: None,
+        auto_rerun_shas: std::collections::HashSet::new(),
     })
 }
 
@@ -3994,6 +4036,7 @@ mod tests {
             tick_attempted: false,
             tick_landed: 0,
             tick_error: None,
+            auto_rerun_shas: std::collections::HashSet::new(),
         }
     }
 
@@ -4318,6 +4361,7 @@ mod tests {
                 tick_attempted: false,
                 tick_landed: 0,
                 tick_error: None,
+                auto_rerun_shas: std::collections::HashSet::new(),
             }
         }
     }
@@ -4642,6 +4686,36 @@ mod tests {
         assert!(
             !prod.contains("classify_main_check_runs("),
             "train.rs production code must use classify_base_check_runs(&runs, &required), never unscoped classify_main_check_runs"
+        );
+    }
+
+    #[test]
+    fn base_state_annotates_empty_alarm_and_omits_it_mid_burst_br5674_p1() {
+        let tip = vec![
+            MainCheckRun { id: 1, name: "Product surface canary (dev)".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Nightly Release".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+        ];
+        let required = vec!["deploy / Deploy to dev".to_string()];
+        // N runs read, none matched required set → alarm on base_state
+        let c_unmatched = classify_base_check_runs(&tip, &required);
+        let bs_unmatched = build_base_state(&c_unmatched, &required, 0);
+        assert_eq!(bs_unmatched.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(bs_unmatched.get("scoped_to_required").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            bs_unmatched.get("alarm").and_then(|v| v.as_str()),
+            Some("2 runs read, none matched required set — check names/pagination")
+        );
+        // mid-burst (pass_merged > 0): verdict is forced green and no false alarm rides
+        let bs_burst = build_base_state(&c_unmatched, &required, 1);
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert!(bs_burst.get("alarm").is_none());
+        // zero total runs on tip → sibling alarm
+        let c_zero = classify_base_check_runs(&[], &required);
+        let bs_zero = build_base_state(&c_zero, &required, 0);
+        assert_eq!(bs_zero.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(
+            bs_zero.get("alarm").and_then(|v| v.as_str()),
+            Some("tip carries no check runs at all")
         );
     }
 }
