@@ -1944,9 +1944,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             return Ok(());
         }
         if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935: a CLOSED PR can never merge — the old drop-and-return
-            // starved the whole lane behind its card. Log it, leave the card
-            // for the humans, and drive the NEXT entry this same tick.
+            // BR#3935 + BR#5897: a CLOSED PR can never merge — stamp cls:"blocked"
+            // in qfacts so the hub never counts an unmerged closed PR as ready/green,
+            // and advance to the next entry this same tick.
+            qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
             log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
@@ -2061,7 +2062,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         .collect();
                     let mut dispatched = 0usize;
                     for r in &stale {
-                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok() {
+                        if ctx.sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"]).is_ok()
+                            || ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"]).is_ok()
+                        {
                             dispatched += 1;
                         }
                     }
@@ -3655,10 +3658,19 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
         // Read-only by construction: `gh pr list` is the ONLY GitHub call
         // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
         // board authority and the hub holds no VCS credentials).
-        let rows = ctx.gh_json(&[
+        let rows = match ctx.gh_json(&[
             "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
             "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
-        ])?;
+        ]) {
+            Ok(r) => r,
+            Err(e) if e.contains("502") || e.contains("504") || e.contains("Bad Gateway") || e.contains("timeout") => {
+                ctx.gh_json(&[
+                    "pr", "list", "--repo", &repo, "--state", "open", "--limit", "100",
+                    "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
+                ])?
+            }
+            Err(e) => return Err(e),
+        };
         let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);

@@ -10980,21 +10980,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           return [];
         };
 
-        // 1. Queued cars (already verify-accepted onto the merge train)
+        // 1. Queued cars (already verify-accepted onto the merge train).
+        // When the executor walk completed without terminating early on a bounce
+        // (every walked entry is "ready" or "waiting"), any queued card that has
+        // NO entry in `facts` was skipped by the walk because its PR is CLOSED
+        // on GitHub (e.g. SP #2659 on BR#5639) — never count it as ready.
+        const walkCompletedWithoutBounce =
+          facts.length > 0 &&
+          facts.every((e: any) => e.cls === "ready" || e.cls === "waiting");
         for (const q of queue) {
           seenCards.add(q.id);
           if (q.pr) seenPrs.add(Number(q.pr));
           const cls = factFor(q.id);
-          if (cls === "conflict" || cls === "blocked") {
+          if (cls === "conflict" || cls === "blocked" || (walkCompletedWithoutBounce && cls === "")) {
             inProgress++;
-          } else if (cls === "waiting") {
-            verifying++;
-            batchCandidates.push({
-              id: q.id,
-              ...(q.pr ? { pr: q.pr } : {}),
-              state: "verifying",
-              detail: "being verified — checks/mergeability running",
-            });
           } else if (cls === "needs-review") {
             verifying++;
             batchCandidates.push({
@@ -11004,12 +11003,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               detail: "waiting to be verified — needs a fresh review",
             });
           } else {
+            // cls === "ready", cls === "waiting" (already verify-accepted; waiting
+            // on base settle or CI), or not walked yet ("") → verified & ready (green)
             ready++;
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
               state: "ready",
-              detail: "verified — merges this pass (batch)",
+              detail: cls === "waiting" ? "verified — ready to merge (waiting on lane/CI)" : "verified — merges this pass (batch)",
             });
           }
         }
@@ -11100,7 +11101,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           }
         }
 
-        // 5. Reconcile-seen open PRs on this repo not yet bound to a card above
+        // 5. Reconcile-seen open PRs on this repo not yet covered above ("So we can see all PRs")
         if (lane.base === "main") {
           for (const rs of this.state.storage.sql.exec(
             `SELECT pr, card FROM reconcile_seen WHERE repo = ? AND missing = 0 ORDER BY pr ASC`,
@@ -11109,26 +11110,65 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             const prNum = Number(rs.pr ?? 0);
             if (!prNum || seenPrs.has(prNum) || mergedPrs.has(prNum) || ignoredPrs.has(prNum)) continue;
             seenPrs.add(prNum);
+            const boundCardId = String(rs.card ?? "").trim();
+            const boundCard = boundCardId
+              ? (this.one(`SELECT id, status, meta, updated_ts FROM artefacts WHERE id = ?`, boundCardId) as any)
+              : null;
+            const bm = boundCard ? JSON.parse(boundCard.meta ?? "{}") : {};
+            if (boundCard && String(boundCard.status) === "in_progress" && String(bm?.merge_train?.state ?? "") !== "awaiting") {
+              inProgress++;
+              continue;
+            }
+            const isVerifiedReady =
+              boundCard &&
+              String(boundCard.status) === "blocked" &&
+              (String(bm?.merge_train?.state ?? "") === "queued" ||
+                /VERIFY ACCEPT/i.test(String(bm?.blocked?.reason ?? "")));
+            if (isVerifiedReady) {
+              ready++;
+              batchCandidates.push({
+                id: boundCardId,
+                pr: prNum,
+                state: "ready",
+                detail: "verified — ready to merge",
+              });
+              continue;
+            }
             const vDuty = this.one(
               `SELECT d.duty_id AS duty_id, a.status AS status, a.meta AS meta, a.updated_ts AS updated_ts
                FROM reconcile_duties d JOIN artefacts a ON a.id = d.duty_id
                WHERE d.repo = ? AND d.pr = ? AND d.kind = 'verify' AND a.status IN ('todo','in_progress') LIMIT 1`,
               lane.repo, prNum,
             ) as any;
-            if (vDuty) {
-              verifying++;
-              const dm = JSON.parse(vDuty.meta ?? "{}");
-              const sig = Math.max(Number(dm.session_alive_ts ?? 0), Number(dm.last_progress?.ts ?? 0), Number(vDuty.updated_ts ?? 0));
-              const live = String(vDuty.status) === "in_progress" && now0 - sig < 10 * 60_000;
+            const childVerify = boundCardId
+              ? (this.one(
+                  `SELECT a.id AS duty_id, a.status AS status, a.meta AS meta, a.updated_ts AS updated_ts
+                   FROM relations rel JOIN artefacts a ON a.id = rel.src_id
+                   WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task' AND a.status IN ('todo','in_progress')
+                   ORDER BY a.created_ts DESC LIMIT 1`,
+                  boundCardId,
+                ) as any)
+              : null;
+            const activeDuty = vDuty ?? childVerify;
+            verifying++;
+            if (activeDuty) {
+              const dm = JSON.parse(activeDuty.meta ?? "{}");
+              const sig = Math.max(Number(dm.session_alive_ts ?? 0), Number(dm.last_progress?.ts ?? 0), Number(activeDuty.updated_ts ?? 0));
+              const live = String(activeDuty.status) === "in_progress" && now0 - sig < 10 * 60_000;
               const state = live ? "verifying" : "waiting";
               batchCandidates.push({
-                id: String(rs.card || vDuty.duty_id),
+                id: String(boundCardId || activeDuty.duty_id),
                 pr: prNum,
                 state,
-                detail: live ? `being verified (${vDuty.duty_id} in progress)` : `waiting to be verified (${vDuty.duty_id} queued)`,
+                detail: live ? `being verified (${activeDuty.duty_id} in progress)` : `waiting to be verified (${activeDuty.duty_id} queued)`,
               });
             } else {
-              inProgress++;
+              batchCandidates.push({
+                id: boundCardId || `PR#${prNum}`,
+                pr: prNum,
+                state: "waiting",
+                detail: "waiting to be verified",
+              });
             }
           }
         }

@@ -3081,11 +3081,12 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     });
 
     // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2
+    // Even if queue_facts stamps cls:"waiting" on the already verify-accepted PR 504 (e.g. waiting on base settle), it stays ready (green)
     await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-ng", merge_capable: true });
     await kbJson("/train.queue_facts", {
       repo,
       base: "main",
-      entries: [{ id: readyCard.id, pr: 504, cls: "ready" }],
+      entries: [{ id: readyCard.id, pr: 504, cls: "waiting" }],
       conflict_pairs: [[504, 503]],
       actor: "gw-ng",
     });

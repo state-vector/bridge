@@ -14,6 +14,7 @@ import {
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
+  classifyHeadChecks,
   decideMergeAction,
   decideTrainGate,
   leaseDecide,
@@ -1070,6 +1071,17 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
       [101, 102],
       [103, 104],
     ]);
+  });
+  it("BR#5897: classifyHeadChecks deduplicates by check name (newest non-cancelled run wins over stale failure)", () => {
+    const v = classifyHeadChecks([
+      { id: 100, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old1" },
+      { id: 101, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old2" },
+      { id: 200, name: "Deploy health (merge gate)", conclusion: "success", html_url: "https://example/new" },
+      { id: 201, name: "Rust Tests", conclusion: "success", html_url: "https://example/rust" },
+    ]);
+    expect(v.verdict).toBe("green");
+    expect(v.red).toEqual([]);
+    expect(v.green).toBe(2);
   });
 });
 

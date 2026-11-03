@@ -1031,28 +1031,42 @@ export type HeadCheckVerdict = {
 };
 
 /** The HEAD side of the 5c mechanical gate: same decision rule as
- *  classifyMainCheckRuns, but exempt-external failures (BR#2267) are pulled
- *  OUT of red and recorded as `external` — they are collected into the class
- *  ask, never bounce a PR. */
+ *  classifyMainCheckRuns (newest non-cancelled run per check name wins, by
+ *  highest id — so a re-run that succeeded supersedes an earlier failure of
+ *  the same check), with exempt-external failures (BR#2267) pulled OUT of red
+ *  and recorded as `external` — they are collected into the class ask, never
+ *  bounce a PR. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
+  const byName = new Map<string, MainCheckRun[]>();
+  for (const r of runs) {
+    const name = r.name ?? "";
+    const list = byName.get(name) ?? [];
+    list.push(r);
+    byName.set(name, list);
+  }
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
-  for (const r of runs) {
-    if (r.conclusion == null) {
-      if (isExemptCheckName(r.name ?? "")) continue; // exempt externals in flight say nothing
-      unsettled.push(r.name ?? "");
+  for (const [name, list] of byName) {
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge) {
+      if (!isExemptCheckName(name)) unsettled.push(`${name} (only cancelled runs)`);
       continue;
     }
-    if (isExemptCheckName(r.name ?? "")) {
-      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    if (judge.conclusion == null) {
+      if (isExemptCheckName(name)) continue; // exempt externals in flight say nothing
+      unsettled.push(name);
       continue;
     }
-    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
-    else unsettled.push(r.name ?? "");
+    if (isExemptCheckName(name)) {
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) external.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+    else unsettled.push(name);
   }
   if (red.length) return { verdict: "red", red, unsettled, external, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };

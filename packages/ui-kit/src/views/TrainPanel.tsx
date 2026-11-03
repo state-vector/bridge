@@ -446,15 +446,17 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
                     const cls = clsOf(q);
                     if (cls === "conflict" || cls === "blocked") {
                       ip++;
-                    } else if (cls === "waiting") {
-                      ver++;
-                      cars.push({ id: q.id, pr: q.pr, state: "verifying", detail: "being verified — checks/mergeability running" });
                     } else if (cls === "needs-review") {
                       ver++;
                       cars.push({ id: q.id, pr: q.pr, state: "waiting", detail: "waiting to be verified — needs a fresh review" });
-                    } else if (cls === "ready" || cls !== "") {
+                    } else if (cls === "ready" || cls === "waiting" || cls !== "") {
                       rdy++;
-                      cars.push({ id: q.id, pr: q.pr, state: "ready", detail: "verified — merges this pass (batch)" });
+                      cars.push({
+                        id: q.id,
+                        pr: q.pr,
+                        state: "ready",
+                        detail: cls === "waiting" ? "verified — ready to merge (waiting on lane/CI)" : "verified — merges this pass (batch)",
+                      });
                     }
                   }
                   for (const a of l.awaiting ?? []) {
