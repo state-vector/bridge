@@ -40,7 +40,7 @@
 //! before any local op names it.
 
 use crate::train_gate::{
-    classify_base_check_runs, classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
+    classify_base_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
     merge_sweep_human_leg_title, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
     CheckVerdict, DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
@@ -1322,7 +1322,38 @@ fn awaiting_sweep(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value
     }
 }
 
+fn lane_required_workflows(lane: &Value) -> Vec<String> {
+    lane.get("required_workflows")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn has_rerun_request(lane: &Value) -> bool {
+    lane.get("rerun_failed").filter(|v| !v.is_null()).is_some()
+}
+
+/// Extract the GitHub Actions workflow run ID from a check-run `html_url`
+/// (`https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>`),
+/// falling back to the last all-digit path segment when no `/runs/<id>` pair
+/// is present.
+fn extract_actions_run_id(url: &str) -> Option<i64> {
+    let segs: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    for w in segs.windows(2) {
+        if w[0] == "runs" && w[1].chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(id) = w[1].parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    segs.iter()
+        .rev()
+        .find(|p| p.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
+    let required = lane_required_workflows(lane);
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
     // happens — it's broken"): the answered alarm ask IS the authority. The
     // hub's askAnswer stamps `meta.lane.bypass_merge {pr}` (a BYPASS answer on
@@ -1348,14 +1379,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|b| b.get("pr"))
         .and_then(|v| v.as_i64())
         .filter(|p| *p > 0);
-    let rerun_requested = lane.get("rerun_failed").map(|_| true).unwrap_or(false);
+    let rerun_requested = has_rerun_request(lane);
     if let Some(bpr) = bypass_pr {
         renew_lease(ctx, repo, base);
         let facts = ctx.pr_facts(repo, bpr);
         let ack = |ctx: &mut Ctx, outcome: &str| -> Result<(), String> {
             ctx.mcp(
                 "train_queue_facts",
-                json!({ "repo": repo, "base": base, "entries": [], "bypass_consumed": outcome }),
+                json!({ "repo": repo, "base": base, "bypass_consumed": outcome }),
             )
             .map(|_| ())
         };
@@ -1444,22 +1475,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     if rerun_requested {
         renew_lease(ctx, repo, base);
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
-        // the red verdict carries urls (`…/actions/runs/<id>`) — rerun by id
+        let v = classify_base_check_runs(&ctx.check_runs(repo, &base_sha), &required);
+        // the red verdict carries urls (`…/actions/runs/<id>/job/<job_id>`) — rerun by workflow run id
         let reds: Vec<(i64, &str)> = v
             .red
             .iter()
             .filter_map(|r| {
-                let id = r
-                    .url
-                    .rsplit('/')
-                    .find(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-                    .and_then(|p| p.parse::<i64>().ok())?;
+                let id = extract_actions_run_id(&r.url)?;
                 Some((id, r.name.as_str()))
             })
             .collect();
         if reds.is_empty() {
-            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": "nothing-red" }));
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "rerun_consumed": "nothing-red" }));
             log(Some(key), "rerun: nothing red on the base tip — stamp consumed");
         } else {
             let mut rerun_ok = 0;
@@ -1471,7 +1498,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
             }
             let outcome = if rerun_ok == reds.len() { "issued".to_string() } else { format!("partial: {rerun_ok}/{}", reds.len()) };
-            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": outcome }));
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "rerun_consumed": outcome }));
             log(Some(key), &format!("rerun: re-ran {} failing check(s) on the base tip — stamp consumed ({outcome})", reds.len()));
         }
     }
@@ -1488,7 +1515,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let stop_sha = vstr(stop, "sha").unwrap_or("");
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+        let base_runs = ctx.check_runs(repo, &base_sha);
+        let v = classify_base_check_runs(&base_runs, &required);
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
@@ -1510,12 +1538,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
             // drive the walk ONE step per tick while the line holds (state
             // hub-side, crash-safe: any executor picks it up mid-flight).
-            match bisect_step(ctx, key, repo, base, stop) {
+            match bisect_step(ctx, key, repo, base, stop, &required) {
                 Ok(()) => {}
                 Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
             }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
-            log(Some(key), &format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") }));
+            let hold_msg = format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") });
+            ctx.note(&hold_msg);
+            renew_lease(ctx, repo, base);
+            log(Some(key), &hold_msg);
             return Ok(());
         }
     }
@@ -1713,7 +1744,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // pending/green keeps draining (destination-green is the settle's).
         if pass_merged > 0 && !tip_sha.is_empty() {
             let tip_runs = ctx.check_runs(repo, &tip_sha);
-            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+            if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("burst drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
@@ -2181,7 +2212,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // pending/green keeps landing (destination-green is the settle's).
         if pass_merged > 0 && !tip_sha.is_empty() {
             let tip_runs = ctx.check_runs(repo, &tip_sha);
-            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+            if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("batch drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
@@ -2522,7 +2553,7 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
 /// probes pin the final card; an unreadable or bound-stalled probe stamps
 /// inconclusive and the pass bounces oldest-first, one per tick. GitHub
 /// re-run dispatch (check-runs rerequest) is a WRITE — worker-class only.
-fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -> Result<(), String> {
+fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, required: &[String]) -> Result<(), String> {
     let bisect = match stop.get("bisect").filter(|b| !b.is_null()) {
         Some(b) => b,
         None => return Ok(()), // legacy stop — nothing to bisect
@@ -2610,7 +2641,7 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -
         }
     };
     let runs = ctx.check_runs(repo, &sha);
-    match classify_main_check_runs(&runs).verdict {
+    match classify_base_check_runs(&runs, required).verdict {
         MainVerdict::Red => {
             renew_lease(ctx, repo, base);
             ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "red" }, "culprit_task": task, "culprit_sha": sha }))?;
@@ -4580,5 +4611,37 @@ mod tests {
         let args = call_args(&recorded[0]);
         assert_eq!(args.get("action").and_then(|v| v.as_str()), Some("acquire"));
         assert_eq!(args.get("merge_capable"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn rerun_failed_null_is_not_a_request_and_run_id_ignores_job_suffix_br5679() {
+        assert!(!has_rerun_request(&json!({})));
+        assert!(!has_rerun_request(&json!({ "rerun_failed": null })));
+        assert!(has_rerun_request(&json!({ "rerun_failed": { "at": 1793680000000_i64 } })));
+        assert_eq!(
+            extract_actions_run_id("https://github.com/state-vector/superpositional/actions/runs/41576347395/job/125726311965"),
+            Some(41576347395)
+        );
+        assert_eq!(
+            extract_actions_run_id("https://github.com/state-vector/superpositional/actions/runs/41576347395"),
+            Some(41576347395)
+        );
+        assert_eq!(extract_actions_run_id("https://github.example/run/999"), Some(999));
+        assert_eq!(extract_actions_run_id("https://github.example/no-digits"), None);
+    }
+
+    #[test]
+    fn stop_recovery_and_all_lane_arms_scope_to_required_workflows_br5679() {
+        // Structural guard (BR#5679): train.rs production code must never call
+        // unscoped `classify_main_check_runs(` — every base/stop/mid-drain/bisect
+        // classification routes through `classify_base_check_runs(&runs, &required)`
+        // so a non-required nightly failure (e.g. Guard Fixture Gate) cannot
+        // trap a stopped lane after its required workflows recover green.
+        let src = include_str!("train.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !prod.contains("classify_main_check_runs("),
+            "train.rs production code must use classify_base_check_runs(&runs, &required), never unscoped classify_main_check_runs"
+        );
     }
 }
