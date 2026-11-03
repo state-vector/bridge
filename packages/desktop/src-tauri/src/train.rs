@@ -1387,10 +1387,14 @@ fn extract_actions_run_id(url: &str) -> Option<i64> {
 fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged: u32) -> Value {
     let mut base_state = json!({
         // mid-drain (pass_merged > 0): destination-green is owned by the
-        // pass settle (BR#4934) — the gate composes with base FORCED green;
-        // the stamp mirrors the gate so the panel never shows a false red
-        // mid-burst.
-        "verdict": if pass_merged > 0 { "green" } else { base_class.verdict.as_str() },
+        // pass settle (BR#4934) — only non-red unsettled/empty reads are
+        // suppressed mid-burst; a RED base is ALWAYS reported as red so the
+        // UI never lies that a red base is green.
+        "verdict": if pass_merged > 0 && base_class.verdict != MainVerdict::Red {
+            "green"
+        } else {
+            base_class.verdict.as_str()
+        },
         "scoped_to_required": !required.is_empty(),
         "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
         "unsettled": base_class.unsettled,
@@ -1665,7 +1669,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("reconcile: PR #{cur_pr} merged on GitHub, event recovered"));
         }
         renew_lease(ctx, repo, base);
-        let runs = ctx.check_runs(repo, &merge_sha);
+        let mut runs = ctx.check_runs(repo, &merge_sha);
+        if ctx.base_probe {
+            if let Ok(live_base_sha) = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"]) {
+                let live_runs = if live_base_sha == merge_sha {
+                    runs.clone()
+                } else {
+                    ctx.check_runs(repo, &live_base_sha)
+                };
+                let live_base_class = classify_base_check_runs(&live_runs, &required);
+                let live_base_state = build_base_state(&live_base_class, &required, 0);
+                let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
+                // If merge_sha's own runs are all completed with a cancelled required run
+                // (cancelled because live_base_sha was pushed on top of merge_sha), judge
+                // the settle from live_base_sha's runs instead of hanging on the cancelled run.
+                let merge_all_done = !runs.is_empty() && runs.iter().all(|r| r.status.as_deref() == Some("completed"));
+                let merge_req_cancelled = runs.iter().any(|r| required.iter().any(|n| n == &r.name) && r.conclusion.as_deref() == Some("cancelled"));
+                if live_base_sha != merge_sha && merge_all_done && merge_req_cancelled {
+                    runs = live_runs;
+                }
+            }
+        }
         // BR#4934: the settle feed carries executor-fed git ancestry — the
         // pass's earlier merge shas verified on base — so the hub can close
         // the pass's parked cards on a green verdict (BR#3516: no hub
@@ -1812,7 +1836,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     if let Some(ref alarm) = base_class.alarm {
         log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
     }
-    let base_state = build_base_state(&base_class, &required, pass_merged);
+    let base_state = build_base_state(&base_class, &required, if from_awaiting_ci { 0 } else { pass_merged });
+    if from_awaiting_ci && base_class.verdict == MainVerdict::Red {
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": base_state }));
+        log(Some(key), "awaiting-ci: base tip is RED — holding batch continuation until base is green");
+        return Ok(());
+    }
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).

@@ -159,7 +159,22 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
         .filter(|r| required.iter().any(|n| n == &r.name))
         .cloned()
         .collect();
+    let gate_runs: Vec<MainCheckRun> = runs
+        .iter()
+        .filter(|r| !required.iter().any(|n| n == &r.name) && is_base_health_gate_name(&r.name))
+        .cloned()
+        .collect();
+    let gate_verdict = if !gate_runs.is_empty() {
+        Some(classify_main_check_runs(&gate_runs))
+    } else {
+        None
+    };
     if scoped.is_empty() {
+        if let Some(gv) = gate_verdict {
+            if gv.verdict == MainVerdict::Red {
+                return gv;
+            }
+        }
         return CheckVerdict {
             verdict: MainVerdict::Empty,
             red: vec![],
@@ -172,7 +187,14 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
             )),
         };
     }
-    classify_main_check_runs(&scoped)
+    let mut res = classify_main_check_runs(&scoped);
+    if let Some(gv) = gate_verdict {
+        if gv.verdict == MainVerdict::Red && !(res.verdict == MainVerdict::Green && res.green >= required.len()) {
+            res.verdict = MainVerdict::Red;
+            res.red.extend(gv.red);
+        }
+    }
+    res
 }
 
 /// core.ts classifyHeadChecks (846): same rule as classify_main_check_runs

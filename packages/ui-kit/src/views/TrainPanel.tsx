@@ -84,6 +84,14 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   // lane's required workflows) holding queued cars shows BLOCKED with
   // the red names, never a fake-busy "checking" line.
   const bs = l.queue_facts?.base_state;
+  if (bs && bs.verdict === "red" && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
+    const reds = (bs.red ?? []).map((r) => r.name).join(", ");
+    return {
+      tone: "err", card: curCard, pr: curPr,
+      label: `⛔ blocked — base is red${reds ? ` (${reds})` : ""}`,
+      title: `main is RED${reds ? `: ${reds}` : ` (${bs.verdict})`} — the standing order (never merge onto a non-green destination) holds all ${l.queue.length} queued car(s) until it clears. Fix forward, re-run a transient check, or bypass-merge a cure — the queue then drains automatically.`,
+    };
+  }
   if (bs && bs.verdict !== "green" && l.queue.length > 0 && now - (l.queue_facts?.at ?? 0) < 15 * 60_000) {
     const reds = (bs.red ?? []).map((r) => r.name).join(", ");
     if (bs.verdict === "unsettled") {
@@ -116,7 +124,7 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
   if (l.currently) {
     const settling = l.currently.phase !== "bursting";
     return {
-      tone: l.currently.phase === "stopped" ? "err" : "live",
+      tone: l.currently.phase === "stopped" ? "err" : settling ? "warn" : "live",
       card: settling ? undefined : l.currently.task_id,
       pr: settling ? undefined : l.currently.pr,
       label: l.currently.phase === "bursting"

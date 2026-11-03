@@ -973,7 +973,12 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
     return classifyMainCheckRuns(runs);
   }
   const scoped = runs.filter((r) => required.includes(r.name ?? ""));
+  const gateRuns = runs.filter((r) => !required.includes(r.name ?? "") && isBaseHealthGateName(r.name ?? ""));
+  const gateVerdict = gateRuns.length ? classifyMainCheckRuns(gateRuns) : null;
   if (!scoped.length) {
+    if (gateVerdict && gateVerdict.verdict === "red") {
+      return gateVerdict;
+    }
     return {
       verdict: "empty",
       red: [],
@@ -982,7 +987,15 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
       alarm: `${runs.length} runs read, none matched required set — check names/pagination`,
     };
   }
-  return classifyMainCheckRuns(scoped);
+  const res = classifyMainCheckRuns(scoped);
+  if (gateVerdict && gateVerdict.verdict === "red" && !(res.verdict === "green" && res.green >= required.length)) {
+    return {
+      ...res,
+      verdict: "red",
+      red: [...res.red, ...gateVerdict.red],
+    };
+  }
+  return res;
 }
 
 /** Deterministic ask title for one red episode — the sha makes the title
