@@ -577,15 +577,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tb-head { border: 1.5px solid var(--accent, #6ea8fe); }
 .tb-awaiting { background: var(--text-faint, #8b94a7); opacity: 0.55; }
 .tb-awaiting-aging { background: var(--amber, #d29a4b); opacity: 0.8; }
-.tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
 .train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
-/* ---------- BR#5658 (Ray 2026-11-03): the verification colour law ----------
-   Colour = verification state on every PR block, and the lane stat line:
-   green = ready (verified, the batch that merges this pass) · orange
-   PULSING = being verified (checks running) · orange SOLID = waiting to be
-   verified (needs a fresh review, incl. the Awaiting parks) · red =
-   conflicted · hatched = protection-blocked · dashed grey = no verdict. */
+/* ---------- BR#5658 (Ray 2026-11-03, v2): the verification colour law ----------
+   1. Per-lane PR stats: in progress (muted) · verifying (amber) · ready (green).
+   2. Backlog train: groups of verifying/ready PRs partitioned into sequential
+      merge batches (Batch 1 | Batch 2 | …), separated by .train-block-gap.
+   3. Block colour strictly denotes verification state (no red on awaiting per
+      BR#5476, no diagonal stripes):
+      - green solid (.tb-ready)     = ready (verified, mergeable)
+      - orange pulsing (.tb-verifying) = being verified right now
+      - orange solid (.tb-wait)     = waiting to be verified */
 .train-block-group { display: inline-flex; align-items: center; gap: 3px; }
 .tb-verifying { background: var(--amber, #d29a4b); animation: tb-pulse 1.6s ease-in-out infinite; }
 .tb-wait { background: var(--amber, #d29a4b); }
@@ -595,7 +597,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-stat.ts-ip { color: var(--text-faint, #8b94a7); }
 .train-stat.ts-verifying { color: var(--amber, #d29a4b); }
 .train-stat.ts-ready { color: var(--green, #3fb26a); }
-.train-stat.ts-waiting { color: var(--amber, #d29a4b); opacity: 0.85; }
 .train-stat-sep { color: var(--text-faint, #8b94a7); opacity: 0.7; }
 
 /* ---------- dashboard ---------- */

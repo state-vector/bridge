@@ -482,19 +482,34 @@ executor stamps the gate's Skip/Note verdicts into that seam (`ctx.note` on the 
 outcome), the hub persists the latest renewal note, and the throughput rate + last
 completed event (with age) close the NOW column so "last" and "now" are never
 conflated again.
-The lane's PR column shows ALL of the lane's PRs by verification state (BR#5658,
-Ray 2026-11-03: "each lane needs to show PR stats — in-progress, verifying and
-ready… colours should denote verification — green if ready, orange pulsing if
-being verified, orange solid if waiting to be"): a count line first (`N in
-progress · M verifying · K ready`, waiting appended when non-zero) — in-progress
-counts the OPEN impl cards with a PR bound to the lane's repo, verifying the
-walk's `waiting` verdicts (checks running), ready the walk's `ready` verdicts —
-then one coloured block per PR, grouped the way the pass merges them: green =
-ready (the batch that merges this pass), orange **pulsing** = being verified,
-orange solid = waiting to be verified (the `needs-review` verdicts plus the
-Awaiting parks after the divider), red = conflicted, hatched = branch-protection
-blocked, dashed grey = no machine verdict yet. The hub serves the buckets as
-`pr_stats` on each `train.status` lane.
+The lane's PR column shows ALL of the lane's PRs by verification state and merge
+batch (BR#5658 v2, Ray 2026-11-03: "each lane needs to show PR stats —
+in-progress, verifying and ready… the backlog train just shows the batches of
+verifying/ready PRs based on how they can be merged in batches… colours should
+denote verification — green if ready, orange pulsing if being verified, orange
+solid if waiting to be"):
+1. **3-bucket lane PR stats (`N in progress · M verifying · K ready`)**:
+   `in_progress` counts open PRs on the lane in active implementation (or bounced
+   back to `in_progress` / conflicted); `verifying` counts all PRs in the
+   verification stage across `in_review` (both `Verify:` todo and `Verify:` in
+   progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
+   counts verified (`ACCEPT`) PRs ready to merge.
+2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
+   runs `selectBatch` iteratively over the lane's verifying + ready PRs (using
+   the executor's `conflict_pairs` and `lane.burst_max`), separating batches with
+   `.train-block-gap` dividers.
+3. **Verification colour law**: inside each batch, **green solid (`.tb-ready`)** =
+   ready (verified), **orange pulsing (`.tb-verifying`)** = actively being
+   verified right now (`Verify:` child `in_progress` / live heartbeat <10m /
+   walk checks running), **orange solid (`.tb-wait`)** = waiting to be verified
+   (`Verify:` child `todo` or idle `awaiting` park; never red on awaiting,
+   never diagonal stripes, per BR#5476).
+And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
+`owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
+never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings
+(`commit/<sha>`) auto-close the `in_review` parent `done` when `Verify:` accepts;
+and answering an unbound implementation handoff ask (`BR#5476` class) auto-mints a
+qualified `task` card linked `derived_from` the ask.
 
 **One card may carry several PRs** (BR#3659): a verify close that accepts multiple PRs
 cites **every** PR URL with one `head <sha>` after each — `PR <url> head <sha>; PR <url>

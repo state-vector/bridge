@@ -92,8 +92,10 @@ export interface Rule {
 const role = (i: RuleInput) => effectiveRole(i.roles ?? []);
 const isTask = (i: RuleInput) => i.type === "task";
 const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
-const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
-const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
+const hasEvidenceLink = (s: string) =>
+  /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s) ||
+  /(?:^|[\s(—–-])(?:commit|landed(?:\s+direct(?:ly)?\s+to\s+main)?(?:\s+on\s+main)?(?:\s+as)?|main\s+commit)[\s#:@=/]+[0-9a-f]{7,40}\b/i.test(s);
+const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|commit|merged|passed|unblocked|still blocked)\b/i.test(s);
 /** BR#4295: the receipts shape hasReceipts accepts — one source of truth for
  *  the guard's rejection text (so an agent obeying it verbatim passes on the
  *  retry, never flails: each rejection is a breach event) and for every
@@ -167,7 +169,7 @@ export const UNBLOCK_FLOOD_MS = 60 * 60_000;
  *  fragments, runs/issues pages of unknown repos, prose) is not a receipt the
  *  runner should clone. */
 export function isClonableRepoRef(url: string): boolean {
-  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/pull\/\d+)?\/?$/.test(url)
+  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/(?:pull\/\d+|commit\/[0-9a-f]{7,40}))?\/?$/.test(url)
     || /^https?:\/\/\S+\.git$/.test(url);
 }
 

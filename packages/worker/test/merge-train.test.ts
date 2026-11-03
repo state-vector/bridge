@@ -23,6 +23,9 @@ import {
   progressVerdict,
   renewProgressDecide,
   selectBatch,
+  partitionMergeBatches,
+  isValidGitHubRepo,
+  parseDirectCommitReceipt,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -1031,6 +1034,42 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
     // `#N` without an owner/name prefix is inert — BR#NNNN card refs and
     // "the unrelated #2534 merge" prose never become legs
     expect(trainParseNoteLegs(`rebased over the unrelated #2534 merge; BR#4648 spins no more; head ${h}`)).toEqual([]);
+  });
+  it("BR#5658 / BR#5324 / BR#5805: rejects /BR#N cross-references, CSS tokens, and numeric-owner fragments (never mints ghost lanes like tb-pulse/BR or 5563/BR)", () => {
+    const h = "a".repeat(40);
+    expect(isValidGitHubRepo("state-vector/bridge")).toBe(true);
+    expect(isValidGitHubRepo("o/r")).toBe(true);
+    expect(isValidGitHubRepo("tb-pulse/BR")).toBe(false);
+    expect(isValidGitHubRepo("5563/BR")).toBe(false);
+    expect(isValidGitHubRepo("1768/BR")).toBe(false);
+    expect(isValidGitHubRepo("5022/BR")).toBe(false);
+    expect(isValidGitHubRepo("foo/GH")).toBe(false);
+    expect(trainParseNoteLegs(`added @keyframes tb-pulse/BR#5658 and BR#5563/BR#5635; (#1768/BR#4993) head ${h}`)).toEqual([]);
+    expect(parseDirectCommitReceipt(`Landed direct to main — https://github.com/state-vector/bridge/commit/${h}`)).toEqual({
+      repo: "state-vector/bridge",
+      sha: h,
+    });
+    expect(parseDirectCommitReceipt(`PR https://github.com/state-vector/bridge/pull/350 head ${h}`)).toBeNull();
+  });
+  it("BR#5658: partitionMergeBatches partitions verifying + ready PRs into sequential non-conflicting merge passes", () => {
+    const cars = [
+      { id: "BR#1", pr: 101, state: "ready" as const },
+      { id: "BR#2", pr: 102, state: "verifying" as const },
+      { id: "BR#3", pr: 103, state: "waiting" as const },
+      { id: "BR#4", pr: 104, state: "ready" as const },
+    ];
+    // PR 101 and PR 104 conflict → Batch 1 takes [101, 102, 103], Batch 2 takes [104]
+    const batches = partitionMergeBatches(cars, [[101, 104]], 10);
+    expect(batches.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 102, 103],
+      [104],
+    ]);
+    // burst_max cap = 2 with no conflicts → [101, 102] then [103, 104]
+    const capped = partitionMergeBatches(cars, [], 2);
+    expect(capped.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 102],
+      [103, 104],
+    ]);
   });
 });
 
