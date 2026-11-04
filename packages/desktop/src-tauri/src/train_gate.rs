@@ -1230,6 +1230,528 @@ pub fn merge_sweep_human_leg_title(repo: &str, reasons: &[String]) -> String {
     format!("{prefix}{text}{suffix}")
 }
 
+// ---------- BR#6179 level-based deploy reconciliation (dark-tip self-heal) ----------
+
+/// Default grace window (5 minutes) before an uncovered tip triggers automatic
+/// `workflow_dispatch` and fast-page escalation (BR#6179). Mirrored in `core.ts`.
+pub const DEPLOY_RECONCILE_GRACE_SECS: u64 = 300;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeployWorkflowRun {
+    pub id: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub head_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// Closed 6-state discriminated union on `phase` representing whether the base
+/// tip commit (`tip_sha`) is covered by a decisive deploy workflow run,
+/// settling in flight, inside the initial push-trigger grace window,
+/// auto-dispatched by the executor, stranded dark past grace, or failed.
+/// Mirrored in `@bridge/contracts` `DeployCoverageStateSchema` and `core.ts`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum DeployCoverageState {
+    Covered {
+        tip_sha: String,
+        tip_age_secs: u64,
+        covered_by_sha: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered_by_run_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered_by_url: Option<String>,
+    },
+    Settling {
+        tip_sha: String,
+        tip_age_secs: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active_run_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active_run_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_run_id: Option<i64>,
+    },
+    UncoveredGrace {
+        tip_sha: String,
+        tip_age_secs: u64,
+        grace_secs: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_run_id: Option<i64>,
+    },
+    UncoveredDispatched {
+        tip_sha: String,
+        tip_age_secs: u64,
+        workflow: String,
+        dispatched_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_run_id: Option<i64>,
+    },
+    UncoveredDark {
+        tip_sha: String,
+        tip_age_secs: u64,
+        grace_secs: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_run_id: Option<i64>,
+        reason: String,
+    },
+    Failed {
+        tip_sha: String,
+        tip_age_secs: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failing_run_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_green_run_id: Option<i64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DeployReconcilePlan {
+    pub coverage: DeployCoverageState,
+    pub dispatch_workflow: Option<String>,
+    pub cancel_run_ids: Vec<i64>,
+    pub covered_by_sha: Option<String>,
+    pub coverage_age_secs: u64,
+}
+
+/// Pure ISO-8601 timestamp parser (e.g. `"2026-11-04T08:01:57Z"` or
+/// `"2026-11-04T08:01:57+00:00"`) → epoch milliseconds, using Howard Hinnant's
+/// civil-from-days algorithm. Zero external dependencies.
+pub fn parse_iso8601_epoch_ms(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.len() < 19 {
+        return None;
+    }
+    let b = t.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't' && b[10] != b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let year: i64 = t.get(0..4)?.parse().ok()?;
+    let month: i64 = t.get(5..7)?.parse().ok()?;
+    let day: i64 = t.get(8..10)?.parse().ok()?;
+    let hour: i64 = t.get(11..13)?.parse().ok()?;
+    let min: i64 = t.get(14..16)?.parse().ok()?;
+    let sec: i64 = t.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+        return None;
+    }
+    let mut rest = t.get(19..)?;
+    let mut millis: i64 = 0;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let digits_len = after_dot.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if digits_len > 0 {
+            let mut frac_str = after_dot[..digits_len.min(3)].to_string();
+            while frac_str.len() < 3 {
+                frac_str.push('0');
+            }
+            millis = frac_str.parse().unwrap_or(0);
+        }
+        rest = &after_dot[digits_len..];
+    }
+    let mut tz_offset_secs: i64 = 0;
+    if !rest.is_empty() && rest != "Z" && rest != "z" {
+        let sign: i64 = if rest.starts_with('+') {
+            1
+        } else if rest.starts_with('-') {
+            -1
+        } else {
+            return None;
+        };
+        let tz = &rest[1..];
+        let (tz_h, tz_m): (i64, i64) = if tz.len() >= 5 && tz.as_bytes()[2] == b':' {
+            (tz.get(0..2)?.parse().ok()?, tz.get(3..5)?.parse().ok()?)
+        } else if tz.len() >= 4 {
+            (tz.get(0..2)?.parse().ok()?, tz.get(2..4)?.parse().ok()?)
+        } else {
+            return None;
+        };
+        tz_offset_secs = sign * (tz_h * 3600 + tz_m * 60);
+    }
+    // Howard Hinnant days_from_civil: days since 1970-01-01
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m_adj = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let total_secs = days * 86400 + hour * 3600 + min * 60 + sec - tz_offset_secs;
+    if total_secs <= 0 {
+        return None;
+    }
+    Some((total_secs as u64) * 1000 + (millis as u64))
+}
+
+/// True when a workflow run represents the lane's primary deploy workflow
+/// (e.g. `Deploy Dev` / `.github/workflows/deploy-dev.yml`) rather than a
+/// secondary observer/gate (`Deploy Health Record`, `Deploy drift alarm`,
+/// `Deploy health (merge gate)`). Mirrored in `core.ts` `isDeployWorkflowRun`.
+pub fn is_deploy_workflow_run(r: &DeployWorkflowRun, required: &[String]) -> bool {
+    let name_lower = r.name.trim().to_lowercase();
+    let path_lower = r.path.as_deref().unwrap_or("").trim().to_lowercase();
+    if name_lower.contains("health record")
+        || name_lower.contains("drift alarm")
+        || name_lower.contains("merge gate")
+        || path_lower.ends_with("deploy-health.yml")
+        || path_lower.ends_with("deploy-drift.yml")
+    {
+        return false;
+    }
+    if path_lower.ends_with("/deploy-dev.yml")
+        || path_lower == "deploy-dev.yml"
+        || path_lower.ends_with("/deploy.yml")
+        || path_lower == "deploy.yml"
+    {
+        return true;
+    }
+    if name_lower == "deploy dev" || name_lower == "deploy" || name_lower.starts_with("deploy to ") {
+        return true;
+    }
+    for req in required {
+        let req_lower = req.trim().to_lowercase();
+        let prefix = match req_lower.find(" / ") {
+            Some(idx) => req_lower[..idx].trim(),
+            None => req_lower.as_str(),
+        };
+        if !prefix.is_empty() && (name_lower == prefix || name_lower == format!("{prefix} dev")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Infer the dispatchable workflow filename (e.g. `"deploy-dev.yml"`) from
+/// observed workflow runs and the lane's `required_workflows`. Mirrored in
+/// `core.ts` `inferDeployWorkflow`.
+pub fn infer_deploy_workflow(required: &[String], workflow_runs: &[DeployWorkflowRun]) -> Option<String> {
+    let mut sorted: Vec<&DeployWorkflowRun> = workflow_runs.iter().collect();
+    sorted.sort_by(|a, b| b.id.cmp(&a.id));
+    for r in &sorted {
+        if !is_deploy_workflow_run(r, required) {
+            continue;
+        }
+        if let Some(raw_path) = r.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            let file = raw_path.rsplit('/').next().unwrap_or("");
+            if (file.ends_with(".yml") || file.ends_with(".yaml")) && file != "deploy.yml" {
+                return Some(file.to_string());
+            }
+        }
+    }
+    for r in &sorted {
+        if !is_deploy_workflow_run(r, required) {
+            continue;
+        }
+        if let Some(raw_path) = r.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            let file = raw_path.rsplit('/').next().unwrap_or("");
+            if file.ends_with(".yml") || file.ends_with(".yaml") {
+                return Some(file.to_string());
+            }
+        }
+        if r.name.trim().eq_ignore_ascii_case("deploy dev") {
+            return Some("deploy-dev.yml".to_string());
+        }
+    }
+    let has_deploy_req = required.iter().any(|w| {
+        let lw = w.trim().to_lowercase();
+        lw.starts_with("deploy /") || lw.starts_with("post-deploy /") || lw == "deploy dev"
+    });
+    if has_deploy_req {
+        return Some("deploy-dev.yml".to_string());
+    }
+    None
+}
+
+fn is_queued_workflow_status(status: Option<&str>) -> bool {
+    matches!(
+        status.unwrap_or("").trim().to_lowercase().as_str(),
+        "queued" | "waiting" | "pending" | "requested"
+    )
+}
+
+fn is_in_progress_workflow_status(status: Option<&str>) -> bool {
+    status.unwrap_or("").trim().eq_ignore_ascii_case("in_progress")
+}
+
+/// Pure level-based deploy coverage & reconciliation state machine (BR#6179):
+/// - Computes `DeployCoverageState` (closed 6-state union on `phase`).
+/// - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
+///   per `tip_sha` when the tip is uncovered past `grace_secs` with no active run.
+/// - Identifies redundant queued deploy runs (`cancel_run_ids`) when the same
+///   `head_sha` already has an `in_progress` or `completed/success` deploy run
+///   (or duplicate queued runs for the same `head_sha`).
+/// Mirrored in `core.ts` `reconcileDeployCoverage`.
+pub fn reconcile_deploy_coverage(
+    tip_sha: &str,
+    tip_age_secs: u64,
+    grace_secs: u64,
+    base_verdict: &CheckVerdict,
+    required: &[String],
+    workflow_runs: &[DeployWorkflowRun],
+    already_dispatched_at: Option<u64>,
+) -> DeployReconcilePlan {
+    let tip_sha = tip_sha.trim().to_string();
+    let grace_secs = grace_secs.max(1);
+    let mut deploy_runs: Vec<&DeployWorkflowRun> = workflow_runs
+        .iter()
+        .filter(|r| is_deploy_workflow_run(r, required))
+        .collect();
+    deploy_runs.sort_by(|a, b| b.id.cmp(&a.id));
+
+    let newest_green = deploy_runs.iter().copied().find(|r| {
+        r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
+            && r.conclusion.as_deref().unwrap_or("").eq_ignore_ascii_case("success")
+    });
+    let last_green_sha = newest_green
+        .map(|r| r.head_sha.clone())
+        .filter(|s| !s.is_empty());
+    let last_green_run_id = newest_green.map(|r| r.id);
+
+    // (D) Redundant queued runs per head_sha:
+    // Preserve first-seen SHA order from `deploy_runs` (already sorted by id desc).
+    let mut by_sha: Vec<(String, Vec<&DeployWorkflowRun>)> = Vec::new();
+    for r in &deploy_runs {
+        let sha = r.head_sha.trim();
+        if sha.is_empty() {
+            continue;
+        }
+        match by_sha.iter_mut().find(|(s, _)| s == sha) {
+            Some((_, list)) => list.push(*r),
+            None => by_sha.push((sha.to_string(), vec![*r])),
+        }
+    }
+    let mut cancel_run_ids: Vec<i64> = Vec::new();
+    for (_, list) in &by_sha {
+        let has_active_or_green = list.iter().any(|r| {
+            is_in_progress_workflow_status(r.status.as_deref())
+                || (r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
+                    && r.conclusion.as_deref().unwrap_or("").eq_ignore_ascii_case("success"))
+        });
+        let queued: Vec<&&DeployWorkflowRun> = list
+            .iter()
+            .filter(|r| is_queued_workflow_status(r.status.as_deref()))
+            .collect();
+        if has_active_or_green {
+            for q in queued {
+                if q.id > 0 && !cancel_run_ids.contains(&q.id) {
+                    cancel_run_ids.push(q.id);
+                }
+            }
+        } else if queued.len() > 1 {
+            for q in queued.into_iter().skip(1) {
+                if q.id > 0 && !cancel_run_ids.contains(&q.id) {
+                    cancel_run_ids.push(q.id);
+                }
+            }
+        }
+    }
+
+    let tip_runs: Vec<&DeployWorkflowRun> = deploy_runs
+        .iter()
+        .copied()
+        .filter(|r| r.head_sha == tip_sha)
+        .collect();
+    let tip_active = tip_runs.iter().copied().find(|r| {
+        (is_in_progress_workflow_status(r.status.as_deref()) || is_queued_workflow_status(r.status.as_deref()))
+            && !cancel_run_ids.contains(&r.id)
+    });
+    let tip_green = tip_runs.iter().copied().find(|r| {
+        r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
+            && r.conclusion.as_deref().unwrap_or("").eq_ignore_ascii_case("success")
+    });
+    let tip_red = tip_runs.iter().copied().find(|r| {
+        r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
+            && r.conclusion.as_deref().map(|c| c != "cancelled" && is_red_conclusion(c)).unwrap_or(false)
+    });
+
+    if base_verdict.verdict == MainVerdict::Green {
+        return DeployReconcilePlan {
+            coverage: DeployCoverageState::Covered {
+                tip_sha: tip_sha.clone(),
+                tip_age_secs,
+                covered_by_sha: tip_sha.clone(),
+                covered_by_run_id: tip_green.map(|r| r.id).or(last_green_run_id),
+                covered_by_url: tip_green.and_then(|r| r.html_url.clone()).or_else(|| newest_green.and_then(|r| r.html_url.clone())),
+            },
+            dispatch_workflow: None,
+            cancel_run_ids,
+            covered_by_sha: Some(tip_sha),
+            coverage_age_secs: 0,
+        };
+    }
+
+    if base_verdict.verdict == MainVerdict::Red {
+        return DeployReconcilePlan {
+            coverage: DeployCoverageState::Failed {
+                tip_sha,
+                tip_age_secs,
+                failing_run_id: tip_red.map(|r| r.id),
+                last_green_sha: last_green_sha.clone(),
+                last_green_run_id,
+            },
+            dispatch_workflow: None,
+            cancel_run_ids,
+            covered_by_sha: last_green_sha,
+            coverage_age_secs: tip_age_secs,
+        };
+    }
+
+    if base_verdict.verdict == MainVerdict::Unsettled || tip_active.is_some() {
+        return DeployReconcilePlan {
+            coverage: DeployCoverageState::Settling {
+                tip_sha,
+                tip_age_secs,
+                active_run_id: tip_active.map(|r| r.id),
+                active_run_url: tip_active.and_then(|r| r.html_url.clone()),
+                last_green_sha: last_green_sha.clone(),
+                last_green_run_id,
+            },
+            dispatch_workflow: None,
+            cancel_run_ids,
+            covered_by_sha: last_green_sha,
+            coverage_age_secs: tip_age_secs,
+        };
+    }
+
+    let workflow = infer_deploy_workflow(required, workflow_runs);
+    if let Some(dispatched_at) = already_dispatched_at.filter(|&ts| ts > 0) {
+        return DeployReconcilePlan {
+            coverage: DeployCoverageState::UncoveredDispatched {
+                tip_sha,
+                tip_age_secs,
+                workflow: workflow.unwrap_or_else(|| "deploy-dev.yml".to_string()),
+                dispatched_at,
+                last_green_sha: last_green_sha.clone(),
+                last_green_run_id,
+            },
+            dispatch_workflow: None,
+            cancel_run_ids,
+            covered_by_sha: last_green_sha,
+            coverage_age_secs: tip_age_secs,
+        };
+    }
+
+    if tip_age_secs < grace_secs {
+        return DeployReconcilePlan {
+            coverage: DeployCoverageState::UncoveredGrace {
+                tip_sha,
+                tip_age_secs,
+                grace_secs,
+                workflow,
+                last_green_sha: last_green_sha.clone(),
+                last_green_run_id,
+            },
+            dispatch_workflow: None,
+            cancel_run_ids,
+            covered_by_sha: last_green_sha,
+            coverage_age_secs: tip_age_secs,
+        };
+    }
+
+    let only_cancelled_or_skipped = !tip_runs.is_empty()
+        && tip_runs.iter().all(|r| {
+            matches!(
+                r.conclusion.as_deref().unwrap_or("").to_lowercase().as_str(),
+                "cancelled" | "skipped"
+            )
+        });
+    let reason = if only_cancelled_or_skipped {
+        "all deploy runs on tip were cancelled/skipped".to_string()
+    } else {
+        "no deploy workflow run fired on tip (push trigger suppressed or run deleted)".to_string()
+    };
+    let dispatch_workflow = if tip_sha.is_empty() { None } else { workflow.clone() };
+
+    DeployReconcilePlan {
+        coverage: DeployCoverageState::UncoveredDark {
+            tip_sha,
+            tip_age_secs,
+            grace_secs,
+            workflow,
+            last_green_sha: last_green_sha.clone(),
+            last_green_run_id,
+            reason,
+        },
+        dispatch_workflow,
+        cancel_run_ids,
+        covered_by_sha: last_green_sha,
+        coverage_age_secs: tip_age_secs,
+    }
+}
+
+fn format_coverage_age_short(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+/// Human-readable single-line deploy coverage summary for lane reasons and
+/// TrainPanel banners (BR#6179 B). Mirrored in `core.ts` `formatDeployCoverageSummary`.
+pub fn format_deploy_coverage_summary(cov: &DeployCoverageState) -> String {
+    match cov {
+        DeployCoverageState::Covered { tip_sha, covered_by_run_id, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let run_suffix = covered_by_run_id.map(|id| format!(" (run #{id})")).unwrap_or_default();
+            format!("tip {short} covered by deploy{run_suffix}")
+        }
+        DeployCoverageState::Settling { tip_sha, tip_age_secs, active_run_id, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let age_str = format_coverage_age_short(*tip_age_secs);
+            let run_suffix = active_run_id.map(|id| format!(", run #{id}")).unwrap_or_default();
+            format!("tip {short} deploy in flight (age {age_str}{run_suffix})")
+        }
+        DeployCoverageState::UncoveredGrace { tip_sha, tip_age_secs, grace_secs, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let age_str = format_coverage_age_short(*tip_age_secs);
+            let gm = (*grace_secs / 60).max(1);
+            format!("tip {short} not covered by any deploy (age {age_str}, grace {gm}m)")
+        }
+        DeployCoverageState::UncoveredDispatched { tip_sha, tip_age_secs, workflow, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let age_str = format_coverage_age_short(*tip_age_secs);
+            format!("tip {short} not covered by any deploy (age {age_str}) — auto-dispatched {workflow}")
+        }
+        DeployCoverageState::UncoveredDark { tip_sha, tip_age_secs, last_green_sha, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let age_str = format_coverage_age_short(*tip_age_secs);
+            let prev = last_green_sha
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" — last green deploy {}", &s[..s.len().min(8)]))
+                .unwrap_or_default();
+            format!("tip {short} not covered by any deploy (age {age_str}){prev}")
+        }
+        DeployCoverageState::Failed { tip_sha, tip_age_secs, .. } => {
+            let short = if tip_sha.is_empty() { "unknown" } else { &tip_sha[..tip_sha.len().min(8)] };
+            let age_str = format_coverage_age_short(*tip_age_secs);
+            format!("tip {short} deploy failed (age {age_str})")
+        }
+    }
+}
+
 // ---------- fixtures mirrored from packages/worker/test/merge-train.test.ts ----------
 
 #[cfg(test)]
@@ -2538,5 +3060,162 @@ mod tests {
             ),
             "expected Bounce(Conflict) on CONFLICTING root-fix PR, got {conflicting_root_fix:?}"
         );
+    }
+
+    #[test]
+    fn br6179_level_based_deploy_reconciliation_dark_tip_grace_dispatch_and_redundant_cancel() {
+        let required: Vec<String> = vec![
+            "deploy / Deploy to dev".into(),
+            "post-deploy / Post-Deploy Smoke".into(),
+            "post-deploy / DNS chain".into(),
+            "post-deploy / Lodestar Storage Health".into(),
+        ];
+        let dark_tip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+        let prev_green_tip = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+        let empty_verdict = classify_base_check_runs(&[], &required);
+        assert_eq!(empty_verdict.verdict, MainVerdict::Empty);
+
+        // 1. Deploy Health Record on the dark tip (the exact 2026-11-04 08:19:23Z receipt)
+        //    must NEVER be mistaken for a covering Deploy Dev workflow run.
+        let wf_runs_with_dhr = vec![
+            DeployWorkflowRun {
+                id: 41791923312,
+                name: "Deploy Health Record".into(),
+                path: Some(".github/workflows/deploy-health.yml".into()),
+                head_sha: dark_tip.into(),
+                event: Some("schedule".into()),
+                status: Some("completed".into()),
+                conclusion: Some("success".into()),
+                html_url: None,
+            },
+            DeployWorkflowRun {
+                id: 41780000001,
+                name: "Deploy Dev".into(),
+                path: Some(".github/workflows/deploy-dev.yml".into()),
+                head_sha: prev_green_tip.into(),
+                event: Some("push".into()),
+                status: Some("completed".into()),
+                conclusion: Some("success".into()),
+                html_url: Some("https://github.com/state-vector/superpositional/actions/runs/41780000001".into()),
+            },
+        ];
+        assert!(!is_deploy_workflow_run(&wf_runs_with_dhr[0], &required));
+        assert!(is_deploy_workflow_run(&wf_runs_with_dhr[1], &required));
+        assert_eq!(infer_deploy_workflow(&required, &wf_runs_with_dhr), Some("deploy-dev.yml".into()));
+        assert_eq!(infer_deploy_workflow(&required, &[]), Some("deploy-dev.yml".into()));
+
+        // 2. Inside grace window (age 120s < 300s): UncoveredGrace, no dispatch yet
+        let plan_grace = reconcile_deploy_coverage(
+            dark_tip,
+            120,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &empty_verdict,
+            &required,
+            &wf_runs_with_dhr,
+            None,
+        );
+        assert_eq!(plan_grace.dispatch_workflow, None);
+        assert_eq!(plan_grace.covered_by_sha.as_deref(), Some(prev_green_tip));
+        assert!(matches!(plan_grace.coverage, DeployCoverageState::UncoveredGrace { tip_age_secs: 120, .. }));
+        assert_eq!(
+            format_deploy_coverage_summary(&plan_grace.coverage),
+            "tip 7f5efec2 not covered by any deploy (age 2m, grace 5m)"
+        );
+
+        // 3. Past grace window (age 1020s = 17m >= 300s) and not yet dispatched:
+        //    UncoveredDark + dispatch_workflow = Some("deploy-dev.yml")
+        let plan_dark = reconcile_deploy_coverage(
+            dark_tip,
+            1020,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &empty_verdict,
+            &required,
+            &wf_runs_with_dhr,
+            None,
+        );
+        assert_eq!(plan_dark.dispatch_workflow.as_deref(), Some("deploy-dev.yml"));
+        assert_eq!(plan_dark.covered_by_sha.as_deref(), Some(prev_green_tip));
+        assert_eq!(plan_dark.coverage_age_secs, 1020);
+        assert_eq!(
+            format_deploy_coverage_summary(&plan_dark.coverage),
+            "tip 7f5efec2 not covered by any deploy (age 17m) — last green deploy ebbe1826"
+        );
+
+        // 4. Once dispatched for this SHA (`already_dispatched_at = Some(...)`):
+        //    UncoveredDispatched + dispatch_workflow = None (idempotent once-per-sha guard)
+        let plan_dispatched = reconcile_deploy_coverage(
+            dark_tip,
+            1020,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &empty_verdict,
+            &required,
+            &wf_runs_with_dhr,
+            Some(1793780527000),
+        );
+        assert_eq!(plan_dispatched.dispatch_workflow, None);
+        assert!(matches!(
+            plan_dispatched.coverage,
+            DeployCoverageState::UncoveredDispatched { dispatched_at: 1793780527000, .. }
+        ));
+        assert_eq!(
+            format_deploy_coverage_summary(&plan_dispatched.coverage),
+            "tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml"
+        );
+
+        // 5. Redundant queued run cancellation (Leg D, exact 2026-11-04 08:22 receipt):
+        //    workflow_dispatch run 41798951196 is `in_progress` on `prev_green_tip` while
+        //    push run 41798949143 is `queued` on the SAME `prev_green_tip` → cancel 41798949143!
+        let wf_runs_redundant = vec![
+            DeployWorkflowRun {
+                id: 41798951196,
+                name: "Deploy Dev".into(),
+                path: Some(".github/workflows/deploy-dev.yml".into()),
+                head_sha: prev_green_tip.into(),
+                event: Some("workflow_dispatch".into()),
+                status: Some("in_progress".into()),
+                conclusion: None,
+                html_url: Some("https://github.com/state-vector/superpositional/actions/runs/41798951196".into()),
+            },
+            DeployWorkflowRun {
+                id: 41798949143,
+                name: "Deploy Dev".into(),
+                path: Some(".github/workflows/deploy-dev.yml".into()),
+                head_sha: prev_green_tip.into(),
+                event: Some("push".into()),
+                status: Some("queued".into()),
+                conclusion: None,
+                html_url: Some("https://github.com/state-vector/superpositional/actions/runs/41798949143".into()),
+            },
+        ];
+        let unsettled_verdict = classify_base_check_runs(
+            &[MainCheckRun {
+                id: 1,
+                name: "deploy / Deploy to dev".into(),
+                status: Some("in_progress".into()),
+                conclusion: None,
+                html_url: None,
+            }],
+            &required,
+        );
+        let plan_settling = reconcile_deploy_coverage(
+            prev_green_tip,
+            30,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &unsettled_verdict,
+            &required,
+            &wf_runs_redundant,
+            None,
+        );
+        assert_eq!(plan_settling.cancel_run_ids, vec![41798949143]);
+        assert_eq!(plan_settling.dispatch_workflow, None);
+        assert!(matches!(
+            plan_settling.coverage,
+            DeployCoverageState::Settling { active_run_id: Some(41798951196), .. }
+        ));
+
+        // 6. ISO-8601 parser accuracy
+        assert_eq!(parse_iso8601_epoch_ms("2026-11-04T08:01:57Z"), Some(1_793_779_317_000));
+        assert_eq!(parse_iso8601_epoch_ms("2026-11-04T08:01:57.250Z"), Some(1_793_779_317_250));
+        assert_eq!(parse_iso8601_epoch_ms("invalid"), None);
     }
 }

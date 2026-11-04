@@ -41,10 +41,12 @@
 //! head is fetched explicitly before any local op names it.
 
 use crate::train_gate::{
-    classify_base_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
-    latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
-    CheckVerdict, DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
+    classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
+     is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_deploy_coverage,
+    root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
+    CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision, MainCheckRun,
+    MainVerdict, MergeAction, DEPLOY_RECONCILE_GRACE_SECS, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -232,6 +234,13 @@ struct Ctx {
     /// the executor automatically triggers one `gh run rerun` per `(key, sha)`
     /// so marginal races (e.g. Post-Deploy Smoke deadline race) self-heal.
     auto_rerun_shas: std::collections::HashSet<String>,
+    /// BR#6179: Per-(lane, tip_sha) auto-dispatch guard (`"{key}:{sha}"` -> `dispatched_at_ms`)
+    /// so level-based deploy reconciliation dispatches `workflow_dispatch` at most ONCE per sha.
+    auto_deploy_dispatched_shas: std::collections::HashMap<String, u64>,
+    /// BR#6179: Redundant queued workflow run IDs already cancelled this process lifetime.
+    cancelled_redundant_runs: std::collections::HashSet<i64>,
+    #[cfg(test)]
+    sh_mock: Option<std::sync::Arc<dyn Fn(&str, &[&str]) -> Option<Result<String, String>> + Send + Sync>>,
     // ---- token-rot visibility (BR#4754) ----
     /// The lane card id train_status last reported (the one-per-episode
     /// token-rot note lands there after a self-healed blind episode).
@@ -321,6 +330,10 @@ impl Ctx {
             tick_landed: 0,
             tick_error: None,
             auto_rerun_shas: std::collections::HashSet::new(),
+            auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+            cancelled_redundant_runs: std::collections::HashSet::new(),
+            #[cfg(test)]
+            sh_mock: None,
             last_lane_card: None,
         })
     }
@@ -372,6 +385,12 @@ impl Ctx {
 
     // gh/git inside the target clone; we read stdout, surface stderr on failure.
     fn sh(&self, cmd: &str, cmd_args: &[&str]) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some(ref mock) = self.sh_mock {
+            if let Some(res) = mock(cmd, cmd_args) {
+                return res;
+            }
+        }
         let out = Command::new(cmd)
             .args(cmd_args)
             .current_dir(&self.workdir)
@@ -612,6 +631,72 @@ impl Ctx {
         runs
     }
 
+    /// BR#6179: Read the base branch tip SHA and its commit age in seconds
+    /// (`now_ms - committed_at`). Accepts either `{sha, committed_at}` JSON
+    /// or a bare SHA string (backwards-compatible with `.sha` mocks).
+    fn base_tip_facts(&self, repo: &str, base: &str) -> Result<(String, u64), String> {
+        if let Ok(out) = self.sh(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{repo}/commits/{base}"),
+                "--jq",
+                "{sha: .sha, committed_at: (.commit.committer.date // .commit.author.date)}",
+            ],
+        ) {
+            if let Ok(v) = serde_json::from_str::<Value>(&out) {
+                if let Some(sha) = v.get("sha").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+                    let age_secs = v
+                        .get("committed_at")
+                        .and_then(|d| d.as_str())
+                        .and_then(parse_iso8601_epoch_ms)
+                        .map(|ms| now_ms().saturating_sub(ms) / 1000)
+                        .unwrap_or(0);
+                    return Ok((sha.to_string(), age_secs));
+                }
+            }
+            let trimmed = out.trim().trim_matches('"').to_string();
+            if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                return Ok((trimmed, 0));
+            }
+        }
+        let sha = self.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+        Ok((sha.trim().trim_matches('"').to_string(), 0))
+    }
+
+    /// BR#6179: Read recent workflow runs on `base` (and on `tip_sha`) for
+    /// level-based deploy coverage and redundant-queued-run detection.
+    fn workflow_runs(&self, repo: &str, base: &str, tip_sha: &str) -> Vec<DeployWorkflowRun> {
+        let mut combined: Vec<DeployWorkflowRun> = Vec::new();
+        if let Ok(Value::Array(branch_runs)) = self.gh_json(&[
+            "api",
+            &format!("repos/{repo}/actions/runs?branch={base}&per_page=30"),
+            "--jq",
+            "[.workflow_runs[] | {id, name, path, head_sha, event, status, conclusion, html_url}]",
+        ]) {
+            for r in parse_deploy_workflow_runs(&branch_runs) {
+                if !combined.iter().any(|x| x.id == r.id) {
+                    combined.push(r);
+                }
+            }
+        }
+        if !tip_sha.is_empty() {
+            if let Ok(Value::Array(sha_runs)) = self.gh_json(&[
+                "api",
+                &format!("repos/{repo}/actions/runs?head_sha={tip_sha}&per_page=100"),
+                "--jq",
+                "[.workflow_runs[] | {id, name, path, head_sha, event, status, conclusion, html_url}]",
+            ]) {
+                for r in parse_deploy_workflow_runs(&sha_runs) {
+                    if !combined.iter().any(|x| x.id == r.id) {
+                        combined.push(r);
+                    }
+                }
+            }
+        }
+        combined
+    }
+
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
         let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {sha: .sha, verified: .commit.verification.verified}]"]);
         match out {
@@ -813,6 +898,29 @@ fn workflow_startup_failures(wf_runs: &[Value]) -> Vec<MainCheckRun> {
                 out.push(judge);
             }
         }
+    }
+    out
+}
+
+fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
+    let mut out = Vec::new();
+    for r in wf_runs {
+        let id = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let head_sha = r.get("head_sha").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if id <= 0 || name.is_empty() {
+            continue;
+        }
+        out.push(DeployWorkflowRun {
+            id,
+            name,
+            path: r.get("path").and_then(|v| v.as_str()).map(String::from),
+            head_sha,
+            event: r.get("event").and_then(|v| v.as_str()).map(String::from),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        });
     }
     out
 }
@@ -1478,6 +1586,143 @@ fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged:
     base_state
 }
 
+fn build_base_state_with_coverage(
+    base_class: &CheckVerdict,
+    required: &[String],
+    pass_merged: u32,
+    plan: Option<&DeployReconcilePlan>,
+    cancelled_runs: &[i64],
+) -> Value {
+    let mut base_state = build_base_state(base_class, required, pass_merged);
+    if pass_merged == 0 {
+        if let Some(p) = plan {
+            let obj = base_state.as_object_mut().unwrap();
+            let (tip_sha, tip_age_secs) = match &p.coverage {
+                DeployCoverageState::Covered { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::Settling { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredGrace { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredDispatched { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredDark { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::Failed { tip_sha, tip_age_secs, .. } => (tip_sha.clone(), *tip_age_secs),
+            };
+            if !tip_sha.is_empty() {
+                obj.insert("tip_sha".into(), json!(tip_sha));
+                obj.insert("tip_age_secs".into(), json!(tip_age_secs));
+                obj.insert("covered_by".into(), json!(p.covered_by_sha));
+                obj.insert("coverage_age_secs".into(), json!(p.coverage_age_secs));
+                if let Ok(cov_val) = serde_json::to_value(&p.coverage) {
+                    obj.insert("deploy_coverage".into(), cov_val);
+                }
+            }
+            if !cancelled_runs.is_empty() {
+                obj.insert("cancelled_redundant_runs".into(), json!(cancelled_runs));
+            }
+        }
+    }
+    base_state
+}
+
+/// BR#6179 level-based deploy reconciler (A + B + D):
+/// 1. Evaluates `reconcile_deploy_coverage` on `tip_sha`.
+/// 2. (D) Cancels redundant queued deploy runs (`gh run cancel <id>`) when the
+///    same `head_sha` is already covered by an `in_progress` or `completed/success`
+///    deploy run (or duplicate queued runs).
+/// 3. (A) Auto-dispatches `workflow_dispatch` (`gh workflow run <wf> --ref <base>`)
+///    ONCE per `tip_sha` when the tip is uncovered past `DEPLOY_RECONCILE_GRACE_SECS`.
+/// 4. (B) Returns the enriched `base_state` JSON carrying `deploy_coverage`,
+///    `covered_by`, `coverage_age_secs`, and `cancelled_redundant_runs`.
+fn reconcile_base_deploy(
+    ctx: &mut Ctx,
+    lane: &Value,
+    key: &str,
+    repo: &str,
+    base: &str,
+    tip_sha: &str,
+    tip_age_secs: u64,
+    base_class: &CheckVerdict,
+    required: &[String],
+    pass_merged: u32,
+) -> Value {
+    if tip_sha.is_empty() || !ctx.base_probe {
+        return build_base_state(base_class, required, pass_merged);
+    }
+    let wf_runs = ctx.workflow_runs(repo, base, tip_sha);
+    let auto_key = format!("{key}:{tip_sha}");
+    let manual_redispatch = lane.get("dispatch_deploy").filter(|v| !v.is_null()).is_some();
+    let hub_dispatched_at = if manual_redispatch {
+        None
+    } else {
+        lane.get("deploy_dispatched")
+            .filter(|d| d.get("sha").and_then(|v| v.as_str()) == Some(tip_sha))
+            .and_then(|d| d.get("at").and_then(|v| v.as_u64()))
+    };
+    let already_dispatched = if manual_redispatch {
+        None
+    } else {
+        hub_dispatched_at.or_else(|| ctx.auto_deploy_dispatched_shas.get(&auto_key).copied())
+    };
+    let mut plan = reconcile_deploy_coverage(
+        tip_sha,
+        tip_age_secs,
+        DEPLOY_RECONCILE_GRACE_SECS,
+        base_class,
+        required,
+        &wf_runs,
+        already_dispatched,
+    );
+    let mut cancelled_ok: Vec<i64> = Vec::new();
+    for &run_id in &plan.cancel_run_ids {
+        if !ctx.cancelled_redundant_runs.contains(&run_id) {
+            if ctx.sh("gh", &["run", "cancel", &run_id.to_string(), "--repo", repo]).is_ok() {
+                ctx.cancelled_redundant_runs.insert(run_id);
+                cancelled_ok.push(run_id);
+                log(
+                    Some(key),
+                    &format!(
+                        "deploy reconcile (D): cancelled redundant queued deploy run #{run_id} for already-covered sha {} (BR#6179)",
+                        &tip_sha[..tip_sha.len().min(8)]
+                    ),
+                );
+            }
+        }
+    }
+    if pass_merged == 0 {
+        if let Some(ref wf) = plan.dispatch_workflow.clone() {
+            if ctx.sh("gh", &["workflow", "run", wf, "--repo", repo, "--ref", base]).is_ok() {
+                let ts = now_ms();
+                ctx.auto_deploy_dispatched_shas.insert(auto_key, ts);
+                let (last_green_sha, last_green_run_id) = match &plan.coverage {
+                    DeployCoverageState::UncoveredDark { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::UncoveredGrace { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::UncoveredDispatched { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::Settling { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::Failed { last_green_sha, last_green_run_id, .. } => {
+                        (last_green_sha.clone(), *last_green_run_id)
+                    }
+                    DeployCoverageState::Covered { covered_by_sha, covered_by_run_id, .. } => {
+                        (Some(covered_by_sha.clone()), *covered_by_run_id)
+                    }
+                };
+                plan.coverage = DeployCoverageState::UncoveredDispatched {
+                    tip_sha: tip_sha.to_string(),
+                    tip_age_secs,
+                    workflow: wf.clone(),
+                    dispatched_at: ts,
+                    last_green_sha,
+                    last_green_run_id,
+                };
+                let summary = format_deploy_coverage_summary(&plan.coverage);
+                ctx.note(&format!("self-heal: {summary}"));
+                log(
+                    Some(key),
+                    &format!("deploy reconcile (A): {summary} on {base} (once per sha, BR#6179)"),
+                );
+            }
+        }
+    }
+    build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     let required = lane_required_workflows(lane);
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
@@ -1653,7 +1898,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let stop = lane.get("stop").unwrap();
         let stop_sha = vstr(stop, "sha").unwrap_or("");
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
-        let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+        let (base_sha, base_age_secs) = ctx.base_tip_facts(repo, base)?;
         let base_runs = ctx.check_runs(repo, &base_sha);
         let v = classify_base_check_runs(&base_runs, &required);
         if v.verdict == MainVerdict::Green {
@@ -1720,7 +1965,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 } else {
                     v.clone()
                 };
-                let live_base_state = build_base_state(&effective_v, &required, 0);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &effective_v, &required, 0);
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 let _ = settle_window_rebase(ctx, key, repo, base, lane);
             }
@@ -1776,14 +2021,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         renew_lease(ctx, repo, base);
         let mut runs = ctx.check_runs(repo, &merge_sha);
         if ctx.base_probe {
-            if let Ok(live_base_sha) = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"]) {
+            if let Ok((live_base_sha, live_base_age_secs)) = ctx.base_tip_facts(repo, base) {
                 let live_runs = if live_base_sha == merge_sha {
                     runs.clone()
                 } else {
                     ctx.check_runs(repo, &live_base_sha)
                 };
                 let live_base_class = classify_base_check_runs(&live_runs, &required);
-                let live_base_state = build_base_state(&live_base_class, &required, 0);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &live_base_class, &required, 0);
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 // If merge_sha's own runs are all completed with a cancelled required run
                 // or missing/startup_failure required runs (superseded because a hotfix
@@ -1919,7 +2164,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let base_class = if !ctx.base_probe {
+    let (probed_base_sha, probed_base_age_secs, base_class) = if !ctx.base_probe {
         // BR#5265 fix-up (verify bounce, CI run 41261611797 — the PR's own
         // drills failed in CI): the hoisted read is HERMETIC — the drills
         // (base_probe=false) never shell out to gh; the Unsettled stamp
@@ -1930,22 +2175,39 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // walks on — the gate still refuses to merge onto a non-green
         // destination (leg 3), so the fail-closed law holds; the lane just
         // says WHY it holds.
-        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None }
+        (
+            String::new(),
+            0u64,
+            CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None },
+        )
     } else {
-        match ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])
-            .map(|base_sha| {
-                let runs = ctx.check_runs(repo, &base_sha);
-                (base_sha, runs)
-            })
-        {
-            Ok((_, runs)) => classify_base_check_runs(&runs, &required),
-            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
+        match ctx.base_tip_facts(repo, base).map(|(base_sha, age_secs)| {
+            let runs = ctx.check_runs(repo, &base_sha);
+            (base_sha, age_secs, runs)
+        }) {
+            Ok((base_sha, age_secs, runs)) => (base_sha, age_secs, classify_base_check_runs(&runs, &required)),
+            Err(e) => (
+                String::new(),
+                0u64,
+                CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
+            ),
         }
     };
     if let Some(ref alarm) = base_class.alarm {
         log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
     }
-    let base_state = build_base_state(&base_class, &required, if from_awaiting_ci { 0 } else { pass_merged });
+    let base_state = reconcile_base_deploy(
+        ctx,
+        lane,
+        key,
+        repo,
+        base,
+        &probed_base_sha,
+        probed_base_age_secs,
+        &base_class,
+        &required,
+        if from_awaiting_ci { 0 } else { pass_merged },
+    );
     if from_awaiting_ci && base_class.verdict == MainVerdict::Red {
         let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": base_state }));
         log(Some(key), "awaiting-ci: base tip is RED — holding batch continuation until base is green");
@@ -3763,6 +4025,10 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         tick_landed: 0,
         tick_error: None,
         auto_rerun_shas: std::collections::HashSet::new(),
+        auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+        cancelled_redundant_runs: std::collections::HashSet::new(),
+        #[cfg(test)]
+        sh_mock: None,
         last_lane_card: None,
     })
 }
@@ -4810,6 +5076,10 @@ mod tests {
             tick_landed: 0,
             tick_error: None,
             auto_rerun_shas: std::collections::HashSet::new(),
+            auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+            cancelled_redundant_runs: std::collections::HashSet::new(),
+            #[cfg(test)]
+            sh_mock: None,
             last_lane_card: None,
         }
     }
@@ -5206,6 +5476,10 @@ mod tests {
                 tick_landed: 0,
                 tick_error: None,
                 auto_rerun_shas: std::collections::HashSet::new(),
+                auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+                cancelled_redundant_runs: std::collections::HashSet::new(),
+                #[cfg(test)]
+                sh_mock: None,
                 last_lane_card: None,
             }
         }
@@ -5595,5 +5869,247 @@ mod tests {
         let bs_burst = build_base_state(&c, &required, 1);
         assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
         assert!(bs_burst.get("gate_blocked").is_none());
+    }
+
+    #[test]
+    fn synthetic_dark_tip_drill_dispatches_once_cancels_redundant_and_merges_when_green_br6179() {
+        // Synthetic dark-tip drill (BR#6179 Done-When):
+        // - Tick 1 (dark tip 7f5efec2, 17m old, zero required check runs, only DHR ran):
+        //   executor auto-dispatches `gh workflow run deploy-dev.yml --repo state-vector/superpositional --ref main`
+        //   ONCE for 7f5efec2, stamps `deploy_coverage: { phase: "uncovered_dispatched", ... }`
+        //   and `covered_by: ebbe1826...` in `train_queue_facts`, holds queued PR #2880 without bouncing.
+        // - Tick 2 (dispatched run 41798951196 is in_progress + duplicate push run 41798949143 is queued
+        //   for the SAME sha 7f5efec2): executor does NOT re-dispatch `deploy-dev.yml`, cancels the
+        //   redundant queued run (`gh run cancel 41798949143`), stamps `cancelled_redundant_runs: [41798949143]`.
+        // - Tick 3 (deploy + post-deploy jobs settle green on 7f5efec2): executor stamps
+        //   `deploy_coverage: { phase: "covered", covered_by_sha: 7f5efec2... }` and merges PR #2880
+        //   (`gh pr merge 2880` -> `train_event` `kind: "merged"`), zero human legs.
+        let repo = "state-vector/superpositional";
+        let dark_tip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+        let prev_green = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+        let pr_head = "9533e5ffbc0b3c94f420adb24fd58f1b297a137b";
+        let merged_sha = "dd91af5f33c5351f5bcbc9cd6d4924659bd604a2";
+        let required = vec![
+            "deploy / Deploy to dev".to_string(),
+            "post-deploy / Post-Deploy Smoke".to_string(),
+            "post-deploy / DNS chain".to_string(),
+            "post-deploy / Lodestar Storage Health".to_string(),
+        ];
+        let lane_val = json!({
+            "lane": "state-vector/superpositional@main",
+            "required_workflows": required,
+            "queue": [{ "id": "BR#6165", "pr": 2880 }]
+        });
+        let card_val = json!({
+            "id": "BR#6165",
+            "status": "blocked",
+            "meta": {
+                "prs": [{
+                    "repo": repo,
+                    "number": 2880,
+                    "head_sha_at_acceptance": pr_head
+                }],
+                "merge_train": { "pr": 2880, "state": "queued" }
+            }
+        });
+
+        let (hub, calls) = mock_hub(vec![
+            // ---- Tick 1 (dark tip -> auto-dispatch deploy-dev.yml, hold car) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // train_queue_facts
+            ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
+            ok(json!({ "note": "lease released" })),     // train_lease release
+            // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // train_queue_facts
+            ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
+            ok(json!({ "note": "lease released" })),     // train_lease release
+            // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
+            ok(json!({ "ok": true })),                   // train_queue_facts (ready)
+            ok(json!({ "ok": true })),                   // renew_lease (before merge)
+            ok(json!({ "ok": true })),                   // train_event (merged)
+            ok(json!({ "ok": true })),                   // renew_lease (burst_settle_feed)
+            ok(json!({ "decided": "pending" })),         // train_ci (burst_settle_feed)
+        ]);
+
+        let tick_phase = std::sync::Arc::new(Mutex::new(1u32));
+        let pr_merged_flag = std::sync::Arc::new(Mutex::new(false));
+        let sh_log: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tick_phase_c = tick_phase.clone();
+        let pr_merged_c = pr_merged_flag.clone();
+        let sh_log_c = sh_log.clone();
+
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.identity = Some(IdentityClass::Worker("detached-cody".into()));
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            let line = format!("{cmd} {}", args.join(" "));
+            sh_log_c.lock().unwrap().push(line.clone());
+            let phase = *tick_phase_c.lock().unwrap();
+            if cmd == "git" {
+                return Some(Ok(String::new()));
+            }
+            if cmd == "gh" {
+                if args.first() == Some(&"workflow") && args.get(1) == Some(&"run") {
+                    return Some(Ok(String::new()));
+                }
+                if args.first() == Some(&"run") && args.get(1) == Some(&"cancel") {
+                    return Some(Ok(String::new()));
+                }
+                if args.first() == Some(&"pr") && args.get(1) == Some(&"merge") {
+                    *pr_merged_c.lock().unwrap() = true;
+                    return Some(Ok("merged".into()));
+                }
+                if args.first() == Some(&"pr") && args.get(1) == Some(&"view") {
+                    let is_merged = *pr_merged_c.lock().unwrap();
+                    return Some(Ok(if is_merged {
+                        json!({
+                            "number": 2880,
+                            "headRefOid": pr_head,
+                            "mergeable": "MERGEABLE",
+                            "mergeStateStatus": "CLEAN",
+                            "state": "MERGED",
+                            "mergeCommit": { "oid": merged_sha },
+                            "baseRefName": "main"
+                        }).to_string()
+                    } else {
+                        json!({
+                            "number": 2880,
+                            "headRefOid": pr_head,
+                            "mergeable": "MERGEABLE",
+                            "mergeStateStatus": "CLEAN",
+                            "state": "OPEN",
+                            "mergeCommit": null,
+                            "baseRefName": "main"
+                        }).to_string()
+                    }));
+                }
+                if args.first() == Some(&"api") {
+                    let endpoint = args.get(1).copied().unwrap_or("");
+                    if endpoint.ends_with("/commits/main") {
+                        let committed_iso = crate::logging::iso(now_ms().saturating_sub(17 * 60_000));
+                        return Some(Ok(json!({ "sha": dark_tip, "committed_at": committed_iso }).to_string()));
+                    }
+                    if endpoint.contains(&format!("/commits/{dark_tip}/check-runs")) {
+                        return Some(Ok(match phase {
+                            1 => json!([]).to_string(),
+                            2 => json!([
+                                { "id": 9001, "name": "deploy / Deploy to dev", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/1" }
+                            ]).to_string(),
+                            _ => json!([
+                                { "id": 9001, "name": "deploy / Deploy to dev", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/1" },
+                                { "id": 9002, "name": "post-deploy / Post-Deploy Smoke", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/2" },
+                                { "id": 9003, "name": "post-deploy / DNS chain", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/3" },
+                                { "id": 9004, "name": "post-deploy / Lodestar Storage Health", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/4" }
+                            ]).to_string(),
+                        }));
+                    }
+                    if endpoint.contains(&format!("/commits/{pr_head}/check-runs")) || endpoint.contains(&format!("/commits/{merged_sha}/check-runs")) {
+                        return Some(Ok(json!([
+                            { "id": 8001, "name": "ci / Rust Tests", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41790000000/job/1" }
+                        ]).to_string()));
+                    }
+                    if endpoint.contains("/actions/runs") {
+                        return Some(Ok(match phase {
+                            1 => json!([
+                                { "id": 41791923312_i64, "name": "Deploy Health Record", "path": ".github/workflows/deploy-health.yml", "head_sha": dark_tip, "event": "schedule", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41791923312" },
+                                { "id": 41780000001_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": prev_green, "event": "push", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41780000001" }
+                            ]).to_string(),
+                            2 => json!([
+                                { "id": 41798951196_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "workflow_dispatch", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196" },
+                                { "id": 41798949143_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "push", "status": "queued", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798949143" },
+                                { "id": 41780000001_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": prev_green, "event": "push", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41780000001" }
+                            ]).to_string(),
+                            _ => json!([
+                                { "id": 41798951196_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "workflow_dispatch", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196" }
+                            ]).to_string(),
+                        }));
+                    }
+                    if endpoint.contains("/pulls/2880/commits") {
+                        return Some(Ok(json!([{ "sha": pr_head, "verified": true }]).to_string()));
+                    }
+                }
+            }
+            Some(Ok(String::new()))
+        }));
+
+        // Run Tick 1 (dark tip -> auto-dispatches deploy-dev.yml once)
+        drive_lane(&mut ctx, &lane_val);
+        // Run Tick 2 (deploy in flight + redundant queued run -> cancels 41798949143, does NOT dispatch again)
+        *tick_phase.lock().unwrap() = 2;
+        drive_lane(&mut ctx, &lane_val);
+        // Run Tick 3 (deploy settled green -> merges PR #2880, zero human legs)
+        *tick_phase.lock().unwrap() = 3;
+        drive_lane(&mut ctx, &lane_val);
+
+        let sh_calls = sh_log.lock().unwrap().clone();
+        let dispatches: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh workflow run deploy-dev.yml"))
+            .collect();
+        assert_eq!(
+            dispatches.len(),
+            1,
+            "executor must dispatch deploy-dev.yml ONCE for the dark tip sha, got: {dispatches:?}"
+        );
+        assert_eq!(
+            dispatches[0],
+            "gh workflow run deploy-dev.yml --repo state-vector/superpositional --ref main"
+        );
+
+        let cancels: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh run cancel"))
+            .collect();
+        assert_eq!(
+            cancels,
+            vec!["gh run cancel 41798949143 --repo state-vector/superpositional"],
+            "executor must cancel the redundant queued deploy run on the same sha"
+        );
+
+        let merges: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh pr merge 2880"))
+            .collect();
+        assert_eq!(merges.len(), 1, "PR #2880 must merge automatically on tick 3 once deploy settles green");
+
+        let hub_calls = calls.lock().unwrap().clone();
+        let qf_calls: Vec<&Value> = hub_calls
+            .iter()
+            .filter(|c| call_name(c) == "train_queue_facts")
+            .collect();
+        assert_eq!(qf_calls.len(), 3, "each tick stamps train_queue_facts");
+
+        // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
+        let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
+        assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(bs1.get("covered_by").and_then(|v| v.as_str()), Some(prev_green));
+        assert_eq!(bs1.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("uncovered_dispatched"));
+        assert_eq!(bs1.pointer("/deploy_coverage/workflow").and_then(|v| v.as_str()), Some("deploy-dev.yml"));
+
+        // Tick 2 base_state: settling + cancelled_redundant_runs = [41798949143]
+        let bs2 = call_args(qf_calls[1]).get("base_state").unwrap();
+        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
+        assert_eq!(bs2.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("settling"));
+        assert_eq!(bs2.get("cancelled_redundant_runs"), Some(&json!([41798949143_i64])));
+
+        // Tick 3 base_state: covered by dark_tip + train_event merged fired, ZERO ask_agent calls
+        let bs3 = call_args(qf_calls[2]).get("base_state").unwrap();
+        assert_eq!(bs3.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs3.get("covered_by").and_then(|v| v.as_str()), Some(dark_tip));
+        assert_eq!(bs3.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("covered"));
+        assert!(
+            hub_calls.iter().any(|c| call_name(c) == "train_event" && call_args(c).get("kind") == Some(&json!("merged"))),
+            "tick 3 must record train_event kind=merged"
+        );
+        assert!(
+            !hub_calls.iter().any(|c| call_name(c) == "ask_agent"),
+            "synthetic dark-tip drill must complete with zero human legs"
+        );
     }
 }

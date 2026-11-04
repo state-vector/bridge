@@ -1,6 +1,34 @@
 import { useEffect, useState } from "react";
-import { kbApi, type KbTrainLane } from "../server/kb";
+import { kbApi, type KbDeployCoverageState, type KbTrainLane } from "../server/kb";
 import { Chip, type ChipTone } from "./index-kit";
+
+function formatCoverageAgeShort(secs: number): string {
+  const s = Math.max(0, Math.floor(Number(secs) || 0));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m`;
+}
+
+/** BR#6179 (B): single-line deploy coverage summary for lane pills and banners. */
+export function formatDeployCoverageBanner(cov: KbDeployCoverageState): string {
+  const shortTip = (cov.tip_sha ?? "").slice(0, 8) || "unknown";
+  const ageStr = formatCoverageAgeShort(cov.tip_age_secs);
+  switch (cov.phase) {
+    case "covered":
+      return `tip ${shortTip} covered by deploy${cov.covered_by_run_id ? ` (run #${cov.covered_by_run_id})` : ""}`;
+    case "settling":
+      return `tip ${shortTip} deploy in flight (age ${ageStr}${cov.active_run_id ? `, run #${cov.active_run_id}` : ""})`;
+    case "uncovered_grace":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}, grace ${Math.max(1, Math.floor(cov.grace_secs / 60))}m)`;
+    case "uncovered_dispatched":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}) — auto-dispatched ${cov.workflow}`;
+    case "uncovered_dark": {
+      const prev = cov.last_green_sha ? ` — last green deploy ${cov.last_green_sha.slice(0, 8)}` : "";
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr})${prev}`;
+    }
+    case "failed":
+      return `tip ${shortTip} deploy failed (age ${ageStr})`;
+  }
+}
 
 /** Ticking clock — re-renders every second so lock ages stay live. */
 function useClock() {
@@ -99,6 +127,37 @@ function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: strin
         tone: "warn", card: curCard, pr: curPr,
         label: "⏳ awaiting deploy",
         title: `Main's checks (${(bs.unsettled ?? []).join(", ") || "CI"}) are finishing — ${l.queue.length} queued PR(s) merge as soon as main is green.`,
+      };
+    }
+    if (bs.verdict === "empty") {
+      const cov = bs.deploy_coverage ?? null;
+      if (cov) {
+        const summary = formatDeployCoverageBanner(cov);
+        const shortTip = cov.tip_sha.slice(0, 8) || "tip";
+        if (cov.phase === "uncovered_dispatched") {
+          return {
+            tone: "warn", card: curCard, pr: curPr,
+            label: `⏳ deploy dispatched (${shortTip})`,
+            title: `${summary} — ${l.queue.length} queued PR(s) merge automatically as soon as the dispatched deploy settles green.`,
+          };
+        }
+        if (cov.phase === "uncovered_grace") {
+          return {
+            tone: "warn", card: curCard, pr: curPr,
+            label: `⏳ awaiting deploy (${shortTip})`,
+            title: `${summary} — ${l.queue.length} queued PR(s) held; executor auto-dispatches ${cov.workflow ?? "deploy-dev.yml"} once the grace window elapses.`,
+          };
+        }
+        return {
+          tone: "err", card: curCard, pr: curPr,
+          label: `⛔ dark tip — no deploy (${shortTip})`,
+          title: `${summary} — ${l.queue.length} queued PR(s) held until a deploy covers the tip.`,
+        };
+      }
+      return {
+        tone: "err", card: curCard, pr: curPr,
+        label: "⛔ blocked — tip uncovered",
+        title: `main carries none of the lane's required workflow runs (${bs.alarm ?? "empty"}) — ${l.queue.length} queued PR(s) held until a deploy covers the tip.`,
       };
     }
     return {
@@ -236,6 +295,8 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
   const r = lane.base_red_resolution!;
   const repo = lane.lane.split("@")[0];
   const red = r.verdict === "red";
+  const cov = r.deploy_coverage ?? lane.queue_facts?.base_state?.deploy_coverage ?? null;
+  const covSummary = cov ? formatDeployCoverageBanner(cov) : null;
   const held = ` · ${r.held} PR${r.held === 1 ? "" : "s"} held`;
   return (
     <div className={`train-blocked-banner${red ? "" : " train-blocked-banner-amber"}`} role="alert">
@@ -243,7 +304,7 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
         {red
           ? <>⛔ Merge train STOPPED — main's checks are failing on {repo}{held}</>
           : r.verdict === "empty"
-            ? <>⛔ Merge train HELD — main has none of the checks this lane needs on {repo}{held}</>
+            ? <>⛔ Merge train HELD — {covSummary ? `${covSummary} on ${repo}` : `main has none of the checks this lane needs on ${repo}`}{held}</>
             : <>⛔ Merge train HELD — main's checks are still running on {repo}{held}</>}
       </span>
       {r.whats_broken.length > 0 && (
@@ -270,6 +331,18 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
           >
             {r.fix_card.id} — {plainStatus(r.fix_card.status)}
           </a>
+        ) : cov?.phase === "uncovered_dispatched" ? (
+          <span className="train-banner-dim">
+            {`auto-dispatched ${cov.workflow} for ${cov.tip_sha.slice(0, 8)} — waiting for deploy to settle green`}
+          </span>
+        ) : cov?.phase === "uncovered_grace" ? (
+          <span className="train-banner-dim">
+            {`waiting inside ${Math.max(1, Math.floor(cov.grace_secs / 60))}m grace window — executor auto-dispatches ${cov.workflow ?? "deploy-dev.yml"} if no run starts`}
+          </span>
+        ) : cov?.phase === "uncovered_dark" ? (
+          <span className="train-banner-dim">
+            {`no deploy workflow run fired on ${cov.tip_sha.slice(0, 8)} — executor auto-dispatches ${cov.workflow ?? "deploy-dev.yml"} once per sha`}
+          </span>
         ) : (
           <span className="train-banner-dim">no fix card open yet</span>
         )}

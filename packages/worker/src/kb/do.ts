@@ -130,8 +130,13 @@ import {
   resolveLaneOperationalState,
   type BaseRedEpisodeState,
   type BaseRedResolution,
+  type DeployCoverageState,
   type LaneOperationalState,
   type TrainFixCard,
+  DEPLOY_RECONCILE_GRACE_SECS,
+  formatDeployCoverageSummary,
+  trainDarkTipAskTitle,
+  trainDarkTipAskBrief,
   trainGateBlockedAskTitle,
   trainGateBlockedAskBrief,
   trainPlainStatus,
@@ -205,6 +210,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
+import { DeployCoverageStateSchema } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -8656,9 +8662,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const bs: any = baseBlock;
       const redNames = (Array.isArray(bs.red) ? bs.red : []).map((r: any) => String(r?.name ?? "")).filter(Boolean);
       const emptyAlarm = typeof bs.alarm === "string" && bs.alarm.trim() ? bs.alarm.trim() : "";
+      const covParsed = bs.deploy_coverage ? DeployCoverageStateSchema.safeParse(bs.deploy_coverage) : null;
+      const covSummary = covParsed?.success ? formatDeployCoverageSummary(covParsed.data) : "";
       reason = String(bs.verdict) === "red" && redNames.length
         ? `merge-train: BLOCKED — base main RED: ${redNames.join(", ")} — ${queue.length} car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks the whole queue`
-        : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? `carries none of the lane's required workflow runs (${emptyAlarm || "config?"})` : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
+        : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? `carries none of the lane's required workflow runs (${emptyAlarm || "config?"})${covSummary ? ` · ${covSummary}` : ""}` : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
     }
     // BR#5883: gate-blocked is LOUD — the required-scoped verdict reads green
     // so nothing above fires, yet the repo's own merge gate judges the tip
@@ -10292,6 +10300,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           .filter((p: any) => Array.isArray(p) && p.length === 2 && Number.isInteger(Number(p[0])) && Number(p[0]) > 0 && Number.isInteger(Number(p[1])) && Number(p[1]) > 0)
           .map((p: any) => [Number(p[0]), Number(p[1])] as [number, number])
       : null;
+    const parsedCov = baseState?.deploy_coverage ? DeployCoverageStateSchema.safeParse(baseState.deploy_coverage) : null;
+    const deployCov: DeployCoverageState | null = parsedCov?.success ? parsedCov.data : null;
+    const prevDispatchedSha = String(meta.lane?.deploy_dispatched?.sha ?? "");
+    const nextDeployDispatched =
+      deployCov?.phase === "uncovered_dispatched"
+        ? {
+            sha: deployCov.tip_sha,
+            workflow: deployCov.workflow,
+            at: deployCov.dispatched_at,
+            by: actor,
+          }
+        : meta.lane?.deploy_dispatched ?? undefined;
     meta.lane = {
       ...(meta.lane ?? {}),
       queue_facts: {
@@ -10301,10 +10321,34 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         ...(stalled ? { stalled } : preservedQf.stalled ? { stalled: preservedQf.stalled } : {}),
         ...(conflictPairs ? { conflict_pairs: conflictPairs } : preservedQf.conflict_pairs ? { conflict_pairs: preservedQf.conflict_pairs } : {}),
       },
+      ...(nextDeployDispatched ? { deploy_dispatched: nextDeployDispatched } : {}),
       ...(sweepChanged ? { awaiting_sweep: nextSweep } : {}),
     };
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+    if (deployCov?.phase === "uncovered_dispatched" && meta.lane.dispatch_deploy) {
+      delete meta.lane.dispatch_deploy;
+    }
+    this.saveLaneState(lane.id, meta, Date.now());
     this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entriesArr.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null, ...(sweepStamp ? { awaiting_sweep: Object.keys(sweepStamp).length } : {}) });
+    if (deployCov?.phase === "uncovered_dispatched" && deployCov.tip_sha !== prevDispatchedSha) {
+      this.version(lane.id, actor, "update", `dark-tip self-heal (BR#6179): auto-dispatched ${deployCov.workflow} on ${base} for uncovered tip ${deployCov.tip_sha.slice(0, 8)} (age ${Math.floor(deployCov.tip_age_secs / 60)}m)`, {});
+      this.audit(actor, "train:deploy_dispatched", lane.id, {
+        lane: laneKey(repo, base),
+        sha: deployCov.tip_sha,
+        workflow: deployCov.workflow,
+        tip_age_secs: deployCov.tip_age_secs,
+      });
+    }
+    if (Array.isArray(baseState?.cancelled_redundant_runs) && baseState.cancelled_redundant_runs.length > 0) {
+      const cancelledIds = baseState.cancelled_redundant_runs.map(Number).filter((n: number) => Number.isInteger(n) && n > 0);
+      if (cancelledIds.length > 0) {
+        this.version(lane.id, actor, "update", `deploy reconcile (BR#6179): cancelled redundant queued deploy run(s) ${cancelledIds.map((id: number) => `#${id}`).join(", ")} on already-covered sha ${String(baseState.tip_sha ?? "").slice(0, 8)}`, {});
+        this.audit(actor, "train:redundant_runs_cancelled", lane.id, {
+          lane: laneKey(repo, base),
+          tip_sha: String(baseState.tip_sha ?? ""),
+          cancelled_run_ids: cancelledIds,
+        });
+      }
+    }
     // BR#5265 Fix A: train.status serves meta.blocked.reason — the STORED
     // string, re-written only when laneSyncReason runs. The stamp changed
     // the lane's truth (base verdict + entries); re-render the reason NOW
@@ -10369,7 +10413,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     } else if (baseState && meta.lane?.gate_blocked) {
       const ep = meta.lane.gate_blocked;
       delete meta.lane.gate_blocked;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+      this.saveLaneState(lane.id, meta, Date.now());
       this.audit(actor, "train:gate_blocked_cleared", lane.id, {
         lane: laneKey(repo, base),
         since: ep.since ?? null,
@@ -10391,6 +10435,70 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           this.audit(actor, "train:gate_blocked_ask_closed", lane.id, { ask: String(ep.ask_id) });
         } catch (e) {
           this.audit(actor, "train:gate_blocked_ask_close_error", lane.id, { ask: String(ep.ask_id), error: String((e as Error).message ?? e).slice(0, 160) });
+        }
+      }
+    }
+    // BR#6179 (C) Fast page: an uncovered/dark tip past the grace window holding
+    // cars fires ONE per-SHA alarm ask immediately (with the auto-dispatch
+    // remedy receipt or manual dispatch button) instead of waiting 60+ minutes
+    // for the P4 starvation clock. Auto-closes as soon as a deploy starts
+    // running (`settling` / `unsettled`) or covers the tip (`covered` / `green`).
+    const darkTipCov: DeployCoverageState | null =
+      deployCov && (deployCov.phase === "uncovered_dark" || deployCov.phase === "uncovered_dispatched")
+        ? deployCov
+        : baseState &&
+            String(baseState.verdict ?? "") === "empty" &&
+            typeof baseState.tip_sha === "string" &&
+            baseState.tip_sha.trim() !== "" &&
+            Number(baseState.tip_age_secs ?? 0) >= DEPLOY_RECONCILE_GRACE_SECS
+          ? {
+              phase: "uncovered_dark",
+              tip_sha: String(baseState.tip_sha).trim(),
+              tip_age_secs: Math.floor(Number(baseState.tip_age_secs)),
+              grace_secs: DEPLOY_RECONCILE_GRACE_SECS,
+              workflow: "deploy-dev.yml",
+              last_green_sha: typeof baseState.covered_by === "string" ? baseState.covered_by : null,
+              reason: "no deploy workflow run fired on tip (push trigger suppressed or run deleted)",
+            }
+          : null;
+    if (darkTipCov && String(baseState?.verdict ?? "") === "empty" && entriesArr.length > 0) {
+      await this.syncDarkTipAlarm(
+        lane,
+        repo,
+        base,
+        entriesArr,
+        darkTipCov,
+        typeof baseState?.alarm === "string" ? baseState.alarm : null,
+        actor,
+      );
+    } else if (baseState && meta.lane?.dark_tip && (!darkTipCov || String(baseState.verdict ?? "") !== "empty")) {
+      const freshLane = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+      const ep = freshLane.lane?.dark_tip;
+      if (ep) {
+        delete freshLane.lane.dark_tip;
+        this.saveLaneState(lane.id, freshLane, Date.now());
+        this.audit(actor, "train:dark_tip_cleared", lane.id, {
+          lane: laneKey(repo, base),
+          sha: ep.sha ?? null,
+          since: ep.since ?? null,
+          ask_id: ep.ask_id ?? null,
+          because: `base verdict is now ${String(baseState.verdict ?? "?")}${deployCov ? ` (${deployCov.phase})` : ""}`,
+        });
+        if (ep.ask_id) {
+          try {
+            await this.transition(
+              {
+                id: String(ep.ask_id),
+                to: "done",
+                session: "",
+                note: `auto-closed (BR#6179): dark tip ${String(ep.sha ?? "").slice(0, 8)} on ${repo}@${base} is now ${deployCov ? deployCov.phase : String(baseState.verdict ?? "covered")} — deploy coverage restored or settling in flight.`,
+              },
+              actor,
+            );
+            this.audit(actor, "train:dark_tip_ask_closed", lane.id, { ask: String(ep.ask_id) });
+          } catch (e) {
+            this.audit(actor, "train:dark_tip_ask_close_error", lane.id, { ask: String(ep.ask_id), error: String((e as Error).message ?? e).slice(0, 160) });
+          }
         }
       }
     }
@@ -10950,8 +11058,105 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ) as any;
       meta.lane.gate_blocked.ask_id = freshAsk?.id ? String(freshAsk.id) : meta.lane.gate_blocked.ask_id ?? null;
       meta.lane.gate_blocked.duty_id = ep.duty_id ?? meta.lane.gate_blocked.duty_id ?? null;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+      this.saveLaneState(lane.id, meta, Date.now());
     }
+  }
+
+  /** BR#6179 (C) Fast-page dark-tip alarm synchronizer: when a base tip is
+   *  uncovered past the grace window (`uncovered_dark` or `uncovered_dispatched`)
+   *  while cars are queued, immediately files ONE per-SHA alarm ask (instead of
+   *  waiting 60+ minutes for P4 starvation) and updates the ask if the executor's
+   *  auto-dispatch transitions `uncovered_dark` → `uncovered_dispatched`. */
+  private async syncDarkTipAlarm(
+    lane: { id: string },
+    repo: string,
+    base: string,
+    entriesArr: { id?: string; pr?: number }[],
+    coverage: DeployCoverageState,
+    alarm: string | null,
+    actor: string,
+  ): Promise<void> {
+    const held = entriesArr.length;
+    const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+    const askTitle = trainDarkTipAskTitle({ repo, base }, coverage.tip_sha);
+    const brief = trainDarkTipAskBrief({ lane: { repo, base }, held, alarm, coverage });
+    let meta: any = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    let ep = meta.lane?.dark_tip ?? null;
+    if (!ep || ep.sha !== coverage.tip_sha) {
+      ep = {
+        sha: coverage.tip_sha,
+        since: Date.now(),
+        phase: coverage.phase,
+        ask_id: null as string | null,
+      };
+      meta.lane = { ...(meta.lane ?? {}), dark_tip: ep };
+      this.saveLaneState(lane.id, meta, Date.now());
+      this.audit(actor, "train:dark_tip_episode", lane.id, {
+        lane: `${repo}@${base}`,
+        tip_sha: coverage.tip_sha,
+        tip_age_secs: coverage.tip_age_secs,
+        phase: coverage.phase,
+        held,
+      });
+    }
+    const existing = this.one(
+      `SELECT c.id AS id, c.body_md AS body_md, c.meta AS meta FROM relations r
+       JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND c.title = ? LIMIT 1`,
+      sinkId,
+      askTitle.slice(0, 200),
+    ) as any;
+    if (existing) {
+      const em = JSON.parse(existing.meta ?? "{}");
+      const prevOptions = Array.isArray(em?.ask?.options) ? em.ask.options.map(String) : [];
+      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(prevOptions) !== JSON.stringify(brief.options)) {
+        em.ask = { ...(em.ask ?? {}), to: String(em.ask?.to ?? "human"), options: brief.options };
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET body_md = ?, meta = ?, updated_ts = ? WHERE id = ?`,
+          brief.details,
+          JSON.stringify(em),
+          Date.now(),
+          existing.id,
+        );
+        this.version(existing.id, actor, "update", `dark-tip ask refreshed (${coverage.phase})`, {});
+      }
+      ep.ask_id = String(existing.id);
+    } else {
+      try {
+        await this.askCreate(
+          {
+            to: "human",
+            question: askTitle,
+            reason: `base ${repo}@${base} tip ${coverage.tip_sha.slice(0, 8)} is not covered by any deploy workflow run (age ${Math.max(1, Math.floor(coverage.tip_age_secs / 60))}m) — ${held} car(s) held`,
+            details: brief.details,
+            options: brief.options,
+            artefact_id: sinkId,
+            urgency: "time-sensitive",
+          },
+          actor,
+        );
+      } catch (e) {
+        this.audit(actor, "train:dark_tip_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
+      }
+      const freshAsk = this.one(
+        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
+        sinkId,
+        askTitle.slice(0, 200),
+      ) as any;
+      if (freshAsk?.id) ep.ask_id = String(freshAsk.id);
+    }
+    meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    meta.lane = {
+      ...(meta.lane ?? {}),
+      dark_tip: {
+        ...(meta.lane?.dark_tip ?? ep),
+        phase: coverage.phase,
+        ask_id: ep.ask_id ?? meta.lane?.dark_tip?.ask_id ?? null,
+      },
+    };
+    this.saveLaneState(lane.id, meta, Date.now());
   }
 
   private laneAwaitingRows(repo: string, now0: number, ttlMs?: number, base?: string) {
@@ -11683,6 +11888,31 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const fast = /^Root-fix fast lane \(BR#5189\): merge (\S+) PR #(\d+)/.exec(t);
     // (1) the base-red alarm ask — repo@base in the title
     const baseRed = /^MERGE TRAIN BLOCKED: base (\S+)@(\S+) RED/.exec(t);
+    // (3) BR#6179 dark-tip alarm ask — repo@base in the title
+    const darkTip = /^MERGE TRAIN DARK TIP: (\S+)@(\S+)/.exec(t);
+    if (darkTip && /\b(?:re-?)?dispatch\b/i.test(ans) && !/\backnowledge\b/i.test(ans)) {
+      const repo = darkTip[1];
+      const base = darkTip[2] || "main";
+      const laneRow = this.one(
+        `SELECT id, meta FROM artefacts
+         WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
+           AND status NOT IN ('done', 'superseded') LIMIT 1`,
+        laneKey(repo, base),
+      ) as any;
+      if (laneRow) {
+        const laneMeta = JSON.parse(laneRow.meta ?? "{}");
+        const now = Date.now();
+        laneMeta.lane = {
+          ...(laneMeta.lane ?? {}),
+          dispatch_deploy: { repo, base, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+        };
+        delete laneMeta.lane.deploy_dispatched;
+        this.saveLaneState(laneRow.id, laneMeta, now);
+        this.version(laneRow.id, actor, "update", `deploy workflow dispatch authorized by ask ${askId} on ${repo}@${base}`, {});
+        this.audit(actor, "train:dispatch_deploy_stamped", laneRow.id, { repo, base, ask_id: askId });
+      }
+      return;
+    }
     const bypassPr = ((): number | null => {
       if (fast && /\b(merge|bypass|yes|go)\b/i.test(ans)) return Number(fast[2]);
       if (!baseRed) return null;
@@ -12143,6 +12373,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // quirk-free join (the alarm sink is where these titles live).
         const askPrefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base}`;
         const stopAskPrefix = `MERGE TRAIN STOPPED: ${lane.repo}@${lane.base}`;
+        const darkTipAskPrefix = `MERGE TRAIN DARK TIP: ${lane.repo}@${lane.base}`;
         const askRow = ((this.state.storage.sql.exec(
           `SELECT id, title, meta FROM artefacts
            WHERE type = 'question' AND status = 'todo' AND created_ts > ?
@@ -12150,9 +12381,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           now0 - 7 * 86_400_000,
         ).toArray() as any[]).find((r) => {
           const t = String(r.title ?? "");
-          return t.startsWith(askPrefix) || t.startsWith(stopAskPrefix);
+          return t.startsWith(askPrefix) || t.startsWith(stopAskPrefix) || t.startsWith(darkTipAskPrefix);
         })) ?? null;
         const askMeta = askRow ? JSON.parse(String(askRow.meta ?? "{}") || "{}") : null;
+        const covParsed = brBase?.deploy_coverage ? DeployCoverageStateSchema.safeParse(brBase.deploy_coverage) : null;
+        const deployCov: DeployCoverageState | null = covParsed?.success ? covParsed.data : null;
+        const isDarkTipAsk = askRow && String(askRow.title ?? "").startsWith(darkTipAskPrefix);
+        const darkTipWarrantAsk = Boolean(
+          isDarkTipAsk &&
+          brBase &&
+          String(brBase.verdict ?? "") === "empty" &&
+          (deployCov?.phase === "uncovered_dark" || deployCov?.phase === "uncovered_dispatched"),
+        );
         const qfEntries = Array.isArray(brQf?.entries) ? brQf.entries : [];
         const seenIds = new Set<string>(queue.map((q: any) => String(q.id)));
         const mergedQueue = [
@@ -12163,7 +12403,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
         const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
-        if (!rf.state.warrantAsk && askRow) {
+        if (!rf.state.warrantAsk && !darkTipWarrantAsk && askRow) {
           this.state.storage.sql.exec(
             `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
             now0,
@@ -12207,7 +12447,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           phase: rf.state.phase,
           whats_broken: reds,
           held: queue.length,
-          ask: rf.state.warrantAsk && askRow
+          ...(deployCov ? { deploy_coverage: deployCov } : {}),
+          ask: (rf.state.warrantAsk || darkTipWarrantAsk) && askRow
             ? {
                 id: String(askRow.id),
                 url: this.cardUrl(String(askRow.id)),
@@ -12314,6 +12555,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // never misread a JSON `null` as an active rerun request.
         ...(meta.lane?.bypass_merge ? { bypass_merge: meta.lane.bypass_merge } : {}),
         ...(meta.lane?.rerun_failed ? { rerun_failed: meta.lane.rerun_failed } : {}),
+        ...(meta.lane?.deploy_dispatched ? { deploy_dispatched: meta.lane.deploy_dispatched } : {}),
+        ...(meta.lane?.dispatch_deploy ? { dispatch_deploy: meta.lane.dispatch_deploy } : {}),
         attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,
         queue_awaiting_review: awaitingReview,
         // BR#5114: per-entry executor gate verdicts in walk order (panel

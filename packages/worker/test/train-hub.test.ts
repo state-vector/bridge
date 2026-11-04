@@ -3292,4 +3292,105 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6012" });
   });
+
+  it("BR#6179 synthetic dark-tip drill: stamps deploy_coverage into base_state + lane reason + base_red_resolution, fast-pages ONE dark-tip ask past grace, audits redundant run cancellation, and auto-closes the ask once deploy settles green", async () => {
+    const repo = "state-vector/lane-br6179-dark-tip";
+    const darkTip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+    const prevGreen = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — br6179", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-6179", {
+      merge_capable: true,
+      required_workflows: [
+        "deploy / Deploy to dev",
+        "post-deploy / Post-Deploy Smoke",
+        "post-deploy / DNS chain",
+        "post-deploy / Lodestar Storage Health",
+      ],
+    });
+    const car = await queueViaAccept({ repo, pr: 2880, head: "9".repeat(40), title: "FIX: queued car held by dark tip" });
+
+    // (1) Tick 1: Dark tip past grace (17m old), executor auto-dispatched deploy-dev.yml once per sha
+    const qf1 = await kbJson("/train.queue_facts", {
+      repo,
+      base: "main",
+      actor: "gw-6179",
+      entries: [{ id: car, pr: 2880, cls: "waiting" }],
+      base_state: {
+        verdict: "empty",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+        alarm: "tip carries no check runs at all",
+        tip_sha: darkTip,
+        tip_age_secs: 1020,
+        covered_by: prevGreen,
+        coverage_age_secs: 1020,
+        deploy_coverage: {
+          phase: "uncovered_dispatched",
+          tip_sha: darkTip,
+          tip_age_secs: 1020,
+          workflow: "deploy-dev.yml",
+          dispatched_at: Date.now(),
+          last_green_sha: prevGreen,
+          last_green_run_id: 41780000001,
+        },
+        cancelled_redundant_runs: [41798949143],
+      },
+    });
+    expect(qf1.body.error ?? "").toBe("");
+
+    const snap1 = await laneSnap(repo);
+    // (B) Lane reason + base_red_resolution expose the deploy-coverage summary
+    expect(snap1.reason).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+    expect(snap1.deploy_dispatched?.sha).toBe(darkTip);
+    expect(snap1.deploy_dispatched?.workflow).toBe("deploy-dev.yml");
+    expect(snap1.base_red_resolution).toBeTruthy();
+    expect(snap1.base_red_resolution.verdict).toBe("empty");
+    expect(snap1.base_red_resolution.deploy_coverage?.phase).toBe("uncovered_dispatched");
+    expect(snap1.base_red_resolution.deploy_coverage?.tip_sha).toBe(darkTip);
+
+    // (C) Fast page: ONE dark-tip ask filed immediately (no 63m starvation wait)
+    expect(snap1.base_red_resolution.ask).toBeTruthy();
+    expect(snap1.base_red_resolution.ask.question).toBe(
+      `MERGE TRAIN DARK TIP: ${repo}@main — tip 7f5efec2 not covered by any deploy run. Remedy?`,
+    );
+    const askId = snap1.base_red_resolution.ask.id;
+    const askArt = (await kbJson("/get", { id: askId })).body;
+    expect(askArt.status).toBe("todo");
+    expect(String(askArt.body_md)).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+
+    // (2) Tick 2: Dispatched deploy settles GREEN on 7f5efec2 -> dark-tip episode clears & ask auto-closes!
+    const qf2 = await kbJson("/train.queue_facts", {
+      repo,
+      base: "main",
+      actor: "gw-6179",
+      entries: [{ id: car, pr: 2880, cls: "ready" }],
+      base_state: {
+        verdict: "green",
+        scoped_to_required: true,
+        red: [],
+        unsettled: [],
+        tip_sha: darkTip,
+        tip_age_secs: 1500,
+        covered_by: darkTip,
+        coverage_age_secs: 0,
+        deploy_coverage: {
+          phase: "covered",
+          tip_sha: darkTip,
+          tip_age_secs: 1500,
+          covered_by_sha: darkTip,
+          covered_by_run_id: 41798951196,
+        },
+      },
+    });
+    expect(qf2.body.error ?? "").toBe("");
+
+    const snap2 = await laneSnap(repo);
+    expect(snap2.base_red_resolution).toBeUndefined();
+    const askArtAfter = (await kbJson("/get", { id: askId })).body;
+    expect(askArtAfter.status).toBe("done");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6179" });
+  });
 });

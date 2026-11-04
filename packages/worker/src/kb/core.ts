@@ -11,6 +11,8 @@ import type { AwaitEvent } from "./closure";
 import type {
   BaseRedPhase,
   BaseRedResolution,
+  DeployCoveragePhase,
+  DeployCoverageState,
   LaneOperationalState,
   TrainEntryClass,
   TrainFixCard,
@@ -19,6 +21,8 @@ import type {
 export type {
   BaseRedPhase,
   BaseRedResolution,
+  DeployCoveragePhase,
+  DeployCoverageState,
   LaneOperationalState,
   TrainEntryClass,
   TrainFixCard,
@@ -3551,6 +3555,400 @@ export function trainStarvationDutyBody(i: TrainStarvationDiagnosisInput): strin
     `3. **Verify pool depth**: check \`queue_awaiting_review\` and open \`Verify:\` tasks — are verify duties backed up or bouncing in a coverage loop?`,
     `4. **Park exits (\`awaiting\` / \`blocked\` cards)**: inspect every card in \`awaiting\` and \`queue\` — confirm each has a valid \`head_sha_at_acceptance\` covering its live PR head and a live machine exit (\`awaiting_sweep\` / \`pr_merged\` proxy).`,
   ].join("\n");
+}
+
+// ---------- BR#6179 level-based deploy reconciliation (dark-tip self-heal) ----------
+
+/** Default grace window (5 minutes) before an uncovered tip triggers automatic
+ *  `workflow_dispatch` and fast-page escalation (BR#6179). */
+export const DEPLOY_RECONCILE_GRACE_SECS = 300;
+
+export type DeployWorkflowRun = {
+  id: number;
+  name: string;
+  path?: string | null;
+  head_sha: string;
+  event?: string | null;
+  status?: string | null;
+  conclusion?: string | null;
+  html_url?: string | null;
+};
+
+export type DeployReconcilePlan = {
+  coverage: DeployCoverageState;
+  /** Workflow filename (e.g. `deploy-dev.yml`) to dispatch via `gh workflow run`
+   *  when the tip is uncovered past the grace window and not yet dispatched. */
+  dispatch_workflow: string | null;
+  /** Redundant queued/waiting/pending workflow run IDs to cancel via `gh run cancel`
+   *  because the same `head_sha` is already covered by an `in_progress` or
+   *  `completed/success` deploy run (or a newer duplicate queued run). */
+  cancel_run_ids: number[];
+  /** SHA covered by the newest decisive green deploy run on the branch (if any). */
+  covered_by_sha: string | null;
+  /** Age of the uncovered tip in seconds (0 when `coverage.phase === "covered"`). */
+  coverage_age_secs: number;
+};
+
+/** Parse an ISO-8601 timestamp (e.g. `"2026-11-04T08:01:57Z"`) to epoch ms, or null. */
+export function parseIso8601EpochMs(s: string | null | undefined): number | null {
+  if (!s || typeof s !== "string") return null;
+  const trimmed = s.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+/** True when a workflow run represents the lane's primary deploy workflow
+ *  (e.g. `Deploy Dev` / `.github/workflows/deploy-dev.yml`) rather than a
+ *  secondary observer/gate (`Deploy Health Record`, `Deploy drift alarm`,
+ *  `Deploy health (merge gate)`). Mirrored in `train_gate.rs` `is_deploy_workflow_run`. */
+export function isDeployWorkflowRun(r: DeployWorkflowRun, required: string[]): boolean {
+  const nameLower = (r.name ?? "").trim().toLowerCase();
+  const pathLower = (r.path ?? "").trim().toLowerCase();
+  if (
+    nameLower.includes("health record") ||
+    nameLower.includes("drift alarm") ||
+    nameLower.includes("merge gate") ||
+    pathLower.endsWith("deploy-health.yml") ||
+    pathLower.endsWith("deploy-drift.yml")
+  ) {
+    return false;
+  }
+  if (pathLower.endsWith("/deploy-dev.yml") || pathLower === "deploy-dev.yml" || pathLower.endsWith("/deploy.yml") || pathLower === "deploy.yml") {
+    return true;
+  }
+  if (nameLower === "deploy dev" || nameLower === "deploy" || nameLower.startsWith("deploy to ")) {
+    return true;
+  }
+  for (const req of required) {
+    const reqLower = req.trim().toLowerCase();
+    const slashIdx = reqLower.indexOf(" / ");
+    const prefix = slashIdx >= 0 ? reqLower.slice(0, slashIdx).trim() : reqLower;
+    if (prefix && (nameLower === prefix || nameLower === `${prefix} dev`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Infer the dispatchable workflow filename (e.g. `"deploy-dev.yml"`) from
+ *  observed workflow runs and the lane's `required_workflows`. Mirrored in
+ *  `train_gate.rs` `infer_deploy_workflow`. */
+export function inferDeployWorkflow(required: string[], workflowRuns: DeployWorkflowRun[]): string | null {
+  const sorted = [...workflowRuns].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+  for (const r of sorted) {
+    if (!isDeployWorkflowRun(r, required)) continue;
+    const rawPath = (r.path ?? "").trim();
+    if (rawPath) {
+      const file = rawPath.split("/").pop() ?? "";
+      if ((file.endsWith(".yml") || file.endsWith(".yaml")) && file !== "deploy.yml") {
+        return file;
+      }
+    }
+  }
+  for (const r of sorted) {
+    if (!isDeployWorkflowRun(r, required)) continue;
+    const rawPath = (r.path ?? "").trim();
+    if (rawPath) {
+      const file = rawPath.split("/").pop() ?? "";
+      if (file.endsWith(".yml") || file.endsWith(".yaml")) {
+        return file;
+      }
+    }
+    if ((r.name ?? "").trim().toLowerCase() === "deploy dev") {
+      return "deploy-dev.yml";
+    }
+  }
+  const hasDeployReq = required.some((w) => {
+    const lw = w.trim().toLowerCase();
+    return lw.startsWith("deploy /") || lw.startsWith("post-deploy /") || lw === "deploy dev";
+  });
+  if (hasDeployReq) return "deploy-dev.yml";
+  return null;
+}
+
+function isQueuedWorkflowStatus(status: string | null | undefined): boolean {
+  const s = (status ?? "").trim().toLowerCase();
+  return s === "queued" || s === "waiting" || s === "pending" || s === "requested";
+}
+
+function isInProgressWorkflowStatus(status: string | null | undefined): boolean {
+  return (status ?? "").trim().toLowerCase() === "in_progress";
+}
+
+/** Pure level-based deploy coverage & reconciliation state machine (BR#6179):
+ *  - Computes `DeployCoverageState` (closed 6-state union on `phase`).
+ *  - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
+ *    per `tipSha` when the tip is uncovered past `graceSecs` with no active run.
+ *  - Identifies redundant queued deploy runs (`cancel_run_ids`) when the same
+ *    `head_sha` already has an `in_progress` or `completed/success` deploy run
+ *    (or duplicate queued runs for the same `head_sha`).
+ *  Mirrored in `train_gate.rs` `reconcile_deploy_coverage`. */
+export function reconcileDeployCoverage(input: {
+  tipSha: string;
+  tipAgeSecs: number;
+  graceSecs?: number;
+  baseVerdict: MainCheckVerdict;
+  required: string[];
+  workflowRuns: DeployWorkflowRun[];
+  alreadyDispatchedAt?: number | null;
+}): DeployReconcilePlan {
+  const tipSha = (input.tipSha ?? "").trim();
+  const tipAgeSecs = Math.max(0, Math.floor(Number(input.tipAgeSecs ?? 0) || 0));
+  const graceSecs = Math.max(1, Math.floor(Number(input.graceSecs ?? DEPLOY_RECONCILE_GRACE_SECS) || DEPLOY_RECONCILE_GRACE_SECS));
+  const deployRuns = input.workflowRuns
+    .filter((r) => isDeployWorkflowRun(r, input.required))
+    .sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+
+  const newestGreen = deployRuns.find(
+    (r) => (r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success",
+  );
+  const lastGreenSha = newestGreen?.head_sha ? newestGreen.head_sha : null;
+  const lastGreenRunId = newestGreen?.id ?? null;
+
+  // (D) Redundant queued runs per head_sha:
+  // If a head_sha already has an in_progress or completed/success deploy run,
+  // any queued/waiting/pending/requested deploy run for that same head_sha is redundant.
+  // If a head_sha has multiple queued runs, all but the newest queued run are redundant.
+  const bySha = new Map<string, DeployWorkflowRun[]>();
+  for (const r of deployRuns) {
+    const sha = (r.head_sha ?? "").trim();
+    if (!sha) continue;
+    const list = bySha.get(sha) ?? [];
+    list.push(r);
+    bySha.set(sha, list);
+  }
+  const cancelRunIds: number[] = [];
+  for (const [, list] of bySha) {
+    const hasActiveOrGreen = list.some(
+      (r) =>
+        isInProgressWorkflowStatus(r.status) ||
+        ((r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success"),
+    );
+    const queued = list.filter((r) => isQueuedWorkflowStatus(r.status));
+    if (hasActiveOrGreen) {
+      for (const q of queued) {
+        if (q.id > 0 && !cancelRunIds.includes(q.id)) cancelRunIds.push(q.id);
+      }
+    } else if (queued.length > 1) {
+      for (const q of queued.slice(1)) {
+        if (q.id > 0 && !cancelRunIds.includes(q.id)) cancelRunIds.push(q.id);
+      }
+    }
+  }
+
+  const tipRuns = deployRuns.filter((r) => r.head_sha === tipSha);
+  const tipActive = tipRuns.find(
+    (r) => (isInProgressWorkflowStatus(r.status) || isQueuedWorkflowStatus(r.status)) && !cancelRunIds.includes(r.id),
+  );
+  const tipGreen = tipRuns.find(
+    (r) => (r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success",
+  );
+  const tipRed = tipRuns.find(
+    (r) =>
+      (r.status ?? "").toLowerCase() === "completed" &&
+      r.conclusion != null &&
+      r.conclusion !== "cancelled" &&
+      MAIN_RED_CONCLUSIONS.has(r.conclusion),
+  );
+
+  if (input.baseVerdict.verdict === "green") {
+    return {
+      coverage: {
+        phase: "covered",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        covered_by_sha: tipSha,
+        covered_by_run_id: tipGreen?.id ?? lastGreenRunId,
+        covered_by_url: tipGreen?.html_url ?? newestGreen?.html_url ?? null,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: tipSha,
+      coverage_age_secs: 0,
+    };
+  }
+
+  if (input.baseVerdict.verdict === "red") {
+    return {
+      coverage: {
+        phase: "failed",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        failing_run_id: tipRed?.id ?? null,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  if (input.baseVerdict.verdict === "unsettled" || tipActive) {
+    return {
+      coverage: {
+        phase: "settling",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        active_run_id: tipActive?.id ?? null,
+        active_run_url: tipActive?.html_url ?? null,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  // Uncovered tip (`baseVerdict.verdict === "empty"` and no active deploy workflow run on `tipSha`)
+  const workflow = inferDeployWorkflow(input.required, input.workflowRuns);
+  if (input.alreadyDispatchedAt != null && input.alreadyDispatchedAt > 0) {
+    return {
+      coverage: {
+        phase: "uncovered_dispatched",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        workflow: workflow ?? "deploy-dev.yml",
+        dispatched_at: Math.floor(input.alreadyDispatchedAt),
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  if (tipAgeSecs < graceSecs) {
+    return {
+      coverage: {
+        phase: "uncovered_grace",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        grace_secs: graceSecs,
+        workflow,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  const onlyCancelledOrSkipped =
+    tipRuns.length > 0 &&
+    tipRuns.every((r) => {
+      const c = (r.conclusion ?? "").toLowerCase();
+      return c === "cancelled" || c === "skipped";
+    });
+  const reason = onlyCancelledOrSkipped
+    ? "all deploy runs on tip were cancelled/skipped"
+    : "no deploy workflow run fired on tip (push trigger suppressed or run deleted)";
+
+  return {
+    coverage: {
+      phase: "uncovered_dark",
+      tip_sha: tipSha,
+      tip_age_secs: tipAgeSecs,
+      grace_secs: graceSecs,
+      workflow,
+      last_green_sha: lastGreenSha,
+      last_green_run_id: lastGreenRunId,
+      reason,
+    },
+    dispatch_workflow: tipSha ? workflow : null,
+    cancel_run_ids: cancelRunIds,
+    covered_by_sha: lastGreenSha,
+    coverage_age_secs: tipAgeSecs,
+  };
+}
+
+function formatCoverageAgeShort(secs: number): string {
+  const s = Math.max(0, Math.floor(Number(secs) || 0));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m`;
+}
+
+/** Human-readable single-line deploy coverage summary for lane reasons and
+ *  TrainPanel banners (BR#6179 B). Mirrored in `train_gate.rs` `format_deploy_coverage_summary`. */
+export function formatDeployCoverageSummary(cov: DeployCoverageState): string {
+  const shortTip = (cov.tip_sha ?? "").slice(0, 8) || "unknown";
+  const ageStr = formatCoverageAgeShort(cov.tip_age_secs);
+  switch (cov.phase) {
+    case "covered":
+      return `tip ${shortTip} covered by deploy${cov.covered_by_run_id ? ` (run #${cov.covered_by_run_id})` : ""}`;
+    case "settling":
+      return `tip ${shortTip} deploy in flight (age ${ageStr}${cov.active_run_id ? `, run #${cov.active_run_id}` : ""})`;
+    case "uncovered_grace":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}, grace ${Math.max(1, Math.floor(cov.grace_secs / 60))}m)`;
+    case "uncovered_dispatched":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}) — auto-dispatched ${cov.workflow}`;
+    case "uncovered_dark": {
+      const prev = cov.last_green_sha ? ` — last green deploy ${cov.last_green_sha.slice(0, 8)}` : "";
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr})${prev}`;
+    }
+    case "failed":
+      return `tip ${shortTip} deploy failed (age ${ageStr})`;
+  }
+}
+
+/** BR#6179 (C) Fast-page deterministic ask title for a dark/uncovered tip past
+ *  the grace window — keyed on `(repo, base, tipSha.slice(0, 8))` so at most
+ *  ONE ask fires per dark tip SHA. ≤240 chars, ends in "?". */
+export function trainDarkTipAskTitle(lane: { repo: string; base: string }, tipSha: string): string {
+  const shortTip = (tipSha ?? "").slice(0, 8) || "unknown";
+  const prefix = `MERGE TRAIN DARK TIP: ${lane.repo}@${lane.base} — `;
+  const suffix = `tip ${shortTip} not covered by any deploy run. Remedy?`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "?" : suffix);
+}
+
+/** BR#6179 (C) Self-contained plain-reading brief + one-click options for a
+ *  dark-tip alarm ask (satisfies Rule 6c ask quality bar). */
+export function trainDarkTipAskBrief(input: {
+  lane: { repo: string; base: string };
+  held: number;
+  alarm?: string | null;
+  coverage: DeployCoverageState;
+}): { details: string; options: string[] } {
+  const { lane, held, alarm, coverage } = input;
+  const shortTip = (coverage.tip_sha ?? "").slice(0, 8) || "unknown";
+  const ageStr = formatCoverageAgeShort(coverage.tip_age_secs);
+  const wf =
+    coverage.phase === "uncovered_dispatched"
+      ? coverage.workflow
+      : coverage.phase === "uncovered_dark" || coverage.phase === "uncovered_grace"
+        ? coverage.workflow ?? "deploy-dev.yml"
+        : "deploy-dev.yml";
+  const lastGreen =
+    "last_green_sha" in coverage && coverage.last_green_sha
+      ? `${coverage.last_green_sha.slice(0, 8)}${coverage.last_green_run_id ? ` (run #${coverage.last_green_run_id})` : ""}`
+      : "none recorded in recent workflow history";
+  const dispatched = coverage.phase === "uncovered_dispatched";
+  const details = [
+    `What this is: merge lane ${lane.repo}@${lane.base} is holding ${held} verified change(s) because the current ${lane.base} tip commit (${shortTip}, age ${ageStr}) is not covered by any decisive deploy workflow run (${alarm || "tip carries no check runs at all"}).`,
+    `Current state: ${formatDeployCoverageSummary(coverage)}. Last decisive green deploy covered: ${lastGreen}. This happens when a merge push event is suppressed (for example by an app/bot token class) or when the deploy workflow run was cancelled or deleted before creating required check runs.`,
+    dispatched
+      ? `Automatic remedy already taken: the merge-train executor automatically dispatched ${wf} on ${lane.base} for tip ${shortTip} (once per SHA). The lane will resume merging queued changes automatically as soon as that deploy run settles green; human action is only needed if the dispatched run fails to start.`
+      : `Why it needs you: tip ${shortTip} is past the grace window with no deploy run in flight. Choose option 1 to authorize an immediate ${wf} workflow dispatch on ${lane.base}, or run \`gh workflow run ${wf} --repo ${lane.repo} --ref ${lane.base}\`.`,
+  ].join("\n\n");
+  const options = dispatched
+    ? [
+        `(Recommended) Acknowledge — auto-dispatched ${wf} is in flight; hold until it settles`,
+        `Re-dispatch ${wf} on ${lane.base} now`,
+      ]
+    : [
+        `(Recommended) Dispatch ${wf} on ${lane.base} now`,
+        `Acknowledge — investigating workflow trigger suppression`,
+      ];
+  return { details, options };
 }
 
 /** The machine-proxy close note for train:landed — cites the merge commit

@@ -200,6 +200,62 @@ export interface KbTrainFixCard {
   merge_sha?: string;
 }
 
+/** BR#6179 closed 6-state deploy coverage union on `phase`. */
+export type KbDeployCoverageState =
+  | {
+      phase: "covered";
+      tip_sha: string;
+      tip_age_secs: number;
+      covered_by_sha: string;
+      covered_by_run_id?: number | null;
+      covered_by_url?: string | null;
+    }
+  | {
+      phase: "settling";
+      tip_sha: string;
+      tip_age_secs: number;
+      active_run_id?: number | null;
+      active_run_url?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_grace";
+      tip_sha: string;
+      tip_age_secs: number;
+      grace_secs: number;
+      workflow?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_dispatched";
+      tip_sha: string;
+      tip_age_secs: number;
+      workflow: string;
+      dispatched_at: number;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_dark";
+      tip_sha: string;
+      tip_age_secs: number;
+      grace_secs: number;
+      workflow?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+      reason: string;
+    }
+  | {
+      phase: "failed";
+      tip_sha: string;
+      tip_age_secs: number;
+      failing_run_id?: number | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    };
+
 export interface KbBaseRedResolution {
   verdict: "red" | "unsettled" | "empty";
   phase?: KbBaseRedPhase;
@@ -207,6 +263,7 @@ export interface KbBaseRedResolution {
   held: number;
   ask: { id: string; url: string; question: string; options: string[] } | null;
   fix_card: KbTrainFixCard | null;
+  deploy_coverage?: KbDeployCoverageState | null;
 }
 
 export interface KbTrainLane {
@@ -291,6 +348,13 @@ export interface KbTrainLane {
       scoped_to_required?: boolean;
       red?: { name: string; url?: string }[];
       unsettled?: string[];
+      alarm?: string;
+      tip_sha?: string;
+      tip_age_secs?: number;
+      covered_by?: string | null;
+      coverage_age_secs?: number | null;
+      deploy_coverage?: KbDeployCoverageState | null;
+      cancelled_redundant_runs?: number[];
       /** BR#5883: the gate-consumed qualifier — the scoped verdict IS green
        *  but the repo's own merge gate (`main-green gate`, judging main's
        *  WHOLE tip) reports non-green. The lane reads GATE-BLOCKED while

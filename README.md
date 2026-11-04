@@ -1029,6 +1029,42 @@ bounce (the PR carries no defect), never a human leg (main is green — no
 decision exists). A REAL red beside the gate red is not healed, and a red
 base keeps the circular BR#5189 law untouched.
 
+### Level-based deploy reconciliation & dark-tip self-heal (BR#6179)
+
+Edge-triggered deploys (`on: push`) can be silently suppressed when a PR is
+merged with a `GITHUB_TOKEN`/app-class token or when a deploy run is cancelled
+or deleted — leaving `main`'s tip commit **dark** (zero required check-runs on
+the tip, verdict `empty`, holding the queue forever). The executor and hub now
+reconcile deploy coverage as a closed 6-state machine (`DeployCoverageState`:
+`covered` | `settling` | `uncovered_grace` | `uncovered_dispatched` |
+`uncovered_dark` | `failed`, mirrored in `train_gate.rs` and `core.ts`):
+
+- **A. Auto-dispatch past grace (once per SHA)**: when the base tip is
+  uncovered (`verdict == "empty"`, no deploy workflow run in flight or queued
+  for `tip_sha`, secondary observers like `Deploy Health Record` excluded) and
+  the tip commit is older than `DEPLOY_RECONCILE_GRACE_SECS` (5 minutes), the
+  executor dispatches the deploy workflow (`gh workflow run deploy-dev.yml
+  --repo <repo> --ref <base>`) at most **once per SHA**, persisted both in
+  executor memory and hub-side (`lane.deploy_dispatched`) and audited as
+  `train:deploy_dispatched`.
+- **B. Deploy-coverage predicate & lane vocabulary**: `queue_facts.base_state`
+  stamps `tip_sha`, `tip_age_secs`, `covered_by` (the SHA of the newest
+  decisive green deploy), `coverage_age_secs`, and `deploy_coverage`. The lane
+  blocked reason and `TrainPanel` banner render the coverage fact directly
+  (`tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched
+  deploy-dev.yml`) instead of conflating a dark tip with a red base.
+- **C. Fast page**: an uncovered tip past grace holding cars immediately files
+  ONE per-SHA `MERGE TRAIN DARK TIP` alarm ask (`syncDarkTipAlarm`) with the
+  auto-dispatch receipt and a one-click re-dispatch option — never waiting
+  60+ minutes for the P4 starvation clock — and auto-closes the ask the moment
+  the deploy starts settling or covers the tip.
+- **D. Redundant queued run cancellation**: when a `workflow_dispatch` (or
+  earlier run) is already `in_progress` or `completed/success` for `head_sha`
+  and a duplicate `push` run for the **same `head_sha`** is `queued` behind the
+  concurrency group, the executor cancels the redundant queued run (`gh run
+  cancel <id>`, audited as `train:redundant_runs_cancelled`), saving ~15m of
+  extra line hold per occurrence.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in

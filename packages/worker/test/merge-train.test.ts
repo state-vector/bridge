@@ -67,6 +67,15 @@ import {
   TRAIN_HEAD_STAMP_RE,
   TRAIN_LEASE_TTL_MS,
   TRAIN_PROGRESS_STALE_MS,
+  DEPLOY_RECONCILE_GRACE_SECS,
+  formatDeployCoverageSummary,
+  inferDeployWorkflow,
+  isDeployWorkflowRun,
+  parseIso8601EpochMs,
+  reconcileDeployCoverage,
+  trainDarkTipAskBrief,
+  trainDarkTipAskTitle,
+  type DeployWorkflowRun,
   type MainCheckRun,
   type TrainLease,
 } from "../src/kb/core.ts";
@@ -1851,5 +1860,148 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
         url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
       },
     ]);
+  });
+
+  it("BR#6179: level-based deploy reconciliation (dark-tip grace, auto-dispatch once per sha, coverage summary, and redundant queued run cancellation)", () => {
+    const required = [
+      "deploy / Deploy to dev",
+      "post-deploy / Post-Deploy Smoke",
+      "post-deploy / DNS chain",
+      "post-deploy / Lodestar Storage Health",
+    ];
+    const darkTip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+    const prevGreenTip = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+    const emptyVerdict = classifyBaseCheckRuns([], required);
+    expect(emptyVerdict.verdict).toBe("empty");
+
+    // 1. Deploy Health Record (2026-11-04 08:19:23Z receipt) is NOT a covering deploy workflow
+    const wfRunsWithDhr: DeployWorkflowRun[] = [
+      {
+        id: 41791923312,
+        name: "Deploy Health Record",
+        path: ".github/workflows/deploy-health.yml",
+        head_sha: darkTip,
+        event: "schedule",
+        status: "completed",
+        conclusion: "success",
+      },
+      {
+        id: 41780000001,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "push",
+        status: "completed",
+        conclusion: "success",
+        html_url: "https://github.com/state-vector/superpositional/actions/runs/41780000001",
+      },
+    ];
+    expect(isDeployWorkflowRun(wfRunsWithDhr[0], required)).toBe(false);
+    expect(isDeployWorkflowRun(wfRunsWithDhr[1], required)).toBe(true);
+    expect(inferDeployWorkflow(required, wfRunsWithDhr)).toBe("deploy-dev.yml");
+    expect(inferDeployWorkflow(required, [])).toBe("deploy-dev.yml");
+
+    // 2. Inside grace window (age 120s < 300s): uncovered_grace, no dispatch yet
+    const planGrace = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 120,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+    });
+    expect(planGrace.dispatch_workflow).toBeNull();
+    expect(planGrace.covered_by_sha).toBe(prevGreenTip);
+    expect(planGrace.coverage.phase).toBe("uncovered_grace");
+    expect(formatDeployCoverageSummary(planGrace.coverage)).toBe("tip 7f5efec2 not covered by any deploy (age 2m, grace 5m)");
+
+    // 3. Past grace window (age 1020s = 17m >= 300s) and not yet dispatched:
+    //    uncovered_dark + dispatch_workflow = "deploy-dev.yml"
+    const planDark = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 1020,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+    });
+    expect(planDark.dispatch_workflow).toBe("deploy-dev.yml");
+    expect(planDark.covered_by_sha).toBe(prevGreenTip);
+    expect(planDark.coverage_age_secs).toBe(1020);
+    expect(planDark.coverage.phase).toBe("uncovered_dark");
+    expect(formatDeployCoverageSummary(planDark.coverage)).toBe(
+      "tip 7f5efec2 not covered by any deploy (age 17m) — last green deploy ebbe1826",
+    );
+
+    // 4. Once dispatched for this SHA (`alreadyDispatchedAt` set):
+    //    uncovered_dispatched + dispatch_workflow = null (idempotent once-per-sha guard)
+    const planDispatched = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 1020,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+      alreadyDispatchedAt: 1793780527000,
+    });
+    expect(planDispatched.dispatch_workflow).toBeNull();
+    expect(planDispatched.coverage.phase).toBe("uncovered_dispatched");
+    expect(formatDeployCoverageSummary(planDispatched.coverage)).toBe(
+      "tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml",
+    );
+
+    // 5. Fast-page ask title + brief contract (Leg C)
+    const askTitle = trainDarkTipAskTitle({ repo: "state-vector/superpositional", base: "main" }, darkTip);
+    expect(askTitle).toBe("MERGE TRAIN DARK TIP: state-vector/superpositional@main — tip 7f5efec2 not covered by any deploy run. Remedy?");
+    expect(askTitle.length).toBeLessThanOrEqual(240);
+    expect(askTitle.endsWith("?")).toBe(true);
+    const brief = trainDarkTipAskBrief({
+      lane: { repo: "state-vector/superpositional", base: "main" },
+      held: 18,
+      alarm: "tip carries no check runs at all",
+      coverage: planDispatched.coverage,
+    });
+    expect(brief.options[0].startsWith("(Recommended)")).toBe(true);
+    expect(brief.details).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+
+    // 6. Redundant queued run cancellation (Leg D, exact 2026-11-04 08:22 receipt):
+    //    workflow_dispatch 41798951196 is in_progress while push 41798949143 is queued on the same sha
+    const wfRunsRedundant: DeployWorkflowRun[] = [
+      {
+        id: 41798951196,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "workflow_dispatch",
+        status: "in_progress",
+      },
+      {
+        id: 41798949143,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "push",
+        status: "queued",
+      },
+    ];
+    const unsettledVerdict = classifyBaseCheckRuns(
+      [{ id: 1, name: "deploy / Deploy to dev", status: "in_progress", conclusion: null }],
+      required,
+    );
+    const planSettling = reconcileDeployCoverage({
+      tipSha: prevGreenTip,
+      tipAgeSecs: 30,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: unsettledVerdict,
+      required,
+      workflowRuns: wfRunsRedundant,
+    });
+    expect(planSettling.cancel_run_ids).toEqual([41798949143]);
+    expect(planSettling.dispatch_workflow).toBeNull();
+    expect(planSettling.coverage.phase).toBe("settling");
+
+    // 7. ISO-8601 parser parity with Rust
+    expect(parseIso8601EpochMs("2026-11-04T08:01:57Z")).toBe(1_793_779_317_000);
+    expect(parseIso8601EpochMs("invalid")).toBeNull();
   });
 });
