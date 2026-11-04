@@ -178,6 +178,7 @@ describe("BR#6384 Leg 1 — observed-merge close (real DO)", () => {
     expect(upd.status).toBeLessThan(400);
     // NO provenance row exists for (REPO, 6120) — the merge happened outside
     // the train. The feed's MERGED row is the only receipt.
+    const beforeChildren = await dutyChildrenOf(id);
     const rep = await kbJson("/reconcile.report", {
       repo: REPO,
       prs: [
@@ -196,7 +197,9 @@ describe("BR#6384 Leg 1 — observed-merge close (real DO)", () => {
     expect(close, "the close note must cite the observation").toBeTruthy();
     expect(String(close.summary)).toContain(SHA.slice(0, 9));
     expect(String(close.summary)).toContain("BR#6384");
-    expect(await dutyChildrenOf(id)).toHaveLength(0);
+    // the close spawned nothing itself: the only duty child is the card's
+    // own block-time round (main's park law, present before the report)
+    expect(await dutyChildrenOf(id)).toHaveLength(beforeChildren.length);
   });
 });
 
@@ -299,7 +302,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect((await taskById(id)).meta?.strand_ladder?.rounds).toBe(1);
     expect(await strandDutiesOf(id)).toHaveLength(1);
     // cap the ladder at ONE round, then rule the duty (terminal on a receipt)
-    const cap = await kbJson("/admin.settings_set", { settings: { "train.strand_ladder_rounds": 1 } });
+    const cap = await kbJson("/admin.settings_set", { settings: { "train_strand_ladder_rounds": 1 } });
     expect(cap.body.error ?? "").toBe("");
     expect((await kbJson("/transition", { id: duty, to: "in_progress", actor: "rig", note: "ruling the round" })).status).toBeLessThan(400);
     expect((await kbJson("/transition", {

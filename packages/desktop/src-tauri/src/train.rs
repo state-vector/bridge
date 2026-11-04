@@ -5029,12 +5029,15 @@ mod tests {
         ]);
         let out = concat_pr_rows(&open, &merged);
         let rows = out.as_array().expect("array");
-        assert_eq!(rows.len(), 2, "open objects + valid merged rows only");
+        // the daemon drops non-OBJECTS only (both sides) — number-level junk
+        // is the hub's normalizePr contract; the merged side additionally
+        // keeps MERGED rows with a positive number
+        assert_eq!(rows.len(), 3, "2 open objects + 1 valid merged row");
         assert_eq!(rows[0]["number"], 1);
-        assert_eq!(rows[1]["number"], 2);
+        assert_eq!(rows[2]["number"], 2);
+        assert_eq!(rows[2]["state"], "MERGED");
         // the gh object shape flattens to the string the hub contract reads
-        assert_eq!(rows[1]["mergeCommit"], json!("f".repeat(40)));
-        assert_eq!(rows[1]["state"], "MERGED");
+        assert_eq!(rows[2]["mergeCommit"], json!("f".repeat(40)));
         // a broken merged feed degrades to the open feed alone
         let open_only = concat_pr_rows(&pr_payload(&json!([{ "number": 5 }])), &json!(null));
         assert_eq!(open_only.as_array().unwrap().len(), 1);

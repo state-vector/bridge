@@ -707,12 +707,12 @@ export class KnowledgeHub {
     // BR#6384 Leg 2 — the bounded disposition ladder, immediately after the
     // strand sweep (same candidates, one classification): a train-only wait
     // stranded out of the derived queue on a HEALTHY lane past
-    // train.strand_disposition_h (default 24h, clamp 4..168) can no longer
+    // train_strand_disposition_h (default 24h, clamp 4..168) can no longer
     // sit parked forever — the ladder runs machine-executed rungs: (a) merge
     // evidence (provenance or a satisfied probe) closes the car citing the
     // receipt; (b) a conclusive closed-unmerged probe supersedes it with
     // findings; (c) ONE re-verify-or-drop duty per round
-    // (train.strand_ladder_rounds, default 2, clamp 1..8, relates-linked —
+    // (train_strand_ladder_rounds, default 2, clamp 1..8, relates-linked —
     // never a gating child); (d) rounds exhausted → superseded with
     // findings. The BR#6163 alarm becomes the heads-up, not the terminal
     // state. Probe-first: a probe-backable wait gets enqueued with ONE pass
@@ -12041,7 +12041,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  (out_of_queue_await — a plain typed park with no merge_train stamp),
    *  on a live lane that provably MOVED after the car parked (a merged
    *  event newer than the park — a stalled lane is the starvation law's
-   *  problem, not the ladder's), parked past train.strand_disposition_h
+   *  problem, not the ladder's), parked past train_strand_disposition_h
    *  (default 24, clamp 4..168). Rungs, in order:
    *    (a) merge evidence in the ledger (a provenance row for the awaited
    *        PR, or a satisfied merge/checks probe) → close the car citing
@@ -12052,17 +12052,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *    (c) probe-first: enqueue the wait's probe (BR#6384 grammar) with ONE
    *        pass of grace; past the grace, ONE re-verify-or-drop duty per
    *        round (relates-linked, never a gating child), rounds bounded by
-   *        train.strand_ladder_rounds (default 2, clamp 1..8);
+   *        train_strand_ladder_rounds (default 2, clamp 1..8);
    *    (d) rounds exhausted → supersede with findings.
    *  A live in_progress owner is never superseded under (the strand sweep's
    *  own liveness law mirrors this; the ladder only admits blocked cars). */
   private async dispositionStrandedTrainWaits(now0: number): Promise<void> {
     const dispositionH = (() => {
-      const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_disposition_h'`);
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train_strand_disposition_h'`);
       return s ? Math.max(4, Math.min(168, parseInt(s.value, 10) || 24)) : 24;
     })();
     const capRounds = (() => {
-      const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_ladder_rounds'`);
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train_strand_ladder_rounds'`);
       return s ? Math.max(1, Math.min(8, parseInt(s.value, 10) || 2)) : 2;
     })();
     const rows = this.state.storage.sql.exec(
@@ -12109,8 +12109,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             ? `provenance: ${awaitEv.repo}#${awaitEv.n} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer}; full sha ${String(pv.merge_sha)})`
             : `executor-verified satisfied: ${String(verifiedOk!.receipt ?? "")}`;
           this.strandNormalizeToBlocked(carId, "strand disposition (BR#6384) rung (a) — unparking before the evidence close");
+          // lifecycle law: blocked→done is illegal — unpark first (the
+          // machine-managed train move), then close citing the receipt
+          const live = this.one(`SELECT status FROM artefacts WHERE id = ?`, carId) as any;
+          if (live && String(live.status) === "blocked") {
+            await this.transition({ id: carId, to: "in_progress", session: "", note: "strand disposition (BR#6384) — unpark the car for the evidence close", merge_train: true }, "system:train");
+          }
           await this.transition(
-            { id: carId, to: "done", session: "", note: `strand disposition (BR#6384): the train-only wait is satisfied — ${receipt}; closing the stranded car on the receipt (Leg 2a)` },
+            { id: carId, to: "done", session: "", note: `strand disposition (BR#6384): the wait is satisfied — merge sha ${pv ? String(pv.merge_sha).slice(0, 9) : String(verifiedOk!.head_sha ?? "").slice(0, 9)} (${pv ? "provenance" : "probe"} receipt: ${receipt}); closing the stranded car on the receipt (Leg 2a)` },
             "system:train",
           );
           this.audit("system:train", "strand_disposition_close", carId, { class: cls, via: pv ? "provenance" : "probe" });
@@ -12149,7 +12155,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // ---- rung (d): ladder exhausted — supersede with findings ----
           this.strandNormalizeToBlocked(carId, "strand disposition (BR#6384 Leg 2) rung (d) — unparking before the supersede");
           await this.transition(
-            { id: carId, to: "superseded", session: "", note: `strand disposition (BR#6384 Leg 2): ladder exhausted — ${rounds} re-verify-or-drop round(s) ruled with no satisfiable evidence and no conclusive negative (cap train.strand_ladder_rounds=${capRounds}); the car superseded with findings — no unbounded parks` },
+            { id: carId, to: "superseded", session: "", note: `strand disposition (BR#6384 Leg 2): ladder exhausted — ${rounds} re-verify-or-drop round(s) ruled with no satisfiable evidence and no conclusive negative (cap train_strand_ladder_rounds=${capRounds}); the car superseded with findings — no unbounded parks` },
             "system:train",
           );
           this.audit("system:train", "strand_disposition_exhausted", carId, { rounds, cap: capRounds });
@@ -13682,7 +13688,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 await this.transition({ id: a.card, to: "in_progress", session: "", note: "reconcile: observed-merge close (BR#6384) — unpark the card for the machine proxy", merge_train: true }, actor);
               }
               await this.transition(
-                { id: a.card, to: "done", session: "", note: `reconcile: observed MERGED — the feed saw ${repo}#${j.pr} merged out-of-band (mergeCommit ${a.merge_sha.slice(0, 9)}); closing the bound card on the observation (BR#6384 anti-languish, no provenance row needed). Full sha: ${a.merge_sha}` },
+                { id: a.card, to: "done", session: "", note: `reconcile: observed MERGED (BR#6384) — ${repo}#${j.pr} merged out-of-band, mergeCommit ${a.merge_sha.slice(0, 9)}; closing the bound card on the feed observation, no provenance row needed. Full sha: ${a.merge_sha}` },
                 actor,
               );
               this.audit(actor, "reconcile_observed_merge_close", a.card, { pr: `${repo}#${j.pr}`, merge_sha: a.merge_sha });
