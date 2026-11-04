@@ -1987,6 +1987,54 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
  *  never drift from reality. */
 export const MERGE_TRAIN_REASON_PREFIX = "merge-train:";
 export const MERGE_TRAIN_QUEUED_REASON = "merge-train: queued";
+/** BR#6348 — the conflicting car's park reason prefix. Like the queued
+ *  prefix it ADMITS the car into mergeTrainQueue (the derived queue must
+ *  never go silently empty while its head car is conflicting — the Phase A
+ *  defect), but the executor's walk skips a car already parked conflicting
+ *  (the typed clock + budget alarm own the exit), so admission here means
+ *  VISIBILITY (starvation accounting, panel queue block), not mergeability. */
+export const MERGE_TRAIN_CONFLICTING_REASON = "merge-train: conflicting";
+/** BR#6348 — the bounded budget for a typed conflicting park, knob
+ *  `train.conflicting_budget_min`, clamped 15..1440. Default 120 min: the
+ *  Phase A episode churned 3h46m invisible; the alarm must fire well inside
+ *  that. Past the budget the conflicting sweep alarms ONCE per episode to
+ *  the train alarm sink naming the mechanical rebase leg. */
+export const TRAIN_CONFLICTING_BUDGET_MIN_DEFAULT = 120;
+
+export function clampConflictingBudgetMin(...candidates: unknown[]): number {
+  for (const v of candidates) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return Math.min(1440, Math.max(15, n));
+  }
+  return TRAIN_CONFLICTING_BUDGET_MIN_DEFAULT;
+}
+
+/** The conflicting park's blocked.reason — carries MERGE_TRAIN_CONFLICTING_
+ *  REASON (queue admission) + the enumerated conflicts + the demanded
+ *  machine leg, so plain reading names the exit. */
+export function trainConflictingParkReason(
+  pr: number,
+  repo: string,
+  conflictFiles: readonly string[],
+  defect?: string | null,
+): string {
+  const files = conflictFiles.length
+    ? conflictFiles.slice(0, 5).join(", ") + (conflictFiles.length > 5 ? ", …" : "")
+    : "trial-merge failed to enumerate (fail-closed)";
+  const head = `${MERGE_TRAIN_CONFLICTING_REASON} — PR ${repo ? `${repo}#` : "#"}${pr} conflicts with base (${conflictFiles.length} file(s)): ${files}`;
+  return `${head} — the mechanical rebase leg owns the exit: rebase onto origin/main, resolve, signed force-with-lease push, fresh verify, re-queue at the BACK (BR#6348; bounded budget + loud alarm at expiry)${defect ? ` — ${String(defect).slice(0, 160)}` : ""}`;
+}
+
+/** BR#6348 — the conflicting-episode keys a phase write must clear when the
+ *  card LEAVES the conflicting phase (accept → queued, merged → awaiting-ci,
+ *  machine re-queue). Stale keys are inert to readers (every reader gates on
+ *  state === "conflicting") but they are illegal residue under the closed
+ *  union — one helper, called at the phase-write sites. */
+export function clearConflictingEpisode(mt: Record<string, unknown> | undefined): void {
+  if (!mt) return;
+  delete mt.conflicting_at;
+  delete mt.conflicting_alarm;
+}
 // BR#6045: the queue-note matcher binds BOTH the canonical `merge-train:
 // queued` prefix AND the semantically-equivalent re-queue spelling
 // `merge-train: re-queued` (a fresh verify accept after a bounce). The direct
@@ -2147,7 +2195,13 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
     // candidate even if its prose reason lost the prefix. Admission is
     // deliberately FAIL-OPEN (prefix OR stamp — a stray admit gets gate-
     // checked by the executor; a silent drop starves a lane).
-    || isAwaitingMerge(c.meta),
+    || isAwaitingMerge(c.meta)
+    // BR#6348 — a typed conflicting park is a queue VISIBILITY slot, not a
+    // merge candidate: the walk skips it (the typed clock + budget alarm own
+    // the exit), but it must never silently leave the derived queue — the
+    // Phase A empty-queue starvation happened precisely because a conflicting
+    // car was invisible to every alarm.
+    || mergePhaseOf(c.meta) === "conflicting",
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
   return [...queued]
@@ -2248,7 +2302,7 @@ export function releaseHold(meta: any): string | null {
   // BR#6330 — the phase set is closed (contracts MergeTrainPhaseSchema);
   // unbound/landed/base-red-park hold nothing: the train no longer owns the
   // exit. Semantics unchanged from the pre-6330 literal set.
-  if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") {
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "conflicting" || st === "awaiting") {
     const pr = trainPrLeg(meta);
     if (pr) {
       const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
@@ -2267,14 +2321,17 @@ export function releaseHold(meta: any): string | null {
  *  reason prefix alone, so a watchdog hold-park whose note lacks the prefix
  *  silently drops a live queued/awaiting-ci car out of the train queue
  *  forever — the BR#4995 class, root-caused from the BR#5674 Mission 2
- *  audit. The two live-slot states ride the state-named prefix; every other
- *  hold (bounced/awaiting/typed waits) is NOT a queue slot and must stay
- *  unprefixed — those legs re-enter through the board, never the queue. */
+ *  audit. The live-slot states ride the state-named prefix (queued /
+ *  awaiting-ci / conflicting — BR#6348: a conflicting car must stay in the
+ *  derived queue, the silent-empty-queue state is the Phase A defect); every
+ *  other hold (bounced/awaiting/typed waits) is NOT a queue slot and must
+ *  stay unprefixed — those legs re-enter through the board, never the queue. */
 export function mergeTrainHoldPrefix(meta: any): string | null {
   const mt = ((meta ?? {}).merge_train ?? {}) as Record<string, unknown>;
   const st = String(mt.state ?? "");
   if (st === "queued") return `${MERGE_TRAIN_REASON_PREFIX} queued — `;
   if (st === "awaiting-ci") return `${MERGE_TRAIN_REASON_PREFIX} awaiting-ci — `;
+  if (st === "conflicting") return `${MERGE_TRAIN_CONFLICTING_REASON} — `;
   return null;
 }
 
@@ -2352,6 +2409,7 @@ export function trainStrandClass(meta: any, admitted: boolean): TrainStrandClass
   const state = String(mt.state ?? "");
   if (state === "awaiting") return null; // BR#5633 sweep owns Awaiting parks
   if (state === "bounced") return null;  // BR#4494 demote owns bounce re-entry
+  if (state === "conflicting") return null; // BR#6348 budget sweep owns conflicting parks
   if (state === "unbound" && admitted) return "unbound_in_queue";
   if (trainOnlyAwait(m) && !admitted) return "out_of_queue_await";
   if (state === "queued" && !admitted) return "queued_out_of_queue";
@@ -3034,6 +3092,7 @@ export function trainRequeueSwap(meta: any): any {
   const m = meta && typeof meta === "object" ? { ...meta } : {};
   m.merge_train = { ...(m.merge_train ?? {}), state: "queued" };
   delete m.merge_train.awaiting;
+  clearConflictingEpisode(m.merge_train); // BR#6348: re-queue ends the conflicting episode
   delete m.boosted;
   m.blocked = { ...(m.blocked ?? {}), reason: MERGE_TRAIN_QUEUED_REASON };
   return m;

@@ -1954,9 +1954,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // (b) Run settle_window_rebase over the held queue so any queued PR that
             //     became CONFLICTING against moved main (e.g. PR #2800 after #2817)
             //     is immediately trial-merged and bounced (`kind: "bounced"`,
-            //     `bounce_kind: "conflict"`, `conflict_files`) to `in_progress` for
-            //     an agent to rebase and resolve — never left rotting in the queue
-            //     claiming "ready" and never punted to the human.
+            //     `bounce_kind: "conflict"`, `conflict_files`) — the hub parks it
+            //     TYPED conflicting (BR#6348: queue-visible, bounded budget, loud
+            //     alarm at expiry; the mechanical rebase leg owns the exit) instead
+            //     of churning it through the pool.
             if ctx.base_probe {
                 let effective_v = if v.verdict == MainVerdict::Empty && !stop_sha.is_empty() && stop_sha != base_sha {
                     let stop_runs = ctx.check_runs(repo, stop_sha);
@@ -2461,6 +2462,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             base_red_names: &base_red_names,
             base_gate_green,
         });
+        // BR#6348: a car ALREADY parked TYPED conflicting is a clock, not a
+        // bounce. The hub's conflict bounce parks it (merge_train.state =
+        // "conflicting") IN the derived queue on a bounded budget with a
+        // loud alarm at expiry; re-verdicting it every tick would bounce-
+        // storm the ledger (the #279 ×31 class) and end this walk behind a
+        // car whose exit is the mechanical rebase leg, not a re-bounce.
+        // Convert the repeat conflicting verdict to a Skip: the walk
+        // advances (the queue is not held), and the queue_facts stamp below
+        // keeps cls "conflict" so the panel + starvation accounting still
+        // see the car. The FIRST conflicting verdict still bounces — that
+        // establishes the typed park with the trial-merge file list.
+        let gate = match gate {
+            MergeAction::Bounce { bounce_kind: crate::train_gate::BounceKind::Conflict, defect }
+                if card_meta.pointer("/merge_train/state").and_then(|v| v.as_str()) == Some("conflicting") =>
+            {
+                log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) already parked TYPED conflicting — skip (the bounded clock + budget alarm own the exit, BR#6348)"));
+                MergeAction::Skip { reason: format!("parked conflicting (BR#6348) — the typed clock + budget alarm own the exit; {defect}") }
+            }
+            g => g,
+        };
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
             MergeAction::CloseSuperseded { reason } => ("close_superseded", format!(" — {reason}")),
@@ -2505,6 +2526,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             },
             MergeAction::Skip { reason } => if reason.contains("no accepted verify") {
                 "needs-review"
+            } else if reason.contains("parked conflicting (BR#6348)") {
+                // BR#6348: a parked conflicting car stays honestly conflict-
+                // classed in the queue block — not "waiting"
+                "conflict"
             } else if ready_on_own_head {
                 "ready"
             } else {

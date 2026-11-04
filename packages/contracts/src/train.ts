@@ -180,14 +180,16 @@ export type LaneOperationalState = z.infer<typeof LaneOperationalStateSchema>;
  *
  *  Only train machinery writes it: accept → queued, train:merged →
  *  awaiting-ci, landed/burst-settle/merged-park-heal → landed (card closes),
- *  bounce → bounced, Awaiting force-review park → awaiting, lane unbind →
- *  unbound. `base-red-park` is reserved for the merge-ladder base-red park
- *  (no writer yet — the executor stamps it when the ladder parks a card on a
- *  base-fix task). Legacy spellings normalise through MergeTrainPhaseSchema. */
+ *  bounce → bounced, CONFLICTING gate verdict → conflicting (BR#6348 typed
+ *  park), Awaiting force-review park → awaiting, lane unbind → unbound.
+ *  `base-red-park` is reserved for the merge-ladder base-red park (no writer
+ *  yet — the executor stamps it when the ladder parks a card on a base-fix
+ *  task). Legacy spellings normalise through MergeTrainPhaseSchema. */
 export const MergeTrainPhaseSchema = z.enum([
   "queued",
   "awaiting-ci",
   "bounced",
+  "conflicting",
   "awaiting",
   "unbound",
   "base-red-park",
