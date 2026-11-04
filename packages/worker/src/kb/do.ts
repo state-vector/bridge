@@ -125,6 +125,11 @@ import {
   trainAwaitingReason,
   trainAwaitingHumanLeg,
   trainRequeueSwap,
+  trainConflictingParkReason,
+  clampConflictingBudgetMin,
+  clearConflictingEpisode,
+  MERGE_TRAIN_CONFLICTING_REASON,
+  TRAIN_CONFLICTING_BUDGET_MIN_DEFAULT,
   trainBaseRedAskTitle,
   trainBaseRedAskBrief,
   trainBaseRedAskWarranted,
@@ -703,6 +708,18 @@ export class KnowledgeHub {
       await this.sweepMergedParks(now0);
     } catch (e) {
       this.audit("system:train", "merged_park_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+    // BR#6348 — conflicting-budget sweep on the same cadence: a car parked
+    // TYPED conflicting runs on a bounded budget (train.conflicting_budget_min);
+    // past the budget the loud alarm fires ONCE per episode to the train alarm
+    // sink, naming the mechanical rebase leg the car has been waiting on. This
+    // is the Phase A impossibility remover: the car is queue-visible (typed
+    // admission) AND clocked (this sweep) — a conflicting head can no longer
+    // sit 3h46m in silent churn.
+    try {
+      await this.sweepConflictingCars(now0);
+    } catch (e) {
+      this.audit("system:train", "conflicting_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
     // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
     // verdict. If no verifier ever picks the verification round up, the park is
@@ -4950,6 +4967,22 @@ export class KnowledgeHub {
       // BR#3853/3937/5139 re-park loop. The bounce supersedes the human-leg
       // park: flip to bounced (the leg is back on the board — a fresh verify
       // accept re-queues) and drop the awaiting stamp.
+      // BR#6348 — the same law for the TYPED conflicting park: a claim
+      // (blocked → in_progress) of a conflicting car means a live session
+      // took the mechanical rebase leg — the park ends (conflicting →
+      // bounced, episode keys cleared) so the bounded clock stops and the
+      // car rides the claim; the re-pushed head re-enters via fresh verify.
+      // A dead claim re-parks through releaseHold — conflicting HOLDS the
+      // release (the train owns the exit), so the park cannot strand.
+      if (
+        row.type === "task" && row.status === "blocked" && verdict.status === "in_progress" &&
+        String((((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "")) === "conflicting"
+      ) {
+        meta.merge_train = { ...(meta.merge_train ?? {}), state: "bounced" };
+        clearConflictingEpisode(meta.merge_train);
+        this.audit(actor, "train:conflicting_unparked", id, { from: "conflicting", to: "bounced", via: "blocked→in_progress" });
+        this.version(id, actor, "update", "conflicting park ended — a live session took the mechanical rebase leg; merge_train.state conflicting → bounced (BR#6348)", {});
+      }
       if (
         row.type === "task" && row.status === "blocked" && verdict.status === "in_progress" &&
         String((((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "")) === "awaiting"
@@ -9235,6 +9268,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             merge_sha: mergeSha,
             merged_at: mergedAt,
           };
+          clearConflictingEpisode(next.merge_train); // BR#6348: the merge ends any conflicting episode
           next.provenance = { repo, pr, head_sha: headSha ?? "", merge_sha: mergeSha, task_id: chain.task_id, verdict_id: chain.verdict_id, session: chain.session, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt };
           // blocked stays blocked (lifecycle forbids blocked→blocked) — the
           // state rides meta.merge_train; the reason says awaiting-CI.
@@ -9404,7 +9438,81 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // re-enters review through the normal handoff, which auto-spawns the
         // fresh verify duty (BR#3516 §5). NO human leg, NO ask.
       }
-      // gate | conflict | plain-coverage-lapse (BR#5226 fall-through) — the
+      // BR#6348 — a CONFLICTING gate verdict parks the car TYPED instead of
+      // bouncing it into pool churn. The Phase A defect (BR#6340): PR #309
+      // went CONFLICTING, the impl bounce sent the card to in_progress, the
+      // watchdog released it to the pool, and the churned car VANISHED from
+      // the derived queue for 3h46m — `merge-train: ready` + green base was
+      // truthful and no alarm could see a car to complain about, while the
+      // mechanical rebase (repo steering §8: 100% machine work) had no live
+      // executor. The typed `conflicting` park keeps the car IN the derived
+      // queue (admission via the merge-train: conflicting prefix + the typed
+      // phase), holds the watchdog release (releaseHold), and runs on a
+      // BOUNDED budget with a loud alarm at expiry (sweepConflictingCars).
+      // The walk-side mirror (train.rs) skips a car already parked
+      // conflicting — the park is established once, refreshed in place, and
+      // ends only through the mechanical rebase leg (signed force-with-lease
+      // push → fresh verify → re-queue at the BACK) or the merge itself.
+      if (bounceKind === "conflict") {
+        const parkReason = trainConflictingParkReason(pr, repo, conflictFiles, defect);
+        const fresh = String(cm.merge_train?.state ?? "") !== "conflicting";
+        // The park facts. A re-assert while already parked refreshes the
+        // facts (the conflict set can change as main moves) but NEVER the
+        // bounded clock — the budget must be able to expire even if the
+        // executor re-verdicts the car every tick.
+        const parkFacts: any = {
+          ...(cm.merge_train ?? {}),
+          state: "conflicting",
+          bounce_kind: "conflict",
+          defect: (defect ?? "").slice(0, 300) || undefined,
+          conflict_files: conflictFiles,
+          pr,
+          repo,
+          ...(fresh ? { conflicting_at: now } : {}),
+        };
+        delete parkFacts.awaiting;
+        const nextMeta = { ...cm, boosted: now, merge_train: parkFacts };
+        if (String(card.status ?? "") === "blocked") {
+          // IN PLACE — blocked→blocked is an illegal edge (the strand law's
+          // in-place repair shape): one atomic meta write, reason under the
+          // card, queue admission rides the prefix.
+          nextMeta.blocked = { ...(cm.blocked ?? {}), reason: parkReason, ts: fresh ? now : Number(cm.blocked?.ts ?? now) };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now, taskId);
+          this.audit(actor, fresh ? "train:conflicting_park" : "train:conflicting_reassert", taskId, { lane: laneKey(repo, base), pr, ...(headSha ? { head_sha: headSha } : {}), files: conflictFiles.length, in_place: true });
+          this.version(taskId, actor, "update", fresh
+            ? `parked TYPED conflicting (BR#6348) — PR #${pr} conflicts with base (${conflictFiles.length} file(s)); the car stays IN the derived queue on a bounded budget (train.conflicting_budget_min), the loud alarm fires at expiry; exit = mechanical rebase → fresh verify → re-queue at the BACK`
+            : `conflicting re-assert — facts refreshed in place, the bounded clock is NOT reset (BR#6348)`, {});
+        } else {
+          // The pool-churn shape this fix exists to end (a re-bounce of a
+          // card the earlier impl bounce had sent to in_progress/todo):
+          // legal blocked transition carrying the machine-managed park flag,
+          // so the typed-await trip-wires stay off (machine.ts exempt).
+          delete nextMeta.blocked;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now, taskId);
+          await this.transition(
+            {
+              id: taskId,
+              to: "blocked",
+              merge_train: nextMeta.merge_train,
+              note: parkReason,
+              unblock_condition: "the mechanical rebase leg lands (signed force-with-lease push onto origin/main, conflicts resolved) → fresh verify → re-queue at the BACK (BR#6348)",
+            },
+            actor,
+          );
+          this.audit(actor, "train:conflicting_park", taskId, { lane: laneKey(repo, base), pr, ...(headSha ? { head_sha: headSha } : {}), files: conflictFiles.length, from: String(card.status ?? "") });
+          this.version(taskId, actor, "transition", `${String(card.status ?? "")} → blocked — TYPED conflicting park (BR#6348): the car re-enters the derived queue (queue-visible, bounded budget, alarm at expiry) instead of churning in the pool`, {});
+        }
+        cm.merge_train = nextMeta.merge_train;
+        // BR#4934: the lane forgets the in-flight merge ONLY when the bounced
+        // card IS that merge's card — same rule as every bounce leg.
+        const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
+        meta.currently = inFlightBounced ? null : meta.currently;
+        const reason = this.laneSyncReason(lane.id, meta, now);
+        ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, conflicting_park: true }, taskId);
+        this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the car parks TYPED conflicting (BR#6348) — queue-visible on a bounded budget, loud alarm at expiry; the mechanical rebase leg owns the exit`, { reason });
+        return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, conflicting_park: true, reason };
+      }
+      // gate | plain-coverage-lapse (BR#5226 fall-through) — the
       // impl bounce (BR#3516 §5): blocked → in_progress with the fix-up
       // brief; resolution invalidates the verdict — the card re-enters the
       // queue only after a fresh verify. NO ask legs here either (BR#4960):
@@ -9425,9 +9533,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ? `merge-train bounce (gate, base-red) — PR #${pr} is mechanically clean; MAIN is red (${baseRedNames.join(", ") || "required checks"}) — held until it clears; nothing to do on this PR`
           : bounceKind === "gate"
           ? `merge-train bounce (gate) — PR #${pr}: ${(defect ?? "named gate defect").slice(0, 160)}`
-          : bounceKind === "conflict"
-            ? `merge-train bounce (conflict) — PR #${pr} conflicts with base (${conflictFiles.length} file(s))`
-            : `merge-train bounce (coverage) — PR #${pr} head moved past the accepted verdict${headSha ? ` ${String(headSha).slice(0, 9)}` : ""} — the verify pool re-verifies at the new head`;
+          : `merge-train bounce (coverage) — PR #${pr} head moved past the accepted verdict${headSha ? ` ${String(headSha).slice(0, 9)}` : ""} — the verify pool re-verifies at the new head`;
       // BR#4981 state 7: a gate bounce whose mergeStateStatus is `blocked` is
       // branch protection the machine cannot satisfy (review/required checks
       // on the PR head) — surface it as the honest bypass-wait state instead
@@ -9499,9 +9605,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ? `PR #${pr} bounced (gate, base-red) — MAIN is red; the PR is fine and held until it clears (the fix rides the base-red card/ask), then re-queue at the back`
           : bounceKind === "gate"
           ? `PR #${pr} bounced (gate) — named defect; impl fixes it, then re-verify and re-queue at the back`
-          : bounceKind === "conflict"
-            ? `PR #${pr} bounced (conflict) — ${conflictFiles.length} conflicting file(s); the impl repair leg resolves, then re-verify and re-queue at the back`
-            : `PR #${pr} bounced (coverage) — head moved past the verdict; the verify pool re-verifies at the new head, then re-queue at the back`;
+          : `PR #${pr} bounced (coverage) — head moved past the verdict; the verify pool re-verifies at the new head, then re-queue at the back`;
       this.version(lane.id, actor, `train:${kind}`, laneNote, { reason });
       return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason };
     }
@@ -10902,6 +11006,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     meta.prs = withStampHeads;
     meta.pr = { ...(meta.pr ?? {}), repo: withStampHeads[0].repo, number: withStampHeads[0].number, head_sha_at_acceptance: withStampHeads[0].head_sha_at_acceptance, ...(withStampHeads[0].base ? { base: withStampHeads[0].base } : {}) };
     meta.merge_train = { ...(meta.merge_train ?? {}), state: "queued", at: Date.now(), pr: withStampHeads[0].number, repo: withStampHeads[0].repo, legs_total: withStampHeads.length };
+    clearConflictingEpisode(meta.merge_train); // BR#6348: accept ends the conflicting episode
     delete meta.merge_train.awaiting;
     // BR#4068 decay: the bounce boost survives the repair but not the
     // re-entry — the card is back in line, so it re-joins the normal ranks
@@ -11856,6 +11961,80 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     this.audit("system:train", "strand_reboard", id, { class: cls, mode: "blocked_transition", from: status });
     this.version(id, "system:train", "transition", `strand re-board (BR#6163) — ${status} → blocked with the queue park restored and the typed train wait preserved`, { class: cls, from: status });
     return `re-boarded via blocked transition (${status})`;
+  }
+
+  /** BR#6348 — the conflicting-budget sweep (alarm cadence, the strand-sweep
+   *  family). A car parked TYPED conflicting (merge_train.state =
+   *  "conflicting", the BR#6348 park the conflict bounce writes) is a
+   *  queue-visible clock: it stays IN the derived queue (typed admission),
+   *  releaseHold keeps the watchdog from stranding it, and THIS sweep owns
+   *  the bound — past `train.conflicting_budget_min` (default 120, clamped
+   *  15..1440) it alarms ONCE per episode (24h dedupe via
+   *  meta.conflicting_alarm + askCreate's identical-open-ask guard) to the
+   *  train alarm sink, naming the mechanical rebase leg the exit demands
+   *  (repo steering §8: conflict resolution is 100% machine work). The Phase
+   *  A defect (BR#6340: PR #309 churning 3h46m invisible) is impossible by
+   *  construction: queue admission makes the car visible to the starvation
+   *  sweep, and this sweep makes the silence LOUD. The park never expires
+   *  itself — visibility + alarm, not interruption (the BR#4960 Awaiting
+   *  law); the exit is the rebase leg landing or the merge clearing it. */
+  private async sweepConflictingCars(now0: number): Promise<void> {
+    const budgetMin = (() => {
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train.conflicting_budget_min'`);
+      return clampConflictingBudgetMin(s ? parseInt(s.value, 10) : NaN);
+    })();
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, title, meta, status_ts FROM artefacts
+       WHERE type = 'task' AND status = 'blocked'
+         AND json_extract(meta, '$.merge_train.state') = 'conflicting'`,
+    ).toArray() as any[];
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const mt = (meta.merge_train ?? {}) as Record<string, unknown>;
+        const prN = Number(mt.pr ?? 0) || 0;
+        const repo = String(mt.repo ?? (meta.pr as any)?.repo ?? "");
+        const parkedAt = Number(mt.conflicting_at ?? mt.at ?? r.status_ts ?? 0);
+        if (!parkedAt) continue;
+        const ageMs = now0 - parkedAt;
+        if (ageMs < budgetMin * 60_000) continue;
+        // alarm leg: once per card-episode (24h dedupe) + askCreate's
+        // identical-open-ask guard
+        const alarmedAt = Number((mt.conflicting_alarm as any)?.at ?? 0);
+        if (now0 - alarmedAt < 24 * 3_600_000) continue;
+        const files = Array.isArray(mt.conflict_files) ? (mt.conflict_files as unknown[]).map(String).filter(Boolean) : [];
+        const ageH = Math.max(1, Math.round(ageMs / 3_600_000));
+        const budgetH = Math.round(budgetMin / 60 * 10) / 10;
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: `CONFLICTING train car ${r.id} (PR ${repo ? `${repo}#` : "#"}${prN}) past the ${budgetMin}m budget (${ageH}h) — dispatch the mechanical rebase leg?`,
+              reason: `conflicting car loud alarm (BR#6348) — queue-visible the whole time, but the exit is machine work nobody has claimed`,
+              details: `BR#6348 conflicting-budget alarm: card ${r.id} "${String(r.title ?? "").slice(0, 60)}" is parked TYPED conflicting on ${repo ? `${repo}#` : "#"}${prN} — CONFLICTING against its base (${files.length} file(s): ${files.slice(0, 5).join(", ") || "trial-merge failed to enumerate"}). The typed park keeps the car in the derived queue (starvation accounting sees it) and releaseHold keeps the watchdog from stranding it, but the EXIT is the mechanical rebase leg — rebase onto origin/main, resolve the conflicts, signed force-with-lease push, fresh verify, re-queue at the BACK — and no session has claimed it for ${ageH}h (budget ${budgetH}h, knob train.conflicting_budget_min). Repo steering §8: this is 100% machine work — never a human leg.`,
+              options: [
+                "(Recommended) Dispatching the mechanical rebase leg — claim the card, rebase, resolve, signed force-with-lease push, fresh verify",
+                "The conflict needs an authored decision (not mechanical) — say which and why",
+                "False park — the PR is not actually conflicting (re-verify will clear it)",
+              ],
+              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            },
+            "system:train",
+          );
+          const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, r.id);
+          const m2 = JSON.parse(after?.meta ?? "{}");
+          m2.merge_train = { ...(m2.merge_train ?? {}), conflicting_alarm: { at: now0, budget_min: budgetMin } };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m2), r.id);
+          this.audit("system:train", "train:conflicting_budget_expired", r.id, { lane_pr: prN, repo, age_h: ageH, budget_min: budgetMin, files: files.length });
+          this.version(r.id, "system:train", "update", `conflicting budget expired (BR#6348) — ${ageH}h parked conflicting past the ${budgetMin}m budget; loud alarm filed naming the mechanical rebase leg`, {});
+        } catch (e) {
+          // an identical alarm is already open for this episode — that IS once
+          this.audit("system:train", "conflicting_alarm_deduped", r.id, { detail: String((e as Error).message ?? e).slice(0, 200) });
+        }
+      } catch (e) {
+        this.audit("system:train", "conflicting_sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
+      }
+    }
   }
 
   /** BR#5349: the canonical card deep-link for payload surfaces that bypass

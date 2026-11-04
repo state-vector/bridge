@@ -1617,7 +1617,8 @@ other law owns them.
 
 There is exactly ONE answer to "is this card awaiting merge?", and it is the
 typed card phase `meta.merge_train.state` — the closed union
-`queued | awaiting-ci | bounced | awaiting | unbound | base-red-park | landed`
+`queued | awaiting-ci | bounced | conflicting | awaiting | unbound |
+base-red-park | landed`
 (canonical in `@bridge/contracts` `MergeTrainPhaseSchema`; the predicate is
 `isAwaitingMerge` = phase ∈ {queued, awaiting-ci}). Every reader asks the
 field: the derived queue (`mergeTrainQueue` admits on prefix OR stamp —
@@ -1670,6 +1671,37 @@ starved until a manual re-park.
 Pinned in `packages/worker/test/br6349-stale-requeue.test.ts` (the incident
 note rides the real bundled DO) plus the parser drills in
 `merge-train.test.ts`.
+
+### Conflicting cars park, typed — never churn (BR#6348)
+
+A conflicting head car used to bounce back to `in_progress` — invisible to
+every queue reader (the derived queue went silently empty while the lane
+still held a car) and churned: the Phase A specimen retried the same losing
+trial-merge for 3h46m with zero signal. Now a conflicting gate verdict parks
+the card **typed**: `meta.merge_train.state = "conflicting"` (in the closed
+union) with `conflicting_at` starting a **bounded budget** — knob
+`train.conflicting_budget_min` (default 120 min, clamped 15–1440). The park
+reason carries the `merge-train: conflicting` prefix, which — like the
+queued prefix — ADMITS the card into the derived `mergeTrainQueue`:
+starvation accounting, the panel queue block, and the lane's queue counts
+all see it. Admission here means **visibility, not mergeability** — the
+executor's walk SKIPS a car already parked conflicting (a repeat conflicting
+verdict on a parked car converts to Skip, class `conflict`; only the first
+verdict bounces, establishing the park with the trial-merge file list), so
+the clock owns the exit, not churn. `releaseHold` protects the park (the
+watchdog never strands it). Past the budget `sweepConflictingCars` (alarm
+cadence) fires ONE ask per episode (24h `conflicting_alarm` dedupe plus the
+identical-open-ask guard) to the train alarm sink naming the mechanical
+rebase leg — repo steering §8: the exit is 100% machine work. A claiming
+session ends the park (blocked→in_progress flips the phase conflicting→
+bounced and clears the episode keys), rebases onto origin/main, resolves,
+signed force-with-lease pushes, re-verifies, and re-queues at the BACK.
+Every phase write that leaves the phase (accept → queued, train:merged,
+machine re-queue) clears `conflicting_at`/`conflicting_alarm`
+(`clearConflictingEpisode`) — stale keys are inert to readers but illegal
+residue under the closed union. `trainStrandClass` returns null for
+`conflicting` (the budget sweep owns it; the strand sweep never double-owns).
+Pinned in `packages/worker/test/br6348-conflicting-park.test.ts`.
 
 ### The ops (MCP + HTTP)
 

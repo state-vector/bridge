@@ -339,7 +339,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-batch" });
   });
 
-  it("a merge-tree conflict bounces the head card with the fix-up brief (verdict INVALID) and the queue advances", async () => {
+  it("a merge-tree conflict parks the head card TYPED conflicting (BR#6348) — queue-visible on a bounded budget, the follower queues behind", async () => {
     const repo = "state-vector/lane-bounce";
     const c1 = await queueViaAccept({ repo, pr: 2601, head: "b".repeat(40), title: "IMPL: bounce drill head" });
     const c2 = await queueViaAccept({ repo, pr: 2602, head: "d".repeat(40), title: "IMPL: bounce drill follower" });
@@ -353,8 +353,10 @@ describe("merge train DO drill (real bundled worker)", () => {
     });
     expect(merged.body.error ?? "").toBe("");
 
-    // the executor's trial rebase hit conflicts → bounce with the file list,
-    // NAMING THE KIND (BR#4066: every bounce carries coverage|conflict|gate)
+    // the executor's trial rebase hit conflicts → the car parks TYPED
+    // conflicting (BR#6348), NOT an impl bounce into pool churn — queue
+    // visibility is the invariant the Phase A defect broke (3h46m silent
+    // empty queue while a conflicting car churned invisible)
     const bounced = await kbJson("/train.event", {
       repo, base: "main", kind: "bounced", actor: "gw-b", pr: 2601, head_sha: "b".repeat(40),
       bounce_kind: "conflict", merge_state_status: "dirty",
@@ -363,25 +365,31 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.error ?? "", `train:bounced failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.task).toBe(c1);
     expect(bounced.body.bounce_kind).toBe("conflict");
+    expect(bounced.body.conflicting_park).toBe(true);
 
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
-    expect(card1.meta?.merge_train?.state).toBe("bounced");
-    expect(String(card1.body_md)).toContain("Merge-train bounce (conflict): PR #2601");
-    expect(String(card1.body_md)).toContain("- `packages/worker/src/kb/do.ts`");
-    expect(String(card1.body_md)).toContain("- `packages/contracts/src/mcp.ts`");
-    expect(String(card1.body_md)).toContain("INVALID at the new head");
-    expect(String(card1.body_md)).toContain("the impl repair leg");
-    expect(String(card1.body_md)).toContain("machine-clean carries, human-resolved invalidates");
-    expect(String(card1.body_md)).toContain("re-queues at the BACK");
-    // the transition note names the kind too — not a generic "conflicts with base"
+    expect(card1.status).toBe("blocked");
+    expect(card1.meta?.merge_train?.state).toBe("conflicting");
+    expect(card1.meta?.merge_train?.bounce_kind).toBe("conflict");
+    expect(card1.meta?.merge_train?.conflicting_at).toBeGreaterThan(0);
+    expect(card1.meta?.merge_train?.conflict_files).toEqual(["packages/worker/src/kb/do.ts", "packages/contracts/src/mcp.ts"]);
+    // the park reason IS the plain-reading brief: enumerated conflicts + the
+    // demanded machine leg (the mechanical rebase owns the exit)
+    expect(String(card1.meta?.blocked?.reason ?? "")).toMatch(/^merge-train: conflicting — PR state-vector\/lane-bounce#2601 conflicts with base \(2 file\(s\)\): /);
+    expect(String(card1.meta?.blocked?.reason ?? "")).toContain("packages/worker/src/kb/do.ts");
+    expect(String(card1.meta?.blocked?.reason ?? "")).toContain("packages/contracts/src/mcp.ts");
+    expect(String(card1.meta?.blocked?.reason ?? "")).toContain("force-with-lease");
+    expect(String(card1.meta?.blocked?.reason ?? "")).toContain("BR#6348");
+    // the version log names the park — the machine action is on the record
     const bounceHist = (await kbJson("/get_history", { id: c1, limit: 5 })).body;
-    expect(JSON.stringify(bounceHist)).toContain("merge-train bounce (conflict) — PR #2601 conflicts with base (2 file(s))");
+    expect(JSON.stringify(bounceHist)).toContain("parked TYPED conflicting (BR#6348)");
 
-    // the lane freed; the follower is now the whole queue
+    // the lane freed (the bounced card WAS the in-flight merge) but the car
+    // STAYS IN the derived queue — visible on its bounded budget, the
+    // follower queues behind it (never a silently empty queue again)
     const after = await laneSnap(repo);
     expect(after.currently).toBeNull();
-    expect(after.queue.map((x: any) => x.id)).toEqual([c2]);
+    expect(after.queue.map((x: any) => x.id)).toEqual([c1, c2]);
   });
 
   it("a PLAIN coverage lapse (head moved past the verdict, no human leg, BR#5226) bounces to the VERIFY POOL — coverage brief, NO Awaiting park, NO conflict language, ZERO duty spam", async () => {
