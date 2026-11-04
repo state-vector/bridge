@@ -8555,6 +8555,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           const holder = lease!.holder;
           meta.lease = null;
           const reason = this.laneSyncReason(r.id, meta, now);
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, r.id);
           this.audit("system:merge-train", "lease_lapsed", r.id, { holder, expired_at: new Date(lease!.expires_ts).toISOString(), reason });
           this.version(r.id, "system:merge-train", "lease_lapsed", `lease of ${holder} lapsed — ${reason}`, {});
         } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:")) {
@@ -8643,12 +8644,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (meta.currently?.phase === "stopped") meta.currently = null;
     }
     const reason = this.laneSyncReason(lane.id, meta, now);
-    // BR#5114: laneSyncReason persists only on a reason CHANGE — the
-    // now_action stamp refreshes every renewal without one, so persist it
-    // explicitly (idempotent; ~1 write per lane per tick).
-    if (action === "renew" && progNote) {
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
-    }
+    // BR#5114 + BR#6012: laneSyncReason persists only on a reason CHANGE —
+    // while meta.stop is set (or on re-acquire with an unchanged reason),
+    // meta.lease, meta.lane.last_capable_lease_ts, and now_action still
+    // change every lease op, so ALWAYS persist meta explicitly here.
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
     this.audit(actor, `train:lease_${action}`, lane.id, { lane: laneKey(repo, base), note: decided.note });
     this.version(lane.id, actor, `train:lease_${action}`, decided.note, { lease: meta.lease, reason });
     return { ok: true, lane: laneKey(repo, base), lease: meta.lease, currently: meta.currently ?? null, stop: meta.stop ?? null, reason, note: decided.note };
@@ -11741,6 +11741,30 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             `auto-closed (BR#6012 state machine: phase=${rf.state.phase}, warrantAsk=false) — no human action is warranted while ${rf.state.phase === "cure_pr_merged_awaiting_ci" ? `fix PR #${rf.mergedPr?.number} is already merged and settling post-merge CI` : "the fix work runs automatically"}`,
             { from: "todo", to: "done" },
           );
+        }
+        // BR#6012: when a root-fix cure PR has merged on top of an older
+        // stopped commit (`rf.mergedPr.merge_sha !== stopActive.sha`) and the
+        // new merge commit's CI is settling (`!brBase || brBase.verdict !== "red"`),
+        // transition the lane out of the superseded `stopped` state into
+        // `awaiting-ci` on the cure's merge commit so the executor polls the
+        // cure's CI to green and drains the queue.
+        if (
+          stopActive &&
+          rf.state.phase === "cure_pr_merged_awaiting_ci" &&
+          rf.mergedPr?.merge_sha &&
+          String(stopActive.sha ?? "") !== rf.mergedPr.merge_sha &&
+          (!brBase || String(brBase.verdict ?? "") !== "red")
+        ) {
+          delete meta.stop;
+          meta.currently = {
+            pr: rf.mergedPr.number,
+            merge_sha: rf.mergedPr.merge_sha,
+            phase: "awaiting-ci",
+            task_id: rf.card?.id ?? null,
+            merged_at: now0,
+          };
+          this.laneSyncReason(l.id, meta, now0);
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
         }
         base_red_resolution = {
           verdict: brBase ? String(brBase.verdict ?? "red") : mNowUnsettled ? "unsettled" : "red",
