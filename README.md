@@ -1524,6 +1524,43 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
   queued (`merge-train: queued — waiting on N leg(s): repo#n, …`); the final close
   cites every leg's merge commit.
 
+### Bounce-release strands are re-boarded (BR#6163)
+
+A card that left the merge queue while carrying a **train-only wait** —
+`pr_merged` / `pr_checks_green`, events only a lane's `train_events` can fire —
+can never have that wait satisfied by anything a pool executor does: the wait
+fires from lane merges, and the card is in no lane's queue. The ghost
+bounce-release (a verify bounce whose owning session is dead) used to release
+exactly such a card to the pool, stamping no trace of the dead wait — BR#5522
+(PR #2734) starved 38 hours under a healthy train that merged 24 PRs a day.
+
+Three legs close the class. The ghost release now copies the train-only wait
+onto the release stamp (`bounce_released.train_only_await`) so the strand is
+readable from the card's own facts. The alarm-cadence strand sweep
+(`sweepStrandedTrainCards`) judges every open card carrying train state or a
+train-only wait: strand classes are `out_of_queue_await` (a train-only wait,
+no longer a queue candidate), `queued_out_of_queue` (the card says queued, the
+derived queue dropped it — the unprefixed-park class), and `unbound_in_queue`
+(admitted but legless — the fail-closed unbound park). A strand only counts
+when the lane it cites is HEALTHY — a `merged` event newer than the card's
+park proves the train moved and left this car behind (a stalled train is the
+starvation sweep's problem, not stranded cars) — and only past
+`train.strand_hours` (a setting, default 2, clamped 1–168). The reaction is
+ONE machine re-board per episode — an in-place reason-prefix repair for
+blocked parks (`merge-train: queued — strand re-board (BR#6163): …`, the
+prefix is what admits the car back into the derived queue; blocked→blocked is
+an illegal edge) or a legal `blocked` transition for released cards, carrying
+the machine-managed park flag so the agent queue hook never re-parses legs,
+and the typed wait is preserved — pinned by `meta.strand_reboard` so a card
+is re-boarded once, never cyclically; a live in_progress claim is never
+hijacked. `unbound_in_queue` cars are alarm-only: a machine re-queue would
+fail-closed re-stamp unbound. Every strand also alarms ONCE per card-episode
+(24h `strand_alarm` dedupe plus the identical-open-ask guard) to the train
+alarm sink (`train_alarm_sink_id`, default BR#3124) with the class, the age,
+and what the machine already did. Awaiting parks (BR#5633's sweep), bounced
+re-entry (BR#4494's demote), and cards holding a bound ask are excluded —
+other law owns them.
+
 ### The ops (MCP + HTTP)
 
 `train.status` (GET `/train` mirrors it) · `train.lease` (acquire / renew / release) ·
