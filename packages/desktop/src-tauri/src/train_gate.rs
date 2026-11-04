@@ -69,6 +69,26 @@ pub struct CheckVerdict {
     /// - zero total runs on the tip → "tip carries no check runs at all"
     /// - N runs read but 0 matched required_workflows → "{N} runs read, none matched required set — check names/pagination"
     pub alarm: Option<String>,
+    /// BR#5883 (gate-consumed qualifier): set ONLY when the lane-scoped
+    /// verdict is Green while the repo's own merge gate (`main-green gate`,
+    /// scripts/main-green-gate.sh — it judges main's WHOLE tip, the exact
+    /// classify_main_check_runs predicate) would judge that same tip
+    /// non-green. The lane verdict stays Green (BR#5265's law: non-required
+    /// reds never park the train), but a plain green is no longer certified —
+    /// the hub escalates the qualifier at P1 and the lane vocabulary names
+    /// the gate-blocking checks. None whenever the verdict already speaks
+    /// for the whole tip (unconfigured lanes) or is itself non-green.
+    pub gate: Option<GateBlock>,
+}
+
+/// BR#5883: the repo gate's own view of the tip — what `main-green gate`
+/// would report right now (per-name newest-non-cancelled judge, any red /
+/// any unsettled fails, zero runs fails).
+#[derive(Clone, Debug)]
+pub struct GateBlock {
+    pub verdict: MainVerdict,
+    pub red: Vec<MainRedCheck>,
+    pub unsettled: Vec<String>,
 }
 
 fn is_red_conclusion(c: &str) -> bool {
@@ -106,6 +126,7 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
             external: vec![],
             green: 0,
             alarm: Some("tip carries no check runs at all".to_string()),
+            gate: None,
         };
     }
     let mut red = Vec::new();
@@ -149,6 +170,7 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
             external: vec![],
             green: 0,
             alarm: Some("tip carries no check runs at all".to_string()),
+            gate: None,
         };
     }
     if required.is_empty() {
@@ -185,13 +207,43 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
                 "{} runs read, none matched required set — check names/pagination",
                 runs.len()
             )),
+            gate: None,
         };
     }
+    // Never mask a red base_state mid-burst: when the required-set read is
+    // not itself fully green, a red base-health gate folds in — the verdict
+    // speaks red instead of a mid-burst green.
     let mut res = classify_main_check_runs(&scoped);
     if let Some(gv) = gate_verdict {
         if gv.verdict == MainVerdict::Red && !(res.verdict == MainVerdict::Green && res.green >= required.len()) {
             res.verdict = MainVerdict::Red;
             res.red.extend(gv.red);
+        }
+    }
+    // BR#5883 (gate-consumed qualifier): a required-set GREEN no longer
+    // certifies a plain green when the repo's own merge gate would judge the
+    // same tip non-green. On a merge-commit tip the required `main-green
+    // gate` run is vacuous (BR#5847) and the checks it consumes (e.g. the
+    // 2026-11-03 `Deploy drift alarm` FAILURE, run 41632091557) sit outside
+    // the required set — the scoped read certified green while every car's
+    // gate failed and the lane starved 3.5h+ with the P1 base alarm silent.
+    // The qualifier rides the stamp; the verdict itself stays Green (the
+    // BR#5265 law stands: non-required reds never park the walk — the cars'
+    // own gate rows and the hub escalation own the block). The two arms
+    // compose: the fold above speaks for mid-burst states; this qualifier
+    // speaks for the fully-green lane read the fold deliberately leaves
+    // untouched.
+    if res.verdict == MainVerdict::Green {
+        let gate = classify_main_check_runs(runs);
+        if gate.verdict != MainVerdict::Green {
+            return CheckVerdict {
+                gate: Some(GateBlock {
+                    verdict: gate.verdict,
+                    red: gate.red,
+                    unsettled: gate.unsettled,
+                }),
+                ..res
+            };
         }
     }
     res
@@ -251,7 +303,7 @@ fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<
     } else {
         MainVerdict::Green
     };
-    CheckVerdict { verdict, red, unsettled, external, green, alarm: None }
+    CheckVerdict { verdict, red, unsettled, external, green, alarm: None, gate: None }
 }
 
 /// BR#5880 (live incident, tick 2026-11-03T21:23:47Z on PR #2707): the
@@ -485,6 +537,17 @@ pub fn bounce_event_kind(gate: &BounceKind, trial_clean: bool, files_len: usize)
 /// pass — the one-click human merge ask is the fast lane (BR#5189 §5, SP #2617
 /// precedent). MUST stay byte-identical to core.ts DEPLOY_HEALTH_PATTERN.
 pub const DEPLOY_HEALTH_PATTERN: &str = "deploy health";
+
+/// The destination-green gate check (BR#3008/BR#3009) — matched as a
+/// lowercase substring against the check NAME ("main-green gate" matches).
+/// A head red of this class judges MAIN's tip, not the PR's own code: when
+/// main's tip now classifies fully green (the exact predicate the gate
+/// runs, scripts/main-green-gate.sh), the conviction is stale by
+/// construction and the self-heal re-runs it (BR#5883 — the 2026-11-03
+/// episode: a gate red stamped 09:07:27Z against a transiently-unsettled
+/// `Test` pinned the head car for hours; main settled green 20s later and
+/// nothing re-opened the terminal verdict). MUST stay byte-identical to
+/// core.ts MAIN_GREEN_GATE_PATTERN.
 pub const MAIN_GREEN_GATE_PATTERN: &str = "main-green gate";
 
 pub fn is_base_health_gate_name(name: &str) -> bool {
@@ -563,6 +626,14 @@ pub struct TrainGateInput<'a> {
     /// matches the circular deploy-health class off them (the receipt names
     /// the red the fix cures).
     pub base_red_names: &'a [String],
+    /// BR#5883: the tip's whole-tip gate predicate is GREEN — main's tip
+    /// classifies fully green under `classify_main_check_runs` (the exact
+    /// predicate `main-green gate` runs), i.e. the walk-start scoped verdict
+    /// is Green with no gate qualifier attached. Gates the stale
+    /// main-green-gate self-heal: a gate conviction against a since-settled
+    /// tip re-runs; a conviction against a still-red tip is honest and
+    /// stands (the base alarm / P1 escalation owns it).
+    pub base_gate_green: bool,
 }
 
 /// core.ts decideMergeAction (907): the 5c gate + verify lineage as one
@@ -745,6 +816,15 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 .red
                 .iter()
                 .all(|r| is_base_health_gate_name(&r.name))
+            // BR#5883: the main-green gate class has its own arm below — it
+            // re-runs under the gate's own predicate (base_gate_green) and
+            // names the class in its reason. An ALL-main-green-gate red must
+            // not be consumed here with the deploy-health reason, or the
+            // dedicated arm can never fire (the 2026-11-03 test failure).
+            && head
+                .red
+                .iter()
+                .all(|r| !r.name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
         {
             return MergeAction::RerunGate {
                 reason: format!(
@@ -753,6 +833,40 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                     names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
                 ),
             };
+        }
+        // BR#5883 stale-gate sibling self-heal: the destination-green gate
+        // (`main-green gate`) judges MAIN's tip, not the PR's own code. A
+        // head red of ENTIRELY that class while the tip now classifies
+        // fully green under the gate's own predicate is a stale conviction
+        // by construction — the check stamped FAILURE against a tip that
+        // was transiently unsettled (or red) and has since settled
+        // (observed 2026-11-03: gate red at 09:07:27Z judged a `Test` run
+        // still in flight; main settled green at 09:07:47Z — 20s later —
+        // and the terminal verdict pinned the head car for hours because
+        // this arm only matched the deploy-health class). Re-run the gate
+        // job and treat the entry as a clock: the fresh run clears or
+        // re-convicts honestly. NEVER a bounce (a bounce round-trips the
+        // verify pool for a defect the PR does not carry), NEVER a human
+        // leg (no decision is needed — the gate's own predicate holds).
+        // The base_gate_green input is what separates a STALE gate red
+        // (re-run) from an HONEST one (a tip red exists — re-running would
+        // just re-convict; the qualifier escalation owns the block).
+        if i.base_gate_green {
+            let head = classify_head_checks(i.head_checks);
+            if head.verdict == MainVerdict::Red
+                && head
+                    .red
+                    .iter()
+                    .all(|r| r.name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
+            {
+                return MergeAction::RerunGate {
+                    reason: format!(
+                        "PR #{n} head red is entirely the main-green gate class ({names}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run",
+                        n = i.pr_number,
+                        names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                };
+            }
         }
     }
     // BR#3727: blocked with head checks merely PENDING is a clock, not a
@@ -1156,6 +1270,120 @@ mod tests {
     }
 
     #[test]
+    fn gate_qualifier_fires_when_scoped_green_but_repo_gate_judges_red_br5883() {
+        // The 2026-11-03 starve shape (BR#5822 episode 2): tip is a MERGE
+        // commit — the required `main-green gate` run is vacuous there
+        // (BR#5847) — `Test`/`CLI build` are green, but the non-required
+        // `Deploy drift alarm` FAILED. The scoped verdict must stay GREEN
+        // (BR#5265 law: non-required reds never park the walk) while the
+        // qualifier names exactly what the repo's own gate would report.
+        let tip = [
+            run(1, "Test", Some("success")),
+            run(2, "CLI build (packages/cli)", Some("success")),
+            run(3, "Deploy drift alarm", Some("failure")),
+        ];
+        let required: Vec<String> = vec!["Test".into(), "CLI build (packages/cli)".into(), "main-green gate".into()];
+        let v = classify_base_check_runs(&tip, &required);
+        assert!(matches!(v.verdict, MainVerdict::Green), "scoped verdict stays green: got {:?}", v.verdict);
+        let gate = v.gate.expect("gate qualifier must ride a scoped-green tip the repo gate judges red");
+        assert!(matches!(gate.verdict, MainVerdict::Red));
+        assert_eq!(gate.red.len(), 1);
+        assert_eq!(gate.red[0].name, "Deploy drift alarm");
+        assert!(gate.unsettled.is_empty());
+    }
+
+    #[test]
+    fn gate_qualifier_covers_unsettled_and_stays_silent_when_honest_br5883() {
+        let required: Vec<String> = vec!["Test".into(), "main-green gate".into()];
+        // gate verdict UNSETTLED: a tip check still in flight fails the gate
+        // script too ("an in-flight main does not vouch for main")
+        let v = classify_base_check_runs(
+            &[run(1, "Test", Some("success")), run(2, "Deploy health (merge gate)", None)],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Green));
+        let gate = v.gate.expect("in-flight non-required check fails the gate: qualifier must fire");
+        assert!(matches!(gate.verdict, MainVerdict::Unsettled));
+        assert_eq!(gate.unsettled, vec!["Deploy health (merge gate)"]);
+        // fully green tip → NO qualifier (silence is the point)
+        let v = classify_base_check_runs(
+            &[run(1, "Test", Some("success")), run(2, "main-green gate", Some("success")), run(3, "Deploy drift alarm", Some("success"))],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Green));
+        assert!(v.gate.is_none(), "a tip the gate judges green must not carry the qualifier");
+        // scoped verdict RED → the verdict itself speaks; no qualifier
+        let v = classify_base_check_runs(
+            &[run(1, "Test", Some("failure")), run(2, "Deploy drift alarm", Some("failure"))],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Red));
+        assert!(v.gate.is_none());
+        // un-configured lane → the whole-tip read IS the gate verdict; no qualifier
+        let v = classify_base_check_runs(&[run(1, "ci", Some("failure"))], &[]);
+        assert!(matches!(v.verdict, MainVerdict::Red));
+        assert!(v.gate.is_none());
+    }
+
+    #[test]
+    fn stale_main_green_gate_red_self_heals_on_a_gate_green_tip_br5883() {
+        // The sibling defect (BR#5822 episode 2): the head car's gate red was
+        // stamped 09:07:27Z against a transiently-unsettled `Test` on main;
+        // main settled green 09:07:47Z and nothing re-ran the terminal
+        // verdict. With base GREEN (scoped) AND the tip judging fully green
+        // under the gate's own predicate (base_gate_green), the stale
+        // conviction must re-run — never bounce, never a human leg.
+        let head = [run(1, "Test", Some("success")), run(2, "main-green gate", Some("failure"))];
+        let g = MainVerdict::Green;
+        let commits = [(format!("{:040x}", 1), true)];
+        let action = decide_train_gate(crate::train_gate::TrainGateInput {
+            pr_number: 377,
+            head_sha: &format!("{:040x}", 2),
+            card_meta: &serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 377, "head_sha_at_acceptance": format!("{:040x}", 2) } }),
+            card_status: Some("blocked"),
+            base_verdict: g.clone(),
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".to_string()),
+            commits: &commits,
+            head_checks: &head,
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
+            base_gate_green: true,
+        });
+        match action {
+            MergeAction::RerunGate { reason } => {
+                assert!(reason.contains("main-green gate class"), "reason must name the class: {reason}");
+                assert!(reason.contains("BR#5883"), "reason must cite the card: {reason}");
+            }
+            other => panic!("expected rerun_gate, got {:?}", other),
+        }
+        // The HONEST gate red: the tip still judges non-green (a real
+        // `Deploy drift alarm` red sits on main) — NO self-heal; the entry
+        // falls through to the standing blocked rows (queued card → Note).
+        let action = decide_train_gate(crate::train_gate::TrainGateInput {
+            pr_number: 377,
+            head_sha: &format!("{:040x}", 2),
+            card_meta: &serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 377, "head_sha_at_acceptance": format!("{:040x}", 2) } }),
+            card_status: Some("blocked"),
+            base_verdict: g,
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".to_string()),
+            commits: &commits,
+            head_checks: &head,
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
+            base_gate_green: false,
+        });
+        assert!(
+            !matches!(action, MergeAction::RerunGate { .. }),
+            "an honest gate conviction must not re-run against a red tip: got {:?}",
+            action
+        );
+    }
+
+    #[test]
     fn merge_action_order_is_the_law() {
         let ok = |n: i64| (format!("{n:040x}"), true);
         let g = MainVerdict::Green;
@@ -1275,6 +1503,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -1315,6 +1544,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Bounce { bounce_kind, .. } => assert_eq!(bounce_kind, BounceKind::Coverage),
@@ -1343,6 +1573,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -1375,6 +1606,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Skip { reason } => {
@@ -1398,6 +1630,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Note { reason } => assert!(reason.contains("head check RED"), "reason: {reason}"),
@@ -1426,6 +1659,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -1489,6 +1723,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("leg 1/1") && receipt.contains("BR#3516")),
@@ -1555,6 +1790,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         }
     }
 
@@ -1758,6 +1994,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: true,
             base_red_names: &["Deploy health (merge gate)".to_string(), "Deploy Dev".to_string()],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -1786,6 +2023,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &["Deploy Dev".to_string()],
+            base_gate_green: false,
         });
         assert!(matches!(gate, MergeAction::Skip { .. }), "got {gate:?}");
     }
@@ -1809,6 +2047,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: true,
             base_red_names: &["Deploy health (merge gate)".to_string()],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::HumanLeg { reason } => {
@@ -1836,6 +2075,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &["Deploy health (merge gate)".to_string()],
+            base_gate_green: false,
         });
         assert!(!matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
     }
@@ -1860,6 +2100,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: true,
             base_red_names: &["Deploy Dev".to_string()],
+            base_gate_green: false,
         });
         assert!(!matches!(gate, MergeAction::Merge { .. }) && !matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
     }
@@ -1882,6 +2123,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: true,
             base_red_names: &[],
+            base_gate_green: false,
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "got {gate:?}");
     }
@@ -1911,6 +2153,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         match gate {
             MergeAction::RerunGate { reason } => {
@@ -1944,6 +2187,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         assert!(!matches!(gate, MergeAction::RerunGate { .. }), "got {gate:?}");
         assert!(matches!(gate, MergeAction::Note { .. }), "got {gate:?}");
@@ -1968,6 +2212,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &["Deploy health (merge gate)".to_string()],
+            base_gate_green: false,
         });
         assert!(!matches!(gate, MergeAction::RerunGate { .. }), "got {gate:?}");
     }
@@ -1999,6 +2244,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: false,
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
     }
@@ -2024,6 +2270,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: true,
         });
         assert!(matches!(gate, MergeAction::RerunGate { .. }), "expected RerunGate on stale main-green gate, got {gate:?}");
     }

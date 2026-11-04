@@ -261,6 +261,14 @@ export interface KbTrainLane {
       scoped_to_required?: boolean;
       red?: { name: string; url?: string }[];
       unsettled?: string[];
+      /** BR#5883: the gate-consumed qualifier — the scoped verdict IS green
+       *  but the repo's own merge gate (`main-green gate`, judging main's
+       *  WHOLE tip) reports non-green. The lane reads GATE-BLOCKED while
+       *  cars are held; escalated at P1 hub-side. */
+      gate_blocked?: boolean;
+      gate_verdict?: "green" | "red" | "unsettled" | "empty";
+      gate_red?: { name: string; url?: string }[];
+      gate_unsettled?: string[];
     };
     /** BR#5376: the ACTIVE batch-stall episode — members were selected,
      *  merges attempted, NOTHING landed for K consecutive ticks. The next

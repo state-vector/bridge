@@ -920,6 +920,14 @@ export type MainCheckVerdict = {
   green: number;
   /** BR#5674 P1 (empty-is-loud): explains why verdict === "empty" */
   alarm?: string;
+  /** BR#5883 (gate-consumed qualifier): set ONLY when the lane-scoped
+   *  verdict is Green while the repo's own merge gate (`main-green gate`,
+   *  scripts/main-green-gate.sh — it judges main's WHOLE tip, the exact
+   *  classifyMainCheckRuns predicate) would judge that same tip non-green.
+   *  The verdict stays Green (BR#5265's law: non-required reds never park
+   *  the train); the qualifier is what the hub escalates at P1. Mirror of
+   *  train_gate.rs CheckVerdict.gate. */
+  gate?: { verdict: MainCheckVerdict["verdict"]; red: MainRedCheck[]; unsettled: string[] };
 };
 
 /** Conclusions that mean the line is stopped. `cancelled` and null are NOT
@@ -963,8 +971,8 @@ export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
   return { verdict: "green", red, unsettled, green };
 }
 
-/** BR#5265 Fix B + BR#5674 P1 (empty-is-loud): TypeScript mirror of
- *  train_gate.rs classify_base_check_runs. */
+/** BR#5265 Fix B + BR#5674 P1 (empty-is-loud) + BR#5883 (gate-consumed
+ *  qualifier): TypeScript mirror of train_gate.rs classify_base_check_runs. */
 export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]): MainCheckVerdict {
   if (!runs.length) {
     return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
@@ -987,6 +995,9 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
       alarm: `${runs.length} runs read, none matched required set — check names/pagination`,
     };
   }
+  // Never mask a red base_state mid-burst: when the required-set read is not
+  // itself fully green, a red base-health gate folds in — the verdict speaks
+  // red instead of a mid-burst green.
   const res = classifyMainCheckRuns(scoped);
   if (gateVerdict && gateVerdict.verdict === "red" && !(res.verdict === "green" && res.green >= required.length)) {
     return {
@@ -994,6 +1005,20 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
       verdict: "red",
       red: [...res.red, ...gateVerdict.red],
     };
+  }
+  // BR#5883: a required-set GREEN no longer certifies a plain green when the
+  // repo's own merge gate would judge the same tip non-green (the 2026-11-03
+  // starve: `Deploy drift alarm` red on a merge-commit tip — the required
+  // `main-green gate` run is vacuous there, BR#5847 — certified green while
+  // every car's gate failed). Mirror of the train_gate.rs composition. The
+  // two arms compose: the fold above speaks for mid-burst states; this
+  // qualifier speaks for the fully-green lane read the fold deliberately
+  // leaves untouched.
+  if (res.verdict === "green") {
+    const gate = classifyMainCheckRuns(runs);
+    if (gate.verdict !== "green") {
+      return { ...res, gate: { verdict: gate.verdict, red: gate.red, unsettled: gate.unsettled } };
+    }
   }
   return res;
 }
@@ -1889,6 +1914,13 @@ export const MAIN_RED_TAG = "main-red";
  *  can pass — the one-click human merge ask is the fast lane (BR#5189 §5,
  *  SP #2617 precedent). MUST stay byte-identical to train_gate.rs. */
 export const DEPLOY_HEALTH_PATTERN = "deploy health";
+
+/** BR#5883: the destination-green gate check (BR#3008/BR#3009) — matched as a
+ *  lowercase substring against the check NAME ("main-green gate" matches). A
+ *  head red of this class judges MAIN's tip, not the PR's own code; when the
+ *  tip now classifies fully green under the gate's own predicate the
+ *  conviction is stale by construction and the self-heal re-runs it. MUST
+ *  stay byte-identical to train_gate.rs MAIN_GREEN_GATE_PATTERN. */
 export const MAIN_GREEN_GATE_PATTERN = "main-green gate";
 
 export function isBaseHealthGateName(name: string): boolean {
@@ -2375,6 +2407,12 @@ export type TrainGateInput = {
    *  position in meta.prs) — the gate checks THAT leg's stamp, and the
    *  merge receipt cites the leg, not just the PR. */
   legNumber?: number;
+  /** BR#5883: main's tip judges fully green under the gate's own predicate
+   *  (classifyMainCheckRuns over the WHOLE tip — the exact main-green-gate
+   *  script rule), i.e. the walk-start scoped verdict is Green with no gate
+   *  qualifier attached. Gates the stale main-green-gate self-heal. Mirror
+   *  of train_gate.rs TrainGateInput.base_gate_green. */
+  baseGateGreen?: boolean;
 };
 
 // ---- the executor's fact boundary (BR#3714) ----
@@ -2467,7 +2505,13 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     const head = classifyHeadChecks(i.headChecks);
     if (
       head.verdict === "red" &&
-      head.red.every((r) => isBaseHealthGateName(r.name))
+      // BR#5883: the main-green gate class has its own arm below — it
+      // re-runs under the gate's own predicate (baseGateGreen) and names
+      // the class in its reason. An ALL-main-green-gate red must not be
+      // consumed here with the deploy-health reason, or the dedicated arm
+      // can never fire (the 2026-11-03 test failure).
+      head.red.every((r) => isBaseHealthGateName(r.name)) &&
+      head.red.every((r) => !r.name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN))
     )
       return {
         kind: "rerun_gate",
@@ -2475,6 +2519,35 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
           .map((r) => r.name)
           .join(", ")}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run`,
       };
+    // BR#5883 stale-gate sibling self-heal: the destination-green gate
+    // (`main-green gate`) judges MAIN's tip, not the PR's own code. A head
+    // red of ENTIRELY that class while the tip now judges fully green under
+    // the gate's own predicate is a stale conviction by construction — the
+    // check stamped FAILURE against a transiently-unsettled or since-settled
+    // tip (observed 2026-11-03: gate red at 09:07:27Z judged a `Test` run
+    // still in flight; main settled green 20s later and the terminal verdict
+    // pinned the head car for hours). Re-run the gate job and treat the
+    // entry as a clock: the fresh run clears or re-convicts honestly. NEVER
+    // a bounce, NEVER a human leg. baseGateGreen is what separates a STALE
+    // gate red (re-run) from an HONEST one (a tip red exists — re-running
+    // would just re-convict; the qualifier escalation owns the block). MUST
+    // stay behaviour-identical to train_gate.rs decide_train_gate.
+    // BR#5883: baseGateGreen absent (legacy callers that predate the field)
+    // defaults to GREEN — only an EXPLICIT false marks the conviction honest
+    // (a real tip red; re-running would just re-convict).
+    if (i.baseGateGreen !== false) {
+      const headGate = classifyHeadChecks(i.headChecks);
+      if (
+        headGate.verdict === "red" &&
+        headGate.red.every((r) => r.name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN))
+      )
+        return {
+          kind: "rerun_gate",
+          reason: `PR #${i.prNumber} head red is entirely the main-green gate class (${headGate.red
+            .map((r) => r.name)
+            .join(", ")}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run`,
+        };
+    }
   }
   // BR#3727: blocked with head checks merely PENDING is a clock, not a
   // defect — strict branch protection re-runs the required checks on the
@@ -2736,6 +2809,50 @@ export function trainBaseRedAskTitle(lane: { repo: string; base: string }, reds:
   return prefix + names + suffix;
 }
 
+/** Deterministic gate-blocked alarm ask title (BR#5883 — ONE per gate-blocked
+ *  episode; the gate-red-name set makes it unique per episode, askCreate's
+ *  identical-open-ask guard dedupes the per-tick repeats). ≤240 chars, ends
+ *  "?" — the ask contract. */
+export function trainGateBlockedAskTitle(lane: { repo: string; base: string }, gateReds: string[]): string {
+  const prefix = `MERGE TRAIN GATE-BLOCKED: ${lane.repo}@${lane.base} passes its required workflows but the repo merge gate judges main RED (`;
+  const suffix = `) — merges fail until it clears. Fix it?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let names = gateReds.join(", ") || "unknown check";
+  if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + names + suffix;
+}
+
+/** The gate-blocked ask's live brief (BR#5883): the lane's required
+ *  workflows are green — the P1 base alarm reads NONE — while the repo's own
+ *  merge gate (`main-green gate`, which judges main's WHOLE tip) fails every
+ *  open PR. This is the exact 2026-11-03 starve shape that stayed silent for
+ *  3.5h+ because the required-scoped verdict certified green. The brief is
+ *  self-contained: what the gate sees, what is held, and the ways it clears. */
+export function trainGateBlockedAskBrief(
+  lane: { repo: string; base: string },
+  gateReds: { name: string; url?: string }[],
+  gateUnsettled: string[],
+  held: number,
+): { details: string; options: string[] } {
+  const broken = gateReds.length
+    ? gateReds.map((r) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")
+    : "- (no failing checks — the gate is waiting on checks that have not finished)";
+  const unsettled = gateUnsettled.length ? gateUnsettled.map((n) => `- ${n}`).join("\n") : "";
+  const details = [
+    `The merge train on **${lane.repo}** (${lane.base}) is gate-blocked: the lane's required workflows are ALL green — the usual red alarm reads none — but the repo's own merge gate check (\`main-green gate\`, which judges the WHOLE tip of ${lane.base}, not just the required list) is failing on these checks:`,
+    broken,
+    ...(unsettled ? [``, `Still running / inconclusive (the gate refuses these too):`, unsettled] : []),
+    ``,
+    `Every open PR's \`main-green gate\` run re-judges main's tip and fails while these are red, so ${held} queued change(s) cannot merge — the train looks idle-but-green while it is actually stopped. This exact shape starved the 2026-11-03 queue for 3.5h+ with no alarm (the required-scoped verdict certified green).`,
+    ``,
+    `Ways it clears: fix forward (land the cure for the named check), re-run a transient failure once its premise settled, or the check self-heals on the next tip it judges green. A stale \`main-green gate\` red on a PR re-runs automatically now (BR#5883 self-heal) when main's tip judges fully green.`,
+  ].join("\n");
+  return {
+    details,
+    options: ["(Recommended) Investigate the named checks now", "Re-run the named checks (if transient)", "Hold — I'll handle it myself"],
+  };
+}
+
 /** Plain status words for a human ask/banner (BR#5349: no jargon) — the
  *  hub-side mirror of TrainPanel's plainStatus. */
 export function trainPlainStatus(s: string | undefined): string {
@@ -2888,6 +3005,11 @@ export type TrainStarvationDiagnosisInput = {
   redNames: string[];
   unsettledNames: string[];
   baseAlarm: string | null;
+  /** BR#5883: the gate-consumed qualifier's names — what the repo's own
+   *  merge gate judges red/unsettled on the tip while the scoped verdict
+   *  reads green (empty when no qualifier rode the stamp). */
+  gateRedNames?: string[];
+  gateUnsettledNames?: string[];
   queue: { id: string; pr?: number }[];
   awaiting: { task: string; pr?: number }[];
   lastMergeTs: number | null;
@@ -2948,6 +3070,11 @@ export function trainStarvationDutyBody(i: TrainStarvationDiagnosisInput): strin
     `- **Failing base checks:** ${i.redNames.length ? i.redNames.join(", ") : "none"}`,
     `- **Unsettled base checks:** ${i.unsettledNames.length ? i.unsettledNames.join(", ") : "none"}`,
     `- **Base alarm (P1):** ${i.baseAlarm ?? "none"}`,
+    ...(i.gateRedNames?.length || i.gateUnsettledNames?.length
+      ? [
+          `- **Gate-blocked (BR#5883):** the scoped verdict reads \`${i.baseVerdict}\` but the repo's own merge gate judges the tip ${i.gateRedNames?.length ? `RED on: ${i.gateRedNames.join(", ")}` : ""}${i.gateUnsettledNames?.length ? `${i.gateRedNames?.length ? "; " : ""}unsettled: ${i.gateUnsettledNames.join(", ")}` : ""} — every queued PR's \`main-green gate\` run fails on these until they settle`,
+        ]
+      : []),
     `- **Queue count:** ${i.queue.length} (${i.queue.map((q) => `${q.id}${q.pr ? `#${q.pr}` : ""}`).join(", ") || "none"})`,
     `- **Awaiting count:** ${i.awaiting.length} (${i.awaiting.map((a) => `${a.task}${a.pr ? `#${a.pr}` : ""}`).join(", ") || "none"})`,
     `- **Last merge ts:** ${i.lastMergeTs ? `${new Date(i.lastMergeTs).toISOString()} (${i.lastMergeTs}, ${i.mins}m ago)` : `none (${i.mins}m starved)`}`,

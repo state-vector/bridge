@@ -1406,6 +1406,24 @@ fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged:
         if let Some(ref alarm) = base_class.alarm {
             base_state.as_object_mut().unwrap().insert("alarm".into(), json!(alarm));
         }
+        // BR#5883 (gate-consumed qualifier): the scoped verdict reads green
+        // but the repo's own merge gate (`main-green gate`, which judges
+        // main's WHOLE tip) would judge it non-green — stamp the qualifier
+        // whole so the hub escalates at P1 (immediate diagnostic duty +
+        // one-per-episode ask) instead of the P4 starve clock, and the lane
+        // vocabulary names the gate-blocking checks. Mid-drain the stamp
+        // mirrors the gate's forced green (BR#4934) and omits the
+        // qualifier — the pass settle owns destination-green.
+        if let Some(ref gate) = base_class.gate {
+            let obj = base_state.as_object_mut().unwrap();
+            obj.insert("gate_blocked".into(), json!(true));
+            obj.insert("gate_verdict".into(), json!(gate.verdict.as_str()));
+            obj.insert(
+                "gate_red".into(),
+                json!(gate.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>()),
+            );
+            obj.insert("gate_unsettled".into(), json!(gate.unsettled));
+        }
     }
     base_state
 }
@@ -1821,7 +1839,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // walks on — the gate still refuses to merge onto a non-green
         // destination (leg 3), so the fail-closed law holds; the lane just
         // says WHY it holds.
-        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None }
+        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None }
     } else {
         match ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])
             .map(|base_sha| {
@@ -1830,7 +1848,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             })
         {
             Ok((_, runs)) => classify_base_check_runs(&runs, &required),
-            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None },
+            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
         }
     };
     if let Some(ref alarm) = base_class.alarm {
@@ -2069,6 +2087,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // self-heal decision.
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
+        // BR#5883: the tip's whole-tip gate predicate (the `main-green gate`
+        // judge) is green iff the hoisted scoped verdict is Green with NO
+        // gate qualifier attached — walk-start truth, never composed with
+        // the mid-drain forced green (a stale gate re-run must rest on the
+        // gate's own predicate, not on the burst's pass-green fiction).
+        let base_gate_green = base_class.verdict == MainVerdict::Green && base_class.gate.is_none();
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -2082,6 +2106,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             leg_number: Some(leg_number),
             root_fix,
             base_red_names: &base_red_names,
+            base_gate_green,
         });
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
@@ -2108,6 +2133,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     leg_number: Some(leg_number),
                     root_fix,
                     base_red_names: &[],
+                    // simulated green base ⇒ the qualifier-free green tip the
+                    // BR#5883 field encodes (RerunGate ≠ Merge, so the
+                    // ready_on_own_head predicate reads identically either way)
+                    base_gate_green: true,
                 }),
                 MergeAction::Merge { .. }
             )
@@ -5391,5 +5420,38 @@ mod tests {
             bs_zero.get("alarm").and_then(|v| v.as_str()),
             Some("tip carries no check runs at all")
         );
+    }
+
+    #[test]
+    fn base_state_stamps_the_gate_blocked_qualifier_br5883() {
+        // The 2026-11-03 starve stamp: scoped green + `Deploy drift alarm`
+        // red on the tip → base_state carries the qualifier whole (verdict
+        // STAYS green — BR#5265 law — but a plain green is never certified).
+        let tip = vec![
+            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("failure".into()), html_url: Some("https://example.test/drift".into()) },
+        ];
+        let required = vec!["Test".to_string(), "main-green gate".to_string()];
+        let c = classify_base_check_runs(&tip, &required);
+        assert_eq!(c.verdict, MainVerdict::Green);
+        let bs = build_base_state(&c, &required, 0);
+        assert_eq!(bs.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs.get("gate_blocked").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(bs.get("gate_verdict").and_then(|v| v.as_str()), Some("red"));
+        assert_eq!(bs.pointer("/gate_red/0/name").and_then(|v| v.as_str()), Some("Deploy drift alarm"));
+        assert_eq!(bs.pointer("/gate_red/0/url").and_then(|v| v.as_str()), Some("https://example.test/drift"));
+        // honest green (no qualifier) → no gate fields on the stamp
+        let tip_green = vec![
+            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+        ];
+        let bs_green = build_base_state(&classify_base_check_runs(&tip_green, &required), &required, 0);
+        assert!(bs_green.get("gate_blocked").is_none());
+        assert!(bs_green.get("gate_red").is_none());
+        // mid-burst: forced green composes away the qualifier (the pass
+        // settle owns destination-green, BR#4934)
+        let bs_burst = build_base_state(&c, &required, 1);
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert!(bs_burst.get("gate_blocked").is_none());
     }
 }

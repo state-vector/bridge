@@ -2310,6 +2310,74 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-br" });
   });
 
+  it("BR#5883: a scoped-GREEN base the repo gate judges red escalates at P1 — the lane reads GATE-BLOCKED (named checks), ONE diagnostic duty + ONE human ask file (per-tick repeats dedupe), and a fresh stamp without the qualifier clears the episode and closes the ask", async () => {
+    const repo = "state-vector/lane-gate-blocked";
+    // a reachable alarm sink for this episode (the setting overrides BR#3124)
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — gate-blocked", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-gb", { merge_capable: true, required_workflows: ["Test"] });
+    const c1 = await queueViaAccept({ repo, pr: 58831, head: "e".repeat(40), title: "IMPL: gate-blocked drill alpha" });
+    const c2 = await queueViaAccept({ repo, pr: 58832, head: "f".repeat(40), title: "IMPL: gate-blocked drill beta" });
+
+    // the 2026-11-03 starve stamp: verdict GREEN (required set green — the
+    // P1 base alarm reads none) + the gate-consumed qualifier naming what
+    // main-green-gate.sh reports on the tip
+    const stamp = () =>
+      kbJson("/train.queue_facts", {
+        repo, base: "main", actor: "gw-gb",
+        entries: [{ id: c1, pr: 58831, cls: "waiting" }, { id: c2, pr: 58832, cls: "waiting" }],
+        base_state: {
+          verdict: "green", scoped_to_required: true, red: [], unsettled: [],
+          gate_blocked: true, gate_verdict: "red",
+          gate_red: [{ name: "Deploy drift alarm", url: "https://example.test/drift" }],
+          gate_unsettled: [],
+        },
+      });
+    expect((await stamp()).body.error ?? "").toBe("");
+
+    const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane.queue_facts.base_state.verdict).toBe("green");
+    expect(lane.queue_facts.base_state.gate_blocked).toBe(true);
+    expect(lane.reason).toContain("merge-train: GATE-BLOCKED");
+    expect(lane.reason).toContain("Deploy drift alarm");
+    expect(lane.reason).toContain("2 car(s) held");
+
+    // repo-unique tokens: full-KB searches drown in lane-card noise
+    const askHits = async () => {
+      const all = (await kbJson("/search", { q: "lane-gate-blocked", type: "question", limit: 50 })).body.artefacts;
+      return all.filter((x: any) => String(x.title).startsWith("MERGE TRAIN GATE-BLOCKED:") && String(x.title).includes(`${repo}@main`));
+    };
+    const dutyHits = async () => {
+      const all = (await kbJson("/search", { q: "lane-gate-blocked", type: "task", limit: 50 })).body.artefacts;
+      return all.filter((x: any) => x.type === "task" && String(x.title).includes("GATE-BLOCKED on ") && String(x.title).includes(`${repo}@main`));
+    };
+    expect(await askHits()).toHaveLength(1);
+    expect((await dutyHits()).length).toBe(1);
+    const ask = (await askHits())[0];
+    expect(String(ask.body_md)).toContain("main-green gate");
+    expect(String(ask.body_md)).toContain("Deploy drift alarm");
+    expect(String(ask.body_md)).toContain("3.5h");
+
+    // per-tick repeats dedupe — ONE ask, ONE duty
+    expect((await stamp()).body.error ?? "").toBe("");
+    expect(await askHits()).toHaveLength(1);
+    expect((await dutyHits()).length).toBe(1);
+
+    // fresh stamp WITHOUT the qualifier: episode clears, ask auto-closes,
+    // the normal vocabulary returns
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-gb",
+      entries: [{ id: c1, pr: 58831, cls: "ready" }, { id: c2, pr: 58832, cls: "ready" }],
+      base_state: { verdict: "green", scoped_to_required: true, red: [], unsettled: [] },
+    });
+    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
+    expect(lane2.reason).not.toContain("GATE-BLOCKED");
+    const asksAfter = await askHits();
+    expect(asksAfter.length).toBe(1);
+    expect(asksAfter[0].status).toBe("done");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-gb" });
+  });
+
   it("BR#5349 (+ BR#5631): a non-green base holding cars serves base_red_resolution on train.status — whats_broken + held + ask:null while agent-workable (no action demanded of the human) + the lane's OPEN hotfix+main-red fix card; green drops the block (the banner's own off-switch)", async () => {
     const repo = "state-vector/lane-brr";
     await acquire(repo, "gw-brr", { merge_capable: true, required_workflows: ["Test"] });
