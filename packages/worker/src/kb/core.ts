@@ -2454,7 +2454,18 @@ export function trainStrandClass(meta: any, admitted: boolean): TrainStrandClass
   if (state === "bounced") return null;  // BR#4494 demote owns bounce re-entry
   if (state === "conflicting") return null; // BR#6348 budget sweep owns conflicting parks
   if (state === "unbound" && admitted) return "unbound_in_queue";
-  if (trainOnlyAwait(m) && !admitted) return "out_of_queue_await";
+  // BR#6395: only a card that actually bears train-car provenance (a merge_train
+  // stamp, a bounce_released.train_only_await stamp, or a bound review/impl PR
+  // stamp) can be a stranded train car. A card with NO train provenance that
+  // awaits pr_merged / pr_checks_green is waiting on an UPSTREAM PR dependency
+  // (e.g. an epic parent or post-merge follow-up) and must never be overwritten
+  // with "merge-train: queued — strand re-board".
+  // A review_pr only proves a PR was submitted, not that it was accepted
+  // onto the train. In particular it may differ from the upstream await.
+  const hasTrainCarEvidence =
+    state === "queued" || state === "awaiting-ci" ||
+    Boolean(m.bounce_released?.train_only_await);
+  if (trainOnlyAwait(m) && !admitted && hasTrainCarEvidence) return "out_of_queue_await";
   if (state === "queued" && !admitted) return "queued_out_of_queue";
   return null;
 }

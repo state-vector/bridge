@@ -2374,11 +2374,16 @@ export class KnowledgeHub {
 
   async board() {
     // owner renders via the BR#4262 render-time join (principal at rest →
-    // label on display); matching below stays on ids/meta, never owner text
+    // label on display); matching below stays on ids/meta, never owner text.
+    // BR#6395: order open items before terminal (done/superseded) items so a
+    // burst of closures never pushes active/blocked/queued tasks out of the
+    // board payload window.
     const tasks = this.state.storage.sql.exec(
       `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.type IN ('task','question') ORDER BY a.updated_ts DESC LIMIT 200`,
+       WHERE a.type IN ('task','question')
+       ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END ASC, a.updated_ts DESC
+       LIMIT 250`,
     ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
@@ -6893,10 +6898,17 @@ export class KnowledgeHub {
           // deliberate-park semantics.
           const stripRecommended = (s: string): string =>
             s.trim().replace(/^\(recommended\)\s*/i, "").trim();
-          const optHit = (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
+          const strippedAnswer = stripRecommended(answer);
+          // BR#6395: a batch-authorization answer ("SUPERSEDE all 29 — ...",
+          // "SUPERSEDE only the 6 dead parks") authorizes the bound disposition
+          // task to supersede target cards — it must resume the bound task,
+          // NEVER drop the bound task itself (the BR#6383/BR#6387 misfire).
+          const isBatchSupersedeAuth =
+            !isMigrationAsk && /^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(strippedAnswer);
+          const optHit = !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
             .map((o) => stripRecommended(String(o ?? "")).split(/\s+/)[0] ?? "")
             .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
-            .some((verb) => stripRecommended(answer).toLowerCase().startsWith(verb.toLowerCase()));
+            .some((verb) => strippedAnswer.toLowerCase().startsWith(verb.toLowerCase()));
           const asActor = `system:question(${actor})`;
           if (isMigrationAsk || optHit) {
             if (/\bSUPERSEDE\b/i.test(answer)) {

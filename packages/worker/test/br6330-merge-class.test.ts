@@ -2,6 +2,8 @@ import { Miniflare } from "miniflare";
 import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
+import { exitClassOf, blockedSummaryOf, EXIT_CLASSES } from "../../ui-kit/src/server/views";
+import { trainStrandClass } from "../src/kb/core";
 
 /**
  * BR#6330 / BR#6332 — ONE merge classification (decision BR#6330).
@@ -124,8 +126,35 @@ describe("BR#6330 leg 2 — exitClassOf: one classification, no prose path (sour
     expect(viewsSrc).toMatch(/phase === "queued" \|\| phase === "awaiting-ci"/);
     expect(viewsSrc).toMatch(/phase === "awaiting"\) return EXIT_CLASSES\.awaiting/);
   });
-  it("the pr_merged await_event is a legacy bridge that fires ONLY when the phase field is absent", () => {
-    expect(viewsSrc).toMatch(/phase === null && \(ev === "pr_merged" \|\| ev === "br_pr_merged"\)/);
+  it("pr_merged waits without a queued/awaiting-ci train phase classify under EXIT_CLASSES.pr, never EXIT_CLASSES.merge (BR#6395)", () => {
+    expect(viewsSrc).not.toMatch(/phase === null && \(ev === "pr_merged"/);
+    // Genuine train cars (queued / awaiting-ci) -> merge class (unblocked by System (merge train))
+    const queuedCar = { status: "blocked", meta: { merge_train: { state: "queued", pr: 2887, repo: "state-vector/superpositional" }, blocked: { await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2887 } } } };
+    expect(exitClassOf(queuedCar)).toBe(EXIT_CLASSES.merge);
+    expect(blockedSummaryOf(queuedCar).whatUnblocks).toContain("System (train)");
+
+    // Conflicting train cars -> conflict class (unblocked by Agent (mechanical rebase))
+    const conflictCar = { status: "blocked", meta: { merge_train: { state: "conflicting", pr: 399, repo: "state-vector/bridge" }, blocked: { await_event: { event: "pr_merged", repo: "state-vector/bridge", n: 399 } } } };
+    expect(exitClassOf(conflictCar)).toBe(EXIT_CLASSES.conflict);
+    expect(blockedSummaryOf(conflictCar).whatUnblocks).toContain("Agent: rebase");
+
+    // Upstream PR dependency (phase === null) -> pr class, NEVER merge class
+    const upstreamWait = { status: "blocked", meta: { blocked: { reason: "waiting on family PR #2456", unblock_condition: "Machine proxy (typed await_event pr_merged repo=state-vector/superpositional n=2456): PR #2456 merges", await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2456 } } } };
+    expect(exitClassOf(upstreamWait)).toBe(EXIT_CLASSES.pr);
+    const bs = blockedSummaryOf(upstreamWait);
+    expect(bs.whatUnblocks).toContain("PR owner: deliver superpositional#2456");
+    expect(bs.whyBlocked).toBe("PR #2456 merges");
+
+    // Unbound PR park -> pr class (not "other")
+    const unboundCar = { status: "blocked", meta: { merge_train: { state: "unbound", pr: 2575 }, blocked: { await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2575 } } } };
+    expect(exitClassOf(unboundCar)).toBe(EXIT_CLASSES.repair);
+    expect(blockedSummaryOf(unboundCar).whatUnblocks).toContain("bind superpositional#2575");
+
+    // Upstream PR dependency is NOT a stranded train car (BR#6395)
+    expect(trainStrandClass(upstreamWait.meta, false)).toBeNull();
+    expect(trainStrandClass({ ...upstreamWait.meta, review_pr: { repo: "state-vector/bridge", number: 400 } }, false)).toBeNull();
+    // A bounce-released train car WITH train provenance IS still detected
+    expect(trainStrandClass({ merge_train: { state: "queued", pr: 2735 }, bounce_released: { train_only_await: { event: "pr_merged", repo: "state-vector/superpositional", n: 2735 } } }, false)).toBe("out_of_queue_await");
   });
 });
 
@@ -193,5 +222,34 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect(cur.status).toBe("blocked");
     expect(cur.meta?.merge_train?.state).toBe("queued");
     expect(cur.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: REPO, n: N });
+  });
+
+  it("BR#6395 — answering a batch-supersede authorization ask ('SUPERSEDE all 29...') resumes the bound task instead of dropping it", async () => {
+    const drainId = await task("EXECUTE: drain the strand backlog");
+    expect((await kbJson("/transition", { id: drainId, to: "in_progress", actor: "drill-drain-owner", note: "working" })).status).toBe(200);
+    const askRes = await kbJson("/ask.create", {
+      to: "human",
+      question: "29 cards need SUPERSEDE (6 on closed PRs, 23 on conflicting PRs). Authorize?",
+      reason: "Supersede is human-authority — requesting batch drop authorization.",
+      details: "Executing the strand-backlog disposition on 29 stale parked cards whose PRs are closed or conflicting.",
+      options: [
+        "(Recommended) SUPERSEDE all 29 — 6 dead + 23 conflicting parks",
+        "SUPERSEDE only the 6 dead parks",
+        "NO — leave all 29 parked",
+      ],
+      artefact_id: drainId,
+      actor: "drill-drain-owner",
+    });
+    expect(askRes.status, `ask failed: ${JSON.stringify(askRes.body)}`).toBe(200);
+    const askId = String(askRes.body.id);
+    const ans = await kbJson("/ask.answer", {
+      id: askId,
+      answer: "(Recommended) SUPERSEDE all 29 — 6 dead + 23 conflicting parks",
+      actor: "web:rayh",
+    });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    const after = (await kbJson("/get", { id: drainId })).body;
+    expect(after.status).not.toBe("superseded");
+    expect(["in_progress", "todo"]).toContain(after.status);
   });
 });

@@ -1665,9 +1665,14 @@ deliberately fail-open, a stray admit is gate-checked while a silent drop
 starves a lane), the watchdog holds (`releaseHold`), the lane awaiting band,
 and the Backlog's "Awaiting PR merge — train" group (`exitClassOf` — the
 prose `TRAIN_RX`/`GH_PR_RX` regexes are deleted; the `pr_merged` await_event
-is the machine LEG the train flips, not a display class, and bridges the
-class only for pre-stamp legacy parks whose phase field is entirely absent).
-A card cannot enter the merge class by text. The count in Backlog equals the
+is the machine LEG the train flips, not a display class, and non-train
+`pr_merged` waits — upstream PR dependencies with `phase === null` or
+`unbound`/`bounced` PRs — are distinguished: dependencies file under "Awaiting
+PR dependency", and unbound/bounced PRs under "Awaiting agent — PR repair or
+queue binding". `conflicting` train cars file under "Awaiting PR rebase —
+conflict on train", with every Backlog section and row explicitly labelling
+who or what unblocks it: `You`, `Agent`, or `System`, BR#6395).
+A card cannot enter the merge class by text or by an upstream `pr_merged` wait. The count in Backlog equals the
 trains queue by construction because stranded state self-heals:
 `sweepMergedParks` (alarm cadence, the strand-sweep family) closes any
 blocked queued/awaiting-ci card whose PR leg carries a **provenance merge

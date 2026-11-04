@@ -100,6 +100,10 @@ export interface ExitClass {
   key: string;
   title: string;
   icon: string;
+  /** Who or what unblocks cards in this section ("You (answer ask)", "System (merge train)", etc.). */
+  unblockedBy: string;
+  /** Visual tone for the unblocker chip: urgent = You, warn = Agent, scope = System event. */
+  unblockedTone: "urgent" | "warn" | "scope";
   note: string;
 }
 
@@ -110,16 +114,17 @@ const DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/;
  *  (per accepted BR#4960 — no asks; the parked card IS the visibility). */
 const AWAITING_RX = /^Awaiting review \(verdict /i;
 
-/** BR#6330 — ONE merge classification: the typed merge_train phase is the
- *  single source of "awaiting merge" (decision BR#6330). Pure local readers
- *  of the SAME field the hub owns (meta.merge_train.state — the closed set
- *  lives canonically in @bridge/contracts MergeTrainPhaseSchema; ui-kit
+/** BR#6330 / BR#6395 — ONE merge classification: the typed merge_train phase
+ *  is the single source of "awaiting merge" (decision BR#6330). Pure local
+ *  readers of the SAME field the hub owns (meta.merge_train.state — the closed
+ *  set lives canonically in @bridge/contracts MergeTrainPhaseSchema; ui-kit
  *  does not depend on that package for bundle isolation, so this mirrors it
  *  and MUST stay in sync with contracts mergePhaseOf/isAwaitingMerge).
  *  Prose reasons and the pr_merged await_event NO LONGER classify a card
- *  into the merge group — a card cannot enter the class by text. */
-const MERGE_TRAIN_PHASES = new Set(["queued", "awaiting-ci", "bounced", "awaiting", "unbound", "base-red-park", "landed"]);
-function mergePhaseOf(t: { meta?: any }): string | null {
+ *  into the merge group — a card cannot enter the class by text or by an
+ *  upstream pr_merged wait with no train slot. */
+const MERGE_TRAIN_PHASES = new Set(["queued", "awaiting-ci", "bounced", "conflicting", "awaiting", "unbound", "base-red-park", "landed"]);
+export function mergePhaseOf(t: { meta?: any }): string | null {
   const st = String(t?.meta?.merge_train?.state ?? "");
   return st && MERGE_TRAIN_PHASES.has(st) ? st : null;
 }
@@ -131,26 +136,134 @@ export function isAwaitingMerge(t: { meta?: any }): boolean {
 
 /** The exit-class table — single source; exitClassOf returns entries from it. */
 export const EXIT_CLASSES: Record<string, ExitClass> = {
-  ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes." },
-  awaiting: { key: "awaiting", title: "Awaiting review — force-review", icon: "◉", note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl." },
-  verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it." },
-  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; holds a live merge-train slot (typed merge_train phase queued/awaiting-ci — BR#6330: the one classification). The count here is the trains panel queue by construction." },
-  ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success)." },
-  deploy: { key: "deploy", title: "Awaiting deploy", icon: "▲", note: "waiting on a hub deploy at the named commit." },
-  task: { key: "task", title: "Awaiting another task", icon: "◈", note: "waiting on another card's done/answer (br_done / br_answered)." },
-  issue: { key: "issue", title: "Awaiting GitHub issue", icon: "⊙", note: "waiting on an upstream issue closing." },
-  time: { key: "time", title: "Awaiting a date", icon: "◷", note: "time-gated — flips when the clock passes." },
-  main: { key: "main", title: "Awaiting green main", icon: "✖", note: "red-main / stop-the-line hold — resumes when the line is green." },
-  other: { key: "other", title: "Blocked — other", icon: "▪", note: "no typed leg matched — open the card to resolve or re-scope." },
-  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); Release (or Release all) to put one back now — protected parks refuse and say why." },
+  ask: {
+    key: "ask",
+    title: "Awaiting you — ask pending",
+    icon: "⚑",
+    unblockedBy: "You (answer ask in For Me)",
+    unblockedTone: "urgent",
+    note: "a human ask holds the card; answer it and the task auto-resumes.",
+  },
+  awaiting: {
+    key: "awaiting",
+    title: "Awaiting review — force-review",
+    icon: "◉",
+    unblockedBy: "You (force-review on card)",
+    unblockedTone: "urgent",
+    note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl.",
+  },
+  verify: {
+    key: "verify",
+    title: "Awaiting PR verification",
+    icon: "✓",
+    unblockedBy: "Agent (fresh verify session)",
+    unblockedTone: "warn",
+    note: "in review — a fresh verify session must rule before the train can queue it.",
+  },
+  merge: {
+    key: "merge",
+    title: "Awaiting PR merge — train",
+    icon: "⇥",
+    unblockedBy: "System (merge train)",
+    unblockedTone: "scope",
+    note: "impl & verification complete; holds a live merge-train slot (typed merge_train phase queued/awaiting-ci — BR#6330: the one classification). The train merges the PR, waits for main CI, and closes the card.",
+  },
+  conflict: {
+    key: "conflict",
+    title: "Awaiting PR rebase — conflict on train",
+    icon: "⚡",
+    unblockedBy: "Agent (mechanical rebase)",
+    unblockedTone: "warn",
+    note: "PR conflicts with main (typed phase conflicting — BR#6348); an agent claims the card, rebases onto origin/main, pushes signed, and re-verifies.",
+  },
+  repair: {
+    key: "repair",
+    title: "Awaiting agent — PR repair or queue binding",
+    icon: "↻",
+    unblockedBy: "Agent (repair and fresh verification)",
+    unblockedTone: "warn",
+    note: "the PR is unbound or bounced; an agent must resolve the recorded defect and obtain a fresh verify accept before it can enter the train.",
+  },
+  pr: {
+    key: "pr",
+    title: "Awaiting PR dependency",
+    icon: "⇻",
+    unblockedBy: "PR owner merges; system observes the receipt",
+    unblockedTone: "scope",
+    note: "waiting on the named PR, without a live train slot. Its owner must deliver it; the hub needs a merge receipt before it can schedule continuation. This does not mean the PR must merge outside a train.",
+  },
+  ci: {
+    key: "ci",
+    title: "Awaiting CI",
+    icon: "◔",
+    unblockedBy: "System (CI check probe)",
+    unblockedTone: "scope",
+    note: "waiting on check runs (pr_checks_green / run_success); daemon proxy probe flips the park when checks go green.",
+  },
+  deploy: {
+    key: "deploy",
+    title: "Awaiting deploy",
+    icon: "▲",
+    unblockedBy: "Deployment executor; hub observes commit",
+    unblockedTone: "scope",
+    note: "waiting on a hub deploy at the named commit.",
+  },
+  task: {
+    key: "task",
+    title: "Awaiting another task",
+    icon: "◈",
+    unblockedBy: "System (when target BR# completes)",
+    unblockedTone: "scope",
+    note: "waiting on another card's done/answer (br_done / br_answered); hub proxy watch flips it when that card finishes.",
+  },
+  issue: {
+    key: "issue",
+    title: "Awaiting GitHub issue",
+    icon: "⊙",
+    unblockedBy: "System / Agent (upstream issue close)",
+    unblockedTone: "scope",
+    note: "waiting on an upstream issue closing.",
+  },
+  time: {
+    key: "time",
+    title: "Awaiting a date / timer",
+    icon: "◷",
+    unblockedBy: "System (timer elapses)",
+    unblockedTone: "scope",
+    note: "time-gated — hub proxy watch flips it when the clock passes.",
+  },
+  main: {
+    key: "main",
+    title: "Awaiting green main",
+    icon: "✖",
+    unblockedBy: "System / Agent (main-red root fix)",
+    unblockedTone: "scope",
+    note: "red-main / stop-the-line hold — resumes when the root-blocker fix lands and main is green.",
+  },
+  other: {
+    key: "other",
+    title: "Blocked — other",
+    icon: "▪",
+    unblockedBy: "You or Agent (resolve on card)",
+    unblockedTone: "warn",
+    note: "no typed leg matched — open the card to resolve or re-scope.",
+  },
+  timeout: {
+    key: "timeout",
+    title: "Timeout — churn parks",
+    icon: "⏱",
+    unblockedBy: "System (recorded cooldown) or You (Release)",
+    unblockedTone: "scope",
+    note: "the watchdog drains these to the pool automatically (BR#2893); Release (or Release all) to put one back now — protected parks refuse and say why.",
+  },
 };
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
- *  First match wins; the typed await_event outranks prose. */
+ *  First match wins; the typed phase and await_event outrank prose. */
 export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   const m = t.meta ?? {};
   const b = m.blocked ?? {};
@@ -165,18 +278,18 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   // force-review owns the exit, not the proxy
   if (AWAITING_RX.test(reason)) return EXIT_CLASSES.awaiting;
   if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
-  // BR#6330 — ONE classification: the typed merge_train phase decides the
-  // merge class (queued|awaiting-ci ⇒ awaiting merge; awaiting ⇒ the
-  // force-review park). The pr_merged await_event is the machine LEG the
-  // train flips, not a display class; the prose TRAIN/PR regexes are
-  // retired. Legacy bridge: a pr_merged-typed park with NO merge_train
-  // stamp at all (pre-BR#5750 parks) keeps the merge class until the heal
-  // sweep stamps or closes it — the bridge fires only when the field is
-  // entirely absent, so a stamped card can never be reclassified by text.
+  // BR#6330 / BR#6395 — ONE classification: ONLY the typed merge_train phase
+  // (queued|awaiting-ci) enters EXIT_CLASSES.merge ("Awaiting PR merge — train").
+  // Non-train pr_merged / br_pr_merged waits (upstream PR dependencies with
+  // phase===null, or unbound/bounced PRs) classify under EXIT_CLASSES.pr so
+  // the train section matches the live train queue by construction.
   const phase = mergePhaseOf(t);
   if (phase === "awaiting") return EXIT_CLASSES.awaiting;
   if (phase === "queued" || phase === "awaiting-ci") return EXIT_CLASSES.merge;
-  if (phase === null && (ev === "pr_merged" || ev === "br_pr_merged")) return EXIT_CLASSES.merge;
+  if (phase === "conflicting") return EXIT_CLASSES.conflict;
+  if (phase === "base-red-park") return EXIT_CLASSES.main;
+  if (phase === "unbound" || phase === "bounced") return EXIT_CLASSES.repair;
+  if (ev === "pr_merged" || ev === "br_pr_merged") return EXIT_CLASSES.pr;
   if (ev === "pr_checks_green" || ev === "run_success") return EXIT_CLASSES.ci;
   if (ev === "deployed") return EXIT_CLASSES.deploy;
   if (ev === "br_done" || ev === "br_answered") return EXIT_CLASSES.task;
@@ -187,6 +300,104 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   if (RED_MAIN_RX.test(unblock) || RED_MAIN_RX.test(reason)) return EXIT_CLASSES.main;
   if (DATE_RX.test(unblock)) return EXIT_CLASSES.time;
   return EXIT_CLASSES.other;
+}
+
+const MACHINE_PROXY_PREFIX_RX = /^Machine proxy(?:\s*\([^)]*\))?:\s*/i;
+const STRAND_WRAPPER_RX = /^merge-train:\s*queued\s*—\s*strand re-board\s*\(BR#6163\):[^;]*;\s*prior park:\s*/i;
+
+/** Clean human-readable summary of why a card is blocked and what specific
+ *  actor/event unblocks it, for per-row rendering in BacklogView (BR#6395). */
+export function blockedSummaryOf(t: { status?: string; meta?: any }): {
+  whatUnblocks: string;
+  unblockedTone: "urgent" | "warn" | "scope";
+  whyBlocked: string;
+} {
+  const cls = exitClassOf(t);
+  const m = t?.meta ?? {};
+  const b = m.blocked ?? {};
+  const evObj = b.await_event ?? {};
+  const ev = evObj.event as string | undefined;
+  const phase = mergePhaseOf(t);
+  const rawReason = String(b.reason ?? "").replace(STRAND_WRAPPER_RX, "").trim();
+  const rawUnblock = String(b.unblock_condition ?? "").replace(MACHINE_PROXY_PREFIX_RX, "").trim();
+
+  const prNum = Number(evObj.n ?? m.merge_train?.pr ?? m.pr?.number ?? m.review_pr?.number ?? 0);
+  const prRepo = String(evObj.repo ?? m.merge_train?.repo ?? m.pr?.repo ?? m.review_pr?.repo ?? "");
+  const prShort = prNum > 0 ? (prRepo ? `${prRepo.split("/").pop()}#${prNum}` : `PR #${prNum}`) : "PR";
+
+  let whatUnblocks = cls.unblockedBy;
+  let unblockedTone = cls.unblockedTone;
+
+  if (cls.key === "ask") {
+    const askId = m.awaiting_ask?.ask_id ?? evObj.ask_id;
+    whatUnblocks = askId ? `You: answer ${askId}` : "You: answer ask";
+    unblockedTone = "urgent";
+  } else if (cls.key === "awaiting") {
+    whatUnblocks = `You: force-review ${prShort}`;
+    unblockedTone = "urgent";
+  } else if (cls.key === "verify") {
+    whatUnblocks = `Agent: verify ${prShort}`;
+    unblockedTone = "warn";
+  } else if (cls.key === "merge") {
+    whatUnblocks = phase === "awaiting-ci"
+      ? `System (train): ${prShort} merged, settling CI`
+      : `System (train): merges ${prShort} & closes card`;
+    unblockedTone = "scope";
+  } else if (cls.key === "conflict") {
+    whatUnblocks = `Agent: rebase ${prShort} onto main`;
+    unblockedTone = "warn";
+  } else if (cls.key === "repair") {
+    whatUnblocks = phase === "unbound"
+      ? `Agent: bind ${prShort} and obtain fresh verification`
+      : `Agent: repair ${prShort} and re-verify`;
+    unblockedTone = "warn";
+  } else if (cls.key === "pr") {
+    if (phase === "unbound") {
+      whatUnblocks = `Agent / System: re-verify ${prShort} to queue (or closes on merge)`;
+      unblockedTone = "warn";
+    } else if (phase === "bounced") {
+      whatUnblocks = `Agent: fix bounced ${prShort} & re-verify`;
+      unblockedTone = "warn";
+    } else if (ev === "br_pr_merged" && evObj.id) {
+      whatUnblocks = `System (proxy): when ${evObj.id}'s PR merges`;
+      unblockedTone = "scope";
+    } else {
+      whatUnblocks = `PR owner: deliver ${prShort}; system: observe merge receipt`;
+      unblockedTone = "scope";
+    }
+  } else if (cls.key === "ci") {
+    whatUnblocks = ev === "run_success"
+      ? `System (CI probe): successful run${evObj.run_id ? ` ${evObj.run_id}` : " at the awaited head"}`
+      : `System (CI probe): when ${prShort} checks pass`;
+    unblockedTone = "scope";
+  } else if (cls.key === "deploy") {
+    const sha = String(evObj.commit ?? "").slice(0, 9);
+    whatUnblocks = sha ? `System (deploy): hub @ ${sha}` : "System (deploy): hub deploy";
+    unblockedTone = "scope";
+  } else if (cls.key === "task") {
+    const targetId = String(evObj.id ?? "");
+    whatUnblocks = targetId
+      ? `System (proxy): when ${targetId} is ${ev === "br_answered" ? "answered" : "done"}`
+      : cls.unblockedBy;
+    unblockedTone = "scope";
+  } else if (cls.key === "issue") {
+    const iss = evObj.n ? `${String(evObj.repo ?? "").split("/").pop() || "GH"}#${evObj.n}` : "issue";
+    whatUnblocks = `System / Agent: when ${iss} closes`;
+    unblockedTone = "scope";
+  } else if (cls.key === "timeout") {
+    const until = Number(evObj.until_ts ?? 0);
+    whatUnblocks = until > Date.now()
+      ? `System (cooldown ${rel(until)}) or You (Release)`
+      : "System (watchdog drain) or You (Release)";
+    unblockedTone = "scope";
+  } else if (cls.key === "time") {
+    const until = Number(evObj.until_ts ?? 0);
+    whatUnblocks = until > 0 ? `System (timer): ${rel(until)}` : cls.unblockedBy;
+    unblockedTone = "scope";
+  }
+
+  const whyBlocked = (rawUnblock || rawReason || "blocked — open card to inspect").slice(0, 110);
+  return { whatUnblocks, unblockedTone, whyBlocked };
 }
 
 export interface UnblockTwinIndex {
