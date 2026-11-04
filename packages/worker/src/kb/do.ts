@@ -4464,26 +4464,30 @@ export class KnowledgeHub {
 
   /** BR#6135 interactive claim takeover — the execution-half of the
    *  BR#2997 design record (Ray live ruling 2026-11-04: "interactive agents
-   *  intercept work and claim it locally; do it now on main").
+   *  intercept work and claim it locally; do it now on main"), amended by
+   *  BR#6436 (Ray ruling 2026-11-05): eligibility is no longer owner-only —
+   *  an authenticated FULL-AGENT credential (live token tags, gateway/cron
+   *  excluded) may pull rank over a dispatched runner claim ACROSS owners.
    *
    *  The motivating incident: an interactive session paused on the human,
    *  went silent >10m, the watchdog released its claim to the pool, and a
    *  dispatched runner won the re-claim race before the human came back
    *  (BR#6068). The only recovery path was a human web release + another
    *  pool race. This op closes that gap with ONE atomic write: the taker
-   *  (owner agent, or web/human) flips meta.session to itself with no pool
-   *  pass in between — there is no window for a dispatcher to win.
+   *  (owner agent, full-agent credential, or web/human) flips meta.session
+   *  to itself with no pool pass in between — there is no window for a
+   *  dispatcher to win.
    *
    *  Legality lives in takeover.ts (pure, closed unions); this method owns
    *  resolution (server-verified authority anchors only — token principal,
-   *  token label, the gateway attribution pair; never body-declared, per
-   *  BR#2673), the single UPDATE, the audit (`claim_takeover` — its own op
-   *  class, BR#3430) and the version row. The ex-holder stands down by
-   *  ENFORCED law, not convention: machine.ts's takeover-stale-holder rule
-   *  gate-rejects its next state change with a checkpoint-and-exit order,
-   *  and log_progress stays open to it (additive) so the checkpoint can
-   *  land. Churn funk resets (meta.attempt) per the BR#2997 bookkeeping
-   *  take-over ≠ abandonment for the taken-from agent. */
+   *  token label + LIVE tags, the gateway attribution pair; never
+   *  body-declared, per BR#2673), the single UPDATE, the audit
+   *  (`claim_takeover` — its own op class, BR#3430) and the version row.
+   *  The ex-holder stands down by ENFORCED law, not convention: machine.ts's
+   *  takeover-stale-holder rule gate-rejects its next state change with a
+   *  checkpoint-and-exit order, and log_progress stays open to it (additive)
+   *  so the checkpoint can land. Churn funk resets (meta.attempt) per the
+   *  BR#2997 bookkeeping take-over ≠ abandonment for the taken-from agent. */
   private async claimTakeover(body: any, actor: string) {
     const id = String(body.id ?? "").trim();
     if (!id) throw new Error("claim takeover requires id");
@@ -4495,18 +4499,22 @@ export class KnowledgeHub {
       // authority anchors — every one derived from token/auth state. A
       // body-declared "I am interactive" is worthless (BR#2673) and none of
       // these fields accept it: mcp.ts stamps token_id from the identity,
-      // never the payload.
+      // never the payload. BR#6436: the full-agent anchor reads the LIVE
+      // credential tags of that token row (gateway/cron excluded) — the
+      // taker's authority class is derived, never declared.
       const tokenId = String(body.token_id ?? "");
-      const actingPrincipal = tokenId
-        ? (this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, tokenId) as any)?.principal ?? null
+      const actingToken = tokenId
+        ? (this.one(`SELECT principal, tags FROM auth_tokens WHERE id = ?`, tokenId) as any) ?? null
         : null;
+      const actingPrincipal = actingToken?.principal ?? null;
+      const actingTags = actingToken ? parseTags(actingToken.tags ?? "") : null;
       const attributedAgent = body.gateway === true && String(body.agent ?? "").trim()
         ? String(body.agent).trim().slice(0, 60)
         : null;
       const session = (await this.resolveSession(body, tokenId).catch(() => undefined)) ?? null;
       const verdict = decideTakeover(
         { id, type: row.type, status: row.status, owner: String(row.owner ?? ""), roles, meta },
-        { actor, actingPrincipal, attributedAgent, session },
+        { actor, actingPrincipal, actingTags, attributedAgent, session },
       );
       if (verdict.ok === false) {
         // typed, rule-tagged, terminal (retry law) — breachClass folds every
@@ -4524,7 +4532,7 @@ export class KnowledgeHub {
         to_session: verdict.toSession,
         by: attributedAgent ?? actingPrincipal ?? actor,
         at: ts,
-        reason: String(body.note ?? "").trim().slice(0, 300) || "interactive claim takeover (owner/web-directed)",
+        reason: String(body.note ?? "").trim().slice(0, 300) || "interactive claim takeover",
       };
       const next: any = { ...meta };
       if (verdict.toSession) next.session = verdict.toSession;
@@ -4547,7 +4555,7 @@ export class KnowledgeHub {
         from_session: stamp.from_session, to_session: stamp.to_session, by: stamp.by, reason: stamp.reason,
       });
       this.version(id, actor, "transition",
-        `claim taken over — session ${stamp.from_session ?? "(none)"} → ${stamp.to_session ?? owner} (owner/web-directed, BR#6135). Ex-holder: STAND DOWN — checkpoint last_will via log_progress (worktree, branch, done/next), push nothing, end your run.`,
+        `claim taken over — session ${stamp.from_session ?? "(none)"} → ${stamp.to_session ?? owner} (interactive takeover, BR#6135/BR#6436). Ex-holder: STAND DOWN — checkpoint last_will via log_progress (worktree, branch, done/next), push nothing, end your run.`,
         { takeover: stamp });
       return { id, status: "in_progress", taken_over: true, from_session: stamp.from_session, session: stamp.to_session };
     } catch (e) {

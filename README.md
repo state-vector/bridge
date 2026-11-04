@@ -701,9 +701,10 @@ in_review, verify separation, human legs escalate to you. The button only copies
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
 
-**Interactive claim takeover (BR#6135)** — the other half of the interactive loop, for
-cards already claimed: when a card's live claim is held by a dispatched runner session,
-the owner (or a human via the web) takes the claim over in ONE atomic write — the
+**Interactive claim takeover (BR#6135, amended BR#6436)** — the other half of the
+interactive loop, for cards already claimed: when a card's live claim is held by a
+dispatched runner session, the owner (a full authenticated agent, or a human via the
+web) takes the claim over in ONE atomic write — the
 `claim_takeover` MCP tool / REST door, or `transition {to: "in_progress", takeover: true}`.
 Status never leaves `in_progress`: no release→pool→re-claim race window, the holder
 session flips to the taker (a human taker holds via its `web:<login>` actor — the holder
@@ -712,7 +713,14 @@ attributedAgent ?? actor`, the same law the claim path uses) — which also reti
 BR#3611 gateway self-release admission for the card: the ex-runner can no longer release
 what it no longer owns. Authority is server-verified, never declared (BR#2673): the
 taker must be owner/web/human-anchored (token label/principal match or the web session
-plane), and the affordance targets runner-held claims — a taker with authority takes any
+plane) OR hold a full-agent credential (BR#6436: the acting token's LIVE
+`auth_tokens.tags` classify it as a full authenticated agent — `gateway` and
+`cadence:cron` tokens are infrastructure and never pull rank, untagged agent tokens are
+full agents by default; the class is derived from the credential, never declared in a
+body). The full-agent anchor is deliberately cross-owner: an authenticated agent may
+pull rank over a dispatched runner claim it does not own (Ray ruling 2026-11-05,
+superseding the owner-only portion of BR#6159). The affordance targets runner-held
+claims — a taker with authority takes any
 non-duty, unheld card, whatever session holds it (peer-interactive claims included;
 BR#6159 divergence 3). Refusals are never
 breaches (BR#3430): every rejection carries its `[rule: takeover-*]` tag inside the
@@ -1996,14 +2004,18 @@ closes those leaks with four hub mechanisms:
   block. Prompt law backs it: a lost claim race means you are not the executor; stand down
   (rule 5d + protocol card 7). Hub/auto-spawned duties start session-less — the first real session
   to claim them stamps the lease.
-- **Interactive claim takeover** (BR#6135, the BR#2997 design landed): the card's owner agent — or a
-  human via the web plane — re-takes an `in_progress` claim held by a dispatched runner with ONE
+- **Interactive claim takeover** (BR#6135, the BR#2997 design landed; amended BR#6436): the card's owner agent, a
+  human via the web plane, or an authenticated FULL-AGENT credential re-takes an `in_progress` claim held by a dispatched runner with ONE
   atomic write (`claim_takeover`, or `transition {to:"in_progress", takeover:true}`): `meta.session`
   flips to the taker, status never moves, there is no release→pool→re-claim pass, so no dispatcher
   can win the card in between (the exact race that handed a paused interactive session's card to a
   runner — the BR#6068 lesson; a session pausing on the human should bind an ask, which pauses the
   watchdog). Authority is server-verified from the token (owner label/principal, the gateway
-  attribution pair, or web/human) — never declared (BR#2673). Refusals are named terminal rules:
+  attribution pair, web/human, or BR#6436's full-agent credential: the acting token's LIVE
+  `auth_tokens.tags` with `gateway` and `cadence:cron` excluded — untagged agent tokens qualify as
+  the default full-agent class; the taker's authority class is derived from the credential, never a
+  body declaration, BR#2673) — and the full-agent anchor works across owners: an authenticated agent
+  may pull rank over a dispatched runner claim it does not own. Refusals are named terminal rules:
   verify/unblock duty cards (separation of duties is not transferable) and cards holding a typed
   wait — train slot, `await_event`, bound ask (the wait owns the exit). The ex-holder stands down by
   enforced law, not convention: the `takeover-stale-holder` rule gate-rejects its next state change
@@ -2011,7 +2023,9 @@ closes those leaks with four hub mechanisms:
   `meta.attempt` resets — taken-over is not abandonment), and the Rust runner classifies the
   rejection as a claim race, so a stood-down run never trips the dispatch breaker. Drills:
   `packages/worker/test/takeover.test.ts` (pure decision law + real-DO: atomic swap, stand-down
-  order, authority/duty/hold refusals, idempotence), `test/do.test.ts` REST-door + owner-leg
+  order, authority/duty/hold refusals, idempotence; BR#6436: `isFullAgentCredential` tag law,
+  cross-owner full-agent take with the ex-runner stood down, gateway/cron refusals,
+  untagged-qualifies/body-declared-worthless), `test/do.test.ts` REST-door + owner-leg
   drills (gateway-token/principal transfer proven through the release gate — the BR#4262
   display join vs the stored principal, the BR#3611 self-release admission dying with the
   owner leg, stand-down release+finish refusals, the breach-fold refusal storm, door
