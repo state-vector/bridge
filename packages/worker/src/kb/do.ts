@@ -189,6 +189,7 @@ import { cardPath } from "@bridge/specs";
 import {
   accountingLine,
   normalizePr,
+  prRowIsOpen,
   reconcileJoin,
   type ReconcileBinding,
   type ReconcileDuty,
@@ -289,6 +290,11 @@ export function proxyProbeKey(atom: Pick<ProxyAtom, "kind" | "repo" | "runId" | 
   }
   if (atom.kind === "pr_checks_green") {
     return Number(atom.number ?? 0) > 0 ? `checks:${repo}#${Number(atom.number)}` : null;
+  }
+  // BR#6384: pr_merged probes join the queue grammar (Leg 3) — one row per
+  // (repo, pr) merge state, the same dedupe shape as the checks probe.
+  if (atom.kind === "pr_merged") {
+    return Number(atom.number ?? 0) > 0 ? `merged:${repo}#${Number(atom.number)}` : null;
   }
   return null;
 }
@@ -697,6 +703,24 @@ export class KnowledgeHub {
       await this.sweepStrandedTrainCards(now0);
     } catch (e) {
       this.audit("system:train", "strand_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+    // BR#6384 Leg 2 — the bounded disposition ladder, immediately after the
+    // strand sweep (same candidates, one classification): a train-only wait
+    // stranded out of the derived queue on a HEALTHY lane past
+    // train.strand_disposition_h (default 24h, clamp 4..168) can no longer
+    // sit parked forever — the ladder runs machine-executed rungs: (a) merge
+    // evidence (provenance or a satisfied probe) closes the car citing the
+    // receipt; (b) a conclusive closed-unmerged probe supersedes it with
+    // findings; (c) ONE re-verify-or-drop duty per round
+    // (train.strand_ladder_rounds, default 2, clamp 1..8, relates-linked —
+    // never a gating child); (d) rounds exhausted → superseded with
+    // findings. The BR#6163 alarm becomes the heads-up, not the terminal
+    // state. Probe-first: a probe-backable wait gets enqueued with ONE pass
+    // of grace before the ladder spends a round.
+    try {
+      await this.dispositionStrandedTrainWaits(now0);
+    } catch (e) {
+      this.audit("system:train", "strand_disposition_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
     // BR#6330/BR#6332 — merged-park heal on the same cadence: a blocked card
     // parked queued/awaiting-ci whose PR leg has a provenance merge receipt
@@ -1467,7 +1491,37 @@ export class KnowledgeHub {
         // a fact the hub OWNS, unlike a GitHub read it cannot make.
         const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, atom.repo, atom.number);
         if (pv) return { ok: true, receipt: `provenance: ${atom.repo}#${atom.number} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
-        return { ok: false, receipt: `unresolvable from the hub — GitHub state ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516) and no train provenance row exists — verify first-hand (gh pr view) or wait for a train event` };
+        // BR#6384 Leg 3: probe-backed next (the BR#4658 grammar applied to
+        // the merge atom) — "unresolvable from the hub" stops being the
+        // terminal parking reason for the most common atom class. A worker-
+        // executor probe verdict is a fact the hub owns (stamped through
+        // proxy.verify with the gh receipt); ok=1 rides the mergeCommit as
+        // head_sha, ok=0 conclusive (CLOSED unmerged) is an honest negative
+        // (fail-closed, BR#3409), everything else stays transient.
+        const v = this.one(
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
+          proxyProbeKey(atom),
+        ) as any;
+        if (v?.state === "verified" && v.ok === 1) {
+          return { ok: true, receipt: `executor-verified (BR#4658/BR#6384): ${v.receipt}` };
+        }
+        if (v?.state === "verified" && v.ok === 0) {
+          return { ok: false, receipt: `executor-verified negative (BR#4658/BR#6384): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
+        }
+        if (v?.state === "failed") {
+          const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
+          return {
+            ok: false,
+            receipt: exhausted
+              ? `worker-executor probe exhausted after ${v.attempts} attempts — ${v.error ?? "gh kept failing"}; verify first-hand (BR#3516)`
+              : `worker-executor probe pending (attempt ${v.attempts}/${PROBE_ATTEMPT_CAP} failed: ${v.error ?? "gh failed"} — retrying)`,
+            probeState: exhausted ? "exhausted" : "pending",
+          };
+        }
+        if (v) {
+          return { ok: false, receipt: `worker-executor probe pending (BR#4658/BR#6384) — a daemon executor will run gh and stamp the verdict`, probeState: "pending" };
+        }
+        return { ok: false, receipt: `unverified from the hub — merge state for ${atom.repo}#${atom.number} needs credentials the hub does not hold (BR#3516) and no train provenance row exists; enqueueing a worker-executor verification probe (BR#6384)`, probeState: "unprobed" };
       }
       case "br_pr_merged": {
         // bare form resolves against the default repo (the board's project
@@ -1616,7 +1670,7 @@ export class KnowledgeHub {
       key, String(atom.repo ?? ""), atom.kind,
       atom.kind === "run_success" ? (atom.runId ?? null) : null,
       atom.kind === "run_success" ? (atom.newerThan ?? null) : null,
-      atom.kind === "pr_checks_green" ? Number(atom.number ?? 0) || null : null,
+      atom.kind === "pr_checks_green" || atom.kind === "pr_merged" ? Number(atom.number ?? 0) || null : null,
       atom.kind === "run_success" ? (atom.head ?? null) : null,
       cardId, now, now,
     );
@@ -11963,6 +12017,173 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return `re-boarded via blocked transition (${status})`;
   }
 
+  /** BR#6384 Leg 2 — in-place park normalization for a stranded car about
+   *  to be dispositioned: strip the typed wait and the probe-grace marker so
+   *  no sweep re-probes or re-parks the car mid-exit, preserving
+   *  blocked.ts for the audit trail. Blocked→blocked is an illegal edge, so
+   *  the normalization is a meta repair, not a transition; the CALLER owns
+   *  the legal exit (unpark-then-done / unpark-then-superseded). */
+  private strandNormalizeToBlocked(carId: string, why: string): void {
+    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, carId) as any;
+    if (!row || String(row.status) !== "blocked") return; // raced — the caller's exit re-judges
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (meta.blocked?.await_event !== undefined) delete meta.blocked.await_event;
+    if (meta.blocked?.unblock_condition !== undefined) delete meta.blocked.unblock_condition;
+    delete meta.strand_probe_grace;
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), carId);
+    this.audit("system:train", "strand_normalize", carId, { why });
+  }
+
+  /** BR#6384 Leg 2 — the bounded disposition ladder for stranded train-only
+   *  waits (alarm cadence, right after the strand sweep). Eligibility is the
+   *  strand-sweep's own classification narrowed to the anti-languish class:
+   *  a blocked car with a train-only typed await, OUT of the derived queue
+   *  (out_of_queue_await — a plain typed park with no merge_train stamp),
+   *  on a live lane that provably MOVED after the car parked (a merged
+   *  event newer than the park — a stalled lane is the starvation law's
+   *  problem, not the ladder's), parked past train.strand_disposition_h
+   *  (default 24, clamp 4..168). Rungs, in order:
+   *    (a) merge evidence in the ledger (a provenance row for the awaited
+   *        PR, or a satisfied merge/checks probe) → close the car citing
+   *        the receipt;
+   *    (b) a conclusive negative on a pr_merged probe (CLOSED unmerged) →
+   *        supersede the car with findings — the wait can provably never
+   *        fire;
+   *    (c) probe-first: enqueue the wait's probe (BR#6384 grammar) with ONE
+   *        pass of grace; past the grace, ONE re-verify-or-drop duty per
+   *        round (relates-linked, never a gating child), rounds bounded by
+   *        train.strand_ladder_rounds (default 2, clamp 1..8);
+   *    (d) rounds exhausted → supersede with findings.
+   *  A live in_progress owner is never superseded under (the strand sweep's
+   *  own liveness law mirrors this; the ladder only admits blocked cars). */
+  private async dispositionStrandedTrainWaits(now0: number): Promise<void> {
+    const dispositionH = (() => {
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_disposition_h'`);
+      return s ? Math.max(4, Math.min(168, parseInt(s.value, 10) || 24)) : 24;
+    })();
+    const capRounds = (() => {
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_ladder_rounds'`);
+      return s ? Math.max(1, Math.min(8, parseInt(s.value, 10) || 2)) : 2;
+    })();
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, title, meta FROM artefacts
+       WHERE type = 'task' AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event') IS NOT NULL`,
+    ).toArray() as any[];
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        // the strand sweep's admit test, narrowed: only OUT-of-queue cars are
+        // ladder candidates (an admitted queue park is the train's business)
+        const admitted =
+          Number(meta.merge_train?.pr ?? 0) > 0 &&
+          ([String(meta.blocked?.reason ?? ""), String(meta.blocked_reason ?? "")].some(
+            (rn: string) => rn.startsWith(MERGE_TRAIN_REASON_PREFIX),
+          ) || mergeTrainHoldPrefix(meta) !== null);
+        const cls = trainStrandClass(meta, admitted);
+        if (cls !== "out_of_queue_await") continue;
+        const awaitEv = trainOnlyAwait(meta);
+        if (!awaitEv) continue;
+        const parkTs = Number(meta.blocked?.ts ?? 0);
+        if (!parkTs || now0 - parkTs <= dispositionH * 3_600_000) continue;
+        // live lane + healthy-lane proof: the repo merged SOMETHING after
+        // this car parked (the strand sweep's own aliveness gate)
+        const moved = this.one(
+          `SELECT seq FROM train_events WHERE repo = ? AND kind = 'merged' AND ts > ? LIMIT 1`,
+          awaitEv.repo, parkTs,
+        );
+        if (!moved) continue;
+        const carId = String(r.id);
+        const atom = (awaitEventToAtom({ event: awaitEv.event, repo: awaitEv.repo, n: awaitEv.n } as any)) as ProxyAtom | null;
+        const probeKey = atom ? proxyProbeKey(atom) : null;
+        const probeRow = probeKey
+          ? (this.one(`SELECT ok, receipt, head_sha, error, state, attempts FROM proxy_probes WHERE key = ?`, probeKey) as any)
+          : null;
+        const verifiedOk = probeRow?.state === "verified" && Number(probeRow.ok) === 1 ? probeRow : null;
+        const verifiedNo = probeRow?.state === "verified" && Number(probeRow.ok) === 0 ? probeRow : null;
+        // ---- rung (a): merge evidence closes the car citing the receipt ----
+        const pv = awaitEv.event === "pr_merged"
+          ? (this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, awaitEv.repo, awaitEv.n) as any)
+          : null;
+        if (pv || verifiedOk) {
+          const receipt = pv
+            ? `provenance: ${awaitEv.repo}#${awaitEv.n} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer}; full sha ${String(pv.merge_sha)})`
+            : `executor-verified satisfied: ${String(verifiedOk!.receipt ?? "")}`;
+          this.strandNormalizeToBlocked(carId, "strand disposition (BR#6384) rung (a) — unparking before the evidence close");
+          await this.transition(
+            { id: carId, to: "done", session: "", note: `strand disposition (BR#6384): the train-only wait is satisfied — ${receipt}; closing the stranded car on the receipt (Leg 2a)` },
+            "system:train",
+          );
+          this.audit("system:train", "strand_disposition_close", carId, { class: cls, via: pv ? "provenance" : "probe" });
+          continue;
+        }
+        // ---- rung (b): a conclusive closed-unmerged probe supersedes ----
+        if (verifiedNo && awaitEv.event === "pr_merged") {
+          this.strandNormalizeToBlocked(carId, "strand disposition (BR#6384 Leg 2) rung (b) — unparking before the supersede");
+          await this.transition(
+            { id: carId, to: "superseded", session: "", note: `strand disposition (BR#6384 Leg 2): the merged probe rules the PR CLOSED unmerged — ${String(verifiedNo.error ?? "conclusive negative")} (${String(verifiedNo.receipt ?? "")}); the wait can provably never fire — superseding the stranded car with findings` },
+            "system:train",
+          );
+          this.audit("system:train", "strand_disposition_supersede", carId, { class: cls, via: "probe_negative" });
+          continue;
+        }
+        // ---- rung (c) probe-first: enqueue + ONE pass of grace ----
+        if (probeKey && !meta.strand_probe_grace && (!probeRow || probeRow.state === "pending" || probeRow.state === "failed")) {
+          if (atom) this.enqueueProxyProbe(atom, carId, now0);
+          const fresh = this.one(`SELECT meta FROM artefacts WHERE id = ?`, carId) as any;
+          const m3 = JSON.parse(fresh?.meta ?? "{}");
+          m3.strand_probe_grace = { at: now0, key: probeKey };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m3), carId);
+          this.audit("system:train", "strand_probe_enqueued", carId, { key: probeKey, grace_until: "next alarm pass" });
+          continue;
+        }
+        // ---- rung (c)/(d): the bounded duty rounds ----
+        const ledger = (meta.strand_ladder ?? null) as { rounds?: number; last_duty_id?: string } | null;
+        const rounds = Number(ledger?.rounds ?? 0);
+        // an OPEN round duty holds the ladder — never a second duty while
+        // one lives (the executor leg needs its pass to rule)
+        if (ledger?.last_duty_id) {
+          const d = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(ledger.last_duty_id)) as any;
+          if (d && ["todo", "in_progress", "in_review", "blocked"].includes(String(d.status))) continue;
+        }
+        if (rounds >= capRounds) {
+          // ---- rung (d): ladder exhausted — supersede with findings ----
+          this.strandNormalizeToBlocked(carId, "strand disposition (BR#6384 Leg 2) rung (d) — unparking before the supersede");
+          await this.transition(
+            { id: carId, to: "superseded", session: "", note: `strand disposition (BR#6384 Leg 2): ladder exhausted — ${rounds} re-verify-or-drop round(s) ruled with no satisfiable evidence and no conclusive negative (cap train.strand_ladder_rounds=${capRounds}); the car superseded with findings — no unbounded parks` },
+            "system:train",
+          );
+          this.audit("system:train", "strand_disposition_exhausted", carId, { rounds, cap: capRounds });
+          continue;
+        }
+        // ---- rung (c): spawn the next round's ONE re-verify-or-drop duty ----
+        const nextRound = rounds + 1;
+        const created = await this.create(
+          {
+            type: "task",
+            title: `Strand disposition round ${nextRound} — verify-or-drop ${carId}`.slice(0, 200),
+            session: "", // machine spawn: a FRESH session must rule
+            roles: ["review"],
+            meta: { machine_duty: { by: "strand-ladder", kind: "re-verify-or-drop", subject: carId, round: nextRound } },
+            body_md: `Strand-disposition duty (BR#6384 Leg 2) — car ${carId} ("${String(r.title ?? "").slice(0, 60)}") sits parked on the train-only wait ${awaitEv.event} for ${awaitEv.repo}#${awaitEv.n}, out of the merge queue, under a lane that kept merging. Round ${nextRound}/${capRounds} of the bounded disposition ladder.\n\nRule the wait first-hand (gh is read-only here):\n1. gh pr view ${awaitEv.n} --repo ${awaitEv.repo} --json state,mergedAt,mergeCommit,statusCheckRollup — MERGED (close ${carId} done citing the mergeCommit + URL), CLOSED unmerged (supersede ${carId} with findings), or OPEN and advancing (re-queue the car: in-place merge-train prefix repair) — or the wait is genuinely unsatisfiable.\n2. You never close ${carId} without a receipt URL, never delete it.\n\nStructural note: this duty is relates-linked to ${carId}, never child_of it — it must never gate the car's exit (the closed-pair deadlock class). Close YOURSELF done citing the receipt URL of whatever you ruled (the done gate demands it).`,
+          },
+          "system:train",
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
+          created.id, carId, now0,
+        );
+        // pin the ledger AFTER create (create owns meta) — re-read, patch, save
+        const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, carId) as any;
+        const m4 = JSON.parse(after?.meta ?? "{}");
+        m4.strand_ladder = { rounds: nextRound, last_duty_id: created.id };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m4), carId);
+        this.audit("system:train", "strand_ladder_round", carId, { round: nextRound, duty: created.id, cap: capRounds });
+      } catch (e) {
+        this.audit("system:train", "strand_disposition_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
+      }
+    }
+  }
+
   /** BR#6348 — the conflicting-budget sweep (alarm cadence, the strand-sweep
    *  family). A car parked TYPED conflicting (merge_train.state =
    *  "conflicting", the BR#6348 park the conflict bounce writes) is a
@@ -13213,7 +13434,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const openCards = this.state.storage.sql.exec(
       `SELECT id, status, meta, tags FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')`,
     ).toArray() as any[];
-    const openPrs = new Set(prs.map((p) => p.number));
+    // BR#6384: the open set is the OPEN-feed partition, not every fed row —
+    // MERGED rows riding beside the feed (the merged feed) are observation
+    // receipts, and counting them here would read a merged PR "still open"
+    // and disarm the two-consecutive-missing guard forever.
+    const openPrs = new Set(prs.filter(prRowIsOpen).map((p) => p.number));
     const bindings: ReconcileBinding[] = [];
     for (const row of openCards) {
       const meta = JSON.parse(row.meta ?? "{}");
@@ -13435,6 +13660,38 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             // the machine gate refused (open verify children, closure legs) —
             // record, alarm-below-covers it, and never force a close
             this.audit(actor, "reconcile_reverse_close_failed", a.card, { pr: `${repo}#${j.pr}`, error: String((e as Error).message ?? e).slice(0, 300) });
+          }
+          break;
+        }
+        case "observed_merge_close": {
+          // BR#6384 Leg 1: the feed itself observed the bound PR MERGED with
+          // a citable mergeCommit — close the card citing the live sha (the
+          // same unblock-then-close the reverse path uses; no provenance row
+          // and no ruling duty needed, the observation IS the receipt).
+          const target = this.one(`SELECT id, meta, tags FROM artefacts WHERE id = ?`, a.card) as any;
+          if (target && isStandingCard(JSON.parse(target.meta ?? "{}"), parseTags(target.tags))) {
+            this.audit(actor, "reconcile_observed_close_skipped_lane", a.card, { pr: `${repo}#${j.pr}`, merge_sha: a.merge_sha.slice(0, 9), note: "standing lane card — the observation never closes it (BR#5151)" });
+            break;
+          }
+          try {
+            const card = this.one(`SELECT id, status FROM artefacts WHERE id = ?`, a.card) as any;
+            if (card && card.status !== "done" && card.status !== "superseded") {
+              // unpark via the machine-managed transition (trip-wires
+              // suppressed for merge_train moves) from ANY open status
+              if (card.status !== "in_progress") {
+                await this.transition({ id: a.card, to: "in_progress", session: "", note: "reconcile: observed-merge close (BR#6384) — unpark the card for the machine proxy", merge_train: true }, actor);
+              }
+              await this.transition(
+                { id: a.card, to: "done", session: "", note: `reconcile: observed MERGED — the feed saw ${repo}#${j.pr} merged out-of-band (mergeCommit ${a.merge_sha.slice(0, 9)}); closing the bound card on the observation (BR#6384 anti-languish, no provenance row needed). Full sha: ${a.merge_sha}` },
+                actor,
+              );
+              this.audit(actor, "reconcile_observed_merge_close", a.card, { pr: `${repo}#${j.pr}`, merge_sha: a.merge_sha });
+            }
+          } catch (e) {
+            // the machine gate refused (open verify children, closure legs) —
+            // record it; the next report re-observes (the merged row rides
+            // every cycle's feed) — never force a close
+            this.audit(actor, "reconcile_observed_close_failed", a.card, { pr: `${repo}#${j.pr}`, error: String((e as Error).message ?? e).slice(0, 300) });
           }
           break;
         }

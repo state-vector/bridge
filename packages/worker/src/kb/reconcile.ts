@@ -50,6 +50,23 @@ export interface ReconcilePr {
   /** ISO 8601 — the PR's last update; age is measured against it. */
   updatedAt: string | null;
   isDraft: boolean;
+  /** BR#6384: OPEN | MERGED | CLOSED | null — null is the legacy open feed
+   *  (a row fetched with --state open is open by construction). MERGED rows
+   *  ride ADDITIVELY beside the open rows (the merged feed, BR#4658's probe
+   *  grammar applied to the reconcile join) and are the anti-languish
+   *  receipt: the feed itself observing a bound PR merged. */
+  state: string | null;
+  /** BR#6384: the merge commit sha on a MERGED row — the citable receipt
+   *  for the observed-merge close. Null on open rows and legacy feeds. */
+  mergeCommit: string | null;
+}
+
+/** BR#6384: the feed partition. A row is an OPEN-feed row when it carries no
+ *  state (legacy shape — `--state open` rows) or state OPEN; MERGED/CLOSED
+ *  rows are observation receipts, never queue members — they feed the
+ *  observed-merge loop only and must never be judged as live PRs. */
+export function prRowIsOpen(p: ReconcilePr): boolean {
+  return p.state === null || String(p.state).toUpperCase() === "OPEN";
 }
 
 /** Normalize one raw `gh pr list --json` row. Drops junk rows (missing,
@@ -73,6 +90,10 @@ export function normalizePr(raw: unknown): ReconcilePr | null {
     headRefName: s(r.headRefName),
     updatedAt: s(r.updatedAt),
     isDraft: r.isDraft === true,
+    // BR#6384: passthrough — both null on the legacy open feed (a reporter
+    // that never learned the merged feed still reports exactly as before).
+    state: s(r.state),
+    mergeCommit: s(r.mergeCommit),
   };
 }
 
@@ -156,6 +177,12 @@ export type ReconcileDecision =
   /** Second consecutive miss, no provenance: the PR left open state without
    *  a merge record — spawn a ruling duty, never a silent close. */
   | { action: "spawn_reverse" }
+  /** BR#6384 anti-languish: the feed itself observed this binding's PR
+   *  MERGED (the merged rows ride beside the open feed) — close the card
+   *  citing the live mergeCommit. No provenance row and no ruling duty are
+   *  needed: the observation IS the receipt (extends BR#6330's
+   *  provenance-only close to every merge path). */
+  | { action: "observed_merge_close"; card: string; merge_sha: string }
   /** A duty already exists for this PR but the PR is STILL unbound past the
    *  actionable age (the duty died without binding it) — the drift alarm. */
   | { action: "alarm_unaccounted"; why: string };
@@ -193,6 +220,9 @@ export interface ReconcileAccounting {
    *  them (queued/mid-rebase is not vanished); the missing clock is cleared
    *  and no ruling duty spawns (BR#4894 Finding A). */
   reverse_train_exempt: number;
+  /** BR#6384: bindings whose bound PR was observed MERGED by this cycle's
+   *  feed — each one is a card closed citing the live mergeCommit. */
+  observed_merged: number;
   accounted: number;
   /** false ⇒ the run FAILED — alarm to the sink. */
   ok: boolean;
@@ -218,7 +248,8 @@ export function accountingLine(a: ReconcileAccounting): string {
   const alarm = a.ok ? "" : ` — ALARM: ${a.unaccounted} unaccounted`;
   const info = a.grace || a.unreviewed ? ` (+${a.grace} in age grace, +${a.unreviewed} unreviewed)` : "";
   const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? `, ${a.reverse_train_exempt} train-owned` : ""}]` : a.reverse_lane_exempt || a.reverse_train_exempt ? ` [reverse:${a.reverse_lane_exempt ? ` ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? ` ${a.reverse_train_exempt} train-owned` : ""}]` : "";
-  return base + alarm + info + reverse;
+  const observed = a.observed_merged ? ` [observed-merge: ${a.observed_merged} observed-merged closed]` : "";
+  return base + alarm + info + reverse + observed;
 }
 
 /** Join one repo's observed open PRs against the board projection and emit
@@ -257,13 +288,19 @@ export function reconcileJoin(args: {
     reverse_dutied: 0,
     reverse_lane_exempt: 0,
     reverse_train_exempt: 0,
+    observed_merged: 0,
     accounted: 0,
     ok: true,
   };
   const judgements: ReconcileJudgement[] = [];
 
-  const drafts = prs.filter((p) => p.isDraft);
-  const reviewed = prs.filter((p) => !p.isDraft);
+  // BR#6384: the feed partition — only OPEN-feed rows are queue members.
+  // MERGED/CLOSED rows riding beside them are observation receipts for the
+  // observed-merge loop below; judging them as live PRs would mis-account
+  // every merged PR on the repo as board state.
+  const openRows = prs.filter(prRowIsOpen);
+  const drafts = openRows.filter((p) => p.isDraft);
+  const reviewed = openRows.filter((p) => !p.isDraft);
   for (const p of reviewed) {
     const age = prAgeMs(p.updatedAt, cfg.now);
     const approved = p.reviewDecision === "APPROVED";
@@ -377,7 +414,31 @@ export function reconcileJoin(args: {
     judgements.push({ pr: p.number, decision: { action: "grace" }, reason: `unbound but inside the actionable grace (${Math.round(age / 3_600_000)}h old)` });
   }
   acc.unreviewed += drafts.length; // drafts are informational, outside the invariant
-  acc.accounted = acc.bound + acc.ignored + acc.inflight + acc.spawned;
+
+  // ---- BR#6384 observation loop: MERGED rows against the bindings ----
+  // The feed's MERGED rows are the anti-languish receipt: a binding whose PR
+  // shows MERGED with a citable mergeCommit has LANDED — the card closes
+  // citing the live sha, whatever path merged it (train, human click, gh pr
+  // merge out-of-band). Lane cards stay exempt (BR#5151: the train's settle
+  // path is the only lane writer). Bindings closed here are skipped by the
+  // reverse loop below — the observation owns them this cycle, and a
+  // "vanished from the open list" ruling would be noise on top of a receipt.
+  const observedClosed = new Set<number>();
+  for (const p of prs) {
+    if (String(p.state ?? "").toUpperCase() !== "MERGED" || !p.mergeCommit) continue;
+    const b = bindings.get(p.number);
+    if (!b) continue; // merged with no bound card — nothing to close
+    if (b.lane) {
+      acc.bound++;
+      judgements.push({ pr: p.number, decision: { action: "lane_exempt", card: b.card }, reason: "standing merge-lane card (BR#5151) — the observation never closes it; the train's settle path is the only lane writer" });
+      continue;
+    }
+    observedClosed.add(p.number);
+    acc.observed_merged++;
+    judgements.push({ pr: p.number, decision: { action: "observed_merge_close", card: b.card, merge_sha: p.mergeCommit }, reason: `the feed observed the bound PR MERGED (${p.mergeCommit.slice(0, 9)}) — closing citing the live mergeCommit (BR#6384), no provenance row or ruling duty needed` });
+  }
+
+  acc.accounted = acc.bound + acc.ignored + acc.inflight + acc.spawned + acc.observed_merged;
   acc.ok = acc.unaccounted === 0;
 
   // ---- reverse reconcile: bindings whose PR is gone from the open list ----
@@ -392,6 +453,12 @@ export function reconcileJoin(args: {
   for (const b of args.bindings) {
     if (reverseJudged.has(b.pr)) continue;
     reverseJudged.add(b.pr);
+    if (observedClosed.has(b.pr)) {
+      // BR#6384: the observation loop closed this binding this cycle — its
+      // PR "leaving the open list" is the merge, already receipted. No
+      // missing clock, no reverse close, no ruling duty on top.
+      continue;
+    }
     if (b.lane) {
       // BR#5151: a standing lane card is never a zombie — its bootstrap PR
       // leaving the open list (or a stray provenance row on the card) is not
