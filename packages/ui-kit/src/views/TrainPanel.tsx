@@ -355,12 +355,12 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
               : r.fix_card.conflict
                 ? ": has merge conflicts with main — agent rebasing automatically"
                 : r.ask
-                  ? `: blocked by circular red-main gate — force-merge #${r.fix_card.pr} with --admin (see ask → ${r.ask.id})`
-                  : ": in flight — checks/verification running; train merges automatically or asks if --admin force-merge is needed"}
+                  ? `: YOUR GATE — merge PR #${r.fix_card.pr} yourself (open the ask → ${r.ask.id}), then click DONE`
+                  : ": in flight — checks/verification running; train merges automatically or raises your gate if an out-of-turn merge is needed"}
           </>
         ) : red
           ? r.ask
-            ? " · or re-run a flaky check · or you bypass-merge a fix PR"
+            ? " · or re-run a flaky check"
             : " — the fix work runs on its own; you'll be asked only if a fix PR needs an out-of-turn merge or manual steps (BR#5631)"
           : " · just wait — they finish on their own"}
       </span>
@@ -370,10 +370,14 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
           <a
             className="train-banner-card"
             href={r.ask.url}
+            target="_blank"
+            rel="noreferrer"
             title={r.ask.question}
             onClick={(e) => { if (openTask) { e.preventDefault(); openTask(r.ask!.id); } }}
           >
-            answer the ask (→ {r.ask.id}) — one click
+            {r.fix_card?.pr && !r.fix_card.merged
+              ? `merge PR #${r.fix_card.pr} yourself, then click DONE in the ask (→ ${r.ask.id})`
+              : `answer the ask (→ ${r.ask.id}) — one click`}
           </a>
         </span>
       )}

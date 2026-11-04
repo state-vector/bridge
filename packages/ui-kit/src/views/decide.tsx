@@ -51,8 +51,19 @@ export interface HistoryEntry {
 }
 
 
-/** Ask options, two shapes (Ray, 2026-10-23):
- *  - binary + short → one line: [ APPROVE ] [ DENY ]
+/** BR#6390: option button variant — a decline-shaped option renders REJECT
+ * (red), everything else ACCEPT (green). Shared by AskOptions and the task
+ * detail's inline ask buttons so the ACCEPT/DECLINE pair reads as one shape
+ * everywhere. */
+export function askOptionVariant(o: string): "accept" | "reject" {
+  const declineLike = /\bdecline\b|\bdeny\b|\breject\b|\bno-?go\b|\bhold\b|\bstop\b|\bwait\b/i.test(o);
+  const acceptLike = /\bdone\b|\baccept\b|\bapprove\b|\bgo\b|\byes\b|\bmerged?\b/i.test(o);
+  return declineLike && !acceptLike ? "reject" : "accept";
+}
+
+/** Ask options, two shapes (Ray, 2026-10-23 + BR#6390 2026-11-05):
+ *  - 2 options, each ≤64 chars → one line: [ DONE — MERGED PR #N ] [ DECLINE — HOLD THE LINE ]
+ *    (accept green + decline red, full label visible — never letter-keys)
  *  - everything else → vertical list, text VISIBLE next to the key:
  *      [ A ] - Provision x
  *      [ B ] - Reword y
@@ -64,12 +75,11 @@ export function AskOptions({ options: raw, onPick, busy }: {
     .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))
     .filter((o) => o && !/\[object\s*object\]/i.test(o));
   if (options.length === 0) return null;
-  const short = options.every((o) => o.length <= 34);
-  if (options.length === 2 && short) {
+  if (options.length === 2 && options.every((o) => o.length <= 64)) {
     return (
       <ActionRow>
         {options.map((o) => (
-          <Btn key={o} variant="accept" disabled={busy} onClick={() => onPick(o)}>{o.toUpperCase()}</Btn>
+          <Btn key={o} variant={askOptionVariant(o)} disabled={busy} onClick={() => onPick(o)}>{o.toUpperCase()}</Btn>
         ))}
       </ActionRow>
     );

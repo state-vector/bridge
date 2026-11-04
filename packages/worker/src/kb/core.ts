@@ -2081,7 +2081,10 @@ export type RootFixBinding = { repo: string; head_sha: string };
 
 /** meta.root_fix read off a card — null unless it names repo + head_sha (or
  *  an agent-filed root-blocker card carrying main_tip/red_since + a bound PR
- *  repo, BR#6012). */
+ *  repo, BR#6012; or a BASE-FIX / stop-the-line card stamped `tip_sha` +
+ *  `root_blocker_for_lane` ("<repo>@<base>") by the field — BR#6390, the
+ *  2026-11-04 BR#6378 shape, which hub code never mints but must still
+ *  recognize). */
 export function mainRedBinding(meta: any): RootFixBinding | null {
   const b = meta?.root_fix;
   if (b && typeof b === "object") {
@@ -2092,28 +2095,68 @@ export function mainRedBinding(meta: any): RootFixBinding | null {
   const fallbackSha =
     typeof meta?.main_tip === "string" && meta.main_tip
       ? meta.main_tip
-      : typeof meta?.red_since === "string" && meta.red_since
-        ? meta.red_since
-        : "";
+      : typeof meta?.tip_sha === "string" && meta.tip_sha
+        ? meta.tip_sha
+        : typeof meta?.red_since === "string" && meta.red_since
+          ? meta.red_since
+          : "";
   const fallbackRepo = String(
     meta?.root_fix?.repo ??
+      meta?.repo ??
       meta?.pr?.repo ??
       (Array.isArray(meta?.prs) && meta.prs[0]?.repo ? meta.prs[0].repo : "") ??
       meta?.merge_train?.repo ??
+      // BR#6390: the field-minted BASE-FIX shape names the lane, not a PR
+      // ("repo@base") — split the repo half out as the binding's repo.
+      (typeof meta?.root_blocker_for_lane === "string" && meta.root_blocker_for_lane.includes("@")
+        ? meta.root_blocker_for_lane.split("@")[0]
+        : "") ??
       "",
   ).trim();
   return fallbackRepo && fallbackSha ? { repo: fallbackRepo, head_sha: fallbackSha } : null;
 }
 
 /** The qualification (Rust is_root_fix_card mirror): tags root_blocker (or
- *  root-blocker) + main-red AND a bound failing main-HEAD run. Tags alone
- *  never qualify — the binding does. */
+ *  root-blocker / root-fix / base-fix) + main-red (or main_red /
+ *  stop-the-line) AND a bound failing main-HEAD run. Tags alone never
+ *  qualify — the binding does. BR#6390: a field-minted BASE-FIX card can
+ *  carry NO root-side tag at all — the marker then lives in meta
+ *  (`root_blocker_for_lane` "<repo>@<base>" or a `root_blocker` id string —
+ *  the BR#6378 exemplar), so a meta marker qualifies as the root-side half.
+ *  Neither tags nor meta markers qualify ALONE: the failing-run binding below
+ *  is still required. */
 export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
   const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
-  const hasRoot = tags.includes(ROOT_FIX_TAG) || tags.includes("root-blocker");
-  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red");
+  const hasRoot =
+    tags.includes(ROOT_FIX_TAG) ||
+    tags.includes("root-blocker") ||
+    tags.includes("root-fix") ||
+    tags.includes("base-fix") ||
+    // BR#6390: meta-borne root-side markers (the BR#6378 exemplar carries no
+    // root-side tag — recognition must not hinge on which tag vocabulary the
+    // field used).
+    (typeof card?.meta?.root_blocker_for_lane === "string" && card.meta.root_blocker_for_lane.includes("@")) ||
+    typeof card?.meta?.root_blocker === "string";
+  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red") || tags.includes("stop-the-line");
   if (!hasRoot || !hasMainRed) return false;
   return mainRedBinding(card?.meta) !== null;
+}
+
+/** BR#6390: the LANE BASE-FIX card shape — an agent-filed stop-the-line fix
+ *  card that never carries the root_blocker tag pair (the 2026-11-04 BR#6378
+ *  episode: tags [main-red, merge-train, stop-the-line, cortex, p0], meta
+ *  {repo, tip_sha, root_blocker_for_lane}) and so was invisible to step 1 of
+ *  trainOpenRootFix — the episode resolution fell back to a stale fix_card
+ *  and the human gate flapped. A card is the lane's base-fix iff it names
+ *  this lane's repo in meta.root_blocker_for_lane, is main-red-tagged, and
+ *  reads as a base/CI fix (stop-the-line | base-fix | p0 tags). */
+export function isLaneBaseFixCard(card: { tags?: unknown; meta?: any }, repo: string): boolean {
+  if (!repo) return false;
+  const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
+  if (!tags.includes(MAIN_RED_TAG) && !tags.includes("main_red")) return false;
+  if (!(tags.includes("stop-the-line") || tags.includes("base-fix") || tags.includes("base_fix") || tags.includes("p0"))) return false;
+  const lane = String(card?.meta?.root_blocker_for_lane ?? "");
+  return lane.split("@")[0] === repo && mainRedBinding(card?.meta)?.repo === repo;
 }
 
 /** BR#6012: true iff a queued card's title explicitly names a base-red /
@@ -3252,29 +3295,43 @@ export function trainBaseRedAskBrief(
       ? `- A fix PR is open: ${fix.curePr.repo}#${fix.curePr.number} — https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`
       : `- No fix PR is open yet — it appears here automatically the moment one binds to the fix card.`,
     fix.culpritPr ? `- The PR that broke main: #${fix.culpritPr}` : ``,
+    // BR#6390 (Ray 2026-11-05): a bound cure PR turns the ask into a HUMAN
+    // GATE — "do this thing and click DONE when done to unblock". The act is
+    // YOURS (out-of-turn bypass merge is human authority, BR#4122/BR#5450:
+    // "I am the bypass actor — do not try and automate bypass merges, you
+    // MUST escalate to me"); the options say whether it is done, nothing else.
     ...(fix.curePr
       ? [
           ``,
-          `**Why this needs your force-merge (Bridge cannot merge it):**`,
-          `- Fix PR **${fix.curePr.repo}#${fix.curePr.number}** (https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}) is blocked by the circular base-red gate: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`.`,
-          `- Bridge's gateway cannot bypass branch protection on a failing required check without admin authority. Force-merge it out of turn to break the deadlock:`,
-          `  \`gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash\``,
+          `# HUMAN GATE — your one action`,
+          `Merge fix PR **${fix.curePr.repo}#${fix.curePr.number}** yourself, then click **DONE** below:`,
+          ``,
+          `1. Open the PR: https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`,
+          `2. Merge it (Squash and merge — you hold the bypass) or run:`,
+          `   \`\`\``,
+          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+          `   \`\`\``,
+          `3. Come back here and click **DONE — PR #${fix.curePr.number} merged**.`,
+          ``,
+          `Why you: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`. Bridge's gateway cannot bypass branch protection (no admin). When you click DONE, the train picks up the merge, waits out main's deploy, and the ${held} held PR${held === 1 ? "" : "s"} drain automatically.`,
+          ``,
+          `If you **DECLINE**: the line holds — nothing merges until main is green again, and agent sessions keep fixing on ${fix.card ? fix.card.id : "the fix card"}. The queue drains by itself the moment main recovers.`,
         ]
       : []),
     ``,
-    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): force-merge it with \`--admin\` (or answer BYPASS if the gateway holds admin) so it lands out of turn ahead of the queue — this is the only way a fix that cannot pass the circular base-red gate while main is broken gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
+    fix.curePr
+      ? `**Other ways this clears:** the fix lands through the line itself once main recovers (no action from you), a transient check clears on re-run, or you answer in your own words with manual steps.`
+      : `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) manual steps on your side: answer OTHER and describe them; (3) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green; (4) if a fix PR binds later, this ask becomes a HUMAN GATE (you merge it, click DONE).`,
   ].filter((l) => l !== undefined).join("\n");
-  // 2026-11-03 Ray ruling (BR#5631): an ask whose honest answers are all
-  // "keep doing what you're already doing" is noise — see
-  // trainBaseRedAskWarranted. These options only render when the warrant
-  // gate let the ask through, so the exhausted shape leads with the human
-  // levers (manual steps / a fresh direction), never a default "keep digging".
+  // BR#6390 (Ray 2026-11-05): the cure-bound ask is ACCEPT/DECLINE shape —
+  // "just to say if it is done or not". DONE records the human's merge
+  // (trainAlarmAnswerDispatch stamps lane.bypass_merge so the executor's next
+  // tick observes/lands it); DECLINE holds the line and suppresses re-asks
+  // for this episode+PR. Free text remains available for anything else.
   const options = fix.curePr
     ? [
-        `(Recommended) Force-merge / Bypass-merge fix PR #${fix.curePr.number} (--admin) — breaks the circular red-main gate`,
-        `Hold the line — it merges automatically once green`,
-        `Transient — re-run the failing check`,
-        `Other — manual steps (I'll reply)`,
+        `DONE — PR #${fix.curePr.number} merged`,
+        `DECLINE — hold the line`,
       ]
     : fix.card?.exhausted
       ? [

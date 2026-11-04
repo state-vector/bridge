@@ -1768,16 +1768,49 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 vstr(f, "headRefOid").unwrap_or("").to_string(),
             )
         }) {
-            Ok((state, Some(_), _)) if state == "MERGED" => {
+            Ok((state, Some(merge_sha), head_sha)) if state == "MERGED" => {
+                // BR#6390: the human merged it themselves (the HUMAN GATE's
+                // DONE) — stamp the merged event so the lane settles on the
+                // cure (awaiting-ci on this sha, provenance, the episode
+                // phase flips to cure_pr_merged_awaiting_ci and any straggler
+                // ask auto-closes). Consuming the stamp WITHOUT the event left
+                // external merges invisible to the episode state.
+                ctx.tick_landed += 1;
+                ctx.mcp(
+                    "train_event",
+                    json!({
+                        "repo": repo, "base": base, "kind": "merged", "pr": bpr,
+                        "merge_sha": merge_sha, "head_sha": head_sha,
+                        "signer": ctx.holder, "bypass": true,
+                        "reason": "bypass-merge (merged-elsewhere) — the human landed the cure out of turn via the answered HUMAN GATE ask; stamping the merged event so the lane settles on it",
+                    }),
+                )?;
                 ack(ctx, "merged-elsewhere")?;
-                ctx.note(&format!("bypass: PR #{bpr} already MERGED — authorization consumed"));
-                log(Some(key), &format!("bypass: PR #{bpr} already merged — nothing to do, stamp consumed"));
+                ctx.note(&format!("bypass: PR #{bpr} already MERGED by the human ({}) — merged event stamped, authorization consumed", &merge_sha[..merge_sha.len().min(9)]));
+                log(Some(key), &format!("bypass: PR #{bpr} already merged by the human as {} — merged event stamped, stamp consumed", &merge_sha[..merge_sha.len().min(9)]));
             }
             Ok((state, _, _)) if state == "CLOSED" => {
                 ack(ctx, "closed")?;
                 log(Some(key), &format!("bypass: PR #{bpr} is CLOSED — authorization consumed (nothing to merge)"));
             }
             Ok((_, _, head_sha)) => {
+                // BR#6390 DONE grace: the human clicked DONE ("I merged it") —
+                // GitHub may lag the click by seconds, or the click landed a
+                // hair early. Give the authorization a 10-minute window where
+                // the tick only WATCHES (no merge attempt, stamp kept); the
+                // next tick after the merge lands takes the MERGED arm above.
+                // Past the window, the pre-existing behavior applies: try the
+                // machine merge (plain, then --admin), else consume with the
+                // needs-human receipt.
+                let stamped_at = lane
+                    .pointer("/bypass_merge/at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let grace_ms = 10 * 60 * 1000i64;
+                if stamped_at > 0 && (now_ms() as i64 - stamped_at) < grace_ms {
+                    ctx.note(&format!("bypass: PR #{bpr} authorized (DONE) — watching for the human's merge (stamp held, grace {}s left)", ((grace_ms - (now_ms() as i64 - stamped_at)) / 1000).max(0)));
+                    log(Some(key), &format!("bypass: PR #{bpr} authorized (DONE) and still open — holding the stamp inside the 10m DONE grace; no merge attempt this tick"));
+                } else {
                 // open: land it out of turn with the BR#5376 method fallback
                 // (squash → rebase → merge, remembered per repo) — a policy
                 // mismatch must ride the landing path, not loop.
@@ -1849,6 +1882,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         ack(ctx, &format!("refused (needs human --admin: gh pr merge {bpr} --repo {repo} --admin --squash): {}", trunc(&why, 160)))?;
                         log(Some(key), &format!("bypass: PR #{bpr} merge refused — needs human --admin (`gh pr merge {bpr} --repo {repo} --admin --squash`), reason on the lane card: {}", trunc(&why, 160)));
                     }
+                }
                 }
             }
             Err(e) => {
@@ -2643,21 +2677,35 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // merges the cure onto the red base.
                 if root_fix {
                     renew_lease(ctx, repo, base);
+                    // BR#6390 human-gate contract: the ask says DO THIS, then
+                    // CLICK DONE — the copyable --admin merge command + PR and
+                    // card links inline, and the options are the accept/decline
+                    // pair the ask planes render as inline buttons. DONE is
+                    // dispatched hub-side (trainAlarmAnswerDispatch stamps
+                    // lane.bypass_merge; the executor's stamp consumer lands or
+                    // acks the merge). DECLINE holds the line, stamps nothing.
                     let fast_details = [
                         format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
                         "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
-                        "Merging the cure is what turns main green again; declining holds the line (bisect stays parked on the cure).".to_string(),
+                        "HUMAN GATE — do this and click DONE when done to unblock:".to_string(),
+                        "1. Merge the cure out of turn (the gate fails every PR — including this fix PR itself — until the fix lands on the base). Copy-paste:".to_string(),
+                        "   ```".to_string(),
+                        format!("   gh pr merge {pr} --repo {repo} --admin --squash"),
+                        "   ```".to_string(),
+                        format!("2. Click DONE — PR #{pr} merged below. The queue unblocks itself: main's checks re-run on the new merge commit and the train drains once they settle green."),
+                        format!("Links: fix PR {repo}#{pr} — https://github.com/{repo}/pull/{pr} · fix card {head_id}."),
+                        "DECLINE — hold the line keeps the queue parked until main greens some other way; the fix work keeps digging.".to_string(),
                     ].join("\n\n");
                     ctx.mcp("ask_agent", json!({
                         "to": "human",
                         "question": root_fix_fast_lane_title(repo, pr),
                         "reason": reason,
                         "details": fast_details,
-                        "options": ["Merge the cure now", "Not yet — hold the line"],
+                        "options": [format!("DONE — PR #{pr} merged"), "DECLINE — hold the line"],
                         "artefact_id": head_id,
                     }))?;
-                    ctx.note(&format!("root-fix fast lane: filed the one-click merge ask for PR #{pr} (circular deploy-health class)"));
-                    log(Some(key), &format!("root-fix fast lane: human merge ask filed for PR #{pr} — the train cannot merge through the circular gate"));
+                    ctx.note(&format!("root-fix fast lane: filed the human-gate merge ask for PR #{pr} (circular deploy-health class)"));
+                    log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
                     release_if_idle(ctx, key, repo, base)?;
                     return Ok(());
                 }

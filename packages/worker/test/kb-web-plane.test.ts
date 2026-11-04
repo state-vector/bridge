@@ -231,7 +231,10 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toContain("Merge train STOPPED");
     expect(trainPanelSrc).toContain("BROKEN:");
     expect(trainPanelSrc).toContain("WHAT FIXES IT:");
-    expect(trainPanelSrc).toContain("or you bypass-merge a fix PR");
+    // BR#6390: the banner names the human gate, not a bypass suggestion —
+    // "merge the fix PR yourself, then click DONE in the ask"
+    expect(trainPanelSrc).toContain("YOUR GATE — merge PR #");
+    expect(trainPanelSrc).toContain("then click DONE in the ask");
     expect(trainPanelSrc).toContain("WHAT WE NEED FROM YOU:");
     expect(trainPanelSrc).toContain("answer the ask");
     // pinned at the very top: the banner renders BEFORE the lane table head

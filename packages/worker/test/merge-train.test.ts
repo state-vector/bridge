@@ -19,6 +19,8 @@ import {
   classifyBaseRedEpisodeState,
   isBaseCureCardTitle,
   isRootFixCard,
+  isLaneBaseFixCard,
+  mainRedBinding,
   trainBaseRedAskBrief,
   trainBaseRedAskWarranted,
   decideMergeAction,
@@ -1813,6 +1815,46 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
         meta: { main_tip: "8454ae7bb", pr: { repo: "state-vector/superpositional", number: 2800 } },
       }),
     ).toBe(true);
+    // 3b. BR#6390: the BASE-FIX card shape (BR#6378) — tip_sha + meta.repo +
+    // root_blocker_for_lane, main-red + stop-the-line tags, NO root_blocker
+    // tag — QUALIFIES under isRootFixCard too (BR#6390: a lane base-fix is a
+    // human-gate carrier exactly like a root-fix card) and isLaneBaseFixCard
+    // additionally binds it to its lane via mainRedBinding
+    expect(
+      isRootFixCard({
+        tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+        meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+      }),
+    ).toBe(true); // the lane's base-fix carries the human gate too
+    // a card WITHOUT any binding marker stays a non-root card
+    expect(
+      isRootFixCard({
+        tags: ["main-red", "merge-train", "stop-the-line", "p0"],
+        meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879" },
+      }),
+    ).toBe(false); // names no root_blocker/root_blocker_for_lane — binding is mandatory
+    expect(
+      isLaneBaseFixCard(
+        {
+          tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+          meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+        },
+        "state-vector/superpositional",
+      ),
+    ).toBe(true);
+    expect(
+      isLaneBaseFixCard(
+        {
+          tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+          meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+        },
+        "state-vector/bridge",
+      ),
+    ).toBe(false); // another repo's lane must not adopt it
+    expect(mainRedBinding({ repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879" })).toEqual({
+      repo: "state-vector/superpositional",
+      head_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879",
+    });
 
     // 4. BaseRedEpisodeState: conflicting PR never warrants a human ask; valid cure PR produces `--admin` command + why
     const conflictingEp = classifyBaseRedEpisodeState({
@@ -1840,9 +1882,15 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
       11,
       { card: { id: "BR#5968", title: "ROOT-FIX", status: "blocked" }, curePr: { repo: "state-vector/superpositional", number: 2800 }, culpritPr: 2612 },
     );
+    // BR#6390: the cure-bound ask is a HUMAN GATE — do-the-thing + DONE/DECLINE
+    expect(brief.details).toContain("HUMAN GATE");
     expect(brief.details).toContain("gh pr merge 2800 --repo state-vector/superpositional --admin --squash");
-    expect(brief.details).toContain("Why this needs your force-merge");
-    expect(brief.options[0]).toContain("Force-merge / Bypass-merge fix PR #2800 (--admin)");
+    expect(brief.details).toContain("https://github.com/state-vector/superpositional/pull/2800");
+    expect(brief.details).toContain("11 held PRs drain automatically");
+    expect(brief.options).toEqual([
+      "DONE — PR #2800 merged",
+      "DECLINE — hold the line",
+    ]);
   });
 
   it("BR#6142: workflow-level startup_failure (0 job check-runs) classifies RED in classifyBaseCheckRuns and classifyRequiredRuns", () => {
