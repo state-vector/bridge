@@ -11759,7 +11759,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         };
       })();
       const brQf: any = meta.lane?.queue_facts ?? null;
+      const inNormalSettle = !meta.stop && (meta.currently?.phase === "awaiting-ci" || meta.currently?.phase === "bursting");
       const brBase: any = brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
+        && (!inNormalSettle || String(brQf.base_state?.verdict ?? "") === "red")
         && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0
         ? brQf.base_state : null;
       const stopActive: any = meta.stop ?? null;
