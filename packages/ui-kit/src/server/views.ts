@@ -103,21 +103,38 @@ export interface ExitClass {
   note: string;
 }
 
-const GH_PR_RX = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|\bPR #?\d+\b/i;
 const GH_ISSUE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+|\bGH#\d+\b/i;
 const RED_MAIN_RX = /\bred\s+main\b|\bmain\s+is\s+red\b|stop-the-line|\buntil main (is )?green\b|\bline is green\b/i;
 const DATE_RX = /\b(20\d{2})-(\d{2})-(\d{2})(?!\d)/;
-const TRAIN_RX = /merge-train|serialized merge train|\bthe train\b/i;
 /** BR#4962: the typed Awaiting review park a coverage bounce stamps
  *  (per accepted BR#4960 — no asks; the parked card IS the visibility). */
 const AWAITING_RX = /^Awaiting review \(verdict /i;
+
+/** BR#6330 — ONE merge classification: the typed merge_train phase is the
+ *  single source of "awaiting merge" (decision BR#6330). Pure local readers
+ *  of the SAME field the hub owns (meta.merge_train.state — the closed set
+ *  lives canonically in @bridge/contracts MergeTrainPhaseSchema; ui-kit
+ *  does not depend on that package for bundle isolation, so this mirrors it
+ *  and MUST stay in sync with contracts mergePhaseOf/isAwaitingMerge).
+ *  Prose reasons and the pr_merged await_event NO LONGER classify a card
+ *  into the merge group — a card cannot enter the class by text. */
+const MERGE_TRAIN_PHASES = new Set(["queued", "awaiting-ci", "bounced", "awaiting", "unbound", "base-red-park", "landed"]);
+function mergePhaseOf(t: { meta?: any }): string | null {
+  const st = String(t?.meta?.merge_train?.state ?? "");
+  return st && MERGE_TRAIN_PHASES.has(st) ? st : null;
+}
+/** exported for the pinned test (BR#6330) — the one predicate. */
+export function isAwaitingMerge(t: { meta?: any }): boolean {
+  const p = mergePhaseOf(t);
+  return p === "queued" || p === "awaiting-ci";
+}
 
 /** The exit-class table — single source; exitClassOf returns entries from it. */
 export const EXIT_CLASSES: Record<string, ExitClass> = {
   ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes." },
   awaiting: { key: "awaiting", title: "Awaiting review — force-review", icon: "◉", note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl." },
   verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it." },
-  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; parked on the serialized merge train (typed pr_merged)." },
+  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; holds a live merge-train slot (typed merge_train phase queued/awaiting-ci — BR#6330: the one classification). The count here is the trains panel queue by construction." },
   ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success)." },
   deploy: { key: "deploy", title: "Awaiting deploy", icon: "▲", note: "waiting on a hub deploy at the named commit." },
   task: { key: "task", title: "Awaiting another task", icon: "◈", note: "waiting on another card's done/answer (br_done / br_answered)." },
@@ -148,14 +165,24 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   // force-review owns the exit, not the proxy
   if (AWAITING_RX.test(reason)) return EXIT_CLASSES.awaiting;
   if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
-  if (ev === "pr_merged" || ev === "br_pr_merged") return EXIT_CLASSES.merge;
+  // BR#6330 — ONE classification: the typed merge_train phase decides the
+  // merge class (queued|awaiting-ci ⇒ awaiting merge; awaiting ⇒ the
+  // force-review park). The pr_merged await_event is the machine LEG the
+  // train flips, not a display class; the prose TRAIN/PR regexes are
+  // retired. Legacy bridge: a pr_merged-typed park with NO merge_train
+  // stamp at all (pre-BR#5750 parks) keeps the merge class until the heal
+  // sweep stamps or closes it — the bridge fires only when the field is
+  // entirely absent, so a stamped card can never be reclassified by text.
+  const phase = mergePhaseOf(t);
+  if (phase === "awaiting") return EXIT_CLASSES.awaiting;
+  if (phase === "queued" || phase === "awaiting-ci") return EXIT_CLASSES.merge;
+  if (phase === null && (ev === "pr_merged" || ev === "br_pr_merged")) return EXIT_CLASSES.merge;
   if (ev === "pr_checks_green" || ev === "run_success") return EXIT_CLASSES.ci;
   if (ev === "deployed") return EXIT_CLASSES.deploy;
   if (ev === "br_done" || ev === "br_answered") return EXIT_CLASSES.task;
   if (ev === "issue_closed") return EXIT_CLASSES.issue;
   if (ev === "time") return EXIT_CLASSES.time;
   // prose fallback — no typed leg on the card
-  if (TRAIN_RX.test(reason) || TRAIN_RX.test(unblock) || GH_PR_RX.test(unblock)) return EXIT_CLASSES.merge;
   if (GH_ISSUE_RX.test(unblock)) return EXIT_CLASSES.issue;
   if (RED_MAIN_RX.test(unblock) || RED_MAIN_RX.test(reason)) return EXIT_CLASSES.main;
   if (DATE_RX.test(unblock)) return EXIT_CLASSES.time;

@@ -8,6 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
+import { isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -2098,7 +2099,13 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
     // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
     // the silence-release parked unprefixed must not stay invisible to the
     // train (the BR#4995 silent drop)
-    || isWatchdogTrainHoldPark(c.meta),
+    || isWatchdogTrainHoldPark(c.meta)
+    // BR#6330 — typed-phase admission: the closed merge_train phase is the
+    // single classification; a car stamped queued/awaiting-ci is a queue
+    // candidate even if its prose reason lost the prefix. Admission is
+    // deliberately FAIL-OPEN (prefix OR stamp — a stray admit gets gate-
+    // checked by the executor; a silent drop starves a lane).
+    || isAwaitingMerge(c.meta),
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
   return [...queued]
@@ -2196,6 +2203,9 @@ export function releaseHold(meta: any): string | null {
   const m = meta ?? {};
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const st = String(mt.state ?? "");
+  // BR#6330 — the phase set is closed (contracts MergeTrainPhaseSchema);
+  // unbound/landed/base-red-park hold nothing: the train no longer owns the
+  // exit. Semantics unchanged from the pre-6330 literal set.
   if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") {
     const pr = trainPrLeg(meta);
     if (pr) {

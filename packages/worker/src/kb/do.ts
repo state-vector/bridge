@@ -691,6 +691,17 @@ export class KnowledgeHub {
     } catch (e) {
       this.audit("system:train", "strand_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
+    // BR#6330/BR#6332 — merged-park heal on the same cadence: a blocked card
+    // parked queued/awaiting-ci whose PR leg has a provenance merge receipt
+    // is a stranded "awaiting merge" ghost (the settle-close that owed it
+    // rode a pass interrupted by red/out-of-band pushes). Close it on the
+    // receipt — this is what makes the Backlog merge group and the trains
+    // queue converge by construction (one classification).
+    try {
+      await this.sweepMergedParks(now0);
+    } catch (e) {
+      this.audit("system:train", "merged_park_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
     // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
     // verdict. If no verifier ever picks the verification round up, the park is
     // permanent — the watchdog used to sweep only in_progress, so in_review
@@ -9699,6 +9710,80 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     }
     if (closed) this.version(lane.id, actor, "train:landed", `burst-settle: ${closed} parked card(s) closed on the pass's green settle (ancestor evidence, BR#4934)`, {});
+    return closed;
+  }
+
+  /** BR#6330/BR#6332 — merged-park heal, the structural leg of the one-
+   *  classification law. A blocked card whose typed merge phase is queued|
+   *  awaiting-ci while its PR leg carries a PROVENANCE merge receipt is a
+   *  stranded park: the merge already happened and the close that owed it
+   *  rode a lane settle that may never come (the pass was interrupted by a
+   *  red cycle or an out-of-band push — the 2026-11-05 evidence: nine cards
+   *  for merged PRs still sitting in the "awaiting merge" class). The
+   *  provenance table is the hub's own merge record (BR#3287, stamped at
+   *  train merges) — a receipt close needs zero GitHub calls. Multi-leg
+   *  cards re-queue to their next unlanded leg (closeBurstParks mechanics)
+   *  instead of closing. Runs on the alarm cadence (the strand-sweep
+   *  family); one bad card audits and skips, never throws. */
+  private async sweepMergedParks(now0: number): Promise<number> {
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts
+       WHERE type = 'task' AND status = 'blocked'
+         AND (json_extract(meta, '$.merge_train.state') = 'queued'
+              OR json_extract(meta, '$.merge_train.state') = 'awaiting-ci')`,
+    ).toArray() as any[];
+    if (!rows.length) return 0;
+    const prov = new Map<string, { merge_sha: string; merged_at: number }>();
+    for (const p of this.state.storage.sql.exec(`SELECT repo, pr, merge_sha, merged_at FROM provenance`).toArray() as any[]) {
+      const n = Number(p?.pr ?? 0);
+      if (n > 0 && p?.repo) prov.set(`${String(p.repo)}#${n}`, { merge_sha: String(p.merge_sha ?? ""), merged_at: Number(p.merged_at ?? 0) || 0 });
+    }
+    if (!prov.size) return 0;
+    let closed = 0;
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const legs = trainLegs(meta);
+        const repoDefault = String((meta as any).merge_train?.repo ?? (meta as any).pr?.repo ?? "");
+        const mergedLeg = legs.find((l) => {
+          const repo = String(l.repo ?? repoDefault);
+          return repo && prov.has(`${repo}#${Number(l.number) || 0}`);
+        });
+        if (!mergedLeg) continue;
+        const legRepo = String(mergedLeg.repo ?? repoDefault);
+        const legN = Number(mergedLeg.number) || 0;
+        const rec = prov.get(`${legRepo}#${legN}`)!;
+        const legRec = ((meta as any).merge_train?.legs ?? {})[String(legN)] ?? {};
+        const mergeSha = String(legRec.merge_sha ?? rec.merge_sha ?? "");
+        const legsMap = { ...((meta as any).merge_train?.legs ?? {}), [String(legN)]: { ...legRec, state: "landed", landed_at: now0, via: "merged-park-heal", ...(mergeSha ? { merge_sha: mergeSha } : {}) } };
+        const next = { ...(meta as any), merge_train: { ...(meta as any).merge_train ?? {}, legs: legsMap } };
+        const remaining = trainLegsRemaining(next);
+        this.state.storage.sql.exec(
+          `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, 'system:train', ?, ?, ?, NULL, ?)`,
+          now0, legRepo, String(mergedLeg.base ?? "main"), legN, r.id, mergeSha || null, JSON.stringify({ via: "merged-park-heal", receipt: `provenance ${legRepo}#${legN}` }),
+        );
+        if (remaining.length) {
+          const nx = remaining[0];
+          (next as any).merge_train = { ...(next as any).merge_train, state: "queued", pr: nx.number, repo: nx.repo, remaining: remaining.length };
+          next.blocked = { ...(next.blocked ?? {}), reason: trainQueueRemainingReason(next) };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now0, r.id);
+          this.audit("system:train", "merged_park_leg_healed", r.id, { lane: `${legRepo}@${String(mergedLeg.base ?? "main")}`, pr: legN, remaining: remaining.map((l) => l.number) });
+          this.version(r.id, "system:train", "train:landed", `merged-park heal: PR #${legN} leg stamped landed on the provenance receipt; ${remaining.length} leg(s) remain`, {});
+          continue;
+        }
+        const note = `Merged-park heal (BR#6330): PR ${legRepo}#${legN} carries a provenance merge receipt${mergeSha ? ` (merge sha ${mergeSha.slice(0, 9)})` : ""} — the card sat in the "awaiting merge" class with its merge already landed. Closed by the heal sweep, zero hub GitHub calls.`;
+        await this.transition({ id: r.id, to: "in_progress", session: "", note: `merge-train: landed — merged-park heal (provenance receipt PR #${legN})`, merge_train: true }, "system:train");
+        await this.transition({ id: r.id, to: "done", session: "", note }, "system:train");
+        const cm = JSON.parse(String((this.one(`SELECT meta FROM artefacts WHERE id = ?`, r.id) as any)?.meta ?? "{}"));
+        cm.merge_train = { ...(cm.merge_train ?? {}), state: "landed", pr: legN, ...(mergeSha ? { merge_sha: mergeSha } : {}), landed_at: now0, via: "merged-park-heal" };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now0, r.id);
+        this.audit("system:train", "merged_park_healed", r.id, { lane: `${legRepo}@${String(mergedLeg.base ?? "main")}`, pr: legN, merge_sha: mergeSha || null });
+        this.version(r.id, "system:train", "train:landed", `merged-park heal: card closed — PR #${legN} merge receipt in provenance`, {});
+        closed += 1;
+      } catch (e) {
+        this.audit("system:train", "merged_park_heal_error", r.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+    }
     return closed;
   }
 

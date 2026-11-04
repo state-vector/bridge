@@ -167,3 +167,54 @@ export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
   }),
 ]);
 export type LaneOperationalState = z.infer<typeof LaneOperationalStateSchema>;
+
+// ---- BR#6330: one merge classification — the typed card phase is the single source ----
+
+/** The closed lifecycle of a card's merge-train slot, `meta.merge_train.state`.
+ *  This field is THE single source of "is this card awaiting merge" — every
+ *  reader (hub queue derivation, watchdog holds, UI Backlog grouping) asks
+ *  this one field via mergePhaseOf/isAwaitingMerge; nothing classifies a
+ *  card into the merge class from prose reasons, note prefixes, or the
+ *  pr_merged await_event (that typed wait remains the machine LEG the train
+ *  flips — it is not a display classification).
+ *
+ *  Only train machinery writes it: accept → queued, train:merged →
+ *  awaiting-ci, landed/burst-settle/merged-park-heal → landed (card closes),
+ *  bounce → bounced, Awaiting force-review park → awaiting, lane unbind →
+ *  unbound. `base-red-park` is reserved for the merge-ladder base-red park
+ *  (no writer yet — the executor stamps it when the ladder parks a card on a
+ *  base-fix task). Legacy spellings normalise through MergeTrainPhaseSchema. */
+export const MergeTrainPhaseSchema = z.enum([
+  "queued",
+  "awaiting-ci",
+  "bounced",
+  "awaiting",
+  "unbound",
+  "base-red-park",
+  "landed",
+]);
+export type MergeTrainPhase = z.infer<typeof MergeTrainPhaseSchema>;
+
+/** The phases that make a blocked card "Awaiting PR merge — train": it holds
+ *  a live slot the serialized train owns (queued) or its PR already merged
+ *  and main is settling (awaiting-ci — the heal sweep closes these on the
+ *  provenance receipt). Everything else is NOT awaiting merge. */
+export const AWAITING_MERGE_PHASES: readonly [MergeTrainPhase, MergeTrainPhase] = ["queued", "awaiting-ci"];
+
+/** meta.merge_train.state → the closed phase, null when absent/legacy-unknown.
+ *  Accepts the pending "awaiting-ci" spelling and normalises nothing else —
+ *  an unrecognised value is a data bug to surface, not paper over. */
+export function mergePhaseOf(meta: unknown): MergeTrainPhase | null {
+  const mt = (meta as any)?.merge_train;
+  const st = typeof mt?.state === "string" ? mt.state : "";
+  if (!st) return null;
+  const parsed = MergeTrainPhaseSchema.safeParse(st);
+  return parsed.success ? parsed.data : null;
+}
+
+/** THE one predicate (BR#6330): is this card awaiting merge on the train?
+ *  Pure function of the typed phase — no prose, no await_event inference. */
+export function isAwaitingMerge(meta: unknown): boolean {
+  const p = mergePhaseOf(meta);
+  return p === AWAITING_MERGE_PHASES[0] || p === AWAITING_MERGE_PHASES[1];
+}

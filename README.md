@@ -1599,6 +1599,32 @@ and what the machine already did. Awaiting parks (BR#5633's sweep), bounced
 re-entry (BR#4494's demote), and cards holding a bound ask are excluded —
 other law owns them.
 
+### One merge classification (BR#6330)
+
+There is exactly ONE answer to "is this card awaiting merge?", and it is the
+typed card phase `meta.merge_train.state` — the closed union
+`queued | awaiting-ci | bounced | awaiting | unbound | base-red-park | landed`
+(canonical in `@bridge/contracts` `MergeTrainPhaseSchema`; the predicate is
+`isAwaitingMerge` = phase ∈ {queued, awaiting-ci}). Every reader asks the
+field: the derived queue (`mergeTrainQueue` admits on prefix OR stamp —
+deliberately fail-open, a stray admit is gate-checked while a silent drop
+starves a lane), the watchdog holds (`releaseHold`), the lane awaiting band,
+and the Backlog's "Awaiting PR merge — train" group (`exitClassOf` — the
+prose `TRAIN_RX`/`GH_PR_RX` regexes are deleted; the `pr_merged` await_event
+is the machine LEG the train flips, not a display class, and bridges the
+class only for pre-stamp legacy parks whose phase field is entirely absent).
+A card cannot enter the merge class by text. The count in Backlog equals the
+trains queue by construction because stranded state self-heals:
+`sweepMergedParks` (alarm cadence, the strand-sweep family) closes any
+blocked queued/awaiting-ci card whose PR leg carries a **provenance merge
+receipt** — the hub's own merge record (BR#3287), zero GitHub calls — via the
+lifecycle-legal blocked→in_progress→done citing the merge sha; multi-leg
+cards stamp the leg landed and re-queue to the next unlanded leg (the
+closeBurstParks mechanics). This kills the 2026-11-05 shape: nine cards for
+already-merged PRs sitting in the merge class because the settle-close owed
+them rode a pass interrupted by red cycles / out-of-band pushes.
+Pinned in `packages/worker/test/br6330-merge-class.test.ts`.
+
 ### The ops (MCP + HTTP)
 
 `train.status` (GET `/train` mirrors it) · `train.lease` (acquire / renew / release) ·
