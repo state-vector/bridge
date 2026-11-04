@@ -41,6 +41,8 @@
     // BR#6135: same rig as do.test.ts (miniflare + workerd fetch types) —
     // the pure-law halves of the suite are covered via src imports in
     // machine.test.ts-shape files; this file carries the DO rig
-    "test/takeover.test.ts"
+    "test/takeover.test.ts",
+    // BR#4684: same rig as rotation.test.ts (miniflare + workerd fetch types)
+    "test/roster-reap.test.ts"
   ]
 }

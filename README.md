@@ -256,6 +256,17 @@ the old name in `identity_aliases` (`old → current`), and:
   lists the table; a retired name can never be a canonical, so chains stay
   forward-only).
 
+**Dead registrations reap themselves — the roster is a sweep, not a landfill
+(BR#4684)**: the hub's watchdog archives (revokes, never deletes) gateway
+registrations with no auth signal for `roster_reap_days` (default 7) and
+tokens that were provisioned but never once authenticated (`roster_reap_hours`
+paces the pass, 0 disables; `admin.roster_reap` drills it with an injectable
+clock). The row and its audit trail stay; the roster shows only live-or-
+recently-live gateways; a returning machine is one approval click — the same
+principal re-pairing rotates the same row back to life in place and the old
+label rides along as an alias. Once-seen agent identities are never reaped on
+silence: their labels are board history, not infrastructure.
+
 ```jsonc
 {
   "schema_version": 2,                 // written by the runner; future versions warn
