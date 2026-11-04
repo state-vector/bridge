@@ -103,6 +103,9 @@ import {
   trainLegLanded,
   trainLegsRemaining,
   trainCardMatchesLane,
+  trainOnlyAwait,
+  trainStrandClass,
+  type TrainStrandClass,
   verdictCoversHeadLeg,
   carryAppendLeg,
   trainQueueRemainingReason,
@@ -664,6 +667,17 @@ export class KnowledgeHub {
 
 
 
+    }
+    // BR#6163 — strand sweep on the alarm cadence: cards that left the merge
+    // queue carrying a train-only wait (pr_merged / pr_checks_green) never
+    // get that wait satisfied by anything a pool executor does — the healthy-
+    // lane gate (a merged event newer than the card's park) separates the
+    // stranded car from a genuinely stalled train. One machine re-board per
+    // episode + one alarm per episode (24h dedupe) to the train alarm sink.
+    try {
+      await this.sweepStrandedTrainCards(now0);
+    } catch (e) {
+      this.audit("system:train", "strand_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
     // (A3) stale in_review: an impl owner parks in in_review awaiting a verify
     // verdict. If no verifier ever picks the verification round up, the park is
@@ -4934,13 +4948,24 @@ export class KnowledgeHub {
       // liveness = EITHER real signal: the owner session's hub ping, or the
       // task's own heartbeat (meta.last_progress.ts — what log_progress writes).
       // A live owner does at least one of these within the stall window.
-      const lastProgressTs = Number(JSON.parse(row.meta ?? "{}").last_progress?.ts ?? 0);
+      const rowMeta = JSON.parse(row.meta ?? "{}");
+      const lastProgressTs = Number(rowMeta.last_progress?.ts ?? 0);
       const lastSignal = Math.max(Number(ownerSession?.last_seen_ts ?? 0), lastProgressTs);
       const dead = !ownerToken || !lastSignal || (Date.now() - lastSignal > staleMin * 60_000);
       if (dead) {
         ghostBounce = true;
         owner = "";
         meta.bounce_released = { reason: "owning session dead at bounce — released to pool", at: Date.now() };
+        // BR#6163 — strand evidence: a dead-owner bounce-release of a card
+        // carrying a train-only wait (pr_merged / pr_checks_green) leaves the
+        // pool a card no executor can satisfy — the release transitions delete
+        // meta.blocked, and the queue slot died with the park, so the wait can
+        // never fire (BR#5522 stranded 38h under a healthy train). Copy the
+        // wait onto the release stamp from the card's STORED park (row.meta —
+        // still intact here, pre-write) so sweepStrandedTrainCards can
+        // re-board on evidence instead of guessing.
+        const strandAwait = trainOnlyAwait(rowMeta);
+        if (strandAwait) meta.bounce_released.train_only_await = strandAwait;
       }
     }
     // gateway attribution: a gateway-tagged token is infrastructure — it claims
@@ -11224,6 +11249,211 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit("system:train", "starve_sweep_error", l.id, { error: String((e as Error).message ?? e).slice(0, 160) });
       }
     }
+  }
+
+  /** BR#6163 — the strand sweep. A card that left the merge queue while
+   *  carrying a train-only wait (pr_merged / pr_checks_green) can never have
+   *  that wait satisfied by anything a pool executor does: the wait fires
+   *  from lane train_events, and the card is no longer in any lane's queue.
+   *  Shapes: the ghost bounce-release (owner dead → released to pool with the
+   *  wait still stamped, BR#5522 — 38h stranded under a healthy train), the
+   *  unprefixed park (silently dropped from mergeTrainQueue, the BR#4995
+   *  class), and the fail-closed unbound park (admitted, legless).
+   *  Healthy-lane gate: the strand only matters when the lane it cites
+   *  MOVED since the card parked (a merged event newer than the park) — a
+   *  stalled train is sweepLaneStarvation's problem, not stranded cars.
+   *  Reaction: ONE machine re-board per episode (in-place prefix repair for
+   *  blocked parks — blocked→blocked is an illegal edge — or a legal blocked
+   *  transition for released cards; the machine-managed park flag keeps the
+   *  agent queue hook off so the re-board never re-stamps through
+   *  trainQueueOnAccept), pinned by meta.strand_reboard; then ONE alarm per
+   *  episode (24h dedupe via meta.strand_alarm + askCreate's identical-open-
+   *  ask guard) to the train alarm sink. unbound_in_queue cars are alarm-only:
+   *  a machine re-queue would fail-closed re-stamp unbound (no heads exist).
+   *  in_progress cars re-board only on a dead owner signal — a live claim is
+   *  never hijacked (the BR#3659 defect-2 law). */
+  private async sweepStrandedTrainCards(now0: number): Promise<void> {
+    const strandHours = (() => {
+      const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_hours'`);
+      return s ? Math.max(1, Math.min(168, parseInt(s.value, 10) || 2)) : 2;
+    })();
+    const staleMin = (() => {
+      const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
+      return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+    })();
+    const lanes = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts
+       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
+    ).toArray() as any[];
+    const liveRepos = new Set<string>();
+    for (const l of lanes) {
+      try {
+        const lm = JSON.parse(l.meta ?? "{}");
+        const lane = laneOfMeta(lm);
+        if (!lane || l.status === "done" || l.status === "superseded") continue;
+        liveRepos.add(lane.repo);
+      } catch { /* skip malformed lane cards */ }
+    }
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, owner, title, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+         AND (json_extract(meta, '$.merge_train.state') IS NOT NULL
+              OR json_extract(meta, '$.blocked.await_event') IS NOT NULL
+              OR json_extract(meta, '$.bounce_released.train_only_await') IS NOT NULL)`,
+    ).toArray() as any[];
+    for (const r of rows) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const admitted =
+          String(r.status) === "blocked" &&
+          Number(meta.merge_train?.pr ?? 0) > 0 &&
+          ([String(meta.blocked?.reason ?? ""), String(meta.blocked_reason ?? "")].some(
+            (rn) => rn.startsWith(MERGE_TRAIN_REASON_PREFIX),
+          ) || mergeTrainHoldPrefix(meta) !== null);
+        const cls = trainStrandClass(meta, admitted);
+        if (!cls) continue;
+        // lane linkage, widened beyond the legs: an unbound (legless) card
+        // matches on its train stamp or its await evidence instead
+        const awaitEv = trainOnlyAwait(meta);
+        const repo = [
+          trainLegsRemaining(meta)[0]?.repo,
+          meta.merge_train?.repo,
+          awaitEv?.repo,
+          meta.pr?.repo,
+        ].map((x) => String(x ?? "")).find((x) => x.includes("/")) ?? "";
+        if (!repo || !liveRepos.has(repo)) continue; // no live lane to judge aliveness against
+        const parkTs = Number(meta.blocked?.ts ?? meta.merge_train?.at ?? r.status_ts ?? 0);
+        if (!parkTs) continue;
+        const ageMs = now0 - parkTs;
+        if (ageMs < strandHours * 3_600_000) continue;
+        // healthy-lane proof: the repo merged SOMETHING after this card parked
+        const moved = this.one(
+          `SELECT seq FROM train_events WHERE repo = ? AND kind = 'merged' AND ts > ? LIMIT 1`,
+          repo, parkTs,
+        );
+        if (!moved) continue; // the train itself is stalled — starvation law owns that
+        const ageH = Math.max(1, Math.round(ageMs / 3_600_000));
+        // machine re-board: once per episode, and never for unbound cars or a
+        // live in_progress claim
+        let did = "";
+        if (cls !== "unbound_in_queue" && !meta.strand_reboard) {
+          if (String(r.status) === "in_progress" && this.strandOwnerLive(r.owner, meta, staleMin)) {
+            did = "none — live claim, not hijacked";
+          } else {
+            did = await this.strandAct(String(r.id), String(r.status), cls, awaitEv) || "re-boarded";
+          }
+        }
+        // alarm leg: once per card-episode (24h dedupe) + askCreate's
+        // identical-open-ask guard
+        const alarmedAt = Number(meta.strand_alarm?.at ?? 0);
+        if (now0 - alarmedAt < 24 * 3_600_000) continue;
+        const prN = Number(meta.merge_train?.pr ?? awaitEv?.n ?? meta.pr?.number ?? 0);
+        try {
+          await this.askCreate(
+            {
+              to: "human",
+              question: `${r.id} sits out of the merge queue on a train-only wait (${cls === "unbound_in_queue" ? "unbound legs" : String(awaitEv?.event ?? "pr_merged")}) while ${repo} kept merging — need a human leg?`,
+              reason: `stranded ${ageH}h under a healthy lane — machine re-board this episode: ${did || "none (unbound car: a re-queue would fail-closed re-stamp unbound)"}`,
+              details: `BR#6163 strand sweep (bounce-release strands train-parked cards): card ${r.id} "${String(r.title ?? "").slice(0, 60)}" left the merge-train queue while carrying a typed wait only the train can satisfy (PR merge / green checks${prN ? ` on ${repo}#${prN}` : ` on ${repo}`}). The lane merged another PR after this card parked ${ageH}h ago, so the train is healthy and this car was left behind. Status ${String(r.status)}; strand class ${cls}; machine action this episode: ${did || "none"}.`,
+              options: [
+                "(Recommended) Investigating the strand — will re-queue or release the car",
+                "False positive — the card's wait is still satisfiable",
+                "Release the car — clear the train wait and let the pool own it",
+              ],
+              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            },
+            "system:train",
+          );
+          const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, r.id);
+          const m2 = JSON.parse(after?.meta ?? "{}");
+          m2.strand_alarm = { at: now0, class: cls };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m2), r.id);
+        } catch (e) {
+          // an identical alarm is already open for this episode — that IS once
+          this.audit("system:train", "strand_alarm_deduped", r.id, { detail: String((e as Error).message ?? e).slice(0, 200) });
+        }
+      } catch (e) {
+        this.audit("system:train", "strand_sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
+      }
+    }
+  }
+
+  /** Liveness for a stranded card's owner — the same two real signals the
+   *  ghost-bounce conversion reads (BR#6163): the owner token's freshest
+   *  session ping, or the task's own last_progress heartbeat. Dead-by-
+   *  construction (no token) is dead; anything within the stall window is
+   *  live and must not be hijacked. */
+  private strandOwnerLive(owner: unknown, meta: any, staleMin: number): boolean {
+    const label = String(owner ?? "");
+    if (!label) return false;
+    const token = this.one(`SELECT id FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, label, label);
+    if (!token) return false; // dead by construction — can never heartbeat
+    const sess = this.one(
+      `SELECT last_seen_ts FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
+      token.id,
+    );
+    const lastProgressTs = Number(meta?.last_progress?.ts ?? 0);
+    const lastSignal = Math.max(Number(sess?.last_seen_ts ?? 0), lastProgressTs);
+    return !!lastSignal && Date.now() - lastSignal <= staleMin * 60_000;
+  }
+
+  /** The strand re-board leg. Blocked parks repair IN PLACE (the reason
+   *  prefix is what mergeTrainQueue admits on; blocked→blocked is an illegal
+   *  edge). Released cards (todo / in_review / dead-owner in_progress) take a
+   *  LEGAL blocked transition carrying the machine-managed park flag — that
+   *  flag keeps the agent queue hook off, so the re-board never re-parses
+   *  legs through trainQueueOnAccept — plus the preserved typed await.
+   *  Returns a short action description for the alarm/evidence trail. */
+  private async strandAct(
+    id: string,
+    status: string,
+    cls: TrainStrandClass,
+    awaitEv: { event: string; repo: string; n: number } | null,
+  ): Promise<string> {
+    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, id);
+    if (!row || String(row.status) !== status) return ""; // raced — next sweep re-judges
+    const meta = JSON.parse(row.meta ?? "{}");
+    const prior = String(meta.blocked?.reason ?? meta.blocked_reason ?? "").slice(0, 200);
+    const reason = `${MERGE_TRAIN_QUEUED_REASON} — strand re-board (BR#6163): left the queue on a train-only wait (${awaitEv?.event ?? "train state"}) under a lane that kept merging${prior ? `; prior park: ${prior}` : ""}`;
+    if (status === "blocked") {
+      meta.blocked = { ...(meta.blocked ?? {}), reason };
+      meta.strand_reboard = { at: Date.now(), class: cls };
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(meta), Date.now(), id,
+      );
+      this.audit("system:train", "strand_reboard", id, { class: cls, mode: "in_place_prefix_repair" });
+      this.version(id, "system:train", "update", `strand re-board (BR#6163) — queue reason prefix repaired in place; the lane's derived queue admits this car again`, { class: cls });
+      return "in-place re-board (prefix repair)";
+    }
+    if (meta.blocked) {
+      // stale park residue on a RELEASED card: the transition would keep the
+      // old record as-is (the reason writes only on an absent park) — strip
+      // it so the fresh park carries the strand reason and the restored wait
+      delete meta.blocked;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+    }
+    await this.transition(
+      {
+        id,
+        to: "blocked",
+        merge_train: meta.merge_train ?? {},
+        note: reason,
+        unblock_condition: awaitEv
+          ? describeAwaitEvent(awaitEv as any)
+          : "merge-train gate re-admission (BR#6163 strand re-board)",
+        ...(awaitEv ? { await_event: awaitEv } : {}),
+      },
+      "system:train",
+    );
+    // re-read AFTER the transition (transition owns meta) before pinning
+    const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+    const m2 = JSON.parse(after?.meta ?? "{}");
+    m2.strand_reboard = { at: Date.now(), class: cls };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m2), id);
+    this.audit("system:train", "strand_reboard", id, { class: cls, mode: "blocked_transition", from: status });
+    this.version(id, "system:train", "transition", `strand re-board (BR#6163) — ${status} → blocked with the queue park restored and the typed train wait preserved`, { class: cls, from: status });
+    return `re-boarded via blocked transition (${status})`;
   }
 
   /** BR#5349: the canonical card deep-link for payload surfaces that bypass

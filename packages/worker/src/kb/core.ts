@@ -2243,6 +2243,65 @@ export function isWatchdogTrainHoldPark(meta: any): boolean {
   );
 }
 
+// ---- strand law (BR#6163: bounce-release strands train-parked cars) ----
+
+/** The await events ONLY the merge train can fire: `pr_merged` and
+ *  `pr_checks_green` are satisfied by lane train_events (merged / settle),
+ *  never by anything a pool executor can do. A card out of the queue while
+ *  carrying one of these waits for a merge event no queue will ever deliver
+ *  — the strand the BR#6163 sweep re-boards or alarms on. */
+export const TRAIN_ONLY_AWAIT_EVENTS = ["pr_merged", "pr_checks_green"] as const;
+
+/** The card's live train-only await. Reads meta.blocked.await_event (the
+ *  typed-wait park shape, closure.ts's closed grammar) and falls back to the
+ *  bounce-release evidence stamp (meta.bounce_released.train_only_await —
+ *  the release transitions delete meta.blocked, so the evidence must ride
+ *  the release stamp). Normalised {event, repo, n}; null otherwise. */
+export function trainOnlyAwait(
+  meta: any,
+): { event: string; repo: string; n: number } | null {
+  const m = meta ?? {};
+  const candidates = [m.blocked?.await_event, m.bounce_released?.train_only_await];
+  for (const ev of candidates) {
+    if (!ev || typeof ev !== "object") continue;
+    const event = String((ev as any).event ?? "");
+    const repo = (ev as any).repo;
+    const n = Number((ev as any).n ?? (ev as any).number ?? 0);
+    if (
+      (TRAIN_ONLY_AWAIT_EVENTS as readonly string[]).includes(event) &&
+      typeof repo === "string" && repo.includes("/") &&
+      Number.isFinite(n) && n > 0
+    ) {
+      return { event, repo: repo.trim(), n };
+    }
+  }
+  return null;
+}
+
+export type TrainStrandClass =
+  | "out_of_queue_await"  // train-only await, card no longer a queue candidate
+  | "queued_out_of_queue" // card SAYS merge-train queued, queue dropped it
+  | "unbound_in_queue";   // admitted queue park whose legs never bound (alarm only)
+
+/** Which strand class (if any) is this card in? `admitted` = the card is a
+ *  queue candidate (blocked + merge_train.pr>0 + the merge-train prefix or a
+ *  watchdog hold-park — mergeTrainQueue's admit test, regardless of legs).
+ *  Excludes the states other law owns: Awaiting parks (the BR#5633 sweep),
+ *  bounced re-entry (the BR#4494 demote), and cards holding a bound ask
+ *  (awaiting_ask — the ask pause is deliberate, not a strand). */
+export function trainStrandClass(meta: any, admitted: boolean): TrainStrandClass | null {
+  const m = meta ?? {};
+  const mt = ((m.merge_train ?? {}) as Record<string, unknown>);
+  if (m.awaiting_ask) return null;
+  const state = String(mt.state ?? "");
+  if (state === "awaiting") return null; // BR#5633 sweep owns Awaiting parks
+  if (state === "bounced") return null;  // BR#4494 demote owns bounce re-entry
+  if (state === "unbound" && admitted) return "unbound_in_queue";
+  if (trainOnlyAwait(m) && !admitted) return "out_of_queue_await";
+  if (state === "queued" && !admitted) return "queued_out_of_queue";
+  return null;
+}
+
 // ---- carry-record law (BR#3516 §5) ----
 
 /** One head move the delivery chain ACCEPTED: `update-branch` (server-side,
