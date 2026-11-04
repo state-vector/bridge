@@ -679,29 +679,32 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
     expect(r.accounting.reverse_dutied).toBe(0);
   });
 
-  it("a MERGED row with no mergeCommit is not a receipt — the binding is never closed on it", () => {
+  it("a MERGED row with no mergeCommit is not a receipt — the binding falls to the reverse path, never the observation close", () => {
+    // the true projection: a merged row is absent from the OPEN set, so the
+    // DO passes missing=true — and with no citable sha the observation loop
+    // must not close; the reverse guard owns the ruling
     const r = reconcileJoin({
       repo: "o/r",
       prs: [{ ...pr(17, { state: "MERGED", mergeCommit: null }) }],
-      bindings: [binding(17)],
+      bindings: [binding(17, { missing: true })],
       ignores: [],
       duties: [],
       cfg: CFG,
     });
-    expect(r.judgements).toHaveLength(0);
+    expect(r.judgements.map((x) => x.decision.action)).toEqual(["mark_missing"]);
     expect(r.accounting.observed_merged).toBe(0);
   });
 
-  it("a CLOSED row is not a merge receipt either — the binding is never closed on it", () => {
+  it("a CLOSED row is not a merge receipt either — the binding falls to the reverse path, never the observation close", () => {
     const r = reconcileJoin({
       repo: "o/r",
       prs: [{ ...pr(18, { state: "CLOSED" }) }],
-      bindings: [binding(18)],
+      bindings: [binding(18, { missing: true })],
       ignores: [],
       duties: [],
       cfg: CFG,
     });
-    expect(r.judgements).toHaveLength(0);
+    expect(r.judgements.map((x) => x.decision.action)).toEqual(["mark_missing"]);
     expect(r.accounting.observed_merged).toBe(0);
   });
 
