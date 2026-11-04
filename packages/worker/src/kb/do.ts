@@ -181,6 +181,7 @@ import {
   type ReconcileJudgement,
   type ReconcilePr,
 } from "./reconcile.ts";
+import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import {
   decide,
   invariants as checkInvariants,
@@ -3424,6 +3425,10 @@ export class KnowledgeHub {
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
+        // BR#6135: the dedicated takeover door — routed through the same
+        // transition wrapper so refusals carry the identical audited
+        // transition_rejected + breach-fold treatment as every gate.
+        case "claim_takeover": return this.json(await this.transition({ ...body, to: "in_progress", takeover: true }, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
         case "card.force_review": return this.json(await this.cardForceReview(body, actor));
         case "link": return this.json(await this.link(body, actor));
@@ -4681,11 +4686,139 @@ export class KnowledgeHub {
     };
   }
 
+  /** BR#6135 — interactive claim takeover: the atomic claim-transfer op.
+   *
+   *  An in_progress task whose claim is held by a dispatch-spawned runner
+   *  session can be re-taken by the card's owner or a human (BR#2673:
+   *  web/human actor, server-verified — never self-declared) in ONE write:
+   *  meta.session flips to the taker, the owner leg transfers with it (the
+   *  ex-holder's BR#3611 gateway self-release admission keys on
+   *  owner == attributed agent — post-transfer it cannot match, so the
+   *  steal-back is structurally impossible), the status stays in_progress
+   *  (no release→pool→re-claim race — the exact race that handed a paused
+   *  interactive session's card to a runner), the dead holder's watchdog
+   *  markers (grace/subprocess declarations) clear, the churn funk
+   *  (meta.attempt) resets — BR#2997: no abandonment penalty for the
+   *  taken-from agent — and the takeover is stamped meta.taken_over with a
+   *  system:fence audit row + a version entry.
+   *
+   *  Refusals are the pure law in takeover.ts (decideTakeover); each throws
+   *  [rule: takeover-*] with result_class gate_rejected, audited +
+   *  breach-folded by the transition() wrapper exactly like every gate
+   *  (BR#3430: the ownership machinery working is observable, never a
+   *  breach). machine.ts's takeover-stale-holder RULE enforces the other
+   *  half: the superseded holder session's next state change is refused
+   *  with the stand-down order (its log_progress stays open — checkpoint,
+   *  then exit; BR#3337 interop: the runner classifies the rejection as a
+   *  benign claim race and stands down).
+   */
+  private async claimTakeover(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    const roles = parseTags(row.roles);
+    // Authority inputs — every one server-derived from the token row, nothing
+    // client-declared (BR#2673): the acting principal, the gateway
+    // attribution pair (body.gateway is the token's tag, body.agent the
+    // attributed agent), the actor string, the resolved session.
+    const actingPrincipal = typeof body.token_id === "string" && body.token_id
+      ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, body.token_id)?.principal ?? null
+      : null;
+    const attributedAgent = body.gateway && String(body.agent ?? "").trim()
+      ? String(body.agent).trim().slice(0, 60)
+      : undefined;
+    // Holder class (design 2, server-verified the only way this repo trusts —
+    // the token row): the holder session's owning token is gateway-tagged ⇔
+    // the dispatch runner spawned it. An unnamed holder (meta.session absent)
+    // is infrastructure by construction and stays eligible.
+    const holderSession = typeof meta.session === "string" && meta.session.trim() ? meta.session.trim() : null;
+    let holderIsRunner = true;
+    if (holderSession) {
+      // Server-verified holder class: the sessions row's own kind stamp
+      // ('gateway' — set at first touch from the owning token's tags) or, for
+      // rows predating the stamp, the token-tag join. A session that resolves
+      // to neither was spawned by no gateway — a peer session name.
+      const srow = this.one(`SELECT token_id, kind FROM sessions WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1`, holderSession);
+      if (!srow) holderIsRunner = false;
+      else if (String(srow.kind ?? "") === "gateway") holderIsRunner = true;
+      else {
+        const trow = srow.token_id ? this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, srow.token_id) : null;
+        holderIsRunner = trow ? tagsSayGateway(trow.tags) : false;
+      }
+    }
+    const verdict = decideTakeover(
+      { id, type: row.type, status: row.status, owner: row.owner ?? "", roles, meta, holderIsRunner },
+      { actor, actingPrincipal, attributedAgent, session: await this.resolveSession(body, String(body.token_id ?? "")) },
+    );
+    if (verdict.ok === false) { // === false, not !ok: strict:false disables truthiness narrowing on the literal discriminant
+      const err: any = new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+      err.result_class = "gate_rejected";
+      throw err;
+    }
+    const ts = Date.now();
+    if (verdict.already) {
+      return { id, status: row.status, taken_over: "already", holder: verdict.fromSession };
+    }
+    const note = String(body.note ?? "").trim();
+    // THE atomic transfer — one UPDATE, status/status_ts untouched. The
+    // holder is never left unnamed: a human/web taker holds via the human
+    // plane (actor), so the stale-holder gate always has a session to key on.
+    const stamp: TakenOverStamp = {
+      from_session: verdict.fromSession,
+      to_session: verdict.toSession ?? actor,
+      by: actor,
+      at: ts,
+      reason: note,
+    };
+    meta.taken_over = stamp;
+    meta.session = String(stamp.to_session).slice(0, 120);
+    delete meta.attempt; // churn-funk reset (BR#2997): no abandonment penalty for the taken-from agent
+    delete meta.grace_until; // the dead holder's declared silence must not pause the watchdog for the taker
+    delete meta.subprocess; // same — the ex-holder's declared quiet window ends with its claim
+    // Claim transfer: the taker becomes owner — release/finish authority
+    // follows the claim (mirrors the claim path's principal-preferred law).
+    const newOwner = actingPrincipal ?? attributedAgent ?? actor;
+    if (attributedAgent && attributedAgent !== actor && this.isGatewayActor(actor)) {
+      this.gatewayTouch(actor, attributedAgent); // gateway→agent edge (BR#2455)
+    }
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET meta = ?, owner = ?, updated_ts = ? WHERE id = ?`,
+      JSON.stringify(meta), newOwner, ts, id,
+    );
+    this.audit("system:fence", "claim_takeover", id, {
+      from_session: verdict.fromSession, to_session: meta.session,
+      from_owner: row.owner ?? "", to_owner: newOwner, by: actor, note: note || undefined,
+    });
+    this.version(id, actor, "transition",
+      `claim taken over${verdict.fromSession ? ` — ${verdict.fromSession} → ${meta.session}` : ""} (owner/web-anchored, BR#6135)${note ? ` — ${note.slice(0, 120)}` : ""}`,
+      { from_session: verdict.fromSession, to_session: meta.session, by: actor, takeover: true },
+    );
+    return {
+      id, status: row.status, taken_over: true,
+      from_session: verdict.fromSession, holder: meta.session, owner: newOwner,
+      note: "claim is yours: heartbeat log_progress every ≤10m; the superseded holder has been gate-ordered to stand down (checkpoint last_will, exit)",
+    };
+  }
+
   private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
+    // ---- BR#6135: takeover:true is the claim re-take edge. An
+    // in_progress → in_progress transition is NOT in the lifecycle — with
+    // the flag it routes to the atomic claim-takeover op instead (the
+    // owner/web-anchored interception; same op the claim_takeover tool and
+    // the REST door call). Everything after this line is the normal
+    // lifecycle machinery, untouched. ----
+    if (body.takeover === true) {
+      if (to && to !== "in_progress")
+        throw new Error(
+          `takeover:true is the claim re-take edge — it rides to:"in_progress" only (got ${JSON.stringify(to)}); the op re-takes the live in_progress claim and leaves the status untouched`,
+        );
+      return this.claimTakeover(body, actor);
+    }
     // ---- the law: one table, one executor (machine.ts). Legality AND every
     // spawn/escalate/supersede decision come back as a typed Verdict
     // (Applied | Rejection); this function persists and executes the effects,

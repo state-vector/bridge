@@ -66,6 +66,14 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
 
+
+// /get returns meta as a parsed object on recent rows and as a JSON string on
+// legacy shapes — tests read it both ways.
+function metaOf(b: any): Record<string, any> {
+  if (!b?.meta) return {};
+  return typeof b.meta === "string" ? JSON.parse(b.meta) : b.meta;
+}
+
 describe("auth token SQL paths (real storage)", () => {
   it("mints a token on a cold database (ensureSchema + INSERT)", async () => {
     const { status, body } = await kbJson("/admin.mint", {
@@ -1229,5 +1237,183 @@ describe("BR#5874 — verify-round supersede is target-aware", () => {
     expect(roundAfter.body.status).not.toBe("superseded");
     const dispAfter = await kbJson("/get", { id: disp.body.id });
     expect(dispAfter.body.status).not.toBe("superseded"); // cross-PR duty coexists untouched
+  });
+});
+
+// ---------- BR#6135: interactive claim takeover — atomic owner/web-anchored claim transfer off runner sessions ----------
+// The op: one write flips meta.session + the owner leg; status stays
+// in_progress (no release→pool→re-claim race); the ex-holder's next state
+// change is gate-refused with the stand-down order (its log_progress stays
+// open); refusals fold never-breach (BR#3430). Ray live ruling 2026-11-04.
+describe("interactive claim takeover (BR#6135)", () => {
+  it("happy path: a web taker takes a runner-held claim atomically; the ex-holder is stood down", async () => {
+    // the runner: a gateway token with a principal, its dispatch session
+    const gw = await kbJson("/admin.mint", { label: "br6135-gw", tags: ["gateway"], principal: "p_br6135_box" });
+    expect(gw.status).toBe(200);
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover happy path br6135" });
+    const claim = await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim",
+      actor: "br6135-gw", gateway: true, agent: "br6135-agent", token_id: gw.body.id, session: "dispatch-BR-6135T",
+    });
+    expect(claim.status).toBe(200);
+    let held = await kbJson("/get", { id: card.id });
+    expect(metaOf(held.body).session).toBe("dispatch-BR-6135T");
+    // claim ownership anchors the PRINCIPAL (do.ts claim law). /get renders the
+    // BR#4262 display join — the principal reads as its token label — so the
+    // discriminating observable is the release gate below: the machine sees the
+    // RAW stored owner, and a label-stored owner would have been ADMITTED by
+    // the BR#3611 gateway self-release admission instead of refused.
+    expect(held.body.owner).toBe("br6135-gw");
+    const sweepPre = await kbJson("/transition", {
+      id: card.id, to: "todo", note: "runner: sweep-shaped release",
+      actor: "br6135-gw", gateway: true, agent: "br6135-agent", token_id: gw.body.id,
+    });
+    expect(sweepPre.status).toBe(400);
+    expect(String(sweepPre.body.error)).toContain("is claimed by p_br6135_box"); // stored owner = principal
+
+    // THE takeover — web actor (human plane, BR#2673 anchor), no session: the
+    // holder becomes the human plane and the owner leg transfers with it.
+    const take = await kbJson("/transition", { id: card.id, to: "in_progress", takeover: true, note: "interactive takeover", actor: "web:rayh" });
+    expect(take.status).toBe(200);
+    expect(take.body.status).toBe("in_progress"); // status untouched — no pool pass
+    expect(take.body.taken_over).toBe(true);
+    held = await kbJson("/get", { id: card.id });
+    const meta = metaOf(held.body);
+    expect(meta.session).toBe("web:rayh"); // holder is never left unnamed
+    expect(meta.taken_over.from_session).toBe("dispatch-BR-6135T");
+    expect(meta.taken_over.by).toBe("web:rayh");
+    expect(held.body.owner).toBe("web:rayh"); // claim transfer: owner follows the taker
+    expect(held.body.status).toBe("in_progress");
+
+    // the version row is on the card's history
+    const hist = await kbJson("/get_history", { id: card.id });
+    const rows = hist.body.versions ?? [];
+    expect(rows.some((r: any) => String(r.summary).includes("claim taken over"))).toBe(true);
+
+    // EX-HOLDER STAND-DOWN: the superseded runner session's release is
+    // refused with the named order — the BR#3348 two-writers class, enforced
+    const rel = await kbJson("/transition", {
+      id: card.id, to: "todo", note: "runner: stale claim released",
+      actor: "br6135-gw", gateway: true, agent: "br6135-agent", token_id: gw.body.id, session: "dispatch-BR-6135T",
+    });
+    expect(rel.status).toBe(400);
+    expect(String(rel.body.error)).toContain("STAND DOWN");
+    // …and so is its finish
+    const fin = await kbJson("/transition", {
+      id: card.id, to: "in_review", note: "PR https://github.com/state-vector/bridge/pull/1",
+      actor: "br6135-gw", gateway: true, agent: "br6135-agent", token_id: gw.body.id, session: "dispatch-BR-6135T",
+    });
+    expect(fin.status).toBe(400);
+    expect(String(fin.body.error)).toContain("STAND DOWN");
+
+    // the BR#3611 gateway self-release admission DIED with the owner leg: the
+    // runner releasing without its session (liveness-sweep shape) still hits
+    // release-needs-ownership — owner web:rayh matches neither its actor nor
+    // its attributed agent
+    const sweep = await kbJson("/transition", {
+      id: card.id, to: "todo", note: "runner: stale claim released",
+      actor: "br6135-gw", gateway: true, agent: "br6135-agent", token_id: gw.body.id,
+    });
+    expect(sweep.status).toBe(400);
+    expect(String(sweep.body.error)).toContain("is claimed by web:rayh");
+  });
+
+  it("a non-owner agent bearer is refused [rule: takeover-authority] — and the refusals fold never-breach (BR#3430)", async () => {
+    const gw = await kbJson("/admin.mint", { label: "br6135-gw2", tags: ["gateway"], principal: "p_br6135_box2" });
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover authority br6135" });
+    await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim",
+      actor: "br6135-gw2", gateway: true, agent: "br6135-agent2", token_id: gw.body.id, session: "dispatch-BR-6135B",
+    });
+    const breachCardsFor = async () => {
+      const { body } = await kbJson("/list", { type: "task", tag: "breach", limit: 200 });
+      return (body.artefacts ?? []).filter((a: any) => String(a.title).includes(card.id));
+    };
+    for (let i = 0; i < 4; i++) {
+      const r = await kbJson("/transition", {
+        id: card.id, to: "in_progress", takeover: true, actor: "random-agent", session: "sneaky-1",
+      });
+      expect(r.status).toBe(400);
+      expect(String(r.body.error)).toContain("[rule: takeover-authority]");
+    }
+    // BR#3430: an ownership rejection is the system working — no breach card
+    expect(await breachCardsFor()).toHaveLength(0);
+  });
+
+  it("a holder that is not a dispatch-spawned runner session is refused [rule: takeover-holder]", async () => {
+    const agent = await kbJson("/admin.mint", { label: "br6135-peer", tags: [] });
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover peer holder br6135" });
+    const claim = await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim", actor: "br6135-peer", token_id: agent.body.id, session: "peer-interactive-1",
+    });
+    expect(claim.status).toBe(200);
+    const r = await kbJson("/transition", { id: card.id, to: "in_progress", takeover: true, actor: "web:rayh" });
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("[rule: takeover-holder]");
+  });
+
+  it("verify duty cards refuse (SoD is not transferable) and typed-wait holds refuse", async () => {
+    const gw = await kbJson("/admin.mint", { label: "br6135-gw3", tags: ["gateway"] });
+    // verdict duty
+    const { body: duty } = await kbJson("/create", { type: "task", title: "Verify: takeover duty br6135", roles: ["review"] });
+    const dc = await kbJson("/transition", {
+      id: duty.id, to: "in_progress", note: "claim", actor: "br6135-gw3", gateway: true, agent: "br6135-agent3", token_id: gw.body.id, session: "dispatch-BR-6135C",
+    });
+    expect(dc.status).toBe(200);
+    const dr = await kbJson("/transition", { id: duty.id, to: "in_progress", takeover: true, actor: "web:rayh" });
+    expect(dr.status).toBe(400);
+    expect(String(dr.body.error)).toContain("[rule: takeover-verdict-duty]");
+    // typed wait: an in_progress card holding awaiting_ask is held by the ask
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover held br6135" });
+    await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw3", gateway: true, agent: "br6135-agent3", token_id: gw.body.id, session: "dispatch-BR-6135D",
+    });
+    const upd = await kbJson("/update", { id: card.id, meta: { awaiting_ask: { ask_id: "BR#999" } } });
+    expect(upd.status).toBe(200);
+    const hr = await kbJson("/transition", { id: card.id, to: "in_progress", takeover: true, actor: "web:rayh" });
+    expect(hr.status).toBe(400);
+    expect(String(hr.body.error)).toContain("[rule: takeover-held]");
+  });
+
+  it("idempotent: the holder re-running the takeover reports already, without rewriting the stamp", async () => {
+    const ownerTok = await kbJson("/admin.mint", { label: "br6135-owner", tags: [], principal: "p_br6135_box4" });
+    const gw = await kbJson("/admin.mint", { label: "br6135-gw4", tags: ["gateway"], principal: "p_br6135_box4" });
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover idempotent br6135" });
+    await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw4", gateway: true, agent: "br6135-agent4", token_id: gw.body.id, session: "dispatch-BR-6135E",
+    });
+    const t1 = await kbJson("/transition", {
+      id: card.id, to: "in_progress", takeover: true, actor: "br6135-owner", token_id: ownerTok.body.id, session: "ray-local-1",
+    });
+    expect(t1.status).toBe(200);
+    expect(t1.body.taken_over).toBe(true);
+    expect(t1.body.holder).toBe("ray-local-1");
+    const t2 = await kbJson("/transition", {
+      id: card.id, to: "in_progress", takeover: true, actor: "br6135-owner", token_id: ownerTok.body.id, session: "ray-local-1",
+    });
+    expect(t2.status).toBe(200);
+    expect(t2.body.taken_over).toBe("already");
+    const held = await kbJson("/get", { id: card.id });
+    const stamp = metaOf(held.body).taken_over;
+    expect(stamp.from_session).toBe("dispatch-BR-6135E"); // the FIRST stamp survived
+  });
+
+  it("the REST door claim_takeover routes through the same op; the lifecycle edge stays illegal without the flag", async () => {
+    const gw = await kbJson("/admin.mint", { label: "br6135-gw5", tags: ["gateway"] });
+    const { body: card } = await kbJson("/create", { type: "task", title: "takeover doors br6135" });
+    await kbJson("/transition", {
+      id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw5", gateway: true, agent: "br6135-agent5", token_id: gw.body.id, session: "dispatch-BR-6135F",
+    });
+    // plain in_progress → in_progress is NOT a lifecycle edge
+    const plain = await kbJson("/transition", { id: card.id, to: "in_progress", note: "double claim", actor: "web:rayh" });
+    expect(plain.status).toBe(400);
+    // the dedicated door works
+    const door = await kbJson("/claim_takeover", { id: card.id, note: "via the REST door", actor: "web:rayh" });
+    expect(door.status).toBe(200);
+    expect(door.body.taken_over).toBe(true);
+    // takeover:true refuses any other target
+    const wrong = await kbJson("/transition", { id: card.id, to: "todo", takeover: true, actor: "web:rayh" });
+    expect(wrong.status).toBe(400);
+    expect(String(wrong.body.error)).toContain('to:"in_progress" only');
   });
 });

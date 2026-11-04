@@ -483,6 +483,7 @@ describe("loop regressions", () => {
         "review-needs-pr",
         "review-separation-of-duties",
         "supersede-authority",
+        "takeover-stale-holder", // BR#6135: the ex-holder stand-down order
         "unblock-needs-resolution",
         "verdict-done-needs-receipts",
         "verdict-no-blocked",
@@ -1392,6 +1393,42 @@ describe("claim-race classification (BR#3337)", () => {
       reason: "task BR#3611B cannot be completed unreviewed — complete a verify (review-role) child task first",
     }));
     const mixed = [...ownershipEventsNewWording(5, "BR#3611B"), ...genuine];
+    expect(detectBreaches(mixed, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
+  });
+
+  // BR#6135: interactive claim takeover — every takeover refusal is the
+  // ownership machinery working, never a breach. The audited reason ends in
+  // its [rule: takeover-*] tag (do.ts trims messages to keep the tag inside
+  // the 300-char slice, BR#4295 anchoring), and RULE_BREACH_CLASSES folds
+  // each tag: authority/target/holder/stale-holder → claim_race (BR#3429
+  // symmetry), held → release_held (BR#4562 symmetry), verdict-duty →
+  // gate:separation (SoD is not transferable).
+  it("takeover refusal tags classify without raising breach cards (BR#6135)", () => {
+    expect(breachClass("takeover needs an owner/web/human-anchored taker — bearer 'random-agent' is neither; the holder keeps the claim. [rule: takeover-authority]")).toBe("claim_race");
+    expect(breachClass('takeover moves the in_progress claim only — pass to:"in_progress" (got "todo"). [rule: takeover-target]')).toBe("claim_race");
+    expect(breachClass("holder session 'peer-interactive-1' is not a dispatch-spawned runner session — takeover moves runner-held claims only. [rule: takeover-holder]")).toBe("claim_race");
+    expect(breachClass("STAND DOWN: your claim on this task was taken over; your session is superseded. Checkpoint last_will via log_progress (stays open to you), then end your run; do not retry this transition. [rule: takeover-stale-holder]")).toBe("claim_race");
+    expect(breachClass("card parks on a bound ask — the answer owns the exit; a takeover must not destroy the wait (BR#4067). Wait it out or let a human/owner release. [rule: takeover-held]")).toBe("release_held");
+    expect(breachClass("verify duty: separation of duties is not transferable — a fresh session must produce the review. [rule: takeover-verdict-duty]")).toBe("gate:separation");
+    // the audit shape: a refusal storm on one card folds to claim_race and
+    // raises nothing; a genuine gate refusal on the same card is untouched
+    const takeoverEvents = (n: number, task = "BR#6135A") =>
+      Array.from({ length: n }, (_, i) => ({
+        ts: 1_000_000 + i * 60_000,
+        task,
+        op: "transition_rejected",
+        reason: `takeover needs an owner/web/human-anchored taker — bearer 'random-agent' is neither; the holder keeps the claim. [rule: takeover-authority]`,
+      }));
+    expect(detectBreaches(takeoverEvents(9), new Set())).toHaveLength(0);
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#6135B",
+      op: "transition_rejected",
+      reason: "task BR#6135B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const mixed = [...takeoverEvents(5, "BR#6135B"), ...genuine];
     expect(detectBreaches(mixed, new Set())).toMatchObject([
       { klass: "gate:done-unreviewed", count: 3 },
     ]);

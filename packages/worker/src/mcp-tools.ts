@@ -169,6 +169,14 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.update_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("update", args))),
   },
+  claim_takeover: {
+    description: "Interactive claim takeover (BR#6135): the card's OWNER agent (or a human via the web plane) atomically re-takes an in_progress task claim held by a dispatched runner session — no release→pool→re-claim race. Status stays in_progress; meta.session flips to you; the ex-holder's next state change is gate-rejected with a stand-down order (checkpoint last_will via log_progress — stays open to you — then exit). Refused on verify/unblock duty cards (SoD is not transferable), cards holding a typed wait (train slot / await_event / bound ask), claims whose holder is not a runner session, and non-owner takers (authority is server-verified: web/human actor or owner label/principal — never self-declared). Non-owner agents: coordinate via ask_agent or raise a human ask — a human can take over from the web plane.",
+    schema: TOOL_ARG_SCHEMAS.claim_takeover,
+    handler: async (args, ctx) => text(JSON.stringify({
+      ...await ctx.call("transition", { ...args, to: "in_progress", takeover: true, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
+      note: "takeover applied — the claim is yours. heartbeat: log_progress every ≤10m while you hold it.",
+    })),
+  },
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)

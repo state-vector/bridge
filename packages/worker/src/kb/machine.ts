@@ -378,6 +378,36 @@ export const RULES: Rule[] = [
       `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
   },
   {
+    // BR#6135 interactive claim takeover — the stand-down half. A takeover
+    // atomically flips meta.session to the taker; the EX-holder (the
+    // dispatched runner session named in meta.taken_over.from_session) must
+    // not act on the card afterwards — its finish/bounce/state writes are
+    // the BR#3348 two-writers class. This rule makes the stand-down law
+    // ENFORCED, not advisory: any transition by the ex-holder's session
+    // while the new holder's claim is live is refused with a named order
+    // (checkpoint last_will via log_progress — which stays open, additive —
+    // then exit). Keyed on the SERVER-stamped taken_over record, never a
+    // client claim. The watchdog (system:watchdog) and web/human planes
+    // carry no session and are structurally unaffected; a pooled re-claim
+    // (todo → in_progress) restamps meta.session, ending the refusal for
+    // whoever legitimately re-claimed.
+    name: "takeover-stale-holder",
+    when: (i) =>
+      isTask(i) &&
+      i.status === "in_progress" &&
+      !!i.meta?.taken_over &&
+      !!i.body?.session &&
+      String(i.body.session) === String(i.meta.taken_over.from_session ?? "") &&
+      !!i.meta?.session &&
+      String(i.meta.session) !== String(i.body.session),
+    guard: (i) =>
+      `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session").slice(0, 40)} (BR#6135) — you are the superseded holder. ` +
+      // keep the whole message + its [rule: …] tag inside the 300-char audit
+      // slice — breachClass classifies from the tag (BR#4295); a cut tag
+      // folds `other` and the stand-down itself would raise breach cards.
+      "STAND DOWN: checkpoint last_will via log_progress (stays open to you), then end your run; do not retry this transition.",
+  },
+  {
     name: "release-needs-ownership",
     when: (i) =>
       isTask(i) &&
@@ -1124,6 +1154,21 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // held, and unbounded refusal storms are fixed at the emitter.
   "release-holds-typed-await": "release:held-typed-await",
   "release-holds-train-queue": "release:held-train-queue",
+  // BR#6135 claim takeover (interactive claim interception): every takeover
+  // refusal is the ownership machinery working, never a breach —
+  // authority/target rejections join the claim_race family (BR#3429
+  // symmetry: a non-owner probing a takeover is the same observable as a
+  // non-owner probing a release), a held wait joins release_held (BR#4562
+  // symmetry), the verdict-duty refusal is the SoD gate (BR#2997), the
+  // ex-holder stand-down rejection is the lost-claim race settling (5d),
+  // and a non-runner-holder refusal is the design boundary holding (the op
+  // moves claims off runner leases only).
+  "takeover-authority": "claim_race",
+  "takeover-target": "claim_race",
+  "takeover-held": "release_held",
+  "takeover-verdict-duty": "gate:separation",
+  "takeover-holder": "claim_race",
+  "takeover-stale-holder": "claim_race",
 };
 
 export function breachClass(reason: string): string {
