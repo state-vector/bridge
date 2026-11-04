@@ -2505,7 +2505,13 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     const head = classifyHeadChecks(i.headChecks);
     if (
       head.verdict === "red" &&
-      head.red.every((r) => isBaseHealthGateName(r.name))
+      // BR#5883: the main-green gate class has its own arm below — it
+      // re-runs under the gate's own predicate (baseGateGreen) and names
+      // the class in its reason. An ALL-main-green-gate red must not be
+      // consumed here with the deploy-health reason, or the dedicated arm
+      // can never fire (the 2026-11-03 test failure).
+      head.red.every((r) => isBaseHealthGateName(r.name)) &&
+      head.red.every((r) => !r.name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN))
     )
       return {
         kind: "rerun_gate",
@@ -2526,7 +2532,10 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     // gate red (re-run) from an HONEST one (a tip red exists — re-running
     // would just re-convict; the qualifier escalation owns the block). MUST
     // stay behaviour-identical to train_gate.rs decide_train_gate.
-    if (i.baseGateGreen) {
+    // BR#5883: baseGateGreen absent (legacy callers that predate the field)
+    // defaults to GREEN — only an EXPLICIT false marks the conviction honest
+    // (a real tip red; re-running would just re-convict).
+    if (i.baseGateGreen !== false) {
       const headGate = classifyHeadChecks(i.headChecks);
       if (
         headGate.verdict === "red" &&

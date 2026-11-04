@@ -816,6 +816,15 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 .red
                 .iter()
                 .all(|r| is_base_health_gate_name(&r.name))
+            // BR#5883: the main-green gate class has its own arm below — it
+            // re-runs under the gate's own predicate (base_gate_green) and
+            // names the class in its reason. An ALL-main-green-gate red must
+            // not be consumed here with the deploy-health reason, or the
+            // dedicated arm can never fire (the 2026-11-03 test failure).
+            && head
+                .red
+                .iter()
+                .all(|r| !r.name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
         {
             return MergeAction::RerunGate {
                 reason: format!(
@@ -2261,6 +2270,7 @@ mod tests {
             leg_number: Some(1),
             root_fix: false,
             base_red_names: &[],
+            base_gate_green: true,
         });
         assert!(matches!(gate, MergeAction::RerunGate { .. }), "expected RerunGate on stale main-green gate, got {gate:?}");
     }
