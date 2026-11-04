@@ -483,6 +483,7 @@ describe("loop regressions", () => {
         "review-needs-pr",
         "review-separation-of-duties",
         "supersede-authority",
+        "takeover-stale-holder",
         "unblock-needs-resolution",
         "verdict-done-needs-receipts",
         "verdict-no-blocked",
@@ -505,6 +506,34 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "agent-x" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "web:ray" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
+  });
+
+  it("BR#6135: a taken-over (superseded) holder is refused on its next state change — stand down, not race", async () => {
+    const takenOver = {
+      status: "in_progress" as const,
+      to: "in_review" as const,
+      owner: "opencode-ray",
+      actor: "opencode-ray",
+      meta: {
+        session: "ray-local-1",
+        taken_over: { from_session: "bridge-task-BR-1", to_session: "ray-local-1", by: "opencode-ray", at: 1, reason: "test" },
+      },
+      body: { session: "bridge-task-BR-1", note: "PR https://example.com/1" },
+    };
+    const v = await decide(input(takenOver), baseCtx());
+    expect(v.ok).toBe(false);
+    if (v.ok === false) {
+      expect(v.code).toBe("guard-failed");
+      expect(v.rule).toBe("takeover-stale-holder");
+      expect(v.message).toContain("STAND DOWN");
+    }
+    // the NEW holder is unaffected
+    expect((await decide(input({ ...takenOver, body: { session: "ray-local-1", note: "PR https://example.com/2" } }), baseCtx())).ok).toBe(true);
+    // a session-less actor (watchdog/web) is structurally exempt — the
+    // watchdog must keep its release path through a takeover
+    expect((await decide(input({ ...takenOver, to: "todo", actor: "system:watchdog", body: {} }), baseCtx())).ok).toBe(true);
+    // the refusal dies once the card is pooled (todo → claim restamps session)
+    expect((await decide(input({ ...takenOver, status: "todo", to: "in_progress", body: { session: "bridge-task-BR-1" } }), baseCtx())).ok).toBe(true);
   });
 
   it("BR#5151: infrastructure close-protection no longer exempts the owner's own actor", async () => {

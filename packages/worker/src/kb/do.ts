@@ -201,6 +201,7 @@ import {
   OWNER_RELEASE_EXEMPT,
   RuleCtx,
 } from "./machine.ts";
+import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -3424,6 +3425,7 @@ export class KnowledgeHub {
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
         case "update": return this.json(await this.update(body, actor));
         case "transition": return this.json(await this.transition(body, actor));
+        case "claim.takeover": return this.json(await this.claimTakeover(body, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
         case "card.force_review": return this.json(await this.cardForceReview(body, actor));
         case "link": return this.json(await this.link(body, actor));
@@ -4380,6 +4382,102 @@ export class KnowledgeHub {
     this.version(parentId, actor, "note", `close leg(s) ${shape} unowned at done — auto-derived close-duty child ${created.id} (BR#3361)`, { child: created.id, legs: shape });
   }
 
+  /** BR#6135 interactive claim takeover — the execution-half of the
+   *  BR#2997 design record (Ray live ruling 2026-11-04: "interactive agents
+   *  intercept work and claim it locally; do it now on main").
+   *
+   *  The motivating incident: an interactive session paused on the human,
+   *  went silent >10m, the watchdog released its claim to the pool, and a
+   *  dispatched runner won the re-claim race before the human came back
+   *  (BR#6068). The only recovery path was a human web release + another
+   *  pool race. This op closes that gap with ONE atomic write: the taker
+   *  (owner agent, or web/human) flips meta.session to itself with no pool
+   *  pass in between — there is no window for a dispatcher to win.
+   *
+   *  Legality lives in takeover.ts (pure, closed unions); this method owns
+   *  resolution (server-verified authority anchors only — token principal,
+   *  token label, the gateway attribution pair; never body-declared, per
+   *  BR#2673), the single UPDATE, the audit (`claim_takeover` — its own op
+   *  class, BR#3430) and the version row. The ex-holder stands down by
+   *  ENFORCED law, not convention: machine.ts's takeover-stale-holder rule
+   *  gate-rejects its next state change with a checkpoint-and-exit order,
+   *  and log_progress stays open to it (additive) so the checkpoint can
+   *  land. Churn funk resets (meta.attempt) per the BR#2997 bookkeeping
+   *  take-over ≠ abandonment for the taken-from agent. */
+  private async claimTakeover(body: any, actor: string) {
+    const id = String(body.id ?? "").trim();
+    if (!id) throw new Error("claim takeover requires id");
+    try {
+      const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+      if (!row) throw new Error(`no such artefact: ${id}`);
+      const roles: string[] = parseTags(row.roles);
+      const meta = JSON.parse(row.meta ?? "{}");
+      // authority anchors — every one derived from token/auth state. A
+      // body-declared "I am interactive" is worthless (BR#2673) and none of
+      // these fields accept it: mcp.ts stamps token_id from the identity,
+      // never the payload.
+      const tokenId = String(body.token_id ?? "");
+      const actingPrincipal = tokenId
+        ? (this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, tokenId) as any)?.principal ?? null
+        : null;
+      const attributedAgent = body.gateway === true && String(body.agent ?? "").trim()
+        ? String(body.agent).trim().slice(0, 60)
+        : null;
+      const session = (await this.resolveSession(body, tokenId).catch(() => undefined)) ?? null;
+      const verdict = decideTakeover(
+        { id, type: row.type, status: row.status, owner: String(row.owner ?? ""), roles, meta },
+        { actor, actingPrincipal, attributedAgent, session },
+      );
+      if (verdict.ok === false) {
+        // typed, rule-tagged, terminal (retry law) — breachClass folds every
+        // takeover tag into the never-a-breach families (machine.ts)
+        const err: any = new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+        err.result_class = "gate_rejected";
+        throw err;
+      }
+      if (verdict.already) {
+        return { id, status: row.status, taken_over: false, note: `claim already held by your session (${verdict.toSession}) — nothing to take over` };
+      }
+      const ts = Date.now();
+      const stamp: TakenOverStamp = {
+        from_session: verdict.fromSession,
+        to_session: verdict.toSession,
+        by: attributedAgent ?? actingPrincipal ?? actor,
+        at: ts,
+        reason: String(body.note ?? "").trim().slice(0, 300) || "interactive claim takeover (owner/web-directed)",
+      };
+      const next: any = { ...meta };
+      if (verdict.toSession) next.session = verdict.toSession;
+      next.taken_over = stamp;
+      delete next.attempt; // churn-funk reset (BR#2997): taken-over ≠ abandoned, counters start clean
+      // owner re-anchors to the taker exactly like a fresh claim would
+      // (principal > attributed agent > actor label; a web taker claims as
+      // its web actor) — for the owner-agent taker this is a no-op.
+      const owner = actingPrincipal ?? attributedAgent ?? actor;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET meta = ?, owner = ?, updated_ts = ? WHERE id = ?`,
+        JSON.stringify(next), owner, ts, id,
+      );
+      this.audit(actor, "claim_takeover", id, {
+        from_session: stamp.from_session, to_session: stamp.to_session, by: stamp.by, reason: stamp.reason,
+      });
+      this.version(id, actor, "transition",
+        `claim taken over — session ${stamp.from_session ?? "(none)"} → ${stamp.to_session ?? owner} (owner/web-directed, BR#6135). Ex-holder: STAND DOWN — checkpoint last_will via log_progress (worktree, branch, done/next), push nothing, end your run.`,
+        { takeover: stamp });
+      return { id, status: "in_progress", taken_over: true, from_session: stamp.from_session, session: stamp.to_session };
+    } catch (e) {
+      const mid = String(body?.id ?? "");
+      if (mid) {
+        const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, mid);
+        this.audit(actor, "takeover_rejected", mid, {
+          from: cur?.status, reason: String((e as Error)?.message ?? e).slice(0, 300),
+        });
+        try { await this.foldBreaches(mid); } catch { /* the breach door never blocks the gate */ }
+      }
+      throw e;
+    }
+  }
+
   /** BR#3910: one-click human supersede from the web plane. BR#2480 law: no
    *  agent may supersede — the route in index.js only admits cookie (human)
    *  sessions, and the task lifecycle deliberately has no →superseded edge,
@@ -4686,6 +4784,15 @@ export class KnowledgeHub {
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
+    // BR#6135: takeover:true on an in_progress card routes to the atomic
+    // claim-takeover op BEFORE the lifecycle table — in_progress →
+    // in_progress is otherwise the illegal edge this flag exists to replace
+    // (the BR#3218 "claim via transition" UX keeps working verbatim). On a
+    // pooled/todo card the flag is a no-op: a normal claim is the correct
+    // move and the lifecycle table below already handles it.
+    if (body.takeover === true && to === "in_progress" && row.status === "in_progress") {
+      return await this.claimTakeover(body, actor);
+    }
     // ---- the law: one table, one executor (machine.ts). Legality AND every
     // spawn/escalate/supersede decision come back as a typed Verdict
     // (Applied | Rejection); this function persists and executes the effects,

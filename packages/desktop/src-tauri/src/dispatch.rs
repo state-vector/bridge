@@ -2782,6 +2782,11 @@ fn is_claim_race_error(e: &str) -> bool {
     e.contains("not allowed (allowed:")
         || e.contains("is terminal for")
         || (e.contains("claimed by") && e.contains("only the owner"))
+        // BR#6135 interactive claim takeover: the owner/web re-took the
+        // claim from this runner mid-run; the takeover-stale-holder rule
+        // rejects the runner's next state change with a stand-down order.
+        // Same family as a lost claim race — never a dispatch failure.
+        || e.contains("was taken over by")
 }
 
 /// A spawned session whose output is a wall of lifecycle/ownership gate
@@ -2796,7 +2801,9 @@ fn claim_race_run(stdout: &str, stderr: &str) -> bool {
     // sigs below are stable fragments; the ownership shape is the same
     // structural pair is_claim_race_error uses ("claimed by" + "only the
     // owner", present in every wording of the release-needs-ownership guard).
-    const SIGS: [&str; 2] = ["not allowed (allowed:", "is claimed by"];
+    // BR#6135: "was taken over by" is the takeover-stale-holder rule's stable
+    // prefix — a stood-down runner is a lost race, not a broken agent.
+    const SIGS: [&str; 3] = ["not allowed (allowed:", "is claimed by", "was taken over by"];
     if SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s)) {
         return true;
     }

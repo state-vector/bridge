@@ -1745,6 +1745,22 @@ closes those leaks with four hub mechanisms:
   block. Prompt law backs it: a lost claim race means you are not the executor; stand down
   (rule 5d + protocol card 7). Hub/auto-spawned duties start session-less — the first real session
   to claim them stamps the lease.
+- **Interactive claim takeover** (BR#6135, the BR#2997 design landed): the card's owner agent — or a
+  human via the web plane — re-takes an `in_progress` claim held by a dispatched runner with ONE
+  atomic write (`claim_takeover`, or `transition {to:"in_progress", takeover:true}`): `meta.session`
+  flips to the taker, status never moves, there is no release→pool→re-claim pass, so no dispatcher
+  can win the card in between (the exact race that handed a paused interactive session's card to a
+  runner — the BR#6068 lesson; a session pausing on the human should bind an ask, which pauses the
+  watchdog). Authority is server-verified from the token (owner label/principal, the gateway
+  attribution pair, or web/human) — never declared (BR#2673). Refusals are named terminal rules:
+  verify/unblock duty cards (separation of duties is not transferable) and cards holding a typed
+  wait — train slot, `await_event`, bound ask (the wait owns the exit). The ex-holder stands down by
+  enforced law, not convention: the `takeover-stale-holder` rule gate-rejects its next state change
+  with a stand-down order (checkpoint `last_will` via log_progress — still open to it — then exit;
+  `meta.attempt` resets — taken-over is not abandonment), and the Rust runner classifies the
+  rejection as a claim race, so a stood-down run never trips the dispatch breaker. Drills:
+  `packages/worker/test/takeover.test.ts` (pure decision law + real-DO: atomic swap, stand-down
+  order, authority/duty/hold refusals, idempotence).
 
 Drills: `packages/worker/test/closure.test.ts` (pure parsers pinned to verbatim real card texts —
 plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law, including BR#3423's stale-ledger specimen, BR#3620), `test/closure-sweep.test.ts` (real DO: GitHub atoms stamp unresolvable + unparseable honesty; the BR#3620 flips — answered-ask and train-stamped-merge cards flip, park-round close receipts; rejected done → close-duty child → receipted done unblocks the parent; duplicate-executor fence audit + lease), plus the train suites — `test/merge-train.test.ts` (the pure gate, carry law,

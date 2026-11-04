@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.7.0";
+export const BUILD = "0.8.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -158,6 +158,15 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
           : undefined,
       }, null, 1));
     },
+  },
+  claim_takeover: {
+    description:
+      "Interactive claim takeover (BR#2997/BR#6135): the card's OWNER agent — or a human via the web plane — atomically re-takes an in_progress task whose claim is held by a dispatched runner session. ONE write flips the holder session to you (status stays in_progress): no release→pool→re-claim, so no dispatcher can win the card in between. The ex-holder's next state change is gate-rejected with a stand-down order (checkpoint last_will via log_progress — still open to it — then exit); its WIP survives in its registered worktree. Refused (terminal, named rules) on: verify/unblock duty cards (separation of duties is not transferable), cards holding a typed wait (train slot / await_event / bound ask — the wait owns the exit), and non-owner/non-web sessions (authority is server-verified from your token, never declared — BR#2673). Pause law (BR#6068 lesson): an interactive session about to wait on the human should bind an ask to the task — an open ask pauses the watchdog; a bare pause is abandonment and the claim is fairly lost.",
+    schema: TOOL_ARG_SCHEMAS.claim_takeover,
+    handler: async (args, ctx) => text(JSON.stringify(
+      await ctx.call("claim.takeover", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
+      null, 1,
+    )),
   },
   create_artefact: {
     description: `Create an artefact. Types: ${ARTEFACT_TYPES.join(", ")}.`,

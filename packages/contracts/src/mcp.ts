@@ -21,6 +21,7 @@ export const TOOL_NAMES = [
   "answer_ask",
   "ask_agent",
   "asks",
+  "claim_takeover",
   "create_artefact",
   "get_artefact",
   "get_history",
@@ -71,6 +72,13 @@ export const TOOL_ARG_SCHEMAS = {
     limit: z.number().int().max(100).optional(),
   }),
   get_artefact: z.looseObject({ id: z.string() }),
+  claim_takeover: z.looseObject({
+    id: z.string(),
+    note: z.string().optional(),
+    session: z.string().optional(),
+  }).describe(
+    "Interactive claim takeover (BR#2997/BR#6135): the card's OWNER agent (or a human via web) atomically re-takes an in_progress task claim held by a dispatched runner session — no release→pool→re-claim race. Status stays in_progress; meta.session flips to you; the ex-holder's next state-change is gate-rejected with a stand-down order (checkpoint last_will, exit). Refused on verify/unblock duty cards and cards holding a typed wait (train slot / await_event / bound ask). Non-owner agents: ask the human or coordinate via ask_agent.",
+  ),
   create_artefact: z.looseObject({
     type: z.string(),
     title: z.string().max(300),
@@ -112,6 +120,11 @@ export const TOOL_ARG_SCHEMAS = {
     budget_minutes: z.number().int().max(1440).optional(),
     replacement_id: z.string().optional(),
     session: z.string().optional(),
+    /** BR#6135 interactive claim takeover: with to:"in_progress" and
+     *  takeover:true the transition becomes an owner/web-anchored claim
+     *  re-take (same op as claim_takeover) instead of the (illegal)
+     *  in_progress→in_progress edge. */
+    takeover: z.boolean().optional(),
   }),
   link_artefacts: z.looseObject({
     src: z.string(),
