@@ -1105,3 +1105,151 @@ describe("BR#4702 — capped re-attempts under a standing escalation are observa
     expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((b: any) => [b.id, b.meta?.breach_key]))}`).toHaveLength(0);
   });
 });
+
+// ---------- (i) BR#5916 — the zombie-park re-arm: unclaimable infra anchors ----------
+
+describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (machine, no breach)", () => {
+  // 24h — mirrors the churn-guard cooldown (BR#5842) that parked the real
+  // BR#3124 sink on a timer in the first place.
+  const REARM_MS = 24 * 60 * 60_000;
+  // the sweep clocks ride past the file's largest existing sweep (t0+533m)
+  const anchorSweepNow = t0 + 560 * 60_000;
+
+  it("an anchor's expired timer re-parks on a fresh typed wait — no flip, no spawn, no escalation, no drift", async () => {
+    // 1. the anchor: meta.infra_anchor = true (do-not-claim/do-not-close),
+    //    parked on a typed time await that has ALREADY expired relative to
+    //    the sweep clock — the BR#3124 zombie shape (expired wait + capped
+    //    spawner + do-not-touch guards = no legal leg left).
+    const c = await kbJson("/create", {
+      type: "task", title: "IMPL: br5916 anchor drill", qualified: true, session: "drill-exec-br5916",
+      meta: { infra_anchor: true },
+    });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br5916", session: "drill-exec-br5916" });
+    const expiredUntil = t0 - 5 * 60_000; // already expired (derived from t0, BR#5623 law)
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5916", session: "drill-exec-br5916",
+      note: "cooldown park (BR#5842 mechanism)",
+      await_event: { event: "time", until_ts: expiredUntil },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    expect((await taskById(id)).status).toBe("blocked");
+    // the carve-out suppresses even the PARK-TIME machine round for the anchor
+    expect((await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br5916 anchor drill"))).toHaveLength(0);
+
+    // 2. sweep past the flood window: the expired timer fires — the machine
+    //    re-arms the park itself (no agent action, no breach event).
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: anchorSweepNow });
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "the anchor stays parked — the timer owns the exit; the sweep re-arms it").toBe("blocked");
+    const rearm = after.meta?.blocked?.await_event;
+    expect(rearm?.event).toBe("time");
+    expect(rearm?.until_ts, "the expired atom is replaced by a fresh wait stamped from the sweep clock").toBe(anchorSweepNow + REARM_MS);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting");
+    expect(String(after.meta?.proxy_check?.detail)).toContain("BR#5916");
+    // NO unblock duty, NO escalation stamp — the do-not-claim anchor never
+    // burns the shared spawner budget (BR#5916 scope 2)
+    expect((await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br5916 anchor drill"))).toHaveLength(0);
+    expect(after.meta?.unblock_escalated).toBeUndefined();
+    expect(after.meta?.escalate).toBeUndefined();
+
+    // 3. idempotent: a second sweep inside the fresh window re-stamps
+    //    waiting and does NOT drift the timer.
+    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: anchorSweepNow + 30 * 60_000 });
+    expect(sweep2.body.error).toBeUndefined();
+    const after2 = await taskById(id);
+    expect(after2.status).toBe("blocked");
+    expect(after2.meta?.blocked?.await_event?.until_ts).toBe(rearm.until_ts);
+    expect(after2.meta?.proxy_check?.verdict).toBe("waiting");
+  });
+
+  it("the sink route: the configured alarm sink (train_alarm_sink_id) re-arms without any meta flag", async () => {
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br5916 sink-route drill", qualified: true, session: "drill-exec-br5916s" });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br5916s", session: "drill-exec-br5916s" });
+    // point the sink setting at the drill card, park it expired, sweep
+    const set = await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: id } });
+    expect(set.status, `settings_set failed: ${JSON.stringify(set.body)}`).toBeLessThan(500);
+    const expiredUntil = t0 - 3 * 60_000;
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5916s", session: "drill-exec-br5916s",
+      note: "sink cooldown park", await_event: { event: "time", until_ts: expiredUntil },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 610 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status).toBe("blocked");
+    expect(after.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 610 * 60_000) + REARM_MS });
+    expect(String(after.meta?.proxy_check?.detail)).toContain("BR#5916");
+    // restore the setting so later tests see the default sink
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: "BR#3124" } });
+  });
+
+  it("the cap carve-out: a capped ANCHOR stamps no escalation and burns no budget; a capped non-anchor still escalates (behavior preserved)", async () => {
+    // a closed unblock child linked to the parent — the cap counts rounds
+    // EVER regardless of status, and closing keeps openChild null so the
+    // sweep actually reaches the cap branch
+    const mkChild = async (parent: string, tag: string) => {
+      const cc = await kbJson("/create", { type: "task", title: `Unblock: br5916-cap ${tag}`, qualified: true, session: `duty-${tag}`, roles: ["unblock"] });
+      expect(cc.status, `child create failed: ${JSON.stringify(cc.body)}`).toBe(200);
+      const cid = String(cc.body.id);
+      const lnk = await kbJson("/link", { src: cid, relation: "child_of", dst: parent });
+      expect(lnk.status, `link failed: ${JSON.stringify(lnk.body)}`).toBe(200);
+      await kbJson("/transition", { id: cid, to: "in_progress", actor: `duty-${tag}`, session: `duty-${tag}` });
+      const done = await kbJson("/transition", { id: cid, to: "done", actor: `duty-${tag}`, session: `duty-${tag}`, note: "receipts: https://github.com/a/b/pull/1 re-verified — exit not held; findings recorded" });
+      expect(done.status, `child done failed: ${JSON.stringify(done.body)}`).toBe(200);
+    };
+
+    // --- the non-anchor CONTROL: existing BR#2893 cap behavior intact ---
+    const nc = await kbJson("/create", { type: "task", title: "IMPL: br5916 cap control", qualified: true, session: "drill-exec-br5916c" });
+    expect(nc.status).toBe(200);
+    const nid = String(nc.body.id);
+    await kbJson("/transition", { id: nid, to: "in_progress", actor: "drill-exec-br5916c", session: "drill-exec-br5916c" });
+    for (const tag of ["c1", "c2", "c3"]) await mkChild(nid, tag);
+    const npark = await kbJson("/transition", {
+      id: nid, to: "blocked", actor: "drill-exec-br5916c", session: "drill-exec-br5916c",
+      note: "capped park", await_event: { event: "time", until_ts: t0 - 2 * 60_000 },
+    });
+    expect(npark.status, `control park failed: ${JSON.stringify(npark.body)}`).toBe(200);
+    // the cap fires at PARK time on the normal path: escalation stamped once
+    const nNow = await taskById(nid);
+    expect(nNow.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(nNow.meta?.escalate?.reason)).toContain("spawner stopped");
+
+    // --- the ANCHOR: same 3 done children, same expired timer — carve-out ---
+    const ac = await kbJson("/create", {
+      type: "task", title: "IMPL: br5916 cap anchor", qualified: true, session: "drill-exec-br5916a",
+      meta: { infra_anchor: true },
+    });
+    expect(ac.status).toBe(200);
+    const aid = String(ac.body.id);
+    await kbJson("/transition", { id: aid, to: "in_progress", actor: "drill-exec-br5916a", session: "drill-exec-br5916a" });
+    for (const tag of ["a1", "a2", "a3"]) await mkChild(aid, tag);
+    const apark = await kbJson("/transition", {
+      id: aid, to: "blocked", actor: "drill-exec-br5916a", session: "drill-exec-br5916a",
+      note: "capped anchor park", await_event: { event: "time", until_ts: t0 - 2 * 60_000 },
+    });
+    expect(apark.status, `anchor park failed: ${JSON.stringify(apark.body)}`).toBe(200);
+    const aNow = await taskById(aid);
+    // the carve-out: 3 children ever and STILL no escalation stamp, no budget burn
+    expect(aNow.meta?.unblock_escalated).toBeUndefined();
+    expect(aNow.meta?.escalate).toBeUndefined();
+
+    // the sweep: the anchor's expired timer RE-ARMS (never escalates), and
+    // the control's capped park stays honestly suppressed (spawn_skipped)
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 640 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const aAfter = await taskById(aid);
+    expect(aAfter.status).toBe("blocked");
+    expect(aAfter.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 640 * 60_000) + REARM_MS });
+    expect(aAfter.meta?.unblock_escalated).toBeUndefined();
+    const nAfter = await taskById(nid);
+    expect(nAfter.status).toBe("blocked");
+    expect(nAfter.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(nAfter.meta?.proxy_check?.spawn_skipped)).toContain("unblock spawner cap");
+  });
+});
