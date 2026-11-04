@@ -70,6 +70,7 @@ import {
   // serialized merge train (BR#3516)
   MERGE_TRAIN_QUEUED_REASON,
   MERGE_TRAIN_REASON_PREFIX,
+  MERGE_TRAIN_QUEUE_NOTE_RX,
   TRAIN_AWAITING_REASON_PREFIX,
   TRAIN_LEASE_TTL_MS,
   TRAIN_CI_TYPICAL_MINUTES,
@@ -5024,17 +5025,34 @@ export class KnowledgeHub {
     // gate already exempts on (machine.ts) — is the recursion guard: the
     // hook's own re-park passes it, so this fires only on agent-driven
     // parks; alreadyQueued keeps the hook's re-park a meta-only stamp.
-    if (
-      row.type === "task" &&
-      verdict.status === "blocked" &&
-      !body.merge_train &&
-      String(body.note ?? body.reason ?? "").startsWith(MERGE_TRAIN_QUEUED_REASON)
-    ) {
+    // BR#6045: the matcher binds BOTH the canonical `merge-train: queued`
+    // prefix and the re-queue spelling `merge-train: re-queued` (a fresh
+    // verify accept after a bounce). The old startsWith gate silently skipped
+    // the hook on the re-queued form — stamp stranded on the pre-bounce SHA,
+    // state never flipped to queued — and the next drain walk bounced the
+    // card for coverage against the stale stamp (BR#5646 bounce #2, PR
+    // superpositional#2555: the only delta was the one-word prefix).
+    // BR#5674 P1 empty-is-loud: a note that LOOKS machine-binding (opens with
+    // the train's reason prefix) but matches NO machine hook is audited loud
+    // (`queue_hook_unmatched`) instead of vanishing — the silent no-op is
+    // what turned a one-word prefix miss into a bounce loop. Machine-managed
+    // parks (`body.merge_train`) manage their own stamp and never enter this
+    // ladder; `body.merge_train` stays the recursion guard (the hook's own
+    // re-park passes it), and `alreadyQueued` keeps the hook's re-park a
+    // meta-only stamp.
+    const queueParkNote = String(body.note ?? body.reason ?? "");
+    if (row.type === "task" && verdict.status === "blocked" && !body.merge_train && MERGE_TRAIN_QUEUE_NOTE_RX.test(queueParkNote)) {
       try {
-        await this.trainQueueOnAccept(id, { note: String(body.note ?? body.reason ?? "") }, actor);
+        await this.trainQueueOnAccept(id, { note: queueParkNote }, actor);
       } catch (e) {
         this.audit("system:merge-train", "queue_hook_error", id, { error: String((e as Error).message ?? e).slice(0, 200) });
       }
+    } else if (row.type === "task" && verdict.status === "blocked" && !body.merge_train && queueParkNote.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
+      this.audit("system:merge-train", "queue_hook_unmatched", id, {
+        note: queueParkNote.slice(0, 160),
+        hint: "no machine hook binds this merge-train note — the train will NOT act on this park; re-queue with 'merge-train: queued' (+ the PR leg and head <sha> tokens)",
+      });
+      this.version(id, "system:merge-train", "queue_hook_unmatched", `park note opens '${MERGE_TRAIN_REASON_PREFIX}' but matched no machine queue hook — the train will not act on it (BR#6045 / BR#5674 P1)`, {});
     }
     // verify-verdict decisions are actionable: the human's answer DOES the
     // thing, not just records it. Accepting a VERIFIED verdict closes the
