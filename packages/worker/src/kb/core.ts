@@ -4174,7 +4174,11 @@ export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptanc
  *  "- PR n\n  head <sha>" list layout). Anything unpaired stays unbound —
  *  the queue arm fail-closes on it. Never a silent cross-pairing. A PR may
  *  be cited as the full /pull/ URL or the board's `owner/name#N` shorthand
- *  (BR#4648) — the URL form wins when both cite the same PR. */
+ *  (BR#4648) — the URL form wins when both cite the same PR. Duplicate
+ *  citations of the SAME PR (a commits deep-link after the canonical URL,
+ *  URL + shorthand) collapse to one leg (BR#6349): a single cited PR then
+ *  binds its head by the lenient single-PR rule again, instead of degrading
+ *  to strict adjacency pairing across a phantom second leg. */
 export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const t = String(text ?? "");
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
@@ -4182,8 +4186,15 @@ export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
     const repo = `${m[1]}/${m[2]}`;
     if (!isValidGitHubRepo(repo)) continue;
+    const key = `${repo}#${m[3]}`;
+    // BR#6349: the receipts deep-link (`/pull/N/commits/<sha>`) matches this
+    // regex too — a second citation of an already-cited PR must never mint
+    // a second leg. One PR is ONE leg: the duplicate broke the adjacency
+    // pairing (neither token bound), and the queue arm silently folded the
+    // stamp back to the stale head on re-queue (the BR#4684/PR#309 livelock).
+    if (seen.has(key)) continue;
+    seen.add(key);
     prs.push({ repo, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-    seen.add(`${repo}#${m[3]}`);
   }
   for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
     const idx = m.index ?? 0;
