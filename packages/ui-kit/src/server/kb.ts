@@ -410,7 +410,9 @@ export const kbApi = {
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
-  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
+  // BR#6135: `takeover` rides the same door — the server routes it through the
+  // claim-takeover op (in_progress → in_progress, holder flip, owner transfer)
+  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string; takeover?: boolean }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
   // BR#3910: one-click human supersede — the server composes the two-step
   // (blocked → release → todo → superseded) and enforces the web-session-only

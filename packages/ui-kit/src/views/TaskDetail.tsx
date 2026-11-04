@@ -264,6 +264,18 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#6135: the takeover click — the same in_progress door with takeover:true;
+  // the server verifies the web-session human anchor, flips holder+owner atomically.
+  const takeover = async () => {
+    setBusy(true);
+    try {
+      await kbApi.transition(task.id, "in_progress", { takeover: true, note: "interactive takeover — human took the live claim" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "takeover failed"); useKb.getState().reportError("claim takeover", e); } finally {
+      setBusy(false);
+    }
+  };
   // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
   // force-review — approve re-anchors the verdict at the parked head and
   // re-queues the train; request_changes bounces impl. No ask was filed;
@@ -363,6 +375,27 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       {!m.blocked && task.type === "task" && task.status === "todo" && !(task.meta as TaskMeta | undefined)?.ask && (
         <div className="row" style={{ marginBottom: 6 }}>
           <SupersedeBtn task={task as any} onChanged={onChanged} />
+        </div>
+      )}
+      {/* BR#6135: interactive claim takeover — a runner-held in_progress claim can
+          be flipped to the human in ONE atomic write (holder + owner move together,
+          no pool pass, the ex-holder is stood down by the next gate it hits). The
+          affordance targets the interactive loop's runner-held claims (BR#6159);
+          authority is still server-verified on click (owner/web anchor, BR#2673)
+          and any refusal renders inline — never a silent no-op. */}
+      {!m.blocked && task.type === "task" && task.status === "in_progress" && /^dispatch-/.test(String(m.session ?? "")) && (
+        <div className="task-blocked-info" style={{ marginBottom: 6 }}>
+          <div className="row" style={{ marginTop: 0 }}>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title="Take over the live claim: you become the holder and owner in one atomic write — the runner session is stood down (its next state change is refused). For interactive steering: the agent keeps its worktree and WIP; you drive the card from here."
+              onClick={() => void takeover()}
+            >Take over claim</Btn>
+            <span className="muted-note">
+              held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
+            </span>
+            {cardErr && <span className="k-err">{cardErr}</span>}
+          </div>
         </div>
       )}
       {((task.meta as TaskMeta | undefined)?.superseded_by || (task.meta as TaskMeta | undefined)?.superseded_reason) && (

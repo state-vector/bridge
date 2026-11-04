@@ -4450,6 +4450,11 @@ export class KnowledgeHub {
       if (verdict.toSession) next.session = verdict.toSession;
       next.taken_over = stamp;
       delete next.attempt; // churn-funk reset (BR#2997): taken-over ≠ abandoned, counters start clean
+      // BR#6159 bookkeeping: the ex-holder's declared-silence stamps die with
+      // its claim — a subprocess budget or grace window declared by a session
+      // that no longer holds the card must not shield the new holder's lease.
+      delete next.grace_until;
+      delete next.subprocess;
       // owner re-anchors to the taker exactly like a fresh claim would
       // (principal > attributed agent > actor label; a web taker claims as
       // its web actor) — for the owner-agent taker this is a no-op.

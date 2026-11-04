@@ -1426,6 +1426,51 @@ describe("claim-race classification (BR#3337)", () => {
     ]);
   });
 
+  // BR#6135: interactive claim takeover — every takeover refusal is the
+  // ownership machinery working, never a breach. The audited reason ends in
+  // its [rule: takeover-*] tag (do.ts trims messages to keep the tag inside
+  // the 300-char slice, BR#4295 anchoring), and RULE_BREACH_CLASSES folds
+  // each tag: authority/target/stale-holder → claim_race (BR#3429
+  // symmetry), held → release_held (BR#4562 symmetry), verdict-duty →
+  // gate:separation (SoD is not transferable). Message texts mirror
+  // takeover.ts / machine.ts verbatim — wording edits must land together
+  // with these pins (the BR#3611 specimen lesson).
+  it("takeover refusal tags classify without raising breach cards (BR#6135)", () => {
+    expect(breachClass("claim takeover of BR#6135A is owner/web/human-anchored (BR#2673: authority is server-verified, never self-declared) — you are random-agent and the card is held by dispatch-BR-1. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane). [rule: takeover-authority]")).toBe("claim_race");
+    expect(breachClass("claim takeover applies to an in_progress task — BR#6135A is a todo task. A todo card is claimed normally (claim = todo → in_progress); a blocked card is released/unblocked through its typed wait; an in_review card is bounced or closed through review. [rule: takeover-target]")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135A was taken over by web:rayh (owner/web-directed, BR#6135) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder]")).toBe("claim_race");
+    expect(breachClass("BR#6135A is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg. [rule: takeover-held]")).toBe("release_held");
+    expect(breachClass("BR#6135A is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over. [rule: takeover-verdict-duty]")).toBe("gate:separation");
+    // tag-cut variants: the audit slice truncates at 300 chars and the
+    // long takeover messages interpolate ids/actors/principals, so the
+    // ladder must own the structural shape too (BR#4295/BR#3611) — same
+    // families, tag or no tag:
+    expect(breachClass("claim takeover of BR#6135C is owner/web/human-anchored (BR#2673: authority is server-verified, never self-declared) — you are a-very-long-actor-label-at-the-limit-of-the-schema-field and the card is held by p_a_long_principal_identifier_from_the_auth_tokens_table. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane).")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135D was taken over by web:rayh (owner/web-directed, BR#6135) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder] (this tail would be cut past 300 chars in a real audit)".slice(0, 300))).toBe("claim_race");
+    expect(breachClass("BR#6135E is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg.".padEnd(301, " x"))).toBe("release_held");
+    expect(breachClass("BR#6135F is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over.".padEnd(301, " y"))).toBe("gate:separation");
+    // the audit shape: a refusal storm on one card folds to claim_race and
+    // raises nothing; a genuine gate refusal on the same card is untouched
+    const takeoverEvents = (n: number, task = "BR#6135A") =>
+      Array.from({ length: n }, (_, i) => ({
+        ts: 1_000_000 + i * 60_000,
+        task,
+        op: "transition_rejected",
+        reason: `takeover needs an owner/web/human-anchored taker — bearer 'random-agent' is neither; the holder keeps the claim. [rule: takeover-authority]`,
+      }));
+    expect(detectBreaches(takeoverEvents(9), new Set())).toHaveLength(0);
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#6135B",
+      op: "transition_rejected",
+      reason: "task BR#6135B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const mixed = [...takeoverEvents(5, "BR#6135B"), ...genuine];
+    expect(detectBreaches(mixed, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
+  });
+
   it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
     const genuine = [0, 1, 2].map((n) => ({
       ts: 1_000_000 + n * 60_000,

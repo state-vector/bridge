@@ -1178,6 +1178,17 @@ export function breachClass(reason: string): string {
   // `status 'x' is terminal for task`). Benign and self-healing: the loser
   // skips and the winner proceeds. Observable as claim_race, never a breach.
   if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
+  // BR#6135 takeover refusals, tag-cut variant: the takeover messages
+  // interpolate ids/actors/principals, so a >300-char audit slice can cut
+  // the trailing [rule: takeover-*] tag (BR#4295 anchoring) — the ladder
+  // owns the structural shape then, folding to the same never-breach
+  // families the tag table uses (the BR#3611 lesson: match the structure,
+  // not a sentence literal). Verdict-duty needs no leg of its own — its
+  // text carries "separation of duties" and falls to gate:separation below.
+  if (r.includes("claim takeover applies to an in_progress task")) return "claim_race"; // takeover-target
+  if (r.includes("owner/web/human-anchored")) return "claim_race"; // takeover-authority
+  if (r.includes("was taken over by") || r.includes("you are the superseded holder")) return "claim_race"; // takeover-stale-holder
+  if (r.includes("the wait owns the exit, not the executor")) return "release_held"; // takeover-held
   // BR#3429: ownership-gate rejections are claim races too — a non-owner
   // (dispatched session vs runner-held claim) tried to release a claimed
   // card. The gate refuses, the loser skips, the owner/human decides.
