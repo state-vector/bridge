@@ -11040,15 +11040,36 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  hotfix+main-red in the LANE CARD's project (the lane card's project
    *  column is the repo→project join; BR#5346 is the live superpositional
    *  example). Newest-touched first. */
-  private trainFixCard(project: string): { id: string; url: string; title: string; status: string } | null {
-    const row = project ? this.one(
-      `SELECT id, title, status FROM artefacts
+  private trainFixCard(project: string, repo?: string, redNames?: string[]): { id: string; url: string; title: string; status: string } | null {
+    if (!project) return null;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, title, status, tags, meta FROM artefacts
        WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-         AND project = ? AND tags LIKE '%"hotfix"%' AND tags LIKE '%"main-red"%'
-       ORDER BY updated_ts DESC LIMIT 1`,
+         AND project = ? AND tags LIKE '%"main-red"%'
+       ORDER BY updated_ts DESC LIMIT 20`,
       project,
-    ) as any : null;
-    return row ? { id: String(row.id), url: this.cardUrl(String(row.id)), title: String(row.title), status: String(row.status) } : null;
+    ).toArray() as any[];
+    const candidates = rows.filter((r) => {
+      const m = JSON.parse(r.meta ?? "{}");
+      if (repo && m?.root_fix?.repo && String(m.root_fix.repo) !== repo) return false;
+      const t = parseTags(r.tags).map((x) => x.toLowerCase());
+      return t.includes("hotfix") || t.includes("blocker") || t.includes("root_blocker") || t.includes("root-blocker");
+    });
+    if (!candidates.length) return null;
+    if (redNames && redNames.length > 0) {
+      const matched = candidates.find((r) => {
+        const titleLower = String(r.title ?? "").toLowerCase();
+        return redNames.some((rn) => {
+          const short = rn.split("/").pop()?.trim().toLowerCase() ?? rn.toLowerCase();
+          return short.length >= 4 && titleLower.includes(short);
+        });
+      });
+      if (matched) {
+        return { id: String(matched.id), url: this.cardUrl(String(matched.id)), title: String(matched.title), status: String(matched.status) };
+      }
+    }
+    const row = candidates[0];
+    return { id: String(row.id), url: this.cardUrl(String(row.id)), title: String(row.title), status: String(row.status) };
   }
 
   /** 2026-11-02: the episode's OPEN root-fix card (BR#5190) for a repo, with
@@ -11080,7 +11101,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return Number.isFinite(attempts) && attempts >= 3;
   }
 
-  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[]): {
+  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[], redNames?: string[]): {
     card: { id: string; title: string; status: string; exhausted?: boolean } | null;
     curePr: { repo: string; number: number } | null;
     conflictPr?: { repo: string; number: number } | null;
@@ -11088,6 +11109,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     culpritPr: number | null;
     state: BaseRedEpisodeState;
   } {
+    const matchesRedNames = (title: string, failing?: unknown): boolean => {
+      if (!redNames || redNames.length === 0) return true;
+      const hay = `${title} ${Array.isArray(failing) ? failing.join(" ") : ""}`.toLowerCase();
+      return redNames.some((rn) => {
+        const short = rn.split("/").pop()?.trim().toLowerCase() ?? rn.toLowerCase();
+        return short.length >= 4 && hay.includes(short);
+      });
+    };
     const conflictPrs = new Set<number>(
       (entries ?? [])
         .filter((e) => String(e?.cls ?? "") === "conflict" && Number.isInteger(Number(e?.pr)) && Number(e?.pr) > 0)
@@ -11121,9 +11150,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags FROM artefacts
          WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
+           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ?)
          ORDER BY updated_ts DESC LIMIT 20`,
-        repo, repo, repo,
+        repo, repo, repo, repo,
       ).toArray() as any[];
       for (const r of rows) {
         const m = JSON.parse(r.meta ?? "{}");
@@ -11142,6 +11171,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const curePr = rawPr && !conflicting ? rawPr : null;
         const conflictPr = rawPr && conflicting ? rawPr : null;
         const mergedPr = !curePr && !conflictPr && awaitingCiLegs.length ? awaitingCiLegs[awaitingCiLegs.length - 1] : null;
+        // If this card's PR already merged for an OLD check (e.g. deploy/sccache)
+        // and the live red checks on main have shifted to a different check that
+        // this card does not name, skip it so the live check's fix card is shown.
+        if (mergedPr && !curePr && redNames && redNames.length > 0 && !matchesRedNames(String(r.title ?? ""), m?.root_fix?.failing)) {
+          continue;
+        }
         const candidate = {
           card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr,
@@ -11638,18 +11673,32 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const stopActive: any = meta.stop ?? null;
       let base_red_resolution: any = null;
       if (brBase || stopActive) {
+        const nowActionObj: any = meta.lane?.now_action ?? null;
+        const nowActionFresh = nowActionObj && now0 - Number(nowActionObj.at ?? 0) < 15 * 60_000;
+        const mNowRed = nowActionFresh ? /^main still red \(red: ([^)]+)\)/.exec(String(nowActionObj.note ?? "")) : null;
+        const mNowUnsettled = nowActionFresh && /^main still unsettled\b/.test(String(nowActionObj.note ?? ""));
         const reds = brBase
           ? (Array.isArray(brBase.red) ? brBase.red : [])
               .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
               .filter((r: any) => r.name)
-          : (() => {
-              const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : [])
-                .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? r?.html_url ?? "") }))
-                .filter((r: any) => r.name);
-              if (fromStop.length) return fromStop;
-              const why = String(stopActive?.reason ?? "").trim();
-              return why ? [{ name: why, url: "" }] : [];
-            })();
+          : mNowRed
+            ? mNowRed[1]
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
+                .map((name) => {
+                  const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : []).find((r: any) => String(r?.name ?? "") === name);
+                  const fromQf = (Array.isArray(brQf?.base_state?.red) ? brQf.base_state.red : []).find((r: any) => String(r?.name ?? "") === name);
+                  return { name, url: String(fromQf?.url ?? fromStop?.url ?? fromStop?.html_url ?? "") };
+                })
+            : (() => {
+                const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : [])
+                  .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? r?.html_url ?? "") }))
+                  .filter((r: any) => r.name);
+                if (fromStop.length) return fromStop;
+                const why = String(stopActive?.reason ?? "").trim();
+                return why ? [{ name: why, url: "" }] : [];
+              })();
         // the OPEN alarm ask for this episode — filed per red episode under
         // the deterministic trainBaseRedAskTitle prefix. Newest open questions
         // first, prefix-matched in JS: parameterized LIKE+ESCAPE trips
@@ -11677,9 +11726,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           }),
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
-        const rf = this.trainOpenRootFix(lane.repo, mergedQueue);
+        const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
         base_red_resolution = {
-          verdict: brBase ? String(brBase.verdict ?? "red") : "red",
+          verdict: brBase ? String(brBase.verdict ?? "red") : mNowUnsettled ? "unsettled" : "red",
           phase: rf.state.phase,
           whats_broken: reds,
           held: queue.length,
@@ -11691,11 +11740,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          // 2026-11-02 + BR#5679: the fix card prefers the episode's ROOT-FIX
-          // card (BR#5190 — the auto-spawned work unit the triage outcomes
-          // ride), then the project's open hotfix+main-red task, and on a
-          // stopped lane falls back to the named culprit card so the banner
-          // never says "no fix card" when a stop culprit is known.
+          // 2026-11-02 + BR#5679 + BR#6012: the fix card prefers the episode's
+          // ROOT-FIX card (matching the live failing check names when multiple
+          // root-fix cards exist), then the project's open blocker/hotfix+main-red
+          // task (also matched against live red check names), and falls back to
+          // stop.culprit_task ONLY when no root-fix or project main-red card exists.
           fix_card: (() => {
             if (rf.card) {
               const shownPr = rf.curePr ?? rf.conflictPr ?? rf.mergedPr ?? null;
@@ -11709,7 +11758,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
               };
             }
-            const projFix = this.trainFixCard(String((l as any).project ?? ""));
+            const projFix = this.trainFixCard(String((l as any).project ?? ""), lane.repo, reds.map((r: any) => r.name));
             if (projFix) return projFix;
             const culpritId = String(stopActive?.culprit_task ?? "").trim();
             if (culpritId) {
