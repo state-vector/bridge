@@ -14,13 +14,21 @@ pub const TRAIN_CI_BOUND_MULTIPLIER: u64 = 3;
 pub const TRAIN_CI_TYPICAL_MINUTES: u64 = 20;
 
 const MAIN_RED_CONCLUSIONS: [&str; 4] = ["failure", "timed_out", "action_required", "startup_failure"];
-const MERGE_EXEMPT_CHECK_PATTERNS: [&str; 6] = [
+// BR#6001: 'superpositional' joins the exempt list — the 'Superpositional'
+// external check is posted by the superpositional-sync GitHub App, NOT a repo
+// workflow, and per accepted BR#3177 a failing SP review pipeline (process
+// error) is a Superpositional quality issue, never a merge gate. The app's
+// indexing pipeline failures (IndexingFailed/States.Timeout, check-run
+// 126241425334 on PR #387/#390 heads) held two verified PRs out of the lane
+// for >60m. MUST stay behaviour-identical to core.ts MERGE_EXEMPT_CHECK_PATTERNS.
+const MERGE_EXEMPT_CHECK_PATTERNS: [&str; 7] = [
     "workers builds",
     "workers-builds",
     "cloudflare pages",
     "cloudflare workers",
     "deploy preview",
     "codeql",
+    "superpositional",
 ];
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1204,6 +1212,75 @@ mod tests {
         assert!(matches!(v.verdict, MainVerdict::Green)); // exempt in-flight says nothing
         let v = classify_head_checks(&[run(1, "ci", None)]);
         assert!(matches!(v.verdict, MainVerdict::Unsettled));
+    }
+
+    // ---------- BR#6001: the Superpositional external check is never gating
+    // (implements accepted BR#3177 — a failing SP review pipeline is an SP
+    // quality issue; the app-side IndexingFailed/States.Timeout on check-run
+    // 126241425334 held verified PRs #387/#390 out of the lane >60m). ----------
+    #[test]
+    fn superpositional_failure_is_exempt_external_never_gating_br6001() {
+        // FAILURE beside all-green substance checks → GREEN with external[]
+        // populated — never RED, never the note/bounce rows.
+        let v = classify_head_checks(&[run(1, "ci", Some("success")), run(2, "Superpositional", Some("failure"))]);
+        assert!(matches!(v.verdict, MainVerdict::Green), "SP process failure must not gate: {:?}", v.verdict);
+        assert_eq!(v.external.len(), 1);
+        assert_eq!(v.external[0].name, "Superpositional");
+        assert_eq!(v.external[0].conclusion, "failure");
+        assert!(v.red.is_empty());
+    }
+
+    #[test]
+    fn superpositional_success_still_counts_green_br6001() {
+        // no regression: SUCCESS on the SP check counts as a green check
+        let v = classify_head_checks(&[run(1, "Superpositional", Some("success")), run(2, "ci", Some("success"))]);
+        assert!(matches!(v.verdict, MainVerdict::Green));
+        assert_eq!(v.green, 2);
+        assert!(v.external.is_empty());
+        // in-flight SP check says nothing (BR#2267 law unchanged)
+        let v = classify_head_checks(&[run(1, "Superpositional", None)]);
+        assert!(matches!(v.verdict, MainVerdict::Green));
+        assert!(v.unsettled.is_empty());
+    }
+
+    #[test]
+    fn unrelated_external_check_names_still_gate_br6001() {
+        // the exemption is pattern-listed, not a blanket — a name not on the
+        // list is unchanged: RED, external[] empty
+        let v = classify_head_checks(&[run(1, "ci", Some("success")), run(2, "Some Other App", Some("failure"))]);
+        assert!(matches!(v.verdict, MainVerdict::Red));
+        assert!(v.external.is_empty());
+    }
+
+    #[test]
+    fn sp_failure_head_gate_merges_no_note_no_bounce_br6001() {
+        // the BR#5994 starvation shape end-to-end at the head gate: every
+        // substance check SUCCESS, only 'Superpositional' FAILURE → the lane
+        // MERGES — never the note row, never a bounce.
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "state-vector/bridge", "number": 387, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 387,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: Some("clean".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[
+                run(1, "Test", Some("success")),
+                run(2, "Superpositional", Some("failure")),
+            ],
+            leg_number: Some(1),
+            root_fix: false,
+            base_red_names: &[],
+            base_gate_green: false,
+        });
+        match gate {
+            MergeAction::Merge { receipt } => assert!(receipt.contains("BR#3516"), "receipt: {receipt}"),
+            other => panic!("expected merge (SP failure never gates), got {other:?}"),
+        }
     }
 
     #[test]
