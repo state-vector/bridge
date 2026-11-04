@@ -125,6 +125,13 @@ export const TOOL_ARG_SCHEMAS = {
      *  re-take (same op as claim_takeover) instead of the (illegal)
      *  in_progress→in_progress edge. */
     takeover: z.boolean().optional(),
+    /** BR#6432 executor-applied batch SUPERSEDE authorization: with
+     *  to:"superseded" on a blocked task, carries the answered
+     *  authorization ask (batch_auth.ask, "BR#N"). The hub verifies the
+     *  human answer server-side, scopes the drop to the card ids the ask
+     *  names, rechecks the target's current state, and executes the drop
+     *  as system:question(<answered_by>) — the agent never writes it. */
+    batch_auth: z.object({ ask: z.string() }).loose().optional(),
   }),
   link_artefacts: z.looseObject({
     src: z.string(),

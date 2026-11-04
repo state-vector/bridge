@@ -2329,6 +2329,39 @@ export function trainMergeReceipt(
   return legRepo === repo ? hit : null;
 }
 
+/** BR#6432 — card-id references in prose: the receipt scope of a batch
+ *  SUPERSEDE authorization. Parses the board's card-id grammar out of an
+ *  artefact body: `BR#1234` / `BR-1234` (case-insensitive), slash chains
+ *  (`BR#4689/#4834/#4692` — the census style the authorization asks use),
+ *  and legacy `TASK-001` ids. Bare `#1234` / `repo#1234` PR references and
+ *  PR URLs are NEVER card ids and never match — the scope stays exactly the
+ *  cards the authorizer named, deduplicated in first-appearance order. */
+export function parseCardIdRefs(text: string): string[] {
+  const hits: Array<{ at: number; id: string }> = [];
+  for (const m of text.matchAll(/\bBR[#-](\d+(?:\/#\d+)*)/gi)) {
+    // slash chains: the first number carries the match position, the
+    // continuations follow in order after it
+    let at = m.index + m[0].length - m[1].length;
+    for (const part of m[1].split("/")) {
+      hits.push({ at, id: `BR#${part.replace(/^#/, "")}` });
+      at += part.length + 1;
+    }
+  }
+  for (const m of text.matchAll(/\b(TASK-\d+)\b/gi)) {
+    hits.push({ at: m.index, id: m[1].toUpperCase() });
+  }
+  hits.sort((a, b) => a.at - b.at);
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const { id } of hits) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
 /** BR#4067 — does a release path need to HOLD? Returns the hold description
  *  when the card carries machine-wait state — a merge-train queue slot
  *  (queued/awaiting-ci/bounced/awaiting on a live PR leg), a typed

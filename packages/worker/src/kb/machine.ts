@@ -31,7 +31,10 @@ export function effectiveRole(roles: string[]): Role {
 
 export const VERDICT_ROLES: Role[] = ["review", "unblock"];
 
+// BR#6432: exported for the batch-auth application leg in do.ts — the same
+// human-principal test the answer dispatch's authority rests on.
 const HUMAN_ACTOR = /^web(:|$)|^human:/;
+export { HUMAN_ACTOR };
 // system actors (watchdog, churn-guard, separation) act ON claims — releases
 // they perform are the machinery working, not agents dumping each other's work.
 // Exported for the BR#5807 meta-integrity guard (do.ts update): the same

@@ -61,6 +61,7 @@ import {
   isValidAskTarget,
   tagsSayGateway,
   parseTags,
+  parseCardIdRefs,
   isStandingCard,
   resolveRolePlaybook,
   selfProvisionLabel,
@@ -215,6 +216,7 @@ import {
   blockedParkVerdict,
   UNBLOCK_SPAWN_CAP,
   OWNER_RELEASE_EXEMPT,
+  HUMAN_ACTOR,
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
@@ -4864,6 +4866,123 @@ export class KnowledgeHub {
     };
   }
 
+  /** BR#6432 — apply an ANSWERED batch SUPERSEDE authorization to one named
+   *  target. The motivating incident: Ray authorized 29 strand-park drops in
+   *  the answered ask BR#6387 ("SUPERSEDE all 29 — 6 dead + 23 conflicting
+   *  parks"), but the answer misfired onto the bound disposition task
+   *  (BR#6383) instead of the 29 targets; the replacement executor's 29
+   *  supersedes hit the supersede-authority gate (BR#2480), and the honest
+   *  alternative — one verb-first ask per card (BR#6409, which did drop
+   *  BR#4494) — meant 29 repeat human asks. This op completes the BR#6395
+   *  batch-answer fix: the executor re-checks each target's CURRENT state
+   *  (the ruling's predicate must still hold) and carries the authorization
+   *  reference; the hub does the authority work server-side:
+   *
+   *    1. the ask must be a question node ANSWERED BY A HUMAN PRINCIPAL
+   *       (web:/human: — read from the hub's own row, never body-declared);
+   *    2. the recorded answer must be a batch SUPERSEDE authorization
+   *       ("SUPERSEDE all N —", "SUPERSEDE only …");
+   *    3. the target must be NAMED in the ask's body census (receipt-scoped,
+   *       never pattern-matched; "only"-scoped answers intersect with the ids
+   *       the answer text itself names — a partial authorization the hub
+   *       cannot resolve names zero ids and applies to nothing);
+   *    4. the target must be an open park (status blocked) whose card is not
+   *       a standing lane/infrastructure card (BR#5061);
+   *    5. the drop then executes exactly like the per-card answer dispatch:
+   *       as system:question(<answered_by>) with human_verdict:true — the
+   *       machine is only the pen; provenance is stamped in meta.batch_auth.
+   *
+   *  Every refusal is a typed gate_rejected naming its rule (BR#4390) and
+   *  rides the audited transition_rejected trail. */
+  private async applyBatchAuthorization(body: any, actor: string, row: any) {
+    const id = String(row.id);
+    const ts = Date.now();
+    const refuse = (rule: string, message: string): never => {
+      const err: any = new Error(`${message} [rule: ${rule}]`);
+      err.result_class = "gate_rejected";
+      throw err;
+    };
+    const rawAsk = String(body.batch_auth?.ask ?? "").trim();
+    const askId = /^BR-\d+$/i.test(rawAsk) ? `BR#${rawAsk.slice(3)}` : rawAsk;
+    if (!/^BR#\d+$/.test(askId)) {
+      refuse("batch-auth-ask-id", `batch_auth.ask must be the answered authorization ask id (BR#N), got '${rawAsk.slice(0, 40)}'`);
+    }
+    const ask = this.one(`SELECT id, type, body_md, meta FROM artefacts WHERE id = ?`, askId);
+    if (!ask || ask.type !== "question") {
+      refuse("batch-auth-ask-missing", `batch authorization ask ${askId} not found (or not a question node)`);
+    }
+    const am = JSON.parse(ask.meta ?? "{}");
+    const answer = String(am.ask?.answer ?? "").trim();
+    const answeredBy = String(am.ask?.answered_by ?? "");
+    if (!answer || !am.ask?.answered_ts) {
+      refuse("batch-auth-unanswered", `ask ${askId} is not answered — a batch SUPERSEDE authorization is the human's recorded answer on the ask (BR#2480); file the ask and let the answer authorize the drops`);
+    }
+    if (!HUMAN_ACTOR.test(answeredBy)) {
+      refuse("batch-auth-not-human", `ask ${askId}'s answer was recorded by '${answeredBy}' — batch drop authority requires a human principal (web:/human:)`);
+    }
+    const stripped = answer.trim().replace(/^\(recommended\)\s*/i, "").trim();
+    if (!/^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(stripped)) {
+      refuse("batch-auth-not-batch", `ask ${askId}'s recorded answer is not a batch SUPERSEDE authorization ('${stripped.slice(0, 80)}') — per-card drops ride their own answered asks`);
+    }
+    // Receipt scope: the card ids the authorization body names (the ask's own
+    // id excluded — self-references in prose are citations, not targets).
+    const scope = parseCardIdRefs(String(ask.body_md ?? "")).filter((c) => c !== askId);
+    const onlyScoped = !/^SUPERSEDE\s+all\b/i.test(stripped);
+    const answerNamed = onlyScoped ? new Set(parseCardIdRefs(stripped)) : null;
+    const authorized = answerNamed ? scope.filter((c) => answerNamed.has(c)) : scope;
+    if (!authorized.includes(id)) {
+      refuse(
+        "batch-auth-target-out-of-scope",
+        answerNamed && authorized.length === 0
+          ? `ask ${askId}'s "only"-scoped answer names no card ids — the hub never guesses a partial authorization's targets; name the cards in the answer or re-issue the ask`
+          : `target ${id} is not named in authorization ask ${askId}'s scope (${authorized.length} card${authorized.length === 1 ? "" : "s"}) — batch authority is receipt-scoped to the named census, never pattern-matched`,
+      );
+    }
+    // State recheck: the ruling applies to open parks only. A card that went
+    // terminal, was claimed, or was rebound since the authorization must NOT
+    // take the old ruling — skip it and say why.
+    if (row.status !== "blocked") {
+      refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}', not an open park — recheck its current state before applying the ruling (the drop edge is blocked → superseded, BR#3913)`);
+    }
+    const meta = JSON.parse(row.meta ?? "{}");
+    const tags: string[] = parseTags(row.tags);
+    if (meta.lane || tags.includes("infrastructure")) {
+      refuse("batch-auth-target-protected", `target ${id} is a standing lane/infrastructure card — closing it retires a live subsystem (BR#5061); outside batch disposition scope`);
+    }
+    this.audit(actor, "batch_auth_apply", id, {
+      ask: askId,
+      answered_by: answeredBy,
+      answered_ts: am.ask.answered_ts,
+      session: String(body.session ?? "") || undefined,
+    });
+    const asActor = `system:question(${answeredBy})`;
+    await this.transition(
+      {
+        id,
+        to: "superseded",
+        human_verdict: true,
+        note: `batch authorization ask ${askId} answered by ${answeredBy} — dropped: ${stripped.slice(0, 80)} (applied via batch_auth by ${actor}${body.session ? `/${String(body.session).slice(0, 60)}` : ""})`,
+      },
+      asActor,
+    );
+    // Durable provenance on the dropped card: who authorized, which ask, who
+    // carried it. get_history keeps the act row; this keeps it machine-readable.
+    const cur = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+    const cm = JSON.parse(cur?.meta ?? "{}");
+    cm.batch_auth = {
+      ask: askId,
+      answered_by: answeredBy,
+      answered_ts: am.ask.answered_ts,
+      answer: answer.slice(0, 300),
+      applied_by: actor,
+      applied_session: String(body.session ?? "") || undefined,
+      applied_ts: ts,
+    };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), id);
+    this.version(id, actor, "update", `batch_auth provenance stamped — authorization ask ${askId} answered by ${answeredBy}`, {});
+    return { id, status: "superseded", batch_auth: { ask: askId, answered_by: answeredBy, authorized_scope: authorized.length } };
+  }
+
   private async doTransition(body: any, actor: string) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
@@ -4877,6 +4996,17 @@ export class KnowledgeHub {
     // move and the lifecycle table below already handles it.
     if (body.takeover === true && to === "in_progress" && row.status === "in_progress") {
       return await this.claimTakeover(body, actor);
+    }
+    // BR#6432: an executor-applied batch SUPERSEDE authorization. The
+    // answered ask IS the human authority (BR#2480 — same law as the
+    // per-card answer dispatch); the agent session that carries
+    // {batch_auth: {ask}} never writes the drop itself — the hub
+    // re-executes the recorded human answer as the machinery pen
+    // (system:question(<answered_by>)), receipt-scoped to the card ids the
+    // authorization body names, with the target's current state rechecked
+    // first. Refusals are typed gate_rejected (BR#4390).
+    if (body?.batch_auth != null && to === "superseded" && row.type === "task") {
+      return await this.applyBatchAuthorization(body, actor, row);
     }
     // ---- the law: one table, one executor (machine.ts). Legality AND every
     // spawn/escalate/supersede decision come back as a typed Verdict
