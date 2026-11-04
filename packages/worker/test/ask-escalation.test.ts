@@ -221,5 +221,63 @@ describe("ask TTL escalation (real DO)", () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../src/kb/do.ts", import.meta.url), "utf8");
     expect(src).toContain("await this.escalateStaleAsks(now0)");
+
+    /** index of the `}` matching the `{` at openIdx (balanced-text match —
+     *  the alarmSweep region holds no unbalanced braces in strings/comments) */
+    const matchBrace = (s: string, openIdx: number): number => {
+      let depth = 0;
+      for (let i = openIdx; i < s.length; i++) {
+        if (s[i] === "{") depth++;
+        else if (s[i] === "}") { depth--; if (depth === 0) return i; }
+      }
+      return -1;
+    };
+    /** the whole `try { … } catch (…) { … }` statement starting at tryIdx */
+    const tryCatchStmt = (s: string, tryIdx: number): string => {
+      const tryClose = matchBrace(s, s.indexOf("{", tryIdx));
+      const catchKw = s.indexOf("catch", tryClose);
+      const end = catchKw === -1 ? tryClose : matchBrace(s, s.indexOf("{", catchKw));
+      return s.slice(tryIdx, end + 1);
+    };
+
+    // alarmSweep's body
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    expect(sweepOpen).toBeGreaterThan(-1);
+    const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
+
+    // BR#6202 placement pin — the escalation used to sit INSIDE the
+    // starvation sweep's catch (ran only when sweepLaneStarvation threw),
+    // so a plain `toContain` passed while the happy path never escalated.
+    // The contract: the starvation sweep's try statement and the escalation
+    // phase are SIBLINGS, and the escalation carries its own guard.
+    const starveCall = body.indexOf("await this.sweepLaneStarvation(now0);");
+    expect(starveCall).toBeGreaterThan(-1);
+    const starveTry = body.lastIndexOf("try", starveCall);
+    const starveStmt = tryCatchStmt(body, starveTry);
+    const escCall = body.indexOf("await this.escalateStaleAsks(now0);");
+    expect(escCall).toBeGreaterThan(-1);
+    // the call lives OUTSIDE the starvation sweep's try/catch — a successful
+    // starvation sweep no longer skips it
+    expect(starveStmt).not.toContain("escalateStaleAsks");
+    expect(escCall).toBeGreaterThan(starveTry + starveStmt.length);
+    // and it is guarded by its OWN try/catch with a phase audit line — an
+    // escalation error degrades alone instead of riding another phase's catch
+    const escTry = body.lastIndexOf("try", escCall);
+    const escStmt = tryCatchStmt(body, escTry);
+    expect(escStmt).toContain("await this.escalateStaleAsks(now0);");
+    expect(escStmt).toContain("} catch");
+    expect(escStmt).toContain("ask_escalation_error");
+  });
+
+  it("a full alarm-sweep tick completes green with the escalation phase in place (the drill DO's healthy lane: sweepLaneStarvation SUCCEEDS on this tick)", async () => {
+    // The alarm cadence's own code path (admin.alarm_sweep → alarmSweep):
+    // with no lanes configured, sweepLaneStarvation resolves — the happy
+    // path. Under the BR#6202 defect this tick still passed (the escalation
+    // merely never ran); the placement contract above pins WHERE the call
+    // sits, and the ask-escalation drill above pins WHAT it does. Together:
+    // every tick escalates.
+    const sweep = await kbJson("/admin.alarm_sweep");
+    expect(sweep.status, JSON.stringify(sweep.body)).toBe(200);
+    expect(sweep.body.ok).toBe(true);
   });
 });

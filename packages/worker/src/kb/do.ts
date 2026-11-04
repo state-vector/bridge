@@ -652,6 +652,7 @@ export class KnowledgeHub {
       await this.sweepLaneStarvation(now0);
     } catch (e) {
       this.audit("system:train", "starve_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
     // (0b) BR#3942 — TTL escalation for agent-addressed asks. An ask to an
     // agent identity that sits unanswered past the TTL while the addressee is
     // OFFLINE black-holes: the owner-gated release law (BR#3931) deadlocks
@@ -663,10 +664,15 @@ export class KnowledgeHub {
     // with the proof, and NO duplicate ask is minted (one-ask-per-class
     // doctrine). An ONLINE addressee + unanswered is still reachable —
     // agents may simply be mid-task — so no escalation.
-    await this.escalateStaleAsks(now0);
-
-
-
+    // BR#6202: this call used to sit INSIDE the starvation sweep's catch —
+    // it ran only when sweepLaneStarvation THREW, so on the normal tick the
+    // BR#3942 re-route never fired. Own guarded phase (the (A1)/(A2)
+    // pattern above): every tick escalates, and an escalation error can't
+    // mask (or ride) the starvation sweep's own audit.
+    try {
+      await this.escalateStaleAsks(now0);
+    } catch (e) {
+      this.audit("system:watchdog", "ask_escalation_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
     // BR#6163 — strand sweep on the alarm cadence: cards that left the merge
     // queue carrying a train-only wait (pr_merged / pr_checks_green) never
