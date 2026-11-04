@@ -3075,6 +3075,7 @@ export type BaseRedEpisodeState =
       card: null;
       curePr: null;
       conflictPr: null;
+      mergedPr: null;
       culpritPr: number | null;
     }
   | {
@@ -3083,6 +3084,7 @@ export type BaseRedEpisodeState =
       card: { id: string; title: string; status: string; exhausted: false };
       curePr: null;
       conflictPr: null;
+      mergedPr: null;
       culpritPr: number | null;
     }
   | {
@@ -3091,6 +3093,16 @@ export type BaseRedEpisodeState =
       card: { id: string; title: string; status: string; exhausted?: boolean };
       curePr: null;
       conflictPr: { repo: string; number: number };
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_merged_awaiting_ci";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: { repo: string; number: number; merge_sha: string };
       culpritPr: number | null;
     }
   | {
@@ -3099,6 +3111,7 @@ export type BaseRedEpisodeState =
       card: { id: string; title: string; status: string; exhausted?: boolean };
       curePr: { repo: string; number: number };
       conflictPr: null;
+      mergedPr: null;
       culpritPr: number | null;
       command: string;
     }
@@ -3108,6 +3121,7 @@ export type BaseRedEpisodeState =
       card: { id: string; title: string; status: string; exhausted: true };
       curePr: null;
       conflictPr: null;
+      mergedPr: null;
       culpritPr: number | null;
     };
 
@@ -3115,6 +3129,7 @@ export function classifyBaseRedEpisodeState(fix: {
   card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
   curePr?: { repo: string; number: number } | null;
   conflictPr?: { repo: string; number: number } | null;
+  mergedPr?: { repo: string; number: number; merge_sha: string } | null;
   culpritPr?: number | null;
 }): BaseRedEpisodeState {
   const culpritPr = fix?.culpritPr ?? null;
@@ -3126,7 +3141,7 @@ export function classifyBaseRedEpisodeState(fix: {
         exhausted: !!fix.card.exhausted,
       }
     : null;
-  if (fix?.curePr && Number.isInteger(fix.curePr.number) && fix.curePr.number > 0 && !fix.conflictPr) {
+  if (fix?.curePr && Number.isInteger(fix.curePr.number) && fix.curePr.number > 0 && !fix.conflictPr && !fix.mergedPr) {
     const card = rawCard ?? {
       id: `PR#${fix.curePr.number}`,
       title: "",
@@ -3139,8 +3154,26 @@ export function classifyBaseRedEpisodeState(fix: {
       card,
       curePr: { repo: fix.curePr.repo, number: fix.curePr.number },
       conflictPr: null,
+      mergedPr: null,
       culpritPr,
       command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+    };
+  }
+  if (fix?.mergedPr && Number.isInteger(fix.mergedPr.number) && fix.mergedPr.number > 0) {
+    const card = rawCard ?? {
+      id: `PR#${fix.mergedPr.number}`,
+      title: "",
+      status: "in_progress",
+      exhausted: false,
+    };
+    return {
+      phase: "cure_pr_merged_awaiting_ci",
+      warrantAsk: false,
+      card,
+      curePr: null,
+      conflictPr: null,
+      mergedPr: { repo: fix.mergedPr.repo, number: fix.mergedPr.number, merge_sha: String(fix.mergedPr.merge_sha ?? "") },
+      culpritPr,
     };
   }
   if (fix?.conflictPr && Number.isInteger(fix.conflictPr.number) && fix.conflictPr.number > 0 && rawCard) {
@@ -3150,11 +3183,12 @@ export function classifyBaseRedEpisodeState(fix: {
       card: rawCard,
       curePr: null,
       conflictPr: { repo: fix.conflictPr.repo, number: fix.conflictPr.number },
+      mergedPr: null,
       culpritPr,
     };
   }
   if (!rawCard) {
-    return { phase: "diagnosing", warrantAsk: false, card: null, curePr: null, conflictPr: null, culpritPr };
+    return { phase: "diagnosing", warrantAsk: false, card: null, curePr: null, conflictPr: null, mergedPr: null, culpritPr };
   }
   if (rawCard.exhausted) {
     return {
@@ -3163,6 +3197,7 @@ export function classifyBaseRedEpisodeState(fix: {
       card: { ...rawCard, exhausted: true },
       curePr: null,
       conflictPr: null,
+      mergedPr: null,
       culpritPr,
     };
   }
@@ -3172,6 +3207,7 @@ export function classifyBaseRedEpisodeState(fix: {
     card: { ...rawCard, exhausted: false },
     curePr: null,
     conflictPr: null,
+    mergedPr: null,
     culpritPr,
   };
 }

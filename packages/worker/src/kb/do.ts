@@ -11084,6 +11084,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     card: { id: string; title: string; status: string; exhausted?: boolean } | null;
     curePr: { repo: string; number: number } | null;
     conflictPr?: { repo: string; number: number } | null;
+    mergedPr?: { repo: string; number: number; merge_sha: string } | null;
     culpritPr: number | null;
     state: BaseRedEpisodeState;
   } {
@@ -11096,12 +11097,26 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (conflictPrs.has(prNum)) return true;
       return m?.merge_train?.state === "bounced" && m?.merge_train?.bounce_kind === "conflict";
     };
+    const mergedShaForPr = (m: any, legRepo: string, prNum: number): string | null => {
+      const fromCard = trainMergeReceipt(m, legRepo, prNum);
+      if (fromCard?.merge_sha) return fromCard.merge_sha;
+      if (Number(m?.provenance?.pr) === prNum && typeof m?.provenance?.merge_sha === "string" && m.provenance.merge_sha) {
+        return String(m.provenance.merge_sha);
+      }
+      const ev = this.one(
+        `SELECT merge_sha FROM train_events WHERE kind = 'merged' AND repo = ? AND pr = ? AND merge_sha IS NOT NULL ORDER BY ts DESC LIMIT 1`,
+        legRepo,
+        prNum,
+      ) as any;
+      return ev?.merge_sha ? String(ev.merge_sha) : null;
+    };
     let root: {
       card: { id: string; title: string; status: string; exhausted?: boolean } | null;
       curePr: { repo: string; number: number } | null;
       conflictPr?: { repo: string; number: number } | null;
+      mergedPr?: { repo: string; number: number; merge_sha: string } | null;
       culpritPr: number | null;
-    } = { card: null, curePr: null, conflictPr: null, culpritPr: null };
+    } = { card: null, curePr: null, conflictPr: null, mergedPr: null, culpritPr: null };
     if (repo) {
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags FROM artefacts
@@ -11118,14 +11133,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
           .filter((l) => Number.isInteger(l.number) && l.number > 0);
-        const rawPr = unlandedLegs.length ? unlandedLegs[unlandedLegs.length - 1] : null;
+        const openLegs = unlandedLegs.filter((l) => !mergedShaForPr(m, l.repo, l.number));
+        const awaitingCiLegs = unlandedLegs
+          .map((l) => ({ ...l, merge_sha: mergedShaForPr(m, l.repo, l.number) }))
+          .filter((l): l is { repo: string; number: number; merge_sha: string } => !!l.merge_sha);
+        const rawPr = openLegs.length ? openLegs[openLegs.length - 1] : null;
         const conflicting = rawPr ? isCardPrConflicting(m, rawPr.number) : false;
         const curePr = rawPr && !conflicting ? rawPr : null;
         const conflictPr = rawPr && conflicting ? rawPr : null;
+        const mergedPr = !curePr && !conflictPr && awaitingCiLegs.length ? awaitingCiLegs[awaitingCiLegs.length - 1] : null;
         const candidate = {
           card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr,
           conflictPr,
+          mergedPr,
           culpritPr: Number(m.root_fix?.pr ?? 0) || root.culpritPr || null,
         };
         if (!root.card) root = candidate;
@@ -11133,17 +11154,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           root = candidate;
           break;
         }
+        if (mergedPr && !root.mergedPr) {
+          root = candidate;
+        }
       }
     }
     // (2) the queue-entry fallback — runs ONLY when no open root-fix card has
-    // a non-conflicting cure PR yet. BR#6012: never scavenge generic product
-    // `fix(<scope>):` PRs (#2555 `fix(chat): ...`) and never graft a queued
-    // card's PR onto a different root-fix card. A queued entry qualifies iff:
-    //   - its PR is not conflicting (`cls !== "conflict"`), AND
-    //   - the queued card is itself a qualified root-fix card (`isRootFixCard`),
-    //     OR no root-fix card exists yet (`!root.card`) and the queued card's
-    //     title explicitly names a base/CI/deploy/gate cure (`isBaseCureCardTitle`).
-    if (!root.curePr) {
+    // a non-conflicting cure PR (or already-merged awaiting-ci cure PR) yet.
+    if (!root.curePr && !root.mergedPr) {
       for (const e of entries ?? []) {
         if (String(e?.cls ?? "") === "conflict") continue;
         const pr = Number(e?.pr);
@@ -11160,12 +11178,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);
         if (!matchLeg) continue;
         const legRepo = String(matchLeg.repo || repo);
+        if (mergedShaForPr(m, legRepo, pr)) continue;
         const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
         if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
         const resolved = {
           card: { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr: { repo: legRepo, number: pr },
           conflictPr: null,
+          mergedPr: null,
           culpritPr: root.culpritPr,
         };
         return { ...resolved, state: classifyBaseRedEpisodeState(resolved) };
@@ -11678,7 +11698,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // never says "no fix card" when a stop culprit is known.
           fix_card: (() => {
             if (rf.card) {
-              const shownPr = rf.curePr ?? rf.conflictPr ?? null;
+              const shownPr = rf.curePr ?? rf.conflictPr ?? rf.mergedPr ?? null;
               return {
                 id: rf.card.id,
                 url: this.cardUrl(rf.card.id),
@@ -11686,6 +11706,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 status: rf.card.status,
                 ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
                 ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
+                ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
               };
             }
             const projFix = this.trainFixCard(String((l as any).project ?? ""));

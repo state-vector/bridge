@@ -3268,6 +3268,28 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(snap3.base_red_resolution.fix_card.pr).toBe(2800);
     expect(snap3.base_red_resolution.fix_card.conflict).toBeUndefined();
 
+    // (4) #2800 merges (`train.event` kind:"merged" -> awaiting-ci):
+    //     phase transitions to `cure_pr_merged_awaiting_ci`, open ask auto-closes (warrantAsk: false),
+    //     and `fix_card.merged === true` with `merge_sha` so the UI says MERGED, never "waiting on PR #2800"
+    const mergedEv = await kbJson("/train.event", {
+      repo,
+      base: "main",
+      actor: "gw-6012",
+      kind: "merged",
+      pr: 2800,
+      merge_sha: "e96bc222aa349f395be9deb5f683c988043359a4",
+      head_sha: "2".repeat(40),
+      task_id: rootFix.body.id,
+    });
+    expect(mergedEv.body.error ?? "").toBe("");
+    expect((await stamp([{ id: cChat, pr: 2555, cls: "waiting" }])).body.error ?? "").toBe("");
+    expect(await findOpenAsk()).toBeNull();
+    const snap4 = await laneSnap(repo);
+    expect(snap4.base_red_resolution.phase).toBe("cure_pr_merged_awaiting_ci");
+    expect(snap4.base_red_resolution.fix_card.pr).toBe(2800);
+    expect(snap4.base_red_resolution.fix_card.merged).toBe(true);
+    expect(snap4.base_red_resolution.fix_card.merge_sha).toBe("e96bc222aa349f395be9deb5f683c988043359a4");
+
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6012" });
   });
 });
