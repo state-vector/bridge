@@ -1932,22 +1932,51 @@ export function isBaseHealthGateName(name: string): boolean {
  *  failing main-HEAD run sha it cures. */
 export type RootFixBinding = { repo: string; head_sha: string };
 
-/** meta.root_fix read off a card — null unless it names repo + head_sha. */
+/** meta.root_fix read off a card — null unless it names repo + head_sha (or
+ *  an agent-filed root-blocker card carrying main_tip/red_since + a bound PR
+ *  repo, BR#6012). */
 export function mainRedBinding(meta: any): RootFixBinding | null {
   const b = meta?.root_fix;
-  if (!b || typeof b !== "object") return null;
-  const repo = typeof b.repo === "string" ? b.repo : "";
-  const sha = typeof b.head_sha === "string" ? b.head_sha : "";
-  return repo && sha ? { repo, head_sha: sha } : null;
+  if (b && typeof b === "object") {
+    const repo = typeof b.repo === "string" ? b.repo : "";
+    const sha = typeof b.head_sha === "string" ? b.head_sha : "";
+    if (repo && sha) return { repo, head_sha: sha };
+  }
+  const fallbackSha =
+    typeof meta?.main_tip === "string" && meta.main_tip
+      ? meta.main_tip
+      : typeof meta?.red_since === "string" && meta.red_since
+        ? meta.red_since
+        : "";
+  const fallbackRepo = String(
+    meta?.root_fix?.repo ??
+      meta?.pr?.repo ??
+      (Array.isArray(meta?.prs) && meta.prs[0]?.repo ? meta.prs[0].repo : "") ??
+      meta?.merge_train?.repo ??
+      "",
+  ).trim();
+  return fallbackRepo && fallbackSha ? { repo: fallbackRepo, head_sha: fallbackSha } : null;
 }
 
-/** The qualification (Rust is_root_fix_card mirror): tags root_blocker +
- *  main-red AND a bound failing main-HEAD run. Tags alone never qualify —
- *  the binding does. */
+/** The qualification (Rust is_root_fix_card mirror): tags root_blocker (or
+ *  root-blocker) + main-red AND a bound failing main-HEAD run. Tags alone
+ *  never qualify — the binding does. */
 export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
   const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
-  if (!tags.includes(ROOT_FIX_TAG) || !tags.includes(MAIN_RED_TAG)) return false;
+  const hasRoot = tags.includes(ROOT_FIX_TAG) || tags.includes("root-blocker");
+  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red");
+  if (!hasRoot || !hasMainRed) return false;
   return mainRedBinding(card?.meta) !== null;
+}
+
+/** BR#6012: true iff a queued card's title explicitly names a base-red /
+ *  CI / deploy-health / merge-gate / stop-the-line fix — NEVER a generic
+ *  product bugfix (`fix(chat): ...`, `fix(web): ...`), which previously
+ *  matched bare `/\bfix\b/` and grafted unrelated product PRs (#2555) onto
+ *  the root-fix card as a fake bypass-merge cure. */
+export function isBaseCureCardTitle(title: string): boolean {
+  const t = String(title ?? "");
+  return /\bfix\s*\(\s*(?:ci|deploy|gate|train|build|infra|runner|smoke|actions)\s*\)|main[- ]green|main[- ]red|stop[- ]the[- ]line|deploy[- ]health|root[-_ ]blocker|root[-_ ]fix/i.test(t);
 }
 
 /** The deterministic one-click human merge ask title for the circular
@@ -2485,6 +2514,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   // an uncovered head bounced before this line, so behind reaching the
   // compose is always a §5-carryable head.
   const behind = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "behind";
+  const mechanicallySound = i.mergeable === true && i.commits.every((c) => c.verified);
   // ---- STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive: "the
   // train already runs — it should detect this itself; the system
   // aggressively self-heals"): the deploy-health merge-gate check judges
@@ -2501,7 +2531,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   // pre-clear: a failed required check reads BLOCKED, and the stale class
   // must heal there too. MUST stay behaviour-identical to train_gate.rs
   // decide_train_gate (the mirror). ----
-  if (i.baseVerdict === "green") {
+  if (mechanicallySound && i.baseVerdict === "green") {
     const head = classifyHeadChecks(i.headChecks);
     if (
       head.verdict === "red" &&
@@ -2562,7 +2592,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
   // covered head — the merge leg pre-clears the state (supersedes the
   // BR#3727 "blocked+green bounce stands" posture).
   const blocked = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked";
-  if (blocked) {
+  if (mechanicallySound && blocked) {
     const head = classifyHeadChecks(i.headChecks);
     if (head.verdict === "unsettled")
       return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
@@ -2575,7 +2605,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
     headSha: i.headSha,
     baseVerdict: i.baseVerdict,
     mergeable: i.mergeable,
-    mergeStateStatus: behind || blocked ? "clean" : i.mergeStateStatus,
+    mergeStateStatus: mechanicallySound && (behind || blocked) ? "clean" : i.mergeStateStatus,
     commits: i.commits,
     headChecks: i.headChecks,
     cardStatus: i.cardStatus,
@@ -2919,8 +2949,17 @@ export function trainBaseRedAskBrief(
       ? `- A fix PR is open: ${fix.curePr.repo}#${fix.curePr.number} — https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`
       : `- No fix PR is open yet — it appears here automatically the moment one binds to the fix card.`,
     fix.culpritPr ? `- The PR that broke main: #${fix.culpritPr}` : ``,
+    ...(fix.curePr
+      ? [
+          ``,
+          `**Why this needs your force-merge (Bridge cannot merge it):**`,
+          `- Fix PR **${fix.curePr.repo}#${fix.curePr.number}** (https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}) is blocked by the circular base-red gate: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`.`,
+          `- Bridge's gateway cannot bypass branch protection on a failing required check without admin authority. Force-merge it out of turn to break the deadlock:`,
+          `  \`gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash\``,
+        ]
+      : []),
     ``,
-    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): answer BYPASS and it merges out of turn, ahead of the queue — this is the only way a fix that cannot pass its own checks while the breakage it fixes is still live gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
+    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): force-merge it with \`--admin\` (or answer BYPASS if the gateway holds admin) so it lands out of turn ahead of the queue — this is the only way a fix that cannot pass the circular base-red gate while main is broken gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
   ].filter((l) => l !== undefined).join("\n");
   // 2026-11-03 Ray ruling (BR#5631): an ask whose honest answers are all
   // "keep doing what you're already doing" is noise — see
@@ -2929,7 +2968,7 @@ export function trainBaseRedAskBrief(
   // levers (manual steps / a fresh direction), never a default "keep digging".
   const options = fix.curePr
     ? [
-        `(Recommended) Bypass-merge fix PR #${fix.curePr.number} now`,
+        `(Recommended) Force-merge / Bypass-merge fix PR #${fix.curePr.number} (--admin) — breaks the circular red-main gate`,
         `Hold the line — it merges automatically once green`,
         `Transient — re-run the failing check`,
         `Other — manual steps (I'll reply)`,

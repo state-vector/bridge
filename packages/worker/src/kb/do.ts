@@ -92,6 +92,8 @@ import {
   ROOT_FIX_TAG,
   MAIN_RED_TAG,
   isRootFixCard,
+  isBaseCureCardTitle,
+  mainRedBinding,
   rootFixCardTitle,
   rootFixCardBody,
   renewProgressDecide,
@@ -8670,13 +8672,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const open = this.state.storage.sql.exec(
       `SELECT id, status, meta, tags FROM artefacts
        WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-       AND json_extract(meta, '$.root_fix.repo') = ?
-       ORDER BY created_ts DESC LIMIT 5`,
-      a.repo,
+       AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
+       ORDER BY created_ts DESC LIMIT 20`,
+      a.repo, a.repo, a.repo,
     ).toArray() as any[];
     for (const o of open) {
       const om = JSON.parse(o.meta ?? "{}");
-      if (!isRootFixCard({ tags: parseTags(o.tags), meta: om })) continue;
+      const binding = mainRedBinding(om);
+      if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
       const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
       if (o.status === "blocked" && !sameSha) continue;
       om.boosted = om.boosted ?? a.now;
@@ -10990,67 +10993,94 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return Number.isFinite(attempts) && attempts >= 3;
   }
 
-  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number }[]): {
+  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[]): {
     card: { id: string; title: string; status: string; exhausted?: boolean } | null;
     curePr: { repo: string; number: number } | null;
+    conflictPr?: { repo: string; number: number } | null;
     culpritPr: number | null;
   } {
+    const conflictPrs = new Set<number>(
+      (entries ?? [])
+        .filter((e) => String(e?.cls ?? "") === "conflict" && Number.isInteger(Number(e?.pr)) && Number(e?.pr) > 0)
+        .map((e) => Number(e!.pr)),
+    );
+    const isCardPrConflicting = (m: any, prNum: number): boolean => {
+      if (conflictPrs.has(prNum)) return true;
+      return m?.merge_train?.state === "bounced" && m?.merge_train?.bounce_kind === "conflict";
+    };
     let root: {
       card: { id: string; title: string; status: string; exhausted?: boolean } | null;
       curePr: { repo: string; number: number } | null;
+      conflictPr?: { repo: string; number: number } | null;
       culpritPr: number | null;
-    } = { card: null, curePr: null, culpritPr: null };
+    } = { card: null, curePr: null, conflictPr: null, culpritPr: null };
     if (repo) {
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags FROM artefacts
          WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-           AND json_extract(meta, '$.root_fix.repo') = ?
-         ORDER BY updated_ts DESC LIMIT 5`,
-        repo,
+           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
+         ORDER BY updated_ts DESC LIMIT 20`,
+        repo, repo, repo,
       ).toArray() as any[];
       for (const r of rows) {
         const m = JSON.parse(r.meta ?? "{}");
-        if (!isRootFixCard({ tags: parseTags(r.tags), meta: m })) continue;
+        const binding = mainRedBinding(m);
+        if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) || binding?.repo !== repo) continue;
         const legs = (Array.isArray(m.prs) ? m.prs : [])
           .map((l: any) => ({ repo: String(l?.repo ?? repo), number: Number(l?.number) }))
           .filter((l: { number: number }) => Number.isInteger(l.number) && l.number > 0);
         const first = Number(m.pr?.number ?? 0) || 0;
-        const curePr = legs.length
+        const rawPr = legs.length
           ? legs[legs.length - 1]
           : first > 0
             ? { repo: String(m.pr?.repo ?? repo), number: first }
             : null;
-        root = {
+        const conflicting = rawPr ? isCardPrConflicting(m, rawPr.number) : false;
+        const curePr = rawPr && !conflicting ? rawPr : null;
+        const conflictPr = rawPr && conflicting ? rawPr : null;
+        const candidate = {
           card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr,
-          culpritPr: Number(m.root_fix?.pr ?? 0) || null,
+          conflictPr,
+          culpritPr: Number(m.root_fix?.pr ?? 0) || root.culpritPr || null,
         };
-        break;
+        if (!root.card) root = candidate;
+        if (curePr) {
+          root = candidate;
+          break;
+        }
       }
     }
-    // (2) the queue-entry fallback — runs when the root-fix card is absent
-    // OR present without a bound cure PR (the root-fix card stays the fix
-    // card; the queued PR becomes the cure)
+    // (2) the queue-entry fallback — runs ONLY when no open root-fix card has
+    // a non-conflicting cure PR yet. BR#6012: never scavenge generic product
+    // `fix(<scope>):` PRs (#2555 `fix(chat): ...`) and never graft a queued
+    // card's PR onto a different root-fix card. A queued entry qualifies iff:
+    //   - its PR is not conflicting (`cls !== "conflict"`), AND
+    //   - the queued card is itself a qualified root-fix card (`isRootFixCard`),
+    //     OR no root-fix card exists yet (`!root.card`) and the queued card's
+    //     title explicitly names a base/CI/deploy/gate cure (`isBaseCureCardTitle`).
     if (!root.curePr) {
       for (const e of entries ?? []) {
+        if (String(e?.cls ?? "") === "conflict") continue;
         const pr = Number(e?.pr);
         const id = String(e?.id ?? "");
         if (!id || !Number.isInteger(pr) || pr <= 0) continue;
         const row = this.one(
-          `SELECT id, title, status, meta FROM artefacts WHERE id = ?`,
+          `SELECT id, title, status, meta, tags FROM artefacts WHERE id = ?`,
           id,
         ) as any;
         if (!row) continue;
         const m = JSON.parse(row.meta ?? "{}");
+        if (isCardPrConflicting(m, pr)) continue;
         const legs = [...(Array.isArray(m.prs) ? m.prs : []), ...(m.pr ? [m.pr] : [])] as any[];
         const legRepo = String(legs.find((l: any) => Number(l?.number) === pr)?.repo ?? repo);
         if (!legs.some((l: any) => Number(l?.number) === pr)) continue;
-        // fix-of-the-base title shapes only — a bypass option that offered
-        // an arbitrary held PR would merge something that doesn't cure
-        if (!/\bfix\b|main[- ]green|\bgate\b|stop[- ]the[- ]line|\bred\b|\bci\b|deploy health/i.test(String(row.title ?? ""))) continue;
+        const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
+        if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
         return {
-          card: root.card ?? { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
+          card: { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
           curePr: { repo: legRepo, number: pr },
+          conflictPr: null,
           culpritPr: root.culpritPr,
         };
       }
@@ -11550,14 +11580,21 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // stopped lane falls back to the named culprit card so the banner
           // never says "no fix card" when a stop culprit is known.
           fix_card: (() => {
-            const rf = this.trainOpenRootFix(lane.repo, queue);
+            const qfEntries = Array.isArray(brQf?.entries) ? brQf.entries : [];
+            const mergedQueue = queue.map((q: any) => {
+              const qfe = qfEntries.find((e: any) => String(e?.id ?? "") === String(q.id) || (Number(e?.pr) > 0 && Number(e?.pr) === Number(q.pr)));
+              return qfe?.cls ? { ...q, cls: String(qfe.cls) } : q;
+            });
+            const rf = this.trainOpenRootFix(lane.repo, mergedQueue);
             if (rf.card) {
+              const shownPr = rf.curePr ?? rf.conflictPr ?? null;
               return {
                 id: rf.card.id,
                 url: this.cardUrl(rf.card.id),
                 title: rf.card.title,
                 status: rf.card.status,
-                ...(rf.curePr ? { pr: rf.curePr.number, pr_url: `https://github.com/${rf.curePr.repo}/pull/${rf.curePr.number}` } : {}),
+                ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
+                ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
               };
             }
             const projFix = this.trainFixCard(String((l as any).project ?? ""));
