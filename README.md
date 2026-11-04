@@ -650,7 +650,10 @@ row shows the addressee's presence (`offline · last seen Nm ago` / `never seen`
 card tells you who it is waiting on and whether that identity is even alive. The original
 options stay on the ask and answering it resumes the blocked subject as usual.
 Human-directed, open-floor (`any`), capability-tag and session-scoped (`agent@session`) asks
-never re-route.
+never re-route. The dispatcher bootstrap teaches the companion law (rule 6d + PROTOCOL
+CARD): **verdict duties ask the authority, not the identity** — when a gated act's authority
+class is owner-agent-OR-human, the ask goes to the human at file time rather than waiting
+for the TTL rescue.
 
 **Human comments post from every web surface.** The comment boxes (task detail's
 "Comment / steer", the decision popover, discussion replies) all write to the card's
