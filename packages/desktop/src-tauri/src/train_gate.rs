@@ -586,16 +586,37 @@ pub fn is_root_fix_card(card: &Value) -> bool {
         .and_then(|t| t.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_lowercase())).collect())
         .unwrap_or_default();
-    if !tags.iter().any(|t| t == "root_blocker") || !tags.iter().any(|t| t == "main-red") {
+    let has_root = tags.iter().any(|t| t == "root_blocker" || t == "root-blocker");
+    let has_main_red = tags.iter().any(|t| t == "main-red" || t == "main_red");
+    if !has_root || !has_main_red {
         return false;
     }
-    let b = match card.get("meta").and_then(|m| m.get("root_fix")) {
-        Some(b) if b.is_object() => b,
+    let meta = match card.get("meta") {
+        Some(m) if m.is_object() => m,
         _ => return false,
     };
-    let repo = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
-    let sha = b.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
-    !repo.is_empty() && !sha.is_empty()
+    if let Some(b) = meta.get("root_fix").filter(|b| b.is_object()) {
+        let repo = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        let sha = b.get("head_sha").and_then(|v| v.as_str()).unwrap_or("");
+        if !repo.is_empty() && !sha.is_empty() {
+            return true;
+        }
+    }
+    let fallback_sha = meta
+        .get("main_tip")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| meta.get("red_since").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    let fallback_repo = meta
+        .pointer("/root_fix/repo")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| meta.pointer("/pr/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .or_else(|| meta.pointer("/prs/0/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .or_else(|| meta.pointer("/merge_train/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    !fallback_repo.is_empty() && !fallback_sha.is_empty()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -754,15 +775,53 @@ pub fn decide_merge_action(
     }
 }
 
-/// core.ts decideTrainGate (1486): the executor's per-candidate gate, each
-/// leg fail-closed — verdict coverage (stamp or contiguous carry) first,
-/// then the standing gate.
-pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
+#[derive(Clone, Debug, PartialEq)]
+pub enum CandidateHeadCheckState {
+    Green,
+    Pending { unsettled: Vec<String> },
+    RedCircularDeployGate { names: Vec<String> },
+    RedCircularMainGreenGate { names: Vec<String> },
+    RedCircularMixedGates { names: Vec<String> },
+    RedSubstantive { names: Vec<String> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CandidateMergeState {
+    Clean,
+    Unstable,
+    Behind,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CandidateGatePhase {
+    CardSuperseded,
+    CardDone,
+    HeadUncovered { leg_number: usize, stamped: String },
+    MergeabilityComputing { reason: String },
+    Conflicting,
+    UnverifiedCommits { count: usize },
+    UnhandledMergeState { state: String },
+    MechanicallySound {
+        leg_number: usize,
+        legs_total: usize,
+        merge_state: CandidateMergeState,
+        head_state: CandidateHeadCheckState,
+    },
+}
+
+/// BR#6012 defense-in-depth state machine (mirror of core.ts
+/// classifyCandidateGatePhase): classifies a train candidate into an exhaustive,
+/// mutually-exclusive phase BEFORE any transition rule runs, so impossible
+/// states (a conflicting PR reaching RerunGate/Note/Merge/HumanLeg, or a
+/// circular root-fix PR on a red base being swallowed by `blocked -> Note`)
+/// are unrepresentable by construction.
+pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
     if i.card_status == Some("superseded") {
-        return MergeAction::CloseSuperseded { reason: "linked card is superseded — closing PR without review".into() };
+        return CandidateGatePhase::CardSuperseded;
     }
     if i.card_status == Some("done") {
-        return MergeAction::Skip { reason: "linked card already done — nothing to merge under it".into() };
+        return CandidateGatePhase::CardDone;
     }
     let legs = train_legs(i.card_meta);
     let leg_number = i.leg_number.unwrap_or(1).max(1);
@@ -772,7 +831,80 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             .and_then(|l| l.head_sha_at_acceptance.clone())
             .map(|s| s[..s.len().min(9)].to_string())
             .unwrap_or_else(|| "(no stamp)".into());
-        return MergeAction::Bounce {
+        return CandidateGatePhase::HeadUncovered { leg_number, stamped };
+    }
+    let state = i
+        .merge_state_status
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    if state.as_deref().map_or(true, |s| s == "unknown") {
+        return CandidateGatePhase::MergeabilityComputing {
+            reason: format!(
+                "PR #{n} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)",
+                n = i.pr_number
+            ),
+        };
+    }
+    let state = state.unwrap_or_default();
+    if i.mergeable != Some(true) {
+        if i.mergeable.is_none() {
+            return CandidateGatePhase::MergeabilityComputing {
+                reason: "GitHub still computing mergeability — not yet, skip this tick".into(),
+            };
+        }
+        return CandidateGatePhase::Conflicting;
+    }
+    let merge_state = match state.as_str() {
+        "clean" => CandidateMergeState::Clean,
+        "unstable" => CandidateMergeState::Unstable,
+        "behind" => CandidateMergeState::Behind,
+        "blocked" => CandidateMergeState::Blocked,
+        _ => return CandidateGatePhase::UnhandledMergeState { state },
+    };
+    let unverified = i.commits.iter().filter(|(_, v)| !v).count();
+    if unverified > 0 {
+        return CandidateGatePhase::UnverifiedCommits { count: unverified };
+    }
+    let head = classify_head_checks(i.head_checks);
+    let head_state = match head.verdict {
+        MainVerdict::Green | MainVerdict::Empty => CandidateHeadCheckState::Green,
+        MainVerdict::Unsettled => CandidateHeadCheckState::Pending { unsettled: head.unsettled },
+        MainVerdict::Red => {
+            let names: Vec<String> = head.red.iter().map(|r| r.name.clone()).collect();
+            let all_base_health = !names.is_empty() && names.iter().all(|n| is_base_health_gate_name(n));
+            let all_main_green = !names.is_empty() && names.iter().all(|n| n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
+            let none_main_green = names.iter().all(|n| !n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
+            if all_base_health && none_main_green {
+                CandidateHeadCheckState::RedCircularDeployGate { names }
+            } else if all_main_green {
+                CandidateHeadCheckState::RedCircularMainGreenGate { names }
+            } else if all_base_health {
+                CandidateHeadCheckState::RedCircularMixedGates { names }
+            } else {
+                CandidateHeadCheckState::RedSubstantive { names }
+            }
+        }
+    };
+    CandidateGatePhase::MechanicallySound {
+        leg_number,
+        legs_total: legs.len().max(1),
+        merge_state,
+        head_state,
+    }
+}
+
+/// core.ts decideTrainGate (1486): the executor's per-candidate gate, driven by
+/// the exhaustive `CandidateGatePhase` state machine (BR#6012).
+pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
+    match classify_candidate_gate_phase(&i) {
+        CandidateGatePhase::CardSuperseded => MergeAction::CloseSuperseded {
+            reason: "linked card is superseded — closing PR without review".into(),
+        },
+        CandidateGatePhase::CardDone => MergeAction::Skip {
+            reason: "linked card already done — nothing to merge under it".into(),
+        },
+        CandidateGatePhase::HeadUncovered { leg_number, stamped } => MergeAction::Bounce {
             defect: format!(
                 "PR #{n} live head {h} is not covered by the accepted verdict (leg {L} stamped {s}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head",
                 n = i.pr_number,
@@ -781,213 +913,177 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 s = stamped
             ),
             bounce_kind: BounceKind::Coverage,
-        };
-    }
-    // BR#3727: mergeStateStatus=behind IS the state the carry law (BR#3516 §5)
-    // was written for — base advanced, branch still mergeable. The shared law
-    // stays clean/unstable and bounces behind: the SWEEP has no update-branch
-    // authority. The TRAIN does — its merge leg owns trial-merge →
-    // update-branch → verdict carries — so the train gate pre-clears behind
-    // here. Without it, the exact PRs the carry law was written for
-    // bounce-loop (bounce → re-verify → re-queue → behind again — nothing in
-    // the bounce flow updates the branch). Coverage is already settled above:
-    // an uncovered head bounced before this line, so behind reaching the
-    // compose is always a §5-carryable head.
-    let behind = i
-        .merge_state_status
-        .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("behind"))
-        .unwrap_or(false);
-    // ---- STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive: "the
-    // train already runs — it should detect this itself; the system
-    // aggressively self-heals"): the deploy-health merge-gate check judges
-    // MAIN's deploy state, not the PR's own code. A head red of ENTIRELY
-    // that class with the base GREEN is a stale verdict by construction —
-    // the check stamped FAILURE against a deploy that has since settled
-    // (observed 2026-11-02: gate red at 07:49 judged the in-flight 06:40
-    // deploy; main settled green at 07:52 and the red sat in the queue —
-    // nothing re-opens a terminal gate verdict when its premise evaporates).
-    // The train RE-RUNS the failed gate jobs (check-runs rerequest,
-    // worker-class identity-gated in the executor arm) and treats the entry
-    // as a clock: next tick reads the fresh run green → merge, or honestly
-    // red → the standing law's rows own it. NEVER a bounce (a bounce
-    // round-trips the verify pool for a defect the PR does not carry),
-    // NEVER a human leg (no decision is needed — main is green). This row
-    // sits ABOVE the blocked pre-clear: a failed required check reads
-    // BLOCKED, and the stale class must heal there too, not note into a
-    // parked queue. MUST stay behaviour-identical to core.ts decideTrainGate
-    // (the mirror). ----
-    if i.base_verdict == MainVerdict::Green {
-        let head = classify_head_checks(i.head_checks);
-        if head.verdict == MainVerdict::Red
-            && head
-                .red
-                .iter()
-                .all(|r| is_base_health_gate_name(&r.name))
-            // BR#5883: the main-green gate class has its own arm below — it
-            // re-runs under the gate's own predicate (base_gate_green) and
-            // names the class in its reason. An ALL-main-green-gate red must
-            // not be consumed here with the deploy-health reason, or the
-            // dedicated arm can never fire (the 2026-11-03 test failure).
-            && head
-                .red
-                .iter()
-                .all(|r| !r.name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
-        {
-            return MergeAction::RerunGate {
-                reason: format!(
-                    "PR #{n} head red is entirely the deploy-health class ({names}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run",
-                    n = i.pr_number,
-                    names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
-                ),
-            };
-        }
-        // BR#5883 stale-gate sibling self-heal: the destination-green gate
-        // (`main-green gate`) judges MAIN's tip, not the PR's own code. A
-        // head red of ENTIRELY that class while the tip now classifies
-        // fully green under the gate's own predicate is a stale conviction
-        // by construction — the check stamped FAILURE against a tip that
-        // was transiently unsettled (or red) and has since settled
-        // (observed 2026-11-03: gate red at 09:07:27Z judged a `Test` run
-        // still in flight; main settled green at 09:07:47Z — 20s later —
-        // and the terminal verdict pinned the head car for hours because
-        // this arm only matched the deploy-health class). Re-run the gate
-        // job and treat the entry as a clock: the fresh run clears or
-        // re-convicts honestly. NEVER a bounce (a bounce round-trips the
-        // verify pool for a defect the PR does not carry), NEVER a human
-        // leg (no decision is needed — the gate's own predicate holds).
-        // The base_gate_green input is what separates a STALE gate red
-        // (re-run) from an HONEST one (a tip red exists — re-running would
-        // just re-convict; the qualifier escalation owns the block).
-        if i.base_gate_green {
-            let head = classify_head_checks(i.head_checks);
-            if head.verdict == MainVerdict::Red
-                && head
-                    .red
+        },
+        CandidateGatePhase::MergeabilityComputing { reason } => MergeAction::Skip { reason },
+        CandidateGatePhase::Conflicting => MergeAction::Bounce {
+            defect: format!(
+                "PR #{n} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue",
+                n = i.pr_number
+            ),
+            bounce_kind: BounceKind::Conflict,
+        },
+        CandidateGatePhase::UnhandledMergeState { state } => MergeAction::Bounce {
+            defect: format!(
+                "PR #{n} mergeStateStatus={state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg",
+                n = i.pr_number
+            ),
+            bounce_kind: BounceKind::Gate,
+        },
+        CandidateGatePhase::UnverifiedCommits { count } => MergeAction::HumanLeg {
+            reason: format!(
+                "PR #{n} has {count} commit(s) not GitHub-verified — signing-environment class, never per-PR",
+                n = i.pr_number
+            ),
+        },
+        CandidateGatePhase::MechanicallySound {
+            leg_number,
+            legs_total,
+            merge_state,
+            head_state,
+        } => {
+            let behind = merge_state == CandidateMergeState::Behind;
+            let blocked = merge_state == CandidateMergeState::Blocked;
+            // (1) Stale base-health gate self-heal on a GREEN base
+            if i.base_verdict == MainVerdict::Green {
+                if let CandidateHeadCheckState::RedCircularDeployGate { names } = &head_state {
+                    return MergeAction::RerunGate {
+                        reason: format!(
+                            "PR #{n} head red is entirely the deploy-health class ({names}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run",
+                            n = i.pr_number,
+                            names = names.join(", ")
+                        ),
+                    };
+                }
+                if i.base_gate_green {
+                    if let CandidateHeadCheckState::RedCircularMainGreenGate { names } = &head_state {
+                        return MergeAction::RerunGate {
+                            reason: format!(
+                                "PR #{n} head red is entirely the main-green gate class ({names}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run",
+                                n = i.pr_number,
+                                names = names.join(", ")
+                            ),
+                        };
+                    }
+                }
+            }
+            // (2) Root-fix fast lane on a RED base (above `blocked` so a BLOCKED
+            //     circular gate check on the cure PR is never swallowed as Note)
+            if i.root_fix && i.base_verdict == MainVerdict::Red {
+                if head_state == CandidateHeadCheckState::Green {
+                    return MergeAction::Merge {
+                        receipt: format!(
+                            "ROOT-FIX FAST-TRACK (BR#5189): PR #{n} is the bound main-breakage fix and its head is GREEN — merging onto the red base to turn the line green (root_fix_fast_tracked); base red: {reds}",
+                            n = i.pr_number,
+                            reds = if i.base_red_names.is_empty() {
+                                "required checks".to_string()
+                            } else {
+                                i.base_red_names.join(", ")
+                            }
+                        ),
+                    };
+                }
+                let head_circular = matches!(
+                    &head_state,
+                    CandidateHeadCheckState::RedCircularDeployGate { .. }
+                        | CandidateHeadCheckState::RedCircularMainGreenGate { .. }
+                        | CandidateHeadCheckState::RedCircularMixedGates { .. }
+                );
+                let base_circular = i
+                    .base_red_names
                     .iter()
-                    .all(|r| r.name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
-            {
-                return MergeAction::RerunGate {
+                    .any(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN))
+                    && !matches!(&head_state, CandidateHeadCheckState::RedSubstantive { .. });
+                if head_circular || base_circular {
+                    return MergeAction::HumanLeg {
+                        reason: format!(
+                            "PR #{n} is the bound main-breakage fix but the circular deploy-health class stands (BR#5189, SP #2617 precedent): the gate is red because MAIN is red — the head cannot go green while the line it fixes is stopped; the one-click human merge ask is the fast lane",
+                            n = i.pr_number
+                        ),
+                    };
+                }
+            }
+            // (3) Blocked with pending or red head checks
+            if blocked {
+                if let CandidateHeadCheckState::Pending { unsettled } = &head_state {
+                    return MergeAction::Skip {
+                        reason: format!(
+                            "PR #{n} mergeStateStatus=blocked — required checks re-running on head {h} ({u}) — pending, not a defect; next tick",
+                            n = i.pr_number,
+                            h = &i.head_sha[..i.head_sha.len().min(9)],
+                            u = unsettled.join(", ")
+                        ),
+                    };
+                }
+                match &head_state {
+                    CandidateHeadCheckState::RedCircularDeployGate { names }
+                    | CandidateHeadCheckState::RedCircularMainGreenGate { names }
+                    | CandidateHeadCheckState::RedCircularMixedGates { names }
+                    | CandidateHeadCheckState::RedSubstantive { names } => {
+                        return MergeAction::Note {
+                            reason: format!(
+                                "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
+                                n = i.pr_number,
+                                names = names.join(", ")
+                            ),
+                        };
+                    }
+                    CandidateHeadCheckState::Green | CandidateHeadCheckState::Pending { .. } => {}
+                }
+            }
+            // (4) Non-green base
+            if i.base_verdict != MainVerdict::Green {
+                let w = if i.base_verdict == MainVerdict::Red { "RED" } else { "not green" };
+                return MergeAction::Skip {
                     reason: format!(
-                        "PR #{n} head red is entirely the main-green gate class ({names}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run",
-                        n = i.pr_number,
-                        names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+                        "base main {w} — the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert"
                     ),
                 };
             }
-        }
-    }
-    // BR#3727: blocked with head checks merely PENDING is a clock, not a
-    // defect — strict branch protection re-runs the required checks on the
-    // head right after every machine-clean update-branch, so the tick after
-    // the carry reads blocked. Pending checks wait a tick; red checks note
-    // (the shared law's own non-in_review row). BR#4633 L4.2 (the approval
-    // anchor): blocked with GREEN checks no longer bounces — the BR verify
-    // verdict IS the approval of record, and the head move that dismissed the
-    // stale GitHub review is exactly the event L4.2 refuses to count as a
-    // lost approval. Coverage is settled above (an uncovered head bounced
-    // before this line), so blocked+green reaching the compose is a verified,
-    // covered head — the merge leg pre-clears the state (supersedes the
-    // BR#3727 "blocked+green bounce stands" posture).
-    let blocked = i
-        .merge_state_status
-        .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("blocked"))
-        .unwrap_or(false);
-    if blocked {
-        let head = classify_head_checks(i.head_checks);
-        if head.verdict == MainVerdict::Unsettled {
-            return MergeAction::Skip {
-                reason: format!(
-                    "PR #{n} mergeStateStatus=blocked — required checks re-running on head {h} ({u}) — pending, not a defect; next tick",
-                    n = i.pr_number,
-                    h = &i.head_sha[..i.head_sha.len().min(9)],
-                    u = head.unsettled.join(", ")
-                ),
-            };
-        }
-        if head.verdict == MainVerdict::Red {
-            return MergeAction::Note {
-                reason: format!(
-                    "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
-                    n = i.pr_number,
-                    names = head.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
-                ),
-            };
-        }
-    }
-    // ---- BR#5190 root-fix fast lane pre-clear (steering BR#5189): main is
-    // RED and the candidate is THE bound main-breakage fix — the shared law's
-    // base-red row would park the cure forever behind the very red it cures
-    // (the lane is stopped; nothing else merges until main greens). Two rows:
-    // (a) head green — merge the cure onto the red base NOW (receipt stamps
-    //     root_fix_fast_tracked); the cure's own merge is what turns main
-    //     green again.
-    // (b) circular deploy-health class — the base's red NAMES the deploy
-    //     health gate, which is red BECAUSE main is red: the head can never go
-    //     green while the line it fixes is stopped, so no machine leg can ever
-    //     pass — the one-click human merge ask is the fast lane (SP #2617
-    //     precedent).
-    // Coverage is settled above (an uncovered head bounced), so both rows see
-    // a verified, covered head. Base red but NOT circular with a non-green
-    // head falls through — the standing law's own rows own that wait; the
-    // fast lane is never invented for a red the cure doesn't cure. ----
-    if i.root_fix && i.base_verdict == MainVerdict::Red {
-        let head = classify_head_checks(i.head_checks);
-        if head.verdict == MainVerdict::Green {
-            return MergeAction::Merge {
-                receipt: format!(
-                    "ROOT-FIX FAST-TRACK (BR#5189): PR #{n} is the bound main-breakage fix and its head is GREEN — merging onto the red base to turn the line green (root_fix_fast_tracked); base red: {reds}",
-                    n = i.pr_number,
-                    reds = if i.base_red_names.is_empty() { "required checks".to_string() } else { i.base_red_names.join(", ") }
-                ),
-            };
-        }
-        let base_circular = i.base_red_names.iter().any(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN));
-        if base_circular {
-            return MergeAction::HumanLeg {
-                reason: format!(
-                    "PR #{n} is the bound main-breakage fix but the circular deploy-health class stands (BR#5189, SP #2617 precedent): the gate is red because MAIN is red — the head cannot go green while the line it fixes is stopped; the one-click human merge ask is the fast lane",
-                    n = i.pr_number
-                ),
-            };
-        }
-    }
-    let composed_state: Option<&str> = match i.merge_state_status.as_deref() {
-        Some(s) if behind || blocked => Some("clean"),
-        other => other,
-    };
-    let gate = decide_merge_action(
-        i.pr_number,
-        i.head_sha,
-        i.card_status,
-        &i.base_verdict,
-        i.mergeable,
-        composed_state,
-        i.commits,
-        i.head_checks,
-        true,
-        true,
-    );
-    match gate {
-        MergeAction::Merge { .. } => MergeAction::Merge {
-            receipt: format!(
-                "PR #{n} merged by the serialized merge train (BR#3516) leg {L}/{M}: head {h} — verdict covers head (stamp/carry), 5c gate pass (mergeable, {state}, {k} verified commits), base green, head checks green",
-                n = i.pr_number,
-                L = leg_number,
-                M = if legs.is_empty() { 1 } else { legs.len() },
-                h = &i.head_sha[..i.head_sha.len().min(9)],
-                state = if behind {
-                    "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
-                } else if blocked {
-                    "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
-                } else {
-                    "clean"
+            // (5) Green base, non-blocked head check states
+            match &head_state {
+                CandidateHeadCheckState::Pending { unsettled } => MergeAction::Skip {
+                    reason: format!("head checks unsettled ({}) — not yet, skip this tick", unsettled.join(", ")),
                 },
-                k = i.commits.len()
-            ),
-        },
-        other => other,
+                CandidateHeadCheckState::RedCircularDeployGate { names }
+                | CandidateHeadCheckState::RedCircularMainGreenGate { names }
+                | CandidateHeadCheckState::RedCircularMixedGates { names }
+                | CandidateHeadCheckState::RedSubstantive { names } => {
+                    let joined = names.join(", ");
+                    if i.card_status == Some("in_review") {
+                        MergeAction::Bounce {
+                            defect: format!("PR #{n} head check RED: {joined}. Fix or bounce to impl", n = i.pr_number),
+                            bounce_kind: BounceKind::Gate,
+                        }
+                    } else {
+                        MergeAction::Note {
+                            reason: format!(
+                                "PR #{n} head check RED: {joined} — card not in_review, no bounce; the linked session owns it",
+                                n = i.pr_number
+                            ),
+                        }
+                    }
+                }
+                CandidateHeadCheckState::Green => {
+                    let state_clause = if behind {
+                        "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
+                    } else if blocked {
+                        "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
+                    } else {
+                        "clean"
+                    };
+                    MergeAction::Merge {
+                        receipt: format!(
+                            "PR #{n} merged by the serialized merge train (BR#3516) leg {L}/{T}: head {h} — verdict covers head (stamp/carry), 5c gate pass (mergeable, {state_clause}, {c} verified commits), base green, head checks green",
+                            n = i.pr_number,
+                            L = leg_number,
+                            T = legs_total,
+                            h = &i.head_sha[..i.head_sha.len().min(9)],
+                            c = i.commits.len()
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2350,5 +2446,68 @@ mod tests {
             base_gate_green: true,
         });
         assert!(matches!(gate, MergeAction::RerunGate { .. }), "expected RerunGate on stale main-green gate, got {gate:?}");
+    }
+
+    #[test]
+    fn br6012_state_machine_defends_blocked_circular_root_fix_and_conflicting_preconditions() {
+        let head = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let meta = root_fix_meta(head);
+        // 1. Agent-filed root-blocker card shape (hyphen tag + main_tip + pr.repo) qualifies
+        assert!(is_root_fix_card(&serde_json::json!({
+            "tags": ["root-blocker", "main-red"],
+            "meta": { "main_tip": "8454ae7bb", "pr": { "repo": "state-vector/superpositional", "number": 2800 } }
+        })));
+        // 2. Real GitHub circular root-fix state: mergeStateStatus="blocked" +
+        //    head check RED on "Deploy health (merge gate)" + base_red_names="deploy / Deploy to dev"
+        //    must NOT be swallowed by `blocked -> Note`; it transitions to HumanLeg!
+        let circular_blocked = decide_train_gate(TrainGateInput {
+            pr_number: 2800,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(true),
+            merge_state_status: Some("blocked".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[
+                run(1, "Deploy health (merge gate)", Some("failure")),
+                run(2, "ci / Rust Tests", Some("success")),
+            ],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &["deploy / Deploy to dev".to_string()],
+            base_gate_green: false,
+        });
+        assert!(
+            matches!(circular_blocked, MergeAction::HumanLeg { .. }),
+            "expected HumanLeg on BLOCKED circular root-fix PR, got {circular_blocked:?}"
+        );
+        // 3. A CONFLICTING PR (`mergeable == Some(false)`) ALWAYS bounces as Conflict,
+        //    even when `merge_state_status == "blocked"` or `root_fix == true` or `base_verdict == Green`!
+        let conflicting_root_fix = decide_train_gate(TrainGateInput {
+            pr_number: 2800,
+            head_sha: head,
+            card_meta: &meta,
+            card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red,
+            mergeable: Some(false),
+            merge_state_status: Some("blocked".into()),
+            commits: &[(head.into(), true)],
+            head_checks: &[run(1, "ci / Rust Tests", Some("success"))],
+            leg_number: Some(1),
+            root_fix: true,
+            base_red_names: &["deploy / Deploy to dev".to_string()],
+            base_gate_green: false,
+        });
+        assert!(
+            matches!(
+                conflicting_root_fix,
+                MergeAction::Bounce {
+                    bounce_kind: BounceKind::Conflict,
+                    ..
+                }
+            ),
+            "expected Bounce(Conflict) on CONFLICTING root-fix PR, got {conflicting_root_fix:?}"
+        );
     }
 }

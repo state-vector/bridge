@@ -807,15 +807,22 @@ every tick. Two laws now hold:
   and its cure PR — and the executor refreshes the OPEN ask in place every red tick,
   so the bypass option CARRIES the cure PR's number the moment one binds (never
   again the old `Bypass-merge a cure PR (I'll reply with the number)` shape that
-  demanded a number a one-shot ask could never learn). The cure join covers the
-  whole queue (BR#5516): `trainOpenRootFix` prefers the root-fix card's own PR legs
-  and falls back to the lane's queue entries — any open queued card whose PR legs
-  match its queue entry and whose title names a fix of the base
-  (fix/gate/main-green/red/ci/stop-the-line/deploy-health shapes) renders as the
-  cure, so a verify-accepted fix PR parked on an ordinary lane card surfaces in the
-  ask the moment it queues (bypass-first) instead of a stale "No fix PR is open
-  yet" (the 2026-11-02 episode: the human answered RETRY on a structurally
-  self-failing gate run while fix PR #357 sat queued). The brief opens with a
+  demanded a number a one-shot ask could never learn).   The cure join (`trainOpenRootFix` + `classifyBaseRedEpisodeState`, BR#5516 /
+  BR#6012) is a closed state machine (`diagnosing` → `fix_in_progress` →
+  `cure_pr_conflicting` → `cure_pr_awaiting_force_merge` / `fix_exhausted`): it
+  prefers the root-fix card's own unlanded PR legs (accepting both `root_blocker`
+  and `root-blocker` tags + `main_tip`/`red_since` bindings) and falls back to a
+  queued entry ONLY when no root-fix card exists yet and the queued card's title
+  explicitly names a base/CI/deploy/gate cure (`isBaseCureCardTitle` — never
+  generic product `fix(<scope>):` PRs, and never grafting a queued card's PR onto
+  a different root-fix card). A conflicting PR (`cls: "conflict"`) transitions to
+  `cure_pr_conflicting` (`warrantAsk: false` — conflicts are self-healed by
+  bouncing to an agent to rebase, never a human bypass ask); while stopped, the
+  executor refreshes `base_state` via `train_queue_facts` and runs
+  `settle_window_rebase` so conflicting queued PRs bounce immediately. When
+  `cure_pr_awaiting_force_merge` holds, the brief includes the exact copy-paste
+  force-merge command (`gh pr merge <N> --repo <repo> --admin --squash`) and the
+  circular-gate explanation. The brief opens with a
   **Read of the red (triage before you answer)** block that classifies each red
   check by name shape: a gate/main-green check says IN PLAIN TEXT that a re-run
   fails IDENTICALLY — fix forward or bypass-merge the cure, never answer RETRY

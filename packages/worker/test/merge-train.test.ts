@@ -15,6 +15,12 @@ import {
   carryAppendLeg,
   classifyRequiredRuns,
   classifyHeadChecks,
+  classifyCandidateGatePhase,
+  classifyBaseRedEpisodeState,
+  isBaseCureCardTitle,
+  isRootFixCard,
+  trainBaseRedAskBrief,
+  trainBaseRedAskWarranted,
   decideMergeAction,
   decideTrainGate,
   leaseDecide,
@@ -1740,5 +1746,72 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
       ],
     });
     expect(gate.kind).toBe("rerun_gate");
+  });
+
+  it("BR#6012 state machine: CandidateGatePhase & BaseRedEpisodeState make illegal transitions unrepresentable", () => {
+    const head = "e".repeat(40);
+    // 1. A conflicting PR (mergeable: false) ALWAYS classifies as phase:'conflicting' -> bounce(conflict),
+    //    even if mergeStateStatus is 'blocked' and baseVerdict is 'green' with a stale deploy-health red
+    const conflictInput = {
+      prNumber: 2800,
+      headSha: head,
+      cardMeta: { prs: [{ repo: "state-vector/superpositional", number: 2800, head_sha_at_acceptance: head }] },
+      cardStatus: "blocked",
+      baseVerdict: "green" as const,
+      mergeable: false,
+      mergeStateStatus: "blocked",
+      commits: [{ sha: head, verified: true }],
+      headChecks: [{ id: 1, name: "Deploy health (merge gate)", status: "completed", conclusion: "failure" }],
+    };
+    expect(classifyCandidateGatePhase(conflictInput)).toEqual({ phase: "conflicting" });
+    const conflictDecision = decideTrainGate(conflictInput);
+    expect(conflictDecision.kind).toBe("bounce");
+    if (conflictDecision.kind === "bounce") {
+      expect(conflictDecision.bounceKind).toBe("conflict");
+    }
+
+    // 2. isBaseCureCardTitle rejects generic product bugfix titles (`fix(chat): ...`) and accepts base/CI/deploy cures
+    expect(isBaseCureCardTitle("Trace: superpositional PR #2555 — fix(chat): classifier propagates total LLM failure (BR#2985)")).toBe(false);
+    expect(isBaseCureCardTitle("fix(web): dashboard crash")).toBe(false);
+    expect(isBaseCureCardTitle("fix(ci): main-green gate structurally self-failing")).toBe(true);
+    expect(isBaseCureCardTitle("fix(deploy): make the mutation-runner ram pin satisfiable (BR#5955)")).toBe(true);
+
+    // 3. Agent-filed root-blocker card (hyphen tag + main_tip + pr.repo) qualifies under isRootFixCard
+    expect(
+      isRootFixCard({
+        tags: ["root-blocker", "main-red"],
+        meta: { main_tip: "8454ae7bb", pr: { repo: "state-vector/superpositional", number: 2800 } },
+      }),
+    ).toBe(true);
+
+    // 4. BaseRedEpisodeState: conflicting PR never warrants a human ask; valid cure PR produces `--admin` command + why
+    const conflictingEp = classifyBaseRedEpisodeState({
+      card: { id: "BR#5955", title: "ROOT BLOCKER: deploy red", status: "blocked" },
+      curePr: null,
+      conflictPr: { repo: "state-vector/superpositional", number: 2800 },
+    });
+    expect(conflictingEp.phase).toBe("cure_pr_conflicting");
+    expect(conflictingEp.warrantAsk).toBe(false);
+    expect(trainBaseRedAskWarranted({ card: { id: "BR#5955" }, curePr: null, conflictPr: { repo: "state-vector/superpositional", number: 2800 } })).toBe(false);
+
+    const readyEp = classifyBaseRedEpisodeState({
+      card: { id: "BR#5968", title: "ROOT-FIX: deploy red", status: "blocked" },
+      curePr: { repo: "state-vector/superpositional", number: 2800 },
+      conflictPr: null,
+    });
+    expect(readyEp.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(readyEp.warrantAsk).toBe(true);
+    if (readyEp.phase === "cure_pr_awaiting_force_merge") {
+      expect(readyEp.command).toBe("gh pr merge 2800 --repo state-vector/superpositional --admin --squash");
+    }
+    const brief = trainBaseRedAskBrief(
+      { repo: "state-vector/superpositional", base: "main" },
+      [{ name: "deploy / Deploy to dev", url: "https://example.test/run" }],
+      11,
+      { card: { id: "BR#5968", title: "ROOT-FIX", status: "blocked" }, curePr: { repo: "state-vector/superpositional", number: 2800 }, culpritPr: 2612 },
+    );
+    expect(brief.details).toContain("gh pr merge 2800 --repo state-vector/superpositional --admin --squash");
+    expect(brief.details).toContain("Why this needs your force-merge");
+    expect(brief.options[0]).toContain("Force-merge / Bypass-merge fix PR #2800 (--admin)");
   });
 });

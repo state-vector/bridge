@@ -1938,22 +1938,51 @@ export function isBaseHealthGateName(name: string): boolean {
  *  failing main-HEAD run sha it cures. */
 export type RootFixBinding = { repo: string; head_sha: string };
 
-/** meta.root_fix read off a card — null unless it names repo + head_sha. */
+/** meta.root_fix read off a card — null unless it names repo + head_sha (or
+ *  an agent-filed root-blocker card carrying main_tip/red_since + a bound PR
+ *  repo, BR#6012). */
 export function mainRedBinding(meta: any): RootFixBinding | null {
   const b = meta?.root_fix;
-  if (!b || typeof b !== "object") return null;
-  const repo = typeof b.repo === "string" ? b.repo : "";
-  const sha = typeof b.head_sha === "string" ? b.head_sha : "";
-  return repo && sha ? { repo, head_sha: sha } : null;
+  if (b && typeof b === "object") {
+    const repo = typeof b.repo === "string" ? b.repo : "";
+    const sha = typeof b.head_sha === "string" ? b.head_sha : "";
+    if (repo && sha) return { repo, head_sha: sha };
+  }
+  const fallbackSha =
+    typeof meta?.main_tip === "string" && meta.main_tip
+      ? meta.main_tip
+      : typeof meta?.red_since === "string" && meta.red_since
+        ? meta.red_since
+        : "";
+  const fallbackRepo = String(
+    meta?.root_fix?.repo ??
+      meta?.pr?.repo ??
+      (Array.isArray(meta?.prs) && meta.prs[0]?.repo ? meta.prs[0].repo : "") ??
+      meta?.merge_train?.repo ??
+      "",
+  ).trim();
+  return fallbackRepo && fallbackSha ? { repo: fallbackRepo, head_sha: fallbackSha } : null;
 }
 
-/** The qualification (Rust is_root_fix_card mirror): tags root_blocker +
- *  main-red AND a bound failing main-HEAD run. Tags alone never qualify —
- *  the binding does. */
+/** The qualification (Rust is_root_fix_card mirror): tags root_blocker (or
+ *  root-blocker) + main-red AND a bound failing main-HEAD run. Tags alone
+ *  never qualify — the binding does. */
 export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
   const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
-  if (!tags.includes(ROOT_FIX_TAG) || !tags.includes(MAIN_RED_TAG)) return false;
+  const hasRoot = tags.includes(ROOT_FIX_TAG) || tags.includes("root-blocker");
+  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red");
+  if (!hasRoot || !hasMainRed) return false;
   return mainRedBinding(card?.meta) !== null;
+}
+
+/** BR#6012: true iff a queued card's title explicitly names a base-red /
+ *  CI / deploy-health / merge-gate / stop-the-line fix — NEVER a generic
+ *  product bugfix (`fix(chat): ...`, `fix(web): ...`), which previously
+ *  matched bare `/\bfix\b/` and grafted unrelated product PRs (#2555) onto
+ *  the root-fix card as a fake bypass-merge cure. */
+export function isBaseCureCardTitle(title: string): boolean {
+  const t = String(title ?? "");
+  return /\bfix\s*\(\s*(?:ci|deploy|gate|train|build|infra|runner|smoke|actions)\s*\)|main[- ]green|main[- ]red|stop[- ]the[- ]line|deploy[- ]health|root[-_ ]blocker|root[-_ ]fix/i.test(t);
 }
 
 /** The deterministic one-click human merge ask title for the circular
@@ -2464,136 +2493,191 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  still computing — the executor backoff-polls (15/30/60s, lease-bounded)
  *  before this gate and the shared law waits on it: never a bounce, never
  *  a merge on an unconfirmed state. */
-export function decideTrainGate(i: TrainGateInput): MergeAction {
-  if (i.cardStatus === "superseded")
-    return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
-  if (i.cardStatus === "done")
-    return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+export type CandidateHeadCheckState =
+  | { kind: "green" }
+  | { kind: "pending"; unsettled: string[] }
+  | { kind: "red_circular_deploy_gate"; names: string[] }
+  | { kind: "red_circular_main_green_gate"; names: string[] }
+  | { kind: "red_circular_mixed_gates"; names: string[] }
+  | { kind: "red_substantive"; names: string[] };
+
+export type CandidateGatePhase =
+  | { phase: "card_superseded" }
+  | { phase: "card_done" }
+  | { phase: "head_uncovered"; legNumber: number; stamped: string }
+  | { phase: "mergeability_computing"; reason: string }
+  | { phase: "conflicting" }
+  | { phase: "unverified_commits"; count: number }
+  | { phase: "unhandled_merge_state"; state: string }
+  | {
+      phase: "mechanically_sound";
+      legNumber: number;
+      legsTotal: number;
+      mergeState: "clean" | "unstable" | "behind" | "blocked";
+      headState: CandidateHeadCheckState;
+    };
+
+/** BR#6012 defense-in-depth state machine: classifies a train candidate into an
+ *  exhaustive, mutually-exclusive phase BEFORE any transition rule runs, so
+ *  impossible states (e.g. a conflicting PR reaching `rerun_gate` or `blocked`
+ *  pre-clear, or an unverified-commit PR fast-tracking) are unrepresentable. */
+export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhase {
+  if (i.cardStatus === "superseded") return { phase: "card_superseded" };
+  if (i.cardStatus === "done") return { phase: "card_done" };
   const legs = trainLegs(i.cardMeta);
   const legNumber = Math.max(1, Math.floor(i.legNumber ?? 1));
   const leg = legs.length ? legs[legNumber - 1] : undefined;
   if (!verdictCoversHeadLeg(leg, i.headSha)) {
     const stamped = String(leg?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
+    return { phase: "head_uncovered", legNumber, stamped };
+  }
+  const rawState = typeof i.mergeStateStatus === "string" ? i.mergeStateStatus.trim().toLowerCase() : "";
+  if (!rawState || rawState === "unknown") {
     return {
-      kind: "bounce",
-      defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${legNumber} stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
-      bounceKind: "coverage",
+      phase: "mergeability_computing",
+      reason: `PR #${i.prNumber} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)`,
     };
   }
-  // BR#3727: mergeStateStatus=behind IS the state the carry law (BR#3516 §5)
-  // was written for — base advanced, branch still mergeable. The shared law
-  // stays clean/unstable and bounces behind: the SWEEP has no update-branch
-  // authority. The TRAIN does — its merge leg owns trial-merge →
-  // update-branch → verdict carries — so the train gate pre-clears behind
-  // here. Without it, the exact PRs the carry law was written for
-  // bounce-loop (bounce → re-verify → re-queue → behind again — nothing in
-  // the bounce flow updates the branch). Coverage is already settled above:
-  // an uncovered head bounced before this line, so behind reaching the
-  // compose is always a §5-carryable head.
-  const behind = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "behind";
-  // ---- STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive: "the
-  // train already runs — it should detect this itself; the system
-  // aggressively self-heals"): the deploy-health merge-gate check judges
-  // MAIN's deploy state, not the PR's own code. A head red of ENTIRELY that
-  // class with the base GREEN is a stale verdict by construction — the check
-  // stamped FAILURE against a deploy that has since settled (observed
-  // 2026-11-02: gate red at 07:49 judged the in-flight 06:40 deploy; main
-  // settled green at 07:52 and the red sat in the queue — nothing re-opens a
-  // terminal gate verdict when its premise evaporates). The train RE-RUNS the
-  // failed gate jobs (check-runs rerequest, worker-class identity-gated in
-  // the executor arm) and treats the entry as a clock: next tick reads the
-  // fresh run green → merge, or honestly red → the standing law's rows own
-  // it. NEVER a bounce, NEVER a human leg. This row sits ABOVE the blocked
-  // pre-clear: a failed required check reads BLOCKED, and the stale class
-  // must heal there too. MUST stay behaviour-identical to train_gate.rs
-  // decide_train_gate (the mirror). ----
-  if (i.baseVerdict === "green") {
-    const head = classifyHeadChecks(i.headChecks);
-    if (
-      head.verdict === "red" &&
-      // BR#5883: the main-green gate class has its own arm below — it
-      // re-runs under the gate's own predicate (baseGateGreen) and names
-      // the class in its reason. An ALL-main-green-gate red must not be
-      // consumed here with the deploy-health reason, or the dedicated arm
-      // can never fire (the 2026-11-03 test failure).
-      head.red.every((r) => isBaseHealthGateName(r.name)) &&
-      head.red.every((r) => !r.name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN))
-    )
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) {
       return {
-        kind: "rerun_gate",
-        reason: `PR #${i.prNumber} head red is entirely the deploy-health class (${head.red
-          .map((r) => r.name)
-          .join(", ")}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run`,
+        phase: "mergeability_computing",
+        reason: "GitHub still computing mergeability — not yet, skip this tick",
       };
-    // BR#5883 stale-gate sibling self-heal: the destination-green gate
-    // (`main-green gate`) judges MAIN's tip, not the PR's own code. A head
-    // red of ENTIRELY that class while the tip now judges fully green under
-    // the gate's own predicate is a stale conviction by construction — the
-    // check stamped FAILURE against a transiently-unsettled or since-settled
-    // tip (observed 2026-11-03: gate red at 09:07:27Z judged a `Test` run
-    // still in flight; main settled green 20s later and the terminal verdict
-    // pinned the head car for hours). Re-run the gate job and treat the
-    // entry as a clock: the fresh run clears or re-convicts honestly. NEVER
-    // a bounce, NEVER a human leg. baseGateGreen is what separates a STALE
-    // gate red (re-run) from an HONEST one (a tip red exists — re-running
-    // would just re-convict; the qualifier escalation owns the block). MUST
-    // stay behaviour-identical to train_gate.rs decide_train_gate.
-    // BR#5883: baseGateGreen absent (legacy callers that predate the field)
-    // defaults to GREEN — only an EXPLICIT false marks the conviction honest
-    // (a real tip red; re-running would just re-convict).
-    if (i.baseGateGreen !== false) {
-      const headGate = classifyHeadChecks(i.headChecks);
-      if (
-        headGate.verdict === "red" &&
-        headGate.red.every((r) => r.name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN))
-      )
-        return {
-          kind: "rerun_gate",
-          reason: `PR #${i.prNumber} head red is entirely the main-green gate class (${headGate.red
-            .map((r) => r.name)
-            .join(", ")}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run`,
-        };
+    }
+    return { phase: "conflicting" };
+  }
+  if (rawState !== "clean" && rawState !== "unstable" && rawState !== "behind" && rawState !== "blocked") {
+    return { phase: "unhandled_merge_state", state: rawState };
+  }
+  const unverified = i.commits.filter((c) => !c.verified).length;
+  if (unverified > 0) {
+    return { phase: "unverified_commits", count: unverified };
+  }
+  const head = classifyHeadChecks(i.headChecks);
+  let headState: CandidateHeadCheckState;
+  if (head.verdict === "green") {
+    headState = { kind: "green" };
+  } else if (head.verdict === "unsettled") {
+    headState = { kind: "pending", unsettled: head.unsettled };
+  } else {
+    const names = head.red.map((r) => r.name);
+    const allBaseHealth = names.length > 0 && names.every((n) => isBaseHealthGateName(n));
+    const allMainGreen = names.length > 0 && names.every((n) => n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
+    const noneMainGreen = names.every((n) => !n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
+    if (allBaseHealth && noneMainGreen) {
+      headState = { kind: "red_circular_deploy_gate", names };
+    } else if (allMainGreen) {
+      headState = { kind: "red_circular_main_green_gate", names };
+    } else if (allBaseHealth) {
+      headState = { kind: "red_circular_mixed_gates", names };
+    } else {
+      headState = { kind: "red_substantive", names };
     }
   }
-  // BR#3727: blocked with head checks merely PENDING is a clock, not a
-  // defect — strict branch protection re-runs the required checks on the
-  // head right after every machine-clean update-branch, so the tick after
-  // the carry reads blocked. Pending checks wait a tick; red checks note
-  // (the shared law's own non-in_review row). BR#4633 L4.2 (the approval
-  // anchor): blocked with GREEN checks no longer bounces — the BR verify
-  // verdict IS the approval of record, and the head move that dismissed the
-  // stale GitHub review is exactly the event L4.2 refuses to count as a
-  // lost approval. Coverage is settled above (an uncovered head bounced
-  // before this line), so blocked+green reaching the compose is a verified,
-  // covered head — the merge leg pre-clears the state (supersedes the
-  // BR#3727 "blocked+green bounce stands" posture).
-  const blocked = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked";
-  if (blocked) {
-    const head = classifyHeadChecks(i.headChecks);
-    if (head.verdict === "unsettled")
-      return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
-    if (head.verdict === "red")
-      return { kind: "note", reason: `PR #${i.prNumber} head check RED: ${head.red.map((r) => r.name).join(", ")} — card queued (not in_review), no bounce; the linked session owns it` };
+  return {
+    phase: "mechanically_sound",
+    legNumber,
+    legsTotal: legs.length || 1,
+    mergeState: rawState,
+    headState,
+  };
+}
+
+export function decideTrainGate(i: TrainGateInput): MergeAction {
+  const phase = classifyCandidateGatePhase(i);
+  switch (phase.phase) {
+    case "card_superseded":
+      return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
+    case "card_done":
+      return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+    case "head_uncovered":
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${phase.legNumber} stamped ${phase.stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+        bounceKind: "coverage",
+      };
+    case "mergeability_computing":
+      return { kind: "skip", reason: phase.reason };
+    case "conflicting":
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`,
+        bounceKind: "conflict",
+      };
+    case "unhandled_merge_state":
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} mergeStateStatus=${phase.state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg`,
+        bounceKind: "gate",
+      };
+    case "unverified_commits":
+      return {
+        kind: "human_leg",
+        reason: `PR #${i.prNumber} has ${phase.count} commit(s) not GitHub-verified — signing-environment class, never per-PR`,
+      };
+    case "mechanically_sound": {
+      const { legNumber, legsTotal, mergeState, headState } = phase;
+      const behind = mergeState === "behind";
+      const blocked = mergeState === "blocked";
+      // (1) Stale base-health gate self-heal on a GREEN base
+      if (i.baseVerdict === "green") {
+        if (headState.kind === "red_circular_deploy_gate") {
+          return {
+            kind: "rerun_gate",
+            reason: `PR #${i.prNumber} head red is entirely the deploy-health class (${headState.names.join(", ")}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run`,
+          };
+        }
+        if (i.baseGateGreen !== false && headState.kind === "red_circular_main_green_gate") {
+          return {
+            kind: "rerun_gate",
+            reason: `PR #${i.prNumber} head red is entirely the main-green gate class (${headState.names.join(", ")}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run`,
+          };
+        }
+      }
+      // (2) Blocked with pending or red head checks
+      if (blocked) {
+        if (headState.kind === "pending") {
+          return {
+            kind: "skip",
+            reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${headState.unsettled.join(", ")}) — pending, not a defect; next tick`,
+          };
+        }
+        if (headState.kind !== "green") {
+          return {
+            kind: "note",
+            reason: `PR #${i.prNumber} head check RED: ${headState.names.join(", ")} — card queued (not in_review), no bounce; the linked session owns it`,
+          };
+        }
+      }
+      // (3) Non-green base
+      if (i.baseVerdict !== "green") {
+        const w = i.baseVerdict === "red" ? "RED" : "not green";
+        return {
+          kind: "skip",
+          reason: `base main ${w} — the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert`,
+        };
+      }
+      // (4) Green base, non-blocked head check states
+      if (headState.kind === "pending") {
+        return {
+          kind: "skip",
+          reason: `head checks unsettled (${headState.unsettled.join(", ")}) — not yet, skip this tick`,
+        };
+      }
+      if (headState.kind !== "green") {
+        const names = headState.names.join(", ");
+        return i.cardStatus === "in_review"
+          ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
+          : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
+      }
+      // (5) Mechanically sound + base green + head green -> Merge
+      return {
+        kind: "merge",
+        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
+      };
+    }
   }
-  const gate = decideMergeAction({
-    prNumber: i.prNumber,
-    prTitle: "",
-    headSha: i.headSha,
-    baseVerdict: i.baseVerdict,
-    mergeable: i.mergeable,
-    mergeStateStatus: behind || blocked ? "clean" : i.mergeStateStatus,
-    commits: i.commits,
-    headChecks: i.headChecks,
-    cardStatus: i.cardStatus,
-    verifyAcceptedOnHead: true,
-    verifyAcceptedAny: true,
-  });
-  if (gate.kind === "merge")
-    return {
-      kind: "merge",
-      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
-    };
-  return gate;
 }
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
@@ -2925,8 +3009,17 @@ export function trainBaseRedAskBrief(
       ? `- A fix PR is open: ${fix.curePr.repo}#${fix.curePr.number} — https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`
       : `- No fix PR is open yet — it appears here automatically the moment one binds to the fix card.`,
     fix.culpritPr ? `- The PR that broke main: #${fix.culpritPr}` : ``,
+    ...(fix.curePr
+      ? [
+          ``,
+          `**Why this needs your force-merge (Bridge cannot merge it):**`,
+          `- Fix PR **${fix.curePr.repo}#${fix.curePr.number}** (https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}) is blocked by the circular base-red gate: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`.`,
+          `- Bridge's gateway cannot bypass branch protection on a failing required check without admin authority. Force-merge it out of turn to break the deadlock:`,
+          `  \`gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash\``,
+        ]
+      : []),
     ``,
-    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): answer BYPASS and it merges out of turn, ahead of the queue — this is the only way a fix that cannot pass its own checks while the breakage it fixes is still live gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
+    `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) a fix PR is open (above): force-merge it with \`--admin\` (or answer BYPASS if the gateway holds admin) so it lands out of turn ahead of the queue — this is the only way a fix that cannot pass the circular base-red gate while main is broken gets in; (3) manual steps on your side: answer OTHER and describe them; (4) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green.`,
   ].filter((l) => l !== undefined).join("\n");
   // 2026-11-03 Ray ruling (BR#5631): an ask whose honest answers are all
   // "keep doing what you're already doing" is noise — see
@@ -2935,7 +3028,7 @@ export function trainBaseRedAskBrief(
   // levers (manual steps / a fresh direction), never a default "keep digging".
   const options = fix.curePr
     ? [
-        `(Recommended) Bypass-merge fix PR #${fix.curePr.number} now`,
+        `(Recommended) Force-merge / Bypass-merge fix PR #${fix.curePr.number} (--admin) — breaks the circular red-main gate`,
         `Hold the line — it merges automatically once green`,
         `Transient — re-run the failing check`,
         `Other — manual steps (I'll reply)`,
@@ -2968,12 +3061,140 @@ export function trainBaseRedAskBrief(
  *  held, fix card link — informational, ask:null), queue self-drains the
  *  moment main is green (BR#4692). An ask there would only demand a
  *  pointless "keep going" click. */
+/** BR#6012 closed state machine for a base-red episode's resolution phase.
+ *  Makes illegal states unrepresentable:
+ *  - `diagnosing` / `fix_in_progress` / `cure_pr_conflicting` NEVER warrant a
+ *    human ask (`warrantAsk: false`) and NEVER carry a `curePr`.
+ *  - `cure_pr_awaiting_force_merge` ALWAYS carries a non-conflicting `curePr`
+ *    owned by `card` and the exact `--admin` command.
+ *  - `fix_exhausted` warrants a manual-intervention ask with `curePr: null`. */
+export type BaseRedEpisodeState =
+  | {
+      phase: "diagnosing";
+      warrantAsk: false;
+      card: null;
+      curePr: null;
+      conflictPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "fix_in_progress";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted: false };
+      curePr: null;
+      conflictPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_conflicting";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: null;
+      conflictPr: { repo: string; number: number };
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_awaiting_force_merge";
+      warrantAsk: true;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: { repo: string; number: number };
+      conflictPr: null;
+      culpritPr: number | null;
+      command: string;
+    }
+  | {
+      phase: "fix_exhausted";
+      warrantAsk: true;
+      card: { id: string; title: string; status: string; exhausted: true };
+      curePr: null;
+      conflictPr: null;
+      culpritPr: number | null;
+    };
+
+export function classifyBaseRedEpisodeState(fix: {
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
+  curePr?: { repo: string; number: number } | null;
+  conflictPr?: { repo: string; number: number } | null;
+  culpritPr?: number | null;
+}): BaseRedEpisodeState {
+  const culpritPr = fix?.culpritPr ?? null;
+  const rawCard = fix?.card && fix.card.id
+    ? {
+        id: String(fix.card.id),
+        title: String(fix.card.title ?? ""),
+        status: String(fix.card.status ?? ""),
+        exhausted: !!fix.card.exhausted,
+      }
+    : null;
+  if (fix?.curePr && Number.isInteger(fix.curePr.number) && fix.curePr.number > 0 && !fix.conflictPr) {
+    const card = rawCard ?? {
+      id: `PR#${fix.curePr.number}`,
+      title: "",
+      status: "blocked",
+      exhausted: false,
+    };
+    return {
+      phase: "cure_pr_awaiting_force_merge",
+      warrantAsk: true,
+      card,
+      curePr: { repo: fix.curePr.repo, number: fix.curePr.number },
+      conflictPr: null,
+      culpritPr,
+      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+    };
+  }
+  if (fix?.conflictPr && Number.isInteger(fix.conflictPr.number) && fix.conflictPr.number > 0 && rawCard) {
+    return {
+      phase: "cure_pr_conflicting",
+      warrantAsk: false,
+      card: rawCard,
+      curePr: null,
+      conflictPr: { repo: fix.conflictPr.repo, number: fix.conflictPr.number },
+      culpritPr,
+    };
+  }
+  if (!rawCard) {
+    return { phase: "diagnosing", warrantAsk: false, card: null, curePr: null, conflictPr: null, culpritPr };
+  }
+  if (rawCard.exhausted) {
+    return {
+      phase: "fix_exhausted",
+      warrantAsk: true,
+      card: { ...rawCard, exhausted: true },
+      curePr: null,
+      conflictPr: null,
+      culpritPr,
+    };
+  }
+  return {
+    phase: "fix_in_progress",
+    warrantAsk: false,
+    card: { ...rawCard, exhausted: false },
+    curePr: null,
+    conflictPr: null,
+    culpritPr,
+  };
+}
+
 export function trainBaseRedAskWarranted(fix: {
-  card?: { exhausted?: boolean } | null;
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
   curePr?: unknown;
+  conflictPr?: unknown;
 }): boolean {
-  if (fix && fix.curePr != null) return true;
-  return !!(fix && fix.card && fix.card.exhausted);
+  const curePr =
+    fix?.curePr && typeof fix.curePr === "object" && Number.isInteger((fix.curePr as any).number) && (fix.curePr as any).number > 0
+      ? { repo: String((fix.curePr as any).repo ?? ""), number: Number((fix.curePr as any).number) }
+      : fix?.curePr != null
+        ? { repo: "repo", number: 1 }
+        : null;
+  const conflictPr =
+    fix?.conflictPr && typeof fix.conflictPr === "object" && Number.isInteger((fix.conflictPr as any).number) && (fix.conflictPr as any).number > 0
+      ? { repo: String((fix.conflictPr as any).repo ?? ""), number: Number((fix.conflictPr as any).number) }
+      : null;
+  const card = fix?.card
+    ? { id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted }
+    : null;
+  return classifyBaseRedEpisodeState({ card, curePr, conflictPr }).warrantAsk;
 }
 
 /** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall

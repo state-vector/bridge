@@ -1181,8 +1181,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
 fn root_fix_head_under_stop(lane: &Value) -> bool {
     lane.get("queue")
         .and_then(|q| q.as_array())
-        .and_then(|q| q.first())
-        .map(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false))
+        .map(|q| q.iter().any(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false)))
         .unwrap_or(false)
 }
 
@@ -1505,8 +1504,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                                 refusal = Some(e);
                                 continue;
                             }
-                            refusal = Some(e);
-                            break; // non-method refusal: branch protection et al — never loop
+                            // BR#6012: branch protection refuses plain `gh pr merge` on a
+                            // circular red-base gate (`BLOCKED`). Try `--admin` in case the
+                            // gateway token holds admin; if not, report that human `--admin`
+                            // is required instead of pretending the machine could bypass.
+                            match ctx.sh("gh", &["pr", "merge", &bpr.to_string(), "--repo", repo, method_flag_for(m), "--admin"]) {
+                                Ok(_) => {}
+                                Err(admin_err) => {
+                                    if is_merge_method_refusal(&admin_err) {
+                                        refusal = Some(admin_err);
+                                        continue;
+                                    }
+                                    refusal = Some(format!("{e} (--admin also refused: {admin_err})"));
+                                    break; // non-method refusal: branch protection et al — never loop
+                                }
+                            }
                         }
                     }
                     // claimed ok — verify from live facts, never trust the exit code
@@ -1538,8 +1550,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     }
                     None => {
                         let why = refusal.unwrap_or_else(|| "gh pr merge reported ok but no mergeCommit — DO NOT trust this tick".into());
-                        ack(ctx, &format!("refused: {}", trunc(&why, 200)))?;
-                        log(Some(key), &format!("bypass: PR #{bpr} merge refused — authorization consumed, reason on the lane card: {}", trunc(&why, 200)));
+                        ack(ctx, &format!("refused (needs human --admin: gh pr merge {bpr} --repo {repo} --admin --squash): {}", trunc(&why, 160)))?;
+                        log(Some(key), &format!("bypass: PR #{bpr} merge refused — needs human --admin (`gh pr merge {bpr} --repo {repo} --admin --squash`), reason on the lane card: {}", trunc(&why, 160)));
                     }
                 }
             }
@@ -1636,6 +1648,30 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if auto_rerun_ok > 0 {
                     log(Some(key), &format!("self-heal: auto-dispatched rerun for {auto_rerun_ok} failing required workflow(s) on stopped tip {}", &base_sha[..base_sha.len().min(9)]));
                 }
+            }
+            // BR#6012 stopped-lane self-healing & live base_state refresh:
+            // (a) Keep queue_facts.base_state fresh while stopped so the UI banner
+            //     reflects live failing/pending checks instead of a stale stop.failing
+            //     snapshot from hours ago. When base_sha reads Empty (e.g. a hotfix
+            //     merged onto main and its deploy workflow is queued behind stop_sha's
+            //     concurrency lock), fall back to stop_sha's live check-runs.
+            // (b) Run settle_window_rebase over the held queue so any queued PR that
+            //     became CONFLICTING against moved main (e.g. PR #2800 after #2817)
+            //     is immediately trial-merged and bounced (`kind: "bounced"`,
+            //     `bounce_kind: "conflict"`, `conflict_files`) to `in_progress` for
+            //     an agent to rebase and resolve — never left rotting in the queue
+            //     claiming "ready" and never punted to the human.
+            if ctx.base_probe {
+                let effective_v = if v.verdict == MainVerdict::Empty && !stop_sha.is_empty() && stop_sha != base_sha {
+                    let stop_runs = ctx.check_runs(repo, stop_sha);
+                    let sv = classify_base_check_runs(&stop_runs, &required);
+                    if sv.verdict != MainVerdict::Empty { sv } else { v.clone() }
+                } else {
+                    v.clone()
+                };
+                let live_base_state = build_base_state(&effective_v, &required, 0);
+                let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
+                let _ = settle_window_rebase(ctx, key, repo, base, lane);
             }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             let hold_msg = format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") });
@@ -2851,13 +2887,13 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
             }
             // BR#4066 refinement rides here too — one law, both implementations.
             let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, files.len());
-            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts bounced to impl agent to resolve; the verdict does not carry");
             let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "bounce_kind": event_kind, "reason": reason });
             if event_kind == "conflict" {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
             ctx.mcp("train_event", ev)?;
-            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
+            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced to impl agent to resolve", files.len()));
             return Ok(());
         }
         // Ray 2026-10-30: "if it's still mergeable, go — we only need a

@@ -3180,4 +3180,94 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       { pr: 503, state: "verifying" },
     ]);
   });
+
+  it("BR#6012: BaseRedEpisodeState DO defense-in-depth — never grafts generic fix(chat): PRs onto root-fix cards, never warrants bypass on conflicting PRs, skips already-landed legs, and hands the human the exact --admin command + why", async () => {
+    const repo = "state-vector/lane-br6012";
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — br6012", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    await acquire(repo, "gw-6012", { merge_capable: true, required_workflows: ["deploy / Deploy to dev"] });
+
+    // Held product bugfix PR (`fix(chat): ...` — exact #2555 shape that previously matched /\bfix\b/)
+    const cChat = await queueViaAccept({
+      repo,
+      pr: 2555,
+      head: "1".repeat(40),
+      title: "Trace: superpositional PR #2555 — fix(chat): classifier propagates total LLM failure (BR#2985)",
+    });
+
+    // Episode root-fix card (in_progress, no PR yet)
+    const rootFix = await kbJson("/create", {
+      type: "task",
+      title: "ROOT-FIX (BR#5189 p0): fix main — deploy / Deploy to dev",
+      tags: ["root_blocker", "main-red", "p0"],
+      project: "superpositional",
+      body_md: "root-fix drill",
+      meta: { root_fix: { repo, head_sha: "d".repeat(40), base: "main", why: "deploy red", failing: ["deploy / Deploy to dev"], bound_at: Date.now() } },
+    });
+    expect(rootFix.status).toBe(200);
+
+    const stamp = (entries: any[]) =>
+      kbJson("/train.queue_facts", {
+        repo,
+        base: "main",
+        actor: "gw-6012",
+        entries,
+        base_state: {
+          verdict: "red",
+          scoped_to_required: true,
+          red: [{ name: "deploy / Deploy to dev", url: "https://example.test/deploy-red" }],
+          unsettled: [],
+        },
+      });
+
+    // (1) Generic `fix(chat):` PR in queue must NEVER graft onto rootFix (`fix_in_progress`, no ask)
+    expect((await stamp([{ id: cChat, pr: 2555, cls: "waiting" }])).body.error ?? "").toBe("");
+    const findOpenAsk = async () => {
+      const all = (await kbJson("/search", { q: "lane-br6012", type: "question", limit: 50 })).body.artefacts;
+      return all.find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo}@main`) && x.status === "todo") ?? null;
+    };
+    expect(await findOpenAsk()).toBeNull();
+    const snap1 = await laneSnap(repo);
+    expect(snap1.base_red_resolution.phase).toBe("fix_in_progress");
+    expect(snap1.base_red_resolution.fix_card.id).toBe(rootFix.body.id);
+    expect(snap1.base_red_resolution.fix_card.pr).toBeUndefined();
+
+    // (2) Bind cure PR #2800 + an already-landed leg #2817 onto rootFix, but mark #2800 CONFLICTING in queue_facts:
+    //     phase must be `cure_pr_conflicting`, `fix_card.conflict === true`, `pr === 2800` (never the landed #2817), and NO ask!
+    await kbJson("/update", {
+      id: rootFix.body.id,
+      meta: {
+        root_fix: { repo, head_sha: "d".repeat(40), base: "main", why: "deploy red", failing: ["deploy / Deploy to dev"], bound_at: Date.now() },
+        prs: [
+          { repo, number: 2800, head_sha_at_acceptance: "2".repeat(40) },
+          { repo, number: 2817, head_sha_at_acceptance: "3".repeat(40) },
+        ],
+        merge_train: {
+          legs: {
+            "2817": { state: "landed", merge_sha: "9".repeat(40) },
+          },
+        },
+      },
+    });
+    expect((await stamp([{ id: rootFix.body.id, pr: 2800, cls: "conflict" }, { id: cChat, pr: 2555, cls: "waiting" }])).body.error ?? "").toBe("");
+    expect(await findOpenAsk()).toBeNull();
+    const snap2 = await laneSnap(repo);
+    expect(snap2.base_red_resolution.phase).toBe("cure_pr_conflicting");
+    expect(snap2.base_red_resolution.fix_card.pr).toBe(2800);
+    expect(snap2.base_red_resolution.fix_card.conflict).toBe(true);
+
+    // (3) Agent finishes rebasing #2800 (`cls: "blocked"` — non-conflicting, held only by circular base gate):
+    //     phase transitions to `cure_pr_awaiting_force_merge` and the human ask files with the exact `--admin` command + why
+    expect((await stamp([{ id: rootFix.body.id, pr: 2800, cls: "blocked" }, { id: cChat, pr: 2555, cls: "waiting" }])).body.error ?? "").toBe("");
+    const ask = await findOpenAsk();
+    expect(ask).toBeTruthy();
+    expect(String(ask.body_md)).toContain(`gh pr merge 2800 --repo ${repo} --admin --squash`);
+    expect(String(ask.body_md)).toContain("Why this needs your force-merge");
+    const snap3 = await laneSnap(repo);
+    expect(snap3.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(snap3.base_red_resolution.fix_card.pr).toBe(2800);
+    expect(snap3.base_red_resolution.fix_card.conflict).toBeUndefined();
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6012" });
+  });
 });
