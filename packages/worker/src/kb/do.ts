@@ -353,6 +353,20 @@ function sanitizeBatchMembers(raw: unknown): number[] | null {
   return out.length ? out : null;
 }
 
+/** BR#6395 — is this subject a disposition/execute task (a card whose job is
+ *  to act on OTHER cards)? Detected from the `disposition` tag or an
+ *  EXECUTE/drain/disposition title. A batch-authorization ask answer
+ *  ("SUPERSEDE all N") bound to such a task authorizes the batch, never the
+ *  task itself (the BR#6387 misfire superseded the executor card). */
+export function isDispositionTask(s: { title?: unknown; tags?: unknown } | null | undefined): boolean {
+  if (!s) return false;
+  const tags = Array.isArray(s.tags)
+    ? (s.tags as unknown[]).map((x) => String(x).trim().toLowerCase())
+    : String(s.tags ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (tags.includes("disposition")) return true;
+  return /\bdisposition\b|\bdrain\b|\bexecute\b/i.test(String(s.title ?? ""));
+}
+
 /** BR#3787 layer 2 — repair rate limit: a device may re-vend its own row at
  *  most this many times per rolling hour. A crash loop must not mint
  *  infinitely; past the limit the device parks and retries later. */
@@ -2374,10 +2388,15 @@ export class KnowledgeHub {
   async board() {
     // owner renders via the BR#4262 render-time join (principal at rest →
     // label on display); matching below stays on ids/meta, never owner text
+    // BR#6395: open tasks rank before terminal rows — a burst of done/
+    // superseded closures must never push active/blocked/queued tasks out
+    // of the 200-row board payload.
     const tasks = this.state.storage.sql.exec(
       `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.type IN ('task','question') ORDER BY a.updated_ts DESC LIMIT 200`,
+       WHERE a.type IN ('task','question')
+       ORDER BY CASE WHEN a.status NOT IN ('done','superseded') THEN 0 ELSE 1 END, a.updated_ts DESC
+       LIMIT 200`,
     ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
@@ -6832,7 +6851,7 @@ export class KnowledgeHub {
       this.version(id, actor, "transition", `answered by ${actor}: ${answer.slice(0, 200)}`, { from: node.status, to: "done", answer: answer.slice(0, 200), claim_resolved: hadClaim || undefined });
       let taskStatus: string | undefined;
       const subject = this.one(
-        `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id
+        `SELECT p.id AS id, p.status AS status, p.owner AS owner, p.meta AS meta, p.title AS title, p.tags AS tags FROM relations r JOIN artefacts p ON p.id = r.dst_id
          WHERE r.relation = 'child_of' AND r.src_id = ? ORDER BY r.created_ts DESC LIMIT 1`, id,
       );
       if (subject) {
@@ -6897,7 +6916,19 @@ export class KnowledgeHub {
             .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
             .some((verb) => stripRecommended(answer).toLowerCase().startsWith(verb.toLowerCase()));
           const asActor = `system:question(${actor})`;
-          if (isMigrationAsk || optHit) {
+          // BR#6395 — BATCH-authorization answers on disposition tasks. An
+          // option like "SUPERSEDE all 29 — …" / "SUPERSEDE only the 6 dead
+          // parks" authorizes the executor to supersede the NAMED TARGET
+          // CARDS — it is not a drop instruction for the bound task itself.
+          // The BR#6387 misfire matched the bare SUPERSEDE verb, superseded
+          // the bound disposition task (BR#6383), and dropped the authorized
+          // 29-card strand batch on the floor. A batch answer takes the
+          // resume/release legs below instead of any terminal verb, so a
+          // live or fresh executor executes the batch against the targets.
+          const batchDisposition =
+            /\bSUPERSEDE\s+(?:all|only)\b/i.test(stripRecommended(answer)) &&
+            isDispositionTask(subject);
+          if ((isMigrationAsk || optHit) && !batchDisposition) {
             if (/\bSUPERSEDE\b/i.test(answer)) {
               // human_verdict: the human's answered-ask decision — the system
               // actor is only the pen. The release-holds guards (BR#4067)

@@ -16,9 +16,10 @@ import { isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
  * Fix legs pinned here:
  *   1. exitClassOf (ui-kit views.ts) classifies the merge group from the
  *      typed merge_train phase ONLY (queued|awaiting-ci) — the TRAIN_RX /
- *      GH_PR_RX prose regexes are deleted, the pr_merged await_event is a
- *      legacy bridge that fires ONLY when the phase field is entirely
- *      absent (source assertions below).
+ *      GH_PR_RX prose regexes are deleted, and per BR#6395 the pr_merged
+ *      await_event legacy bridge is DELETED too: a pr_merged wait with no
+ *      live train phase files under the "not on train" class, never the
+ *      train class (source assertions below).
  *   2. The canonical closed phase + predicate live in @bridge/contracts
  *      (unit-pinned below; ui-kit mirrors it with a MUST-STAY-IN-SYNC note).
  *   3. sweepMergedParks (alarm cadence) closes a blocked queued/awaiting-ci
@@ -124,8 +125,10 @@ describe("BR#6330 leg 2 — exitClassOf: one classification, no prose path (sour
     expect(viewsSrc).toMatch(/phase === "queued" \|\| phase === "awaiting-ci"/);
     expect(viewsSrc).toMatch(/phase === "awaiting"\) return EXIT_CLASSES\.awaiting/);
   });
-  it("the pr_merged await_event is a legacy bridge that fires ONLY when the phase field is absent", () => {
-    expect(viewsSrc).toMatch(/phase === null && \(ev === "pr_merged" \|\| ev === "br_pr_merged"\)/);
+  it("BR#6395: the pr_merged legacy bridge is DELETED — phase-only admission, non-train PR waits file under the pr class", () => {
+    expect(viewsSrc).not.toMatch(/phase === null && \(ev === "pr_merged" \|\| ev === "br_pr_merged"\)/);
+    expect(viewsSrc).toMatch(/phase === "conflicting"\) return EXIT_CLASSES\.conflict/);
+    expect(viewsSrc).toMatch(/EXIT_CLASSES\.pr/);
   });
 });
 

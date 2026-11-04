@@ -1589,8 +1589,11 @@ exactly such a card to the pool, stamping no trace of the dead wait — BR#5522
 Three legs close the class. The ghost release now copies the train-only wait
 onto the release stamp (`bounce_released.train_only_await`) so the strand is
 readable from the card's own facts. The alarm-cadence strand sweep
-(`sweepStrandedTrainCards`) judges every open card carrying train state or a
-train-only wait: strand classes are `out_of_queue_await` (a train-only wait,
+(`sweepStrandedTrainCards`) judges every open card carrying train-car
+provenance (BR#6395: a `merge_train` stamp, a `bounce_released.train_only_await`
+stamp, or a `review_pr` binding — a bare typed wait on an upstream-PR park
+is not provenance and is never re-boarded) that also carries a train-only
+wait or queue state: strand classes are `out_of_queue_await` (a train-only wait,
 no longer a queue candidate), `queued_out_of_queue` (the card says queued, the
 derived queue dropped it — the unprefixed-park class), and `unbound_in_queue`
 (admitted but legless — the fail-closed unbound park). A strand only counts
@@ -1625,9 +1628,12 @@ field: the derived queue (`mergeTrainQueue` admits on prefix OR stamp —
 deliberately fail-open, a stray admit is gate-checked while a silent drop
 starves a lane), the watchdog holds (`releaseHold`), the lane awaiting band,
 and the Backlog's "Awaiting PR merge — train" group (`exitClassOf` — the
-prose `TRAIN_RX`/`GH_PR_RX` regexes are deleted; the `pr_merged` await_event
-is the machine LEG the train flips, not a display class, and bridges the
-class only for pre-stamp legacy parks whose phase field is entirely absent).
+prose `TRAIN_RX`/`GH_PR_RX` regexes are deleted and, per BR#6395, the
+pre-stamp `pr_merged` legacy bridge is deleted too: the `pr_merged`
+await_event is the machine LEG the train flips, not a display class, and a
+`pr_merged`/`br_pr_merged` wait with no live train phase (none, `unbound`,
+`bounced`) is an upstream-PR dependency park that files under the separate
+"Awaiting PR merge — not on train" group — never the train class).
 A card cannot enter the merge class by text. The count in Backlog equals the
 trains queue by construction because stranded state self-heals:
 `sweepMergedParks` (alarm cadence, the strand-sweep family) closes any
@@ -1639,6 +1645,32 @@ closeBurstParks mechanics). This kills the 2026-11-05 shape: nine cards for
 already-merged PRs sitting in the merge class because the settle-close owed
 them rode a pass interrupted by red cycles / out-of-band pushes.
 Pinned in `packages/worker/test/br6330-merge-class.test.ts`.
+
+### Honest Backlog sections: provenance, conflict cars, unblocker labels (BR#6395)
+
+The train section counts only real cars, and every section says who unblocks
+it. Backlog's exit-condition groups gain three accuracy laws: (1) the
+`conflicting` phase renders in its own "Awaiting PR rebase — conflict on
+train" group instead of falling through; a `pr_merged`/`br_pr_merged` wait
+with no live train phase files under "Awaiting PR merge — not on train";
+standing merge-lane anchor cards (`meta.lane.key` / `meta.infra_anchor`)
+belong to the Trains panel and never render as Backlog exit rows. (2) Every
+exit class carries an explicit **unblockedBy** — You · Agent · System —
+merge train · System — CI · System — proxy watch · System — watchdog timer —
+rendered as the section badge, and each row shows its `blocked.reason` plus
+the typed `unblock_condition` next to the same label, so "who/what moves
+this" is answerable without opening the card. (3) The strand sweep requires
+train-car provenance — a `merge_train` stamp, a
+`bounce_released.train_only_await` stamp, or a `review_pr` binding: an
+upstream-PR dependency park whose only train-shaped fact is a typed wait is
+never re-boarded with "merge-train: queued — strand re-board" (the BR#6163
+mass-misclassification is dead at the classifier). Two hub accuracies ride
+along: an ask answer shaped "SUPERSEDE all N" / "SUPERSEDE only the N" on a
+disposition task authorizes the batch and resumes the executor instead of
+superseding the bound task itself (the BR#6387 misfire that dropped the
+authorized 29-card strand batch), and `board()` ranks open tasks before
+terminal rows so burst closures never push active work out of the 200-row
+payload. Pinned in `packages/worker/test/br6395-exit-classes-strand.test.ts`.
 
 ### Duplicate citations bind once; the stale re-queue fails closed (BR#6349)
 

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, exitClassOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, exitClassOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf, isLaneAnchor } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
@@ -37,6 +37,8 @@ interface BlGroup {
   key: string;
   title: string;
   note: string;
+  /** BR#6395 — "who/what unblocks it" for the section, rendered as a badge. */
+  unblockedBy?: string;
   rows: any[];
   showRank: boolean;
   showBoost: boolean;
@@ -81,6 +83,9 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     const byExit = new Map<string, any[]>();
     for (const t of ts) {
       if (t.status !== "blocked" && t.status !== "in_review") continue;
+      // BR#6395 — standing merge-lane anchor cards are the Trains panel's
+      // residents, never a Backlog exit-condition row.
+      if (isLaneAnchor(t)) continue;
       const cls = exitClassOf(t);
       const list = byExit.get(cls.key) ?? [];
       list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
@@ -95,7 +100,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       const rows = byExit.get(key) ?? [];
       if (rows.length === 0) continue;
       const cls = EXIT_CLASSES[key];
-      exitGroups.push({ key, title: cls.title, note: cls.note, icon: cls.icon, rows, showRank: false, showBoost: false });
+      exitGroups.push({ key, title: cls.title, note: cls.note, icon: cls.icon, unblockedBy: cls.unblockedBy, rows, showRank: false, showBoost: false });
     }
 
     return [
@@ -188,6 +193,11 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
           <div className="view-head backlog-group-head">
             <h2>{g.title}</h2>
             <span className="muted-note">{g.rows.length} · {g.note}</span>
+            {g.unblockedBy && (
+              <Chip tone="scope" title={`who/what unblocks the cards in this section: ${g.unblockedBy}`}>
+                unblocks: {g.unblockedBy}
+              </Chip>
+            )}
             {g.key === "timeout" && g.rows.length > 0 && (
               <Btn
                 size="sm"
@@ -205,6 +215,11 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
               const rank = r.rank;
               const boosted = !!r.boosted;
               const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
+              // BR#6395 — per-row unblock facts: who/what owns the exit, the
+              // reason it's parked, and the typed exit condition.
+              const cls = exitClassOf(t);
+              const blockedReason = String(t.meta?.blocked?.reason ?? "").trim();
+              const unblockCond = String(t.meta?.blocked?.unblock_condition ?? "").trim();
               return (
                 <div
                   key={t.id}
@@ -219,11 +234,15 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
                     <TagChips tags={t.tags} />
-                    {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
+                    {t.status === "blocked" && (blockedReason || unblockCond || t.meta?.awaiting_ask?.ask_id) && (
                       <span className="backlog-why">
                         {t.meta?.awaiting_ask?.ask_id
                           ? <><Chip tone="urgent">ask</Chip> {t.meta.awaiting_ask.ask_id}</>
-                          : <><Chip tone="scope">exit</Chip> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
+                          : <>
+                              <Chip tone="scope" title={`who/what unblocks it: ${cls.unblockedBy}`}>{cls.unblockedBy}</Chip>
+                              {blockedReason && <span title={blockedReason}>{blockedReason.slice(0, 110)}</span>}
+                              {unblockCond && <span title={unblockCond}>→ {unblockCond.slice(0, 90)}</span>}
+                            </>}
                       </span>
                     )}
                     {t.status === "in_review" && <span className="backlog-why"><Chip tone="warn">verify</Chip> awaiting a fresh verify session</span>}

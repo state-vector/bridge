@@ -2396,6 +2396,24 @@ export type TrainStrandClass =
   | "queued_out_of_queue" // card SAYS merge-train queued, queue dropped it
   | "unbound_in_queue";   // admitted queue park whose legs never bound (alarm only)
 
+/** BR#6395 — train-car provenance: the card actually RODE a merge train.
+ *  One of: a typed merge_train stamp (any content), a bounce-release
+ *  train-only-await evidence stamp (BR#6163 leg 1), or a review-PR binding
+ *  (meta.review_pr). A train-only await WITHOUT any of these is just an
+ *  upstream-PR dependency park — phase === null, no train stamp, the PR is
+ *  not this card's own leg — and the strand sweep must never re-board it as
+ *  a merge-train car (that overwrite was the BR#6163 mass
+ *  misclassification: upstream parks read "merge-train: queued — strand
+ *  re-board" although no train can ever flip their leg). */
+export function hasTrainCarProvenance(m: any): boolean {
+  const mm = m ?? {};
+  const mt = mm.merge_train;
+  if (mt && typeof mt === "object" && Object.keys(mt as Record<string, unknown>).length > 0) return true;
+  if (mm.bounce_released?.train_only_await) return true;
+  if (mm.review_pr) return true;
+  return false;
+}
+
 /** Which strand class (if any) is this card in? `admitted` = the card is a
  *  queue candidate (blocked + merge_train.pr>0 + the merge-train prefix or a
  *  watchdog hold-park — mergeTrainQueue's admit test, regardless of legs).
@@ -2411,7 +2429,11 @@ export function trainStrandClass(meta: any, admitted: boolean): TrainStrandClass
   if (state === "bounced") return null;  // BR#4494 demote owns bounce re-entry
   if (state === "conflicting") return null; // BR#6348 budget sweep owns conflicting parks
   if (state === "unbound" && admitted) return "unbound_in_queue";
-  if (trainOnlyAwait(m) && !admitted) return "out_of_queue_await";
+  // BR#6395: provenance guard — a train-only await on a card that never
+  // rode a train (no merge_train stamp, no bounce-release evidence, no
+  // review-PR binding) is an upstream-PR dependency park, not a stranded
+  // train car. Leave it exactly as it is.
+  if (trainOnlyAwait(m) && !admitted && hasTrainCarProvenance(m)) return "out_of_queue_await";
   if (state === "queued" && !admitted) return "queued_out_of_queue";
   return null;
 }

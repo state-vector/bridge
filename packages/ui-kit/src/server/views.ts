@@ -101,6 +101,11 @@ export interface ExitClass {
   title: string;
   icon: string;
   note: string;
+  /** BR#6395 — "Who/what unblocks it": the lever that owns the exit for this
+   *  class, rendered as the section-level unblocker badge. One of:
+   *  You · Agent · System — merge train · System — CI · System — proxy
+   *  watch · System — watchdog timer. */
+  unblockedBy: string;
 }
 
 const GH_ISSUE_RX = /github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+|\bGH#\d+\b/i;
@@ -118,7 +123,7 @@ const AWAITING_RX = /^Awaiting review \(verdict /i;
  *  and MUST stay in sync with contracts mergePhaseOf/isAwaitingMerge).
  *  Prose reasons and the pr_merged await_event NO LONGER classify a card
  *  into the merge group — a card cannot enter the class by text. */
-const MERGE_TRAIN_PHASES = new Set(["queued", "awaiting-ci", "bounced", "awaiting", "unbound", "base-red-park", "landed"]);
+const MERGE_TRAIN_PHASES = new Set(["queued", "awaiting-ci", "bounced", "conflicting", "awaiting", "unbound", "base-red-park", "landed"]);
 function mergePhaseOf(t: { meta?: any }): string | null {
   const st = String(t?.meta?.merge_train?.state ?? "");
   return st && MERGE_TRAIN_PHASES.has(st) ? st : null;
@@ -129,25 +134,38 @@ export function isAwaitingMerge(t: { meta?: any }): boolean {
   return p === "queued" || p === "awaiting-ci";
 }
 
-/** The exit-class table — single source; exitClassOf returns entries from it. */
+/** The exit-class table — single source; exitClassOf returns entries from it.
+ *  Every class carries `unblockedBy` (BR#6395): the section badge answers
+ *  "who/what unblocks it" before the reader opens a single card. */
 export const EXIT_CLASSES: Record<string, ExitClass> = {
-  ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes." },
-  awaiting: { key: "awaiting", title: "Awaiting review — force-review", icon: "◉", note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl." },
-  verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it." },
-  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; holds a live merge-train slot (typed merge_train phase queued/awaiting-ci — BR#6330: the one classification). The count here is the trains panel queue by construction." },
-  ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success)." },
-  deploy: { key: "deploy", title: "Awaiting deploy", icon: "▲", note: "waiting on a hub deploy at the named commit." },
-  task: { key: "task", title: "Awaiting another task", icon: "◈", note: "waiting on another card's done/answer (br_done / br_answered)." },
-  issue: { key: "issue", title: "Awaiting GitHub issue", icon: "⊙", note: "waiting on an upstream issue closing." },
-  time: { key: "time", title: "Awaiting a date", icon: "◷", note: "time-gated — flips when the clock passes." },
-  main: { key: "main", title: "Awaiting green main", icon: "✖", note: "red-main / stop-the-line hold — resumes when the line is green." },
-  other: { key: "other", title: "Blocked — other", icon: "▪", note: "no typed leg matched — open the card to resolve or re-scope." },
-  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); Release (or Release all) to put one back now — protected parks refuse and say why." },
+  ask: { key: "ask", title: "Awaiting you — ask pending", icon: "⚑", note: "a human ask holds the card; answer it and the asker resumes.", unblockedBy: "You" },
+  awaiting: { key: "awaiting", title: "Awaiting review — force-review", icon: "◉", note: "coverage-bounced park (BR#4960: no asks): the accepted verdict lapsed at a new head — force-review from the card: approve re-anchors the verdict and re-queues the train, changes requested bounce impl.", unblockedBy: "You" },
+  verify: { key: "verify", title: "Awaiting PR verification", icon: "✓", note: "in review — a fresh verify session must rule before the train can queue it.", unblockedBy: "Agent" },
+  merge: { key: "merge", title: "Awaiting PR merge — train", icon: "⇥", note: "verified; holds a live merge-train slot (typed merge_train phase queued/awaiting-ci — BR#6330: the one classification). The count here is the trains panel queue by construction.", unblockedBy: "System — merge train" },
+  conflict: { key: "conflict", title: "Awaiting PR rebase — conflict on train", icon: "⚠", note: "typed merge_train phase conflicting (BR#6348): the car left the queue on a merge conflict — the budget sweep + loud alarm own it; a signed rebase/re-push re-enters it.", unblockedBy: "Agent" },
+  pr: { key: "pr", title: "Awaiting PR merge — not on train", icon: "🔗", note: "waiting on an upstream PR to merge OUTSIDE the train (typed pr_merged / br_pr_merged leg with no live train phase — BR#6395: these are dependency parks, not train cars). The proxy watch verifies the merge; the PR's owner moves it.", unblockedBy: "System — proxy watch" },
+  ci: { key: "ci", title: "Awaiting CI", icon: "◔", note: "waiting on check runs (pr_checks_green / run_success).", unblockedBy: "System — CI" },
+  deploy: { key: "deploy", title: "Awaiting deploy", icon: "▲", note: "waiting on a hub deploy at the named commit.", unblockedBy: "System — CI" },
+  task: { key: "task", title: "Awaiting another task", icon: "◈", note: "waiting on another card's done/answer (br_done / br_answered).", unblockedBy: "Agent" },
+  issue: { key: "issue", title: "Awaiting GitHub issue", icon: "⊙", note: "waiting on an upstream issue closing.", unblockedBy: "Agent" },
+  time: { key: "time", title: "Awaiting a date", icon: "◷", note: "time-gated — flips when the clock passes.", unblockedBy: "System — watchdog timer" },
+  main: { key: "main", title: "Awaiting green main", icon: "✖", note: "red-main / stop-the-line hold — resumes when the line is green.", unblockedBy: "System — CI" },
+  other: { key: "other", title: "Blocked — other", icon: "▪", note: "no typed leg matched — open the card to resolve or re-scope.", unblockedBy: "You" },
+  timeout: { key: "timeout", title: "Timeout — churn parks", icon: "⏱", note: "the watchdog drains these to the pool automatically (BR#2893); Release (or Release all) to put one back now — protected parks refuse and say why.", unblockedBy: "System — watchdog timer" },
 };
 
 /** Render order for the Backlog exit-class groups: human levers first, then
- *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+ *  machine gates by blast radius, parks last. Train-adjacent merge states
+ *  stay together (merge → conflict → not-on-train, BR#6395). */
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "conflict", "pr", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+
+/** BR#6395 — standing merge-lane anchor cards (the lane card itself,
+ *  meta.lane.key, or a standing infra_anchor): they belong to the Trains
+ *  panel, not to Backlog's task exit-condition groups. */
+export function isLaneAnchor(t: { meta?: any }): boolean {
+  const m = t?.meta ?? {};
+  return Boolean(m.lane?.key) || Boolean(m.infra_anchor);
+}
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed await_event outranks prose. */
@@ -167,16 +185,19 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
   // BR#6330 — ONE classification: the typed merge_train phase decides the
   // merge class (queued|awaiting-ci ⇒ awaiting merge; awaiting ⇒ the
-  // force-review park). The pr_merged await_event is the machine LEG the
-  // train flips, not a display class; the prose TRAIN/PR regexes are
-  // retired. Legacy bridge: a pr_merged-typed park with NO merge_train
-  // stamp at all (pre-BR#5750 parks) keeps the merge class until the heal
-  // sweep stamps or closes it — the bridge fires only when the field is
-  // entirely absent, so a stamped card can never be reclassified by text.
+  // force-review park; conflicting ⇒ its own rebase section, BR#6395). The
+  // pr_merged await_event is the machine LEG the train flips, not a display
+  // class; the prose TRAIN/PR regexes are retired. BR#6395: the pre-BR#5750
+  // legacy bridge (phase === null + pr_merged ⇒ train) is DELETED — a
+  // pr_merged/br_pr_merged wait with no live train phase (null, unbound,
+  // bounced) is an upstream-PR dependency park, not a train car, and files
+  // under EXIT_CLASSES.pr ("not on train") so it can never inflate the
+  // train section again.
   const phase = mergePhaseOf(t);
   if (phase === "awaiting") return EXIT_CLASSES.awaiting;
   if (phase === "queued" || phase === "awaiting-ci") return EXIT_CLASSES.merge;
-  if (phase === null && (ev === "pr_merged" || ev === "br_pr_merged")) return EXIT_CLASSES.merge;
+  if (phase === "conflicting") return EXIT_CLASSES.conflict;
+  if ((phase === null || phase === "unbound" || phase === "bounced") && (ev === "pr_merged" || ev === "br_pr_merged")) return EXIT_CLASSES.pr;
   if (ev === "pr_checks_green" || ev === "run_success") return EXIT_CLASSES.ci;
   if (ev === "deployed") return EXIT_CLASSES.deploy;
   if (ev === "br_done" || ev === "br_answered") return EXIT_CLASSES.task;
