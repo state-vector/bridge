@@ -1009,6 +1009,27 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
       { repo: R, number: 7, head_sha_at_acceptance: h.slice(0, 9) },
     ]);
   });
+  it("BR#6349: a receipts deep-link re-citing an already-cited PR collapses to ONE leg — never a phantom second citation", () => {
+    const R = "state-vector/bridge";
+    const h = "d401a35bbe2faaa6cc8c9060a2b3413b039b9344";
+    // the BR#4684/PR#309 incident note: canonical /pull/ URL + the
+    // /pull/N/commits/<sha> receipt deep-link, which TRAIN_PR_URL_RE also
+    // matches. Before the fix this parsed TWO legs for one PR, broke the
+    // adjacency pairing, and the queue arm silently re-stamped the STALE head.
+    expect(trainParseNoteLegs(
+      `Verify ACCEPT — PR ${u(R, 309)} head ${h}\nreceipts: ${u(R, 309)}/commits/${h}`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
+    // with ONE cited leg the lenient single-PR binding applies again: even a
+    // clause break between the head and its citation still binds (the incident
+    // died exactly here — two legs forced strict adjacency and bound neither)
+    expect(trainParseNoteLegs(
+      `Verify ACCEPT (duty drill). head ${h}\nPR ${u(R, 309)}; receipts: ${u(R, 309)}/commits/${h}`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
+    // URL + owner/name#N shorthand citing the same PR also stays ONE leg
+    expect(trainParseNoteLegs(
+      `PR ${u(R, 309)} head ${h} (${R}#309, merged)`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
+  });
   it("multi-PR notes pair each PR with its NEAREST head (line by line — either order binds)", () => {
     const R = "state-vector/bridge";
     const b = "b".repeat(40), c = "c".repeat(40);

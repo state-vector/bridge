@@ -10855,6 +10855,39 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // the silent-stale coverage-bounce spin class.
     const stampBefore = new Map(stampLegs.map((l) => [`${l.repo}#${l.number}`, l.head_sha_at_acceptance]));
     const refreshed = withStampHeads.some((l) => stampBefore.get(`${l.repo}#${l.number}`) !== l.head_sha_at_acceptance);
+    // BR#6349 fail-closed re-queue: on an already-queued card whose fold moved
+    // NO stamp while the note still carries a `head <sha>` token that NO
+    // stamped leg holds, the note's PR citation failed to bind (the
+    // BR#4684/PR#309 class: a receipts deep-link re-cited the PR, the phantom
+    // leg broke adjacency pairing, neither token bound). Folding the old
+    // stamp forward here silently re-queues the car at a head the verdict
+    // does not cover — the drain walk's coverage gate just bounces it back
+    // (the accept→bounce livelock). Fail CLOSED to the typed `unbound` phase
+    // (BR#6330 closed union) instead: the stale entry never rides the drain
+    // walk, and the next park must come back with a note that actually binds.
+    const noteHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
+    const alreadyQueued = parent.status === "blocked" && blockedReason().startsWith(MERGE_TRAIN_REASON_PREFIX);
+    if (alreadyQueued && !refreshed && noteHead && !stampLegs.some((l) => l.head_sha_at_acceptance === noteHead)) {
+      meta.merge_train = {
+        ...(meta.merge_train ?? {}),
+        state: "unbound",
+        pr: withStampHeads[0].number,
+        repo: withStampHeads[0].repo,
+        at: Date.now(),
+        unbound: withStampHeads.map((l) => l.number),
+        stale_head: String(withStampHeads[0].head_sha_at_acceptance ?? ""),
+        note_head: noteHead,
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+      this.audit("system:merge-train", "queue_stamp_not_refreshed", parentId, {
+        head: noteHead.slice(0, 9),
+        stale_head: String(withStampHeads[0].head_sha_at_acceptance ?? "").slice(0, 9),
+        legs: withStampHeads.map((l) => `${l.repo}#${l.number}`),
+        reason: "re-queue note carried a `head <sha>` no stamped leg holds and the fold moved nothing — the citation did not bind, so the old stamp is NOT folded forward (BR#4684/PR#309 class); merge_train=unbound until a re-park note binds (BR#6349)",
+      });
+      this.version(parentId, actor, "train_queue_unbound", `NOT re-queued — the accept note's head ${noteHead.slice(0, 9)} binds to no stamped leg and the fold moved nothing; merge_train=unbound (fail-closed, BR#6349)`, {});
+      return;
+    }
     // stamp: meta.prs = every leg; meta.pr = the first leg (compat: the gate,
     // the derived-queue filter, and older readers read meta.pr)
     // BR#4806 wake bookkeeping — read the per-lane queue depth BEFORE the
@@ -10878,7 +10911,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.audit(actor, "unboost", parentId, { root: parentId, via: "train:queued" });
       this.version(parentId, actor, "update", "boost decayed — re-queued on the merge train (BR#4068)", {});
     }
-    const alreadyQueued = parent.status === "blocked" && blockedReason().startsWith(MERGE_TRAIN_REASON_PREFIX);
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
     if (!alreadyQueued) {
       await this.transition(
@@ -10962,10 +10994,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     }
     this.audit(actor, "train_queued", parentId, { prs: withStampHeads.map((l) => l.number), repos: [...new Set(withStampHeads.map((l) => l.repo))], head: (withStampHeads[0].head_sha_at_acceptance ?? "").slice(0, 9), requeued: alreadyQueued, refreshed });
-    const noteHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
-    if (alreadyQueued && !refreshed && noteHead && !stampLegs.some((l) => l.head_sha_at_acceptance === noteHead)) {
-      this.audit("system:merge-train", "queue_stamp_not_refreshed", parentId, { head: noteHead.slice(0, 9), reason: "the accept note carried a `head <sha>` token but no stamped leg moved — its PR citation did not parse onto a leg (BR#4648 class); the stamp rides at its old head" });
-    }
+    // (BR#4648's post-hoc queue_stamp_not_refreshed audit used to sit here —
+    // BR#6349 promoted it to the fail-closed unbound arm above: the same
+    // condition now STOPS the re-queue instead of narrating a stale ride.)
     this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? ` (re-queued${refreshed ? ", stamp refreshed" : ""})` : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }
 

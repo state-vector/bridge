@@ -1639,6 +1639,38 @@ already-merged PRs sitting in the merge class because the settle-close owed
 them rode a pass interrupted by red cycles / out-of-band pushes.
 Pinned in `packages/worker/test/br6330-merge-class.test.ts`.
 
+### Duplicate citations bind once; the stale re-queue fails closed (BR#6349)
+
+The `unbound` phase's writer is now fail-closed at the source. The
+BR#4684/PR #309 livelock (2026-11-04): a verify accept note cited the PR
+twice — the canonical `/pull/` URL plus a `/pull/N/commits/<sha>` receipts
+deep-link, which `TRAIN_PR_URL_RE` also matches — `trainParseNoteLegs`
+minted TWO legs for one PR, the multi-PR adjacency pairing bound neither
+`head <sha>` token, and `trainQueueOnAccept` silently folded the stamp back
+to the pre-rebase `head_sha_at_acceptance`. The car re-queued at a head the
+verdict did not cover, the coverage gate bounced it twice, and the lane
+starved until a manual re-park.
+
+- **One PR is ONE leg**: the URL loop dedupes by `repo#number` exactly like
+  the `owner/name#N` loop always did — a deep-link of an already-cited PR
+  never mints a phantom leg, and a single cited PR binds its head by the
+  lenient single-PR rule again (URL + shorthand double-cites collapse the
+  same way). Citing the same PR twice is now harmless; `/commit/<sha>`
+  stays the receipts convention.
+- **The re-queue fail-closed**: when an already-queued card is re-accepted
+  and the note carries a `head <sha>` that binds to NO stamped leg while
+  the fold moved nothing, the card is stamped the typed `unbound` phase
+  with `stale_head`/`note_head` receipts and a loud
+  `queue_stamp_not_refreshed` audit (the BR#4648 event id, promoted from
+  post-hoc narration to the stop) — the old stamp is never folded forward,
+  so a stale entry cannot ride into the drain walk to be bounced later. An
+  honest no-op re-accept (the note's head equals a stamped leg's head)
+  still queues.
+
+Pinned in `packages/worker/test/br6349-stale-requeue.test.ts` (the incident
+note rides the real bundled DO) plus the parser drills in
+`merge-train.test.ts`.
+
 ### The ops (MCP + HTTP)
 
 `train.status` (GET `/train` mirrors it) · `train.lease` (acquire / renew / release) ·
