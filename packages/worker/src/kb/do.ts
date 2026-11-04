@@ -217,6 +217,11 @@ import {
  *  sink the destination-green sweep used (BR#3124, infrastructure). Override
  *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
 const TRAIN_ALARM_SINK_ID = "BR#3124";
+/** BR#5916: the machine re-arm window for unclaimable infra anchors — when a
+ *  do-not-claim anchor's typed time await expires, the sweep re-parks it on a
+ *  fresh wait of this length instead of leaving an expired atom in place
+ *  (24h, mirroring the churn-guard cooldown that put BR#3124 on a timer). */
+const ANCHOR_REARM_MS = 24 * 60 * 60_000;
 /** BR#5377 F1: the human-actor test for the verdict-apply note (mirrors
  *  machine.ts HUMAN_ACTOR — prose attribution, not legality: the gate itself
  *  stays in machine.ts). Distinguishes "accepted by human" (a panel ratify of
@@ -1917,6 +1922,22 @@ export class KnowledgeHub {
     return out;
   }
 
+  /** BR#5916: do-not-claim infra anchors — the standing alarm sink (or any
+   *  card meta-flagged `infra_anchor`) cannot be claimed by an agent, so no
+   *  unblock duty can ever clear it and a capped spawner leaves an expired
+   *  atom in place forever (the BR#3124 zombie park). Such anchors must rest
+   *  parked on a typed wait the machine itself re-arms. */
+  private isUnclaimableAnchor(r: any, meta: any): boolean {
+    if (meta?.infra_anchor === true) return true;
+    const sinks = new Set(
+      [
+        this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+        this.settingValue("reconcile_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+      ].filter(Boolean).map(String),
+    );
+    return sinks.has(String(r?.id ?? ""));
+  }
+
   /** BR#3578 typed ask/time legs, evaluated first-class: an answered ask or
    *  an elapsed timer flips exactly like a machine atom (spawn the duty; the
    *  duty re-verifies first-hand). Shared by the typed-`await_event` path and
@@ -1928,6 +1949,21 @@ export class KnowledgeHub {
     if (aw.event === "time") {
       if (now < aw.until_ts) {
         this.stampProxyCheck(r.id, meta, now, "waiting", `timer until ${new Date(aw.until_ts).toISOString()}`, prev);
+        return;
+      }
+      // BR#5916: a do-not-claim anchor's cooldown timer owns the exit — when
+      // it expires the sweep re-parks the anchor on a FRESH typed wait
+      // (machine re-arm: no flip, no spawn, no breach event). Leaving the
+      // expired atom in place is how BR#3124 became a zombie park — expired
+      // wait + capped spawner + do-not-touch guards = no legal leg left.
+      if (this.isUnclaimableAnchor(r, meta)) {
+        const rearm = now + ANCHOR_REARM_MS;
+        meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "time", until_ts: rearm } };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+        this.stampProxyCheck(r.id, meta, now, "waiting",
+          `BR#5916 machine re-arm: unclaimable anchor's typed time await expired (${new Date(aw.until_ts).toISOString()}) — re-parked on a fresh ${Math.round(ANCHOR_REARM_MS / 60_000)}m wait until ${new Date(rearm).toISOString()}`, prev);
+        this.audit("hub:proxy-watch", "anchor_rearm", r.id, { expired_until_ts: aw.until_ts, rearm_until_ts: rearm });
+        this.version(r.id, "hub:proxy-watch", "note", `BR#5916: unclaimable anchor's time await expired — machine re-parked on a fresh typed wait until ${new Date(rearm).toISOString()} (no flip, no spawn, no breach)`);
         return;
       }
       await this.spawnProxyDuty(r, meta, now, prev, cond,
@@ -2122,6 +2158,14 @@ export class KnowledgeHub {
    *  machine spawns and the pre-refactor tags-based ones). Returns true when
    *  the spawn must be skipped (cap reached; escalation stamped first hit). */
   private unblockSpawnCapped(r: { id: string }, meta: any, actor: string, ts: number): boolean {
+    // BR#5916: do-not-claim infra anchors — an anchor that cannot be claimed
+    // should not burn the shared unblock-spawn budget or stamp escalation
+    // noise on a card no agent may touch. Carve-out: skip quietly (one audit
+    // line), never consume the cap, never stamp meta.unblock_escalated.
+    if (this.isUnclaimableAnchor(r, meta)) {
+      this.audit(actor, "spawn_cap_skipped", r.id, { auto: "unblock", reason: "unclaimable infra anchor (do-not-claim) — spawner carve-out (BR#5916): no budget burn, no escalation" });
+      return true;
+    }
     const roundsEver = this.one(
       `SELECT COUNT(*) AS n FROM relations rel JOIN artefacts c ON c.id = rel.src_id
        WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND (c.roles LIKE '%"unblock"%' OR c.tags LIKE '%"role:unblock"%')`, r.id,
