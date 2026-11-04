@@ -11494,7 +11494,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           }
           const cls = factFor(q.id);
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
-          if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
+          if (cls === "conflict" || (cls === "blocked" && baseGreenInWalk && !meta.stop) || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {
             verifying++;
@@ -11727,12 +11727,27 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
         const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
+        if (!rf.state.warrantAsk && askRow) {
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
+            now0,
+            now0,
+            askRow.id,
+          );
+          this.version(
+            String(askRow.id),
+            "system:train",
+            "transition",
+            `auto-closed (BR#6012 state machine: phase=${rf.state.phase}, warrantAsk=false) — no human action is warranted while ${rf.state.phase === "cure_pr_merged_awaiting_ci" ? `fix PR #${rf.mergedPr?.number} is already merged and settling post-merge CI` : "the fix work runs automatically"}`,
+            { from: "todo", to: "done" },
+          );
+        }
         base_red_resolution = {
           verdict: brBase ? String(brBase.verdict ?? "red") : mNowUnsettled ? "unsettled" : "red",
           phase: rf.state.phase,
           whats_broken: reds,
           held: queue.length,
-          ask: askRow
+          ask: rf.state.warrantAsk && askRow
             ? {
                 id: String(askRow.id),
                 url: this.cardUrl(String(askRow.id)),
