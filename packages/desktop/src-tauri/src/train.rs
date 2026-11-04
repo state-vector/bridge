@@ -592,7 +592,24 @@ impl Ctx {
                 }
             }
         }
-        check_runs_from_pages(&pages)
+        let mut runs = check_runs_from_pages(&pages);
+        // BR#6142: when a GitHub Actions workflow fails with `conclusion ==
+        // "startup_failure"` (e.g. invalid reusable workflow permissions or YAML
+        // syntax error), GitHub creates a workflow_run in `/actions/runs` with
+        // `conclusion: "startup_failure"` and ZERO job entries in `/check-runs`.
+        // Without folding those workflow-level startup_failures into `check_runs`,
+        // a PR whose CI workflow died at startup reads 0 red checks (Green), and
+        // a main deploy that died at startup reads 0 required checks (Empty /
+        // 60m pending settle).
+        if let Ok(Value::Array(wf_runs)) = self.gh_json(&[
+            "api",
+            &format!("repos/{repo}/actions/runs?head_sha={sha}&per_page=100"),
+            "--jq",
+            "[.workflow_runs[] | {id, name, status, conclusion, html_url}]",
+        ]) {
+            runs.extend(workflow_startup_failures(&wf_runs));
+        }
+        runs
     }
 
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
@@ -764,6 +781,40 @@ fn check_runs_from_pages(pages: &[Option<Vec<Value>>]) -> Vec<MainCheckRun> {
         }));
     }
     runs
+}
+
+/// BR#6142: extract workflow-level `startup_failure` runs from `/actions/runs`
+/// when the newest non-cancelled run of a workflow on the commit died at
+/// startup (producing 0 job check-runs in `/commits/{sha}/check-runs`).
+fn workflow_startup_failures(wf_runs: &[Value]) -> Vec<MainCheckRun> {
+    let mut by_name: Vec<(String, Vec<MainCheckRun>)> = Vec::new();
+    for r in wf_runs {
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let item = MainCheckRun {
+            id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            name: name.clone(),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        };
+        match by_name.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, list)) => list.push(item),
+            None => by_name.push((name, vec![item])),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut list) in by_name {
+        list.sort_by(|a, b| b.id.cmp(&a.id));
+        if let Some(judge) = list.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+            if judge.conclusion.as_deref() == Some("startup_failure") {
+                out.push(judge);
+            }
+        }
+    }
+    out
 }
 
 fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -1735,11 +1786,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 let live_base_state = build_base_state(&live_base_class, &required, 0);
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 // If merge_sha's own runs are all completed with a cancelled required run
-                // (cancelled because live_base_sha was pushed on top of merge_sha), judge
-                // the settle from live_base_sha's runs instead of hanging on the cancelled run.
+                // or missing/startup_failure required runs (superseded because a hotfix
+                // live_base_sha was pushed on top of merge_sha), judge the settle from
+                // live_base_sha's runs instead of hanging on merge_sha.
                 let merge_all_done = !runs.is_empty() && runs.iter().all(|r| r.status.as_deref() == Some("completed"));
                 let merge_req_cancelled = runs.iter().any(|r| required.iter().any(|n| n == &r.name) && r.conclusion.as_deref() == Some("cancelled"));
-                if live_base_sha != merge_sha && merge_all_done && merge_req_cancelled {
+                let merge_req_missing_or_startup_fail = !required.is_empty()
+                    && (!runs.iter().any(|r| required.iter().any(|n| n == &r.name))
+                        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure")));
+                if live_base_sha != merge_sha && merge_all_done && (merge_req_cancelled || merge_req_missing_or_startup_fail) {
                     runs = live_runs;
                 }
             }
@@ -4378,6 +4433,52 @@ mod tests {
         assert!(check_runs_from_pages(&[Some(page1), None]).is_empty());
         assert!(check_runs_from_pages(&[None]).is_empty());
         assert!(check_runs_from_pages(&[]).is_empty());
+    }
+
+    #[test]
+    fn workflow_startup_failure_surfaces_red_on_base_and_pr_head_br6142() {
+        // 2026-11-04 incident (BR#6142): PR #2707 added `actions: read` to
+        // reusable deploy.yml without granting it on caller workflows. GitHub
+        // Actions failed `PR` (on PR #2707) and `Deploy Dev` (on main 66c506a99)
+        // with `conclusion: "startup_failure"` in `/actions/runs` and created
+        // ZERO job entries in `/commits/{sha}/check-runs`.
+        let wf_runs = vec![
+            json!({
+                "id": 41783432309i64,
+                "name": "Deploy Dev",
+                "status": "completed",
+                "conclusion": "startup_failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+            }),
+            // A workflow whose older startup_failure was superseded by a newer success must NOT report red
+            json!({
+                "id": 100i64,
+                "name": "Deploy Health Branch Gate",
+                "status": "completed",
+                "conclusion": "startup_failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/100",
+            }),
+            json!({
+                "id": 200i64,
+                "name": "Deploy Health Branch Gate",
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/200",
+            }),
+        ];
+        let sf = workflow_startup_failures(&wf_runs);
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0].name, "Deploy Dev");
+        assert_eq!(sf[0].conclusion.as_deref(), Some("startup_failure"));
+
+        let mut base_runs = check_runs_from_pages(&[Some(vec![filler_run(1)])]);
+        base_runs.extend(sf);
+        let required: Vec<String> = LANE_REQUIRED.iter().map(|s| s.to_string()).collect();
+        let base_verdict = classify_base_check_runs(&base_runs, &required);
+        assert_eq!(base_verdict.verdict, MainVerdict::Red);
+        assert_eq!(base_verdict.red.len(), 1);
+        assert_eq!(base_verdict.red[0].name, "Deploy Dev");
+        assert_eq!(base_verdict.red[0].conclusion, "startup_failure");
     }
 
     // ---- BR#5911 (F2): the self-heal stall fact — "classified fixable,

@@ -995,7 +995,27 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   if (!required.length) {
     return classifyMainCheckRuns(runs);
   }
-  const scoped = runs.filter((r) => required.includes(r.name ?? ""));
+  // BR#6142: a workflow-level `startup_failure` (e.g. "Deploy Dev") creates 0
+  // job check-runs, so its name is the workflow name rather than the job names
+  // in `required`. Include any non-exempt workflow whose newest non-cancelled
+  // run is `startup_failure` in `scoped` so the base verdict immediately speaks
+  // RED instead of Empty.
+  const byNameAll = new Map<string, MainCheckRun[]>();
+  for (const r of runs) {
+    const n = r.name ?? "";
+    const list = byNameAll.get(n) ?? [];
+    list.push(r);
+    byNameAll.set(n, list);
+  }
+  const startupFailedNames = new Set<string>();
+  for (const [name, list] of byNameAll) {
+    if (!name || isExemptCheckName(name)) continue;
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (judge?.conclusion === "startup_failure") {
+      startupFailedNames.add(name);
+    }
+  }
+  const scoped = runs.filter((r) => required.includes(r.name ?? "") || startupFailedNames.has(r.name ?? ""));
   const gateRuns = runs.filter((r) => !required.includes(r.name ?? "") && isBaseHealthGateName(r.name ?? ""));
   const gateVerdict = gateRuns.length ? classifyMainCheckRuns(gateRuns) : null;
   if (!scoped.length) {
@@ -2432,6 +2452,19 @@ export function classifyRequiredRuns(
       failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
     } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
       pending.push(name);
+    }
+  }
+  if (required.length) {
+    // BR#6142: when a workflow fails at startup (`conclusion: "startup_failure"`),
+    // GitHub creates 0 job check-runs, so none of the job names in `required`
+    // ever appear. Fold any non-exempt workflow-level `startup_failure` into
+    // `failing` immediately instead of waiting 60m on missing required jobs.
+    for (const [name, list] of byName) {
+      if (!name || required.includes(name) || isExemptCheckName(name)) continue;
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (judge?.conclusion === "startup_failure") {
+        failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      }
     }
   }
   if (!required.length) {

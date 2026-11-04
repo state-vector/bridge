@@ -1814,4 +1814,42 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(brief.details).toContain("Why this needs your force-merge");
     expect(brief.options[0]).toContain("Force-merge / Bypass-merge fix PR #2800 (--admin)");
   });
+
+  it("BR#6142: workflow-level startup_failure (0 job check-runs) classifies RED in classifyBaseCheckRuns and classifyRequiredRuns", () => {
+    const required = [
+      "deploy / Deploy to dev",
+      "post-deploy / Post-Deploy Smoke",
+      "post-deploy / DNS chain (front doors)",
+      "post-deploy / Lodestar Storage Health",
+    ];
+    const runs = [
+      { id: 1, name: "drift", status: "completed", conclusion: "success", html_url: "https://example.test/drift" },
+      {
+        id: 41783432309,
+        name: "Deploy Dev",
+        status: "completed",
+        conclusion: "startup_failure",
+        html_url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ];
+    const baseV = classifyBaseCheckRuns(runs, required);
+    expect(baseV.verdict).toBe("red");
+    expect(baseV.red).toEqual([
+      {
+        name: "Deploy Dev",
+        conclusion: "startup_failure",
+        url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ]);
+
+    const settleV = classifyRequiredRuns(runs, required, { merged_at: 1000, now: 2000 });
+    expect(settleV.verdict).toBe("red");
+    expect(settleV.failing).toEqual([
+      {
+        name: "Deploy Dev",
+        conclusion: "startup_failure",
+        url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ]);
+  });
 });

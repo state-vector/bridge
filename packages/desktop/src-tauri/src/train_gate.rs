@@ -184,9 +184,27 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
     if required.is_empty() {
         return classify_main_check_runs(runs);
     }
+    // BR#6142: a workflow-level `startup_failure` (e.g. "Deploy Dev") creates
+    // 0 job check-runs, so its name is the workflow name rather than the job
+    // names in `required`. Include any non-exempt workflow whose newest
+    // non-cancelled run is `startup_failure` in `scoped` so the base verdict
+    // immediately speaks RED instead of Empty.
+    let mut startup_failed_names: Vec<String> = Vec::new();
+    for (name, list) in parse_runs(runs) {
+        if is_exempt_check_name(&name) {
+            continue;
+        }
+        let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        if let Some(j) = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+            if j.conclusion.as_deref() == Some("startup_failure") {
+                startup_failed_names.push(name);
+            }
+        }
+    }
     let scoped: Vec<MainCheckRun> = runs
         .iter()
-        .filter(|r| required.iter().any(|n| n == &r.name))
+        .filter(|r| required.iter().any(|n| n == &r.name) || startup_failed_names.iter().any(|n| n == &r.name))
         .cloned()
         .collect();
     let gate_runs: Vec<MainCheckRun> = runs
