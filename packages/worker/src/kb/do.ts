@@ -6537,6 +6537,19 @@ export class KnowledgeHub {
       );
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
+        // BR#5902: the standing alarm sink (train_alarm_sink_id) is exempt
+        // from ask-answer dispatch entirely — every dispatch leg ends in a
+        // transition and every transition on the sink is refused by its
+        // do-not-touch guard (the sink had 32 churn attempts; one answer
+        // batch folded breach BR#5902 from 3 audited release-holds
+        // refusals). Skip the dispatch; the answer still records on the ask
+        // node and trainAlarmAnswerDispatch (bypass/retry stamps) still
+        // runs below.
+        const sinkAnchored =
+          subject.id === this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+        if (sinkAnchored) {
+          this.audit(actor, "answer_dispatch_sink_anchor_skipped", subject.id, { ask_id: id });
+        }
         let cleared = false;
         if (sm.awaiting_ask?.ask_id === id) {
           delete sm.awaiting_ask;
@@ -6552,7 +6565,7 @@ export class KnowledgeHub {
         if (cleared) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
-        if (subject.status === "blocked") {
+        if (subject.status === "blocked" && !sinkAnchored) {
           // BR#3578 answer dispatch: when the ask IS the exit path (a
           // migration ask, or an option that names the action), the ANSWER
           // actions the card — SUPERSEDE drops it, RELEASE/CANCEL releases
@@ -6610,11 +6623,24 @@ export class KnowledgeHub {
             // misfire: resume flipped the card in_progress and nothing ever
             // executed). Release to the pool instead; the dispatch loop
             // picks it up fresh.
-            await this.transition({
-              id: subject.id, to: "todo",
-              note: `ask ${id} answered (${answer.slice(0, 80)}) — holder session ${String(sm.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819: never resume onto a finished runner)`,
-            }, asActor);
-            taskStatus = "todo";
+            // BR#5902: the release leg is hold-clean — releaseHold first. A
+            // park still held by a typed wait (a time await, a train queue
+            // slot, an unanswered sibling ask) must NOT ride this release:
+            // the machine's release backstop refuses blocked→todo on a held
+            // park (BR#4067) and every refusal is an audited breach event —
+            // one answer batch folded breach BR#5902 exactly this way. Skip
+            // and audit instead; the hold's own exit (the proxy watch / the
+            // answer) stays the owner of the park.
+            const hold = releaseHold(sm);
+            if (hold) {
+              this.audit(actor, "answer_dispatch_hold_skipped", subject.id, { ask_id: id, hold: String(hold).slice(0, 160) });
+            } else {
+              await this.transition({
+                id: subject.id, to: "todo",
+                note: `ask ${id} answered (${answer.slice(0, 80)}) — holder session ${String(sm.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819: never resume onto a finished runner)`,
+              }, asActor);
+              taskStatus = "todo";
+            }
           }
         }
       }
@@ -6704,11 +6730,18 @@ export class KnowledgeHub {
       const t = this.one(`SELECT status, owner, meta FROM artefacts WHERE id = ?`, String(row.artefact_id));
       if (t) {
         const meta = JSON.parse(t.meta ?? "{}");
+        // BR#5902 mirror (see the KB-node path above): the standing alarm
+        // sink is exempt from ask-answer dispatch entirely.
+        const sinkAnchored =
+          String(row.artefact_id) === this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+        if (sinkAnchored) {
+          this.audit(actor, "answer_dispatch_sink_anchor_skipped", String(row.artefact_id), { ask_id: id });
+        }
         if (meta.awaiting_ask?.ask_id === id) {
           delete meta.awaiting_ask;
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), String(row.artefact_id));
         }
-        if (t.status === "blocked") {
+        if (t.status === "blocked" && !sinkAnchored) {
           if (this.askAgeGuardHold(Number(row.created_ts ?? 0)) || this.holderIsAlive(meta, t.owner)) {
             await this.transition({
               id: String(row.artefact_id), to: "in_progress",
@@ -6718,11 +6751,19 @@ export class KnowledgeHub {
           } else {
             // BR#3819 (D): dead holder — release to the pool, never resume
             // onto a runner that already finished.
-            await this.transition({
-              id: String(row.artefact_id), to: "todo",
-              note: `decision ${id} answered (${answer.slice(0, 80)}) — holder session ${String(meta.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819)`,
-            }, `system:decision(${actor})`);
-            taskStatus = "todo";
+            // BR#5902 mirror: hold-clean — releaseHold first; a held park
+            // skips + audits instead of feeding the release backstop a
+            // refusal (the breach BR#5902 class).
+            const hold = releaseHold(meta);
+            if (hold) {
+              this.audit(actor, "answer_dispatch_hold_skipped", String(row.artefact_id), { ask_id: id, hold: String(hold).slice(0, 160) });
+            } else {
+              await this.transition({
+                id: String(row.artefact_id), to: "todo",
+                note: `decision ${id} answered (${answer.slice(0, 80)}) — holder session ${String(meta.session ?? "?")} is dead (no live signal within the stale window); released to the pool for fresh dispatch (BR#3819)`,
+              }, `system:decision(${actor})`);
+              taskStatus = "todo";
+            }
           }
         }
       }
