@@ -641,7 +641,9 @@ normal — agents can no longer file an "urgent" ask that renders as a quiet one
 **Asks to offline agents escalate to you (BR#3942).** An ask addressed to an agent identity
 that sits unanswered past `ask_escalation_minutes` (a setting, default 30, clamped 5–240)
 while that identity is offline — no direct token or gateway-dispatch edge seen in the last
-10 minutes, or never seen at all — is escalated by the watchdog to the human planes: the
+10 minutes, or never seen at all — is escalated by the watchdog to the human planes, as its
+own guarded phase of every alarm tick (BR#6202 — the step previously ran only when another
+sweep errored): the
 **same** ask node is stamped `escalated` (one re-route, never a duplicate ask), the ask band
 and For Me render an **ESCALATED — addressee offline** chip with the proof attached, and the
 row shows the addressee's presence (`offline · last seen Nm ago` / `never seen`) so a stalled
