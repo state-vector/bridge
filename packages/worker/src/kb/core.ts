@@ -2643,7 +2643,17 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
             reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${headState.unsettled.join(", ")}) — pending, not a defect; next tick`,
           };
         }
-        if (headState.kind !== "green") {
+        // BR#6012: when the base is non-green and the PR's ONLY failing head
+        // check is a circular base-health gate (`Deploy health (merge gate)` /
+        // `main-green gate`), the PR is held on the base, not broken on its own
+        // code — fall through to (3) so it returns `skip` ("base main RED / not
+        // green") and classifies as `waiting`/`ready` instead of `blocked`.
+        const onlyCircularBaseGate =
+          i.baseVerdict !== "green" &&
+          (headState.kind === "red_circular_deploy_gate" ||
+            headState.kind === "red_circular_main_green_gate" ||
+            headState.kind === "red_circular_mixed_gates");
+        if (headState.kind !== "green" && !onlyCircularBaseGate) {
           return {
             kind: "note",
             reason: `PR #${i.prNumber} head check RED: ${headState.names.join(", ")} — card queued (not in_review), no bounce; the linked session owns it`,
@@ -3216,6 +3226,7 @@ export function trainBaseRedAskWarranted(fix: {
   card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
   curePr?: unknown;
   conflictPr?: unknown;
+  mergedPr?: unknown;
 }): boolean {
   const curePr =
     fix?.curePr && typeof fix.curePr === "object" && Number.isInteger((fix.curePr as any).number) && (fix.curePr as any).number > 0
@@ -3227,10 +3238,14 @@ export function trainBaseRedAskWarranted(fix: {
     fix?.conflictPr && typeof fix.conflictPr === "object" && Number.isInteger((fix.conflictPr as any).number) && (fix.conflictPr as any).number > 0
       ? { repo: String((fix.conflictPr as any).repo ?? ""), number: Number((fix.conflictPr as any).number) }
       : null;
+  const mergedPr =
+    fix?.mergedPr && typeof fix.mergedPr === "object" && Number.isInteger((fix.mergedPr as any).number) && (fix.mergedPr as any).number > 0
+      ? { repo: String((fix.mergedPr as any).repo ?? ""), number: Number((fix.mergedPr as any).number), merge_sha: String((fix.mergedPr as any).merge_sha ?? "") }
+      : null;
   const card = fix?.card
     ? { id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted }
     : null;
-  return classifyBaseRedEpisodeState({ card, curePr, conflictPr }).warrantAsk;
+  return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
 }
 
 /** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall

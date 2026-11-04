@@ -1014,20 +1014,29 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                         ),
                     };
                 }
-                match &head_state {
-                    CandidateHeadCheckState::RedCircularDeployGate { names }
-                    | CandidateHeadCheckState::RedCircularMainGreenGate { names }
-                    | CandidateHeadCheckState::RedCircularMixedGates { names }
-                    | CandidateHeadCheckState::RedSubstantive { names } => {
-                        return MergeAction::Note {
-                            reason: format!(
-                                "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
-                                n = i.pr_number,
-                                names = names.join(", ")
-                            ),
-                        };
+                let only_circular_base_gate = i.base_verdict != MainVerdict::Green
+                    && matches!(
+                        &head_state,
+                        CandidateHeadCheckState::RedCircularDeployGate { .. }
+                            | CandidateHeadCheckState::RedCircularMainGreenGate { .. }
+                            | CandidateHeadCheckState::RedCircularMixedGates { .. }
+                    );
+                if !only_circular_base_gate {
+                    match &head_state {
+                        CandidateHeadCheckState::RedCircularDeployGate { names }
+                        | CandidateHeadCheckState::RedCircularMainGreenGate { names }
+                        | CandidateHeadCheckState::RedCircularMixedGates { names }
+                        | CandidateHeadCheckState::RedSubstantive { names } => {
+                            return MergeAction::Note {
+                                reason: format!(
+                                    "PR #{n} head check RED: {names} — card queued (not in_review), no bounce; the linked session owns it",
+                                    n = i.pr_number,
+                                    names = names.join(", ")
+                                ),
+                            };
+                        }
+                        CandidateHeadCheckState::Green | CandidateHeadCheckState::Pending { .. } => {}
                     }
-                    CandidateHeadCheckState::Green | CandidateHeadCheckState::Pending { .. } => {}
                 }
             }
             // (4) Non-green base
