@@ -1904,6 +1904,16 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
  *  never drift from reality. */
 export const MERGE_TRAIN_REASON_PREFIX = "merge-train:";
 export const MERGE_TRAIN_QUEUED_REASON = "merge-train: queued";
+// BR#6045: the queue-note matcher binds BOTH the canonical `merge-train:
+// queued` prefix AND the semantically-equivalent re-queue spelling
+// `merge-train: re-queued` (a fresh verify accept after a bounce). The direct
+// re-queue hook used to gate on startsWith(MERGE_TRAIN_QUEUED_REASON) alone,
+// so a re-queued accept note silently skipped trainQueueOnAccept — no stamp
+// fold-forward, no state=queued — and the next drain walk bounced the card
+// for coverage against the STALE stamp (BR#5646 bounce #2, PR
+// superpositional#2555: the same verified head bounced twice, the only delta
+// being the note prefix).
+export const MERGE_TRAIN_QUEUE_NOTE_RX = /^merge-train: (?:re-)?queued/;
 
 export type TrainCandidate = { id: string; status_ts: number; meta: any; tags?: string[] };
 

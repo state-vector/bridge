@@ -1395,8 +1395,18 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
   the hook entirely — the card sat dual-state (a derived queue slot plus a leftover
   `merge_train.awaiting` chip) with a stale `head_sha_at_acceptance` (live on
   BR#4711/4678/3623/3999/4995/4999). The blocked branch now runs the hook itself
-  when its note opens with that reason (the `merge_train` body flag guards
-  recursion; `alreadyQueued` makes it a meta-only refresh), and the converse
+  when its note opens with that reason **or its `merge-train: re-queued` spelling**
+  (BR#6045: the old exact-prefix gate silently skipped the hook on the re-queued
+  form a fresh verify writes after a bounce — stamp stranded on the pre-bounce SHA,
+  state never flipped — and the next drain walk bounced the already-accepted head
+  for coverage against the stale stamp, BR#5646 bounce #2 / PR
+  state-vector/superpositional#2555; the matcher is
+  `/^merge-train: (?:re-)?queued/`), and a blocked note that opens `merge-train: `
+  but binds NO machine hook is **audited loud** (`queue_hook_unmatched`, the
+  BR#5674 P1 empty-is-loud ladder) instead of vanishing silently — a near-miss
+  prefix must never decay into a false coverage bounce loop. The `merge_train`
+  body flag guards recursion; `alreadyQueued` makes the hook's re-park a meta-only
+  refresh; and the converse
   demotion holds: a blocked park whose note is neither a `merge-train:` note nor an
   `Awaiting review (verdict …)` reason clears any leftover `merge_train.awaiting`
   and demotes its `awaiting` state to `bounced` — a card that has stopped waiting
