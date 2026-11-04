@@ -8,6 +8,21 @@
  */
 
 import type { AwaitEvent } from "./closure";
+import type {
+  BaseRedPhase,
+  BaseRedResolution,
+  LaneOperationalState,
+  TrainEntryClass,
+  TrainFixCard,
+} from "@bridge/contracts";
+
+export type {
+  BaseRedPhase,
+  BaseRedResolution,
+  LaneOperationalState,
+  TrainEntryClass,
+  TrainFixCard,
+};
 
 export const ARTEFACT_TYPES = [
   "steering",
@@ -3256,6 +3271,76 @@ export function trainBaseRedAskWarranted(fix: {
     ? { id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted }
     : null;
   return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
+}
+
+/** BR#6012 canonical 4-state operational state machine for a merge lane.
+ *  Resolves `stop`, `currently`, and `base_red_resolution` into a single
+ *  mutually-exclusive `LaneOperationalState` (`idle` | `draining_batch` |
+ *  `settling_ci` | `stopped_red`), persisted atomically in the `lane_state`
+ *  SQLite table so the hub and UI never reconstruct state from contradictory
+ *  fragments. */
+export function resolveLaneOperationalState(input: {
+  stop?: {
+    sha?: string;
+    reason?: string;
+    failing?: { name: string; url?: string }[];
+    culprit_task?: string;
+  } | null;
+  currently?: {
+    phase?: string;
+    pr?: number;
+    merge_sha?: string;
+    task_id?: string;
+    merged_at?: number;
+    burst_merged?: number;
+    burst_cap?: number;
+  } | null;
+  episodeState?: BaseRedEpisodeState | null;
+  fixCard?: TrainFixCard | null;
+  now: number;
+}): LaneOperationalState {
+  const { stop, currently, episodeState, fixCard, now } = input;
+  if (stop && stop.sha) {
+    const failingChecks = Array.isArray(stop.failing)
+      ? stop.failing.map((f) => ({ name: String(f.name ?? ""), ...(f.url ? { url: String(f.url) } : {}) })).filter((f) => f.name)
+      : [];
+    return {
+      phase: "stopped_red",
+      failing_sha: String(stop.sha),
+      failing_checks: failingChecks,
+      culprit_task: stop.culprit_task ? String(stop.culprit_task) : null,
+      episode_phase: episodeState?.phase ?? "diagnosing",
+      fix_card: fixCard ?? null,
+      updated_ts: now,
+    };
+  }
+  if (currently && Number(currently.pr) > 0 && currently.merge_sha) {
+    if (currently.phase === "bursting") {
+      return {
+        phase: "draining_batch",
+        pr: Number(currently.pr),
+        merge_sha: String(currently.merge_sha),
+        task_id: currently.task_id ? String(currently.task_id) : null,
+        burst_merged: Math.max(0, Math.floor(Number(currently.burst_merged ?? 1))),
+        burst_cap: Math.max(0, Math.floor(Number(currently.burst_cap ?? DEFAULT_BURST_MAX))),
+        updated_ts: now,
+      };
+    }
+    if (currently.phase === "awaiting-ci") {
+      return {
+        phase: "settling_ci",
+        pr: Number(currently.pr),
+        merge_sha: String(currently.merge_sha),
+        task_id: currently.task_id ? String(currently.task_id) : null,
+        merged_at: Number(currently.merged_at ?? now),
+        updated_ts: now,
+      };
+    }
+  }
+  return {
+    phase: "idle",
+    updated_ts: now,
+  };
 }
 
 /** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall

@@ -179,6 +179,36 @@ export interface KbTrainLease {
   expires_ts: number;
 }
 
+export type KbTrainEntryClass = "ready" | "waiting" | "conflict" | "needs-review" | "blocked";
+export type KbBaseRedPhase =
+  | "diagnosing"
+  | "fix_in_progress"
+  | "cure_pr_conflicting"
+  | "cure_pr_merged_awaiting_ci"
+  | "cure_pr_awaiting_force_merge"
+  | "fix_exhausted";
+
+export interface KbTrainFixCard {
+  id: string;
+  url: string;
+  title: string;
+  status: string;
+  pr?: number;
+  pr_url?: string;
+  conflict?: boolean;
+  merged?: boolean;
+  merge_sha?: string;
+}
+
+export interface KbBaseRedResolution {
+  verdict: "red" | "unsettled" | "empty";
+  phase?: KbBaseRedPhase;
+  whats_broken: { name: string; url?: string }[];
+  held: number;
+  ask: { id: string; url: string; question: string; options: string[] } | null;
+  fix_card: KbTrainFixCard | null;
+}
+
 export interface KbTrainLane {
   lane: string;
   card: string;
@@ -254,7 +284,7 @@ export interface KbTrainLane {
    *  holding cars renders the lane BLOCKED (laneStatus + laneSyncReason). */
   queue_facts?: {
     at: number;
-    entries: { id: string; pr?: number; cls: string }[];
+    entries: { id: string; pr?: number; cls: KbTrainEntryClass | string }[];
     conflict_pairs?: [number, number][];
     base_state?: {
       verdict: "green" | "red" | "unsettled" | "empty";
@@ -281,19 +311,8 @@ export interface KbTrainLane {
       last_error?: string;
     };
   } | null;
-  /** BR#5349 (Ray directive: "THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED
-   *  TO DO — loud and clear, no jargon"): served while a non-green base
-   *  holds cars — what's broken (red names + run URLs), how many PRs are
-   *  held, the episode's OPEN alarm ask (one click to answer), and the
-   *  active fix-forward card. Freshness-guarded hub-side (<15m); absent
-   *  the moment base_state goes green. */
-  base_red_resolution?: {
-    verdict: "red" | "unsettled" | "empty" | string;
-    whats_broken: { name: string; url?: string }[];
-    held: number;
-    ask: { id: string; url: string; question: string; options: string[] } | null;
-    fix_card: { id: string; url: string; title: string; status: string; pr?: number; pr_url?: string } | null;
-  };
+  /** BR#5349 + BR#6012: strongly-typed base-red resolution state machine output. */
+  base_red_resolution?: KbBaseRedResolution;
   /** BR#5376: served while a fresh stall episode rides the stamp — the
    *  batch, how long nothing has landed (ticks + wall-clock), WHY (the
    *  executor's last error), the episode's OPEN alarm ask, and the unblock

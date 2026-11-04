@@ -92,6 +92,7 @@ import {
   // BR#5190 root-fix fast lane: the board half of the main-breakage law
   ROOT_FIX_TAG,
   MAIN_RED_TAG,
+  MAIN_GREEN_GATE_PATTERN,
   isRootFixCard,
   isBaseCureCardTitle,
   mainRedBinding,
@@ -123,7 +124,11 @@ import {
   trainBaseRedAskBrief,
   trainBaseRedAskWarranted,
   classifyBaseRedEpisodeState,
+  resolveLaneOperationalState,
   type BaseRedEpisodeState,
+  type BaseRedResolution,
+  type LaneOperationalState,
+  type TrainFixCard,
   trainGateBlockedAskTitle,
   trainGateBlockedAskBrief,
   trainPlainStatus,
@@ -2808,6 +2813,22 @@ export class KnowledgeHub {
         detail TEXT -- JSON: reason, carry record, verdict citations
       );
       CREATE INDEX IF NOT EXISTS idx_train_events_lane ON train_events (repo, base, seq);
+      -- BR#6012 canonical lane operational state machine table: one row per
+      -- (repo, base) lane, updated atomically on every lease/event/CI/queue_facts
+      -- mutation so lane state is never split-brained across partial JSON writes.
+      CREATE TABLE IF NOT EXISTS lane_state (
+        lane_key TEXT PRIMARY KEY,
+        repo TEXT NOT NULL,
+        base TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        lease_holder TEXT,
+        lease_heartbeat_ts INTEGER,
+        lease_expires_ts INTEGER,
+        last_capable_ts INTEGER,
+        last_capable_holder TEXT,
+        state_json TEXT NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
       -- BR#4170 reconciliation — the hub's durable state for the board↔GitHub
       -- invariant. Four small tables + the pure join in reconcile.ts:
       -- reports  = one row per run (the accounting history, the alarm's receipt);
@@ -8410,10 +8431,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       : null;
     // BR#5883: the gate-blocked qualifier — the scoped verdict IS green (the
     // base-red row above reads none) but the repo's own merge gate judges
-    // main's tip non-green, so every car's `main-green gate` run fails. Fresh
-    // (<15m) like baseBlock; a dead daemon's stale stamp never pins a false
-    // GATE-BLOCKED.
-    const gateBlocked: any = bsQf?.base_state
+    // main's tip non-green, so every car's `main-green gate` run fails.
+    // BR#6012: ONLY applies when this lane's `required_workflows` actually
+    // includes `main-green gate` (or is unconfigured) — a lane like
+    // `superpositional@main` whose required set is strictly the 4 deploy
+    // workflows does not use `main-green gate` and must never be gate-blocked
+    // by a non-required nightly check (e.g. `Guard fixtures`).
+    const laneUsesMainGreenGate =
+      !Array.isArray(lane.required_workflows) ||
+      lane.required_workflows.length === 0 ||
+      lane.required_workflows.some((w: string) => String(w).toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) ||
+      !lane.required_workflows.some((w: string) => String(w).toLowerCase().startsWith("deploy /"));
+    const gateBlocked: any = laneUsesMainGreenGate
+      && bsQf?.base_state
       && String(bsQf.base_state?.verdict ?? "") === "green"
       && bsQf.base_state?.gate_blocked === true
       && now - Number(bsQf.at ?? 0) < 15 * 60_000
@@ -8545,11 +8575,48 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           : `merge-train: ready — last ticked by ${capHolder} ${mins}m ago`)
         : "merge-train: awaiting an available gateway";
     }
-    if (meta.blocked?.reason !== reason) {
-      meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run bridge train on a gateway (doctor-gated)" };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), laneId);
-    }
+    meta.blocked = {
+      ...(meta.blocked ?? {}),
+      reason,
+      unblock_condition: meta.blocked?.unblock_condition ?? "the train advances this card — run bridge train on a gateway (doctor-gated)",
+    };
+    this.saveLaneState(laneId, meta, now);
     return reason;
+  }
+
+  /** BR#6012: single atomic persistence point for a merge lane's state.
+   *  Writes both `artefacts.meta` AND the canonical `lane_state` SQLite row
+   *  unconditionally, eliminating the split-brain where mutations were dropped
+   *  in memory whenever `meta.blocked.reason` stayed constant. */
+  private saveLaneState(laneId: string, meta: any, now: number): LaneOperationalState | null {
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, laneId);
+    const lane = laneOfMeta(meta);
+    if (!lane) return null;
+    const opState = resolveLaneOperationalState({
+      stop: meta.stop ?? null,
+      currently: meta.currently ?? null,
+      now,
+    });
+    const lease: TrainLease | null = meta.lease ?? null;
+    const key = laneKey(lane.repo, lane.base);
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO lane_state (
+         lane_key, repo, base, phase, lease_holder, lease_heartbeat_ts, lease_expires_ts,
+         last_capable_ts, last_capable_holder, state_json, updated_ts
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      key,
+      lane.repo,
+      lane.base,
+      opState.phase,
+      lease?.holder ?? null,
+      lease?.heartbeat_ts ?? null,
+      lease?.expires_ts ?? null,
+      Number(meta.lane?.last_capable_lease_ts ?? 0) || null,
+      meta.lane?.last_capable_holder ? String(meta.lane.last_capable_holder) : null,
+      JSON.stringify(opState),
+      now,
+    );
+    return opState;
   }
 
   /** Arm (G) — train-watch: lease staleness (the hub's credential-free
@@ -10145,7 +10212,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // the alarm machinery IMMEDIATELY: one diagnostic duty + one human ask
     // per episode. A fresh stamp without the qualifier (or a non-green
     // verdict — a louder truth owns the lane) closes the episode.
-    const gateBlockedStamp = !!baseState
+    const laneCfg = laneOfMeta(meta);
+    const laneUsesMainGreenGate =
+      !Array.isArray(laneCfg?.required_workflows) ||
+      laneCfg.required_workflows.length === 0 ||
+      laneCfg.required_workflows.some((w: string) => String(w).toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) ||
+      !laneCfg.required_workflows.some((w: string) => String(w).toLowerCase().startsWith("deploy /"));
+    const gateBlockedStamp = laneUsesMainGreenGate
+      && !!baseState
       && String(baseState.verdict ?? "") === "green"
       && baseState.gate_blocked === true
       && entriesArr.length > 0;
@@ -11869,9 +11943,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           unblock: "restart the merge-train gateway/executor onto the current build",
         };
       }
+      const lane_state = resolveLaneOperationalState({
+        stop: meta.stop ?? null,
+        currently: meta.currently ?? null,
+        fixCard: base_red_resolution?.fix_card ?? null,
+        now: now0,
+      });
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
+        lane_state,
         lease: meta.lease ?? null,
         currently: meta.currently ?? null,
         stop: meta.stop ?? null,

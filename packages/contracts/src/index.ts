@@ -13,3 +13,4 @@ export * from "./pairing.ts";
 export * from "./provision.ts";
 export * from "./ask.ts";
 export * from "./config.ts";
+export * from "./train.ts";

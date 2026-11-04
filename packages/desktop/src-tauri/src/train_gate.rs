@@ -241,7 +241,9 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
     // compose: the fold above speaks for mid-burst states; this qualifier
     // speaks for the fully-green lane read the fold deliberately leaves
     // untouched.
-    if res.verdict == MainVerdict::Green {
+    if res.verdict == MainVerdict::Green
+        && required.iter().any(|n| n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN))
+    {
         let gate = classify_main_check_runs(runs);
         if gate.verdict != MainVerdict::Green {
             return CheckVerdict {

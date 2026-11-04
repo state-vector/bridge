@@ -273,13 +273,13 @@ function BlockedBanner({ lane, openTask }: { lane: KbTrainLane; openTask?: (id: 
         ) : (
           <span className="train-banner-dim">no fix card open yet</span>
         )}
-        {r.fix_card && "pr" in r.fix_card && r.fix_card.pr ? (
+        {r.fix_card?.pr ? (
           <>
             {" — fix PR "}
-            <a href={(r.fix_card as any).pr_url} target="_blank" rel="noreferrer" title="open the fix PR">#{r.fix_card.pr}</a>
-            {(r.fix_card as any).merged
-              ? `: MERGED (${String((r.fix_card as any).merge_sha ?? "").slice(0, 9) || "on main"}) — post-merge CI/deploy running on main; queue drains automatically once green`
-              : (r.fix_card as any).conflict
+            <a href={r.fix_card.pr_url} target="_blank" rel="noreferrer" title="open the fix PR">#{r.fix_card.pr}</a>
+            {r.fix_card.merged
+              ? `: MERGED (${String(r.fix_card.merge_sha ?? "").slice(0, 9) || "on main"}) — post-merge CI/deploy running on main; queue drains automatically once green`
+              : r.fix_card.conflict
                 ? ": has merge conflicts with main — agent rebasing automatically"
                 : r.ask
                   ? `: blocked by circular red-main gate — force-merge #${r.fix_card.pr} with --admin (see ask → ${r.ask.id})`
