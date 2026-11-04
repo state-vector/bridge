@@ -1046,7 +1046,12 @@ export function stopLineAskTitle(sha: string, names: string[]): string {
 
 /** BR#2267 externals — CI checks that never gate a merge (external Cloudflare
  *  workers-builds mirrors, deploy previews). Matched as substrings, case
- *  insensitively, against the check NAME. */
+ *  insensitively, against the check NAME.
+ *  BR#6001 (implements accepted BR#3177): 'superpositional' joins the list —
+ *  the 'Superpositional' external check is posted by the superpositional-sync
+ *  GitHub App, NOT a repo workflow, and a failing SP review pipeline (process
+ *  error — e.g. the IndexingFailed/States.Timeout that held PRs #387/#390 out
+ *  of the lane >60m) is a Superpositional quality issue, never a merge gate. */
 export const MERGE_EXEMPT_CHECK_PATTERNS = [
   "workers builds",
   "workers-builds",
@@ -1054,6 +1059,7 @@ export const MERGE_EXEMPT_CHECK_PATTERNS = [
   "cloudflare workers",
   "deploy preview",
   "codeql",
+  "superpositional",
 ] as const;
 
 export function isExemptCheckName(name: string): boolean {

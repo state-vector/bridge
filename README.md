@@ -702,9 +702,13 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   a stale green never counts. A red-head PR cannot merge even while main is green — the
   train's gate (`decideTrainGate`, composing the standing `decideMergeAction` in
   `packages/worker/src/kb/core.ts`) enforces the same law: two reds never merge.
-  Deliberately NOT required: the `Superpositional` review
-  (a failing review is a quality issue and merge-allowed — a required check would deadlock
-  against it) and the BR#2267 externals (Workers builds / deploy previews never gate). The
+  Deliberately NOT required: the `Superpositional` review — BR#6001 implements BR#3177:
+  a failing review is a quality issue and merge-allowed, and that includes a review
+  *process* failure (the posted check run itself errors — a Superpositional
+  infrastructure problem, never a reason to stop the bridge's merges; the head gate
+  routes it into the exempt `external` bucket like every other external) — a required
+  check would deadlock against it — and the BR#2267 externals (Workers builds / deploy
+  previews never gate). The
   bypass actor is unchanged — rayh alone keeps `bypass_mode=always`: the human retains the
   loud escape hatch; machines do not. Proven end-to-end by probe PRs #216 and #217.
 - **The stop (executor-fed, BR#3516)**: the hub holds no VCS credentials and no longer
