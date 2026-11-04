@@ -96,6 +96,7 @@ import {
   MAIN_RED_TAG,
   MAIN_GREEN_GATE_PATTERN,
   isRootFixCard,
+  isLaneBaseFixCard,
   isBaseCureCardTitle,
   mainRedBinding,
   rootFixCardTitle,
@@ -11179,6 +11180,41 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
          AND c.type = 'question' AND c.title = ? LIMIT 1`,
       sinkId, askTitle.slice(0, 200),
     ) as any;
+    // BR#6390 (Ray 2026-11-05, from the BR#6382→BR#6385 churn): an ANSWERED
+    // gate must not be re-minted before the executor acts on it. Two stamps
+    // suppress (re)filing while the warrant still holds:
+    //  - lane.bypass_merge pending for THIS cure PR — the human clicked DONE;
+    //    the executor's next tick observes/lands the merge and acks the stamp
+    //    (the merged event then flips the phase to cure_pr_merged_awaiting_ci
+    //    and the unwarranted path closes any straggler ask).
+    //  - lane.base_red_ask_declined fresh (< 24h) for THIS ask title + cure
+    //    PR — the human clicked DECLINE ("hold the line"); the same episode
+    //    on the same PR must not re-ask. A different cure PR or a different
+    //    red set (different title) re-arms the gate.
+    const laneMetaRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id) as any;
+    const lm = laneMetaRow ? JSON.parse(laneMetaRow.meta ?? "{}") : {};
+    const pendingBypass = lm.lane?.bypass_merge ?? null;
+    const declinedStamp = lm.lane?.base_red_ask_declined ?? null;
+    if (
+      warranted &&
+      fix.curePr &&
+      pendingBypass &&
+      Number(pendingBypass.pr) === Number(fix.curePr.number)
+    ) {
+      this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "bypass authorization pending (DONE answered, executor tick outstanding)", pr: pendingBypass.pr, ask: existing?.id ?? null });
+      return;
+    }
+    if (
+      warranted &&
+      fix.curePr &&
+      declinedStamp &&
+      String(declinedStamp.ask_title ?? "").slice(0, 200) === askTitle.slice(0, 200) &&
+      Number(declinedStamp.pr ?? -1) === Number(fix.curePr.number) &&
+      Date.now() - Number(declinedStamp.at ?? 0) < 24 * 3_600_000
+    ) {
+      this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "declined (hold the line) — same episode + cure PR within 24h", pr: declinedStamp.pr, ask: existing?.id ?? null });
+      return;
+    }
     if (!warranted) {
       if (existing) {
         try {
@@ -11219,7 +11255,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           {
             to: "human",
             question: askTitle,
-            reason: `base ${repo}@${base} RED — a human-actionable act is on the table: ${fix.curePr ? `bypass-merge cure PR ${fix.curePr.repo}#${fix.curePr.number} (out-of-turn merge is human authority, BR#4122)` : "the fix path is exhausted — manual steps are the only lever left"}`,
+            reason: `base ${repo}@${base} RED — a human gate is on the table: ${fix.curePr ? `merge cure PR ${fix.curePr.repo}#${fix.curePr.number} yourself, then click DONE (out-of-turn merge is human authority, BR#4122/BR#5450)` : "the fix path is exhausted — manual steps are the only lever left"}`,
             details: brief.details,
             options: brief.options,
             artefact_id: sinkId,
@@ -12160,14 +12196,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags FROM artefacts
          WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ?)
+           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR json_extract(meta, '$.repo') = ? OR json_extract(meta, '$.root_blocker_for_lane') LIKE ?)
          ORDER BY updated_ts DESC LIMIT 20`,
-        repo, repo, repo, repo,
+        repo, repo, repo, repo, repo, `${repo}@%`,
       ).toArray() as any[];
       for (const r of rows) {
         const m = JSON.parse(r.meta ?? "{}");
         const binding = mainRedBinding(m);
-        if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) || binding?.repo !== repo) continue;
+        // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
+        // (agent-filed stop-the-line shape — BR#6378) heads the episode.
+        if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
+        if (binding?.repo !== repo) continue;
         const unlandedLegs = trainLegs(m)
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
@@ -12184,7 +12223,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // If this card's PR already merged for an OLD check (e.g. deploy/sccache)
         // and the live red checks on main have shifted to a different check that
         // this card does not name, skip it so the live check's fix card is shown.
-        if (mergedPr && !curePr && redNames && redNames.length > 0 && !matchesRedNames(String(r.title ?? ""), m?.root_fix?.failing)) {
+        // BR#6390: the mismatch must be EXPLICIT (the card carries its own
+        // root_fix.failing list that disagrees) — a card with no failing list
+        // (the BASE-FIX shape, whose title names the deploy run rather than the
+        // gate check that echoes it) still owns its merged-awaiting-ci phase.
+        if (mergedPr && !curePr && redNames && redNames.length > 0 && Array.isArray(m?.root_fix?.failing) && m.root_fix.failing.length > 0 && !matchesRedNames(String(r.title ?? ""), m.root_fix.failing)) {
           continue;
         }
         const candidate = {
@@ -12223,7 +12266,35 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);
         if (!matchLeg) continue;
         const legRepo = String(matchLeg.repo || repo);
-        if (mergedShaForPr(m, legRepo, pr)) continue;
+        // BR#6390: a queue-bound cure whose leg already MERGED (receipt on the
+        // card / provenance / a merged train_event) resolves the episode to
+        // `cure_pr_merged_awaiting_ci` — the human gate must not re-file and
+        // the UI says MERGED, never "waiting on PR #N". The mismatch guard
+        // mirrors Step 1: a card naming a DIFFERENT red (its own root_fix
+        // failing list disagrees with the live reds) steps aside so the live
+        // check's fix card is shown.
+        // BR#4934 red-settle receipt (2026-11-05): the merged-leg resolution
+        // is for GENUINE cures only — a root-fix card, the lane's BASE-FIX
+        // card, or a fix-shaped title. An ordinary IMPL lane car whose leg
+        // already landed is a PARKED LANDED CAR awaiting its settle-close,
+        // never the base red's cure: resolving it made trainStatus's BR#6012
+        // read transition the lane out of a LIVE stop (stop.sha = the red
+        // settle sha ≠ the parked car's older merge sha) and wipe stop.bisect.
+        const rowIsCureCard = isRootFixCard({ tags: parseTags(row.tags), meta: m })
+          || isLaneBaseFixCard({ tags: parseTags(row.tags), meta: m }, legRepo)
+          || isBaseCureCardTitle(String(row.title ?? ""));
+        const mergedSha = rowIsCureCard ? mergedShaForPr(m, legRepo, pr) : null;
+        if (mergedSha) {
+          if (redNames && redNames.length > 0 && Array.isArray(m?.root_fix?.failing) && m.root_fix.failing.length > 0 && !matchesRedNames(String(row.title ?? ""), m.root_fix.failing)) continue;
+          const resolvedMerged = {
+            card: { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
+            curePr: null,
+            conflictPr: null,
+            mergedPr: { repo: legRepo, number: pr, merge_sha: String(mergedSha) },
+            culpritPr: root.culpritPr,
+          };
+          return { ...resolvedMerged, state: classifyBaseRedEpisodeState(resolvedMerged) };
+        }
         const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
         if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
         const resolved = {
@@ -12255,6 +12326,19 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, answer: string, actor: string): Promise<void> {
     const t = String(title ?? askMeta?.ask?.question ?? "");
     const ans = answer.trim();
+    // BR#6390: the number the FILED ASK named — its options carry the cure PR
+    // ("DONE — PR #N merged"). A bare "DONE"/"DECLINE" answer carries no
+    // number, and re-resolving the episode needs the live queue, which the
+    // answer path does not carry — the filed ask is the gate's source of
+    // truth, so read the PR out of its own options first.
+    const askOptionPr = (m: any): number | null => {
+      const opts: string[] = Array.isArray(m?.ask?.options) ? m.ask.options.map((o: any) => String(o)) : [];
+      for (const o of opts) {
+        const hit = /#(\d+)/.exec(o);
+        if (hit) return Number(hit[1]);
+      }
+      return null;
+    };
     // (2) the root-fix fast-lane ask — the PR is IN the title
     const fast = /^Root-fix fast lane \(BR#5189\): merge (\S+) PR #(\d+)/.exec(t);
     // (1) the base-red alarm ask — repo@base in the title
@@ -12285,14 +12369,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       return;
     }
     const bypassPr = ((): number | null => {
-      if (fast && /\b(merge|bypass|yes|go)\b/i.test(ans)) return Number(fast[2]);
+      if (fast && /\b(merge|bypass|yes|go|done)\b/i.test(ans)) return Number(fast[2]);
       if (!baseRed) return null;
+      // BR#6390: DONE is the human-gate accept — "I merged it". The brief's
+      // option carries the PR number; a bare "DONE" falls back to the number
+      // the FILED ASK named (its own options — the gate's source of truth),
+      // then to the episode's open cure PR so the stamp never lands on a
+      // guessed number.
+      if (/\bdone\b/i.test(ans)) {
+        const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
+        if (m) return Number(m[1]);
+        return askOptionPr(askMeta) ?? this.trainOpenRootFix(baseRed[1]).curePr?.number ?? null;
+      }
       if (!/\bbypass\b|\bmerge\b/i.test(ans)) return null;
       const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
       return m ? Number(m[1]) : null;
     })();
     const rerun = !!baseRed && !bypassPr && /\bre-?run\b|\bretry\b|\btransient\b/i.test(ans);
-    if (!bypassPr && !rerun) return;
+    // BR#6390: DECLINE is the human-gate reject — "hold the line". No merge
+    // authority is stamped; instead the decline suppresses re-asks for this
+    // episode title + cure PR (24h) so the answered gate stays answered.
+    const decline = !!baseRed && !bypassPr && !rerun && /\bdecline\b|\bhold\b/i.test(ans);
+    if (!bypassPr && !rerun && !decline) return;
     const repo = fast ? fast[1] : baseRed ? baseRed[1] : "";
     const base = baseRed ? baseRed[2] : "main";
     if (!repo) return;
@@ -12309,6 +12407,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const laneMeta = JSON.parse(laneRow.meta ?? "{}");
     const now = Date.now();
     if (bypassPr && Number.isInteger(bypassPr) && bypassPr > 0) {
+      // a DONE supersedes an earlier DECLINE for the same PR — the gate is
+      // being answered affirmatively now; the decline must not suppress it
+      if (laneMeta.lane?.base_red_ask_declined && Number(laneMeta.lane.base_red_ask_declined.pr) === bypassPr) {
+        delete laneMeta.lane.base_red_ask_declined;
+      }
       laneMeta.lane = {
         ...(laneMeta.lane ?? {}),
         bypass_merge: { repo, base, pr: bypassPr, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
@@ -12316,6 +12419,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
       this.version(laneRow.id, actor, "update", `bypass-merge authorized by ask ${askId} — ${repo}#${bypassPr} merges out of turn on the next tick (answer: "${ans.slice(0, 120)}")`, {});
       this.audit(actor, "train:bypass_merge_stamped", laneRow.id, { repo, base, pr: bypassPr, ask_id: askId });
+    } else if (decline) {
+      const declinedPr = (() => {
+        const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
+        return m ? Number(m[1]) : askOptionPr(askMeta) ?? this.trainOpenRootFix(repo).curePr?.number ?? 0;
+      })();
+      laneMeta.lane = {
+        ...(laneMeta.lane ?? {}),
+        base_red_ask_declined: { repo, base, pr: declinedPr, ask_title: String(title ?? ""), ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+      };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.version(laneRow.id, actor, "update", `human gate DECLINED by ask ${askId} — the line holds; this episode's gate stays answered for ${repo}#${declinedPr || "?"} (no re-ask for 24h or until a different cure PR binds)`, {});
+      this.audit(actor, "train:base_red_ask_declined", laneRow.id, { repo, base, pr: declinedPr, ask_id: askId });
     } else {
       laneMeta.lane = {
         ...(laneMeta.lane ?? {}),
@@ -12926,6 +13041,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // never misread a JSON `null` as an active rerun request.
         ...(meta.lane?.bypass_merge ? { bypass_merge: meta.lane.bypass_merge } : {}),
         ...(meta.lane?.rerun_failed ? { rerun_failed: meta.lane.rerun_failed } : {}),
+        // BR#6390: the DECLINE stamp — the panel/state can show the human held
+        // the line, and train-hub asserts it through the same projection
+        ...(meta.lane?.base_red_ask_declined ? { base_red_ask_declined: meta.lane.base_red_ask_declined } : {}),
         ...(meta.lane?.deploy_dispatched ? { deploy_dispatched: meta.lane.deploy_dispatched } : {}),
         ...(meta.lane?.dispatch_deploy ? { dispatch_deploy: meta.lane.dispatch_deploy } : {}),
         attempt: headHold ? { card: head, hold: headHold.class, note: headHold.note } : null,

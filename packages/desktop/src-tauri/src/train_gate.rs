@@ -595,25 +595,46 @@ pub fn root_fix_fast_lane_title(repo: &str, pr: impl std::fmt::Display) -> Strin
 }
 
 /// The main-breakage qualification (BR#5189 §1): the card is THE root fix iff
-/// it is tagged `root_blocker` + `main-red` AND bound to a failing main-HEAD
-/// run (meta.root_fix with repo + head_sha). Tags alone never qualify — the
-/// binding does (an ambient "main is red" tag without a named run would pin
-/// the whole queue to a stale episode). MUST stay behaviour-identical to the
-/// TS mirror (core.ts isRootFixCard, tag match case-insensitive).
+/// it is tagged `root_blocker` (also root-blocker / root-fix / base-fix) +
+/// `main-red` (also main_red / stop-the-line, BR#6390 — the BASE-FIX /
+/// stop-the-line spellings the field stamps, BR#6378 class) AND bound to a
+/// failing main-HEAD run (meta.root_fix repo+head_sha; fallback sha sources
+/// main_tip / tip_sha / red_since; fallback repo sources root_fix.repo /
+/// repo / pr.repo / prs[0].repo / merge_train.repo / root_blocker_for_lane
+/// "<repo>@<base>"). BR#6390: a field-minted BASE-FIX card can carry NO
+/// root-side tag at all — the marker then lives in meta
+/// (`root_blocker_for_lane` "<repo>@<base>" or a `root_blocker` id string,
+/// the BR#6378 exemplar) — so a meta marker qualifies as the root-side half.
+/// Meta markers never qualify ALONE: the binding (a named failing run) is
+/// still required — an ambient "main is red" tag without a named run would
+/// pin the whole queue to a stale episode. MUST stay behaviour-identical to
+/// the TS mirror (core.ts isRootFixCard, tag match case-insensitive).
 pub fn is_root_fix_card(card: &Value) -> bool {
     let tags: Vec<String> = card
         .get("tags")
         .and_then(|t| t.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_lowercase())).collect())
         .unwrap_or_default();
-    let has_root = tags.iter().any(|t| t == "root_blocker" || t == "root-blocker");
-    let has_main_red = tags.iter().any(|t| t == "main-red" || t == "main_red");
+    let meta_ref = card.get("meta").filter(|m| m.is_object());
+    // BR#6390: a field-minted BASE-FIX card can carry NO root-side tag at
+    // all — the marker then lives in meta (`root_blocker_for_lane`
+    // "<repo>@<base>" or a `root_blocker` id string, the BR#6378 exemplar)
+    // — so a meta marker qualifies as the root-side half. Meta markers never
+    // qualify ALONE: the binding (a named failing run) is still required.
+    let has_root = tags.iter().any(|t| t == "root_blocker" || t == "root-blocker" || t == "root-fix" || t == "base-fix")
+        || meta_ref
+            .and_then(|m| m.get("root_blocker_for_lane"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains('@'))
+            .unwrap_or(false)
+        || meta_ref.and_then(|m| m.get("root_blocker")).and_then(|v| v.as_str()).is_some();
+    let has_main_red = tags.iter().any(|t| t == "main-red" || t == "main_red" || t == "stop-the-line");
     if !has_root || !has_main_red {
         return false;
     }
-    let meta = match card.get("meta") {
-        Some(m) if m.is_object() => m,
-        _ => return false,
+    let meta = match meta_ref {
+        Some(m) => m,
+        None => return false,
     };
     if let Some(b) = meta.get("root_fix").filter(|b| b.is_object()) {
         let repo = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
@@ -626,15 +647,28 @@ pub fn is_root_fix_card(card: &Value) -> bool {
         .get("main_tip")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+        // BR#6390: agent-filed BASE-FIX cards carry tip_sha (the failing main
+        // tip) — same meaning as main_tip. MUST mirror core.ts mainRedBinding.
+        .or_else(|| meta.get("tip_sha").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
         .or_else(|| meta.get("red_since").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
         .unwrap_or("");
     let fallback_repo = meta
         .pointer("/root_fix/repo")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+        .or_else(|| meta.get("repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
         .or_else(|| meta.pointer("/pr/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
         .or_else(|| meta.pointer("/prs/0/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
         .or_else(|| meta.pointer("/merge_train/repo").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        // BR#6390: the field-minted BASE-FIX shape names the lane, not a PR
+        // ("repo@base") — split the repo half out as the binding's repo.
+        .or_else(|| {
+            meta.get("root_blocker_for_lane")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.split_once('@'))
+                .map(|(repo, _)| repo)
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or("");
     !fallback_repo.is_empty() && !fallback_sha.is_empty()
 }

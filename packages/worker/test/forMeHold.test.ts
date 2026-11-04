@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 
 /**
- * BR#3457 — For Me busy-hold state machine (pure module, no react/zustand).
+ * BR#3457 — For Me busy-hold state machine (pure module, no react/zustand),
+ * amended by BR#6390 (no-jump law).
  *
- * The jump bug: clicking accept called onDone → refetch, and the card's fate
- * depended entirely on refetch timing — it vanished, then (with stacked
- * verdicts) popped back. The hold law: on click the card STAYS in the list,
- * moves to the bottom of its section with an actioning chip, and is removed
- * only when a refetch confirms the decision is no longer proposed. On error
- * the hold drops and the card returns to its slot with the error inline.
+ * The jump bug (BR#3457): clicking accept called onDone → refetch, and the
+ * card's fate depended entirely on refetch timing — it vanished, then (with
+ * stacked verdicts) popped back. The hold law: on click the card STAYS in
+ * the list, grayed with an actioning chip, and is removed only when a
+ * refetch confirms the decision is no longer proposed. On error the hold
+ * drops and the card shows the error inline.
+ *
+ * The BR#6390 amendment: a click must never REPOSITION a card either — the
+ * old pin-to-bottom/busy-last sort is superseded. Ordering is stable
+ * created_ts desc, always; busy/answered shows as a chip, not a jump.
  */
 
 import {
@@ -38,24 +43,28 @@ const heldOf = (...cards: any[]): HeldMap => {
   return m;
 };
 
-describe("holdOrder — busy last, then created_ts desc (stable, no jump)", () => {
-  it("idle lists order purely by created_ts desc — holdOrder changes nothing when nothing is busy", () => {
+describe("holdOrder — BR#6390: a click never reorders (stable created_ts desc)", () => {
+  it("idle lists order purely by created_ts desc", () => {
     const items = [d("a", 100), d("b", 300), d("c", 200)];
     expect(holdOrder(items, new Map()).map((x) => x.id)).toEqual(["b", "c", "a"]);
   });
 
-  it("a busy card moves to the bottom of its section; the rest keep their order", () => {
+  it("a held card STAYS in its created_ts slot — no pin-to-bottom (supersedes BR#3457 ordering)", () => {
     const items = [d("a", 100), d("b", 300), d("c", 200)];
-    expect(holdOrder(items, heldOf(d("b", 300))).map((x) => x.id)).toEqual(["c", "a", "b"]);
+    expect(holdOrder(items, heldOf(d("b", 300))).map((x) => x.id)).toEqual(["b", "c", "a"]);
   });
 
-  it("multiple busy cards: newest click first, still after every non-busy card", () => {
+  it("a busy NEWER card stays FIRST — acting on it must not sink it under older cards", () => {
+    const items = [d("a", 100), d("b", 300)];
+    expect(holdOrder(items, heldOf(d("b", 300))).map((x) => x.id)).toEqual(["b", "a"]);
+  });
+
+  it("multiple held cards: each stays in its own created_ts slot", () => {
     const items = [d("a", 100), d("b", 300), d("c", 200), d("e", 400)];
-    // non-busy block by created_ts desc (c, a), then the busy block (e, b)
-    expect(holdOrder(items, heldOf(d("b", 300), d("e", 400))).map((x) => x.id)).toEqual(["c", "a", "e", "b"]);
+    expect(holdOrder(items, heldOf(d("b", 300), d("e", 400))).map((x) => x.id)).toEqual(["e", "b", "c", "a"]);
   });
 
-  it("an error drop returns the card to its created_ts slot (no pinned-bottom residue)", () => {
+  it("an error drop changes nothing — the card never moved in the first place", () => {
     const items = [d("a", 100), d("b", 300), d("c", 200)];
     const held = settleHold(heldOf(d("b", 300)), "b", false); // act failed
     expect(holdOrder(items, held).map((x) => x.id)).toEqual(["b", "c", "a"]);
@@ -91,8 +100,8 @@ describe("begin/settle/reconcile — the card leaves only when the refetch confi
   });
 });
 
-describe("groupDecisions × hold — stacked verdicts render as one busy group at the bottom", () => {
-  it("held verdicts integrate into their target group and the group sorts last", () => {
+describe("groupDecisions × hold — stacked verdicts render as one group, held or not", () => {
+  it("held verdicts integrate into their target group (the group stays visible)", () => {
     const v1 = d("v1", 100, { decision_class: "verify-verdict", task: "T1", verdict: "verified" });
     const v2 = d("v2", 300, { decision_class: "verify-verdict", task: "T1", verdict: "verified" });
     const g1 = d("g1", 200, {}); // generic
@@ -109,7 +118,7 @@ describe("groupDecisions × hold — stacked verdicts render as one busy group a
     expect(groupBusy({ latest: generic[0], prior: [] }, held)).toBe(false);
   });
 
-  it("busy group + busy generic land at the bottom of their own sections", () => {
+  it("ordering is latest-round created_ts desc only — busy groups never sink (BR#6390)", () => {
     const v1 = d("v1", 100, { decision_class: "verify-verdict", task: "T1", verdict: "verified" });
     const v2 = d("v2", 200, { decision_class: "verify-verdict", task: "T1", verdict: "verified" });
     const v3 = d("v3", 300, { decision_class: "verify-verdict", task: "T2", verdict: "verified" });
@@ -118,8 +127,17 @@ describe("groupDecisions × hold — stacked verdicts render as one busy group a
     const held = heldOf(v2, g1); // T1's latest busy; g1 busy
     const { verdictCards, generic } = groupDecisions(mergeHeld([v1, v2, v3, g1, g2], held));
     expect(verdictCards).toHaveLength(2); // one group per target
-    // idle T2 group first, busy T1 group last; idle g2 first, busy g1 last
+    // plain created_ts desc: v3 (300) then v2 (200); g2 (250) then g1 (150)
     expect(holdOrderGroups(verdictCards, held).map((c) => c.latest.id)).toEqual(["v3", "v2"]);
     expect(holdOrder(generic, held).map((x) => x.id)).toEqual(["g2", "g1"]);
+  });
+
+  it("a busy NEWER group stays on top — acting on it must not reorder the section (BR#6390)", () => {
+    const vOld = d("vOld", 100, { decision_class: "verify-verdict", task: "T1", verdict: "verified" });
+    const vNew = d("vNew", 400, { decision_class: "verify-verdict", task: "T2", verdict: "verified" });
+    const held = heldOf(vNew); // the human is acting on the newest group
+    const { verdictCards } = groupDecisions(mergeHeld([vOld, vNew], held));
+    // BR#3457 busy-last would sink vNew below vOld; BR#6390 keeps desc order
+    expect(holdOrderGroups(verdictCards, held).map((c) => c.latest.id)).toEqual(["vNew", "vOld"]);
   });
 });

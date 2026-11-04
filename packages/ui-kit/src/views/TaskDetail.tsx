@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md, AskOptions, askKernel } from "./decide";
+import { md, AskOptions, askKernel, askOptionVariant } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -418,7 +418,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
           {ask.options.length > 0 && (
             <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
               {ask.options.map((o) => (
-                <Btn key={o} size="sm" variant="accept" disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
+                <Btn key={o} size="sm" variant={askOptionVariant(o)} disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
               ))}
             </div>
           )}

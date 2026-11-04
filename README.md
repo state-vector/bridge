@@ -645,6 +645,19 @@ RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resume
 the verb is matched after a leading `(Recommended)` marker is stripped (BR#5570), so a
 rule-6c recommended option dispatches like a verb-first one and a `(Recommended) KEEP`
 click stays a deliberate park instead of silently resuming.
+**The ask renders whole, and a click never moves the cards (BR#6390).** Every ask-band row
+and For Me card renders the FULL question title (no ellipsis kernel), the full escalation
+reason, and the ask's `body_md` as rendered markdown inline in the card itself — the human
+gates (copyable merge commands, PR and check links, the why) live in `body_md` and never
+hide behind a Details click. A 2-option accept/decline pair (`DONE … / DECLINE …`,
+`ACCEPT / DECLINE`, `GO / NO-GO`) renders as two inline buttons — the accept-shaped option
+green, the decline-shaped one red (`askOptionVariant`), full labels visible — everywhere
+asks render (ask band, For Me, task detail). And answering never re-orders: the clicked
+row stays in its EXACT slot, grayed with a spinner while in flight and an ANSWERED gray
+after the call settles, until the refreshed board drops it (a sticky `answered`/`dismissed`
+set, pruned only once the entry is gone from server state) — the old busy-last
+pin-to-bottom sort (`forMeHold`) is gone, so nothing jumps around or snaps back under
+your pointer.
 `urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
@@ -874,8 +887,34 @@ every tick. Two laws now hold:
   merge diff — check the deploy logs first; anything else is diagnosis pending
   until a session reads the failing job log (re-running a structural failure burns
   a cycle and re-arms the ask). Options mirror the triage
-  outcomes: hold-the-line · transient retry · bypass-merge the cure (number
-  included) · manual/other · no-resolution-yet keep digging. The stamp is
+  outcomes — and when a cure PR is bound, the ask is a HUMAN GATE, not a menu
+  (BR#6390, Ray 2026-11-05: "do this thing and click DONE when done to unblock"): the
+  brief carries a `# HUMAN GATE — your one action` block with the copy-paste `--admin`
+  merge command plus the PR and check links, and the options are exactly the
+  accept/decline pair `DONE — PR #N merged` / `DECLINE — hold the line` (the Rust
+  executor's root-fix fast-lane ask files the same pair, title byte-identical in both
+  implementations so the identical-open-ask dedupe still matches whichever side fires
+  first). DONE stamps `lane.bypass_merge` — the executor then lands the cure or, if the
+  human merged it themselves, observes `MERGED` and stamps the `merged` train_event so
+  the episode settles on `cure_pr_merged_awaiting_ci` (a 10-minute DONE grace watches
+  for exactly that before any machine merge attempt is tried). DECLINE stamps
+  `base_red_ask_declined` — the line holds, the same episode + cure PR does not re-ask
+  for 24h, a different cure PR re-arms the gate, and a later DONE supersedes the
+  decline. While a bypass authorization is already pending for the bound PR (or the
+  cure has merged), the gate files nothing — an answered gate is never re-minted
+  before the executor acts on it. The episode join also recognizes the field-minted
+  BASE-FIX / stop-the-line card shape (BR#6378: no root-side tag, `tip_sha` +
+  `root_blocker_for_lane "<repo>@<base>"` in meta — tags `main-red` +
+  `stop-the-line`/`base-fix`/`p0`): `isRootFixCard` / `mainRedBinding` accept the
+  broadened vocabulary (base-fix/root-fix tags + stop-the-line main-red spelling;
+  sha sources `main_tip`/`tip_sha`/`red_since`; a meta marker counts as the root-side
+  half — the failing-run binding stays mandatory, tags alone never qualify), and
+  `isLaneBaseFixCard` heads the episode with that card through
+  `cure_pr_merged_awaiting_ci` — a human-merged cure resolves the episode with ITS
+  card, never a stale fix_card, and the gate never re-files over a merged cure. The
+  Rust mirror (`train_gate.rs is_root_fix_card`) stays behaviour-identical. Without a
+  bound cure the triage menu stands: hold-the-line ·
+  transient retry · manual/other · no-resolution-yet keep digging. The stamp is
   freshness-guarded (<15m, executor refreshes every tick) so a dead daemon's stale
   stamp can never pin a false BLOCKED; a stale or green stamp falls back to the
   normal lane vocabulary.
