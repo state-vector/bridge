@@ -2108,6 +2108,13 @@ starved until a manual re-park.
   lenient single-PR rule again (URL + shorthand double-cites collapse the
   same way). Citing the same PR twice is now harmless; `/commit/<sha>`
   stays the receipts convention.
+- **The verify duty teaches the convention (BR#6343)**: the ACCEPT step of
+  every verify prompt states it outright — cite each PR exactly ONCE (the
+  `/pull/` URL or `owner/name#N`, never both, `head <sha>` adjacent) and
+  cite commit receipts as `/commit/<sha>` URLs, never `/pull/N/commits/…`
+  deep-links — defense-in-depth riding the parser dedupe, so a
+  hand-written note cannot re-arm the livelock on a hub still running a
+  pre-dedupe build.
 - **The re-queue fail-closed**: when an already-queued card is re-accepted
   and the note carries a `head <sha>` that binds to NO stamped leg while
   the fold moved nothing, the card is stamped the typed `unbound` phase
