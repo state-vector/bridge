@@ -15,12 +15,32 @@ beforeAll(async () => {
   const ns = await mf.getDurableObjectNamespace("KB");
   // Miniflare's RPC proxy type and workers-types' fetch graph do not meet.
   // Narrow only this harness boundary; protocol payloads validate below.
-  const durable = await ns.get(ns.idFromName("execution-test")) as unknown as typeof stub;
+  const durable = await ns.get(ns.idFromName("global")) as unknown as typeof stub;
   stub = { fetch: (url, init) => durable.fetch(url, init) };
 });
 afterAll(async () => { await mf?.dispose(); });
 
 describe("durable executor on real SQLite", () => {
+  it("proves a cached worker's canonical identity and refuses gateway or foreign credentials without minting", async () => {
+    const gw = (await post<{ secret: string }>("admin.mint", { label: "cache-host", tags: ["gateway"] })).data;
+    const worker = (await post<{ secret: string }>("agent.provision", { label: "cache-host/old", actor: "cache-host" })).data;
+    const renamed = await post("token.rename", { bearer: worker.secret, label: "cache-host/current" });
+    expect(renamed.data.error).toBeUndefined();
+    const resolve = (cached_secret: string) => mf.dispatchFetch("https://hub.test/api/kb-machine/provision", {
+      method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${gw.secret}` },
+      body: JSON.stringify({ label: "cache-host/old", cached_secret, actor: "web:spoof" }),
+    });
+    const proof = await resolve(worker.secret);
+    expect(proof.status).toBe(200);
+    expect(await proof.json()).toMatchObject({ cached: true, label: "cache-host/current" });
+    expect((await resolve(gw.secret)).status).toBe(403);
+    expect((await resolve("not-a-credential")).status).toBe(401);
+    const foreign = (await post<{ secret: string }>("admin.mint", { label: "foreign", tags: ["gateway"] })).data;
+    const foreignWorker = (await post<{ secret: string }>("agent.provision", { label: "foreign/worker", actor: "foreign" })).data;
+    expect((await resolve(foreignWorker.secret)).status).toBe(403);
+    const stillLive = await post("auth.identify", { bearer: worker.secret });
+    expect(stillLive.data.error).toBeUndefined();
+  });
   it("atomically replays commands, fences missing/stale worker scope, and holds the cross-host restoration barrier", async () => {
     const gateway = await post<{ secret: string }>("admin.mint", { label: "exec-host", tags: ["gateway"] });
     const identity = await post<{ token_id: string }>("auth.identify", { bearer: gateway.data.secret });

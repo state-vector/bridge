@@ -57,6 +57,12 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 ### Durable execution (protocol v1)
 
+Worker provisioning validates cached credentials against the live hub before
+execution begins. Revoked/wrong-class cache entries are re-provisioned; the
+runner binds the hub's canonical worker label rather than an old cache key.
+Transient/deployment errors retain the cache and never trigger credential
+rotation. Gateway and interactive credentials are never worker fallbacks.
+
 New runners acquire a hub-persisted execution generation before spawning an
 agent. The SQLite state and command replay receipt commit atomically. Worker
 MCP writes carry their generation/attempt scope in runner-injected headers;

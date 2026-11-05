@@ -3324,6 +3324,10 @@ fn spawn_opencode(
             return;
         }
     };
+    // Bind the credential actually proved/minted by the hub, not the cache key
+    // requested before rename/canonicalisation. Labels are not credential IDs.
+    let agent_label = agent_token.label;
+    let agent_token = agent_token.secret;
     // Durable lease BEFORE spawning; no legacy fallback when this gate fails.
     match execution_call(cfg, tid, json!({ "kind": "inspect" })).and_then(RemoteExecution::parse) {
         Ok(s) if s.attempt.as_ref().map(|a| !matches!(a.state, RemoteAttemptState::Quiesced)).unwrap_or(false) => {
@@ -6129,26 +6133,33 @@ mod tests {
 /// with rotate (old token revoked, fresh secret issued, cached). Without
 /// this the runner dead-ends forever — the 2026-10-24 churn engine (38
 /// fake in-flight cards, 38–58 watchdog releases each).
-fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<String, String> {
-    if !cfg.token.is_empty() && agent_label == "gateway" {
-        return Ok(cfg.token.clone());
-    }
+struct WorkerCredential { label: String, secret: String }
+fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<WorkerCredential, String> {
     let cache_dir = dispatch_dir().ok_or("no dispatch dir")?;
     let cache_path = cache_dir.join("agent-tokens.json");
     let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    if let Some(secret) = cache.get(agent_label) {
-        if !secret.is_empty() {
-            return Ok(secret.clone());
-        }
-    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let hub = cfg.url.trim_end_matches('/').to_string();
+    if let Some(secret) = cache.get(agent_label).filter(|s| !s.is_empty()).cloned() {
+        let response = client.post(format!("{hub}/api/kb-machine/provision"))
+            .header("Authorization", format!("Bearer {}", cfg.token)).json(&json!({ "label": agent_label, "cached_secret": secret })).send().map_err(|e| e.to_string())?;
+        let status = response.status();
+        let proof: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+        if status.is_success() && proof["cached"] == true {
+            return Ok(WorkerCredential { label: proof["label"].as_str().filter(|s| !s.is_empty()).ok_or("worker proof missing canonical label")?.into(), secret });
+        }
+        if status.as_u16() != 401 && status.as_u16() != 403 {
+            return Err(format!("worker credential proof not ready ({status}); keep cache and wait — never rotate on infrastructure/deploy errors"));
+        }
+        cache.remove(agent_label); // explicit revoked/wrong-class prerequisite
+        dlog(agent_label, "cached worker credential invalid/wrong class; re-provisioning under the gateway's own namespace");
+    }
     // attempt 1: plain provision; attempt 2 (only when the hub has no secret
     // to re-show): rotate re-vend. Revoking-then-minting is safe here — the
     // old secret is provably not in our cache, and by label-namespace rules
@@ -6184,7 +6195,8 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
                 "agent token re-vended by rotate (cache was empty)",
             );
         }
-        return Ok(secret.to_string());
+        let label = body.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("worker provision response missing canonical label")?;
+        return Ok(WorkerCredential { label: label.into(), secret: secret.into() });
     }
     Err(format!(
         "agent token provisioning for '{agent_label}' failed after rotate retry — {last_err}"

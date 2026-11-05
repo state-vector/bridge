@@ -3582,6 +3582,22 @@ export class KnowledgeHub {
         // ---- machine-plane identity + sessions + asks ----
         case "auth.identify": return this.json(await this.identify(String(body.bearer ?? "")));
         case "agent.provision": return this.json(await this.agentProvision(body, actor));
+        case "worker.resolve": {
+          const gateway = this.one(`SELECT label,tags FROM auth_tokens WHERE id=? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
+          if (!gateway || !tagsSayGateway(parseTags(gateway.tags)) || gateway.label !== actor) return this.json({ error: "gateway credential required" }, 403);
+          let worker;
+          try { worker = await this.identify(String(body.secret ?? "")); }
+          catch (error) {
+            const message = String((error as Error).message ?? error);
+            if (message.includes("unknown auth token") || message.includes("revoked") || message.includes("missing bearer")) return this.json({ error: "cached worker credential is no longer valid" }, 401);
+            return this.json({ error: "worker identity storage unavailable; retain cache and retry", result_class: "infra_storage_fault" }, 503);
+          }
+          const row = this.one(`SELECT label,tags FROM auth_tokens WHERE id=? AND revoked_ts IS NULL`, worker.token_id);
+          const tags = parseTags(row?.tags ?? "[]");
+          const mintedBy = tags.filter(t => t.startsWith("by:")).map(t => this.canonLabel(t.slice(3)));
+          if (!row || !row.label.startsWith(`${actor}/`) || !tags.includes("provisioned") || !mintedBy.includes(actor) || tagsSayGateway(tags)) return this.json({ error: "cached credential is not this gateway's provisioned worker" }, 403);
+          return this.json({ cached: true, label: row.label, token_id: worker.token_id });
+        }
         case "self.provision": return this.json(await this.selfProvision(body, actor));
         case "token.repair": return this.json(await this.tokenRepair(body));
         case "agents.list": return this.json(await this.listAgents());
