@@ -963,7 +963,14 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   infrastructure problem, never a reason to stop the bridge's merges; the head gate
   routes it into the exempt `external` bucket like every other external) — a required
   check would deadlock against it — and the BR#2267 externals (Workers builds / deploy
-  previews never gate). The
+  previews never gate). BR#6568 extends the SAME exemption to the typed
+  `pr_checks_green` probe (the executor's first-hand `statusCheckRollup` observation
+  behind the await, `classify_rollup` in train.rs): exempt-external failures no longer
+  stamp the probe conclusively negative — the probe SATISFIES with the exempt external
+  named in the verdict — so a degraded SP flow runner cannot park a typed await
+  indefinitely (the BR#4694 canary / PR bridge#323 class), while a REQUIRED check
+  failing still stamps negative and anything pending stays transient (fail-closed).
+  The
   bypass actor is unchanged — rayh alone keeps `bypass_mode=always`: the human retains the
   loud escape hatch; machines do not. Proven end-to-end by probe PRs #216 and #217.
 - **The stop (executor-fed, BR#3516)**: the hub holds no VCS credentials and no longer

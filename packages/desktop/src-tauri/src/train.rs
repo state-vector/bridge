@@ -4522,11 +4522,21 @@ fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
 /// pr_checks_green: gh's statusCheckRollup reflects the PR's CURRENT head
 /// (head-consistency by construction). SUCCESS/NEUTRAL/SKIPPED don't block;
 /// the terminal-failure classes are conclusive; everything else is pending.
+/// BR#6568: failing checks whose NAME matches MERGE_EXEMPT_CHECK_PATTERNS
+/// (BR#2267 mechanism, BR#6001 list — the same law the head gate applies via
+/// classify_head_checks) route into a NON-BLOCKING external bucket: the
+/// verdict still names the exempt external in its conclusion (the receipt
+/// stays the GitHub checks URL per the BR#4658 evidence contract), but it
+/// SATISFIES the probe — a degraded Superpositional flow runner must not
+/// park a typed pr_checks_green await (live: PR state-vector/bridge#323,
+/// BR#4694). A REQUIRED (non-exempt) check failing still stamps negative,
+/// and any pending check still stays transient (fail-closed, BR#3409).
 fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict {
     if rollup.is_empty() {
         return ProbeVerdict::Transient { error: "no checks reported on the PR yet".into() };
     }
     let mut failed: Vec<String> = Vec::new();
+    let mut external: Vec<String> = Vec::new();
     let mut pending = 0usize;
     for e in rollup {
         let state = e
@@ -4537,7 +4547,13 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
         let name = e.get("name").and_then(|v| v.as_str()).or_else(|| e.get("context").and_then(|v| v.as_str())).unwrap_or("?");
         match state.to_ascii_uppercase().as_str() {
             "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => failed.push(format!("{name}={state}")),
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => {
+                if crate::train_gate::is_exempt_check_name(name) {
+                    external.push(format!("{name}={state}"));
+                } else {
+                    failed.push(format!("{name}={state}"));
+                }
+            }
             _ => pending += 1,
         }
     }
@@ -4551,6 +4567,16 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
     }
     if pending > 0 {
         return ProbeVerdict::Transient { error: format!("checks pending ({pending} of {} not concluded)", rollup.len()) };
+    }
+    if let Some(first) = external.first() {
+        // green-modulo-externals: satisfied, and the verdict NAMES what was
+        // exempted (BR#6568 — the atom passes, the receipt still speaks)
+        let more = if external.len() > 1 { format!(" (+{} more)", external.len() - 1) } else { String::new() };
+        return ProbeVerdict::Satisfied {
+            receipt: url.to_string(),
+            head_sha: head_sha.to_string(),
+            conclusion: format!("checks green (exempt external: {first}{more})"),
+        };
     }
     ProbeVerdict::Satisfied { receipt: url.to_string(), head_sha: head_sha.to_string(), conclusion: "checks green".into() }
 }
@@ -5917,6 +5943,72 @@ mod tests {
         match v {
             ProbeVerdict::Conclusive { error, .. } => assert!(error.contains("Rust Tests=FAILURE")),
             other => panic!("expected conclusive, got {other:?}"),
+        }
+    }
+
+    // ---- BR#6568: the probe path applies the BR#2267/BR#6001 external-check
+    // exemption the head gate already applies — a degraded Superpositional
+    // flow runner must not park a typed pr_checks_green await (live: PR
+    // state-vector/bridge#323, BR#4694). ----
+
+    #[test]
+    fn rollup_exempt_external_failure_satisfies_and_names_the_external() {
+        // the exact live specimen: required checks SUCCESS, only the exempt
+        // external 'Superpositional' FAILURE → SATISFIED naming the external
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "CLI build (packages/cli)", "conclusion": "SUCCESS" },
+            { "name": "main-green gate", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Satisfied { conclusion, head_sha, .. } => {
+                assert!(conclusion.contains("Superpositional=FAILURE"), "verdict must name the exempt external, got: {conclusion}");
+                assert_eq!(head_sha, "deadbeef");
+            }
+            other => panic!("expected satisfied (exempt external must not fail the atom), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollup_exempt_external_failure_with_pending_stays_transient() {
+        // fail-closed: exempting an external never greens an unsettled head
+        let rollup = json!([
+            { "name": "Test", "conclusion": null, "status": "IN_PROGRESS" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "u", "");
+        assert!(matches!(v, ProbeVerdict::Transient { .. }));
+    }
+
+    #[test]
+    fn rollup_required_check_failure_beats_exempt_external_and_stays_conclusive() {
+        let rollup = json!([
+            { "name": "Test", "conclusion": "FAILURE" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Conclusive { error, .. } => {
+                assert!(error.contains("Test=FAILURE"), "required red must gate, got: {error}");
+                assert!(!error.contains("Superpositional"), "exempt external must not ride the gating error, got: {error}");
+            }
+            other => panic!("expected conclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollup_exempt_external_success_is_plain_green() {
+        // no regression: the external succeeding keeps the plain green receipt
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "conclusion": "SUCCESS" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Satisfied { conclusion, .. } => assert_eq!(conclusion, "checks green"),
+            other => panic!("expected satisfied, got {other:?}"),
         }
     }
 
