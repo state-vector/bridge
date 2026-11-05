@@ -2,6 +2,7 @@
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema,
   initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
+import { StartupWaitSchema, startupWaitReason } from "@bridge/contracts";
 
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
@@ -35,24 +36,34 @@ export class ExecutionWork {
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
   private credential(tokenId: string): Credential | null { return this.one<Credential>(`SELECT id,label,principal,tags,revoked_ts FROM auth_tokens WHERE id=?`, tokenId); }
-  private hosts(): CapabilityObservation[] {
+  private hosts(taskId?: string): CapabilityObservation[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
       host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
       active: Number(this.one<{ n: number }>(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state,'$.attempt.host')=? AND json_extract(state,'$.attempt.phase') IN ('running','restoring') AND json_extract(state,'$.attempt.lease_until')>?`, String(row.label), Date.now())?.n ?? 0),
-      readiness: this.readiness(String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), Date.now()),
+      readiness: this.taskReadiness(taskId, String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)))),
     }));
+  }
+  private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
+    const proof = this.readiness(token, host, capabilities, Date.now());
+    return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint=?`, id, host, proof.fingerprint)
+      ? { kind: "repair_required", reason: "This task's startup prerequisite requires changed executor/configuration proof" } : proof;
+  }
+  private startupWait(id: string) {
+    const row = this.one<{ state: string }>(`SELECT state FROM executor_start_waits WHERE task_id=?`, id);
+    return row ? StartupWaitSchema.parse(JSON.parse(row.state)) : null;
   }
   availability(id: string) {
     const task = this.task(id); const blockers = this.blockers(task, Date.now());
     const capability = blockers.find(b => b.kind === "capability_unavailable");
     const state = this.state(task);
     const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
-    const hosts = this.hosts().map(host => {
+    const hosts = this.hosts(id).map(host => {
       const missing = capabilityBlockers(requirements, host.capabilities, host.host);
       if (!missing.length && ![host.capabilities, ...host.capabilities.alternatives].some(c => usableFor(requirements, c, host.host, task.project))) missing.push("model_or_project_scope");
       return { ...host, observed_ts: host.observed_at, expires_ts: host.observed_at + 120_000, blockers: missing, busy: host.active >= host.capabilities.capacity };
     });
-    return { requirements, blockers, phase: capability?.kind === "capability_unavailable" ? capability.reason
+    const startup_wait = this.startupWait(id);
+    return { requirements, blockers, startup_wait, phase: startup_wait ? "unavailable" : capability?.kind === "capability_unavailable" ? capability.reason
       : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts };
   }
   private asks(id: string) {
@@ -70,7 +81,10 @@ export class ExecutionWork {
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
     const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
-    return projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(), asks: this.asks(task.id), now, local });
+    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id), asks: this.asks(task.id), now, local });
+    const wait = this.startupWait(task.id);
+    if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
+    return blockers;
   }
   /** Reads compute fresh availability without persisting, claiming or granting. */
   read(raw: unknown, tokenId = "", session = "", human = false, attention = false) {
@@ -191,21 +205,25 @@ export class ExecutionWork {
   fromHumanDecision(id: string, question: string, reason: string, actor: string) {
     const task = this.task(id); const state = this.state(task);
     if (state.handoff.phase !== "none" && state.handoff.phase !== "returned") return;
+    const startup = this.startupWait(id);
     const details = { id: `local:decision:${crypto.randomUUID()}`, version: 1, requested_at: Date.now(), reason, action: question,
       findings: "See the task and answered decision for the executor's findings.", tried: "Consult the executor's recorded history; no additional attempts are claimed.", next: "Read the continuation and explicitly accept this handoff after human authorisation.",
       evidence: [`https://hub.fleetbridge.run/card/${id.replace("#", "-")}`], approvals: [`Human selected local handoff (${actor})`], recipient: null, quiescence: { kind: "pending" as const } };
     state.handoff = state.attempt?.phase === "quiesced" && state.attempt.checkpoint
       ? { ...details, phase: "waiting", checkpoint: state.attempt.checkpoint, quiescence: { kind: "runner", host: state.attempt.host, generation: state.attempt.generation } } : { ...details, phase: "preparing" };
     if (state.attempt && state.attempt.phase !== "quiesced") state.attempt.phase = "stopping";
-    const meta: TaskMeta = JSON.parse(task.meta || "{}"); delete meta.awaiting_ask;
+    const meta: TaskMeta = JSON.parse(task.meta || "{}"); delete meta.awaiting_ask; delete meta.startup_wait;
     meta.execution_requirements = state.requirements;
     meta.blocked = { reason: `Pick up locally: ${question}`, ts: Date.now(), unblock_condition: "Only explicit authorised local acceptance resolves this handoff; old-writer checkpoint/quiescence must complete first",
       await_event: { event: "local_handoff", handoff_id: details.id, version: 1 } };
     this.storage.transactionSync(() => {
+      // Explicit human conversion transfers the wait, not execution authority.
+      // Startup fingerprints remain fenced if automation is later resumed.
+      this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
       this.sql.exec(`INSERT INTO execution_state (task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(state));
       this.sql.exec(`UPDATE artefacts SET status='blocked',owner=CASE WHEN ?='waiting' THEN '' ELSE owner END,meta=?,updated_ts=? WHERE id=?`, state.handoff.phase, JSON.stringify(meta), Date.now(), id);
     });
-    this.audit(actor, "local_handoff_decision", id, { handoff: details.id, phase: state.handoff.phase });
+    this.audit(actor, "local_handoff_decision", id, { handoff: details.id, phase: state.handoff.phase, startup_wait: startup });
   }
   resumeAfterAnswer(id: string) {
     const task = this.task(id); const state = this.state(task);
@@ -229,7 +247,10 @@ export class ExecutionWork {
       const unavailable = blockers.find(b => b.kind === "capability_unavailable");
       const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
       let status = task.status;
-      if (status === "todo" && unavailable) {
+      if (this.startupWait(task.id)) {
+        // Startup reconciliation owns this episode. Keep composable blockers
+        // visible without replacing its legacy park or manufacturing a new wait.
+      } else if (status === "todo" && unavailable) {
         status = "blocked"; meta.execution_wait = { kind: "capability" };
         meta.blocked = { reason: unavailable.text, unblock_condition: "A live eligible executor capability becomes usable; all other blockers must also clear", ts: Date.now(), await_event: { event: "executor_capability", id: task.id } };
       } else if (status === "blocked" && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability" && !unavailable && !blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required" || b.kind === "writer_quiescence_required")) {

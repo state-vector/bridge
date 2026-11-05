@@ -1,5 +1,6 @@
 /** Durable executor protocol, v1. Transport activity is not action progress. */
 import { z } from "zod";
+import { StartupWaitSchema } from "./startup.ts";
 
 export const EXECUTION_POLICY_VERSION = 1;
 export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
@@ -94,6 +95,7 @@ export const LocalGrantSchema = z.object({
 });
 export type LocalGrant = z.infer<typeof LocalGrantSchema>;
 export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("startup_wait"), episode_id: text, text, wait: StartupWaitSchema }),
   z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),
   z.object({ kind: z.literal("capacity_wait"), episode_id: text, text }),
   z.object({ kind: z.literal("human_answer_required"), episode_id: text, ask_id: text, text }),

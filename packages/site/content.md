@@ -51,6 +51,19 @@ can recover the task. Dirty/unpublished work remains on its originating host.
 Named prerequisite failures hold immediately; three transport startup failures
 also hold that host for repair. Unknown writers or
 external effects never authorise a release.
+Startup failures have their own lifecycle: **waiting for executor** or
+**startup prerequisite requires repair**, separate from execution churn.
+The hub reconciles healthy compatible readiness on advertisements and every
+minute; unchanged task-specific failures cannot be retried with the same
+executor/configuration proof. Other healthy hosts may help when no local work
+is retained. Legacy pre-begin credential-rejection parks recover automatically
+even after ownership expires, but only with zero execution history and no
+independent ask, human/local gate or machine wait. Retained work stays host-affine.
+Critical waits receive one operational incident on the original card after the
+configured stale-work interval (default ten minutes). Backlog and task details
+explain the actual prerequisite; no credential setup request is inferred from a
+generic startup error. Release is a dispatch opportunity, not repair completion.
+
 Paired operators can verify readiness and recover only recorded, never-launched
 legacy credential failures through bounded CLI commands. Local zero-worker and
 child-process checks plus the hub's no-attempt gate preserve actual writers and

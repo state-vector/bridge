@@ -79,6 +79,23 @@ restore readiness, and other ready hosts can pick up the released work. Unknown
 writers and unresolved external effects remain held. Startup preparation is
 not displayed as a successfully dispatched worker.
 Task-specific begin prerequisites do not hold unrelated work on the gateway.
+They create a typed `recovery_required` startup wait for the affected task:
+repeating the same executor/configuration proof cannot re-claim it. A repaired
+credential/configuration, or another compatible host when no local work is
+retained, lets readiness reconciliation release it. Executor-wide failures use
+`waiting_executor`; transient failures keep the short host backoff. Neither
+wait consumes the task's execution/churn budget. Availability and claimability
+show the startup wait, and late progress is commentary, not a hidden re-claim.
+The hub reconciles on every readiness advertisement and its one-minute alarm.
+It also migrates legacy credential-rejection churn parks automatically, including
+owner-lapsed cards, only when no execution generation, attempt or external
+operation exists. Legacy retained work stays on its original gateway; live
+claims, human/local gates, bound asks and unrelated typed waits remain protected.
+Recovery archives old churn counters and records an atomic dispatch receipt;
+it does not claim that execution or repair has completed. Critical (`p0`/`P0`)
+startup waits get one incident on the original card after `stale_minutes`
+(default ten minutes), with their cause and responsible executor visible in
+Backlog and task details, rather than duplicate unblock or approval requests.
 Scheduling checks persisted execution/checkpoint host affinity before claiming;
 a failed launch stops that claim sweep until readiness is re-proved next tick.
 Startup failure logs include the actual reason and whether the task or gateway

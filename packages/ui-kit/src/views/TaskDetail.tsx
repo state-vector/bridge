@@ -11,6 +11,7 @@ import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
 import { SupersedeBtn } from "./supersede";
+import { StartupWaitNotice } from "./StartupWaitNotice";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -745,6 +746,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         )}
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />}
+        {task && <StartupWaitNotice wait={task.meta?.startup_wait} />}
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
           <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />

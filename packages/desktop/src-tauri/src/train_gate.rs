@@ -1306,7 +1306,11 @@ pub struct DeployWorkflowRun {
     pub event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized ALWAYS — explicit `null` while a run is queued/in_progress.
+    /// The hub schema rejects a MISSING conclusion key (nullable ≠ optional),
+    /// so `skip_serializing_if` here made every observation containing an
+    /// in-flight deploy run fail validation (2026-11-05 incident, 123 rejects).
+    #[serde(default)]
     pub conclusion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
