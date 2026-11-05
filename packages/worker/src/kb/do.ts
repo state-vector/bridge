@@ -229,6 +229,7 @@ import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchem
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
+import { StartupWaitSchema, startupWaitReason, startupProofChanged, type StartupWait } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -631,6 +632,8 @@ export class KnowledgeHub {
   private async alarmSweep() {
     await this.ensureSchema();
     const now0 = Date.now();
+    // Readiness owns startup waits, not the task churn/timer machinery.
+    this.reconcileStartupWaits(now0);
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
     // but an ask to an agent that never answers would pause its task FOREVER
     // (the 19h+ in_progress rows were this). TTL: 24h. Expiry clears the ask
@@ -1767,6 +1770,7 @@ export class KnowledgeHub {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
         const bmeta = meta.blocked ?? {};
+        if (this.startupWait(r.id)) continue;
         // BR#3578: the typed await (validated at the door) is trusted and
         // evaluated FIRST; the free text is annotation + legacy fallback.
         const aw = validateAwaitEvent(bmeta.await_event) ?? null;
@@ -2471,9 +2475,9 @@ export class KnowledgeHub {
       const isQ = t.type === "question";
       const gated = t.meta.operator_gated;
       const roleWorkReady = roleTagged && t.qualification.ready !== false ? true : roleTagged;
-      t.is_claimable = t.status === "todo" && !isQ && !gated && (roleWorkReady || t.qualification.ready !== false);
+      t.is_claimable = t.status === "todo" && !t.meta.startup_wait && !isQ && !gated && (roleWorkReady || t.qualification.ready !== false);
       if (!t.is_claimable && t.status === "todo") {
-        t.claim_reason = isQ
+        t.claim_reason = t.meta.startup_wait ? startupWaitReason(StartupWaitSchema.parse(t.meta.startup_wait)) : isQ
           ? "question — answered, not claimed (contribute via log_progress)"
           : gated
             ? `operator gated: ${gated} — a human clears the gate`
@@ -2883,6 +2887,13 @@ export class KnowledgeHub {
       );
       CREATE TABLE IF NOT EXISTS executor_start_claims (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS executor_start_waits (
+        task_id TEXT PRIMARY KEY, state TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS executor_start_rejections (
+        task_id TEXT NOT NULL, host TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        PRIMARY KEY (task_id, host, fingerprint)
       );
       CREATE TABLE IF NOT EXISTS workspaces (
         slug TEXT PRIMARY KEY,
@@ -3672,6 +3683,7 @@ export class KnowledgeHub {
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
         case "admin.stall_sweep":
+        case "admin.startup_sweep":
         case "admin.awaiting_requeue_sweep":
         case "admin.verify_verdict_sweep":
         case "admin.ask_escalation_sweep":
@@ -3741,6 +3753,10 @@ export class KnowledgeHub {
             // (churn/dead-ask) drain at any age; fresh parks and live owners
             // are untouched.
             await this.alarmSweep();
+            return this.json({ ok: true });
+          }
+          if (op === "admin.startup_sweep") {
+            this.reconcileStartupWaits(Number(body.now ?? Date.now()));
             return this.json({ ok: true });
           }
           if (op === "admin.roster_reap") {
@@ -4312,6 +4328,7 @@ export class KnowledgeHub {
     // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    if (metaDel.includes("startup_wait") || (body.meta && Object.hasOwn(body.meta, "startup_wait"))) throw new Error("gate: startup waits are owned by executor readiness reconciliation");
     if (preMeta.ask && (metaDel.includes("ask") || (body.meta && Object.hasOwn(body.meta, "ask") && !body.meta.ask))) throw new Error("an ask's authoritative lifecycle cannot be deleted through metadata updates");
     // the re-claim transition above rewrote meta in DB (cleared the dead-end
     // blocked record) — merge against the POST-transition row, never the stale
@@ -4499,6 +4516,125 @@ export class KnowledgeHub {
       : requirements;
   }
 
+  private startupWait(id: string): StartupWait | null {
+    const row = this.one(`SELECT state FROM executor_start_waits WHERE task_id = ?`, id);
+    return row ? StartupWaitSchema.parse(JSON.parse(row.state)) : null;
+  }
+
+  /** Never use an owner/session expiry as evidence that a writer stopped.
+   * This migration admits only the old, exact pre-begin credential rejection,
+   * with no durable execution history at all. The gateway may have died since. */
+  private reconcileStartupWaits(now: number): void {
+    const candidates = this.state.storage.sql.exec(
+      `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts
+       WHERE type = 'task' AND status IN ('blocked','in_progress')
+       AND instr(json_extract(meta, '$.last_progress.note'), 'runner: durable execution held:') = 1
+       AND instr(json_extract(meta, '$.last_progress.note'), 'worker credential must be provisioned before begin') > 0`,
+    ).toArray();
+    for (const row of candidates) {
+      try {
+      if (this.startupWait(String(row.id))) continue;
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      const state = this.executionState(String(row.id));
+      if (state && (state.generation !== 0 || state.attempt || state.operations.length)) continue;
+      const churn = row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      if (row.status === "blocked" && !churn) continue;
+      if (row.status === "in_progress" && now - Math.max(Number(row.updated_ts), Number(row.status_ts), meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, this.sessionPing(meta), meta.grace_until ?? 0) <= this.staleMinutes() * 60_000) continue;
+      if (meta.operator_gated || meta.subprocess || releaseHold({ ...meta, blocked: undefined }) || this.startupHasAsk(String(row.id))) continue;
+      // Exact gateway identity, not a hostname inferred from a title/session.
+      const host = String(meta.last_progress?.actor ?? "");
+      const gateway = this.one(`SELECT tags FROM auth_tokens WHERE label = ?`, host);
+      if (!gateway || !tagsSayGateway(parseTags(gateway.tags))) continue;
+      const receipt = this.one(`SELECT seq FROM ledger WHERE artefact_id = ? AND actor = ? AND kind = 'mutation' AND action = 'progress'
+        AND instr(summary, 'runner: durable execution held:') = 1
+        AND instr(summary, 'worker credential must be provisioned before begin') > 0 ORDER BY seq DESC LIMIT 1`, row.id, host);
+      if (!receipt) continue; // mutable metadata alone is not recovery authority
+      const wait = StartupWaitSchema.parse({ phase: "waiting_executor", source: "legacy", host,
+        fingerprint: "legacy-pre-begin", reason: "The previous runner rejected its worker credential before begin",
+        since: Number(meta.blocked?.ts ?? meta.last_progress.ts), retained_work: true });
+      meta.startup_wait = wait;
+      // Retained work predates this runtime. Never silently move it off-host.
+      meta.execution_requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), host };
+      const initial = initialExecution(meta.execution_requirements);
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`INSERT INTO executor_start_waits (task_id, state) VALUES (?, ?)`, row.id, JSON.stringify(wait));
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), row.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, row.id, JSON.stringify(state ? { ...state, requirements: initial.requirements } : initial));
+      });
+      } catch (error) { this.startupRecoveryFault(String(row.id), error); }
+    }
+    const hosts = this.state.storage.sql.exec(`SELECT h.token_id, t.label, h.capabilities FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL AND h.observed_ts > ?`, now - 120_000).toArray();
+    for (const entry of this.state.storage.sql.exec(`SELECT task_id, state FROM executor_start_waits`).toArray()) {
+      const id = String(entry.task_id);
+      try {
+      const wait = StartupWaitSchema.parse(JSON.parse(String(entry.state)));
+      const row = this.one(`SELECT status, meta, tags FROM artefacts WHERE id = ?`, id);
+      if (!row || !["todo", "blocked", "in_progress"].includes(String(row.status))) continue;
+      const meta = JSON.parse(row.meta ?? "{}");
+      const state = this.executionState(id);
+      if (state && (state.generation !== 0 || state.attempt || state.operations.length)) continue;
+      // A new claim, human/local wait or independent gate always wins.
+      if (row.status === "in_progress" && wait.source !== "legacy") continue;
+      if (row.status === "in_progress" && now - Math.max(meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, this.sessionPing(meta), meta.grace_until ?? 0) <= this.staleMinutes() * 60_000) continue;
+      const legacyPark = wait.source === "legacy" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      if ((meta.blocked && !legacyPark) || meta.operator_gated || meta.subprocess || releaseHold({ ...meta, blocked: undefined }) || this.startupHasAsk(id)) continue;
+      const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
+      const ready = hosts.find(host => {
+        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(host.capabilities)));
+        if (capabilityBlockers(requirements, capabilities, String(host.label)).length) return false;
+        const proof = this.executorReadiness(String(host.token_id), String(host.label), capabilities, now);
+        return proof.kind === "ready" && startupProofChanged(wait, String(host.label), proof.fingerprint)
+          && !this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, id, host.label, proof.fingerprint);
+      });
+      if (!ready) {
+        // One incident on the original card per wait episode; no approval or
+        // duplicate unblock task. Existing card surfaces display this attention.
+        const priority = (m: { priority?: unknown }, tags: unknown) => parseTags(tags).includes("p0") || String(m.priority ?? "").toUpperCase() === "P0";
+        const critical = priority(meta, row.tags) || this.state.storage.sql.exec(`SELECT p.meta, p.tags FROM relations r JOIN artefacts p ON p.id = r.dst_id WHERE r.src_id = ? AND r.relation = 'child_of'`, id).toArray()
+          .some(parent => priority(JSON.parse(String(parent.meta ?? "{}")), parent.tags));
+        if (critical && wait.attention_at === null && now - wait.since >= this.staleMinutes() * 60_000) {
+          wait.attention_at = now;
+          meta.startup_wait = wait;
+          this.state.storage.transactionSync(() => {
+            this.state.storage.sql.exec(`UPDATE executor_start_waits SET state = ? WHERE task_id = ?`, JSON.stringify(wait), id);
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+            this.audit("system:executor", "startup_wait_incident", id, { host: wait.host, reason: wait.reason, since: wait.since });
+            this.version(id, "system:executor", "note", `Critical work is waiting for executor recovery: ${startupWaitReason(wait)}`, { startup_wait: wait });
+          });
+        }
+        continue;
+      }
+      meta.startup_recovery = { at: now, host: ready.label, previous_attempts: meta.attempt ?? null, wait };
+      delete meta.startup_wait;
+      if (wait.source === "legacy") delete meta.attempt;
+      delete meta.session;
+      delete meta.session_alive_ts;
+      delete meta.grace_until;
+      if (legacyPark) { delete meta.blocked; delete meta.proxy_check; }
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_waits WHERE task_id = ?`, id);
+        this.version(id, "system:executor", "transition", `${row.status} → todo — startup readiness restored; no worker had launched`, { from: row.status, to: "todo", host: ready.label, previous_attempts: meta.startup_recovery.previous_attempts });
+        this.audit("system:executor", "startup_recovered", id, { host: ready.label, source: wait.source });
+      });
+      } catch (error) { this.startupRecoveryFault(id, error); }
+    }
+  }
+
+  private startupRecoveryFault(id: string, error: unknown): void {
+    const reason = String(error).slice(0, 500);
+    const key = `startup_recovery_fault:${id}`;
+    if (this.settingValue(key, "") === reason) return;
+    this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, key, reason);
+    this.audit("system:executor", "startup_recovery_error", id, { reason });
+  }
+
+  private startupHasAsk(id: string): boolean {
+    return !!this.one(`SELECT id FROM asks WHERE artefact_id = ? AND status = 'open'`, id)
+      || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL`, id);
+  }
+
   private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number):
     | { kind: "ready"; worker_id: string; fingerprint: string }
     | { kind: "unprovisioned"; reason: string }
@@ -4523,7 +4659,7 @@ export class KnowledgeHub {
   private executionMutationGuard(op: string, body: Record<string, unknown>): void {
     const writes = new Set(["create", "update", "transition", "claim.takeover", "link", "ask.create", "ask.answer", "train.event", "train.ci", "train.lease", "train.recovery_event"]);
     if (!writes.has(op)) return;
-    const bound = this.one(`SELECT task_id FROM execution_state WHERE worker_token_id = ? LIMIT 1`, String(body.token_id ?? ""));
+    const bound = body.token_id ? this.one(`SELECT task_id FROM execution_state WHERE worker_token_id = ? LIMIT 1`, String(body.token_id)) : null;
     if (bound) {
       const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | null;
       const state = scope?.id ? this.executionState(scope.id) : null;
@@ -4550,6 +4686,7 @@ export class KnowledgeHub {
           const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
+          if (this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, String(body.id), token.label, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before retrying this task");
           const blockers = capabilityBlockers(this.executionSchedulingRequirements(String(body.id), requirements), capabilities, token.label);
           if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
         }
@@ -4581,6 +4718,7 @@ export class KnowledgeHub {
       // readiness of a corrected runner or borrow its proof to claim a card.
       const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
       if (!keepReady) this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(observedCapabilities), now);
+      this.reconcileStartupWaits(now);
       return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
@@ -4595,12 +4733,14 @@ export class KnowledgeHub {
         const blockers = capabilityBlockers(requirements, capabilities, String(h.label));
         const active = this.one(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state, '$.attempt.host') = ? AND json_extract(state, '$.attempt.phase') IN ('running','restoring') AND json_extract(state, '$.attempt.lease_until') > ?`, h.label, now);
         const readiness = this.executorReadiness(String(h.token_id), String(h.label), capabilities, now);
+        if (readiness.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, req.id, h.label, readiness.fingerprint)) blockers.push("startup_prerequisite");
         return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, readiness, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
       });
       const eligible = hosts.filter(h => !h.blockers.length);
       const live = eligible.filter(h => h.expires_ts > now);
       const runnable = live.filter(h => h.readiness.kind === "ready");
-      return { requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : !runnable.length ? "unavailable" : runnable.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
+      const startup_wait = this.startupWait(req.id);
+      return { requirements, startup_wait, phase: startup_wait ? "unavailable" : !eligible.length ? "not_configured" : !live.length ? "offline" : !runnable.length ? "unavailable" : runnable.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
     }
     // A released failed-start acknowledgement never authorises a writer or an
     // external operation. Its exact authenticated replay survives owner clear.
@@ -4633,6 +4773,7 @@ export class KnowledgeHub {
       if (recovering && (current.attempt || !String(meta.last_progress?.note ?? "").startsWith("runner: durable execution held:") || !String(meta.last_progress?.note ?? "").includes("worker credential must be provisioned before begin"))) throw new Error("gate: legacy recovery needs the recorded pre-begin credential rejection and no execution attempt");
       if (current.attempt && current.attempt.phase !== "quiesced") return { kind: "held", reason: "Reconcile and quiesce the existing writer before releasing its claim" };
       if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return { kind: "held", reason: "Reconcile unknown external operations before releasing the claim" };
+      if (meta.operator_gated || meta.subprocess || this.startupHasAsk(req.id) || releaseHold(legacyChurn ? { ...meta, blocked: undefined } : meta)) return { kind: "held", reason: "Independent task wait owns the exit; startup recovery cannot clear it" };
       const observed = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id = ?`, tokenId);
       const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(observed?.capabilities ?? "{}"));
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
@@ -4649,20 +4790,28 @@ export class KnowledgeHub {
       // a proved worker credential for unrelated work on the same gateway.
       const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && readiness.kind === "ready";
       const barrier = command.kind === "start_failed" && !taskPrerequisite ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
+      const startupWait = !recovering && !current.attempt && current.generation === 0 && !current.operations.length
+        ? StartupWaitSchema.parse({ phase: taskPrerequisite ? "recovery_required" : "waiting_executor", source: "start_failed",
+          host: actor, fingerprint, reason, since: now, retained_work: command.retained_work }) : null;
       const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;
       const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
       meta.execution_requirements = requirements;
       current = { ...current, requirements };
       meta.execution_start_failure = { stage, reason, host: actor, at: now };
+      if (startupWait) meta.startup_wait = startupWait;
       if (recovering) {
         meta.startup_recovery = { at: now, host: actor, previous_attempts: meta.attempt ?? null };
         delete meta.attempt;
         delete meta.blocked;
+        delete meta.startup_wait;
       }
       delete meta.session;
       const result = { kind: "released", task_id: req.id, barrier };
       this.state.storage.transactionSync(() => {
         if (barrier) this.state.storage.sql.exec(`INSERT INTO executor_start_barriers (token_id, state) VALUES (?, ?) ON CONFLICT(token_id) DO UPDATE SET state=excluded.state`, tokenId, JSON.stringify(barrier));
+        if (startupWait) this.state.storage.sql.exec(`INSERT INTO executor_start_waits (task_id, state) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, req.id, JSON.stringify(startupWait));
+        if (startupWait?.phase === "recovery_required") this.state.storage.sql.exec(`INSERT OR IGNORE INTO executor_start_rejections (task_id, host, fingerprint) VALUES (?, ?, ?)`, req.id, actor, fingerprint);
+        if (recovering) this.state.storage.sql.exec(`DELETE FROM executor_start_waits WHERE task_id = ?`, req.id);
         this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), req.id);
         this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, req.id, JSON.stringify(current), String(binding?.worker_token_id ?? ""));
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, req.id);
@@ -4696,6 +4845,7 @@ export class KnowledgeHub {
       const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
+      if (this.startupWait(req.id) || this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, req.id, actor, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before begin");
       const blockers = capabilityBlockers(current.requirements, capabilities, actor);
       if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
       if (!gateway || !command.worker.startsWith(`${actor}/`)) throw new Error("gate: runner worker must belong to its authenticated gateway");
@@ -4732,6 +4882,10 @@ export class KnowledgeHub {
   }
 
   private async transition(body: any, actor: string) {
+    if (body.to === "in_progress") {
+      const wait = this.startupWait(String(body.id ?? ""));
+      if (wait) throw new Error(`gate: ${startupWaitReason(wait)}`);
+    }
     try {
       return await this.doTransition(body, actor);
     } catch (e) {
@@ -5671,12 +5825,18 @@ export class KnowledgeHub {
     const nextBodyMd = typeof body.body_md === "string" && body.body_md.trim()
       ? body.body_md
       : String(row.body_md ?? "");
+    const terminalStartup = ["done", "superseded"].includes(verdict.status);
+    if (terminalStartup) delete meta.startup_wait;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
         verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
       );
       if (row.type === "task") {
+        if (terminalStartup) {
+          this.state.storage.sql.exec(`DELETE FROM executor_start_waits WHERE task_id = ?`, id);
+          this.state.storage.sql.exec(`DELETE FROM executor_start_rejections WHERE task_id = ?`, id);
+        }
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, id);
         if (row.status === "todo" && verdict.status === "in_progress" && typeof body.token_id === "string") {
           const credential = this.one(`SELECT tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, body.token_id);
@@ -6400,6 +6560,10 @@ export class KnowledgeHub {
       ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
       : "";
     const instructions = composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine;
+    if (this.startupWait(id) || (row.status === "todo" && meta.startup_recovery)) {
+      this.version(id, actor, "comment", note, { note, will: will || undefined, kind: "commentary" });
+      return { id, kind: "commentary", instructions, note_postscript: "Startup wait retained. Progress does not claim work or clear executor prerequisites." };
+    }
     if (Array.isArray(meta.recovery_links) && meta.recovery_links.length) {
       const principal = body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, String(body.token_id))?.principal : null;
       const owns = row.owner === actor || (principal && row.owner === principal);
@@ -8030,6 +8194,10 @@ export class KnowledgeHub {
             ? "question — answered, not claimed (contribute via log_progress {id, did})"
             : `operator gated: ${gated} — a human clears the gate`;
         }
+      }
+      if (m.startup_wait) {
+        t.is_claimable = false;
+        t.claim_reason = startupWaitReason(StartupWaitSchema.parse(m.startup_wait));
       }
       if (m.attempt) {
         t.previously_attempted = {

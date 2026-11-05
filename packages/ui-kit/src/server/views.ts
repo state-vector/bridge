@@ -1,5 +1,5 @@
 import type { Decision, EventView, Presence } from "@bridge/specs";
-import { mergeCompletesTask } from "@bridge/contracts";
+import { mergeCompletesTask, StartupWaitSchema, startupWaitReason } from "@bridge/contracts";
 import { relTime } from "../relTime";
 
 /** The API doc says EventView.ts is ms epoch; tolerate seconds-valued ts from early adapters. */
@@ -257,6 +257,14 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
     unblockedTone: "warn",
     note: "no typed leg matched — open the card to resolve or re-scope.",
   },
+  executor: {
+    key: "executor",
+    title: "Waiting for executor recovery",
+    icon: "◷",
+    unblockedBy: "System (verified executor readiness)",
+    unblockedTone: "warn",
+    note: "No worker has started. Readiness reconciliation owns the exit; this is not task churn.",
+  },
   timeout: {
     key: "timeout",
     title: "Timeout — churn parks",
@@ -269,12 +277,13 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "executor", "time", "main", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed phase and await_event outrank prose. */
 export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   const m = t.meta ?? {};
+  if (StartupWaitSchema.safeParse(m.startup_wait).success) return EXIT_CLASSES.executor;
   const b = m.blocked ?? {};
   const reason = String(b.reason ?? "");
   const unblock = String(b.unblock_condition ?? "");
@@ -326,6 +335,12 @@ export function blockedSummaryOf(t: { status?: string; meta?: any }): {
 } {
   const cls = exitClassOf(t);
   const m = t?.meta ?? {};
+  const startup = StartupWaitSchema.safeParse(m.startup_wait);
+  if (startup.success) return {
+    whatUnblocks: startup.data.phase === "waiting_executor" ? "System: verified compatible executor readiness" : "Agent: repair startup prerequisite; system: verify changed readiness",
+    unblockedTone: startup.data.attention_at !== null ? "urgent" : "warn",
+    whyBlocked: startupWaitReason(startup.data),
+  };
   const b = m.blocked ?? {};
   const evObj = b.await_event ?? {};
   const ev = evObj.event as string | undefined;

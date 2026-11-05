@@ -16,6 +16,8 @@ import {
   TOOL_ARG_SCHEMAS,
   defineToolTable,
   mcpToolsList,
+  StartupWaitSchema,
+  startupWaitReason,
   type ToolCtx,
   type ToolName,
   type ToolTable,
@@ -132,11 +134,12 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       const m: any = a.meta ?? {};
       const isQuestion = aTags.includes("question");
       const gated = m.operator_gated;
+      const startup = StartupWaitSchema.safeParse(m.startup_wait);
       const traits = isTask
         ? {
             is_question: isQuestion,
-            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated,
-            claim_reason: isQuestion
+            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated && !startup.success,
+            claim_reason: startup.success ? startupWaitReason(startup.data) : isQuestion
               ? "question — answered, not claimed (contribute via log_progress {id, did})"
               : gated
                 ? `operator gated: ${gated} — a human clears the gate`
